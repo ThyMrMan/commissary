@@ -1,0 +1,31 @@
+.reportButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--white-a10);
+  background: var(--white-a04);
+  color: var(--white-a50);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.reportButton:hover {
+  color: #fff;
+  background: var(--white-a08);
+  border-color: var(--white-a18);
+}
+
+.reportButton:focus-visible {
+  outline: none;
+  border-color: rgba(var(--accent-rgb), 0.6);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.2);
+}

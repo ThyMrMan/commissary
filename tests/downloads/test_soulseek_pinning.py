@@ -145,6 +145,275 @@ def _track(username='peer', filename='Artist/Album/01 - Song.flac', title='Song'
     )
 
 
+def test_album_bundle_switch_keeps_completed_track_and_queues_only_missing(configured_client, tmp_path):
+    first = _track(filename='Artist/Album/01 - First.flac', title='First', number=1)
+    crawling = _track(filename='Artist/Album/02 - Second.flac', title='Second', number=2)
+    replacement_first = _track(username='other', filename='Artist/Album/01 - First.flac',
+                               title='First', number=1)
+    replacement_second = _track(username='other', filename='Artist/Album/02 - Second.flac',
+                                title='Second', number=2)
+    first_path = tmp_path / 'first.flac'
+    second_path = tmp_path / 'second.flac'
+    first_path.write_bytes(b'first')
+    second_path.write_bytes(b'second')
+    polls = [
+        {'completed': {('peer', first.filename): first_path}, 'pending': [('peer', crawling.filename)],
+         'reason': 'crawling', 'speed_bps': 20_000, 'sample_seconds': 60},
+        {'completed': {('other', replacement_second.filename): second_path}, 'pending': [],
+         'reason': 'complete', 'speed_bps': 2_000_000, 'sample_seconds': 20},
+    ]
+    expected = [
+        {'name': 'First', 'artists': ['Artist'], 'track_number': 1},
+        {'name': 'Second', 'artists': ['Artist'], 'track_number': 2},
+    ]
+    active = DownloadStatus(id='dl-slow', username='peer', filename=crawling.filename,
+                            state='InProgress', progress=1, size=10,
+                            transferred=1, speed=20_000)
+    with patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'filter_results_by_quality_preference',
+                      side_effect=lambda tracks, profile_id=None: tracks), \
+         patch.object(configured_client, 'download', AsyncMock(return_value='queued')) as enqueue, \
+         patch.object(configured_client, '_poll_album_bundle_downloads', side_effect=polls), \
+         patch.object(configured_client, 'get_all_downloads', AsyncMock(side_effect=[[active], []])), \
+         patch.object(configured_client, 'cancel_download', AsyncMock(return_value=True)) as cancel, \
+         patch('core.soulseek_client.copy_audio_files_atomically',
+               side_effect=lambda paths, staging, remove_source: list(paths)):
+        result = configured_client.download_album_to_staging(
+            'Album', 'Artist', str(tmp_path / 'staging'),
+            preferred_source={'username': 'peer', 'folder_path': 'Artist/Album'},
+            preferred_tracks=[first, crawling],
+            preferred_alternatives=[{'username': 'other', 'folder_path': 'Artist/Album',
+                                     'tracks': [replacement_first, replacement_second]}],
+            expected_tracks=expected,
+        )
+
+    assert result['success'] is True
+    assert result['partial'] is False
+    assert result['completed_count'] == 2
+    assert enqueue.await_count == 3
+    enqueue.assert_any_await('other', replacement_second.filename, replacement_second.size)
+    cancel.assert_awaited_once_with('dl-slow', 'peer', remove=True)
+
+
+def test_album_bundle_does_not_overlap_when_cancellation_fails(configured_client, tmp_path):
+    slow = _track(filename='Artist/Album/01 - Song.flac')
+    alternative = _track(username='other', filename='Artist/Album/01 - Song.flac')
+    local = tmp_path / 'song.flac'
+    local.write_bytes(b'audio')
+    polls = [
+        {'completed': {}, 'pending': [('peer', slow.filename)], 'reason': 'crawling',
+         'speed_bps': 20_000, 'sample_seconds': 60},
+        {'completed': {('peer', slow.filename): local}, 'pending': [], 'reason': 'complete',
+         'speed_bps': 20_000, 'sample_seconds': 20},
+    ]
+    active = DownloadStatus(id='dl-slow', username='peer', filename=slow.filename,
+                            state='InProgress', progress=1, size=10,
+                            transferred=1, speed=20_000)
+    with patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'filter_results_by_quality_preference',
+                      side_effect=lambda tracks, profile_id=None: tracks), \
+         patch.object(configured_client, 'download', AsyncMock(return_value='queued')) as enqueue, \
+         patch.object(configured_client, '_poll_album_bundle_downloads', side_effect=polls), \
+         patch.object(configured_client, 'get_all_downloads', AsyncMock(return_value=[active])), \
+         patch.object(configured_client, 'cancel_download', AsyncMock(return_value=False)), \
+         patch('core.soulseek_client.copy_audio_files_atomically',
+               side_effect=lambda paths, staging, remove_source: list(paths)):
+        result = configured_client.download_album_to_staging(
+            'Album', 'Artist', str(tmp_path / 'staging'),
+            preferred_source={'username': 'peer', 'folder_path': 'Artist/Album'},
+            preferred_tracks=[slow],
+            preferred_alternatives=[{'username': 'other', 'folder_path': 'Artist/Album',
+                                     'tracks': [alternative]}],
+            expected_tracks=[{'name': 'Song', 'artists': ['Artist'], 'track_number': 1}],
+        )
+
+    assert result['success'] is True
+    enqueue.assert_awaited_once_with('peer', slow.filename, slow.size)
+
+
+def test_album_bundle_leaves_unresolved_transfers_alone(configured_client, tmp_path):
+    """slskd says Completed but no local file resolved (#715 path mismatch):
+    another peer would hit the same resolver, so nothing is cancelled or re-queued."""
+    song = _track(filename='Artist/Album/01 - Song.flac')
+    alternative = _track(username='other', filename='Artist/Album/01 - Song.flac')
+    polls = [
+        {'completed': {}, 'pending': [('peer', song.filename)], 'reason': 'unresolved',
+         'speed_bps': None, 'sample_seconds': 0},
+    ]
+    with patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'filter_results_by_quality_preference',
+                      side_effect=lambda tracks, profile_id=None: tracks), \
+         patch.object(configured_client, 'download', AsyncMock(return_value='queued')) as enqueue, \
+         patch.object(configured_client, '_poll_album_bundle_downloads', side_effect=polls), \
+         patch.object(configured_client, 'cancel_download', AsyncMock()) as cancel:
+        result = configured_client.download_album_to_staging(
+            'Album', 'Artist', str(tmp_path / 'staging'),
+            preferred_source={'username': 'peer', 'folder_path': 'Artist/Album'},
+            preferred_tracks=[song],
+            preferred_alternatives=[{'username': 'other', 'folder_path': 'Artist/Album',
+                                     'tracks': [alternative]}],
+            expected_tracks=[{'name': 'Song', 'artists': ['Artist'], 'track_number': 1}],
+        )
+
+    assert result['fallback'] is True
+    enqueue.assert_awaited_once_with('peer', song.filename, song.size)
+    cancel.assert_not_awaited()
+
+
+def test_album_bundle_replaces_a_dead_folder_from_an_alternative(configured_client, tmp_path):
+    song = _track(filename='Artist/Album/01 - Song.flac')
+    alternative = _track(username='other', filename='Artist/Album/01 - Song.flac')
+    local = tmp_path / 'song.flac'
+    local.write_bytes(b'audio')
+    polls = [
+        {'completed': {}, 'pending': [], 'reason': 'failed', 'speed_bps': None, 'sample_seconds': 0},
+        {'completed': {('other', alternative.filename): local}, 'pending': [], 'reason': 'complete',
+         'speed_bps': 2_000_000, 'sample_seconds': 20},
+    ]
+    with patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'filter_results_by_quality_preference',
+                      side_effect=lambda tracks, profile_id=None: tracks), \
+         patch.object(configured_client, 'download', AsyncMock(return_value='queued')) as enqueue, \
+         patch.object(configured_client, '_poll_album_bundle_downloads', side_effect=polls), \
+         patch.object(configured_client, 'cancel_download', AsyncMock()) as cancel, \
+         patch('core.soulseek_client.copy_audio_files_atomically',
+               side_effect=lambda paths, staging, remove_source: list(paths)):
+        result = configured_client.download_album_to_staging(
+            'Album', 'Artist', str(tmp_path / 'staging'),
+            preferred_source={'username': 'peer', 'folder_path': 'Artist/Album'},
+            preferred_tracks=[song],
+            preferred_alternatives=[{'username': 'other', 'folder_path': 'Artist/Album',
+                                     'tracks': [alternative]}],
+            expected_tracks=[{'name': 'Song', 'artists': ['Artist'], 'track_number': 1}],
+        )
+
+    assert result['success'] is True and result['partial'] is False
+    assert enqueue.await_count == 2
+    cancel.assert_not_awaited()
+
+
+def test_album_bundle_measures_aggregate_peer_speed_not_queued_siblings(configured_client):
+    moving = _track(filename='Artist/Album/01 - First.flac', title='First', number=1,
+                    size=100_000_000)
+    queued = _track(filename='Artist/Album/02 - Second.flac', title='Second', number=2,
+                    size=100_000_000)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+
+    async def downloads():
+        return [
+            DownloadStatus(id='moving', username='peer', filename=moving.filename,
+                           state='InProgress', progress=1, size=moving.size,
+                           transferred=int(clock.now * 50_000), speed=50_000),
+            DownloadStatus(id='queued', username='peer', filename=queued.filename,
+                           state='Queued, Remotely', progress=0, size=queued.size,
+                           transferred=0, speed=0),
+        ]
+
+    with patch('core.soulseek_client.time', clock), \
+         patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'get_all_downloads', side_effect=downloads), \
+         patch('core.soulseek_client.get_poll_timeout', return_value=80), \
+         patch('core.soulseek_client.get_poll_interval', return_value=1), \
+         patch('core.settings.config_manager.get', return_value=500):
+        outcome = configured_client._poll_album_bundle_downloads(
+            {('peer', moving.filename): moving, ('peer', queued.filename): queued},
+            lambda state, **kwargs: None,
+            switch_on_crawl=True,
+        )
+
+    assert outcome['reason'] == 'crawling'
+    assert set(outcome['pending']) == {('peer', moving.filename), ('peer', queued.filename)}
+    assert clock.now >= 60
+
+
+def test_queued_album_bundle_is_not_measured_as_a_slow_peer(configured_client):
+    track = _track(filename='Artist/Album/01 - Song.flac', size=100_000_000)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+
+    async def downloads():
+        return [DownloadStatus(id='queued', username='peer', filename=track.filename,
+                               state='Queued, Remotely', progress=0, size=track.size,
+                               transferred=0, speed=0)]
+
+    with patch('core.soulseek_client.time', clock), \
+         patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'get_all_downloads', side_effect=downloads), \
+         patch('core.soulseek_client.get_poll_timeout', return_value=80), \
+         patch('core.soulseek_client.get_poll_interval', return_value=1), \
+         patch('core.settings.config_manager.get', return_value=500):
+        outcome = configured_client._poll_album_bundle_downloads(
+            {('peer', track.filename): track}, lambda state, **kwargs: None,
+            switch_on_crawl=True,
+        )
+
+    assert outcome['reason'] == 'timeout'
+    assert outcome['speed_bps'] is None
+
+
+def test_album_bundle_still_measures_speed_when_fallback_is_disabled(configured_client):
+    track = _track(filename='Artist/Album/01 - Song.flac', size=100_000_000)
+
+    class Clock:
+        now = 0.0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+
+    clock = Clock()
+
+    async def downloads():
+        return [DownloadStatus(
+            id='moving', username='peer', filename=track.filename,
+            state='InProgress', progress=1, size=track.size,
+            transferred=int(clock.now * 750_000), speed=750_000,
+        )]
+
+    def setting(key, default=None):
+        if key == 'soulseek.observed_speed_fallback_enabled':
+            return False
+        if key == 'soulseek.min_observed_download_speed_kbps':
+            return 500
+        return default
+
+    with patch('core.soulseek_client.time', clock), \
+         patch('core.soulseek_client.run_async', side_effect=_run_async), \
+         patch.object(configured_client, 'get_all_downloads', side_effect=downloads), \
+         patch('core.soulseek_client.get_poll_timeout', return_value=40), \
+         patch('core.soulseek_client.get_poll_interval', return_value=1), \
+         patch('core.settings.config_manager.get', side_effect=setting):
+        outcome = configured_client._poll_album_bundle_downloads(
+            {('peer', track.filename): track}, lambda state, **kwargs: None,
+            switch_on_crawl=True,
+        )
+
+    assert outcome['reason'] == 'timeout'
+    assert outcome['speed_bps'] == pytest.approx(750_000)
+    assert outcome['sample_seconds'] >= 30
+
+
 def test_album_bundle_stages_one_selected_soulseek_folder(configured_client, tmp_path):
     configured_client.download_path = tmp_path
     local_file = tmp_path / '01 - Song.flac'
@@ -828,3 +1097,306 @@ def test_filter_results_by_quality_runs_quarantine_dedup_first(configured_client
     usernames = {r.username for r in kept}
     assert 'badpeer' not in usernames, "Quarantined source must be filtered before the quality picker"
     assert 'goodpeer' in usernames
+
+# ---------------------------------------------------------------------------
+# search()
+# ---------------------------------------------------------------------------
+
+
+def _search_ready_client():
+    client = SoulseekClient.__new__(SoulseekClient)
+    client.base_url = 'http://localhost:5030'
+    client.api_key = 'test-key'
+    client.download_path = Path('./test_downloads')
+    client.active_searches = {}
+    return client
+
+
+def _search_config_get(key, default=None):
+    values = {
+        'soulseek.min_peer_upload_speed': 0,
+        'soulseek.search_timeout_buffer': 0,
+    }
+    return values.get(key, default)
+
+
+def test_search_reads_wrapped_slskd_responses_payload():
+    """Regression: some slskd response endpoints return an object containing
+    the response list. Treating only raw lists as valid made SoulSync report
+    0 results even though slskd had peer responses."""
+    client = _search_ready_client()
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST' and endpoint == 'searches':
+            return {'id': 'search-1'}
+        if method == 'GET' and endpoint == 'searches/search-1/responses':
+            return {
+                'responses': [
+                    {
+                        'username': 'peer-a',
+                        'freeUploadSlots': 1,
+                        'uploadSpeed': 1_000_000,
+                        'queueLength': 0,
+                        'files': [
+                            {
+                                'filename': 'Marshall James - Vortex.mp3',
+                                'size': 12_900_000,
+                                'bitRate': 320,
+                            }
+                        ],
+                    }
+                ]
+            }
+        raise AssertionError((method, endpoint))
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request):
+        tracks, albums = _run_async(client.search('marshall james vortex', timeout=1))
+
+    assert albums == []
+    assert len(tracks) == 1
+    assert tracks[0].username == 'peer-a'
+    assert tracks[0].filename == 'Marshall James - Vortex.mp3'
+    assert tracks[0].quality == 'mp3'
+
+
+@pytest.mark.parametrize(
+    ('response_fields', 'expected_slots'),
+    [
+        ({'hasFreeUploadSlot': True}, 1),
+        ({'hasFreeUploadSlot': False, 'freeUploadSlots': 4}, 0),
+        ({'freeUploadSlots': 3}, 3),
+    ],
+)
+def test_search_parses_current_and_legacy_free_slot_fields(configured_client, response_fields, expected_slots):
+    response = {
+        'username': 'peer-a',
+        'files': [{'filename': 'Artist - Song.flac', 'size': 10}],
+        **response_fields,
+    }
+
+    tracks, _albums = configured_client._process_search_responses([response])
+
+    assert len(tracks) == 1
+    assert tracks[0].free_upload_slots == expected_slots
+
+
+def test_search_does_not_skip_late_inserted_responses():
+    """Regression: slskd can return the current response set in a different
+    order from the previous poll. Index slicing skipped newly inserted earlier
+    responses, which could hide the only valid candidate."""
+    client = _search_ready_client()
+    snapshots = [
+        [
+            {
+                'username': 'peer-b',
+                'files': [{'filename': 'Noise Result.mp3', 'size': 1_000_000}],
+            }
+        ],
+        [
+            {
+                'username': 'peer-a',
+                'files': [{'filename': 'Marshall James - Vortex.flac', 'size': 40_000_000}],
+            },
+            {
+                'username': 'peer-b',
+                'files': [{'filename': 'Noise Result.mp3', 'size': 1_000_000}],
+            },
+        ],
+    ]
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST' and endpoint == 'searches':
+            return {'id': 'search-1'}
+        if method == 'GET' and endpoint == 'searches/search-1/responses':
+            return snapshots.pop(0) if snapshots else []
+        raise AssertionError((method, endpoint))
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request), \
+         patch('core.soulseek_client.asyncio.sleep', AsyncMock()):
+        tracks, albums = _run_async(client.search('marshall james vortex', timeout=2))
+
+    assert albums == []
+    assert {track.username for track in tracks} == {'peer-a', 'peer-b'}
+    assert any(track.filename == 'Marshall James - Vortex.flac' for track in tracks)
+
+
+def test_search_keeps_more_than_thirty_peers_and_merges_late_files():
+    client = _search_ready_client()
+    first = [
+        {'username': f'peer-{i}', 'files': [{'filename': f'Artist/Album/{i:02d} - Song {i}.flac', 'size': i + 1}]}
+        for i in range(35)
+    ]
+    second = first + [
+        {'username': 'peer-0', 'files': [
+            {'filename': 'Artist/Album/00 - Song 0.flac', 'size': 1},
+            {'filename': 'Artist/Album/36 - Late Song.flac', 'size': 36},
+        ]},
+    ]
+    snapshots = [first, second]
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST':
+            return {'id': 'search-1'}
+        return snapshots.pop(0) if snapshots else second
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request), \
+         patch('core.soulseek_client.asyncio.sleep', AsyncMock()):
+        tracks, albums = _run_async(client.search('Artist Album', timeout=12))
+
+    assert len(albums) == 1
+    assert len(albums[0].tracks) == 2
+    assert len(tracks) == 34
+
+
+@pytest.mark.parametrize('terminal_payload', [
+    {'state': 'Completed'},
+    {'state': 'Completed, TimedOut'},
+    {'state': 'Completed, ResponseLimitReached'},
+    {'state': 'Completed, ResponseLimitReached', 'isComplete': False},
+    {'state': 'InProgress', 'isComplete': True},
+])
+def test_search_uses_terminal_state_after_initial_collection_grace(terminal_payload):
+    client = _search_ready_client()
+    counts = {'responses': 0, 'status': 0}
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST':
+            return {'id': 'search-1'}
+        if endpoint.endswith('/responses'):
+            counts['responses'] += 1
+            return [{'username': 'peer', 'files': [
+                {'filename': 'Artist - Song.flac', 'size': 10},
+            ]}]
+        if endpoint == 'searches/search-1':
+            counts['status'] += 1
+            return terminal_payload
+        raise AssertionError(endpoint)
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request), \
+         patch('core.soulseek_client.asyncio.sleep', AsyncMock()):
+        tracks, _ = _run_async(client.search('Artist Song', timeout=30))
+
+    assert len(tracks) == 1
+    assert counts['responses'] >= 16
+    assert counts['responses'] < 30
+    assert counts['status'] == 1
+
+
+def test_search_with_no_responses_still_stops_at_terminal_state():
+    client = _search_ready_client()
+    counts = {'responses': 0}
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST':
+            return {'id': 'search-1'}
+        if endpoint.endswith('/responses'):
+            counts['responses'] += 1
+            return []
+        if endpoint == 'searches/search-1':
+            return {'state': 'Completed, TimedOut'}
+        raise AssertionError(endpoint)
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request), \
+         patch('core.soulseek_client.asyncio.sleep', AsyncMock()):
+        tracks, _ = _run_async(client.search('Nothing Here', timeout=30))
+
+    assert tracks == []
+    assert counts['responses'] < 30
+
+
+def test_search_keeps_polling_an_active_search_through_a_quiet_period():
+    client = _search_ready_client()
+    counts = {'responses': 0}
+
+    async def fake_request(method, endpoint, **kwargs):
+        if method == 'POST':
+            return {'id': 'search-1'}
+        if endpoint.endswith('/responses'):
+            counts['responses'] += 1
+            files = [{'filename': 'Artist - First.flac', 'size': 10}]
+            if counts['responses'] >= 25:
+                files.append({'filename': 'Artist - Late.flac', 'size': 11})
+            return [{'username': 'peer', 'files': files}]
+        if endpoint == 'searches/search-1':
+            return {'state': 'InProgress' if counts['responses'] < 25 else 'Completed'}
+        raise AssertionError(endpoint)
+
+    with patch('core.soulseek_client.config_manager.get', side_effect=_search_config_get), \
+         patch.object(client, '_wait_for_rate_limit', AsyncMock()), \
+         patch.object(client, '_make_request', side_effect=fake_request), \
+         patch('core.soulseek_client.asyncio.sleep', AsyncMock()):
+        tracks, _ = _run_async(client.search('Artist', timeout=30))
+
+    assert counts['responses'] >= 25
+    assert {track.filename for track in tracks} == {'Artist - First.flac', 'Artist - Late.flac'}
+
+
+# ---------------------------------------------------------------------------
+# Issue #1387: background pollers back off while slskd is unreachable
+# ---------------------------------------------------------------------------
+
+
+def test_unreachable_slskd_starts_a_backoff_that_doubles_and_caps(configured_client):
+    """one failed connection holds pollers off 15s, each further one doubles
+    it, up to 5 minutes. the chat loops check this so a user who isn't
+    running slskd isn't polled every 6 seconds forever."""
+    StubSession = _build_unreachable_session()
+    assert configured_client.unreachable_backoff_active() is False
+    with patch('aiohttp.ClientSession', return_value=StubSession()):
+        _run_async(configured_client._make_request('GET', 'conversations'))
+    failed_at = configured_client._conn_failed_at
+    assert configured_client.unreachable_backoff_active(now=failed_at + 14) is True
+    assert configured_client.unreachable_backoff_active(now=failed_at + 16) is False
+    with patch('aiohttp.ClientSession', return_value=StubSession()):
+        for _ in range(9):
+            _run_async(configured_client._make_request('GET', 'conversations'))
+    failed_at = configured_client._conn_failed_at
+    assert configured_client.unreachable_backoff_active(now=failed_at + 299) is True
+    assert configured_client.unreachable_backoff_active(now=failed_at + 301) is False
+
+
+def test_any_answer_from_slskd_ends_the_backoff(configured_client):
+    """slskd came back: even a 404 proves it's reachable."""
+    configured_client._conn_failures = 3
+    configured_client._conn_failed_at = __import__('time').time()
+    assert configured_client.unreachable_backoff_active() is True
+
+    class _NotFoundCm:
+        async def __aenter__(self_inner):
+            class _Resp:
+                status = 404
+                reason = 'Not Found'
+                async def text(self_resp):
+                    return ''
+            return _Resp()
+        async def __aexit__(self_inner, *args):
+            return None
+
+    class _Session:
+        def request(self, *args, **kwargs):
+            return _NotFoundCm()
+        async def close(self):
+            return None
+
+    with patch('aiohttp.ClientSession', return_value=_Session()):
+        _run_async(configured_client._make_request('GET', 'conversations'))
+    assert configured_client.unreachable_backoff_active() is False
+
+
+def test_chat_loops_skip_slskd_while_it_is_unreachable():
+    from pathlib import Path
+    ws = (Path(__file__).resolve().parents[2] / "web_server.py").read_text(
+        encoding="utf-8", errors="replace")
+    for name in ("_emit_chat_push_loop", "_chat_auto_prove_loop"):
+        loop = ws.split(f"def {name}")[1].split("\ndef ")[0]
+        assert "unreachable_backoff_active()" in loop, name

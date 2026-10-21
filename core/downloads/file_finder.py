@@ -30,7 +30,7 @@ timed out (#715).
 
 from __future__ import annotations
 
-import logging
+from utils.logging_config import get_logger
 import os
 import re
 from difflib import SequenceMatcher
@@ -38,7 +38,7 @@ from typing import Optional, Tuple
 
 from unidecode import unidecode
 
-logger = logging.getLogger(__name__)
+logger = get_logger("downloads.file_finder")
 
 
 AUDIO_EXTENSIONS = frozenset({
@@ -63,27 +63,6 @@ _FUZZY_THRESHOLD = 0.85
 
 def _is_audio_candidate(path: str) -> bool:
     return os.path.splitext(str(path or ''))[1].lower() in AUDIO_EXTENSIONS
-
-
-def _strip_audio_ext(name: str) -> str:
-    """Drop a trailing AUDIO extension, and only that.
-
-    The fuzzy tier compared a bare title against a filename that still carried
-    its extension, so every on-disk candidate was penalised by a constant
-    ``' flac'``/``' mp3'`` token the target could not have. A streaming source
-    hands the finder ``id||Artist - Title``; there is no extension on that side
-    to cancel it out. The penalty is a fixed number of characters, so it is the
-    SHORT names that fail: ``Kanaria - Dec.`` scored 0.839 against its own file
-    sitting in the download folder and was reported missing, while a longer
-    title diluted the same five characters to nothing.
-
-    Deliberately not ``os.path.splitext``: that splits on the LAST dot wherever
-    it falls, so a title is not safe to feed it — ``The Killers - Mr. Brightside``
-    would come back as ``The Killers - Mr``, and ``Kanaria - Dec.`` would silently
-    lose the period that is part of its name. Only a real audio extension is
-    removed; anything else is left exactly as it is."""
-    stem, ext = os.path.splitext(str(name or ''))
-    return stem if ext.lower() in AUDIO_EXTENSIONS else str(name or '')
 
 
 def _normalize_for_finding(text: str) -> str:
@@ -112,6 +91,33 @@ def _normalize_for_finding(text: str) -> str:
     return ' '.join(text.split()).strip()
 
 
+def _encoded_display_name(api_filename: str) -> Optional[str]:
+    """The display name out of an ``id||...||name`` dispatch key, else None.
+
+    These are NOT filesystem paths. A source encodes what its worker needs to
+    start the download, and the finder only wants the human-readable tail so it
+    can match the file that landed on disk.
+
+    Most sources encode two parts, ``id||name``. SoundCloud encodes THREE,
+    ``id||url||name``, because its worker needs the permalink to download at all
+    (core/soundcloud_client.py splits with maxsplit=2). Reading everything after
+    the FIRST separator therefore made the search target
+    ``https://soundcloud.com/...||SSIO - Alles oder Nix``, and nothing on disk is
+    called that - so the file was never found, never imported and never tagged.
+    The download looked finished and the file just sat in the completed folder
+    (#1239).
+
+    The three-part shape is recognised by its url rather than by counting, so a
+    title that happens to contain ``||`` keeps reading exactly as it did before.
+    """
+    if not api_filename or '||' not in api_filename:
+        return None
+    parts = api_filename.split('||')
+    if len(parts) > 2 and parts[1].startswith(('http://', 'https://')):
+        return parts[-1]
+    return api_filename.split('||', 1)[1]
+
+
 def _extract_basename(api_filename: str) -> str:
     """Cross-platform rightmost-separator split for a real remote PATH.
 
@@ -121,9 +127,9 @@ def _extract_basename(api_filename: str) -> str:
     must NOT be split on (issue #835)."""
     if not api_filename:
         return ""
-    if '||' in api_filename:
-        _id, title = api_filename.split('||', 1)
-        return title
+    encoded = _encoded_display_name(api_filename)
+    if encoded is not None:
+        return encoded
     last_slash = max(api_filename.rfind('/'), api_filename.rfind('\\'))
     return api_filename[last_slash + 1:] if last_slash != -1 else api_filename
 
@@ -179,8 +185,11 @@ def _search_in_directory(
             if not _is_audio_candidate(file_path):
                 continue
 
-            # Tier 1 + 2: exact basename match.
-            if filename == target_basename:
+            # Tier 1 + 2: exact basename match. An extensionless encoded
+            # title (``id||title``) matches the stem exactly; letting it fall
+            # to the fuzzy tier picked 'ANGEL (Live).flac' over 'ANGEL.flac'.
+            stem, ext = os.path.splitext(filename)
+            if target_basename in (filename, stem):
                 if api_dirs and _path_matches_api_dirs(file_path, api_dirs):
                     logger.info(
                         "Found path-confirmed match in %s: %s",
@@ -197,7 +206,6 @@ def _search_in_directory(
                 continue
 
             # Tier 3: slskd dedup suffix.
-            stem, ext = os.path.splitext(filename)
             stripped_stem = _SLSKD_DEDUP_SUFFIX.sub('', stem)
             if stripped_stem != stem and stripped_stem + ext == target_basename:
                 if api_dirs and _path_matches_api_dirs(file_path, api_dirs):
@@ -218,10 +226,27 @@ def _search_in_directory(
             # Tier 4: fuzzy basename match. Cheaper than path-walking
             # the whole tree a second time, so always compute and
             # keep the best one as a fallback.
-            normalized_file = _normalize_for_finding(_strip_audio_ext(filename))
-            similarity = SequenceMatcher(
-                None, normalized_target, normalized_file,
-            ).ratio()
+            #
+            # Encoded dispatch keys (``id||title``) are extensionless by
+            # construction, but the file on disk carries an audio
+            # extension — comparing the extensionless target against the
+            # full on-disk name drags the score under the 0.85 floor
+            # (issue #1366: 'PRYVT - ANGEL' vs 'PRYVT - ANGEL.flac'
+            # scored 0.839, so a completed download was reported "not
+            # found" while sitting in the folder). Compare against the
+            # stem as well and take the better score; the full-name
+            # comparison is unchanged, so every previously-accepted
+            # match still passes.
+            normalized_file = _normalize_for_finding(filename)
+            normalized_stem = _normalize_for_finding(stem)
+            similarity = max(
+                SequenceMatcher(
+                    None, normalized_target, normalized_file,
+                ).ratio(),
+                SequenceMatcher(
+                    None, normalized_target, normalized_stem,
+                ).ratio(),
+            )
             if similarity > highest_fuzzy_similarity:
                 highest_fuzzy_similarity = similarity
                 best_fuzzy_path = file_path
@@ -275,19 +300,14 @@ def find_completed_audio_file(
     # truncated the search target to ``T:T`` and the real file was never found,
     # quarantining valid downloads (issue #835). Real remote paths (Soulseek)
     # still get basename + dir-component extraction.
-    encoded_title = None
-    if api_filename and '||' in api_filename:
-        _id, encoded_title = api_filename.split('||', 1)
+    encoded_title = _encoded_display_name(api_filename)
     if encoded_title is not None:
         target_basename = encoded_title
         api_dirs = []
     else:
         target_basename = _extract_basename(api_filename)
         api_dirs = _api_dir_parts(api_filename)
-    # Extension stripped on the target too. Soulseek reports a real remote PATH
-    # and its basename carries an extension; strip only one side and every
-    # Soulseek transfer would acquire the penalty this just removed.
-    normalized_target = _normalize_for_finding(_strip_audio_ext(target_basename))
+    normalized_target = _normalize_for_finding(target_basename)
 
     best_dl_path, dl_sim = _search_in_directory(
         download_dir, 'downloads', target_basename, normalized_target, api_dirs,

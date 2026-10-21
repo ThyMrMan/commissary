@@ -15,7 +15,6 @@ its phases share state-detection logic.
 from __future__ import annotations
 
 import os
-import shutil as _shutil
 from typing import Any, Dict
 
 from core.automation.deps import AutomationDeps
@@ -94,9 +93,14 @@ def auto_clean_completed_downloads(config: Dict[str, Any], deps: AutomationDeps)
             )
             return {'status': 'completed'}
 
-        deps.run_async(deps.download_orchestrator.clear_all_completed_downloads())
+        ok = deps.run_async(deps.download_orchestrator.clear_all_completed_downloads())
         if not has_post_processing:
             deps.sweep_empty_download_directories()
+        # update_progress only reaches the automation's own run history; this
+        # handler fires every few minutes and used to leave no trace in the
+        # app log at all, which hid weeks of slskd-wide clears.
+        deps.logger.info("download cleanup ran (cleared=%s, empty-dir sweep %s)",
+                         ok, "skipped" if has_post_processing else "ran")
         deps.update_progress(
             automation_id, log_line='Download cleanup completed', log_type='success',
         )
@@ -116,23 +120,9 @@ def auto_full_cleanup(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str,
 
     # --- 1. Clear quarantine ---
     deps.update_progress(automation_id, phase='Clearing quarantine...', progress=0)
-    quarantine_path = os.path.join(
-        deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads')),
-        'ss_quarantine',
-    )
-    q_removed = 0
-    if os.path.exists(quarantine_path):
-        for f in os.listdir(quarantine_path):
-            fp = os.path.join(quarantine_path, f)
-            try:
-                if os.path.isfile(fp):
-                    os.remove(fp)
-                    q_removed += 1
-                elif os.path.isdir(fp):
-                    _shutil.rmtree(fp)
-                    q_removed += 1
-            except Exception as e:  # noqa: BLE001 — best-effort purge
-                deps.logger.debug("quarantine entry purge failed: %s", e)
+    from core.library.cleanup import clear_quarantine_folder, quarantine_path as _qpath
+    q_removed = clear_quarantine_folder(_qpath(
+        deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads'))))['removed']
     steps.append(f'Quarantine: removed {q_removed} items')
     deps.update_progress(
         automation_id,
@@ -165,7 +155,8 @@ def auto_full_cleanup(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str,
         )
     else:
         try:
-            deps.run_async(deps.download_orchestrator.clear_all_completed_downloads())
+            ok = deps.run_async(deps.download_orchestrator.clear_all_completed_downloads())
+            deps.logger.info("full cleanup: download queue clear ran (cleared=%s)", ok)
             steps.append('Download queue: cleared')
             deps.update_progress(
                 automation_id, log_line='Download queue: cleared', log_type='success',

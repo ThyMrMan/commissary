@@ -148,8 +148,9 @@ def test_quality_quarantine_does_not_mark_completed(_isolate_state):
     """When the inner pipeline quality-quarantines the file (``_bitdepth_rejected``),
     the wrapper must NOT fall through to "assume success" and mark the task
     Completed — that made the quarantined file appear in BOTH Completed and
-    Quarantine. The inner pipeline already owns the retry/fail for quality, so
-    the wrapper just returns."""
+    Quarantine. (The wrapper now also owns the retry/fail for this marker —
+    the inner ran with task_id popped and could never do it; see
+    test_quality_quarantine_wedged_processing.py.)"""
     completion_calls = []
     runtime = _build_runtime(completion_calls)
 
@@ -199,9 +200,14 @@ def test_silence_quarantine_does_not_mark_completed(_isolate_state):
 
 
 def test_no_failure_markers_still_assumes_success(_isolate_state):
-    """The pre-existing "assume success" fallback must STILL fire when
-    no failure markers are set — some legitimate flows complete without
-    setting `_final_processed_path`. Don't regress that behavior."""
+    """Legitimate no-destination flows (e.g. redundant source removal where
+    the destination already exists) carry ``_pipeline_import_succeeded``
+    from the inner pipeline — they must STILL complete even though no
+    ``_final_processed_path`` is set. Don't regress that behavior.
+
+    (H4 backend-review: a no-op inner that records NO outcome at all is
+    now treated as failed — see test_wrapper_fails_unrecognized_... in
+    tests/imports/test_backend_review_importing.py.)"""
     completion_calls = []
     runtime = _build_runtime(completion_calls)
 
@@ -211,7 +217,9 @@ def test_no_failure_markers_still_assumes_success(_isolate_state):
         'task_id': 't3',
         'batch_id': 'b3',
         'context_key': 'test::ctx3',
-        # No failure markers, no _final_processed_path
+        # No failure markers, no _final_processed_path — but the inner
+        # pipeline explicitly reported success.
+        '_pipeline_import_succeeded': True,
     }
 
     with patch.object(import_pipeline, 'post_process_matched_download',

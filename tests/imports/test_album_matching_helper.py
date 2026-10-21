@@ -381,6 +381,33 @@ def test_match_below_threshold_files_left_unmatched():
     )
     assert not result['matches']
     assert result['unmatched_files'] == ['/a/random.flac']
+    # Nothing was dropped as a quality duplicate — this file is genuinely
+    # unclaimed, and the caller must be able to tell the two apart.
+    assert result['duplicate_files'] == []
+
+
+def test_match_reports_quality_dedup_losers_separately():
+    """``unmatched_files`` mixes two very different things: the lower-quality
+    copy of a track that DID import, and a real song the matcher never claimed.
+    Only the second is a reason to call an import incomplete, so the dedup
+    losers are reported on their own key (PR #1121 review)."""
+    files = ['/a/01.flac', '/a/01.mp3', '/a/stray.flac']
+    file_tags = {
+        '/a/01.flac': _tags(title='A', track=1, disc=1),
+        '/a/01.mp3': _tags(title='A', track=1, disc=1),
+        '/a/stray.flac': _tags(title='Totally Different', track=9, disc=1),
+    }
+    tracks = [
+        {'name': 'A', 'track_number': 1, 'disc_number': 1, 'artists': [{'name': 'Artist'}]},
+    ]
+    result = match_files_to_tracks(
+        files, file_tags, tracks,
+        target_album='Album', similarity=_sim, quality_rank=_qrank,
+    )
+    assert [m['file'] for m in result['matches']] == ['/a/01.flac']
+    assert result['duplicate_files'] == ['/a/01.mp3']
+    # unmatched_files stays the FULL leftover list — the review UI shows it.
+    assert sorted(result['unmatched_files']) == ['/a/01.mp3', '/a/stray.flac']
 
 
 # ---------------------------------------------------------------------------
@@ -463,3 +490,42 @@ def test_tagless_file_with_weak_title_unmatched_in_multidisc():
     # threshold → no match.
     assert not result['matches']
     assert result['unmatched_files'] == ['/a/track06.flac']
+
+
+def test_descending_score_beats_track_order():
+    """#1289 Bug 4: the Give Up Deluxe cover mislabeling.
+
+    Phase 3 was greedy per-track in tracklist order: an early track with a
+    mediocre score (0.402) permanently claimed a file that a later track
+    would have matched at 1.0. Now scores are claimed in descending order,
+    so the best match wins regardless of track order.
+    """
+    from core.imports.album_matching import match_files_to_tracks
+    # Track 0 (early in list) vaguely resembles the file; track 1 is exact.
+    # With track-order greedy, track 0 would steal it.
+    files = ['/a/cover.flac']
+    file_tags = {
+        '/a/cover.flac': _tags(title='Such Great Heights', artist='The Shins',
+                               track=3, disc=2,
+                               ),
+    }
+    # Give the file a duration so the duration gate passes
+    file_tags['/a/cover.flac']['duration_ms'] = 250000
+    tracks = [
+        {'name': 'Such Great Heights', 'track_number': 3, 'disc_number': 1,
+         'artists': [{'name': 'The Postal Service'}],
+         'duration_ms': 250000},
+        {'name': 'Such Great Heights', 'track_number': 7, 'disc_number': 2,
+         'artists': [{'name': 'The Shins'}],
+         'duration_ms': 250000},
+    ]
+    result = match_files_to_tracks(
+        files, file_tags, tracks,
+        target_album='Give Up Deluxe', similarity=_sim, quality_rank=_qrank,
+    )
+    assert len(result['matches']) == 1
+    m = result['matches'][0]
+    # The Shins cover (disc 2, track 7) must win over the Postal Service
+    # original (disc 1, track 3) — exact artist + position beats title-only.
+    assert m['track']['disc_number'] == 2
+    assert m['file'] == '/a/cover.flac'

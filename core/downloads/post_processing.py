@@ -17,13 +17,12 @@ needs ~9 callbacks/refs and direct injection beats hidden imports.
 
 from __future__ import annotations
 
-import logging
+from utils.logging_config import get_logger
 import os
 import shutil
 import time
 import traceback
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -36,7 +35,7 @@ from core.imports.context import (
     get_import_original_search,
     normalize_import_context,
 )
-from core.imports.filename import extract_track_number_from_filename, parse_filename_metadata
+from core.imports.filename import extract_track_number_from_filename
 from core.metadata import enrichment as metadata_enrichment
 from core.runtime_state import (
     download_tasks,
@@ -45,7 +44,7 @@ from core.runtime_state import (
     tasks_lock,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger("downloads.post_processing")
 
 
 _AUDIO_EXTENSIONS = {
@@ -69,54 +68,20 @@ def _reject_non_audio_found_file(found_file: Optional[str], file_location: Optio
 
 
 def _found_file_matches_expected(found_file: Optional[str],
-                                 expected_final_filename: Optional[str]) -> bool:
-    """True iff a file found in the TRANSFER folder is the file this task's
-    context describes — same name stem as the context-derived expected final
-    filename. Extension is ignored because ``expected_final_filename`` is
-    generated with a hardcoded ``.flac``.
-
-    jadux's wrong-metadata report: under heavy concurrency the finder (fuzzy
-    basename search) or the context lookup (fuzzy fallback) can pair THIS
-    task's context with ANOTHER track's already-imported file; writing tags
-    then stamps the wrong track's metadata into a correct file. The name the
-    tagging context itself predicts is the identity check: if the found file
-    isn't named what this context would have named it, it isn't ours to write.
-    """
-    if not found_file or not expected_final_filename:
+                                 expected_final_path: Optional[str]) -> bool:
+    """Only the import pipeline's recorded destination proves transfer identity."""
+    if not found_file or not expected_final_path:
         return False
-    found_stem = os.path.splitext(os.path.basename(found_file))[0]
-    expected_stem = os.path.splitext(expected_final_filename)[0]
-    return found_stem.casefold() == expected_stem.casefold()
-
-
-def _normalize_match_text(value: str) -> str:
-    return ''.join(ch.lower() for ch in str(value or '') if ch.isalnum())
+    return os.path.normcase(os.path.realpath(found_file)) == os.path.normcase(
+        os.path.realpath(expected_final_path)
+    )
 
 
 def _release_audio_match_score(path: str, expected_title: str, expected_artist: str) -> float:
-    parsed = parse_filename_metadata(path)
-    parsed_title = parsed.get('title') or Path(path).stem
-    parsed_artist = parsed.get('artist') or ''
-    expected_title_norm = _normalize_match_text(expected_title)
-    parsed_title_norm = _normalize_match_text(parsed_title)
-    if expected_title_norm and (
-        expected_title_norm in parsed_title_norm or parsed_title_norm in expected_title_norm
-    ):
-        title_score = 1.0
-    else:
-        title_score = SequenceMatcher(
-            None,
-            expected_title_norm,
-            parsed_title_norm,
-        ).ratio()
-    if expected_artist and parsed_artist:
-        artist_score = SequenceMatcher(
-            None,
-            _normalize_match_text(expected_artist),
-            _normalize_match_text(parsed_artist),
-        ).ratio()
-        return (title_score * 0.75) + (artist_score * 0.25)
-    return title_score
+    from core.downloads.release_import import read_release_file, release_match_score
+    return release_match_score(read_release_file(path), {
+        'name': expected_title, 'artists': [{'name': expected_artist}],
+    })
 
 
 def _track_title_from_task(track_info: Any, context: Optional[dict]) -> str:
@@ -160,13 +125,34 @@ class PostProcessDeps:
     run_async: Callable
     docker_resolve_path: Callable[[str], str]
     extract_filename: Callable[[str], str]
-    make_context_key: Callable[[str, str], str]
+    make_context_key: Callable[..., str]
     find_completed_file: Callable
     enhance_file_metadata: Callable
     wipe_source_tags: Callable[[str], bool]
     post_process_with_verification: Callable
     mark_task_completed: Callable[[str, Optional[dict]], None]
     on_download_completed: Callable[[str, str, bool], None]
+    process_release_file: Optional[Callable] = None
+
+
+def _get_task_context(make_context_key, username, filename, task_id):
+    """Resolve this task's post-processing context.
+
+    Writers store the context under the task-scoped key only when another
+    task already claimed the plain ``username::path`` key (see the collision
+    note in candidates.py); every other write still uses the legacy key.
+    Try the scoped key first, then fall back to the legacy key so legacy
+    contexts keep working unchanged. Returns (resolved_key, context) so the
+    caller deletes/logs the entry it actually read.
+    """
+    scoped_key = make_context_key(username, filename, task_id) if task_id else None
+    legacy_key = make_context_key(username, filename)
+    with matched_context_lock:
+        if scoped_key is not None:
+            context = matched_downloads_context.get(scoped_key)
+            if context is not None:
+                return scoped_key, context
+        return legacy_key, matched_downloads_context.get(legacy_key)
 
 
 def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDeps) -> None:
@@ -223,42 +209,31 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
         download_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads'))
         transfer_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.transfer_path', './Transfer'))
+        # an own-library profile's batch lands in that profile's folder (#1199);
+        # everyone else keeps the folder resolved above, untouched
+        try:
+            from core.imports.paths import import_profile_id, library_root_for_profile
+            transfer_dir = library_root_for_profile(import_profile_id({'batch_id': batch_id})) or transfer_dir
+        except Exception as _root_err:  # noqa: BLE001 - the shared folder is the fallback
+            logger.debug(f"[Post-Processing] per-profile root lookup failed: {_root_err}")
 
-        # Try to get context for generating the correct final filename
+        # The importer records the actual destination before moving a file.
+        # Guessing its name here ignores user templates and unknown numbering.
         task_basename = deps.extract_filename(task_filename)
-        context_key = deps.make_context_key(task_username, task_filename)
-        expected_final_filename = None
+        # Resolve this task's context: task-scoped key first (only written on
+        # a peer/path collision), then the legacy key.
+        context_key, context = _get_task_context(
+            deps.make_context_key, task_username, task_filename, task_id)
 
         logger.info(f"[Post-Processing] Looking up context with key: {context_key}")
 
         with matched_context_lock:
-            context = matched_downloads_context.get(context_key)
             # Debug: Show all available context keys
             available_keys = list(matched_downloads_context.keys())
             logger.info(f"[Post-Processing] Available context keys: {available_keys[:10]}...")  # Show first 10 keys
 
         if context:
             logger.info(f"[Post-Processing] Found context for key: {context_key}")
-            try:
-                original_search = context.get("original_search_result", {})
-                logger.info(f"[Post-Processing] original_search keys: {list(original_search.keys())}")
-
-                clean_title = get_import_clean_title(context, default=original_search.get('title', ''))
-                track_number = original_search.get('track_number')
-
-                logger.info(f"[Post-Processing] clean_title: '{clean_title}', track_number: {track_number}")
-
-                if clean_title and track_number:
-                    # Generate expected final filename that stream processor would create
-                    # Pattern: f"{track_number:02d} - {clean_title}.flac"
-                    sanitized_title = clean_title.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-                    expected_final_filename = f"{track_number:02d} - {sanitized_title}.flac"
-                    logger.info(f"[Post-Processing] Generated expected final filename: {expected_final_filename}")
-                else:
-                    logger.warning(f"[Post-Processing] Missing required data - clean_title: {bool(clean_title)}, track_number: {bool(track_number)}")
-            except Exception as e:
-                logger.error(f"[Post-Processing] Error generating expected filename: {e}")
-                traceback.print_exc()
         else:
             logger.warning(f"[Post-Processing] No context found for key: {context_key}")
             # Try fuzzy matching with similar keys containing the filename
@@ -268,6 +243,15 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
             with matched_context_lock:
                 similar_keys = [k for k in matched_downloads_context.keys()
                                 if k.startswith(f"{task_username}::") and task_basename in k]
+                if task_id:
+                    # A task-scoped key stamped with another task's id is never
+                    # this task's context — drop those before the ambiguity
+                    # check below, which would otherwise refuse a safe match.
+                    def _key_task_id(key):
+                        _ctx = matched_downloads_context.get(key)
+                        return _ctx.get('task_id') if isinstance(_ctx, dict) else None
+                    similar_keys = [k for k in similar_keys
+                                    if _key_task_id(k) in (None, task_id)]
             if len(similar_keys) > 1:
                 # jadux's wrong-metadata report: with 49 wishlist album batches
                 # in flight, guessing `similar_keys[0]` can hand this task ANOTHER
@@ -283,40 +267,26 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                 fuzzy_key = similar_keys[0]
                 context = matched_downloads_context.get(fuzzy_key)
                 logger.info(f"[Post-Processing] Found context using fuzzy key matching: {fuzzy_key}")
-
-                # Generate expected final filename using the found context
-                try:
-                    original_search = context.get("original_search_result", {})
-                    logger.info(f"[Post-Processing] fuzzy context original_search keys: {list(original_search.keys())}")
-
-                    clean_title = get_import_clean_title(context, default=original_search.get('title', ''))
-                    track_number = original_search.get('track_number')
-
-                    logger.info(f"[Post-Processing] fuzzy context clean_title: '{clean_title}', track_number: {track_number}")
-
-                    if clean_title and track_number:
-                        # Generate expected final filename that stream processor would create
-                        # Pattern: f"{track_number:02d} - {clean_title}.flac"
-                        sanitized_title = clean_title.replace('/', '_').replace('\\', '_').replace(':', '_').replace('*', '_').replace('?', '_').replace('"', '_').replace('<', '_').replace('>', '_').replace('|', '_')
-                        expected_final_filename = f"{track_number:02d} - {sanitized_title}.flac"
-                        logger.info(f"[Post-Processing] Generated expected final filename from fuzzy match: {expected_final_filename}")
-                    else:
-                        logger.warning(f"[Post-Processing] Missing required data from fuzzy match - clean_title: {bool(clean_title)}, track_number: {bool(track_number)}")
-                except Exception as e:
-                    logger.error(f"[Post-Processing] Error generating expected filename from fuzzy match: {e}")
-                    traceback.print_exc()
             else:
                 logger.warning(f"[Post-Processing] No similar keys found containing '{task_basename}'")
                 # Show a sample of what keys actually exist for debugging
                 sample_keys = list(matched_downloads_context.keys())[:5]
                 logger.info(f"[Post-Processing] Sample of existing keys: {sample_keys}")
 
+        # A routed artist's files belong in the audiobook folder, not the music library.
+        from core.audiobook_routing import routed_root_for_context
+        transfer_dir = routed_root_for_context(context) or transfer_dir
+
+        expected_final_path = (context or {}).get('_final_processed_path')
+
         # RESILIENT FILE-FINDING LOOP: Try up to 3 times with delays
         found_file = None
         file_location = None
+        release_album = None
 
         # CRITICAL FIX: For YouTube downloads, the filename in task is 'id||title' (metadata),
-        # but the actual file on disk is 'Title.mp3'. We must ask the client for the real path.
+        # but the actual file on disk is the remuxed/transcoded audio (e.g. Title.mp3).
+        # We must ask the client for the real path.
         # Torrent/usenet also use opaque "url||display" filenames. Their completed
         # job may contain a full release, so choose the best matching audio file
         # and copy it to transfer before importing instead of moving the client's
@@ -345,32 +315,27 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                         artist_ctx = get_import_context_artist(context)
                         expected_artist = artist_ctx.get('name', '') if isinstance(artist_ctx, dict) else ''
 
-                    scored_files = [
-                        (_release_audio_match_score(path, expected_title, expected_artist), path)
-                        for path in audio_files
-                        if _is_audio_file(path)
-                    ]
-                    scored_files.sort(reverse=True)
-                    if scored_files:
-                        best_score, best_path = scored_files[0]
-                        logger.info(
-                            "[Post-Processing] Best %s release file for '%s': %s (score %.2f)",
-                            task.get('username'), expected_title, best_path, best_score,
-                        )
-                        if best_score >= 0.80:
-                            copied_path = _copy_release_audio_to_transfer(best_path, transfer_dir)
-                            if copied_path:
-                                found_file = copied_path
-                                file_location = 'download'
-                                logger.info(
-                                    "[Post-Processing] Copied matched %s release file to transfer: %s",
-                                    task.get('username'), copied_path,
-                                )
-                        else:
-                            logger.warning(
-                                "[Post-Processing] No %s release file met match threshold for '%s' (best %.2f)",
-                                task.get('username'), expected_title, best_score,
-                            )
+                    from core.downloads.release_import import (
+                        profile_formats, read_release_file, select_requested_file,
+                    )
+                    from core.quality.selection import load_profile_by_id
+                    release_files = [read_release_file(deps.docker_resolve_path(path))
+                                     for path in audio_files if _is_audio_file(path)]
+                    expected_track = dict(track_info) if isinstance(track_info, dict) else {}
+                    expected_track['name'] = expected_title
+                    if not expected_track.get('artists'):
+                        expected_track['artists'] = [{'name': expected_artist}]
+                    selected = select_requested_file(
+                        release_files, expected_track,
+                        profile_formats(load_profile_by_id(expected_track.get('quality_profile_id'))))
+                    if selected:
+                        logger.info("[Post-Processing] Matched %s release file for %r: %s",
+                                    task.get('username'), expected_title, selected.path)
+                        copied_path = _copy_release_audio_to_transfer(selected.path, transfer_dir)
+                        if copied_path:
+                            found_file = copied_path
+                            file_location = 'download'
+                            release_album = (release_files, selected)
                     if not found_file:
                         with tasks_lock:
                             if task_id in download_tasks:
@@ -434,10 +399,10 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
 
             logger.warning(f"[Post-Processing] Attempt {retry_count + 1}/{_file_search_max_retries} to find file")
             logger.info(f"[Post-Processing] Original filename: {task_basename}")
-            if expected_final_filename:
-                logger.info(f"[Post-Processing] Expected final filename: {expected_final_filename}")
+            if expected_final_path:
+                logger.info(f"[Post-Processing] Recorded import destination: {expected_final_path}")
             else:
-                logger.warning("[Post-Processing] No expected final filename available")
+                logger.warning("[Post-Processing] No recorded import destination available")
 
             # Strategy 1: Try with original filename in both downloads and transfer
             logger.info("[Post-Processing] Strategy 1: Searching with original filename...")
@@ -449,21 +414,32 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
             else:
                 logger.error("[Post-Processing] Strategy 1 FAILED: Original filename not found in either location")
 
-            # Strategy 2: If not found and we have an expected final filename, try that in transfer folder
-            if not found_file and expected_final_filename:
-                logger.info("[Post-Processing] Strategy 2: Searching transfer folder with expected final filename...")
-                found_result = deps.find_completed_file(transfer_dir, expected_final_filename)
-                if found_result and found_result[0]:
-                    found_file, file_location = found_result[0], 'transfer'
-                    found_file, file_location = _reject_non_audio_found_file(found_file, file_location)
+            # Strategy 2: the exact destination the importer recorded. A
+            # transfer-folder hit from Strategy 1's fuzzy basename search only
+            # counts if it IS that file — under heavy concurrency the finder
+            # can pair this task with a neighbour's already-imported track.
+            if not found_file and expected_final_path:
+                logger.info("[Post-Processing] Strategy 2: Checking recorded import destination...")
+                if os.path.isfile(expected_final_path):
+                    found_file, file_location = _reject_non_audio_found_file(expected_final_path, 'transfer')
                     if found_file:
-                        logger.info(f"[Post-Processing] Strategy 2 SUCCESS: Found file with expected final filename: {found_file}")
+                        logger.info(f"[Post-Processing] Strategy 2 SUCCESS: Found recorded import: {found_file}")
                     else:
-                        logger.error("[Post-Processing] Strategy 2 FAILED: Expected final filename resolved to a non-audio file")
+                        logger.error("[Post-Processing] Strategy 2 FAILED: Recorded import is not an audio file")
                 else:
-                    logger.error("[Post-Processing] Strategy 2 FAILED: Expected final filename not found in transfer folder")
-            elif not expected_final_filename:
-                logger.warning("[Post-Processing] Strategy 2 SKIPPED: No expected final filename available")
+                    logger.error("[Post-Processing] Strategy 2 FAILED: Recorded import destination does not exist yet")
+            elif not found_file:
+                logger.warning("[Post-Processing] Strategy 2 SKIPPED: No recorded import destination available")
+
+            if (found_file and file_location == 'transfer'
+                    and not _found_file_matches_expected(found_file, expected_final_path)):
+                logger.warning(
+                    "[Post-Processing] Transfer file '%s' is not this task's recorded import '%s' "
+                    "— ignoring fuzzy match",
+                    found_file, expected_final_path,
+                )
+                found_file = None
+                file_location = None
 
             if found_file:
                 logger.warning(f"[Post-Processing] FILE FOUND after {retry_count + 1} attempts in {file_location}: {found_file}")
@@ -487,14 +463,14 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                     # slskd reported the transfer complete, but the finder never located
                     # the file under the configured download folder. Name the folder we
                     # searched and the two real causes — "still being written" (timing)
-                    # or "Commissary's download path doesn't match slskd's" (the classic
+                    # or "SoulSync's download path doesn't match slskd's" (the classic
                     # standalone config mismatch) — so the user can self-diagnose instead
                     # of getting an opaque "not found". (Discord: Shdjfgatdif.)
                     _searched_name = os.path.basename((task_filename or '').replace('\\', '/')) or task_filename
                     download_tasks[task_id]['error_message'] = (
                         f"slskd reported '{_searched_name}' downloaded, but it never appeared "
                         f"under the download folder ({download_dir}) after {_file_search_max_retries} "
-                        f"checks. Either it's still being written, or Commissary's download path "
+                        f"checks. Either it's still being written, or SoulSync's download path "
                         f"doesn't match slskd's download directory — they must point at the same folder."
                     )
             deps.on_download_completed(batch_id, task_id, False)
@@ -513,20 +489,7 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
             if not metadata_enhanced:
                 logger.warning("[Post-Processing] File in transfer folder missing metadata enhancement - completing now")
                 # Attempt to complete metadata enhancement using context
-                if context and expected_final_filename and \
-                        not _found_file_matches_expected(found_file, expected_final_filename):
-                    # jadux #wrong-metadata: the found transfer file is NOT the
-                    # file this context describes (fuzzy file finder / fuzzy
-                    # context under heavy concurrency). Writing here stamped
-                    # another track's metadata into a correctly-imported
-                    # neighbor. Never write to a transfer file whose name
-                    # doesn't match what this context would have named it.
-                    logger.warning(
-                        f"[Post-Processing] Transfer file '{os.path.basename(found_file)}' does not "
-                        f"match this task's expected '{expected_final_filename}' — refusing to write "
-                        f"tags to a file that isn't provably this track's"
-                    )
-                elif context and expected_final_filename:
+                if context and expected_final_path:
                     try:
                         context = normalize_import_context(context)
                         # Extract required data from context
@@ -573,6 +536,9 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
                                 'album_image_url': album_image_url,
                                 'confidence': 0.9,
                                 'source': 'verification_worker_corrected',
+                                'album_type': album_context.get('album_type') or context.get('album_type') or '',
+                                'record_type': album_context.get('record_type') or context.get('record_type') or '',
+                                'is_compilation': album_context.get('is_compilation') or context.get('is_compilation') or False,
                             }
 
                             # Apply album grouping for consistency with stream processor path.
@@ -633,6 +599,13 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
             with tasks_lock:
                 if task_id in download_tasks:
                     track_info = download_tasks[task_id].get('track_info')
+                    # #1289: this branch completes a task the stream processor
+                    # already imported, and it was the one success path that
+                    # never recorded where the file went. The wishlist removal
+                    # downstream now needs that path as proof, and without it a
+                    # genuinely published track would be kept on the wishlist
+                    # and downloaded twice.
+                    download_tasks[task_id].setdefault('final_file_path', found_file)
                     deps.mark_task_completed(task_id, track_info)
 
             # Clean up context now that both stream processor and verification worker are done
@@ -647,19 +620,37 @@ def run_post_processing_worker(task_id: str, batch_id: str, deps: PostProcessDep
         # File found in downloads folder - attempt post-processing
         try:
             # Rebuild the context key using the same function that stored it
-            context_key = deps.make_context_key(task_username, task_filename)
-
-            # Check if this download has matched context for post-processing
-            with matched_context_lock:
-                context = matched_downloads_context.get(context_key)
+            # (task-scoped key first, then the legacy key).
+            context_key, context = _get_task_context(
+                deps.make_context_key, task_username, task_filename, task_id)
 
             if context:
                 logger.info(f"[Post-Processing] Found matched context, running full post-processing for: {context_key}")
+                if release_album:
+                    context.pop('_pipeline_import_succeeded', None)  # this attempt's outcome only
                 # Run the existing post-processing logic with verification
                 deps.post_process_with_verification(context_key, context, found_file, task_id, batch_id)
+                if release_album and context.get('_pipeline_import_succeeded') and deps.process_release_file:
+                    # The requested track is done and its task completed. The
+                    # profile may also want the album's other tracks from it.
+                    from core.downloads.release_import import import_album_tracks
+                    try:
+                        import_album_tracks(context_key, context, *release_album, transfer_dir,
+                                            deps.process_release_file, _copy_release_audio_to_transfer)
+                    except Exception as album_error:  # the completed request must stay completed
+                        logger.error(f"[Post-Processing] Album tracks import failed: {album_error}")
             else:
                 # No matched context - just mark as completed since file exists
-                logger.warning(f"[Post-Processing] No matched context, marking as completed: {os.path.basename(found_file)}")
+                #
+                # #1289: "the file exists" here means it exists in the DOWNLOADS
+                # folder. Nothing imported it: it is untagged, unrenamed, and in
+                # a directory no media server scans. Reporting success is still
+                # right for the task — the transfer did finish — but it is not a
+                # satisfied wishlist request, so no final_file_path is recorded
+                # and the removal guard keeps the track retryable.
+                logger.warning(f"[Post-Processing] No matched context, marking as completed "
+                               f"WITHOUT import (file stays in the downloads folder): "
+                               f"{os.path.basename(found_file)}")
                 with tasks_lock:
                     if task_id in download_tasks:
                         track_info = download_tasks[task_id].get('track_info')

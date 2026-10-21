@@ -177,19 +177,14 @@ function visibleSourceOrder(enabledExperimental = new Set()) {
     );
 }
 
-// Fetch /api/search/source-status and return a map { src -> bool }
+// Fetch /api/settings/config-status and return a map { src -> bool }
 // covering every visible source. Sources not present in the backend
 // registry (musicbrainz / youtube_videos / soulseek) are reported as
 // configured so the picker doesn't dim always-available sources.
 async function fetchSourceConfiguredMap(enabledExperimental = new Set()) {
     const map = {};
     try {
-        // NOT /api/settings/config-status — that one is admin-only, so for a
-        // standard or Plex profile it 403s and we fall through to the permissive
-        // default below, marking every source configured and hiding nothing.
-        // This endpoint carries the same booleans for the picker's own sources
-        // and is readable by any signed-in profile.
-        const resp = await fetch('/api/search/source-status');
+        const resp = await fetch('/api/settings/config-status');
         if (resp.ok) {
             const data = await resp.json();
             // /status and config-status share the _experimental shape; trust the
@@ -295,26 +290,7 @@ function createSearchController({
 
     function renderSourceRow() {
         if (!sourceRowElement) return;
-        const fullOrder = visibleSourceOrder(state.enabledExperimental);
-        // Show only connections that are actually set up. An unconfigured source
-        // can't answer a search — it used to render greyed out with a "set up in
-        // Settings" tooltip, which is a row of buttons that don't work.
-        //
-        // Two rails, because an empty picker is worse than a greyed-out one:
-        //   • the ACTIVE source always stays visible, so the current selection
-        //     can never become invisible;
-        //   • if nothing is configured, fall back to the full row — that's the
-        //     one case where the "set up in Settings" tooltips are the point.
-        // fetchSourceConfiguredMap already fails permissive (everything true) if
-        // /api/settings/config-status errors, so a blip can't empty the row.
-        // The "is anything set up?" question is asked BEFORE the active-source
-        // rail is applied — that rail always keeps one entry, so testing the
-        // combined list for emptiness would make the fallback unreachable.
-        const anyConfigured = fullOrder.some(src => state.configuredSources[src] !== false);
-        const order = anyConfigured
-            ? fullOrder.filter(src =>
-                state.configuredSources[src] !== false || src === state.activeSource)
-            : fullOrder;
+        const order = visibleSourceOrder(state.enabledExperimental);
         sourceRowElement.innerHTML = order.map(src => {
             const info = SOURCE_LABELS[src];
             if (!info) return '';
@@ -743,22 +719,6 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                </div>`
             : '';
 
-        // Opt-in "search every source" action. Only rendered when the caller
-        // supplies onSources, so the other consumers of this helper
-        // (artist-detail, library) are untouched.
-        const sourcesHtml = config.onSources
-            ? `<button class="enh-item-sources-btn"
-                       title="Search every configured source and pick which copy to download">🔍</button>`
-            : '';
-
-        // The unattended cascade — grab from the first source in the chain that
-        // has it, no prompting. Secondary now: clicking the card opens the
-        // picker, so this is for when you deliberately don't want to choose.
-        const autoHtml = config.onAuto
-            ? `<button class="enh-item-auto-btn"
-                       title="Download automatically from the first source that has it">Auto</button>`
-            : '';
-
         elem.innerHTML = `
             ${imageHtml}
             <div class="enh-item-info">
@@ -766,8 +726,6 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                 <div class="enh-item-meta">${escapeHtml(config.meta)}</div>
             </div>
             ${durationHtml}
-            ${autoHtml}
-            ${sourcesHtml}
             ${badgeHtml}
         `;
 
@@ -782,26 +740,6 @@ function renderCompactSection(sectionId, listId, countId, items, mapItem) {
                 playBtn.addEventListener('click', (e) => {
                     e.stopPropagation(); // Don't trigger main onClick
                     config.onPlay();
-                });
-            }
-        }
-
-        if (config.onSources) {
-            const srcBtn = elem.querySelector('.enh-item-sources-btn');
-            if (srcBtn) {
-                srcBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();   // don't also fire the card's own action
-                    config.onSources(srcBtn);
-                });
-            }
-        }
-
-        if (config.onAuto) {
-            const autoBtn = elem.querySelector('.enh-item-auto-btn');
-            if (autoBtn) {
-                autoBtn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    config.onAuto(autoBtn);
                 });
             }
         }
@@ -1050,7 +988,7 @@ function getCompletionStatusText(completionData) {
         case 'missing':
             return 'Missing';
         case 'downloading':
-            return 'Downloading…';
+            return 'Downloading...';
         case 'downloaded':
             return 'Downloaded';
         case 'error':
@@ -1136,19 +1074,34 @@ function playlistDetailsOrganizeCheckboxId(playlistRef) {
     return `playlist-organize-${playlistRef}`;
 }
 
-/** Infer mirrored-playlist API source from a UI playlist / virtual id. */
+/**
+ * The provider a UI playlist / virtual id demonstrably belongs to, or null.
+ *
+ * Only prefixes we actually recognise produce an answer. Everything else —
+ * youtube_*, tidal_*, beatport_*, artist_album_*, library_* … — is genuinely
+ * unknown from the ref alone.
+ */
+function knownPlaylistSourceForRef(playlistRef) {
+    const ref = String(playlistRef || '');
+    if (ref.startsWith('spotify_public_')) return 'spotify_public';
+    if (ref.startsWith('deezer_arl_')) return 'deezer';
+    return null;
+}
+
+/**
+ * Infer mirrored-playlist API source from a UI playlist / virtual id.
+ *
+ * Falls back to 'spotify' because the organize-preference endpoints have always
+ * required a source and treat it as a lookup key. Do NOT use this for the
+ * mirror-resolution `source` hint — there the fabricated 'spotify' is taken as
+ * decisive and can pick the wrong mirror (R2-14); use
+ * `knownPlaylistSourceForRef` instead.
+ */
 function playlistOrganizeSourceForRef(playlistRef, explicitSource = null) {
     if (explicitSource) {
         return explicitSource;
     }
-    const ref = String(playlistRef || '');
-    if (ref.startsWith('spotify_public_')) {
-        return 'spotify_public';
-    }
-    if (ref.startsWith('deezer_arl_')) {
-        return 'deezer';
-    }
-    return 'spotify';
+    return knownPlaylistSourceForRef(playlistRef) || 'spotify';
 }
 
 /** Map UI playlist ids (e.g. deezer_arl_123) to mirrored-playlist resolve refs. */
@@ -1163,6 +1116,188 @@ function normalizePlaylistOrganizeRef(playlistRef, source = 'spotify') {
     return ref;
 }
 
+let _playlistQualityProfilesPromise = null;
+
+/**
+ * Drop the cached profile list so the next selector re-fetches it.
+ *
+ * Must be called whenever a Quality Profile is created, renamed or deleted.
+ * The cache used to live for the whole page, so after a change in Settings
+ * every dropdown kept offering the old list: a deleted id was posted back and
+ * rejected with 400, and a new profile stayed unusable until a full reload
+ * (R2-11).
+ */
+function invalidatePlaylistQualityProfiles() {
+    _playlistQualityProfilesPromise = null;
+}
+
+async function fetchPlaylistQualityProfiles() {
+    if (!_playlistQualityProfilesPromise) {
+        _playlistQualityProfilesPromise = fetch('/api/quality-profile/custom')
+            .then(res => {
+                if (!res.ok) throw new Error(`Quality profiles: ${res.status}`);
+                return res.json();
+            })
+            .then(data => Array.isArray(data) ? data : (data.profiles || []))
+            .catch(err => {
+                _playlistQualityProfilesPromise = null;
+                throw err;
+            });
+    }
+    return _playlistQualityProfilesPromise;
+}
+
+function playlistQualityProfileSelectHtml(playlistRef, source = 'spotify', compact = false) {
+    const ref = escapeHtml(String(playlistRef || ''));
+    const src = escapeHtml(String(source || 'spotify'));
+    return `
+        <label class="playlist-quality-profile-control ${compact ? 'compact' : ''}" onclick="event.stopPropagation();">
+            <span>Quality Profile</span>
+            <select class="playlist-quality-profile-select" data-playlist-ref="${ref}" data-playlist-source="${src}"
+                onchange="onPlaylistQualityProfileChange(this)">
+                <option value="">Loading…</option>
+            </select>
+        </label>`;
+}
+
+// ── Shared acquisition Quality Profile selector ──────────────────────────────
+//
+// Audit P1-01: the persisted selector above only exists on playlist/mirror
+// surfaces. Every OTHER manual acquisition path — Search, Discover, Library,
+// album, single, top tracks, discography, playlist explorer — had no way to
+// choose a profile, so all of them silently used the global default and the
+// same track got different rules depending on where you clicked.
+//
+// This selector is deliberately NOT persisted: it is the intent for ONE action.
+// It preselects the mirror/watchlist assignment when the surface has one, and
+// the default profile otherwise. The chosen id rides along in the request as
+// `quality_profile_id` and outranks the server-side mirror lookup for that
+// action only.
+
+const ACQUISITION_QUALITY_PROFILE_SELECT_ID = 'acquisition-quality-profile-select';
+
+function acquisitionQualityProfileSelectHtml(selectId = ACQUISITION_QUALITY_PROFILE_SELECT_ID) {
+    const id = escapeHtml(String(selectId));
+    return `
+        <label class="acquisition-quality-profile-control" for="${id}"
+               title="Which Quality Profile this download / wishlist entry must satisfy">
+            <span>Quality Profile</span>
+            <select id="${id}" class="acquisition-quality-profile-select" disabled>
+                <option value="">Loading…</option>
+            </select>
+        </label>`;
+}
+
+// Per-select hydration generation. Two hydrations can be in flight for the SAME
+// select — the modal fires one on open (with a real mirror round-trip) and a
+// caller can immediately request a preselect (no round-trip, so it settles
+// first). Without this guard the slower, older call's continuation ran last and
+// overwrote the user's choice with the mirror/default (R2-05).
+const _acquisitionQualityProfileGeneration = new Map();
+
+/**
+ * Fill an acquisition selector and preselect the effective profile.
+ *
+ * P2-05: a value the server never accepted must never look active. On any
+ * failure the control is disabled and says so, rather than sitting there
+ * showing whatever option happened to be first.
+ */
+async function hydrateAcquisitionQualityProfileSelect(
+    selectId = ACQUISITION_QUALITY_PROFILE_SELECT_ID,
+    { playlistRef = null, source = null, preselectId = null } = {},
+) {
+    const select = document.getElementById(selectId);
+    if (!select) return;
+    const generation = (_acquisitionQualityProfileGeneration.get(selectId) || 0) + 1;
+    _acquisitionQualityProfileGeneration.set(selectId, generation);
+    const isStale = () => _acquisitionQualityProfileGeneration.get(selectId) !== generation;
+    try {
+        // Only a provider we actually recognise may be handed to the mirror
+        // lookup; a guess makes the server pick the wrong mirror (R2-14).
+        const resolvedSource = playlistRef
+            ? (source || knownPlaylistSourceForRef(playlistRef))
+            : null;
+        const [profiles, mirror] = await Promise.all([
+            fetchPlaylistQualityProfiles(),
+            (preselectId == null && playlistRef)
+                ? fetchMirroredPlaylistPreference(playlistRef, resolvedSource)
+                : Promise.resolve(null),
+        ]);
+        if (isStale()) return;
+        if (!profiles.length) {
+            select.innerHTML = '<option value="">No Quality Profiles configured</option>';
+            select.disabled = true;
+            return;
+        }
+        select.innerHTML = profiles.map(profile =>
+            `<option value="${profile.id}">${escapeHtml(profile.name || `Profile ${profile.id}`)}${profile.is_default ? ' (Default)' : ''}</option>`
+        ).join('');
+
+        // Mirror/watchlist assignment wins over the plain default — but only if
+        // that profile still exists; a deleted one must not silently resolve to
+        // "whatever is first in the list".
+        const wanted = preselectId ?? mirror?.quality_profile_id;
+        const available = profiles.some(profile => String(profile.id) === String(wanted));
+        if (wanted != null && available) {
+            select.value = String(wanted);
+        } else {
+            const fallback = profiles.find(profile => profile.is_default) || profiles[0];
+            select.value = String(fallback.id);
+        }
+        select.disabled = false;
+    } catch (err) {
+        if (isStale()) return;
+        console.warn('Could not load Quality Profiles for this dialog:', err);
+        select.innerHTML = '<option value="">Quality Profiles unavailable — using default</option>';
+        select.disabled = true;
+    }
+}
+
+/**
+ * The chosen profile id, or null when the user has no usable choice.
+ *
+ * null means "server decides" (mirror assignment, then global default), which
+ * is exactly the pre-P1-01 behaviour — so an unavailable selector degrades to
+ * the old contract instead of sending a bogus id.
+ */
+function getAcquisitionQualityProfileId(selectId = ACQUISITION_QUALITY_PROFILE_SELECT_ID) {
+    const select = document.getElementById(selectId);
+    if (!select || select.disabled) return null;
+    const value = parseInt(select.value, 10);
+    return Number.isInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * Per-download-modal selector markup. Each modal owns its own control keyed by
+ * the (virtual) playlist id, so several open modals cannot fight over one id.
+ */
+function downloadModalQualityProfileSelectId(playlistId) {
+    return `download-quality-profile-${playlistId}`;
+}
+
+function downloadModalQualityProfileSelectHtml(playlistId) {
+    return acquisitionQualityProfileSelectHtml(downloadModalQualityProfileSelectId(playlistId));
+}
+
+function hydrateDownloadModalQualityProfileSelect(playlistId, options = {}) {
+    return hydrateAcquisitionQualityProfileSelect(
+        downloadModalQualityProfileSelectId(playlistId),
+        { playlistRef: playlistId, ...options },
+    );
+}
+
+/** Preselect a profile the user already chose upstream (e.g. in the wishlist modal). */
+function setDownloadModalQualityProfile(playlistId, qualityProfileId) {
+    return hydrateDownloadModalQualityProfileSelect(playlistId, {
+        preselectId: qualityProfileId,
+    });
+}
+
+/** The profile chosen for this download modal, or null for "server decides". */
+function getDownloadModalQualityProfileId(playlistId) {
+    return getAcquisitionQualityProfileId(downloadModalQualityProfileSelectId(playlistId));
+}
+
 function downloadMissingModalOrganizeCheckboxHtml(playlistId) {
     const safeId = String(playlistId).replace(/'/g, "\\'");
     return `
@@ -1170,7 +1305,8 @@ function downloadMissingModalOrganizeCheckboxHtml(playlistId) {
             <input type="checkbox" id="playlist-folder-mode-${playlistId}" class="playlist-folder-mode-sync"
                 onchange="onPlaylistOrganizePreferenceChange('${safeId}', this.checked, playlistOrganizeSourceForRef('${safeId}'))">
             <span>Organize by Playlist (Downloads/Playlist/Artist - Track.ext)</span>
-        </label>`;
+        </label>
+        ${playlistQualityProfileSelectHtml(playlistId, playlistOrganizeSourceForRef(playlistId))}`;
 }
 
 function playlistOrganizeToggleHtml(playlistRef, source = 'spotify') {
@@ -1182,6 +1318,7 @@ function playlistOrganizeToggleHtml(playlistRef, source = 'spotify') {
                 onchange="onPlaylistOrganizePreferenceChange('${safeRef}', this.checked, '${safeSource}')">
             <span>Organize by playlist</span>
         </label>
+        ${playlistQualityProfileSelectHtml(playlistRef, source)}
     `;
 }
 
@@ -1199,7 +1336,7 @@ function isPlaylistOrganizeEnabled(playlistRef) {
     return downloadMissingCb ? downloadMissingCb.checked : false;
 }
 
-async function fetchMirroredOrganizePreference(playlistRef, source = null) {
+async function fetchMirroredPlaylistPreference(playlistRef, source = null) {
     try {
         const resolvedSource = playlistOrganizeSourceForRef(playlistRef, source);
         const resolveRef = normalizePlaylistOrganizeRef(playlistRef, resolvedSource);
@@ -1207,10 +1344,135 @@ async function fetchMirroredOrganizePreference(playlistRef, source = null) {
             `/api/mirrored-playlists/resolve?ref=${encodeURIComponent(resolveRef)}&source=${encodeURIComponent(resolvedSource)}`
         );
         const data = await res.json();
-        return !!(data.found && data.playlist?.organize_by_playlist);
+        return data.found ? data.playlist : null;
     } catch (err) {
-        console.debug('Could not load organize-by-playlist preference:', err);
-        return false;
+        console.debug('Could not load mirrored-playlist preference:', err);
+        return null;
+    }
+}
+
+async function fetchMirroredOrganizePreference(playlistRef, source = null) {
+    const playlist = await fetchMirroredPlaylistPreference(playlistRef, source);
+    return !!playlist?.organize_by_playlist;
+}
+
+/** Put a persisted selector into an explicit, visibly inert unavailable state. */
+function markPlaylistQualityProfileSelectUnavailable(select, message) {
+    select.innerHTML = `<option value="">${escapeHtml(message)}</option>`;
+    select.disabled = true;
+    select.dataset.effectiveProfileId = '';
+    select.title = message;
+}
+
+/**
+ * Fill the PERSISTED (mirror-owned) selectors for one playlist.
+ *
+ * P2-05: this control writes to the server, so it must never display a value the
+ * server does not hold. Three states are now explicit instead of silently
+ * showing option zero:
+ *
+ *  - no mirror row yet  -> disabled, "Mirror playlist first" (nothing to save to)
+ *  - load failed        -> disabled, "unavailable"
+ *  - profile deleted    -> reconciled to the real default rather than list order
+ *
+ * The last value the server confirmed is remembered in
+ * ``dataset.effectiveProfileId`` so a failed save can roll back to it.
+ */
+async function hydratePlaylistQualityProfileSelects(
+    playlistRef,
+    source = null,
+    knownQualityProfileId = null,
+) {
+    const resolvedSource = playlistOrganizeSourceForRef(playlistRef, source);
+    const matching = [...document.querySelectorAll('.playlist-quality-profile-select')].filter(
+        select => String(select.dataset.playlistRef) === String(playlistRef)
+            && String(select.dataset.playlistSource) === String(resolvedSource)
+    );
+    if (!matching.length) return;
+    try {
+        // A caller that already has the mirror's quality_profile_id read it off a
+        // mirror row, so the mirror provably exists — don't spend one resolve
+        // request per card just to re-learn that (the Auto-Sync board renders
+        // dozens at once).
+        const mirrorKnown = knownQualityProfileId != null;
+        const [profiles, playlist] = await Promise.all([
+            fetchPlaylistQualityProfiles(),
+            mirrorKnown
+                ? Promise.resolve({ id: true, quality_profile_id: knownQualityProfileId })
+                : fetchMirroredPlaylistPreference(playlistRef, resolvedSource),
+        ]);
+        if (!profiles.length) {
+            matching.forEach(select =>
+                markPlaylistQualityProfileSelectUnavailable(select, 'No Quality Profiles configured'));
+            return;
+        }
+        if (!playlist?.id) {
+            // Nothing to persist to yet — showing a selected profile here would
+            // be a lie, because changing it cannot be saved.
+            matching.forEach(select =>
+                markPlaylistQualityProfileSelectUnavailable(select, 'Mirror playlist first'));
+            return;
+        }
+
+        const wanted = knownQualityProfileId ?? playlist.quality_profile_id;
+        const available = profiles.some(profile => String(profile.id) === String(wanted));
+        // A profile deleted between two renders must resolve to the default the
+        // server will actually use, not to whichever option sorts first.
+        const effective = available
+            ? wanted
+            : (profiles.find(profile => profile.is_default) || profiles[0]).id;
+
+        matching.forEach(select => {
+            select.innerHTML = profiles.map(profile =>
+                `<option value="${profile.id}">${escapeHtml(profile.name || `Profile ${profile.id}`)}${profile.is_default ? ' (Default)' : ''}</option>`
+            ).join('');
+            select.value = String(effective);
+            select.dataset.effectiveProfileId = String(effective);
+            select.disabled = false;
+            select.title = '';
+        });
+    } catch (err) {
+        console.warn('Could not load playlist Quality Profiles:', err);
+        matching.forEach(select =>
+            markPlaylistQualityProfileSelectUnavailable(select, 'Quality Profiles unavailable'));
+    }
+}
+
+async function onPlaylistQualityProfileChange(select) {
+    const playlistRef = select.dataset.playlistRef;
+    const source = select.dataset.playlistSource || 'spotify';
+    const previous = select.dataset.effectiveProfileId || '';
+    const qualityProfileId = parseInt(select.value, 10);
+    if (!Number.isInteger(qualityProfileId)) return;
+    select.disabled = true;
+    try {
+        const playlist = await fetchMirroredPlaylistPreference(playlistRef, source);
+        if (!playlist?.id) {
+            // Roll the DOM back: an unsaved selection must not keep looking active.
+            showToast('Mirror this playlist before assigning a Quality Profile', 'warning');
+            if (previous) select.value = previous;
+            await hydratePlaylistQualityProfileSelects(playlistRef, source);
+            return;
+        }
+        const response = await fetch(`/api/mirrored-playlists/${playlist.id}/preferences`, {
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ quality_profile_id: qualityProfileId }),
+        });
+        const data = await response.json();
+        if (!response.ok || data.error) throw new Error(data.error || 'Could not save Quality Profile');
+        // Re-read from the response so the displayed value is the SERVER's, not
+        // ours — e.g. if it was clamped or the row moved meanwhile.
+        await hydratePlaylistQualityProfileSelects(
+            playlistRef, source, data.playlist?.quality_profile_id ?? qualityProfileId,
+        );
+        showToast('Playlist Quality Profile saved', 'success');
+    } catch (err) {
+        showToast(`Could not save Quality Profile: ${err.message}`, 'error');
+        if (previous) select.value = previous;
+        await hydratePlaylistQualityProfileSelects(playlistRef, source);
+    } finally {
+        select.disabled = false;
     }
 }
 
@@ -1246,6 +1508,7 @@ async function loadPlaylistOrganizePreferenceIntoModal(playlistRef, source = nul
     const resolvedSource = playlistOrganizeSourceForRef(playlistRef, source);
     const enabled = await fetchMirroredOrganizePreference(playlistRef, resolvedSource);
     syncPlaylistOrganizeCheckboxes(playlistRef, enabled);
+    await hydratePlaylistQualityProfileSelects(playlistRef, resolvedSource);
 }
 
 async function onPlaylistOrganizePreferenceChange(playlistRef, enabled, source = 'spotify') {
@@ -1414,7 +1677,7 @@ async function fetchAndCacheDeezerArlPlaylistTracks(arlPlaylistId, deezerPlaylis
 
 /**
  * Footer actions for Spotify/Deezer playlist details modals.
- * Standalone Commissary has no media-server playlist sync — show Mirrored + re-analysis instead.
+ * Standalone SoulSync has no media-server playlist sync — show Mirrored + re-analysis instead.
  */
 function playlistModalDownloadSyncFooterHtml(playlistId, options = {}) {
     const {
@@ -1444,7 +1707,7 @@ function playlistModalDownloadSyncFooterHtml(playlistId, options = {}) {
             <option value="reconcile">Reconcile (keep image/desc)</option>
             <option value="append">Append only</option>
         </select>
-        <button id="sync-btn-${playlistId}" class="playlist-modal-btn playlist-modal-btn-primary" onclick="startPlaylistSync('${playlistId}')" ${isSyncing ? 'disabled' : ''}>${isSyncing ? '⏳ Syncing…' : 'Sync Playlist'}</button>`;
+        <button id="sync-btn-${playlistId}" class="playlist-modal-btn playlist-modal-btn-primary" onclick="startPlaylistSync('${playlistId}')" ${isSyncing ? 'disabled' : ''}>${isSyncing ? '⏳ Syncing...' : 'Sync Playlist'}</button>`;
 }
 
 async function restartPlaylistDownloadMissing(playlistId) {
@@ -1497,9 +1760,22 @@ async function navigateToMirroredPlaylist(playlistRef, source = 'spotify') {
     }
 }
 
+/** a download process whose run is over: its modal is results, not work */
+function _isFinishedDownloadProcess(process) {
+    return Boolean(process) && (process.status === 'complete' || process.status === 'cancelled');
+}
+
 async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlistName, spotifyTracks, album, artist, showLoadingOverlayParam = true, contextType = 'artist_album') {
     if (showLoadingOverlayParam) {
-        showLoadingOverlay('Loading album…');
+        showLoadingOverlay('Loading album...');
+    }
+    // a finished run for this album: opening the album again is a new check,
+    // not a replay of the old one. the reporter downloaded one song, closed
+    // the modal while it ran, came back for another and got the previous
+    // run until a browser refresh (#1386). the old results stay reachable
+    // from the download bubble right up to here
+    if (_isFinishedDownloadProcess(activeDownloadProcesses[virtualPlaylistId])) {
+        await closeDownloadMissingModal(virtualPlaylistId);
     }
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
@@ -1631,7 +1907,7 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                                                    onchange="updateTrackSelectionCount('${virtualPlaylistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${renderModalTrackPlaylistButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${virtualPlaylistId}-${index}">🔍 Pending</td>
@@ -1662,30 +1938,19 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                             <span>Organize by Playlist (Downloads/Playlist/Artist - Track.ext)</span>
                         </label>
                         ` : ''}
+                        ${downloadModalQualityProfileSelectHtml(virtualPlaylistId)}
                     </div>
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
+                    ${/* Commissary: choose the album's release (commissary-release-picker.js) */
+                      typeof window.commissaryChooseReleaseButton === 'function' ? window.commissaryChooseReleaseButton(virtualPlaylistId) : ''}
                     ${_isBeatportPlaylistId(virtualPlaylistId) ? `
                     <button class="download-control-btn sync-to-server-btn" id="sync-server-btn-${virtualPlaylistId}" onclick="syncPlaylistToServer('${virtualPlaylistId}')" ${_isSoulsyncStandalone ? 'style="display:none"' : ''}>
                         Sync to Server
                     </button>` : ''}
-                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
-                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
-                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
-                            style="background-color: #0ea5e9; color: white;">
-                        🔎 Manual Search
-                    </button>
-                    ${(typeof window.isAlbumContextPlaylistId === 'function'
-                       && window.isAlbumContextPlaylistId(virtualPlaylistId)) ? `
-                    <button class="download-control-btn" id="album-release-btn-${virtualPlaylistId}"
-                            onclick="openAlbumReleasePickerForModal('${virtualPlaylistId}')"
-                            title="Pick a release of the WHOLE album — every source that indexes complete albums is searched, and the one you choose is downloaded as a set instead of track by track."
-                            style="background-color: #14b8a6; color: white;">
-                        💿 Choose Release
-                    </button>` : ''}
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
-                        Add to Wishlist
+                        ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
                         Cancel All
@@ -1704,7 +1969,7 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                     <div class="modal-sync-progress-bar-fill" id="modal-sync-bar-${virtualPlaylistId}"></div>
                 </div>
                 <div class="modal-sync-progress-info">
-                    <span class="modal-sync-step" id="modal-sync-step-${virtualPlaylistId}">Starting sync…</span>
+                    <span class="modal-sync-step" id="modal-sync-step-${virtualPlaylistId}">Starting sync...</span>
                     <div class="modal-sync-stats">
                         <span class="matched" id="modal-sync-matched-${virtualPlaylistId}">0 matched</span>
                         <span class="failed" id="modal-sync-failed-${virtualPlaylistId}">0 failed</span>
@@ -1716,8 +1981,15 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
     `;
 
     applyProgressiveTrackRendering(virtualPlaylistId, spotifyTracks.length);
+    // Fill the Quality Profile selector once the markup is in the DOM. Preselects
+    // the mirror's persisted assignment for a playlist, the default otherwise
+    // (P1-01); on failure it renders disabled rather than showing a value the
+    // server never accepted (P2-05).
+    void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
     modal.style.display = 'flex';
     hideLoadingOverlay();
+    // owned/missing per track straight away, not after Begin Analysis
+    if (typeof previewModalOwnership === 'function') void previewModalOwnership(virtualPlaylistId);
 
     console.log(`✅ Successfully opened download missing tracks modal for: ${playlistName}`);
 }
@@ -2375,7 +2647,7 @@ async function reopenDownloadModal(virtualPlaylistId) {
         console.log(`📥 [REOPEN] Recreating album modal for: ${item.name}`);
 
         // Fetch album tracks (pass name/artist for Hydrabase support)
-        showLoadingOverlay(`Loading ${item.name}…`);
+        showLoadingOverlay(`Loading ${item.name}...`);
 
         try {
             const _sap2 = new URLSearchParams({ name: item.name || '', artist: item.artist || '' });
@@ -2725,9 +2997,15 @@ function showLibraryDownloadsSection() {
     // that class and its copy comes FIRST in the DOM, so the old global query
     // grabbed the wrong container and insertBefore threw ("not a child of
     // this node") — killing the whole Library page init (#1038).
-    const artistGrid = document.getElementById('library-artists-grid');
-    if (!artistGrid || !artistGrid.parentElement) return;
-    const libraryContent = artistGrid.parentElement;
+    // The React library page renders a dedicated host with NO React children,
+    // so this section can own that subtree outright and React never reconciles
+    // it away. That host is the normal path now that the vanilla music page is
+    // gone; the anchor-on-the-grid path below still resolves (React renders
+    // #library-artists-grid too) and stays as the backstop.
+    const reactHost = document.querySelector('[data-library-downloads-host]');
+    const artistGrid = reactHost ? null : document.getElementById('library-artists-grid');
+    if (!reactHost && (!artistGrid || !artistGrid.parentElement)) return;
+    const libraryContent = reactHost || artistGrid.parentElement;
 
     let downloadsSection = document.getElementById('library-downloads-section');
 
@@ -2737,6 +3015,13 @@ function showLibraryDownloadsSection() {
         downloadsSection.id = 'library-downloads-section';
         downloadsSection.className = 'artist-downloads-section';
         downloadsSection.style.display = 'none';   // revealed below only when bubbles exist
+        // insertBefore(node, null) === appendChild, which is what the React
+        // host wants; the vanilla path still lands ahead of the grid.
+        libraryContent.insertBefore(downloadsSection, artistGrid);
+    } else if (downloadsSection.parentElement !== libraryContent) {
+        // The page was re-rendered under it (React remount, or a nav back to
+        // the vanilla page). Re-home it rather than leaving it orphaned in a
+        // detached tree where the user can never see it.
         libraryContent.insertBefore(downloadsSection, artistGrid);
     }
 
@@ -3693,7 +3978,16 @@ function applyDynamicGlow(cardElement, colors) {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML;
+    // textContent/innerHTML escapes & < > but NOT a double quote, because a
+    // text node does not need one. Almost every caller interpolates the
+    // result into a double-quoted ATTRIBUTE, where a raw quote closes the
+    // attribute early: a track called 'Crazy (12" mix)' reached MusicBrainz
+    // as 'Crazy (12' with everything after it dropped (#1230).
+    //
+    // Safe in both places: the output is always inserted via innerHTML, so
+    // &quot; renders as a plain quote in text and parses correctly in an
+    // attribute.
+    return div.innerHTML.replace(/"/g, '&quot;');
 }
 
 // --- Service Status and System Stats Functions ---
@@ -3748,6 +4042,13 @@ async function fetchAndUpdateServiceStatus() {
         // Cache for library status card
         _lastStatusPayload = data;
 
+        // Re-broadcast for the React dashboard (tools-seam rule: in the
+        // handler). The socket twin (handleServiceStatusUpdate) dispatches the
+        // same event; exactly one of the two runs at a time — this poller
+        // early-returns while the socket is connected — so React never sees
+        // duplicate frames.
+        window.dispatchEvent(new CustomEvent('ss:service-status', { detail: data }));
+
         if (typeof syncSpotifySettingsAuthState === 'function') {
             syncSpotifySettingsAuthState(data?.spotify || null);
         }
@@ -3758,10 +4059,9 @@ async function fetchAndUpdateServiceStatus() {
             sanitizeMetadataSourceSelection({ quiet: true });
         }
 
-        // Update service status indicators and text (dashboard)
-        updateServiceStatus('metadata-source', data.metadata_source, data.spotify);
-        updateServiceStatus('media-server', data.media_server);
-        updateServiceStatus('soulseek', data.soulseek);
+        // The dashboard service cards are React-rendered from the dispatch
+        // above since the flip (service-cards.tsx) — only the sidebar half
+        // survives here.
 
         // Update sidebar service status indicators
         updateSidebarServiceStatus('metadata-source', data.metadata_source, data.spotify);
@@ -3786,8 +4086,8 @@ async function fetchAndUpdateServiceStatus() {
             }
         });
 
-        // Update enrichment service cards
-        if (data.enrichment) renderEnrichmentCards(data.enrichment);
+        // The enrichment chips grid is React-rendered from the dispatch above
+        // since the dashboard flip (service-cards.tsx) — no vanilla write here.
 
         // Check for Spotify rate limit
         if (data.spotify && data.spotify.rate_limited && data.spotify.rate_limit) {
@@ -3894,82 +4194,6 @@ function getMetadataSourcePresentation(metadataStatus, spotifyStatus) {
     };
 }
 
-function updateServiceStatus(service, statusData, spotifyStatus = null) {
-    const serviceCard = document.getElementById(`${service}-service-card`);
-    const indicator = document.getElementById(`${service}-status-indicator`);
-    const statusText = document.getElementById(`${service}-status-text`);
-
-    if (serviceCard) {
-        serviceCard.dataset.statusReady = 'true';
-    }
-
-    if (indicator && statusText) {
-        if (service === 'metadata-source') {
-            const presentation = getMetadataSourcePresentation(statusData || {}, spotifyStatus || {});
-            indicator.className = `service-card-indicator ${presentation.statusClass}`;
-            statusText.textContent = presentation.statusText;
-            statusText.className = `service-card-status-text ${presentation.statusClass}`;
-        } else {
-            if (statusData.connected) {
-                indicator.className = 'service-card-indicator connected';
-                statusText.textContent = 'Connected';
-                statusText.className = 'service-card-status-text connected';
-            } else {
-                indicator.className = 'service-card-indicator disconnected';
-                statusText.textContent = 'Disconnected';
-                statusText.className = 'service-card-status-text disconnected';
-            }
-        }
-    }
-
-    // Response time row — populated uniformly for every service card so all
-    // three read the same way (D4).
-    const responseRow = document.getElementById(`${service}-response-time`);
-    if (responseRow) {
-        const rt = statusData?.response_time;
-        responseRow.textContent = (rt !== undefined && rt !== null)
-            ? `Response: ${rt}ms`
-            : 'Response: --';
-    }
-
-    // Update music source title based on active source
-    if (service === 'metadata-source' && statusData.source) {
-        const musicSourceTitleElement = document.getElementById('metadata-source-title');
-        if (musicSourceTitleElement) {
-            const sourceName = getMetadataSourceLabel(statusData.source);
-            musicSourceTitleElement.textContent = sourceName;
-            currentMusicSourceName = sourceName;
-        }
-
-        // Keep the Spotify action buttons aligned with the actual auth session.
-        const spotifySessionActive = spotifyStatus?.authenticated === true;
-        const authBtn = document.querySelector('button[onclick="authenticateSpotify()"]');
-        const disconnectBtn = document.getElementById('spotify-disconnect-btn');
-        if (authBtn) {
-            authBtn.style.display = spotifySessionActive ? 'none' : '';
-        }
-        if (disconnectBtn) {
-            disconnectBtn.style.display = spotifySessionActive ? '' : 'none';
-        }
-
-        syncPrimaryMetadataSourceAvailability(spotifyStatus);
-
-        const testButton = document.querySelector('#metadata-source-service-card .service-card-button');
-        if (testButton) {
-            const source = statusData.source || 'spotify';
-            testButton.setAttribute('onclick', `testDashboardConnection('${source}')`);
-        }
-    }
-
-    // Update download source title on dashboard card
-    if (service === 'soulseek' && statusData.source) {
-        const sourceNames = { soulseek: 'Soulseek', youtube: 'YouTube', tidal: 'Tidal', qobuz: 'Qobuz', hifi: 'HiFi', deezer_dl: 'Deezer', amazon: 'Amazon', lidarr: 'Lidarr', soundcloud: 'SoundCloud', torrent: 'Torrent', usenet: 'Usenet', hybrid: 'Hybrid' };
-        const displayName = sourceNames[statusData.source] || 'Download Source';
-        const titleEl = document.getElementById('download-source-title');
-        if (titleEl) titleEl.textContent = displayName;
-    }
-}
-
 function updateSidebarServiceStatus(service, statusData, spotifyStatus = null) {
     const indicator = document.getElementById(`${service}-indicator`);
     if (indicator) {
@@ -4014,119 +4238,6 @@ function updateSidebarServiceStatus(service, statusData, spotifyStatus = null) {
             if (sidebarName) sidebarName.textContent = displayName;
         }
     }
-}
-
-function renderEnrichmentCards(enrichment) {
-    const grid = document.getElementById('enrichment-status-grid');
-    if (!grid || !enrichment) return;
-
-    const jiosaavnEnabled = isJiosaavnExperimentalEnabled();
-    const bandcampEnabled = isBandcampExperimentalEnabled();
-
-    // Service display order
-    const serviceOrder = [
-        'musicbrainz', 'spotify_enrichment', 'itunes_enrichment', 'deezer_enrichment', 'jiosaavn_enrichment',
-        'bandcamp_enrichment', 'tidal_enrichment', 'qobuz_enrichment', 'lastfm', 'genius', 'audiodb',
-        'acoustid', 'listenbrainz'
-    ];
-
-    // Map service keys to their settings page selector for click-to-configure
-    const settingsSelectors = {
-        'spotify_enrichment': '.spotify-title',
-        'tidal_enrichment': '.tidal-title',
-        'qobuz_enrichment': '.qobuz-title',
-        'lastfm': '.lastfm-title',
-        'genius': '.genius-title',
-        'acoustid': '.acoustid-title',
-        'listenbrainz': '.listenbrainz-title',
-    };
-
-    const chips = [];
-    for (const key of serviceOrder) {
-        if (key === 'jiosaavn_enrichment' && !jiosaavnEnabled) continue;
-        if (key === 'bandcamp_enrichment' && !bandcampEnabled) continue;
-        const svc = enrichment[key];
-        if (!svc) continue;
-
-        // Determine status class and text
-        let statusClass, statusLabel;
-        if ('running' in svc) {
-            if (!svc.configured) {
-                statusClass = 'not-configured';
-                statusLabel = 'Set up';
-            } else if (svc.paused) {
-                statusClass = 'paused';
-                statusLabel = svc.yield_reason === 'downloads' ? 'Yielding' : 'Paused';
-            } else if (svc.running) {
-                statusClass = svc.idle ? 'idle' : 'running';
-                statusLabel = svc.idle ? 'Idle' : 'Running';
-            } else {
-                statusClass = 'stopped';
-                statusLabel = 'Stopped';
-            }
-        } else {
-            statusClass = svc.configured ? 'running' : 'not-configured';
-            statusLabel = svc.configured ? 'Ready' : 'Set up';
-        }
-
-        const selector = settingsSelectors[key];
-        const clickAttr = selector
-            ? `onclick="navigateToPage('settings'); setTimeout(() => { switchSettingsTab('connections'); setTimeout(() => { const el = document.querySelector('${selector}'); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100); }, 50);"`
-            : '';
-
-        // Build activity display — human-readable, not cryptic numbers
-        let activityHtml = '';
-        let metaHtml = '';
-        const isSpotify = key === 'spotify_enrichment';
-
-        if ('running' in svc && svc.configured) {
-            const c1h = svc.calls_1h || 0;
-            const c24h = svc.calls_24h || 0;
-
-            if (isSpotify && svc.daily_budget) {
-                // Spotify: show budget usage prominently
-                const b = svc.daily_budget;
-                const pct = Math.min(100, Math.round((b.used / b.limit) * 100));
-                const barClass = b.exhausted ? 'exhausted' : pct > 80 ? 'high' : '';
-                activityHtml = `<span class="enrichment-chip-activity">${b.used.toLocaleString()} / ${b.limit.toLocaleString()}</span>`;
-                metaHtml = `<div class="enrichment-chip-budget">
-                    <div class="enrichment-chip-budget-bar ${barClass}" style="width: ${pct}%"></div>
-                </div>`;
-            } else if (c24h > 0) {
-                // Other services: show 24h count
-                activityHtml = `<span class="enrichment-chip-activity">${c24h.toLocaleString()} / 24h</span>`;
-            }
-        }
-
-        // Tooltip: full details including 1h breakdown
-        let tooltipLines = [svc.name + ' — ' + statusLabel];
-        if ('running' in svc && svc.configured) {
-            const c1h = svc.calls_1h || 0;
-            const c24h = svc.calls_24h || 0;
-            if (c24h > 0 || c1h > 0) tooltipLines.push('Last hour: ' + c1h + ' · Last 24h: ' + c24h);
-        }
-        if (isSpotify && svc.daily_budget) {
-            const b = svc.daily_budget;
-            tooltipLines.push('Daily budget: ' + b.used + ' / ' + b.limit + (b.exhausted ? ' (exhausted)' : ''));
-        }
-        if (selector && statusClass === 'not-configured') {
-            tooltipLines = ['Click to configure in Settings'];
-        }
-
-        const statusDisplay = statusClass === 'not-configured' && selector ? 'Configure →' : statusLabel;
-
-        chips.push(`
-            <div class="enrichment-chip status-${statusClass}" ${clickAttr} title="${tooltipLines.join('\n')}">
-                <span class="enrichment-chip-dot"></span>
-                <span class="enrichment-chip-name">${svc.name}</span>
-                ${activityHtml}
-                <span class="enrichment-chip-status">${statusDisplay}</span>
-                ${metaHtml}
-            </div>
-        `);
-    }
-
-    grid.innerHTML = chips.join('');
 }
 
 // ===============================
@@ -4328,12 +4439,21 @@ async function lazyLoadSimilarArtistImages(container, signal) {
             const artistId = bubble.getAttribute('data-artist-id');
             const artistSource = bubble.getAttribute('data-artist-source') || '';
             const artistPlugin = bubble.getAttribute('data-artist-plugin') || '';
+            const artistName = bubble.querySelector('.similar-artist-bubble-name')?.textContent || '';
             if (!artistId) return;
 
             try {
                 const params = new URLSearchParams();
                 if (artistSource) params.set('source', artistSource);
                 if (artistPlugin) params.set('plugin', artistPlugin);
+                // The endpoint documents `name` as REQUIRED for sources that
+                // store no artist image of their own — MusicBrainz resolves
+                // through its url-relations first and then falls back to an
+                // iTunes/Deezer lookup BY NAME. This caller never sent it, so
+                // that fallback could not run and every such artist kept the
+                // placeholder forever (#1201). The name is right here on the
+                // bubble.
+                if (artistName) params.set('name', artistName);
 
                 const imageUrl = params.toString()
                     ? `/api/artist/${encodeURIComponent(artistId)}/image?${params.toString()}`
@@ -4347,8 +4467,21 @@ async function lazyLoadSimilarArtistImages(container, signal) {
                 if (data.success && data.image_url) {
                     const imageContainer = bubble.querySelector('.similar-artist-bubble-image');
                     if (imageContainer) {
-                        const artistName = bubble.querySelector('.similar-artist-bubble-name')?.textContent || 'Artist';
-                        imageContainer.innerHTML = `<img src="${data.image_url}" alt="${artistName}">`;
+                        // built as NODES, not interpolated html: an artist name
+                        // (or a source-supplied url) carrying a quote broke out
+                        // of the attribute and injected markup.
+                        const img = document.createElement('img');
+                        img.src = data.image_url;
+                        img.alt = artistName || 'Artist';
+                        img.onerror = () => {
+                            imageContainer.innerHTML = '';
+                            const fb = document.createElement('div');
+                            fb.className = 'similar-artist-bubble-image-fallback';
+                            fb.textContent = '🎵';
+                            imageContainer.appendChild(fb);
+                            bubble.setAttribute('data-needs-image', 'true');
+                        };
+                        imageContainer.replaceChildren(img);
                         bubble.setAttribute('data-needs-image', 'false');
                         console.log(`✅ Loaded image for similar artist ${artistId}`);
                     }
@@ -4586,4 +4719,56 @@ function parseMusicBrainzMbid(input) {
     candidate = candidate.split(/[?#]/)[0].trim().toLowerCase();
 
     return _MB_UUID_RE.test(candidate) ? candidate : null;
+}
+
+// Relocated verbatim from discover.js (3796-3814) when the vanilla page was deleted;
+// downloads.js formatArtists still calls it.
+function cleanArtistName(artistName) {
+    if (!artistName) return artistName;
+
+    // Remove everything after common featuring patterns (case insensitive)
+    const patterns = [
+        /\s+feat\.?\s+.*/i,      // "feat." or "feat"
+        /\s+featuring\s+.*/i,    // "featuring"
+        /\s+ft\.?\s+.*/i,        // "ft." or "ft"
+        /\s+with\s+.*/i,         // "with"
+        /\s+x\s+.*/i             // " x " (common in collaborations)
+    ];
+
+    let cleaned = artistName;
+    for (const pattern of patterns) {
+        cleaned = cleaned.replace(pattern, '');
+    }
+
+    return cleaned.trim();
+}
+
+/**
+ * formatDuration — milliseconds to M:SS.
+ *
+ * THE ONE DEFINITION. There were three, all top-level `function` declarations
+ * in classic scripts, so the last script loaded silently won and the other two
+ * were dead code:
+ *
+ *   sync-spotify.js  1967  (loads 8372)  no guard  -> undefined gives 'NaN:NaN'
+ *   wishlist-tools.js 1575 (loads 8376)  '--:--'
+ *   sync-services.js 10062 (loads 8382)  '0:00'    <- the winner, and therefore
+ *                                                     the ONLY one that ever ran
+ *
+ * This is sync-services' behaviour transcribed exactly, so nothing on screen
+ * changes. It is pinned HERE, in a file that survives, because the two sync
+ * files are deleted when the sync page flips to React — and without this the
+ * survivor would have become wishlist-tools', turning every unknown duration
+ * from '0:00' into '--:--' across the downloads page, the wishlist and stats.
+ * None of those is the sync page, and none of it would have been intended.
+ *
+ * Whether '--:--' is the better answer for an unknown duration is a fair
+ * question and a separate one. Changing it here would be smuggling a behaviour
+ * change into a refactor.
+ */
+function formatDuration(durationMs) {
+    if (!durationMs) return '0:00';
+    const minutes = Math.floor(durationMs / 60000);
+    const seconds = Math.floor((durationMs % 60000) / 1000);
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
 }

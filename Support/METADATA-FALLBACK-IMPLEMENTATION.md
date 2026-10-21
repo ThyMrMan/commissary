@@ -20,7 +20,7 @@ This document details two alternative approaches for fetching music metadata wit
 
 ### The Problem
 
-Currently, Commissary requires users to:
+Currently, SoulSync requires users to:
 1. Register at Spotify Developer Dashboard
 2. Create an application to get `client_id` and `client_secret`
 3. Enter credentials in settings
@@ -1176,7 +1176,7 @@ class SpotifyClient:
 
 ## Recommended Approach
 
-### For Commissary
+### For SoulSync
 
 1. **Primary:** Keep Spotify OAuth for users who want full features (playlist sync)
 2. **Secondary:** Add Spotify Client Credentials fallback for search/metadata when OAuth not completed
@@ -1204,7 +1204,7 @@ Phase 3 (Optional): Add anonymous Spotify
 
 1. `core/spotify_client.py` - Add fallback logic
 2. `core/itunes_client.py` - New file for iTunes API
-3. `config/settings.py` - Add iTunes/anonymous settings
+3. `core/settings.py` - Add iTunes/anonymous settings
 4. `web_server.py` - Update status endpoints to show active source
 5. `templates/settings.html` - UI for fallback options
 

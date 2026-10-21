@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, runtime_checkable
 
+from core.async_utils import run_blocking
+
 
 def normalize_client_url(raw: str) -> str:
     """Clean a user-entered WebUI URL into something ``requests`` accepts.
@@ -78,6 +80,42 @@ class TorrentStatus:
     # back to their own clock when None.
     ratio: Optional[float] = None
     seeding_time: Optional[int] = None
+    # the v1 info-hash, for clients whose ``id`` is not the hash (aria2's gid).
+    # None means ``id`` already is the hash.
+    info_hash: Optional[str] = None
+    # the client's own category for the torrent (qbittorrent category,
+    # transmission's first label, deluge's label plugin). set on every torrent
+    # in the client, soulsync's or not, so the clients tab can filter by it.
+    # None when the client has none (aria2) or the torrent has none.
+    category: Optional[str] = None
+
+
+class AdoptedRef(str):
+    """A torrent ref for a torrent the client ALREADY had.
+
+    Still a plain str to every caller. One that cares (the audiobook grab) can
+    tell the user the existing download was picked up rather than added.
+    """
+
+
+async def find_existing_torrent(adapter: "TorrentClientAdapter", info_hash: str) -> Optional[str]:
+    """The client's own id for the torrent with this info-hash, or None.
+
+    Lists rather than asks by hash, because not every client keys on the hash
+    (aria2 tracks a gid). A client that cannot be listed answers None, so the
+    caller falls through to a normal add.
+    """
+    wanted = str(info_hash or '').lower()
+    if not wanted:
+        return None
+    try:
+        statuses = await adapter.get_all()
+    except Exception:  # noqa: BLE001 - an unlistable client is just "not found"
+        return None
+    for status in statuses or []:
+        if str(status.info_hash or status.id or '').lower() == wanted:
+            return status.id
+    return None
 
 
 @runtime_checkable
@@ -98,34 +136,24 @@ class TorrentClientAdapter(Protocol):
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         """Hand the torrent client a HTTP/HTTPS URL pointing to a
         ``.torrent`` file or a ``magnet:`` URI. Returns the torrent's
         client-side identifier (info-hash for qBit / Deluge, numeric
-        id for Transmission, GID for aria2) or ``None`` on failure.
-
-        A DUPLICATE IS NOT A FAILURE. When the client already holds the
-        torrent it must return the existing identifier, not None — every
-        adapter has its own way of learning it (Transmission's
-        ``torrent-duplicate``, or ``infohash.expected_hash`` confirmed
-        present for the rest). Returning None there is indistinguishable
-        from a genuine refusal, and the consequence is severe: no download
-        row is created, so nothing ever polls the torrent sitting in the
-        client — often already finished — and the wishlist re-grabs it
-        every hour, forever."""
+        id for Transmission) or ``None`` on failure."""
         ...
 
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         """Upload a raw ``.torrent`` payload. Same return as
         ``add_torrent``. Used when the indexer doesn't expose a
-        direct download URL and Commissary had to fetch the file
+        direct download URL and SoulSync had to fetch the file
         itself first."""
         ...
 
@@ -137,25 +165,6 @@ class TorrentClientAdapter(Protocol):
     async def get_all(self) -> List[TorrentStatus]:
         """Return live status for every torrent the client currently
         tracks. Used by the global download list."""
-        ...
-
-    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
-        """The paths inside one torrent, or ``None`` when the client
-        cannot say.
-
-        Deliberately NOT folded into ``get_status``. This answers a
-        question asked ONCE per download — "is this a video, or a pile
-        of RAR parts nothing here can unpack?" — while
-        ``get_status``/``get_all`` run every few seconds for every
-        active torrent. Carrying a 40-file season pack's listing on
-        every one of those ticks would be paying the payload
-        continuously for an answer wanted once.
-
-        ``None`` means "couldn't ask". An EMPTY list means "asked, and
-        the client has no metadata yet" — a magnet that hasn't resolved.
-        Callers must read both as *unknown*, never as "no files":
-        refusing a release you cannot read is how a working one gets
-        thrown away."""
         ...
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
@@ -209,12 +218,39 @@ def fetch_torrent_payload(url: str, timeout: int = 30):
         return None, None
 
 
+async def _fetch_torrent_payload_async(url: str):
+    """Run the blocking indexer fetch without an event-loop default executor.
+
+    Python 3.14.6 can lose the cross-thread selector wakeup used while
+    ``asyncio.run()`` shuts its default executor down in a long-lived process.
+    Polling a bounded shared worker Future from the owner loop needs no foreign
+    thread to wake that loop and avoids creating an executor Runner.close()
+    must later join.
+    """
+    return await run_blocking(fetch_torrent_payload, url)
+
+
+class ReleaseRejected(Exception):
+    """The fetched .torrent describes something the caller will not accept.
+
+    Raised instead of returning None so the caller can tell "the client
+    refused it" apart from "we refused it, and here is why" — the second
+    needs to reach the user and let the hybrid chain try the next source.
+    """
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 async def add_torrent_smart(
     adapter: "TorrentClientAdapter",
     url_or_magnet: str,
     category: Optional[str] = None,
     save_path: Optional[str] = None,
     fallback_magnet: Optional[str] = None,
+    verify_files=None,
+    adopt_existing: bool = False,
 ) -> Optional[str]:
     """Add a release the way Sonarr/Radarr do: magnets go straight to the
     client; HTTP download links are fetched server-side and handed over as
@@ -222,58 +258,82 @@ async def add_torrent_smart(
     only when the server-side fetch fails, so setups where the client CAN
     reach the indexer keep working.
 
-    ``category=None`` means "use whatever the client is configured with".
-    Every adapter resolves it as ``category or self._category``, where
-    ``self._category`` is ``torrent_client.category`` from Settings — so a
-    literal default here silently OVERRIDES the user's setting instead of
-    deferring to it. This defaulted to "soulsync" and every music download
-    landed in a category called soulsync no matter what Settings said; only
-    the video side was unaffected, because it always passes one explicitly."""
+    ``fallback_magnet`` is the magnet for the SAME release, when the indexer
+    offered both. Callers now prefer the .torrent URL (#1139: a magnet gives
+    the client nothing but an info-hash, so a swarm it can't reach leaves it
+    parked on "downloading metadata" forever), and this is what keeps that
+    preference from being a downgrade — if the server-side fetch fails we use
+    the magnet we already had instead of handing over a URL this process just
+    proved it cannot reach.
+
+    ``verify_files`` (#1149) is called with the .torrent's file-name list
+    before the release is handed over, and raises ``ReleaseRejected`` when it
+    says no. It runs HERE because this is where the payload already exists —
+    checking in the caller would mean fetching the same .torrent twice. It is
+    skipped when the payload never materialises (a magnet, or a fetch that
+    failed): no file list is no evidence, and the caller's title-level check
+    has already had its say.
+    """
     from utils.logging_config import get_logger
     logger = get_logger('torrent.add')
 
-    if not str(url_or_magnet or '').lower().startswith(('http://', 'https://')):
-        # A magnet (or an empty URL, which is its own kind of bug). Handed
-        # straight over — there is nothing to fetch server-side.
-        ref = await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
-        if not ref:
-            # The single most common thing a person needs to know when a grab
-            # "just doesn't work": the client was asked and said no. Across eight
-            # days of a real app.log there was not one line from this subsystem
-            # while one release was refused 324 times, so the refusal was
-            # unattributable — the reason lives in the adapter and died there.
-            logger.warning(
-                "The torrent client accepted nothing for a %s handoff (%s). "
-                "Common causes: the torrent is already in the client, the magnet "
-                "is malformed, or the client cannot reach the swarm.",
-                "magnet" if str(url_or_magnet or '').lower().startswith("magnet:")
-                else "non-HTTP", _strip_query(str(url_or_magnet or '')[:120]) or "<empty>")
-        return ref
+    async def _adopt(info_hash):
+        """``adopt_existing``: a torrent the client already holds is tracked,
+        not re-added. clients refuse the duplicate, which read as a failed grab
+        while the finished files sat in the client."""
+        if not adopt_existing or not info_hash:
+            return None
+        found = await find_existing_torrent(adapter, info_hash)
+        if found:
+            logger.info("Torrent client already holds %s — adopting it", str(info_hash)[:12])
+            return AdoptedRef(found)
+        return None
 
-    import asyncio
-    loop = asyncio.get_event_loop()
-    file_bytes, magnet = await loop.run_in_executor(
-        None, fetch_torrent_payload, url_or_magnet
-    )
+    from core.torrent_clients.qbittorrent import _magnet_hash
+
+    if not str(url_or_magnet or '').lower().startswith(('http://', 'https://')):
+        adopted = await _adopt(_magnet_hash(url_or_magnet))
+        if adopted:
+            return adopted
+        return await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
+
+    file_bytes, magnet = await _fetch_torrent_payload_async(url_or_magnet)
     if magnet:
+        adopted = await _adopt(_magnet_hash(magnet))
+        if adopted:
+            return adopted
         return await adapter.add_torrent(magnet, category=category, save_path=save_path)
     if file_bytes is not None:
+        if verify_files is not None:
+            from core.quality.torrent_contents import torrent_file_names
+            names = torrent_file_names(file_bytes)
+            # None means the payload could not be parsed, which is not
+            # evidence of anything — do not turn a decoder failure into a
+            # blocked download.
+            if names is not None:
+                ok, reason = verify_files(names)
+                if not ok:
+                    raise ReleaseRejected(reason)
+        from core.quality.torrent_contents import torrent_info_hash
+        adopted = await _adopt(torrent_info_hash(file_bytes))
+        if adopted:
+            return adopted
         return await adapter.add_torrent_file(file_bytes, category=category, save_path=save_path)
+
+    if fallback_magnet:
+        logger.warning(
+            "Could not fetch the .torrent server-side from %s — falling back to the "
+            "release's magnet link",
+            _strip_query(url_or_magnet),
+        )
+        adopted = await _adopt(_magnet_hash(fallback_magnet))
+        if adopted:
+            return adopted
+        return await adapter.add_torrent(fallback_magnet, category=category, save_path=save_path)
 
     logger.warning(
         "Could not fetch the .torrent server-side from %s — handing the URL to the "
         "torrent client instead (the client must be able to reach that host itself)",
         _strip_query(url_or_magnet),
     )
-    ref = await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)
-    if ref or not fallback_magnet:
-        return ref
-    # The same release's magnet, carried from the search hit. Callers hand over
-    # the .torrent URL FIRST, because a magnet gives the client an info-hash and
-    # nothing else — one that cannot reach the swarm parks on "downloading
-    # metadata" with zero size and zero peers indefinitely. But in a split
-    # install where Commissary cannot reach the indexer and the CLIENT can, that
-    # preference would lose a magnet that worked. This is the other half of the
-    # trade: prefer the file, keep the magnet.
-    logger.info("URL handoff was refused — retrying the same release as a magnet")
-    return await adapter.add_torrent(fallback_magnet, category=category, save_path=save_path)
+    return await adapter.add_torrent(url_or_magnet, category=category, save_path=save_path)

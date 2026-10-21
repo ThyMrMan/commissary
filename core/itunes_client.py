@@ -78,6 +78,7 @@ class Track:
     disc_number: Optional[int] = None
     album_type: Optional[str] = None
     total_tracks: Optional[int] = None
+    explicit: Optional[bool] = None
 
     @classmethod
     def from_itunes_track(cls, track_data: Dict[str, Any], clean_artist_name: Optional[str] = None) -> 'Track':
@@ -119,7 +120,9 @@ class Track:
             image_url=album_image_url,
             release_date=track_data.get('releaseDate', '').split('T')[0] if track_data.get('releaseDate') else None,
             album_type=album_type,
-            total_tracks=track_count or None
+            total_tracks=track_count or None,
+            explicit=(track_data.get('trackExplicitness') == 'explicit'
+                      if track_data.get('trackExplicitness') else None),
         )
 
 @dataclass
@@ -207,7 +210,7 @@ class Album:
             id=str(album_data.get('collectionId', '')),
             name=_clean_itunes_album_name(album_data.get('collectionName', '')),
             artists=[album_data.get('artistName', 'Unknown Artist')],
-            release_date=album_data.get('releaseDate', ''),
+            release_date=(album_data.get('releaseDate') or '').split('T')[0],
             total_tracks=track_count,
             album_type=album_type,
             image_url=image_url,
@@ -255,11 +258,17 @@ class iTunesClient:
     # Fallback storefronts to try when primary country returns no results
     FALLBACK_COUNTRIES = ['US', 'GB', 'FR', 'DE', 'JP', 'AU', 'CA', 'BR', 'KR', 'SE']
 
+    # stores a search tries when the home store has nothing close (#1398).
+    # plenty of european music isn't in the US store at all. capped because
+    # every search costs ~3s of rate limit.
+    SEARCH_FALLBACK_COUNTRIES = ['US', 'GB', 'DE', 'FR', 'SE']
+    SEARCH_FALLBACK_LIMIT = 3
+
     def __init__(self, country: str = None):
         self._fixed_country = country.upper() if country else None
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Commissary/1.0',
+            'User-Agent': 'SoulSync/1.0',
             'Accept': 'application/json'
         })
         logger.info(f"iTunes client initialized for country: {self.country}")
@@ -270,7 +279,7 @@ class iTunesClient:
         if self._fixed_country:
             return self._fixed_country
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             return (config_manager.get('itunes.country', 'US') or 'US').upper()
         except Exception:
             return 'US'
@@ -281,17 +290,14 @@ class iTunesClient:
         """
         return True
     
-    # A search waits out the rate limit here, where its request is made, and
-    # nowhere above: search_tracks and search_albums check the metadata cache
-    # first and must not wait for a request they may not send. Both carried the
-    # limit as well, so a new search waited twice and a cached one still waited.
     @rate_limited
-    def _search(self, term: str, entity: str, limit: int = 50) -> List[Dict[str, Any]]:
-        """Generic search method for iTunes API"""
+    def _search(self, term: str, entity: str, limit: int = 50,
+                country: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Generic search method for iTunes API. `country` overrides the home store."""
         try:
             params = {
                 'term': term,
-                'country': self.country,
+                'country': (country or self.country).upper(),
                 'media': 'music',
                 'entity': entity,
                 'limit': min(limit, 200),  # iTunes max is 200
@@ -376,11 +382,15 @@ class iTunesClient:
     
     # ==================== Track Methods ====================
     
-    def search_tracks(self, query: str, limit: int = 20) -> List[Track]:
-        """Search for tracks using iTunes API"""
-        # Check search cache
+    # Commissary: no @rate_limited here - _search waits where its request is made;
+    # this one checks the metadata cache first, so a search waited twice and a
+    # cached one waited for a request it never sent
+    def search_tracks(self, query: str, limit: int = 20, country: Optional[str] = None) -> List[Track]:
+        """Search for tracks using iTunes API. `country` searches another store."""
+        # another store's results are cached under their own key
+        cache_query = f"{query}@{country.upper()}" if country else query
         cache = get_metadata_cache()
-        cached_results = cache.get_search_results('itunes', 'track', query, limit)
+        cached_results = cache.get_search_results('itunes', 'track', cache_query, limit)
         if cached_results is not None:
             tracks = []
             for raw in cached_results:
@@ -391,7 +401,7 @@ class iTunesClient:
             if tracks:
                 return tracks
 
-        results = self._search(query, 'song', limit)
+        results = self._search(query, 'song', limit, country=country)
         tracks = []
 
         # Collect artist IDs for batch lookup
@@ -420,10 +430,38 @@ class iTunesClient:
         entries = [(str(td.get('trackId', '')), td) for td in raw_items if td.get('trackId')]
         if entries:
             cache.store_entities_bulk('itunes', 'track', entries)
-            cache.store_search_results('itunes', 'track', query, limit,
+            cache.store_search_results('itunes', 'track', cache_query, limit,
                                        [str(td.get('trackId', '')) for td in raw_items if td.get('trackId')])
 
         return tracks
+
+    def search_tracks_any_store(self, query: str, limit: int = 20,
+                                expected_title: str = '', expected_artist: str = '') -> List[Track]:
+        """search_tracks, then other stores when the home store has nothing close.
+
+        #1398: E-Type's "Princess Of Egypt" and Helena Paparizou's "Ti Ti" aren't
+        in the US store at all, so a US search came back full of other songs.
+        the same search in GB finds both first try. when another store has it,
+        its results go first, then whatever the home store found.
+        """
+        from core.metadata.relevance import is_strong_match
+
+        home = self.search_tracks(query, limit)
+        if not expected_title or any(is_strong_match(t, expected_title, expected_artist) for t in home):
+            return home
+        others = [c for c in self.SEARCH_FALLBACK_COUNTRIES if c != self.country]
+        for country in others[: self.SEARCH_FALLBACK_LIMIT]:
+            found = self.search_tracks(query, limit, country=country)
+            if any(is_strong_match(t, expected_title, expected_artist) for t in found):
+                logger.info("iTunes: %r not in the %s store, found it in %s", query, self.country, country)
+                seen = set()
+                merged = []
+                for t in found + home:
+                    if t.id not in seen:
+                        seen.add(t.id)
+                        merged.append(t)
+                return merged[:limit]
+        return home
     
     def _get_clean_artist_names(self, artist_ids: List[str]) -> Dict[str, str]:
         """
@@ -502,7 +540,7 @@ class iTunesClient:
                     'id': str(cached.get('collectionId', '')),
                     'name': _clean_itunes_album_name(cached.get('collectionName', '')),
                     'total_tracks': cached.get('trackCount', 0),
-                    'release_date': cached.get('releaseDate', ''),
+                    'release_date': (cached.get('releaseDate') or '').split('T')[0],
                     'album_type': 'album',
                     'artists': [clean_artist_name]
                 },
@@ -538,7 +576,7 @@ class iTunesClient:
                         'id': str(track_data.get('collectionId', '')),
                         'name': _clean_itunes_album_name(track_data.get('collectionName', '')),
                         'total_tracks': track_data.get('trackCount', 0),
-                        'release_date': track_data.get('releaseDate', ''),
+                        'release_date': (track_data.get('releaseDate') or '').split('T')[0],
                         'album_type': 'album',  # iTunes doesn't distinguish clearly
                         'artists': [clean_artist_name]
                     },
@@ -561,6 +599,7 @@ class iTunesClient:
     
     # ==================== Album Methods ====================
     
+    # Commissary: no @rate_limited here, as search_tracks above
     def search_albums(self, query: str, limit: int = 20) -> List[Album]:
         """Search for albums using iTunes API.
 

@@ -1,0 +1,286 @@
+import { useQuery } from '@tanstack/react-query';
+
+import type { DiscoverMix } from './-discover.mixes';
+import type { SeasonData } from './-discover.seasonal';
+import type { SectionOutcome } from './-discover.section-state';
+
+import {
+  fetchAvailableDecades,
+  fetchDiscoveryShuffle,
+  fetchDiscoveryWeekly,
+  fetchHiddenGems,
+  fetchListeningMix,
+  fetchDailyMixes,
+  fetchForYouMixes,
+  fetchMoodMixes,
+  fetchPopularPicks,
+  fetchReleaseRadar,
+  fetchSeasonalCurrent,
+  fetchSeasonalPlaylist,
+} from './-discover.api';
+import { decadeMix, type AvailableDecade } from './-discover.decade-shelf';
+import { type Explanation, explanationLine } from './-discover.explanation';
+import { discoverLimiter } from './-discover.limiter';
+import { fetchRecipes, recipeMix, type RecipeMixCard } from './-discover.recipes';
+import { seasonalHasPlaylist, seasonalMixTitles } from './-discover.seasonal';
+
+/**
+ * The Your Mixes registry, as a hook.
+ *
+ * The vanilla has no "mixes loader": seven independent section loaders each
+ * call `_upsertMixCard({key, title, subtitle, tracks, syncKey})` (2079, 2108,
+ * 4372, 4568, 4595, 4627, 10349) and collapse their own section, so the shelf
+ * is whatever arrived. This hook IS that registry — one query per feeder, one
+ * mix per feeder that came back with tracks.
+ *
+ * ── Deliberate divergence: a DETERMINISTIC shelf order ──────────────────────
+ *
+ * The vanilla renders cards in ARRIVAL order (`_yourMixKeys` grows as loaders
+ * finish, 4906-4908), so the shelf shuffles run to run with network timing.
+ * The port pins `LIVE_MIX_FEEDERS`' declaration order — the same cards, in
+ * the same places, every load. Nothing else about a card changes.
+ *
+ * The four personalized queries reuse the exact query keys `useDiscoverPage`
+ * registers, so React Query serves them from the same cache entries — this
+ * hook adds ZERO requests for them. The three it owns are release radar +
+ * weekly (slow external — never gate anything, matching the vanilla's
+ * "started immediately, slotted in when they arrive") and the seasonal
+ * playlist, which is keyed by the CURRENT season and so waits for
+ * /seasonal/current — and only fires at all when the season advertises a
+ * playlist (`seasonalHasPlaylist`, the vanilla's 4285 guard).
+ */
+
+const STALE = Number.POSITIVE_INFINITY;
+
+function mixQuery(key: string, fn: () => Promise<unknown>, enabled = true) {
+  return {
+    queryKey: ['discover', key] as const,
+    queryFn: () => discoverLimiter.run(fn),
+    staleTime: STALE,
+    gcTime: STALE,
+    retry: false,
+    enabled,
+  };
+}
+
+/** The tracks off a section outcome, or [] for pending/error/empty. */
+function outcomeTracks(data: unknown): unknown[] {
+  const outcome = data as SectionOutcome<Record<string, unknown>> | undefined;
+  if (!outcome || outcome.kind !== 'ok') return [];
+  const tracks = outcome.data.tracks;
+  return Array.isArray(tracks) ? tracks : [];
+}
+
+export interface DiscoverMixesController {
+  /** The Your Mixes shelf, in feeder-declaration order; empty feeders absent. */
+  mixes: DiscoverMix[];
+  /** The Time Machine shelf — one card per available decade (2662-2681). */
+  decadeMixes: DiscoverMix[];
+  /** Every mix the modal can resolve, keyed — the registry itself (4906). */
+  registry: Record<string, DiscoverMix>;
+  /** Your mix recipes, for the editor (their cards are in `mixes`). */
+  recipes: RecipeMixCard[];
+  /** the moods shelf: chill, focus, energy... built from your own albums' tags. */
+  moodMixes: DiscoverMix[];
+}
+
+/**
+ * @param belowFoldReady `useDiscoverPage().aboveFoldSettled`. The seasonal
+ * and decades queries SHARE their cache keys with useDiscoverPage's tier-2
+ * entries, which are gated on tier 1 settling — an ungated observer here
+ * would fire those fetches at mount and defeat the tiering the page hook
+ * exists to preserve. The slow-external feeders stay ungated on purpose.
+ */
+/**
+ * a {mixes: [...]} payload as cards: moods, on repeat, repeat rewind, blends.
+ * every track is owned, so there's nothing to download or sync-match: no
+ * syncKey, which leaves Play as the one action.
+ */
+export function mixCardsFrom(payload: Record<string, unknown> | undefined): DiscoverMix[] {
+  if (!payload || !Array.isArray(payload.mixes)) return [];
+  const out: DiscoverMix[] = [];
+  for (const raw of payload.mixes as Record<string, unknown>[]) {
+    const tracks = Array.isArray(raw.tracks) ? raw.tracks : [];
+    if (!tracks.length || typeof raw.key !== 'string') continue;
+    out.push({
+      key: raw.key,
+      title: typeof raw.name === 'string' && raw.name ? raw.name : raw.key,
+      subtitle: typeof raw.subtitle === 'string' ? raw.subtitle : undefined,
+      blurb: typeof raw.subtitle === 'string' ? raw.subtitle : undefined,
+      tracks,
+    });
+  }
+  return out;
+}
+
+export function useDiscoverMixes(belowFoldReady = true): DiscoverMixesController {
+  // Same keys as useDiscoverPage → served from cache, no second request.
+  const popularPicks = useQuery(mixQuery('popular-picks', fetchPopularPicks));
+  const hiddenGems = useQuery(mixQuery('hidden-gems', fetchHiddenGems));
+  const shuffle = useQuery(mixQuery('discovery-shuffle', fetchDiscoveryShuffle));
+  const listeningMix = useQuery(mixQuery('listening-mix', fetchListeningMix));
+  // SHARED cache key with use-page, which stores the seasonal payload as a
+  // SectionOutcome — the queryFn and the read must both speak that shape, or
+  // whichever hook runs second reads garbage out of the shared entry.
+  const seasonal = useQuery({
+    queryKey: ['discover', 'seasonal'] as const,
+    queryFn: async (): Promise<SectionOutcome<SeasonData>> => {
+      try {
+        return {
+          kind: 'ok',
+          data: (await discoverLimiter.run(fetchSeasonalCurrent)) as SeasonData,
+        };
+      } catch (error) {
+        return { kind: 'error', error };
+      }
+    },
+    staleTime: STALE,
+    gcTime: STALE,
+    retry: false,
+    enabled: belowFoldReady,
+  });
+  const decades = useQuery(mixQuery('decades', fetchAvailableDecades, belowFoldReady));
+
+  // Slow external — enabled from mount, awaited by nothing.
+  const releaseRadar = useQuery(mixQuery('release-radar', fetchReleaseRadar));
+  const daily = useQuery(mixQuery('daily-mixes', fetchDailyMixes));
+  // on repeat, repeat rewind, blends: small and fast, so not held back
+  const forYou = useQuery(mixQuery('for-you', fetchForYouMixes));
+  // below the fold, and built once a day server side
+  const moodsQuery = useQuery(mixQuery('moods', fetchMoodMixes, belowFoldReady));
+  // your recipes: server-built, renewed on their own schedule
+  const recipeQuery = useQuery(mixQuery('recipes', fetchRecipes));
+  const weekly = useQuery(mixQuery('discovery-weekly', fetchDiscoveryWeekly));
+
+  const seasonalOutcome = seasonal.data as SectionOutcome<SeasonData> | undefined;
+  const season = seasonalOutcome?.kind === 'ok' ? seasonalOutcome.data : undefined;
+  const seasonKey = season?.season ?? '';
+  const seasonalPlaylist = useQuery(
+    mixQuery(
+      `seasonal-playlist-${seasonKey}`,
+      () => fetchSeasonalPlaylist(seasonKey),
+      seasonKey !== '' && seasonalHasPlaylist(season),
+    ),
+  );
+
+  const mixes: DiscoverMix[] = [];
+
+  // Daily Mixes lead. they're the most personal thing on the shelf (clustered
+  // from what you actually play, mostly owned so they play instantly) and
+  // they used to come ninth, after every generic feeder.
+  const dailyOutcome = daily.data as SectionOutcome<Record<string, unknown>> | undefined;
+  const dailyPayload = dailyOutcome?.kind === 'ok' ? dailyOutcome.data : undefined;
+  if (dailyPayload && Array.isArray(dailyPayload.mixes)) {
+    for (const raw of dailyPayload.mixes as Record<string, unknown>[]) {
+      const tracks = Array.isArray(raw.tracks) ? raw.tracks : [];
+      if (!tracks.length || typeof raw.key !== 'string') continue;
+      mixes.push({
+        key: raw.key,
+        title: String(raw.name || raw.key),
+        subtitle:
+          explanationLine(raw.explanation as Explanation | undefined) || String(raw.subtitle || ''),
+        // the card says who's in it, the way a daily mix should
+        blurb: typeof raw.subtitle === 'string' && raw.subtitle ? raw.subtitle : undefined,
+        tracks,
+      });
+    }
+  }
+
+  // then on repeat, repeat rewind and any blends: straight off what you play
+  const forYouOutcome = forYou.data as SectionOutcome<Record<string, unknown>> | undefined;
+  for (const m of mixCardsFrom(forYouOutcome?.kind === 'ok' ? forYouOutcome.data : undefined)) {
+    mixes.push(m);
+  }
+
+  // then the LIVE_MIX_FEEDERS order: release_radar, discovery_weekly,
+  // seasonal_playlist, popular_picks, hidden_gems, listening_mix,
+  // discovery_shuffle.
+  const radarTracks = outcomeTracks(releaseRadar.data);
+  if (radarTracks.length > 0) {
+    mixes.push({
+      key: 'release_radar',
+      title: 'Fresh Tape',
+      subtitle: 'New releases from artists you follow',
+      tracks: radarTracks,
+      syncKey: 'release_radar',
+    });
+  }
+  const weeklyTracks = outcomeTracks(weekly.data);
+  if (weeklyTracks.length > 0) {
+    mixes.push({
+      key: 'discovery_weekly',
+      title: 'The Archives',
+      subtitle: 'A weekly dig through artists across your library',
+      tracks: weeklyTracks,
+      syncKey: 'discovery_weekly',
+    });
+  }
+  const seasonalTracks = outcomeTracks(seasonalPlaylist.data);
+  if (season && seasonalTracks.length > 0) {
+    const titles = seasonalMixTitles(season);
+    mixes.push({
+      key: 'seasonal_playlist',
+      title: titles.title,
+      subtitle: titles.subtitle,
+      tracks: seasonalTracks,
+      syncKey: 'seasonal_playlist',
+    });
+  }
+  for (const feeder of [
+    {
+      key: 'popular_picks',
+      title: 'Popular Picks',
+      subtitle: 'Popular tracks from artists you love',
+      query: popularPicks,
+    },
+    {
+      key: 'hidden_gems',
+      title: 'Hidden Gems',
+      subtitle: 'Deeper cuts you might have missed',
+      query: hiddenGems,
+    },
+    {
+      key: 'listening_mix',
+      title: 'Your Listening Mix',
+      subtitle: 'From artists matched to your listening',
+      query: listeningMix,
+    },
+    {
+      key: 'discovery_shuffle',
+      title: 'Discovery Shuffle',
+      subtitle: 'A shuffle across everything we discovered for you',
+      query: shuffle,
+    },
+  ]) {
+    const tracks = outcomeTracks(feeder.query.data);
+    if (tracks.length > 0) {
+      mixes.push({
+        key: feeder.key,
+        title: feeder.title,
+        subtitle: feeder.subtitle,
+        tracks,
+        syncKey: feeder.key,
+      });
+    }
+  }
+
+  // Your recipe mixes, last. A new recipe shows even before
+  // it has tracks, so it can be edited.
+  const recipes = (recipeQuery.data as { mixes?: RecipeMixCard[] } | undefined)?.mixes ?? [];
+  for (const card of recipes) mixes.push(recipeMix(card));
+
+  const decadesOutcome = decades.data as SectionOutcome<Record<string, unknown>> | undefined;
+  const availableDecades =
+    decadesOutcome?.kind === 'ok' && Array.isArray(decadesOutcome.data.decades)
+      ? (decadesOutcome.data.decades as AvailableDecade[])
+      : [];
+  const decadeMixes = availableDecades.map((d) => decadeMix(d));
+
+  const moodOutcome = moodsQuery.data as SectionOutcome<Record<string, unknown>> | undefined;
+  const moodMixes = mixCardsFrom(moodOutcome?.kind === 'ok' ? moodOutcome.data : undefined);
+
+  const registry: Record<string, DiscoverMix> = {};
+  for (const m of [...mixes, ...decadeMixes, ...moodMixes]) registry[m.key] = m;
+
+  return { mixes, decadeMixes, registry, recipes, moodMixes };
+}

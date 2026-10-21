@@ -13,7 +13,7 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
-from core.video import packed_release
+from core.video.season_pack import is_pack_download
 from core.video.slskd_search import _is_video
 from utils.logging_config import get_logger
 
@@ -32,55 +32,11 @@ def _norm_state(status: Any) -> str:
     return "downloading"
 
 
-def _is_pack(dl: dict) -> bool:
-    """Whether this grab is a season/complete-series pack rather than one file."""
-    try:
-        from core.video.importer import _scope_of
-        return _scope_of(dl or {}) in ("season", "series")
-    except Exception:      # noqa: BLE001 - unknown scope behaves like today (single file)
-        return False
-
-
-def _packed_patch(dl: dict, names) -> dict:
-    """The refusal patch for a release that can never yield a video file.
-
-    ``_bad_release`` is what tells the monitor to blocklist this exact release
-    before retrying — being packed is a permanent property of it, not a bad
-    night on the swarm, and without the flag the retry would pick it straight
-    back off its own candidate list."""
-    err = packed_release.reason(names, before_finishing=False)
-    logger.info("video download %s (%s): %s", dl.get("id"),
-                dl.get("release_title") or dl.get("title") or "?", err)
-    return {"status": "failed", "_bad_release": True, "error": err}
-
-
-def _packed_by_client(dl: dict, ref, list_files) -> Optional[dict]:
-    """Refuse an in-flight TORRENT whose file list is archives and nothing else.
-
-    Torrents only, and that is not a limitation to be lifted later. A usenet
-    release is ALWAYS rars — that is what usenet is — and SABnzbd/NZBGet unpack
-    them server-side before Commissary ever sees the folder. Judging a usenet job
-    by its file list would refuse every usenet download there is."""
-    if list_files is None or str(dl.get("source") or "") != "torrent":
-        return None
-    try:
-        names = list_files(str(dl.get("source") or ""), str(ref))
-    except Exception:   # noqa: BLE001 - an unanswerable client reads as unknown
-        logger.debug("file list unavailable for %s", ref, exc_info=True)
-        return None
-    if packed_release.classify(names or []) != packed_release.PACKED:
-        return None
-    err = packed_release.reason(names or [], before_finishing=True)
-    logger.info("video download %s (%s): %s", dl.get("id"),
-                dl.get("release_title") or dl.get("title") or "?", err)
-    return {"status": "failed", "_bad_release": True, "error": err}
-
-
 def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
                             resolve_path: Callable[[Any], Any],
                             find_video: Callable[[Any, Any], Any],
                             organizer: Optional[Callable] = None,
-                            find_pack: Optional[Callable[[Any, Any], Any]] = None,
+                            import_pack: Optional[Callable] = None,
                             settled: Optional[Callable[[dict, str], bool]] = None,
                             list_files: Optional[Callable[[str, str], Any]] = None,
                             listing: Optional[Callable[[Any], Any]] = None) -> dict:
@@ -90,18 +46,14 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     for THIS job — scoped to its own content (``name`` = the torrent/nzb job name), never the
     largest file in a shared download folder.
 
-    ``settled(dl, path)`` is the guard against importing a file something is still
-    writing. 100% means the BYTES are in; it does not mean the client has finished
-    putting them where we are about to read them. Passing None keeps the old
-    behaviour (import as soon as a file is visible).
+    ``import_pack(dl, root, name)`` handles the season-pack case, and exists because
+    ``find_video`` is the wrong shape for it: a pack finishes as a FOLDER of episodes, and
+    narrowing it to one file means one episode is judged and the rest are abandoned on disk.
+    It returns None when the job turns out not to be a folder after all (some 'packs' are a
+    single file), so the ordinary path still runs.
 
-    ``list_files(source, ref)`` asks the download CLIENT what is inside the job,
-    and ``listing(path)`` asks the FILESYSTEM what actually arrived. Both feed the
-    same classifier for the same question — "is this a video, or a pile of RAR
-    parts nothing here can unpack?" — at the only two moments it can be answered:
-    while there is still bandwidth to save, and after the fact when there is at
-    least an honest explanation to give. Both default to None, which keeps every
-    existing caller's behaviour exactly."""
+    Commissary: ``settled(dl, path)`` holds the import until the content stops
+    changing (core.commissary.settle); None keeps importing on sight."""
     ref = dl.get("client_ref")
     if not ref:
         return {"_missing": True}
@@ -123,6 +75,14 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # "Downloading 100%" forever. A file that isn't settled on disk yet is handled below
     # (find_video returns nothing → we keep polling), so treating 100% as done is safe.
     if state != "completed" and pct < 100.0:
+        # Commissary: a torrent that is RAR parts and nothing playable can never
+        # import (nothing on the video side unpacks) - refuse it while there is
+        # still bandwidth to save. core/commissary/packed_release.py
+        if list_files is not None:
+            from core.commissary.packed_release import in_flight as _packed_in_flight
+            _refused = _packed_in_flight(dl, ref, list_files)
+            if _refused is not None:
+                return _refused
         speed = int(getattr(status, "download_speed", 0) or 0)
         eta = getattr(status, "eta", None)
         # clients report a huge sentinel (qBittorrent: 8640000s) for "unknown";
@@ -131,16 +91,6 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
             size = int(getattr(status, "size", 0) or 0)
             done = int(getattr(status, "downloaded", 0) or 0)
             eta = int((size - done) / speed) if (speed > 0 and size > done) else None
-        # WHAT is this, before hours of bandwidth go into it? Nothing on the video
-        # side unpacks archives, so a release that is a set of RAR parts is already
-        # lost — the only question is whether that is discovered now or at 100%,
-        # thirty minutes later, by a stall clock whose message is about save paths.
-        # The client is the ONLY place to ask: Prowlarr results carry no file list
-        # at all (prowlarr_search._project hardcodes files=[]), so at grab time
-        # there is quite literally nothing to judge.
-        refusal = _packed_by_client(dl, ref, list_files)
-        if refusal is not None:
-            return refusal
         return {"status": "downloading", "progress": pct,
                 "speed_bps": speed, "eta_seconds": eta}
     # Completed → locate THIS job's finished video file, then import. Prefer the client's
@@ -150,57 +100,58 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
     # vs file 'love.island.s13e42.1080p.web.h264-skyfire[EZTVx.to].mkv'), so save_path/name misses.
     # content_path points straight at the content. Fall back to save_path + name scoping for
     # clients that don't report it (never the largest file in the shared folder).
-    # A season/series pack must hand the importer its FOLDER, not one member: the
-    # single-file locator returns the largest episode, which would import that one
-    # and quietly abandon the rest of the season. find_pack is optional so callers
-    # (and every existing test) that don't supply it keep today's behaviour exactly.
-    locate = find_pack if (find_pack and _is_pack(dl)) else find_video
     content = getattr(status, "content_path", None)
-    name = None
     if content:
         save = resolve_path(content)
-        src = locate(save, None) if save else None            # already this job's own content
+        name = None                                          # already this job's own content
     else:
         reported = getattr(status, "save_path", None) or getattr(status, "incomplete_path", None)
         save = resolve_path(reported)
         name = getattr(status, "name", None)
-        src = locate(save, name) if save else None
+        # a usenet client reports the job's OWN folder (sab ``storage``, nzbget
+        # FinalDir/DestDir), not the shared parent a torrent client reports.
+        # looking for save/name inside it found nothing, so every usenet grab sat
+        # at 100% until the stall timer failed it. scope by name only when that
+        # subfolder really is there
+        if str(dl.get("source") or "").lower() == "usenet" and save and name \
+                and not _scoped_content(save, name):
+            name = None
+    # A season pack is a FOLDER of episodes. Falling through to find_video here would pick
+    # its largest file, hand that one episode to the importer, and leave the rest on disk —
+    # and since a pack row carries no single episode identity, the importer then rejects it
+    # outright ("Season/complete packs need manual import"), stranding the whole download.
+    if save and import_pack is not None and is_pack_download(dl):
+        # Commissary: a pack folder still being moved/unpacked is not finished.
+        folder = find_content_dir(save, name) if settled is not None else None
+        if folder and not settled(dl, folder):
+            return {"progress": 100.0}
+        # Commissary: a season delivered as RAR parts would fail per file, deep
+        # in the importer, with a message about the wrong thing
+        if listing is not None and folder:
+            from core.commissary.packed_release import finished as _packed_finished
+            _refused = _packed_finished(dl, folder, lister=listing)
+            if _refused is not None:
+                return _refused
+        packed = import_pack(dl, save, name)
+        if packed is not None:
+            return packed
+    src = find_video(save, name) if save else None
     if not src:
         if dl.get("dest_path"):
             return {"status": "completed", "progress": 100.0, "dest_path": dl.get("dest_path")}
-        # "Not yet" and "never" look identical from here, and the difference is
-        # thirty minutes of polling followed by a message telling you to go and
-        # check your save paths. So look at what DID arrive.
-        own = scoped_content_path(save, name)
-        names = listing(own) if (listing and own) else []
-        if packed_release.classify(names) == packed_release.PACKED:
-            # Settle FIRST. A usenet job at 100% is very often still being unrar'd
-            # by its own client, with the rars sitting right there while it works;
-            # failing on sight would kill the exact case that was about to succeed.
-            if settled is None or settled(dl, own):
-                return _packed_patch(dl, names)
+        # Commissary: 'not yet' and 'never' look the same from here - a finished job
+        # that is archives and nothing playable is refused once it has settled,
+        # instead of polling until the stall clock blames the save path
+        if listing is not None and save:
+            from core.commissary.packed_release import finished as _packed_finished
+            _own = _scoped_content(save, name) if name else save
+            _refused = _packed_finished(dl, _own, settled, lister=listing) if _own else None
+            if _refused is not None:
+                return _refused
         return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
-    # Visible is not the same as finished. qBittorrent's 'moving' (relocating from
-    # the incomplete folder to the complete one) reports progress 1.0, and the
-    # adapter maps it to 'queued' — which normalises to 'downloading' here, so the
-    # `state != completed AND pct < 100` guard above lets it straight through and
-    # the import reads a file mid-copy. The same is true of usenet par2 repair and
-    # unrar, which write into the folder well after the download hits 100%.
-    # State alone cannot fix this: the adapter deliberately lumps 'moving' and
-    # 'checkingDL' in with 'queuedUP' (done, merely queued to seed), and refusing
-    # to import on 'queued' would strand every seed-queued torrent at 100% forever
-    # — the exact bug the comment above was written to prevent. So the gate is the
-    # filesystem itself: hold until the bytes stop changing.
+    # Commissary: visible is not finished — a 'moving' torrent reads 100%.
     if settled is not None and not settled(dl, src):
         return {"progress": 100.0}   # still being written — keep polling
-    # find_pack_dir hands back its content FOLDER whatever is in it, so a season
-    # delivered as RAR parts gets this far with src set and would fail deep in the
-    # importer, per file, with a message about the wrong thing entirely. Settled
-    # already, so there is no unrar left to wait for.
-    settled_names = listing(src) if listing else None
-    if settled_names is not None and \
-            packed_release.classify(settled_names) == packed_release.PACKED:
-        return _packed_patch(dl, settled_names)
     if organizer is not None:
         return organizer(dl, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
@@ -225,47 +176,6 @@ def _get_status(source: str, ref: str):
     except Exception:   # noqa: BLE001 - a poll hiccup = 'unknown this tick', not a failure
         logger.debug("client status poll failed for %s %s", source, ref, exc_info=True)
         return None
-
-
-def _list_files(source: str, ref: str):
-    """The torrent client's file list for one job, memoized per client ref.
-
-    Memoized because the monitor polls every few seconds and this answer does not
-    change once the metadata is in — asking every tick would be a request per
-    torrent per tick to settle a question asked once. Only a NON-EMPTY answer is
-    cached: an empty list means the magnet has not resolved yet, and caching that
-    as final would mean never looking again at precisely the torrents that had
-    not told us anything.
-
-    Torrent adapters only — the usenet ones have no such call, and would answer
-    'rars' for every job even when SABnzbd is about to unpack them perfectly."""
-    if source != "torrent":
-        return None
-    cached = _files_cache.get(ref)
-    if cached is not None:
-        return cached
-    try:
-        from core.torrent_clients import get_active_adapter
-        adapter = get_active_adapter()
-        if adapter is None or not hasattr(adapter, "list_files"):
-            return None
-        names = _run(adapter.list_files(ref))
-    except Exception:   # noqa: BLE001 - unanswerable reads as unknown, never as bad
-        logger.debug("file list unavailable for %s", ref, exc_info=True)
-        return None
-    if names:
-        if len(_files_cache) > _FILES_CACHE_CAP:
-            for stale in list(_files_cache)[:len(_files_cache) - _FILES_CACHE_CAP]:
-                _files_cache.pop(stale, None)
-        _files_cache[ref] = list(names)
-    return names
-
-
-# client_ref -> the file list, once the client has actually given us one. Same
-# shape and the same reason as _settle_state below: the monitor calls process_*
-# once per tick with no memory in between.
-_files_cache: dict = {}
-_FILES_CACHE_CAP = 512
 
 
 def _resolve_path(reported):
@@ -315,59 +225,6 @@ def _scoped_content(root, name) -> Optional[str]:
     return None
 
 
-def find_pack_dir(root, name=None) -> Optional[str]:
-    """The FOLDER holding a season/series pack's episodes, scoped to this job.
-
-    The single-file path collapses a pack to its largest member, which would
-    import one episode and silently abandon the rest — so a pack asks for its
-    content root instead and the importer fans it out. Same scoping rule as
-    find_video_file: with a job name we only ever look inside that job's own
-    content, never the shared download folder.
-
-    A pack that turns out to be ONE file (a whole season in a single container,
-    or a mislabelled release) is handed back as that file, so the caller's normal
-    single-file import still gets a chance at it."""
-    if not root:
-        return None
-    target = _scoped_content(root, name) if name else root
-    if not target:
-        return None
-    if os.path.isdir(target):
-        return str(target)
-    return str(target) if _is_video(str(target)) else None
-
-
-def scoped_content_path(root, name=None) -> Optional[str]:
-    """This job's OWN content inside ``root``, or None when it isn't there.
-
-    Public because the archive check and the settle gate that guards it both
-    have to look at exactly what ``find_video_file`` looked at. A shared download
-    folder holds every concurrent grab, so a neighbour's .rar files must never be
-    what condemns this release."""
-    if not root:
-        return None
-    return _scoped_content(root, name) if name else str(root)
-
-
-def content_listing(path) -> list:
-    """Every file under ``path`` (or the file itself), as full paths.
-
-    The mirror image of ``_largest_video``: the same walk, asking what IS here
-    rather than which video is biggest. Handed to the same classifier the torrent
-    client's file list goes through, so both sources get one answer."""
-    if not path:
-        return []
-    if os.path.isfile(path):
-        return [str(path)]
-    if not os.path.isdir(path):
-        return []
-    out = []
-    for dirpath, _dirs, files in os.walk(path):
-        for f in files:
-            out.append(os.path.join(dirpath, f))
-    return out
-
-
 def find_video_file(root, name=None) -> Optional[str]:
     """The main video file for a download. When ``name`` (the torrent/nzb job name) is given the
     search is SCOPED to that job's own content (``root/name``), so a shared download folder
@@ -382,81 +239,22 @@ def find_video_file(root, name=None) -> Optional[str]:
     return _largest_video(root)
 
 
-# ── the settle gate ──────────────────────────────────────────────────────────
-# How many CONSECUTIVE identical readings of the content mean "nothing is writing
-# to this any more". Two is the minimum that can mean anything (one reading proves
-# nothing), and at the monitor's 3s poll that costs one extra tick.
-_SETTLE_READS = 2
-
-# download id -> (path, snapshot, consecutive_matches). Module-level because the
-# monitor calls process_* once per tick with no memory between calls — the same
-# shape as this module's sibling `_stall` map in download_monitor.
-_settle_state: dict = {}
-_SETTLE_STATE_CAP = 512
-
-
-def _snapshot(path: str):
-    """Size/count/mtime fingerprint, reusing the music side's tested helper.
-
-    mtime is what makes this work for torrents specifically: a pre-allocated or
-    sparse file already has its FINAL size on the first byte written, so size
-    alone cannot tell a finished file from one still being filled in.
-    """
-    try:
-        from core.download_plugins.album_bundle import snapshot_incomplete_path
-        return snapshot_incomplete_path(path)
-    except Exception:   # noqa: BLE001 - unreadable reads as "not settled", never as done
+def find_content_dir(root, name=None) -> Optional[str]:
+    """This job's own content as a DIRECTORY, or None when it is a single file. The pack
+    path needs the folder, not the file inside it, and must never widen to ``root`` — that
+    is the shared download dir holding every concurrent grab."""
+    if not root:
         return None
+    scoped = _scoped_content(root, name) if name else str(root)
+    return scoped if scoped and os.path.isdir(scoped) else None
 
 
-def content_has_settled(dl: dict, path: str, *, snapshot=_snapshot,
-                        required: int = _SETTLE_READS) -> bool:
-    """True once ``path`` has read identical ``required`` times in a row.
-
-    An unreadable path, an empty directory, or a path that changed since the last
-    tick all reset the count — a client that has just created the destination
-    folder and not yet copied into it must not look the same as one that has
-    finished. Errs toward waiting: the cost of being wrong here is a corrupt
-    file in the library, the cost of waiting is one 3-second tick.
-    """
-    key = str(dl.get("id") or dl.get("client_ref") or path)
-    current = snapshot(path)
-    prior_path, prior_snap, matches = _settle_state.get(key, (None, None, 0))
-
-    if current is None or current[1] <= 0:
-        _settle_state[key] = (path, None, 0)
-        return False
-    if path == prior_path and current == prior_snap:
-        matches += 1
-    else:
-        matches = 1
-    _settle_state[key] = (path, current, matches)
-
-    if matches >= required:
-        _settle_state.pop(key, None)     # done with this download
-        return True
-    if len(_settle_state) > _SETTLE_STATE_CAP:
-        # Downloads that vanish mid-settle would otherwise leak an entry each.
-        for stale in list(_settle_state)[:len(_settle_state) - _SETTLE_STATE_CAP]:
-            _settle_state.pop(stale, None)
-    return False
-
-
-def forget_settle_state(dl_id) -> None:
-    """Drop a download's settle progress (cancelled, failed, retried elsewhere)."""
-    _settle_state.pop(str(dl_id), None)
-
-
-def forget_file_list(client_ref) -> None:
-    """Drop a job's cached file list. Its own function rather than a line in
-    forget_settle_state because the two are keyed differently — settle by
-    download id, this by the CLIENT's ref, which is what the adapter answers to."""
-    _files_cache.pop(str(client_ref), None)
-
-
-def process_active_client_download(dl: dict, organizer=None) -> dict:
+def process_active_client_download(dl: dict, organizer=None, import_pack=None) -> dict:
     """Production entry: poll the real client + resolve + find the video for one torrent/usenet row."""
+    from core.commissary.settle import content_has_settled  # Commissary: settle gate
+    from core.commissary import packed_release as _packed
     return process_client_download(dl, get_status=_get_status, resolve_path=_resolve_path,
                                    find_video=find_video_file, organizer=organizer,
-                                   find_pack=find_pack_dir, settled=content_has_settled,
-                                   list_files=_list_files, listing=content_listing)
+                                   import_pack=import_pack, settled=content_has_settled,
+                                   # Commissary: refuse RAR-only releases
+                                   list_files=_packed.client_files, listing=_packed.listing)

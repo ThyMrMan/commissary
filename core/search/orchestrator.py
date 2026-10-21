@@ -134,14 +134,20 @@ def _build_db_artists(query: str, deps: SearchDeps) -> list[dict]:
     return out
 
 
+# 2, not 3: U2, A1, M83's cousins. a 3 floor quietly made them unsearchable
+# (#1291). matches MIN_QUERY_LENGTH on the search page.
+MIN_REMOTE_QUERY_LENGTH = 2
+
+
 def _short_query_response(db_artists: list[dict], requested_source: str, deps: SearchDeps) -> dict:
-    """Skip the remote search for queries shorter than 3 chars."""
+    """Skip the remote search for a query too short to mean anything."""
     short_source = requested_source or deps.get_metadata_fallback_source()
     return {
         'db_artists': db_artists,
         'spotify_artists': [],
         'spotify_albums': [],
         'spotify_tracks': [],
+        'spotify_playlists': [],
         'metadata_source': short_source,
         'primary_source': short_source,
         'alternate_sources': [],
@@ -158,16 +164,22 @@ def _single_source_response(
     """Run a single-source search — bypasses the fan-out."""
     client, available = resolve_client(requested_source, deps)
 
-    # Explicit Spotify pick that the normal gate rejected (no auth, and 'Spotify
-    # Free' isn't the chosen metadata source). If the no-creds SpotipyFree package
-    # is installed, honor the deliberate selection via the free source instead of
-    # returning nothing — the explicit per-search pick is the user's consent, and
-    # this stays out of every background/fan-out path (which never reaches here).
+    # Explicit Spotify pick without working auth: honor the deliberate selection
+    # via the no-creds free source — the per-search pick is the user's consent,
+    # and this stays out of every background/fan-out path (which never reaches
+    # here). Keyed on AUTH STATE, not on resolve_client failing: the request-
+    # scoped free opt-in can make the resolver hand the client back for this
+    # request, but the actual searches run in ThreadPoolExecutor workers where
+    # the Flask request context (and thus that opt-in) is invisible — so free
+    # must ride the EXPLICIT prefer_free parameter into the workers. Relying on
+    # `not client` here once silently served the Deezer fallback under the
+    # Spotify label the moment the resolver got smarter.
     prefer_free = False
-    if not client and requested_source == 'spotify' and deps.spotify_client:
+    if requested_source == 'spotify' and deps.spotify_client:
         try:
-            if deps.spotify_client._free_installed():
-                client = deps.spotify_client
+            if (deps.spotify_client._free_installed()
+                    and not deps.spotify_client.is_spotify_authenticated()):
+                client = client or deps.spotify_client
                 prefer_free = True
         except Exception as e:
             logger.debug(f"Spotify free-fallback availability check failed: {e}")
@@ -178,6 +190,7 @@ def _single_source_response(
             'spotify_artists': [],
             'spotify_albums': [],
             'spotify_tracks': [],
+            'spotify_playlists': [],
             'metadata_source': requested_source,
             'primary_source': requested_source,
             'alternate_sources': [],
@@ -188,12 +201,13 @@ def _single_source_response(
         source_results = sources.search_source(query, client, requested_source, prefer_free=prefer_free)
     except Exception as e:
         logger.warning(f"Single-source search ({requested_source}) failed: {e}")
-        source_results = {'artists': [], 'albums': [], 'tracks': [], 'available': False}
+        source_results = {'artists': [], 'albums': [], 'tracks': [], 'playlists': [], 'available': False}
 
     logger.info(
         f"Enhanced search [source={requested_source}] results: "
         f"{len(db_artists)} DB, {len(source_results['artists'])} artists, "
-        f"{len(source_results['albums'])} albums, {len(source_results['tracks'])} tracks"
+        f"{len(source_results['albums'])} albums, {len(source_results['tracks'])} tracks, "
+        f"{len(source_results.get('playlists', []))} playlists"
     )
 
     return {
@@ -201,10 +215,14 @@ def _single_source_response(
         'spotify_artists': source_results['artists'],
         'spotify_albums': source_results['albums'],
         'spotify_tracks': source_results['tracks'],
+        'spotify_playlists': source_results.get('playlists', []),
         'metadata_source': requested_source,
         'primary_source': requested_source,
         'alternate_sources': [],
-        'source_available': True,
+        # M16: a total provider outage must not be cached as a successful
+        # empty search — the source is only available when at least one
+        # search kind succeeded.
+        'source_available': source_results.get('available', True),
     }
 
 
@@ -288,7 +306,8 @@ def _fan_out_response(query: str, db_artists: list[dict], deps: SearchDeps) -> d
         f"Enhanced search results ({primary_source}): {len(db_artists)} DB artists, "
         f"{len(primary_results['artists'])} artists, "
         f"{len(primary_results['albums'])} albums, "
-        f"{len(primary_results['tracks'])} tracks | "
+        f"{len(primary_results['tracks'])} tracks, "
+        f"{len(primary_results.get('playlists', []))} playlists | "
         f"Alt sources available: {alternate_sources}"
     )
 
@@ -297,9 +316,14 @@ def _fan_out_response(query: str, db_artists: list[dict], deps: SearchDeps) -> d
         'spotify_artists': primary_results['artists'],
         'spotify_albums': primary_results['albums'],
         'spotify_tracks': primary_results['tracks'],
+        'spotify_playlists': primary_results.get('playlists', []),
         'metadata_source': primary_source,
         'primary_source': primary_source,
         'alternate_sources': alternate_sources,
+        # M16: only mark the source available when at least one search kind
+        # succeeded on it — a provider outage must not be cached as a
+        # successful empty search.
+        'source_available': primary_results.get('available', False),
     }
 
 
@@ -310,6 +334,7 @@ def empty_response() -> dict:
         'spotify_artists': [],
         'spotify_albums': [],
         'spotify_tracks': [],
+        'spotify_playlists': [],
         'sources': {},
         'primary_source': 'spotify',
         'metadata_source': 'spotify',
@@ -324,7 +349,7 @@ def run_enhanced_search(query: str, requested_source: str, deps: SearchDeps) -> 
     """
     db_artists = _build_db_artists(query, deps)
 
-    if len(query) < 3:
+    if len(query) < MIN_REMOTE_QUERY_LENGTH:
         return _short_query_response(db_artists, requested_source, deps)
 
     if requested_source:
@@ -345,14 +370,37 @@ def resolve_youtube_videos_client(deps: SearchDeps):
     return deps.download_orchestrator.client('youtube')
 
 
-def stream_youtube_videos(query: str, youtube_client, run_async: Callable) -> Iterator[str]:
+# how many videos one yt-dlp search may ask for. the default is what the
+# search page has always fetched; the ceiling is the artist page's "show more"
+# path. above 60 yt-dlp pages through search results slowly enough that the
+# request stops feeling like a click.
+YOUTUBE_VIDEO_LIMIT_DEFAULT = 20
+YOUTUBE_VIDEO_LIMIT_MAX = 60
+
+
+def clamp_youtube_video_limit(value) -> int:
+    """the `limit` a client may send, pinned to [1, YOUTUBE_VIDEO_LIMIT_MAX].
+
+    anything that isn't a number (None, '', 'abc') means the default, so an
+    old client that never sends limit keeps its old result count.
+    """
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return YOUTUBE_VIDEO_LIMIT_DEFAULT
+    return max(1, min(YOUTUBE_VIDEO_LIMIT_MAX, limit))
+
+
+def stream_youtube_videos(query: str, youtube_client, run_async: Callable,
+                          max_results: int = YOUTUBE_VIDEO_LIMIT_DEFAULT) -> Iterator[str]:
     """yt-dlp video search generator — yields one videos chunk + done marker.
 
-    Caller is responsible for verifying youtube_client is not None.
+    Caller is responsible for verifying youtube_client is not None and for
+    clamping max_results (clamp_youtube_video_limit).
     """
     try:
         video_query = f"{query} official music video"
-        results = run_async(youtube_client.search_videos(video_query, max_results=20))
+        results = run_async(youtube_client.search_videos(video_query, max_results=max_results))
         videos = []
         for v in (results or []):
             videos.append({
@@ -372,18 +420,23 @@ def stream_youtube_videos(query: str, youtube_client, run_async: Callable) -> It
     yield json.dumps({'type': 'done'}) + '\n'
 
 
-def stream_metadata_source(source_name: str, query: str, client) -> Iterator[str]:
+def stream_metadata_source(source_name: str, query: str, client,
+                           prefer_free: bool = False) -> Iterator[str]:
     """Fan three search-kinds out and yield each as it lands.
 
-    Caller is responsible for resolving and validating the client.
+    Caller is responsible for resolving and validating the client, and for
+    passing prefer_free for an explicit unauthed Spotify pick — the workers
+    run outside the Flask request context, so free can only ride this
+    explicit parameter (same rule as run_enhanced_search's single-source path).
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(sources.search_kind, client, query, 'artists', source_name): 'artists',
-            executor.submit(sources.search_kind, client, query, 'albums', source_name): 'albums',
-            executor.submit(sources.search_kind, client, query, 'tracks', source_name): 'tracks',
+            executor.submit(sources.search_kind, client, query, 'artists', source_name, prefer_free): 'artists',
+            executor.submit(sources.search_kind, client, query, 'albums', source_name, prefer_free): 'albums',
+            executor.submit(sources.search_kind, client, query, 'tracks', source_name, prefer_free): 'tracks',
+            executor.submit(sources.search_kind, client, query, 'playlists', source_name, prefer_free): 'playlists',
         }
         for future in as_completed(futures):
             kind = futures[future]

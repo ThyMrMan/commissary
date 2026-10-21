@@ -37,49 +37,18 @@ def dest_path_for(target_dir: str, src_path: str) -> str:
     return os.path.join(str(target_dir or ""), basename_of(src_path))
 
 
-def resolve_download_root(kind: str, *, root_folder: dict | None = None,
-                          primary_root_folder: dict | None = None,
-                          paths: dict | None = None) -> str:
-    """Where a finished movie/show download should land (multi-library, P.4).
-    Kept pure like the rest of this module — callers fetch the DB-backed
-    ingredients and pass them in. Order:
-      1. ``root_folder`` — an explicitly-picked Library (the interactive "Get"
-         flow's dropdown, or a season-pack/manual-import override).
-      2. ``primary_root_folder`` — the lowest-``sort_order`` configured
-         Library for this kind (the default for unattended grabs: wishlist
-         drain, RSS instant-grab, repair upgrades — nobody's there to pick).
-      3. ``paths`` — the legacy scalar {movies_path, tv_path[, transfer_path]}
-         config, unchanged fallback for installs with zero Libraries configured.
-    Each dict wins only when it actually carries a non-blank ``path``/*_path,
-    so a Library row that exists but has no destination set yet doesn't
-    shadow a good fallback."""
-    k = "movie" if str(kind or "").lower() in ("movie", "movies", "film", "films") else "show"
-    if root_folder and root_folder.get("path"):
-        return root_folder["path"]
-    if primary_root_folder and primary_root_folder.get("path"):
-        return primary_root_folder["path"]
+def target_dir_for(kind: str, paths: dict) -> str:
+    """Pick the library folder for a download's kind. ``paths`` = the config dict
+    ({movies_path, tv_path, youtube_path})."""
     paths = paths or {}
+    k = str(kind or "").lower()
     if k == "movie":
-        return paths.get("movies_path") or paths.get("transfer_path") or ""
-    return paths.get("tv_path") or ""
+        return paths.get("movies_path") or ""
+    if k in ("show", "tv", "episode", "season", "series"):
+        return paths.get("tv_path") or ""
+    if k == "youtube":
+        return paths.get("youtube_path") or ""
+    return ""
 
 
-def resolve_torrent_category(*, root_folder: dict | None = None,
-                             primary_root_folder: dict | None = None) -> str | None:
-    """Which torrent/usenet client category or label a grab destined for this
-    library should carry (multi-category, mirrors resolve_download_root's tiers):
-      1. ``root_folder`` — an explicitly-picked Library's own category.
-      2. ``primary_root_folder`` — the primary configured Library's category.
-      3. ``None`` — the caller falls back to the global torrent_client.category
-         / usenet_client.category setting.
-    A Library that exists but has no category set (blank) means "inherit",
-    not "no category" — same blank-doesn't-shadow rule as the path tiers."""
-    if root_folder and (root_folder.get("category") or "").strip():
-        return root_folder["category"].strip()
-    if primary_root_folder and (primary_root_folder.get("category") or "").strip():
-        return primary_root_folder["category"].strip()
-    return None
-
-
-__all__ = ["basename_of", "find_completed_file", "dest_path_for", "resolve_download_root",
-           "resolve_torrent_category"]
+__all__ = ["basename_of", "find_completed_file", "dest_path_for", "target_dir_for"]

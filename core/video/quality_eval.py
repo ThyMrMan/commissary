@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from core.video.quality_profile import TIERS as _QP_TIERS
+
 # Resolution ranking (higher = better). The loose cutoff and the owned-vs-target
 # check both compare on this rank, so "1920x1080", "1080p" and "1080" all agree.
 _RES_RANK = (("2160", 4), ("4k", 4), ("1440", 3), ("1080", 3),
@@ -26,6 +28,20 @@ def _as_year(v: Any):
         return int(str(v)[:4]) if v not in (None, "") else None
     except (TypeError, ValueError):
         return None
+
+
+def tv_year_mismatch(release_year: Any, show_year: Any) -> bool:
+    """True when a release's year says it's a DIFFERENT show than the wanted
+    one ("Dark Matter (2015)" vs "Dark Matter (2024)"). a year off by one
+    either way is the same show: a first-air date late in the year, a pilot,
+    or a miniseries year the scene uses ("Battlestar.Galactica.2003" for the
+    2004 series). unknown on either side is no judgement.
+
+    callers pass the year in the release's TITLE region (title_region_year):
+    that's where the scene puts a show's disambiguating year. a year after the
+    SxxExx ('Natural High S03E03 2025 1080p') is the air year, not the show's."""
+    py, wy = _as_year(release_year), _as_year(show_year)
+    return bool(py and wy and abs(py - wy) > 1)
 
 
 def resolution_rank(res: Any) -> int:
@@ -111,20 +127,42 @@ _SRC_TIER = {"remux": "remux", "bluray": "bluray", "web-dl": "web",
 _RES_SCORE = {"2160p": 400, "1080p": 300, "720p": 200, "480p": 100}
 _SRC_SCORE = {"remux": 90, "bluray": 70, "web-dl": 55, "webrip": 40, "hdtv": 25, "dvd": 10}
 
-# Which parsed audio tracks earn the audio bonus, per profile["prefer_audio"].
-# "any" is the historical set (the bonus used to be unconditional on it), so
-# existing profiles are unaffected; the other modes narrow or widen it.
-_AUDIO_PREF_SETS = {
-    "any": ("atmos", "truehd", "dts-hd"),
-    "lossless": ("atmos", "truehd", "dts-hd"),
-    "atmos": ("atmos",),
-    "surround": ("atmos", "truehd", "dts-hd", "dts", "eac3", "ac3"),
+# Everything the release parser folds into "SD". ``release_parse`` normalises both
+# 480p and 576p to "480p", but the set is spelled out so a parser that later keeps
+# 576p distinct still lands on the SD tiers instead of falling off the ladder.
+_SD_RESOLUTIONS = frozenset({"480p", "576p"})
+
+# When a (source, resolution) pair has no tier of its own, snap to the nearest
+# source the ladder DOES define at that resolution. Ordered nearest-first; a
+# remux with no remux tier is disc-sourced, so bluray describes it best.
+_SRC_FALLBACK = {
+    "remux": ("bluray", "web"),
+    "bluray": ("web",),
+    "web": ("webrip", "hdtv"),
+    "webrip": ("web", "hdtv"),
+    "hdtv": ("webrip", "web"),
 }
+
+
+# The ladder itself, as the set tier_key validates against. The dependency is
+# one-way (quality_profile imports nothing from here), so a plain import is safe
+# and keeps the invariant checkable without a function call per hit.
+_LADDER = frozenset(_QP_TIERS)
 
 
 def tier_key(source, resolution) -> str:
     """The quality-ladder key for a parsed (source, resolution), or '' if it isn't a
-    ladder tier (junk sources like cam/screener have no tier)."""
+    ladder tier (junk sources like cam/screener have no tier).
+
+    **Invariant: the result is always '' or a member of ``quality_profile.TIERS``.**
+    It used to be a plain ``source + '-' + resolution`` concatenation, which could
+    name tiers the ladder never defined — ``webrip-720p``, ``hdtv-2160p``,
+    ``web-480p``. Those releases were then rejected as "isn't in your enabled
+    tiers" with no toggle anywhere that could accept them, and the ``sdtv`` tier
+    in the UI was a dead switch because nothing could ever produce that key. Two
+    rules close it: SD collapses onto the ladder's deliberately source-less SD
+    tiers, and any remaining gap snaps to the nearest defined source at the same
+    resolution. ``test_quality_tier_keyspace`` walks the whole product space."""
     pre = _SRC_TIER.get(source)
     if not pre:
         # A loosely-named release with a known resolution but NO recognised source
@@ -137,35 +175,34 @@ def tier_key(source, resolution) -> str:
             return ""
     if pre == "dvd":
         return "dvd"
-    return (pre + "-" + resolution) if resolution else ""
+    if not resolution:
+        # 'Show.S15E14.HDTV.x264-GRP' with no resolution is the classic SD
+        # broadcast release, which Sonarr reads as SDTV. it used to die as
+        # "Unknown / unsupported quality" with no setting that could take it.
+        return "sdtv" if pre == "hdtv" else ""
+    if resolution in _SD_RESOLUTIONS:
+        # The ladder collapses SD deliberately: below 720p the source barely
+        # matters and the two source-less tiers (dvd / sdtv) are what the UI
+        # offers. Anything SD that isn't disc-sourced is broadcast-grade.
+        return "sdtv"
+    key = pre + "-" + resolution
+    if key in _LADDER:
+        return key
+    for alt in _SRC_FALLBACK.get(pre, ()):        # snap to the nearest defined source
+        if (alt + "-" + resolution) in _LADDER:
+            return alt + "-" + resolution
+    return ""
 
 
-# How many wanted titles a rejection spells out before it starts counting.
-# A handful of aliases is worth reading — seeing that 'Sur Ecoute' was tried
-# answers the question on its own. A well-travelled show's alias set is the
-# primary title plus every TMDB alternative, thirty names in a dozen scripts,
-# and all of them joined buries the one name the user would recognise.
-_WANTED_SPELLED_OUT = 3
-
-
-def _wanted_text(want_title) -> str:
-    """The wanted side of a title rejection, in a form a person can read.
-
-    A list repr ("wanted ['A', 'B']") must never reach the user, and neither
-    should thirty titles: the ones that fit are named, the rest are counted."""
-    if isinstance(want_title, str):
-        return want_title
-    names = [str(t) for t in (want_title or []) if t]
-    if not names:
-        return "?"
-    if len(names) <= _WANTED_SPELLED_OUT:
-        return " / ".join(names)
-    return "%s (+%d more)" % (" / ".join(names[:_WANTED_SPELLED_OUT]),
-                              len(names) - _WANTED_SPELLED_OUT)
+def _rt_arc_match(release_name, want_title, want_episode):
+    """Commissary: core.commissary.release_titles.arc_episode_match."""
+    from core.commissary.release_titles import arc_episode_match
+    return arc_episode_match(release_name, want_title, want_episode)
 
 
 def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_title=None,
-              want_date=None, want_absolute=None):
+              want_date=None, want_absolute=None, want_alt=None):
+    from core.video.release_parse import title_region_year
     """Validate a hit actually matches what was searched (Sonarr/Radarr-style): the
     TITLE must match the wanted film/show (not just be a substring — 'The Cloverfield
     Paradox 2018' must NOT satisfy a search for 'Paradox (2017)'), an episode search
@@ -175,23 +212,21 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
     # Title gate first — applies to every scope. Rejects a confident title mismatch;
     # an unknown/unisolable title passes through to the scope/year checks below.
     if want_title:
-        from core.video.release_parse import (arc_episode_match, arc_episode_number,
-                                              compared_title, titles_match)
-        # An arc's releases extend the show's title with the arc's name
-        # ('Bleach - Sennen Kessen Hen'), which reads here as a different show.
-        # The judgement is deferred to the episode branch below, which is where
-        # the arc's numbering has to agree and where a pack is turned away.
-        _arc = scope == "episode" and arc_episode_match(
+        from core.video.release_parse import extract_title, titles_match
+        # Commissary: an arc's releases extend the show's title with the arc's
+        # name ('Bleach - Sennen Kessen Hen - 48'), which reads as another show.
+        # The episode branch judges them; the arc's other episodes are the right
+        # show with the wrong number, not a wrong title.
+        from core.commissary import release_titles as _rt
+        _arc = scope == "episode" and _rt.arc_episode_match(
             parsed.get("title"), want_title, want_episode)
         if not _arc and not titles_match(parsed.get("title"), want_title):
-            # The same show's arc, a different episode of it. Saying 'wrong title'
-            # here greys out every episode of an arc in the picker as though none
-            # of them were the show at all.
-            if scope == "episode" and arc_episode_number(
+            if scope == "episode" and _rt.arc_episode_number(
                     parsed.get("title"), want_title) is not None:
                 return None, "Wrong episode"
             return None, "Wrong title (%s — wanted %s)" % (
-                compared_title(parsed.get("title")) or "?", _wanted_text(want_title))
+                _rt.compared_title(parsed.get("title")) or extract_title(parsed.get("title")) or "?",
+                _rt.wanted_text(want_title))
     season, episode = parsed.get("season"), parsed.get("episode")
     if scope == "movie":
         if season is not None:
@@ -216,62 +251,89 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
                 from core.video.release_parse import has_absolute_episode
                 if has_absolute_episode(parsed.get("title"), want_absolute):
                     return None, None
-            # The arc's OWN numbering: a season that IS an arc counts from 1, so
-            # the number on the release is the season's episode number and the
-            # show's absolute (414 for Bleach S17E48) is written nowhere on it.
-            from core.video.release_parse import arc_episode_match
-            if not parsed.get("is_season_pack") and arc_episode_match(
+            # Commissary: an arc numbers its own episodes from 1 (Bleach S17E48 is
+            # '... Sennen Kessen Hen - 48'); never a season pack.
+            if not parsed.get("is_season_pack") and _rt_arc_match(
                     parsed.get("title"), want_title, want_episode):
                 return None, None
-            # NOT "this is a pack" — the parser found no episode number at all.
-            # The old wording ("Not a single episode") described a conclusion the
-            # code never reached, and sent people off checking whether the file
-            # was a season pack when the real answer is that nothing in the name
-            # said which episode it is (fansub absolute numbering, a date-named
-            # daily, or just an unparseable name).
-            return None, "No episode number in the release name"
-        if want_season is not None and season != want_season:
+            return None, "Not a single episode"
+        # A multi-episode file (S01E01E02 / E01-03) satisfies any episode it spans.
+        ep_end = parsed.get("episode_end") or episode
+        # the scene's own (TVDB) numbering for this episode, when it differs
+        # from TMDB's: a release named by it is this episode too
+        alt_ok = exclusive = False
+        if want_alt:
+            try:
+                a_s, a_e = int(want_alt[0]), int(want_alt[1])
+                alt_ok = season == a_s and episode <= a_e <= ep_end
+                exclusive = len(want_alt) > 2 and bool(want_alt[2])
+            except (TypeError, ValueError, IndexError):
+                alt_ok = False
+        if exclusive and not alt_ok:
+            # the TMDB number names a different episode in the scene's
+            # numbering, so only the scene number (or the air date) is this one
+            if want_date and parsed.get("air_date") == want_date:
+                return None, None
+            return None, "Wrong episode (scene numbering is S%02dE%02d)" % (a_s, a_e)
+        if want_season is not None and season != want_season and not alt_ok:
             # A date match trumps a numbering mismatch — scene season numbering for
             # dailies rarely agrees with TMDB's, but the air date is unambiguous.
             if want_date and parsed.get("air_date") == want_date:
                 return None, None
             return None, "Wrong season"
-        # A multi-episode file (S01E01E02 / E01-03) satisfies any episode it spans.
-        ep_end = parsed.get("episode_end") or episode
-        if want_episode is not None and not (episode <= want_episode <= ep_end):
+        if (not alt_ok and want_episode is not None
+                and not (episode <= want_episode <= ep_end)):
             if want_date and parsed.get("air_date") == want_date:
                 return None, None
-            # Scene/indexer ABSOLUTE numbering: an anime tracker writes the show's
-            # absolute number into the SxxExx it synthesises — Re:ZERO S4E16 ships
-            # as 'Season 4 S04E82 - 82', 82 being the 66 episodes before season 4
-            # plus 16. The season is right and only the counter differs, so the
-            # numbering check above turns away the very episode that was asked for.
-            # Both signals have to agree before this accepts: the season check
-            # above has already passed, and the number IS the absolute computed
-            # for the episode asked for — never merely close to it, and never a
-            # guess when the show's absolute numbering is unknown (None).
-            if want_absolute and episode <= want_absolute <= ep_end:
+            # Commissary: an anime tracker writes the ABSOLUTE number into the
+            # SxxExx it makes up (Re:ZERO S4E16 ships as 'S04E82'). The season
+            # already matched; accept only the exact absolute for this episode.
+            if want_absolute and episode <= int(want_absolute) <= ep_end:
                 return None, None
             return None, "Wrong episode"
+        # Show-identity gate (the "Dark Matter" case): two different shows can share
+        # a name AND an SxxExx — "Dark Matter (2015)" and "Dark Matter (2024)" both
+        # have an S02E06. When the release name carries a year and it disagrees with
+        # the wanted show's first-air year, it's the wrong show. Same rule as movies
+        # (earlier year, or >1 later, is a different show); an unknown year passes
+        # because TV scene releases usually omit it. Skipped when the match came via
+        # air date (the year token there is the air date itself, not disambiguation).
+        show_year = title_region_year(parsed.get("title"))
+        if tv_year_mismatch(show_year, want_year):
+            return None, "Wrong year (%s — wanted %s)" % (show_year, _as_year(want_year))
         return None, None
     if scope == "season":
         if not parsed.get("is_season_pack"):
             return None, "Not a full-season pack"
         if want_season is not None and season != want_season:
             return None, "Wrong season"
+        # Same show-identity gate as episodes: a year-tagged pack for the wrong
+        # show's season must not satisfy this show's season search.
+        show_year = title_region_year(parsed.get("title"))
+        if tv_year_mismatch(show_year, want_year):
+            return None, "Wrong year (%s — wanted %s)" % (show_year, _as_year(want_year))
         return None, None
     if scope == "series":
-        return (None, None) if parsed.get("is_series_pack") else (None, "Not a complete-series pack")
+        if not parsed.get("is_series_pack"):
+            return None, "Not a complete-series pack"
+        # Same show-identity gate: a year-tagged complete pack for the wrong show.
+        show_year = title_region_year(parsed.get("title"))
+        if tv_year_mismatch(show_year, want_year):
+            return None, "Wrong year (%s — wanted %s)" % (show_year, _as_year(want_year))
+        return None, None
     return None, None
 
 
 def evaluate_release(parsed, profile, *, scope="movie", want_season=None,
                      want_episode=None, size_gb=None, want_year=None, want_title=None,
-                     want_date=None, want_absolute=None) -> dict:
+                     want_date=None, want_absolute=None, seeders=None, want_alt=None) -> dict:
     """Judge a parsed search hit against the quality profile + the search scope.
 
     Returns ``{accepted, score, rejected, tier, quality_label}`` — ``accepted`` False
-    means it's filtered out (``rejected`` says why); ``score`` ranks the keepers."""
+    means it's filtered out (``rejected`` says why); ``score`` ranks the keepers.
+
+    ``seeders`` is the swarm health for TORRENT hits, and ``None`` for anything
+    without the concept (usenet, Soulseek) — those are never gated on it."""
     parsed = parsed if isinstance(parsed, dict) else {}
     profile = profile if isinstance(profile, dict) else {}
     res, source = parsed.get("resolution"), parsed.get("source")
@@ -316,9 +378,25 @@ def evaluate_release(parsed, profile, *, scope="movie", want_season=None,
     # 4) scope validation (episode vs season pack vs series pack; movie year match)
     if not rejected:
         _, scope_reason = _scope_ok(parsed, scope, want_season, want_episode, want_year, want_title,
-                                    want_date, want_absolute)
+                                    want_date, want_absolute, want_alt)
         if scope_reason:
             rejected = scope_reason
+
+    # 4b) swarm health — a torrent nobody is seeding cannot finish. The client
+    # parks it on 'downloading metadata' or stalls it at 0% indefinitely, and
+    # the wishlist row then reports a fruitless search forever while the dead
+    # torrent accumulates in the client. Radarr/Sonarr call this minimum
+    # seeders; only torrents carry the number, so None is never judged.
+    if not rejected and seeders is not None:
+        floor = (profile or {}).get("min_seeders")
+        floor = 0 if floor is None else floor
+        try:
+            have = int(seeders)
+        except (TypeError, ValueError):
+            have = 0
+        if floor and have < floor:
+            rejected = ("No seeders — nobody is sharing this" if have <= 0 else
+                        "Only %d seeder(s) — your floor is %d" % (have, floor))
 
     # 5) size guard (movie/episode only — packs are legitimately large)
     if not rejected and size_gb:
@@ -332,11 +410,7 @@ def evaluate_release(parsed, profile, *, scope="movie", want_season=None,
         score += 40
     if parsed.get("hdr") and profile.get("prefer_hdr") in ("prefer", "require"):
         score += 30
-    # Audio preference (SOFT — scores, never rejects; a hidden audio filter would
-    # starve grabs). "any" keeps the historical flat bonus for lossless tracks so
-    # every existing profile scores exactly as before.
-    if parsed.get("audio") in _AUDIO_PREF_SETS.get(profile.get("prefer_audio") or "any",
-                                                   _AUDIO_PREF_SETS["any"]):
+    if parsed.get("audio") in ("atmos", "truehd", "dts-hd"):
         score += 15
     if profile.get("prefer_repack") and (parsed.get("repack") or parsed.get("proper")):
         score += 10

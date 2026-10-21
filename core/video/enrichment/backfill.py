@@ -479,7 +479,7 @@ class OpenSubtitlesWorker(VideoBackfillWorker):
 
     def _headers(self):
         return {"Api-Key": self._key(), "Accept": "application/json",
-                "User-Agent": "Commissary v1.0"}
+                "User-Agent": "SoulSync v1.0"}
 
     def test(self):
         if not self._key():
@@ -830,11 +830,7 @@ class TmdbStreamingWorker(VideoBackfillWorker):
         return (self.db.get_setting("tmdb_api_key") or "").strip()
 
     def _region(self):
-        # Same key the Settings "Where to watch region" field writes and that
-        # enrichment/engine.py reads. This used to read a separate region key
-        # that NOTHING ever wrote, so the Streaming overlay was pinned to US no
-        # matter what the user picked.
-        return ((self.db.get_setting("watch_region") or "US").strip().upper() or "US")
+        return ((self.db.get_setting("streaming_region") or "US").strip().upper() or "US")
 
     def _enabled(self):
         return bool(self._key())

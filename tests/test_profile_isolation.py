@@ -28,6 +28,8 @@ from database.video_database import VideoDatabase
 
 _ROOT = Path(__file__).resolve().parent.parent
 _WS = (_ROOT / "web_server.py").read_text(encoding="utf-8")
+# the mirrored playlist routes moved to api/mirrored_playlists.py (aug 26 lift)
+_MPL = (_ROOT / "api" / "mirrored_playlists.py").read_text(encoding="utf-8")
 
 
 # ── 1. music delete_profile: schema-derived sweep ────────────────────────────
@@ -148,23 +150,43 @@ def test_video_profile_sweep(tmp_path):
 
 # ── 3. HTTP IDOR gate: every by-id mirrored route checks visibility ──────────
 
+_MIRROR_GATE_MARKERS = (
+    "mirrored_playlist_visible(",
+    # quality-profiles-foundation's equivalent gate: a SQL-scoped fetch/write
+    # (profile_id baked into the query) instead of fetch-then-check, with the
+    # same admin-bypass semantics as mirrored_playlist_visible.
+    "_owned_mirrored_playlist(",
+    "_mirror_scope_profile_id(",
+)
+
+
+def _by_id_mirrored_routes():
+    return re.findall(
+        r"@bp\.route\('/api/mirrored-playlists/<int:playlist_id>[^']*'[^)]*\)\s*\n"
+        r"def (\w+)\(playlist_id\):((?:\n(?!@bp\.route).*)*)", _MPL)
+
+
 def test_every_by_id_mirrored_route_is_gated():
     """Each /api/mirrored-playlists/<int:playlist_id>... route body must call
-    mirrored_playlist_visible before acting. Counted per route so a NEW
+    an ownership-gate helper before acting. Counted per route so a NEW
     ungated route fails this test the day it's added."""
-    routes = re.findall(
-        r"@app\.route\('/api/mirrored-playlists/<int:playlist_id>[^']*'[^)]*\)\s*\n"
-        r"def (\w+)\(playlist_id\):((?:\n(?!@app\.route).*)*)", _WS)
+    routes = _by_id_mirrored_routes()
     assert len(routes) >= 10, f"expected the by-id route family, found {len(routes)}"
-    ungated = [name for name, body in routes if "mirrored_playlist_visible(" not in body]
+    ungated = [name for name, body in routes
+               if not any(marker in body for marker in _MIRROR_GATE_MARKERS)]
     assert ungated == [], f"by-id routes missing the ownership gate: {ungated}"
 
 
 def test_gate_answers_404_not_403():
-    # foreign ids must be unprobeable — same response as nonexistent
-    assert "mirrored_playlist_visible" in _WS
-    gate_uses = _WS.count("if not mirrored_playlist_visible(")
-    assert gate_uses >= 10
+    """Foreign ids must be unprobeable — same response as nonexistent. Checked
+    per gated route (rather than a flat whole-file substring count) so it
+    holds regardless of which gate idiom the route uses."""
+    routes = _by_id_mirrored_routes()
+    assert len(routes) >= 10
+    no_404 = [name for name, body in routes
+              if any(marker in body for marker in _MIRROR_GATE_MARKERS)
+              and '"Playlist not found"' not in body]
+    assert no_404 == [], f"gated routes without a 404 response: {no_404}"
 
 
 # ── 4. socket rooms: session-derived profile + gated playlist rooms ──────────

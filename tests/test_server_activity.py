@@ -229,6 +229,77 @@ def test_get_history_no_server(monkeypatch):
     assert get_history()["ok"] is False
 
 
+def test_plex_server_negative_cache_prevents_repeated_connect_attempts(monkeypatch):
+    import core.server_activity as sa
+    sa.invalidate_plex_server_cache()
+
+    monkeypatch.setattr(sa, "_plex_config", lambda db=None: {"base_url": "http://192.0.2.1:32400", "token": "abcdef123456"})
+    connect_attempts = 0
+
+    def fake_plex_init(*args, **kwargs):
+        nonlocal connect_attempts
+        connect_attempts += 1
+        raise ConnectionError("Host unreachable")
+
+    import plexapi.server
+    monkeypatch.setattr(plexapi.server, "PlexServer", fake_plex_init)
+
+    # First attempt: connection fails, recorded in cache
+    res1 = sa._plex_server()
+    assert res1 is None
+    assert connect_attempts == 1
+
+    # Second attempt within 60s: hits negative cache immediately without calling PlexServer
+    res2 = sa._plex_server()
+    assert res2 is None
+    assert connect_attempts == 1
+
+    # Third attempt after 60s TTL expires: reconnects
+    original_at = sa._server_cache["at"]
+    sa._server_cache["at"] = original_at - 61.0
+    res3 = sa._plex_server()
+    assert res3 is None
+    assert connect_attempts == 2
+
+    # Credential change bypasses negative cache immediately
+    monkeypatch.setattr(sa, "_plex_config", lambda db=None: {"base_url": "http://192.0.2.2:32400", "token": "abcdef123456"})
+    res4 = sa._plex_server()
+    assert res4 is None
+    assert connect_attempts == 3
+
+    # Cleanup
+    sa.invalidate_plex_server_cache()
+
+
+def test_get_activity_sessions_failure_marks_server_unreachable(monkeypatch):
+    import core.server_activity as sa
+    sa.invalidate_plex_server_cache()
+
+    class _FailingPlex:
+        def sessions(self):
+            raise ConnectionError("Plex crashed")
+
+    monkeypatch.setattr(sa, "_plex_config", lambda db=None: {"base_url": "http://192.0.2.1:32400", "token": "abcdef123456"})
+
+    import plexapi.server
+    monkeypatch.setattr(plexapi.server, "PlexServer", lambda *a, **kw: _FailingPlex())
+
+    # Initial connect succeeds
+    srv = sa._plex_server()
+    assert srv is not None
+
+    # Calling get_activity encounters sessions() failure
+    act = sa.get_activity()
+    assert act["ok"] is False
+    assert act["reason"] == "unreachable"
+
+    # Subsequent _plex_server call should now return None immediately from cache
+    assert sa._plex_server() is None
+
+    # Cleanup
+    sa.invalidate_plex_server_cache()
+
+
 # ── stream termination ───────────────────────────────────────────────────────
 def test_stop_session_calls_stop_with_message(monkeypatch):
     import core.server_activity as sa
@@ -366,7 +437,7 @@ def test_activity_merges_plex_and_jellyfin(monkeypatch):
     assert "Heat" in titles and "Dune" in titles
 
 
-# ── click-through: resolve a stream to its Commissary library page ─────────────
+# ── click-through: resolve a stream to its SoulSync library page ─────────────
 def test_normalize_captures_link_ids():
     m = normalize_session(_movie(ratingKey=100))
     assert m["_link_sid"] == "100"                    # movie links to itself
@@ -422,7 +493,7 @@ def test_normalize_captures_tmdb_from_guids():
 
 
 def test_resolve_falls_back_to_tmdb_when_not_owned(monkeypatch):
-    """Not in the Commissary library → link to the TMDB preview page so anything on
+    """Not in the SoulSync library → link to the TMDB preview page so anything on
     the server is still clickable (works even with no video library at all)."""
     import core.server_activity as sa
     monkeypatch.setattr("api.video.get_video_db", lambda: _EmptyVDB())    # nothing owned
@@ -448,15 +519,16 @@ def test_ui_is_wired():
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
     idx = (root / "webui" / "index.html").read_text(encoding="utf-8")
-    js = (root / "webui" / "static" / "server-activity.js").read_text(encoding="utf-8")
+    # ported to typescript (src/shell, aug 26); same pins against the TS source
+    js = (root / "webui" / "src" / "shell" / "server-activity.ts").read_text(encoding="utf-8")
     css = (root / "webui" / "static" / "style.css").read_text(encoding="utf-8")
     # app-wide floating button next to the notif bell + the script include
     assert 'id="activity-float-btn"' in idx and "ServerActivity.toggle()" in idx
-    assert "server-activity.js" in idx
+    assert "dist/shell.js" in idx  # the shell bundle carries the port
     # the drawer + poll + endpoints
     assert "/api/server-activity" in js and "/api/server-activity/image" in js
     assert "function card" in js and "function refresh" in js
-    assert "setInterval(refresh, 3000)" in js         # live cadence while open
+    assert "setInterval(() => void refresh(), 3000)" in js  # live cadence while open
     assert "startBadgePoll" in js                     # ambient badge from any page
     # never touches the network-triggering user thumb — initials avatar instead
     assert "function initials" in js
@@ -480,7 +552,7 @@ def test_ui_is_wired():
     assert "function actKey" in js and "_actKeys" in js       # key-diffed render (no flicker)
     assert "sact-eq" in js and ".sact-eq" in css              # music equalizer
     assert ".sact-head-dot" in css and "@keyframes sactCardIn" in css
-    # click-through to the Commissary detail page
+    # click-through to the SoulSync detail page
     assert "sact-card--link" in js and "SoulSyncVideo.openDetail" in js
     assert "data-link-kind" in js and ".sact-card--link" in css
     vs = (root / "webui" / "static" / "video" / "video-side.js").read_text(encoding="utf-8")
@@ -488,11 +560,57 @@ def test_ui_is_wired():
 
 
 def test_web_server_registers_the_routes():
+    # the routes moved to api/server_activity.py (aug 25 lift) - same paths,
+    # blueprint decorator
     from pathlib import Path
-    ws = (Path(__file__).resolve().parent.parent / "web_server.py").read_text(encoding="utf-8")
-    assert "@app.route('/api/server-activity')" in ws
-    assert "@app.route('/api/server-activity/image')" in ws
-    assert "@app.route('/api/server-activity/history')" in ws
-    assert "@app.route('/api/server-activity/stop', methods=['POST'])" in ws
-    assert "@app.route('/api/server-activity/stats')" in ws
+    ws = (Path(__file__).resolve().parent.parent / "api" / "server_activity.py").read_text(encoding="utf-8")
+    assert "@bp.route('/api/server-activity')" in ws
+    assert "@bp.route('/api/server-activity/image')" in ws
+    assert "@bp.route('/api/server-activity/history')" in ws
+    assert "@bp.route('/api/server-activity/stop', methods=['POST'])" in ws
+    assert "@bp.route('/api/server-activity/stats')" in ws
     assert "is_admin" in ws.split("stop_server_activity_stream")[1][:400]   # admin-gated
+
+
+def test_a_working_connection_is_kept_past_a_minute(monkeypatch):
+    """the connection used to be rebuilt every 60 s, a plex round trip for
+    nothing."""
+    import core.server_activity as sa
+    import plexapi.server
+    sa.invalidate_plex_server_cache()
+    monkeypatch.setattr(sa, "_plex_config", lambda db=None: {"base_url": "http://192.0.2.1:32400", "token": "abcdef123456"})
+    clock = [1000.0]
+    monkeypatch.setattr(sa.time, "time", lambda: clock[0])
+    built = []
+    monkeypatch.setattr(plexapi.server, "PlexServer", lambda *a, **k: built.append(1) or object())
+    try:
+        first = sa._plex_server()
+        for _ in range(30):
+            clock[0] += 61
+            assert sa._plex_server() is first
+        assert len(built) == 1
+    finally:
+        sa.invalidate_plex_server_cache()
+
+
+def test_a_failed_connection_backs_off_then_reconnects(monkeypatch):
+    import core.server_activity as sa
+    import plexapi.server
+    sa.invalidate_plex_server_cache()
+    monkeypatch.setattr(sa, "_plex_config", lambda db=None: {"base_url": "http://192.0.2.1:32400", "token": "abcdef123456"})
+    clock = [1000.0]
+    monkeypatch.setattr(sa.time, "time", lambda: clock[0])
+    built = []
+    monkeypatch.setattr(plexapi.server, "PlexServer", lambda *a, **k: built.append(object()) or built[-1])
+    try:
+        srv = sa._plex_server()
+        sa._mark_plex_unreachable(srv)
+        clock[0] += 30
+        assert sa._plex_server() is None          # backing off
+        assert len(built) == 1
+        clock[0] += 31
+        again = sa._plex_server()                 # past the minute: reconnect
+        assert again is not None and again is not srv
+        assert len(built) == 2
+    finally:
+        sa.invalidate_plex_server_cache()

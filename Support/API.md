@@ -1,14 +1,20 @@
-# Commissary REST API
+# SoulSync REST API
 
-Commissary includes a full REST API at `/api/v1/` that lets you control everything from external apps, scripts, Discord bots, Home Assistant, or anything that can make HTTP requests.
+SoulSync includes a full REST API at `/api/v1/` that lets you control everything from external apps, scripts, Discord bots, Home Assistant, or anything that can make HTTP requests.
 
 ## Quick Start
 
 ### 1. Generate an API Key
 
-Go to **Settings** in the Commissary web UI and find the **Commissary API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
+Go to **Settings** in the SoulSync web UI and find the **SoulSync API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
 
-This is the way to create your first key. There is a `/api/v1/api-keys/bootstrap` endpoint as well, but it is **not** an anonymous shortcut — see [Bootstrapping the first key](#bootstrapping-the-first-key) for what it requires and why.
+Alternatively, if no keys exist yet, use the bootstrap endpoint:
+
+```bash
+curl -X POST http://localhost:8008/api/v1/api-keys/bootstrap \
+  -H "Content-Type: application/json" \
+  -d '{"label": "My First Key"}'
+```
 
 ### 2. Make Requests
 
@@ -71,7 +77,7 @@ Paginated responses include:
 
 ## Authentication
 
-Every `/api/v1/` endpoint requires an API key. The one exception, `/api/v1/api-keys/bootstrap`, is authenticated by *session* instead — it is not open.
+All `/api/v1/` endpoints require an API key (except the bootstrap endpoint).
 
 | Method | Details |
 |--------|---------|
@@ -79,23 +85,6 @@ Every `/api/v1/` endpoint requires an API key. The one exception, `/api/v1/api-k
 | Query  | `?api_key=sk_...` |
 
 Keys are generated as `sk_` followed by a random token. Only the SHA-256 hash is stored — the raw key is shown once at creation.
-
-**CSRF does not apply here.** Commissary validates `Origin`/`Referer` on state-changing routes, but `/api/v1/` authenticates with a header rather than a cookie, so a malicious page cannot make an authenticated call to it. Scripted clients need send no CSRF header and no `Origin`. The single exception is `/api/v1/api-keys-internal/*`, which the Settings page uses over a session and which stays protected.
-
-### Bootstrapping the first key
-
-`POST /api/v1/api-keys/bootstrap` creates the first key when none exist, and it requires **all** of:
-
-1. Login mode on (`security.require_login`) — otherwise `403 LOGIN_REQUIRED`
-2. A signed-in session — otherwise `401 AUTH_REQUIRED`
-3. That session being an admin — otherwise `403 FORBIDDEN`
-4. No keys existing yet — otherwise `403 FORBIDDEN`
-
-It used to require none of that, which made it a login bypass: `/api/v1/` is deliberately exempt from the login gate because it carries its own keys, so a route here that minted one *without* a key handed any anonymous caller a credential — and `PATCH /api/v1/settings` could then turn `security.require_login` back off. Two sound decisions with a hole between them.
-
-Requiring login mode is the actual gate rather than belt-and-braces: with login off, every request resolves to profile 1 and therefore counts as admin, so an admin check alone would still have authorised anonymous callers.
-
-In practice you will not need this endpoint. Use **Settings → Commissary API → Generate API Key**, which goes through `/api/v1/api-keys-internal/generate` and works whether or not login mode is on.
 
 ### Error Codes
 
@@ -126,7 +115,7 @@ These optional parameters work on all endpoints that return entity data:
 
 ## Multi-Profile Support
 
-Commissary supports multiple user profiles. Profile-scoped endpoints (watchlist, wishlist, discovery) accept a profile identifier:
+SoulSync supports multiple user profiles. Profile-scoped endpoints (watchlist, wishlist, discovery) accept a profile identifier:
 
 | Method | Details |
 |--------|---------|
@@ -935,7 +924,7 @@ Remove a track from the wishlist by its Spotify track ID.
 
 #### `POST /api/v1/wishlist/process`
 
-Trigger wishlist download processing (retries all failed tracks).
+Trigger wishlist download processing (retries all failed tracks). `409 CONFLICT` while a run is already in progress.
 
 ---
 
@@ -1665,7 +1654,7 @@ Get retag queue statistics.
 
 ### ListenBrainz
 
-Browse cached ListenBrainz playlists and their tracks. Playlists are cached locally when Commissary pulls recommendations from ListenBrainz.
+Browse cached ListenBrainz playlists and their tracks. Playlists are cached locally when SoulSync pulls recommendations from ListenBrainz.
 
 #### `GET /api/v1/listenbrainz/playlists`
 
@@ -1727,7 +1716,7 @@ List cached ListenBrainz playlists with optional type filtering and pagination.
 | `track_count` | int | Number of tracks in the playlist |
 | `annotation_data` | object? | Parsed JSON annotation metadata from ListenBrainz |
 | `last_updated` | string | ISO 8601 timestamp of last update from ListenBrainz |
-| `cached_date` | string | ISO 8601 timestamp when Commissary cached this playlist |
+| `cached_date` | string | ISO 8601 timestamp when SoulSync cached this playlist |
 
 #### `GET /api/v1/listenbrainz/playlists/<playlist_id>`
 
@@ -1950,7 +1939,7 @@ Get MusicBrainz cache statistics — total entries, matched vs unmatched, and br
 
 #### `GET /api/v1/cache/discovery-matches`
 
-List cached discovery provider matches. When Commissary discovers tracks from external sources (Tidal playlists, YouTube Music, ListenBrainz recommendations, Beatport), it resolves them against Spotify or iTunes to get downloadable metadata. These resolved matches are cached here to avoid redundant API calls. Results ordered by `last_used_at` descending.
+List cached discovery provider matches. When SoulSync discovers tracks from external sources (Tidal playlists, YouTube Music, ListenBrainz recommendations, Beatport), it resolves them against Spotify or iTunes to get downloadable metadata. These resolved matches are cached here to avoid redundant API calls. Results ordered by `last_used_at` descending.
 
 | Param | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -2123,6 +2112,91 @@ Update settings (partial update). Uses dot-notation keys.
 
 ---
 
+### Video
+
+The movies and TV side. Every endpoint runs the same handler the web UI uses and wraps it in the v1 envelope. Returns `503 NOT_AVAILABLE` on a server with the video side disabled.
+
+#### `GET /api/v1/video/library`
+
+Titles in the video library. `kind=movies|shows` (default `movies`), plus `search`, `letter`, `sort`, `status`, `genre`, `resolution`, `page`, `limit`. When `kind=shows`, the response also includes `total_episodes` — the global episode count across all shows.
+
+#### `GET /api/v1/video/library/genres`
+
+#### `GET /api/v1/video/search?q=`
+
+TMDB multi-search over movies, shows and people.
+
+#### `GET /api/v1/video/trending`
+
+#### `GET /api/v1/video/wishlist`
+
+`kind=movie|show` for a page of items (`search`, `sort`, `page`, `limit`); no `kind` returns counts only.
+
+#### `GET /api/v1/video/wishlist/counts`
+
+#### `POST /api/v1/video/wishlist`
+
+Add a movie, or a set of a show's episodes:
+
+```json
+{"movie": {"tmdb_id": 603, "title": "The Matrix", "year": 1999}}
+```
+
+```json
+{"show": {"tmdb_id": 1396, "title": "Breaking Bad"},
+ "episodes": [{"season_number": 1, "episode_number": 1}, {"season_number": 1, "episode_number": 2}]}
+```
+
+#### `DELETE /api/v1/video/wishlist`
+
+Body: `{"scope": "movie|show|season|episode", "tmdb_id": 603, "season_number"?: 1, "episode_number"?: 1}`.
+
+#### `GET /api/v1/video/watchlist`
+
+Followed shows, people and studios.
+
+#### `POST /api/v1/video/watchlist`
+
+Body: `{"kind": "show|person|studio", "tmdb_id": 1396, "title": "Breaking Bad"}`.
+
+#### `DELETE /api/v1/video/watchlist`
+
+Body: `{"kind": "show", "tmdb_id": 1396}`.
+
+#### `POST /api/v1/video/scan`
+
+Ask for a library scan. Body: `{"mode"?: "incremental|deep|full"}`. `409 CONFLICT` while one is running.
+
+#### `GET /api/v1/video/scan/status`
+
+#### `GET /api/v1/video/stats`
+
+One call for a dashboard widget. `library` (`movies`, `shows`, `episodes` on disk, `episodes_missing` = monitored and aired with no file, `size_bytes`), scoped to the video server; `database` (`size_mb`, `last_update`, `last_scan`, ISO UTC); `downloads` (`active`, `failed`, `completed`, `cancelled`, `by_status`, `speed_bps`, `completed_all_time`); `wishlist` (`movies`, `episodes`, `videos`, `total`).
+
+#### `GET /api/v1/video/downloads`
+
+Video downloads, active rows first then newest (the latest 100). `status` filters by one status or a comma list: `queued`, `searching`, `downloading`, `importing`, `failed`, `import_failed`, `completed`, `cancelled`, plus `active` and `failed` as shorthand for their groups. A filtered answer adds `count`. An unknown status is `400 BAD_REQUEST`.
+
+#### `GET /api/v1/video/downloads/status`
+
+#### `GET /api/v1/video/downloads/history`
+
+#### `GET /api/v1/video/calendar`
+
+Upcoming and recent episodes and releases. `start` and `end` as ISO dates.
+
+#### `GET /api/v1/video/requests`
+
+#### `POST /api/v1/video/requests`
+
+File a request for an admin to approve. Body: `{"kind": "movie|show", "tmdb_id": 27205, "title": "Inception", "year"?: 2010, "note"?: "..."}`.
+
+#### `POST /api/v1/video/requests/<id>/approve`
+
+#### `POST /api/v1/video/requests/<id>/deny`
+
+---
+
 ### API Key Management
 
 #### `GET /api/v1/api-keys`
@@ -2175,20 +2249,13 @@ Revoke an API key by its UUID.
 
 #### `POST /api/v1/api-keys/bootstrap`
 
-Generate the first API key when none exist. **Requires login mode, a signed-in admin session, and an empty key list** — see [Bootstrapping the first key](#bootstrapping-the-first-key). Prefer Settings → Commissary API → Generate API Key.
+Generate the first API key when none exist. **No authentication required.** Returns `403` if keys already exist.
 
 ```json
 {
   "label": "My First Key"
 }
 ```
-
-| Status | Code | Meaning |
-|--------|------|---------|
-| 201 | — | Key created; the raw `key` is in the response and is never shown again |
-| 401 | `AUTH_REQUIRED` | Not signed in |
-| 403 | `LOGIN_REQUIRED` | Login mode is off |
-| 403 | `FORBIDDEN` | Not an admin, or keys already exist |
 
 ---
 
@@ -2444,6 +2511,29 @@ curl -H "Authorization: Bearer sk_..." \
 | GET | `/playlists` | List playlists |
 | GET | `/playlists/<id>` | Playlist detail + tracks |
 | POST | `/playlists/<id>/sync` | Trigger playlist sync |
+| **Video** | | |
+| GET | `/video/library` | Movies or shows in the library |
+| GET | `/video/library/genres` | Video genres |
+| GET | `/video/search` | TMDB multi-search |
+| GET | `/video/trending` | Trending titles |
+| GET | `/video/wishlist` | Wishlist page or counts |
+| GET | `/video/wishlist/counts` | Wishlist counts |
+| POST | `/video/wishlist` | Add a movie or episodes |
+| DELETE | `/video/wishlist` | Remove at any scope |
+| GET | `/video/watchlist` | Followed shows / people / studios |
+| POST | `/video/watchlist` | Follow |
+| DELETE | `/video/watchlist` | Unfollow |
+| POST | `/video/scan` | Ask for a library scan |
+| GET | `/video/scan/status` | Scan progress |
+| GET | `/video/stats` | Library, database, download and wishlist counts |
+| GET | `/video/downloads` | Downloads (`?status=` filter) |
+| GET | `/video/downloads/status` | Download status |
+| GET | `/video/downloads/history` | Download history |
+| GET | `/video/calendar` | Upcoming / recent releases |
+| GET | `/video/requests` | Requests |
+| POST | `/video/requests` | File a request |
+| POST | `/video/requests/<id>/approve` | Approve |
+| POST | `/video/requests/<id>/deny` | Deny |
 | **Settings** | | |
 | GET | `/settings` | Get settings (redacted) |
 | PATCH | `/settings` | Update settings |
@@ -2451,4 +2541,4 @@ curl -H "Authorization: Bearer sk_..." \
 | GET | `/api-keys` | List API keys |
 | POST | `/api-keys` | Generate new key |
 | DELETE | `/api-keys/<id>` | Revoke key |
-| POST | `/api-keys/bootstrap` | Bootstrap first key (admin session + login mode) |
+| POST | `/api-keys/bootstrap` | Bootstrap first key (no auth) |

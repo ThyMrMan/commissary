@@ -6,8 +6,9 @@ import threading
 from typing import Dict, List, Optional, Any
 from functools import wraps
 from dataclasses import dataclass
+from core.http_error_status import http_error_status
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 import json
 import base64
 import webbrowser
@@ -35,6 +36,20 @@ COLLECTION_PLAYLIST_DESCRIPTION = "Your favorited tracks on Tidal"
 _last_api_call_time = 0
 _api_call_lock = threading.Lock()
 MIN_API_INTERVAL = 0.5  # 500ms between API calls
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    status = http_error_status(exc)
+    if status is not None:
+        return status == 429
+    return 'rate limit' in str(exc).lower() or '429' in str(exc)
+
+
+def _is_server_error(exc: Exception) -> bool:
+    status = http_error_status(exc)
+    if status is not None:
+        return status in (502, 503)
+    return '502' in str(exc) or '503' in str(exc)
 
 def rate_limited(func):
     """Decorator to enforce rate limiting on Tidal API calls with retry logic"""
@@ -64,16 +79,14 @@ def rate_limited(func):
                 return result
             except Exception as e:
                 last_exception = e
-                error_str = str(e)
-
                 # Only retry on specific errors
-                if "rate limit" in error_str.lower() or "429" in error_str:
+                if _is_rate_limit_error(e):
                     backoff = 3.0 * (2 ** attempt)  # Exponential: 3s, 6s, 12s, 24s
                     logger.warning(f"Rate limit hit on attempt {attempt + 1}/{max_retries}, backing off {backoff}s: {e}")
                     if attempt < max_retries - 1:
                         time.sleep(backoff)
                         continue
-                elif "503" in error_str or "502" in error_str:
+                elif _is_server_error(e):
                     logger.warning(f"Tidal service error on attempt {attempt + 1}/{max_retries}, backing off: {e}")
                     if attempt < max_retries - 1:
                         time.sleep(2.0)
@@ -112,12 +125,56 @@ class Playlist:
     external_urls: Dict[str, str] = None
     owner: Optional[Dict[str, Any]] = None
     public: bool = True
+    # playlist entries that didn't become tracks: videos, and tracks tidal
+    # didn't return (not in the account's region, or a batch that failed)
+    skipped_videos: int = 0
+    unavailable_tracks: int = 0
     
     def __post_init__(self):
         if self.tracks is None:
             self.tracks = []
         if self.external_urls is None:
             self.external_urls = {}
+
+# Tidal's v2 search used to take the query as a path segment
+# (/searchResults/{query}). tidal retired that route: it now answers 400
+# INVALID_RESOURCE_ID for every search, which read as "not found" for every
+# artist, album and track (#1290). the query is a filter[query] param now.
+# the spec caps it at 256 chars and rejects an empty one.
+_SEARCH_QUERY_MAX = 256
+
+
+def _clean_search_query(query) -> str:
+    """Collapse whitespace and cap the length Tidal accepts for filter[query]."""
+    cleaned = ' '.join(str(query or '').split())
+    return cleaned[:_SEARCH_QUERY_MAX].strip()
+
+
+def _order_included_by_relevance(data, include: str):
+    """Put `included` in the order the search ranked it.
+
+    the collection response lists the ranked hits as ids under
+    data[0].relationships.<include>.data; `included` carries the resources
+    themselves and json:api promises no order for it. anything the ranking
+    does not mention keeps its place at the end.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get('included'), list):
+        return data
+    try:
+        ranked = data['data'][0]['relationships'][include]['data']
+        rank = {str(r.get('id')): i for i, r in enumerate(ranked)}
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return data
+    if not rank:
+        return data
+    tail = len(rank)
+    data['included'] = sorted(
+        data['included'],
+        key=lambda r: rank.get(str(r.get('id')), tail)
+        if isinstance(r, dict) and r.get('type') == include else tail,
+    )
+    return data
+
 
 class TidalClient:
     """Tidal API client for fetching user playlists and track data"""
@@ -168,7 +225,7 @@ class TidalClient:
         """Setup requests session with headers"""
         self.session.headers.update({
             'Accept': 'application/vnd.api+json',
-            'User-Agent': 'Commissary/1.0'
+            'User-Agent': 'SoulSync/1.0'
         })
     
     def _load_saved_tokens(self):
@@ -346,7 +403,7 @@ class TidalClient:
                     handler_self.send_response(200)
                     handler_self.send_header('Content-type', 'text/html')
                     handler_self.end_headers()
-                    handler_self.wfile.write(b'<h1>Success!</h1><p>You can close this window and return to Commissary.</p>')
+                    handler_self.wfile.write(b'<h1>Success!</h1><p>You can close this window and return to SoulSync.</p>')
                 elif 'error' in query_params:
                     # Handle OAuth errors
                     error = query_params.get('error', ['unknown'])[0]
@@ -563,6 +620,7 @@ class TidalClient:
         self.refresh_token = None
         self.token_expires_at = 0
         self._collection_needs_reconnect = False
+        self._account_country = None
         self.session.headers.pop('Authorization', None)
         try:
             config_manager.set('tidal_tokens', {})
@@ -570,6 +628,39 @@ class TidalClient:
             logger.warning(f"Failed to clear tidal_tokens config: {e}")
         logger.info("Tidal client disconnected — saved tokens cleared")
     
+    def _get_account_country(self) -> str:
+        """The account's own country code, for fetching the user's playlists.
+
+        tidal hides a track from `/tracks?filter[id]` when it isn't in the
+        countryCode catalogue we ask for, so a non-US account asking with
+        'US' lost every track that's only licensed at home (#1613).
+        falls back to 'US' when /users/me won't say. cached per token, so a
+        lookup that failed before login gets another go after it.
+        """
+        token = getattr(self, 'access_token', None)
+        cached = getattr(self, '_account_country', None)
+        if cached and cached[0] == token:
+            return cached[1]
+        country = 'US'
+        try:
+            response = self.session.get(
+                f"{self.base_url}/users/me",
+                headers={'accept': 'application/vnd.api+json'},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                attrs = (response.json().get('data') or {}).get('attributes') or {}
+                found = str(attrs.get('country') or '').strip().upper()
+                if len(found) == 2 and found.isalpha():
+                    country = found
+            else:
+                logger.debug("tidal /users/me returned %s, using US catalogue", response.status_code)
+        except Exception as e:
+            logger.debug("tidal account country lookup failed, using US: %s", e)
+        logger.info("tidal account country: %s", country)
+        self._account_country = (token, country)
+        return country
+
     def _get_user_id(self):
         """Get current user's ID from /users/me endpoint"""
         try:
@@ -696,10 +787,181 @@ class TidalClient:
                 next_params = None      # the cursor URL carries all query params
 
             logger.info(f"Successfully retrieved {len(playlists)} playlists (metadata only) with the V2 filter method.")
+
+            # The V2 owners.id filter above returns only playlists the user
+            # CREATED — playlists they merely FOLLOW (Tidal editorial "My
+            # Daily Discovery", other users' lists) never appear, which is
+            # why curated playlists were invisible unless the user re-added
+            # them as personal copies (Specialmed's report). Merge the v1
+            # favorites listing, deduped by id.
+            try:
+                seen_ids = {str(p.id) for p in playlists}
+                favorites = self._get_favorite_playlists(user_id)
+                added = 0
+                for fav in favorites:
+                    if str(fav.id) in seen_ids:
+                        continue
+                    seen_ids.add(str(fav.id))
+                    playlists.append(fav)
+                    added += 1
+                if added:
+                    logger.info(f"Merged {added} followed/favorited Tidal playlists into the listing.")
+            except Exception as e:
+                # Favorites are additive — never let them break the personal listing.
+                logger.warning(f"Could not fetch favorited Tidal playlists: {e}")
+
             return playlists
 
         except Exception as e:
             logger.error(f"A critical error occurred while fetching Tidal V2 playlists: {e}")
+            return []
+
+    @staticmethod
+    def _favorite_playlist_from_item(item):
+        """Build a Playlist from one v1 favorites row. The v1 endpoint wraps
+        each playlist as {'created': ts, 'item': {...}}; tolerate a flat row
+        too. Returns None for rows without a uuid."""
+        pl = item.get('item') if isinstance(item.get('item'), dict) else item
+        uuid = pl.get('uuid') or pl.get('id')
+        if not uuid:
+            return None
+        image_guid = pl.get('squareImage') or pl.get('image') or ''
+        image_url = (
+            f"https://resources.tidal.com/images/{image_guid.replace('-', '/')}/640x640.jpg"
+            if image_guid else None
+        )
+        creator = pl.get('creator') or {}
+        # Editorial playlists carry creator id 0 / no name — label them Tidal.
+        owner = creator.get('name') or ('Tidal' if not creator.get('id') else 'Tidal user')
+        playlist = Playlist(
+            id=str(uuid),
+            name=pl.get('title') or 'Unknown Playlist',
+            description=pl.get('description') or '',
+            external_urls={'tidal': f"https://listen.tidal.com/playlist/{uuid}"},
+            public=bool(pl.get('publicPlaylist', True)),
+            tracks=[],  # fetched on-demand, like the owned rows
+        )
+        playlist.track_count = pl.get('numberOfTracks') or 0
+        playlist.owner = owner
+        if image_url:
+            playlist.image_url = image_url
+        return playlist
+
+    def _get_favorite_playlists(self, user_id):
+        """The user's FOLLOWED playlists — V2 user-collection first, v1 second.
+
+        The v1 favorites endpoint below was the ONLY path here originally, and
+        it is why Specialmed still saw personal playlists only after the "fix":
+        as `get_favorite_albums` documents, **v1 returns 403 for modern OAuth
+        tokens** lacking the `r_usr` scope. It failed, logged at INFO, and
+        degraded silently to the personal listing — indistinguishable, from the
+        user's side, from no fix at all.
+
+        V2 `userCollectionPlaylists` is the same family of endpoint that already
+        works for favorited albums, artists and tracks in this client, so it is
+        tried first. v1 is kept as a fallback because a token old enough to
+        carry `r_usr` will still be served by it.
+        """
+        collected = self._get_collection_playlists()
+        if collected:
+            return collected
+
+        favorites = []
+        headers = {
+            'Accept': 'application/json',
+            'Authorization': f'Bearer {self.access_token}',
+            'User-Agent': 'TIDAL_ANDROID/2.47.1 okhttp/4.9.0',
+        }
+        limit, offset = 50, 0
+        for _page in range(20):  # 1000 followed playlists — generous ceiling
+            response = requests.get(
+                f"{self.alt_base_url}/users/{user_id}/favorites/playlists",
+                headers=headers,
+                params={'limit': limit, 'offset': offset, 'countryCode': 'US'},
+                timeout=15,
+            )
+            if response.status_code != 200:
+                logger.info(f"v1 favorites/playlists returned {response.status_code}; skipping followed playlists.")
+                break
+            data = response.json() or {}
+            items = data.get('items') or []
+            for item in items:
+                try:
+                    playlist = self._favorite_playlist_from_item(item)
+                    if playlist:
+                        favorites.append(playlist)
+                except Exception as e:
+                    logger.debug(f"Skipping unparseable favorite playlist row: {e}")
+            if len(items) < limit:
+                break
+            offset += limit
+        return favorites
+
+    def _get_collection_playlists(self):
+        """Followed playlists via the V2 user-collection endpoint.
+
+        Two steps, mirroring `get_favorite_albums`: walk the collection for the
+        ids, then batch-hydrate their metadata through the same `/v2/playlists`
+        reader the owned listing already uses, so followed and owned rows are
+        parsed by ONE parser and cannot drift apart."""
+        try:
+            ids = self._iter_collection_resource_ids(
+                self._COLLECTION_PLAYLISTS_PATH, 'playlists',
+            )
+            if not ids:
+                # Distinguish the two silences: a token without collection scope
+                # is a fixable user problem, an empty collection is not.
+                if self.collection_needs_reconnect():
+                    logger.warning(
+                        "Tidal followed playlists unavailable: the saved token lacks "
+                        "collection scope. Reconnect Tidal in Settings -> Connections "
+                        "to see followed/editorial playlists."
+                    )
+                else:
+                    logger.info("Tidal user collection reports no followed playlists.")
+                return []
+
+            playlists = []
+            for i in range(0, len(ids), self._COLLECTION_BATCH_SIZE):
+                playlists.extend(self._get_playlists_batch(ids[i:i + self._COLLECTION_BATCH_SIZE]))
+            logger.info(
+                f"Retrieved {len(playlists)}/{len(ids)} followed Tidal playlists "
+                f"from the V2 user collection."
+            )
+            return playlists
+        except Exception as e:
+            logger.warning(f"Tidal V2 followed-playlist collection failed: {e}")
+            return []
+
+    def _get_playlists_batch(self, playlist_ids):
+        """Batch-hydrate playlist metadata via `/v2/playlists?filter[id]=...`.
+
+        Reuses `_collect_v2_playlist_page` — the response shape is identical to
+        the owned listing's, so there is one parser for both."""
+        if not playlist_ids:
+            return []
+        try:
+            params = {'countryCode': 'US', 'filter[id]': ','.join(playlist_ids)}
+            headers = self.session.headers.copy()
+            headers['accept'] = 'application/vnd.api+json'
+            resp = requests.get(
+                f"{self.base_url}/playlists", params=params, headers=headers, timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"Tidal playlists batch returned {resp.status_code}: {resp.text[:200]}"
+                )
+                return []
+            playlists = []
+            self._collect_v2_playlist_page(resp.json(), playlists)
+            # These are FOLLOWED, not owned. The owned listing leaves owner unset;
+            # labelling these keeps the card honest about where the list came from.
+            for playlist in playlists:
+                if not getattr(playlist, 'owner', None):
+                    playlist.owner = 'Tidal'
+            return playlists
+        except Exception as e:
+            logger.warning(f"Tidal _get_playlists_batch error: {e}")
             return []
 
     def _collect_v2_playlist_page(self, data, playlists):
@@ -789,6 +1051,37 @@ class TidalClient:
             
         
     
+    def _search_results(self, query: str, include: str, label: str) -> Optional[Dict]:
+        """GET /searchResults?filter[query]= — the one request all four searches share.
+
+        They had drifted: only the track search logged the body Tidal sends
+        back, so the other three could report nothing but "failed: 400" and a
+        user's bug report could not be answered (Skowl, Sept 22 2026). The
+        status alone never says which parameter Tidal objected to.
+        """
+        cleaned = _clean_search_query(query)
+        if not cleaned:
+            # tidal 400s an empty filter[query]; nothing to search for anyway
+            return None
+
+        response = self.session.get(
+            f"{self.base_url}/searchResults",
+            params={'filter[query]': cleaned, 'countryCode': 'US', 'include': include},
+            timeout=10
+        )
+
+        if response.status_code == 429:
+            raise Exception(f"Rate limited (429) on {label}")
+        if response.status_code == 200:
+            return _order_included_by_relevance(response.json(), include)
+
+        # warning, not debug: a non-200 here means the feature silently did
+        # nothing, and debug does not reach app.log.
+        logger.warning(
+            f"Tidal {label} failed: {response.status_code} - {response.text[:300]}"
+        )
+        return None
+
     @rate_limited
     def search_tracks(self, query: str, limit: int = 10) -> List[Track]:
         """Search for tracks using Tidal's search API"""
@@ -797,24 +1090,8 @@ class TidalClient:
                 logger.error("Not authenticated with Tidal")
                 return []
 
-            from urllib.parse import quote
-            encoded_query = quote(query, safe='')
-            params = {
-                'countryCode': 'US',
-                'include': 'tracks',
-                'limit': limit
-            }
-
-            response = self.session.get(
-                f"{self.base_url}/searchResults/{encoded_query}",
-                params=params,
-                timeout=10
-            )
-            
-            if response.status_code == 429:
-                raise Exception("Rate limited (429) on search_tracks")
-            if response.status_code == 200:
-                data = response.json()
+            data = self._search_results(query, 'tracks', 'search_tracks')
+            if data is not None:
                 tracks = []
 
                 # Handle V2 JSON:API response formats
@@ -826,7 +1103,8 @@ class TidalClient:
                 elif 'included' in data:
                     items = [r for r in data['included'] if r.get('type') == 'tracks']
 
-                for item in items:
+                # no limit param on the collection endpoint; trim here
+                for item in items[:limit]:
                     # Flatten JSON:API resource if needed
                     if 'attributes' in item and 'id' in item:
                         flat = dict(item['attributes'])
@@ -838,12 +1116,10 @@ class TidalClient:
 
                 logger.info(f"Found {len(tracks)} Tidal tracks for query: '{query}'")
                 return tracks
-            else:
-                logger.error(f"Tidal search failed: {response.status_code} - {response.text}")
-                return []
+            return []
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error searching Tidal tracks: {e}")
             return []
@@ -857,24 +1133,10 @@ class TidalClient:
             if not self._ensure_valid_token():
                 return None
 
-            from urllib.parse import quote
             from difflib import SequenceMatcher
-            encoded_query = quote(name, safe='')
-            params = {
-                'countryCode': 'US',
-                'include': 'artists',
-            }
 
-            response = self.session.get(
-                f"{self.base_url}/searchResults/{encoded_query}",
-                params=params,
-                timeout=10
-            )
-
-            if response.status_code == 429:
-                raise Exception("Rate limited (429) on search_artist")
-            if response.status_code == 200:
-                data = response.json()
+            data = self._search_results(name, 'artists', 'search_artist')
+            if data is not None:
                 # JSON:API format: included artists in 'artists' or nested in relationships
                 items = []
                 if 'artists' in data and isinstance(data['artists'], list):
@@ -899,12 +1161,10 @@ class TidalClient:
                             best_score = score
                             best_item = flat
                     return best_item
-            else:
-                logger.debug(f"Tidal artist search failed: {response.status_code}")
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error searching Tidal artist: {e}")
             return None
@@ -916,24 +1176,10 @@ class TidalClient:
             if not self._ensure_valid_token():
                 return None
 
-            from urllib.parse import quote
             query = f"{artist} {title}" if artist else title
-            encoded_query = quote(query, safe='')
-            params = {
-                'countryCode': 'US',
-                'include': 'albums',
-            }
 
-            response = self.session.get(
-                f"{self.base_url}/searchResults/{encoded_query}",
-                params=params,
-                timeout=10
-            )
-
-            if response.status_code == 429:
-                raise Exception("Rate limited (429) on search_album")
-            if response.status_code == 200:
-                data = response.json()
+            data = self._search_results(query, 'albums', 'search_album')
+            if data is not None:
                 items = []
                 if 'albums' in data and isinstance(data['albums'], list):
                     items = data['albums']
@@ -965,12 +1211,10 @@ class TidalClient:
                             best_score = score
                             best_item = flat
                     return best_item
-            else:
-                logger.debug(f"Tidal album search failed: {response.status_code}")
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error searching Tidal album: {e}")
             return None
@@ -982,24 +1226,10 @@ class TidalClient:
             if not self._ensure_valid_token():
                 return None
 
-            from urllib.parse import quote
             query = f"{artist} {title}" if artist else title
-            encoded_query = quote(query, safe='')
-            params = {
-                'countryCode': 'US',
-                'include': 'tracks',
-            }
 
-            response = self.session.get(
-                f"{self.base_url}/searchResults/{encoded_query}",
-                params=params,
-                timeout=10
-            )
-
-            if response.status_code == 429:
-                raise Exception("Rate limited (429) on search_track")
-            if response.status_code == 200:
-                data = response.json()
+            data = self._search_results(query, 'tracks', 'search_track')
+            if data is not None:
                 items = []
                 if 'tracks' in data and isinstance(data['tracks'], list):
                     items = data['tracks']
@@ -1031,12 +1261,10 @@ class TidalClient:
                             best_score = score
                             best_item = flat
                     return best_item
-            else:
-                logger.debug(f"Tidal track search failed: {response.status_code}")
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error searching Tidal track: {e}")
             return None
@@ -1070,7 +1298,7 @@ class TidalClient:
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error getting Tidal artist {artist_id}: {e}")
             return None
@@ -1103,7 +1331,7 @@ class TidalClient:
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error getting Tidal album {album_id}: {e}")
             return None
@@ -1251,7 +1479,7 @@ class TidalClient:
             return None
 
         except Exception as e:
-            if "429" in str(e):
+            if _is_rate_limit_error(e):
                 raise  # Let rate_limited decorator handle retry
             logger.error(f"Error getting Tidal track {track_id}: {e}")
             return None
@@ -1291,7 +1519,7 @@ class TidalClient:
             headers = {'accept': 'application/vnd.api+json'}
             response = self.session.get(
                 f"{self.base_url}/playlists/{playlist_id}",
-                params={'countryCode': 'US'},
+                params={'countryCode': self._get_account_country()},
                 headers=headers,
                 timeout=10
             )
@@ -1313,6 +1541,8 @@ class TidalClient:
             page_num = 0
             consecutive_failures = 0
             MAX_PAGE_RETRIES = 3
+            skipped_videos = 0
+            unavailable_tracks = 0
 
             while True:
                 page_num += 1
@@ -1325,8 +1555,7 @@ class TidalClient:
                 try:
                     tracks_page = self._get_playlist_tracks_page(playlist_id, cursor)
                 except Exception as e:
-                    error_str = str(e)
-                    if "429" in error_str or "rate limit" in error_str.lower():
+                    if _is_rate_limit_error(e):
                         consecutive_failures += 1
                         if consecutive_failures <= MAX_PAGE_RETRIES:
                             backoff = 10.0 * consecutive_failures  # 10s, 20s, 30s
@@ -1348,13 +1577,20 @@ class TidalClient:
                 # Reset failure counter on success
                 consecutive_failures = 0
 
-                # Extract track IDs from this page
+                # Extract track IDs from this page, in playlist order. a
+                # playlist can hold the same track twice (each entry has its
+                # own meta.itemId) and can hold videos, which /tracks never
+                # returns, so both get counted instead of vanishing (#1613).
                 track_ids = []
                 for item in tracks_page.get("data", []):
-                    # In JSON:API, relationship items have both 'type' and 'id'
-                    # The type should be 'tracks' but we'll be defensive
-                    if item.get("type") and item.get("id"):
-                        track_ids.append(item.get("id"))
+                    item_type = item.get("type")
+                    item_id = item.get("id")
+                    if not item_type or not item_id:
+                        continue
+                    if item_type != "tracks":
+                        skipped_videos += 1
+                        continue
+                    track_ids.append(str(item_id))
 
                 if track_ids:
                     # Batch fetch full track details with artists and albums.
@@ -1362,22 +1598,29 @@ class TidalClient:
                     # _COLLECTION_BATCH_SIZE tracks per request, so a relationships
                     # page larger than the cap would be silently truncated if sent
                     # in one shot. Mirrors get_album_tracks. (#867)
-                    batch_tracks = []
-                    for j in range(0, len(track_ids), self._COLLECTION_BATCH_SIZE):
-                        chunk_ids = track_ids[j:j + self._COLLECTION_BATCH_SIZE]
+                    # filter[id] hands back one track per id, so ask once per
+                    # id and lay the results back out in playlist order.
+                    unique_ids = list(dict.fromkeys(track_ids))
+                    by_id = {}
+                    for j in range(0, len(unique_ids), self._COLLECTION_BATCH_SIZE):
+                        chunk_ids = unique_ids[j:j + self._COLLECTION_BATCH_SIZE]
                         try:
-                            batch_tracks.extend(self._get_tracks_batch(chunk_ids))
+                            for t in self._get_tracks_batch(chunk_ids):
+                                by_id[str(t.id)] = t
                         except Exception as e:
                             logger.error(f"Error fetching track details for page {page_num}: {e}")
                             # Lose this chunk but keep going — remaining chunks/pages can still load
                             continue
 
-                    if len(batch_tracks) < len(track_ids):
-                        logger.warning(f"Page {page_num}: requested {len(track_ids)} tracks but only {len(batch_tracks)} returned (some may be unavailable in your region)")
+                    page_tracks = [by_id[tid] for tid in track_ids if tid in by_id]
+                    missing = len(track_ids) - len(page_tracks)
+                    if missing:
+                        unavailable_tracks += missing
+                        logger.warning(f"Page {page_num}: {missing} of {len(track_ids)} tracks didn't come back from Tidal (unavailable in {self._get_account_country()} or failed to load)")
 
-                    tracks.extend(batch_tracks)
-                    total_fetched += len(batch_tracks)
-                    logger.info(f"Fetched {len(batch_tracks)} tracks in this batch, {total_fetched} total so far")
+                    tracks.extend(page_tracks)
+                    total_fetched += len(page_tracks)
+                    logger.info(f"Fetched {len(page_tracks)} tracks in this batch, {total_fetched} total so far")
 
                 # Get next cursor from Tidal's response
                 # Tidal uses: links.meta.nextCursor (confirmed by PR #113)
@@ -1394,7 +1637,9 @@ class TidalClient:
                 description=playlist_attrs.get('description', ''),
                 tracks=tracks,
                 external_urls={'tidal': f"https://listen.tidal.com/playlist/{playlist_id}"},
-                public=playlist_attrs.get('accessType', '') == "PUBLIC"
+                public=playlist_attrs.get('accessType', '') == "PUBLIC",
+                skipped_videos=skipped_videos,
+                unavailable_tracks=unavailable_tracks,
             )
 
             # Extract cover image URL from relationships (same logic as get_user_playlists_metadata_only)
@@ -1408,7 +1653,8 @@ class TidalClient:
             except Exception as _e:
                 logger.debug("tidal playlist image_url extract: %s", _e)
 
-            logger.info(f"Retrieved Tidal playlist '{playlist.name}' with {len(tracks)} tracks")
+            logger.info(f"Retrieved Tidal playlist '{playlist.name}' with {len(tracks)} tracks"
+                        f" ({skipped_videos} videos skipped, {unavailable_tracks} tracks unavailable)")
             return playlist
 
         except Exception as e:
@@ -1419,7 +1665,7 @@ class TidalClient:
     def _get_playlist_tracks_page(self, playlist_id: str, cursor: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """Fetch a page of track IDs from a playlist using cursor-based pagination"""
         try:
-            params = {"countryCode": "US"}
+            params = {"countryCode": self._get_account_country()}
             if cursor:
                 params["page[cursor]"] = cursor
 
@@ -1453,7 +1699,7 @@ class TidalClient:
                 return []
 
             params = {
-                "countryCode": "US",
+                "countryCode": self._get_account_country(),
                 "include": "artists,albums",
                 "filter[id]": ",".join(track_ids)
             }
@@ -1659,6 +1905,15 @@ class TidalClient:
     _COLLECTION_TRACKS_PATH = "userCollectionTracks/me/relationships/items"
     _COLLECTION_ALBUMS_PATH = "userCollectionAlbums/me/relationships/items"
     _COLLECTION_ARTISTS_PATH = "userCollectionArtists/me/relationships/items"
+    # Checked against Tidal's published OpenAPI (tidal-usercollectionplaylists-
+    # api-openapi.yml): the resource exists and its path shape is
+    # `/userCollectionPlaylists/{id}/relationships/items` — byte-identical to the
+    # `/userCollectionAlbums/{id}/...` one above, which this client already calls
+    # with `me` in the {id} slot and which works. The spec's item-identifier
+    # `example: tracks` is boilerplate — the ALBUMS spec says `tracks` too, while
+    # the real responses type as `albums`, which is why the walker filters on the
+    # resource name rather than trusting the example.
+    _COLLECTION_PLAYLISTS_PATH = "userCollectionPlaylists/me/relationships/items"
     _COLLECTION_BATCH_SIZE = 20  # Tidal `filter[id]` page cap
 
     @rate_limited
@@ -1700,7 +1955,7 @@ class TidalClient:
             else:
                 url = f"{self.base_url}/{path}"
                 params = {
-                    'countryCode': 'US',
+                    'countryCode': self._get_account_country(),
                     'locale': 'en-US',
                     'include': 'items',
                 }

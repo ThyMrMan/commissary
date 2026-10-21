@@ -1,3 +1,32 @@
+// Shared lifecycle for every download-missing modal, including re-opened active jobs.
+function installDownloadModalScrollLock() {
+    const selector = '.download-missing-modal';
+    const sync = () => {
+        const open = [...document.querySelectorAll(selector)].some(modal =>
+            !modal.hidden && getComputedStyle(modal).display !== 'none');
+        document.documentElement.classList.toggle('download-modal-open', open);
+    };
+    const containsModal = node => node.nodeType === 1 &&
+        (node.matches(selector) || node.querySelector(selector));
+    const observer = new MutationObserver(records => {
+        if (records.some(record => record.type === 'attributes'
+            ? record.target.matches(selector)
+            : [...record.addedNodes, ...record.removedNodes].some(containsModal))) sync();
+    });
+    observer.observe(document.body, {childList: true, subtree: true, attributes: true,
+                                    attributeFilter: ['style', 'class', 'hidden']});
+    sync();
+    return () => {
+        observer.disconnect();
+        document.documentElement.classList.remove('download-modal-open');
+    };
+}
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', installDownloadModalScrollLock, {once: true});
+} else {
+    installDownloadModalScrollLock();
+}
+
 // WING IT — Download without metadata discovery
 // ==================================================================================
 
@@ -99,7 +128,7 @@ function _wingItAction(urlHash, action) {
 }
 
 async function _wingItSyncFromModal(urlHash, tracks, name, isLB) {
-    showToast('Starting Wing It sync…', 'info');
+    showToast('Starting Wing It sync...', 'info');
     updateYouTubeModalButtons(urlHash, 'syncing');
 
     try {
@@ -255,7 +284,7 @@ function _showWingItChoiceDialog(trackCount, source) {
 
 async function _wingItSync(tracks, playlistName, source, cardIdentifier = null) {
     try {
-        showToast('Syncing playlist to server…', 'info');
+        showToast('Syncing playlist to server...', 'info');
 
         // Format tracks for the sync endpoint
         const syncTracks = tracks.map((t, i) => {
@@ -373,7 +402,7 @@ async function _wingItFromModal(urlHash) {
 
     if (choice === 'sync') {
         // Sync inline — keep modal open, show progress in modal
-        showToast('Starting Wing It sync…', 'info');
+        showToast('Starting Wing It sync...', 'info');
         updateYouTubeModalButtons(urlHash, 'syncing');
 
         try {
@@ -426,8 +455,12 @@ async function _wingItFromModal(urlHash) {
     wingItDownload(tracks, name, source);
 }
 
-async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks, artist = null, album = null) {
-    showLoadingOverlay('Loading YouTube playlist…');
+// `sourceLabel` is the explicit answer to "who made this playlist". the name of
+// this function is a fossil - it serves every virtual playlist on the page - and
+// the prefix sniffing below is a guess that DEFAULTS to YouTube. callers that know
+// (a SoulSync station, a generated mix) pass the label and stop the guessing.
+async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistName, spotifyTracks, artist = null, album = null, sourceLabel = null) {
+    showLoadingOverlay('Loading playlist...');
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
         console.log(`Modal for ${virtualPlaylistId} already exists. Showing it.`);
@@ -478,21 +511,23 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
     };
 
     // Generate hero section with dynamic source detection
-    const source = virtualPlaylistId.startsWith('beatport_') ? 'Beatport' :
+    const source = sourceLabel ? sourceLabel :
+        /^(daily_mix_|release_radar|discovery_weekly|popular_picks|hidden_gems|listening_mix|discovery_shuffle|station_)/.test(virtualPlaylistId) ? 'SoulSync' :
+        virtualPlaylistId.startsWith('beatport_') ? 'Beatport' :
         virtualPlaylistId.startsWith('tidal_') ? 'Tidal' :
             virtualPlaylistId.startsWith('listenbrainz_') ? 'ListenBrainz' :
                 virtualPlaylistId.startsWith('spotify_public_') ? 'Spotify' :
                     virtualPlaylistId.startsWith('spotify:') ? 'Spotify' :
-                        virtualPlaylistId.startsWith('discover_') ? 'Commissary' :
-                            virtualPlaylistId.startsWith('seasonal_') ? 'Commissary' :
-                                virtualPlaylistId.startsWith('spotify_library_') ? 'Commissary' :
-                                    virtualPlaylistId.startsWith('build_playlist_') ? 'Commissary' :
-                                        virtualPlaylistId.startsWith('decade_') ? 'Commissary' :
-                                            virtualPlaylistId === 'build_playlist_custom' ? 'Commissary' :
+                        virtualPlaylistId.startsWith('discover_') ? 'SoulSync' :
+                            virtualPlaylistId.startsWith('seasonal_') ? 'SoulSync' :
+                                virtualPlaylistId.startsWith('spotify_library_') ? 'SoulSync' :
+                                    virtualPlaylistId.startsWith('build_playlist_') ? 'SoulSync' :
+                                        virtualPlaylistId.startsWith('decade_') ? 'SoulSync' :
+                                            virtualPlaylistId === 'build_playlist_custom' ? 'SoulSync' :
                                                 'YouTube';
 
     // Store metadata for discover download sidebar (will be added when Begin Analysis is clicked)
-    if (source === 'Commissary' || virtualPlaylistId.startsWith('discover_lb_') || virtualPlaylistId.startsWith('listenbrainz_') || virtualPlaylistId.startsWith('wing_it_')) {
+    if (source === 'SoulSync' || virtualPlaylistId.startsWith('discover_lb_') || virtualPlaylistId.startsWith('listenbrainz_') || virtualPlaylistId.startsWith('wing_it_')) {
         // Extract image URL from album context or first track's album cover
         let imageUrl = null;
         if (album && album.images && album.images.length > 0) {
@@ -596,7 +631,7 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
                                                    onchange="updateTrackSelectionCount('${virtualPlaylistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${renderModalTrackPlaylistButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${virtualPlaylistId}-${index}">🔍 Pending</td>
@@ -621,18 +656,13 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
                             <input type="checkbox" id="playlist-folder-mode-${virtualPlaylistId}">
                             <span>Organize by Playlist (Downloads/Playlist/Artist - Track.ext)</span>
                         </label>`}
+                        ${downloadModalQualityProfileSelectHtml(virtualPlaylistId)}
                     </div>
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
-                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
-                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
-                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
-                            style="background-color: #0ea5e9; color: white;">
-                        🔎 Manual Search
-                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
-                        Add to Wishlist
+                        ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
                         Cancel All
@@ -649,6 +679,8 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
     `;
 
     applyProgressiveTrackRendering(virtualPlaylistId, spotifyTracks.length);
+    // Quality Profile selector for this acquisition (P1-01).
+    void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
     modal.style.display = 'flex';
     hideLoadingOverlay();
 }
@@ -963,7 +995,10 @@ async function closeDownloadMissingModal(playlistId) {
         // Automatic cleanup and server operations after successful downloads
         await handlePostDownloadAutomation(playlistId, process);
 
-        cleanupDownloadProcess(playlistId);
+        // awaited: it deletes the process by id after a network call, so a
+        // caller opening a fresh run for the same album right after this
+        // close would otherwise have its new process deleted from under it
+        await cleanupDownloadProcess(playlistId);
     }
 }
 
@@ -1076,148 +1111,6 @@ function generateMosaicBackground(coverUrls) {
  * Open wishlist overview modal showing category breakdown
  * This is the NEW entry point for wishlist from dashboard
  */
-async function openWishlistOverviewModal() {
-    try {
-        showLoadingOverlay('Loading wishlist…');
-
-        // Fetch wishlist stats
-        const statsResponse = await fetch('/api/wishlist/stats');
-        const statsData = await statsResponse.json();
-
-        if (!statsResponse.ok) {
-            throw new Error(statsData.error || 'Failed to fetch wishlist stats');
-        }
-
-        const { singles, albums, total } = statsData;
-
-        if (total === 0) {
-            hideLoadingOverlay();
-            showToast('Wishlist is empty. No tracks to process.', 'info');
-            return;
-        }
-
-        // Fetch album covers for mosaic backgrounds
-        // Limit to 50 tracks per category (enough to get 20 unique covers while being efficient)
-        const albumCoversPromise = fetch('/api/wishlist/tracks?category=albums&limit=50').then(r => r.json());
-        const singleCoversPromise = fetch('/api/wishlist/tracks?category=singles&limit=50').then(r => r.json());
-
-        const [albumTracksData, singleTracksData] = await Promise.all([albumCoversPromise, singleCoversPromise]);
-
-        // Extract unique album covers (max 20 per category)
-        const albumCovers = extractUniqueCoverImages(albumTracksData.tracks || [], 20);
-        const singleCovers = extractUniqueCoverImages(singleTracksData.tracks || [], 20);
-
-        // Create modal if it doesn't exist
-        let modal = document.getElementById('wishlist-overview-modal');
-        if (!modal) {
-            modal = document.createElement('div');
-            modal.id = 'wishlist-overview-modal';
-            modal.className = 'modal-overlay';
-            document.body.appendChild(modal);
-        }
-
-        // Fetch current cycle
-        const cycleResponse = await fetch('/api/wishlist/cycle');
-        const cycleData = await cycleResponse.json();
-        const currentCycle = cycleData.cycle || 'albums';
-
-        // Format countdown timer
-        const nextRunSeconds = statsData.next_run_in_seconds || 0;
-        const countdownText = formatCountdownTime(nextRunSeconds);
-        const nextCycleText = currentCycle === 'albums' ? 'Albums/EPs' : 'Singles';
-
-        modal.innerHTML = `
-            <div class="modal-container playlist-modal">
-                <div class="playlist-modal-header">
-                    <div class="playlist-header-content">
-                        <h2>🎵 Wishlist Overview</h2>
-                        <div class="playlist-quick-info">
-                            <span class="playlist-track-count">${total} Total Tracks</span>
-                            <span class="playlist-owner" id="wishlist-next-auto-timer">Next Auto: ${nextCycleText}${countdownText ? ' in ' + countdownText : ''}</span>
-                        </div>
-                    </div>
-                    <span class="playlist-modal-close" onclick="closeWishlistOverviewModal()">×</span>
-                </div>
-
-                <div class="playlist-modal-body">
-                    <div class="wishlist-category-grid">
-                        <!-- Albums/EPs Category -->
-                        <div class="wishlist-category-card ${currentCycle === 'albums' ? 'next-in-queue' : ''}" data-category="albums" onclick="selectWishlistCategory('albums')">
-                            ${generateMosaicBackground(albumCovers)}
-                            <div class="wishlist-category-content">
-                                <div class="wishlist-category-icon">💿</div>
-                                <div class="wishlist-category-title">Albums / EPs</div>
-                                <div class="wishlist-category-count">${albums} tracks</div>
-                                ${currentCycle === 'albums' ? '<div class="wishlist-category-badge">Next in Queue</div>' : ''}
-                            </div>
-                        </div>
-
-                        <!-- Singles Category -->
-                        <div class="wishlist-category-card ${currentCycle === 'singles' ? 'next-in-queue' : ''}" data-category="singles" onclick="selectWishlistCategory('singles')">
-                            ${generateMosaicBackground(singleCovers)}
-                            <div class="wishlist-category-content">
-                                <div class="wishlist-category-icon">🎵</div>
-                                <div class="wishlist-category-title">Singles</div>
-                                <div class="wishlist-category-count">${singles} tracks</div>
-                                ${currentCycle === 'singles' ? '<div class="wishlist-category-badge">Next in Queue</div>' : ''}
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- Selected Category Track List (initially hidden) -->
-                    <div id="wishlist-category-tracks" class="wishlist-category-tracks" style="display: none;">
-                        <div class="wishlist-category-header">
-                            <button class="wishlist-back-btn" onclick="backToCategories()">← Back</button>
-                            <span id="wishlist-category-name" class="wishlist-category-name"></span>
-                            <button class="wishlist-select-all-btn" id="wishlist-select-all-btn" onclick="toggleWishlistSelectAll()">Select All</button>
-                        </div>
-                        <div class="wishlist-batch-bar" id="wishlist-batch-bar" style="display: none;">
-                            <span class="wishlist-batch-count" id="wishlist-batch-count">0 selected</span>
-                            <button class="playlist-modal-btn playlist-modal-btn-secondary wishlist-batch-remove-btn"
-                                    onclick="batchRemoveFromWishlist()">
-                                Remove Selected
-                            </button>
-                        </div>
-                        <div id="wishlist-tracks-list" class="playlist-tracks-scroll">
-                            <div class="loading-indicator">Loading tracks…</div>
-                        </div>
-                    </div>
-                </div>
-
-                <div class="playlist-modal-footer">
-                    <div class="playlist-modal-footer-left">
-                        <button class="playlist-modal-btn playlist-modal-btn-danger" onclick="clearEntireWishlist()">
-                            🗑️ Clear Wishlist
-                        </button>
-                        <button class="playlist-modal-btn playlist-modal-btn-warning" onclick="cleanupWishlistOverview()">
-                            🧹 Cleanup Wishlist
-                        </button>
-                        <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="openWishlistIgnoreModal()" title="Tracks you removed or cancelled — auto-skipped until they expire">
-                            🚫 Ignored
-                        </button>
-                    </div>
-                    <div class="playlist-modal-footer-right">
-                        <button class="playlist-modal-btn playlist-modal-btn-secondary" onclick="closeWishlistOverviewModal()">Close</button>
-                        <button id="wishlist-download-btn" class="playlist-modal-btn playlist-modal-btn-primary" style="display: none;" onclick="downloadSelectedCategory()">
-                            Download Selection
-                        </button>
-                    </div>
-                </div>
-            </div>
-        `;
-
-        modal.style.display = 'flex';
-        hideLoadingOverlay();
-
-        // Start countdown timer update interval
-        startWishlistCountdownTimer(currentCycle, nextRunSeconds);
-
-    } catch (error) {
-        console.error('Error opening wishlist overview:', error);
-        showToast(`Failed to load wishlist: ${error.message}`, 'error');
-        hideLoadingOverlay();
-    }
-}
 
 function startWishlistCountdownTimer(currentCycle, initialSeconds) {
     // Clear any existing interval
@@ -1257,11 +1150,16 @@ function startWishlistCountdownTimer(currentCycle, initialSeconds) {
                     const response = await fetch('/api/wishlist/stats');
                     const data = await response.json();
 
-                    // AUTO-CLOSE DETECTION: If auto-processing started, close modal and notify user (once)
+                    // Auto-processing started: stop the countdown and notify (once).
+                    // This used to call closeWishlistOverviewModal(); the overview
+                    // modal is gone, but that call's clearInterval was the part doing
+                    // the work — `return` below only ends this tick, not the interval.
                     if (data.is_auto_processing) {
                         if (!_wishlistAutoProcessingNotified) {
-                            console.log('🤖 [Wishlist] Auto-processing detected, closing overview modal');
-                            closeWishlistOverviewModal();
+                            if (wishlistCountdownInterval) {
+                                clearInterval(wishlistCountdownInterval);
+                                wishlistCountdownInterval = null;
+                            }
                             showToast('Wishlist auto-processing started. View progress in Download Manager.', 'info');
                             _wishlistAutoProcessingNotified = true;
                         }
@@ -1297,29 +1195,6 @@ function startWishlistCountdownTimer(currentCycle, initialSeconds) {
     }, 1000); // Update every second
 }
 
-function closeWishlistOverviewModal() {
-    console.log('🚪 closeWishlistOverviewModal() called');
-
-    // Stop countdown timer
-    if (wishlistCountdownInterval) {
-        clearInterval(wishlistCountdownInterval);
-        wishlistCountdownInterval = null;
-    }
-
-    const modal = document.getElementById('wishlist-overview-modal');
-    console.log('Modal element:', modal);
-    if (modal) {
-        modal.style.display = 'none';
-        console.log('Modal display set to none');
-        // Also remove from DOM to ensure clean state
-        modal.remove();
-        console.log('Modal removed from DOM');
-    } else {
-        console.warn('Modal element not found');
-    }
-    window.selectedWishlistCategory = null;
-    console.log('✅ Modal closed');
-}
 
 // ── #874: Wishlist ignore-list ("Ignored") modal ────────────────────────
 // Tracks the user removed from the wishlist or cancelled mid-download are
@@ -1341,7 +1216,7 @@ async function openWishlistIgnoreModal() {
             </div>
             <p style="opacity:0.7;font-size:13px;margin:8px 16px 0;">Removed or cancelled tracks are skipped by auto-download until they expire. Un-ignore to allow auto-download again (you can always download manually).</p>
             <div id="wishlist-ignore-list" class="playlist-tracks-scroll" style="flex:1;overflow-y:auto;padding:12px 16px;">
-                <div class="loading-indicator">Loading…</div>
+                <div class="loading-indicator">Loading...</div>
             </div>
             <div class="playlist-modal-footer">
                 <div class="playlist-modal-footer-left">
@@ -1440,7 +1315,7 @@ async function cleanupWishlistOverview() {
     }
 
     try {
-        showLoadingOverlay('Cleaning up wishlist…');
+        showLoadingOverlay('Cleaning up wishlist...');
 
         const response = await fetch('/api/wishlist/cleanup', {
             method: 'POST'
@@ -1461,15 +1336,12 @@ async function cleanupWishlistOverview() {
             const statsResponse = await fetch('/api/wishlist/stats');
             const statsData = await statsResponse.json();
 
+            // The wishlist page is a React route now, so it cannot be refreshed
+            // by calling the old initializer — that would repaint markup nobody
+            // is looking at. Announce the change instead; the page listens.
+            notifyWishlistChanged();
             if (statsData.total === 0) {
-                // Wishlist is empty, refresh the page to show empty state
-                wishlistPageState.isInitialized = false;
-                await initializeWishlistPage();
                 await updateWishlistCount();
-            } else {
-                // Wishlist still has items, refresh the page to show updated counts
-                wishlistPageState.isInitialized = false;
-                await initializeWishlistPage();
             }
         } else {
             showToast(`Failed to cleanup wishlist: ${result.error || 'Unknown error'}`, 'error');
@@ -1495,7 +1367,7 @@ async function clearEntireWishlist() {
     console.log('User confirmed, proceeding with clear...');
 
     try {
-        showLoadingOverlay('Clearing wishlist…');
+        showLoadingOverlay('Clearing wishlist...');
         console.log('Loading overlay shown');
 
         const response = await fetch('/api/wishlist/clear', {
@@ -1518,7 +1390,7 @@ async function clearEntireWishlist() {
 
             console.log('Refreshing wishlist page...');
             wishlistPageState.isInitialized = false;
-            await initializeWishlistPage();
+            notifyWishlistChanged();
         } else {
             console.error('Clear failed:', result.error);
             showToast(`Failed to clear wishlist: ${result.error || 'Unknown error'}`, 'error');
@@ -1531,784 +1403,18 @@ async function clearEntireWishlist() {
     }
 }
 
-async function selectWishlistCategory(category) {
-    try {
-        window.selectedWishlistCategory = category;
 
-        const tracksList = document.getElementById('wishlist-tracks-list');
-        const categoryTracksSection = document.getElementById('wishlist-category-tracks');
-        const nebulaEl = document.getElementById('wishlist-nebula');
-        const downloadBtn = document.getElementById('wishlist-download-btn');
-        const categoryName = document.getElementById('wishlist-category-name');
 
-        if (nebulaEl) nebulaEl.style.display = 'none';
-        categoryTracksSection.style.display = 'block';
-        downloadBtn.style.display = 'inline-block';
-        categoryName.textContent = category === 'albums' ? 'Albums / EPs' : 'Singles';
-
-        tracksList.innerHTML = '<div class="loading-indicator">Loading tracks…</div>';
-
-        const _wlPageSize = window._wlNextLimit || 200;
-        window._wlNextLimit = null;
-        const response = await fetch(`/api/wishlist/tracks?category=${category}&limit=${_wlPageSize}`);
-        const data = await response.json();
-
-        if (!response.ok) throw new Error(data.error || 'Failed to fetch tracks');
-
-        const tracks = data.tracks || [];
-        const totalAvailable = data.total || tracks.length;
-        window._wlCategory = category;
-        window._wlOffset = tracks.length;
-        window._wlTotal = totalAvailable;
-
-        if (tracks.length === 0) {
-            tracksList.innerHTML = '<div class="empty-state">No tracks in this category</div>';
-            return;
-        }
-
-        // For Albums/EPs, group by album
-        if (category === 'albums') {
-            const albumGroups = {};
-
-            tracks.forEach(track => {
-                let spotifyData = track.spotify_data;
-                if (typeof spotifyData === 'string') {
-                    try {
-                        spotifyData = JSON.parse(spotifyData);
-                    } catch (e) {
-                        spotifyData = null;
-                    }
-                }
-
-                const rawAlbum = spotifyData?.album;
-                const albumName = (typeof rawAlbum === 'string' ? rawAlbum : rawAlbum?.name) || 'Unknown Album';
-
-                // Handle both object format {name: '...'} and sanitized string format
-                let artistName = 'Unknown Artist';
-                let artistId = null;
-                if (spotifyData?.artists?.[0]?.name) {
-                    // Object format from Spotify API
-                    artistName = spotifyData.artists[0].name;
-                    artistId = spotifyData.artists[0].id;
-                } else if (spotifyData?.artists?.[0] && typeof spotifyData.artists[0] === 'string') {
-                    // Sanitized string format
-                    artistName = spotifyData.artists[0];
-                } else if (Array.isArray(track.artists) && track.artists.length > 0) {
-                    // Fallback to track.artists
-                    if (typeof track.artists[0] === 'string') {
-                        artistName = track.artists[0];
-                    } else if (track.artists[0]?.name) {
-                        artistName = track.artists[0].name;
-                        artistId = track.artists[0].id;
-                    }
-                }
-
-                const albumImage = spotifyData?.album?.images?.[0]?.url || '';
-
-                // Use album ID if available, otherwise create unique key from album + artist
-                // Sanitize the ID to remove all special characters that could break DOM IDs or CSS selectors
-                const albumId = spotifyData?.album?.id || `${albumName}_${artistName}`
-                    .replace(/[^a-zA-Z0-9\s_-]/g, '')  // Remove all special chars except spaces, underscores, hyphens
-                    .replace(/\s+/g, '_')               // Replace spaces with underscores
-                    .toLowerCase();
-
-                if (!albumGroups[albumId]) {
-                    albumGroups[albumId] = {
-                        albumName,
-                        artistName,
-                        artistId,
-                        albumImage,
-                        tracks: []
-                    };
-                }
-
-                const spotifyTrackId = track.spotify_track_id || track.id || '';
-
-                albumGroups[albumId].tracks.push({
-                    name: track.name || 'Unknown Track',
-                    artistName,
-                    trackNumber: spotifyData?.track_number || 0,
-                    spotifyTrackId
-                });
-            });
-
-            // Render album cards grouped under per-artist sections (#1065):
-            // one tri-state checkbox / delete / download per ARTIST, so a
-            // 30-album discography is one click instead of thirty.
-            const artistGroups = new Map();
-            Object.entries(albumGroups).forEach(([albumId, albumData]) => {
-                const key = albumData.artistName || 'Unknown Artist';
-                if (!artistGroups.has(key)) artistGroups.set(key, []);
-                artistGroups.get(key).push([albumId, albumData]);
-            });
-
-            const cardHTML = ([albumId, albumData]) => {
-                // Sort tracks by track number
-                albumData.tracks.sort((a, b) => a.trackNumber - b.trackNumber);
-
-                // Carried onto each row's manual-search button so the picker can
-                // be opened straight from the row without a second lookup.
-                const safeArtistNameForTracks = escapeHtml(albumData.artistName || '');
-                const safeAlbumNameForTracks = escapeHtml(albumData.albumName || '');
-                const tracksListHTML = albumData.tracks.map(track => {
-                    const safeTrackId = escapeHtml(track.spotifyTrackId || '');
-                    const safeTrackName = escapeHtml(track.name || 'Unknown Track');
-                    return `
-                    <div class="wishlist-album-track wishlist-track-item">
-                        <label class="wishlist-checkbox-wrapper">
-                            <input type="checkbox" class="wishlist-select-cb"
-                                   data-track-id="${safeTrackId}">
-                            <span class="wishlist-checkbox-custom"></span>
-                        </label>
-                        <span class="wishlist-album-track-name">${safeTrackName}</span>
-                        <button class="wishlist-manual-search-btn" data-manual-search-track="${safeTrackId}"
-                                data-ms-name="${safeTrackName}"
-                                data-ms-artist="${safeArtistNameForTracks}"
-                                data-ms-album="${safeAlbumNameForTracks}"
-                                title="Search every source for this track and pick one yourself">
-                            🔍
-                        </button>
-                        <button class="wishlist-delete-btn wishlist-delete-btn-small" data-track-id="${safeTrackId}" title="Remove from wishlist">
-                            🗑️
-                        </button>
-                    </div>
-                `;
-                }).join('');
-
-                // Handle missing album images with a placeholder
-                const safeAlbumId = escapeHtml(albumId);
-                const safeAlbumName = escapeHtml(albumData.albumName || 'Unknown Album');
-                const safeArtistName = escapeHtml(albumData.artistName || 'Unknown Artist');
-                const safeAlbumImage = escapeHtml(albumData.albumImage || '').replace(/'/g, '&#39;');
-                const albumImageStyle = albumData.albumImage
-                    ? `background-image: url('${safeAlbumImage}')`
-                    : `background: linear-gradient(135deg, rgba(30, 30, 30, 0.9) 0%, rgba(50, 50, 50, 0.9) 100%); display: flex; align-items: center; justify-content: center; font-size: 40px;`;
-                const albumImageContent = albumData.albumImage ? '' : '<span style="opacity: 0.3;">💿</span>';
-
-                return `
-                    <div class="wishlist-album-card">
-                        <div class="wishlist-album-header" data-album-id="${safeAlbumId}">
-                            <label class="wishlist-checkbox-wrapper">
-                                <input type="checkbox" class="wishlist-album-select-all-cb"
-                                       data-album-id="${safeAlbumId}">
-                                <span class="wishlist-checkbox-custom"></span>
-                            </label>
-                            <div class="wishlist-album-image" style="${albumImageStyle}">${albumImageContent}</div>
-                            <div class="wishlist-album-info">
-                                <div class="wishlist-album-name">${safeAlbumName}</div>
-                                <div class="wishlist-album-artist">${safeArtistName}</div>
-                                <div class="wishlist-album-track-count">${albumData.tracks.length} track${albumData.tracks.length !== 1 ? 's' : ''}</div>
-                            </div>
-                            <button class="wishlist-delete-btn wishlist-delete-album-btn" data-album-id="${safeAlbumId}" title="Remove all tracks from album">
-                                🗑️
-                            </button>
-                            <div class="wishlist-album-expand-icon" id="expand-icon-${albumId}">▼</div>
-                        </div>
-                        <div class="wishlist-album-tracks" id="tracks-${safeAlbumId}" style="display: none;">
-                            ${tracksListHTML}
-                        </div>
-                    </div>
-                `;
-            };
-
-            let albumsHTML = '';
-            for (const [artistName, entries] of artistGroups) {
-                const trackTotal = entries.reduce((s, [, a]) => s + a.tracks.length, 0);
-                const safeArtist = escapeHtml(artistName);
-                const artistKey = artistName.replace(/[^a-zA-Z0-9\s_-]/g, '').replace(/\s+/g, '_').toLowerCase() || 'unknown';
-                albumsHTML += `
-                    <div class="wishlist-artist-section" data-artist-name="${safeArtist}">
-                        <div class="wishlist-artist-header">
-                            <label class="wishlist-checkbox-wrapper">
-                                <input type="checkbox" class="wishlist-artist-select-all-cb"
-                                       data-artist-key="${escapeHtml(artistKey)}">
-                                <span class="wishlist-checkbox-custom"></span>
-                            </label>
-                            <span class="wishlist-artist-title">${safeArtist}</span>
-                            <span class="wishlist-artist-counts">${entries.length} album${entries.length !== 1 ? 's' : ''} · ${trackTotal} track${trackTotal !== 1 ? 's' : ''}</span>
-                            <button class="wishlist-artist-download-btn" data-artist-name="${safeArtist}" title="Download only ${safeArtist}">⬇</button>
-                            <button class="wishlist-delete-btn wishlist-delete-artist-btn" data-artist-name="${safeArtist}" title="Remove ${safeArtist} and all their releases from the wishlist">🗑️</button>
-                        </div>
-                        <div class="wishlist-album-grid">${entries.map(cardHTML).join('')}</div>
-                    </div>`;
-            }
-
-            tracksList.innerHTML = albumsHTML;
-            if (totalAvailable > tracks.length) {
-                tracksList.insertAdjacentHTML('beforeend',
-                    `<button class="wishlist-load-more-btn" onclick="loadMoreWishlistTracks()">Load More (${tracks.length} of ${totalAvailable})</button>`);
-            }
-            _attachWishlistDelegation(tracksList);
-
-        } else {
-            // For Singles, show list with album images — grouped per artist
-            // (#1065: one checkbox/delete/download per artist, same as albums)
-            const singleArtistRows = new Map();
-            let tracksHTML = '';
-            tracks.forEach((track, index) => {
-                const trackName = track.name || 'Unknown Track';
-
-                let spotifyData = track.spotify_data;
-                if (typeof spotifyData === 'string') {
-                    try {
-                        spotifyData = JSON.parse(spotifyData);
-                    } catch (e) {
-                        spotifyData = null;
-                    }
-                }
-
-                let artistName = 'Unknown Artist';
-                if (spotifyData?.artists?.[0]?.name) {
-                    artistName = spotifyData.artists[0].name;
-                } else if (Array.isArray(track.artists) && track.artists.length > 0) {
-                    if (typeof track.artists[0] === 'string') {
-                        artistName = track.artists[0];
-                    } else if (track.artists[0]?.name) {
-                        artistName = track.artists[0].name;
-                    }
-                }
-
-                let albumName = 'Unknown Album';
-                if (spotifyData?.album?.name) {
-                    albumName = spotifyData.album.name;
-                } else if (typeof track.album === 'string') {
-                    albumName = track.album;
-                } else if (track.album?.name) {
-                    albumName = track.album.name;
-                }
-
-                const albumImage = spotifyData?.album?.images?.[0]?.url || '';
-                const spotifyTrackId = track.spotify_track_id || track.id || '';
-                const safeTrackId = escapeHtml(spotifyTrackId);
-                const safeTrackName = escapeHtml(trackName);
-                const safeArtistName = escapeHtml(artistName);
-                const safeAlbumName = escapeHtml(albumName);
-                const safeAlbumImage = escapeHtml(albumImage).replace(/'/g, '&#39;');
-
-                const rowHTML = `
-                    <div class="playlist-track-item-with-image wishlist-track-item">
-                        <label class="wishlist-checkbox-wrapper">
-                            <input type="checkbox" class="wishlist-select-cb"
-                                   data-track-id="${safeTrackId}">
-                            <span class="wishlist-checkbox-custom"></span>
-                        </label>
-                        <div class="playlist-track-image" style="background-image: url('${safeAlbumImage}')"></div>
-                        <div class="playlist-track-info">
-                            <div class="playlist-track-name">${safeTrackName}</div>
-                            <div class="playlist-track-artist">${safeArtistName} • ${safeAlbumName}</div>
-                        </div>
-                        <button class="wishlist-delete-btn" data-track-id="${safeTrackId}" title="Remove from wishlist">
-                            🗑️
-                        </button>
-                    </div>
-                `;
-                if (!singleArtistRows.has(artistName)) singleArtistRows.set(artistName, []);
-                singleArtistRows.get(artistName).push(rowHTML);
-            });
-
-            for (const [artistName, rows] of singleArtistRows) {
-                const safeArtist = escapeHtml(artistName);
-                tracksHTML += `
-                    <div class="wishlist-artist-section" data-artist-name="${safeArtist}">
-                        <div class="wishlist-artist-header">
-                            <label class="wishlist-checkbox-wrapper">
-                                <input type="checkbox" class="wishlist-artist-select-all-cb">
-                                <span class="wishlist-checkbox-custom"></span>
-                            </label>
-                            <span class="wishlist-artist-title">${safeArtist}</span>
-                            <span class="wishlist-artist-counts">${rows.length} single${rows.length !== 1 ? 's' : ''}</span>
-                            <button class="wishlist-artist-download-btn" data-artist-name="${safeArtist}" title="Download only ${safeArtist}">⬇</button>
-                            <button class="wishlist-delete-btn wishlist-delete-artist-btn" data-artist-name="${safeArtist}" title="Remove ${safeArtist} and all their singles from the wishlist">🗑️</button>
-                        </div>
-                        ${rows.join('')}
-                    </div>`;
-            }
-
-            tracksList.innerHTML = tracksHTML;
-            if (totalAvailable > tracks.length) {
-                tracksList.insertAdjacentHTML('beforeend',
-                    `<button class="wishlist-load-more-btn" onclick="loadMoreWishlistTracks()">Load More (${tracks.length} of ${totalAvailable})</button>`);
-            }
-            _attachWishlistDelegation(tracksList);
-        }
-
-    } catch (error) {
-        console.error('Error loading category tracks:', error);
-        showToast(`Failed to load tracks: ${error.message}`, 'error');
-    }
+// Tell the (React) wishlist page its data moved under it. Mirrors the
+// ss:watchlist-scan bridge: module-scoped vanilla state cannot be read from a
+// module, so the vanilla side announces and the page reacts.
+function notifyWishlistChanged() {
+    window.dispatchEvent(new CustomEvent('ss:wishlist-changed'));
 }
 
-async function loadMoreWishlistTracks() {
-    const btn = document.querySelector('.wishlist-load-more-btn');
-    if (btn) { btn.textContent = 'Loading…'; btn.disabled = true; }
-    // Increase page size and reload
-    window._wlOffset = (window._wlOffset || 200) + 200;
-    // Override the page size for this reload
-    window._wlNextLimit = window._wlOffset;
-    selectWishlistCategory(window._wlCategory);
-}
-
-function _attachWishlistDelegation(container) {
-    // Single click handler for all wishlist album/track interactions
-    container.addEventListener('click', (e) => {
-        const target = e.target;
-
-        // Skip checkbox wrapper clicks — handled by change listener
-        if (target.closest('.wishlist-checkbox-wrapper')) return;
-
-        // Album header click (expand/collapse)
-        const header = target.closest('.wishlist-album-header');
-        if (header && !target.closest('.wishlist-delete-album-btn')) {
-            toggleAlbumTracks(header.dataset.albumId);
-            return;
-        }
-
-        // Artist-level actions (#1065) — before the generic delete handler,
-        // since the artist buttons share the .wishlist-delete-btn styling class
-        const artistDelBtn = target.closest('.wishlist-delete-artist-btn');
-        if (artistDelBtn) {
-            e.stopPropagation();
-            removeArtistFromWishlist(artistDelBtn.dataset.artistName);
-            return;
-        }
-        const artistDlBtn = target.closest('.wishlist-artist-download-btn');
-        if (artistDlBtn) {
-            e.stopPropagation();
-            downloadArtistFromWishlist(artistDlBtn.closest('.wishlist-artist-section'));
-            return;
-        }
-
-        // Album delete button
-        const albumDelBtn = target.closest('.wishlist-delete-album-btn');
-        if (albumDelBtn) {
-            e.stopPropagation();
-            removeAlbumFromWishlist(albumDelBtn.dataset.albumId, e);
-            return;
-        }
-
-        // Per-track manual search — checked BEFORE the delete button, since
-        // both live in the same row and a mis-ordered match here would delete
-        // the track instead of searching for it.
-        const msBtn = target.closest('[data-manual-search-track]');
-        if (msBtn) {
-            e.stopPropagation();
-            openManualSearchFor({
-                id: msBtn.dataset.manualSearchTrack || '',
-                name: msBtn.dataset.msName || '',
-                artist: msBtn.dataset.msArtist || '',
-                album: msBtn.dataset.msAlbum || '',
-            }, msBtn);
-            return;
-        }
-
-        // Track delete button
-        const trackDelBtn = target.closest('.wishlist-delete-btn');
-        if (trackDelBtn && trackDelBtn.dataset.trackId) {
-            e.stopPropagation();
-            removeTrackFromWishlist(trackDelBtn.dataset.trackId, e);
-            return;
-        }
-    });
-
-    // Separate change handler for checkboxes (more reliable than click for inputs)
-    container.addEventListener('change', (e) => {
-        const target = e.target;
-        if (target.classList.contains('wishlist-artist-select-all-cb')) {
-            // #1065: one click selects/deselects the artist's whole catalog
-            toggleWishlistArtistSelection(target.closest('.wishlist-artist-section'), target.checked);
-        } else if (target.classList.contains('wishlist-album-select-all-cb')) {
-            toggleWishlistAlbumSelection(target.dataset.albumId, target.checked);
-            _updateArtistTriState(target.closest('.wishlist-artist-section'));
-        } else if (target.classList.contains('wishlist-select-cb')) {
-            updateWishlistBatchBar();
-            _updateArtistTriState(target.closest('.wishlist-artist-section'));
-        }
-    });
-}
-
-// ── artist-level selection + actions (#1065) ────────────────────────────────
-
-function toggleWishlistArtistSelection(section, checked) {
-    if (!section) return;
-    section.querySelectorAll('.wishlist-select-cb, .wishlist-album-select-all-cb').forEach(cb => {
-        cb.checked = checked;
-        cb.indeterminate = false;
-    });
-    updateWishlistBatchBar();
-}
-
-function _updateArtistTriState(section) {
-    if (!section) return;
-    const artistCb = section.querySelector('.wishlist-artist-select-all-cb');
-    if (!artistCb) return;
-    const total = section.querySelectorAll('.wishlist-select-cb').length;
-    const checked = section.querySelectorAll('.wishlist-select-cb:checked').length;
-    artistCb.checked = total > 0 && checked === total;
-    artistCb.indeterminate = checked > 0 && checked < total;
-}
-
-async function removeArtistFromWishlist(artistName) {
-    if (!artistName) return;
-    const go = async () => {
-        try {
-            const response = await fetch('/api/wishlist/remove-artist', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ artist_name: artistName })
-            });
-            const data = await response.json();
-            if (data.success) {
-                showToast(`Removed ${data.removed_count} track(s) by ${artistName}`, 'success');
-                if (window.selectedWishlistCategory) {
-                    await selectWishlistCategory(window.selectedWishlistCategory);
-                }
-                await updateWishlistCount();
-            } else {
-                showToast(data.error || 'Failed to remove artist', 'error');
-            }
-        } catch (error) {
-            console.error('Error removing artist from wishlist:', error);
-            showToast('Failed to remove artist from wishlist', 'error');
-        }
-    };
-    if (typeof showConfirmDialog === 'function') {
-        const yes = await showConfirmDialog({
-            title: 'Remove Artist from Wishlist',
-            message: `Remove every wishlist track by ${artistName}? They won't be re-added automatically for a while (the removed-track window in Settings).`,
-            confirmText: 'Remove All',
-            destructive: true
-        });
-        if (yes) await go();
-    } else {
-        await go();
-    }
-}
-
-async function downloadArtistFromWishlist(section) {
-    if (!section) return;
-    const ids = Array.from(section.querySelectorAll('.wishlist-select-cb'))
-        .map(cb => cb.dataset.trackId).filter(Boolean);
-    if (!ids.length) { showToast('No tracks under this artist', 'info'); return; }
-    await openDownloadMissingWishlistModal(window.selectedWishlistCategory, new Set(ids));
-}
-
-function backToCategories() {
-    _nebulaBack();
-}
-
-function toggleAlbumTracks(albumId) {
-    const tracksElement = document.getElementById(`tracks-${albumId}`);
-    const expandIcon = document.getElementById(`expand-icon-${albumId}`);
-
-    if (tracksElement.style.display === 'none') {
-        tracksElement.style.display = 'block';
-        expandIcon.textContent = '▲';
-    } else {
-        tracksElement.style.display = 'none';
-        expandIcon.textContent = '▼';
-    }
-}
-
-/**
- * Get all checked wishlist track checkboxes
- */
-function getCheckedWishlistTracks() {
-    return Array.from(document.querySelectorAll('.wishlist-select-cb:checked'));
-}
-
-/**
- * Toggle select all / deselect all tracks in the current wishlist category
- */
-function toggleWishlistSelectAll() {
-    const allCheckboxes = document.querySelectorAll('.wishlist-select-cb');
-    const albumCheckboxes = document.querySelectorAll('.wishlist-album-select-all-cb');
-    const btn = document.getElementById('wishlist-select-all-btn');
-    const allChecked = allCheckboxes.length > 0 && Array.from(allCheckboxes).every(cb => cb.checked);
-
-    const newState = !allChecked;
-
-    allCheckboxes.forEach(cb => { cb.checked = newState; });
-    albumCheckboxes.forEach(cb => { cb.checked = newState; });
-
-    // Expand all albums when selecting all
-    if (newState) {
-        document.querySelectorAll('.wishlist-album-tracks').forEach(el => {
-            el.style.display = 'block';
-        });
-        document.querySelectorAll('[id^="expand-icon-"]').forEach(icon => {
-            icon.textContent = '▲';
-        });
-    }
-
-    if (btn) btn.textContent = newState ? 'Deselect All' : 'Select All';
-    updateWishlistBatchBar();
-}
-
-/**
- * Update the wishlist batch action bar based on checkbox selection
- */
-function updateWishlistBatchBar() {
-    const checked = getCheckedWishlistTracks();
-    const bar = document.getElementById('wishlist-batch-bar');
-    const countEl = document.getElementById('wishlist-batch-count');
-
-    if (!bar || !countEl) return;
-
-    if (checked.length > 0) {
-        bar.style.display = 'flex';
-        countEl.textContent = `${checked.length} selected`;
-    } else {
-        bar.style.display = 'none';
-    }
-
-    // Sync the Select All button text
-    const btn = document.getElementById('wishlist-select-all-btn');
-    if (btn) {
-        const allCheckboxes = document.querySelectorAll('.wishlist-select-cb');
-        const allChecked = allCheckboxes.length > 0 && Array.from(allCheckboxes).every(cb => cb.checked);
-        btn.textContent = allChecked ? 'Deselect All' : 'Select All';
-    }
-}
-
-/**
- * Toggle all track checkboxes within an album when album header checkbox is clicked
- */
-function toggleWishlistAlbumSelection(albumId, checked) {
-    const tracksContainer = document.getElementById(`tracks-${albumId}`);
-    if (tracksContainer) {
-        // Expand the album tracks if selecting
-        if (checked) {
-            tracksContainer.style.display = 'block';
-            const expandIcon = document.getElementById(`expand-icon-${albumId}`);
-            if (expandIcon) expandIcon.textContent = '▲';
-        }
-        tracksContainer.querySelectorAll('.wishlist-select-cb').forEach(cb => {
-            cb.checked = checked;
-        });
-    }
-    updateWishlistBatchBar();
-}
-
-/**
- * Batch remove selected tracks from wishlist
- */
-async function batchRemoveFromWishlist() {
-    const checked = getCheckedWishlistTracks();
-    if (checked.length === 0) return;
-
-    const count = checked.length;
-    const confirmed = await showConfirmationModal(
-        'Remove Tracks',
-        `Remove ${count} track${count !== 1 ? 's' : ''} from your wishlist?`,
-        '🗑️'
-    );
-
-    if (!confirmed) return;
-
-    const trackIds = checked.map(cb => cb.getAttribute('data-track-id'));
-
-    try {
-        const response = await fetch('/api/wishlist/remove-batch', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ spotify_track_ids: trackIds })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(`Removed ${data.removed} track(s) from wishlist`, 'success');
-
-            // Reload the current category to refresh the list
-            if (window.selectedWishlistCategory) {
-                await selectWishlistCategory(window.selectedWishlistCategory);
-            }
-
-            // Update wishlist count in sidebar
-            await updateWishlistCount();
-        } else {
-            showToast(`Failed to remove tracks: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Error batch removing from wishlist:', error);
-        showToast('Failed to remove tracks from wishlist', 'error');
-    }
-}
-
-function showConfirmationModal(title, message, icon = '⚠️') {
-    return new Promise((resolve) => {
-        // Create modal if it doesn't exist
-        let modal = document.getElementById('confirmation-modal-overlay');
-        if (!modal) {
-            modal = document.createElement('div');
-            modal.id = 'confirmation-modal-overlay';
-            modal.className = 'confirmation-modal-overlay';
-            document.body.appendChild(modal);
-        }
-
-        // Set modal content
-        modal.innerHTML = `
-            <div class="confirmation-modal">
-                <div class="confirmation-modal-icon">${icon}</div>
-                <div class="confirmation-modal-title">${title}</div>
-                <div class="confirmation-modal-message">${message}</div>
-                <div class="confirmation-modal-buttons">
-                    <button class="confirmation-modal-btn confirmation-modal-btn-cancel" id="confirm-cancel">Cancel</button>
-                    <button class="confirmation-modal-btn confirmation-modal-btn-confirm" id="confirm-yes">Yes, Remove</button>
-                </div>
-            </div>
-        `;
-
-        // Show modal with animation
-        setTimeout(() => {
-            modal.classList.add('show');
-        }, 10);
-
-        // Escape key handler - defined outside so we can remove it
-        const handleEscape = (e) => {
-            if (e.key === 'Escape') {
-                handleCancel();
-            }
-        };
-
-        // Handle button clicks
-        const handleCancel = () => {
-            document.removeEventListener('keydown', handleEscape);
-            modal.classList.remove('show');
-            setTimeout(() => {
-                modal.remove();
-            }, 200);
-            resolve(false);
-        };
-
-        const handleConfirm = () => {
-            document.removeEventListener('keydown', handleEscape);
-            modal.classList.remove('show');
-            setTimeout(() => {
-                modal.remove();
-            }, 200);
-            resolve(true);
-        };
-
-        document.getElementById('confirm-cancel').addEventListener('click', handleCancel);
-        document.getElementById('confirm-yes').addEventListener('click', handleConfirm);
-
-        // Close on overlay click
-        modal.addEventListener('click', (e) => {
-            if (e.target === modal) {
-                handleCancel();
-            }
-        });
-
-        // Add Escape key listener
-        document.addEventListener('keydown', handleEscape);
-    });
-}
-
-async function removeTrackFromWishlist(spotifyTrackId, event) {
-    // Stop event propagation to prevent triggering parent click handlers
-    if (event) {
-        event.stopPropagation();
-    }
-
-    const confirmed = await showConfirmationModal(
-        'Remove Track',
-        'Are you sure you want to remove this track from your wishlist?',
-        '🗑️'
-    );
-
-    if (!confirmed) {
-        return;
-    }
-
-    try {
-        const response = await fetch('/api/wishlist/remove-track', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ spotify_track_id: spotifyTrackId })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast('Track removed from wishlist', 'success');
-
-            // Reload the current category to refresh the list
-            if (window.selectedWishlistCategory) {
-                await selectWishlistCategory(window.selectedWishlistCategory);
-            }
-
-            // Update wishlist count in sidebar
-            await updateWishlistCount();
-        } else {
-            showToast(`Failed to remove track: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Error removing track from wishlist:', error);
-        showToast('Failed to remove track from wishlist', 'error');
-    }
-}
-
-async function removeAlbumFromWishlist(albumId, event) {
-    // Stop event propagation to prevent triggering parent click handlers
-    if (event) {
-        event.stopPropagation();
-    }
-
-    const confirmed = await showConfirmationModal(
-        'Remove Album',
-        'Are you sure you want to remove all tracks from this album from your wishlist?',
-        '💿'
-    );
-
-    if (!confirmed) {
-        return;
-    }
-
-    try {
-        const response = await fetch('/api/wishlist/remove-album', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ album_id: albumId })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(`Removed ${data.removed_count} track(s) from wishlist`, 'success');
-
-            // Reload the current category to refresh the list
-            if (window.selectedWishlistCategory) {
-                await selectWishlistCategory(window.selectedWishlistCategory);
-            }
-
-            // Update wishlist count in sidebar
-            await updateWishlistCount();
-        } else {
-            showToast(`Failed to remove album: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Error removing album from wishlist:', error);
-        showToast('Failed to remove album from wishlist', 'error');
-    }
-}
-
-async function downloadSelectedCategory() {
-    const category = window.selectedWishlistCategory;
-    if (!category) {
-        showToast('No category selected', 'error');
-        return;
-    }
-
-    // Collect checked track IDs
-    const checkedBoxes = document.querySelectorAll('.wishlist-select-cb:checked');
-    const selectedTrackIds = new Set(Array.from(checkedBoxes).map(cb => cb.dataset.trackId).filter(Boolean));
-
-    await openDownloadMissingWishlistModal(category, selectedTrackIds.size > 0 ? selectedTrackIds : null);
-}
 
 async function openDownloadMissingWishlistModal(category = null, selectedTrackIds = null) {
-    showLoadingOverlay('Loading wishlist…');
+    showLoadingOverlay('Loading wishlist...');
     const playlistId = "wishlist"; // Use a consistent ID for wishlist
 
     // Check if a process is already active for the wishlist
@@ -2440,7 +1546,7 @@ async function openDownloadMissingWishlistModal(category = null, selectedTrackId
                                 ${tracks.map((track, index) => `
                                     <tr data-track-index="${index}">
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-match-status match-checking" id="match-${playlistId}-${index}">🔍 Pending</td>
                                         <td class="track-download-status" id="download-${playlistId}-${index}">-</td>
@@ -2528,7 +1634,7 @@ async function startWishlistMissingTracksProcess(playlistId) {
             // Special handling for auto-processing conflict
             if (response.status === 409) {
                 console.log('🤖 [Wishlist] Auto-processing is running, redirecting to download manager');
-                showToast('Wishlist auto-processing is already running. Opening Download Manager…', 'info');
+                showToast('Wishlist auto-processing is already running. Opening Download Manager...', 'info');
 
                 // Close wishlist modal and show download manager
                 const wishlistModal = document.getElementById('download-modal-wishlist');
@@ -2785,9 +1891,6 @@ async function startMissingTracksProcess(playlistId) {
         if (selectAllCb) selectAllCb.disabled = true;
 
         // Prepare request body - add album/artist context for artist album downloads
-        // Set when this request carried a picker choice, so it can be released
-        // once — and only once — the server confirms the batch exists.
-        let _pendingPinKey = null;
         const wingItState = youtubePlaylistStates[playlistId] || {};
         const isWingIt = wingItState.wing_it || false;
         const requestBody = {
@@ -2796,6 +1899,18 @@ async function startMissingTracksProcess(playlistId) {
             ignore_manual_matches: forceDownloadAll,
             wing_it: isWingIt,
             skip_acoustid: skipAcoustid,
+            // The Quality Profile chosen in this dialog (P1-01). null keeps the
+            // server's own order: mirror assignment, then the global default —
+            // i.e. exactly the pre-selector behaviour.
+            quality_profile_id: getDownloadModalQualityProfileId(playlistId),
+            // Provider hint so a mirror lookup can't be defeated by two providers
+            // sharing an upstream playlist id (P2-01). Only sent when the ref
+            // actually identifies a provider: the server treats an exact source
+            // match as decisive, so a guessed 'spotify' would resolve a
+            // YouTube/Beatport playlist to a Spotify mirror (R2-14).
+            source: (typeof knownPlaylistSourceForRef === 'function')
+                ? (knownPlaylistSourceForRef(playlistId) || undefined)
+                : undefined,
         };
 
         // If this is an artist album download, use album name and include full context
@@ -2808,29 +1923,8 @@ async function startMissingTracksProcess(playlistId) {
             requestBody.is_album_download = _isAlbumContext; // false for single track search results
             requestBody.album_context = process.album;   // Full Spotify album object
             requestBody.artist_context = process.artist; // Full Spotify artist object
-            // A release the user chose in the album source picker, if any.
-            // NOT dropped here — only once the server has accepted the batch
-            // (below). Spending it at build time meant a 429, a blocklist 409 or
-            // a dead connection silently ate the choice, and the natural retry
-            // then ran with no pin at all while looking like it had worked.
-            const _pendingPick = _pendingAlbumPins[playlistId];
-            if (_pendingPick) {
-                _pendingPinKey = playlistId;
-                if (_pendingPick.pin) {
-                    requestBody.pinned_release = _pendingPick.pin;
-                    console.log(`📌 [Album] Pinned release from ${_pendingPick.pin.source}`);
-                }
-                if (_pendingPick.replace) {
-                    // The picker asked and the user chose "replace what I have".
-                    // That is the same intent as the modal's Force toggle, so it
-                    // rides the same two flags — which is what makes the server
-                    // set force_replace and actually overwrite, instead of the
-                    // import protection discarding the download as a duplicate.
-                    requestBody.force_download_all = true;
-                    requestBody.ignore_manual_matches = true;
-                    console.log('📌 [Album] Picker confirmed replace — forcing re-download over the existing files');
-                }
-            }
+            // Commissary: the release picked in Choose Release (commissary-release-picker.js)
+            if (process.commissaryPinnedRelease) requestBody.commissary_pinned_release = process.commissaryPinnedRelease;
             console.log(`🎵 [${_isAlbumContext ? 'Album' : 'Single Track'}] Sending context: ${process.album?.name} by ${process.artist?.name}`);
         } else {
             // For playlists/wishlists, use the virtual playlist name
@@ -2872,13 +1966,6 @@ async function startMissingTracksProcess(playlistId) {
         }
 
         process.batchId = data.batch_id;
-
-        // The batch exists, so the pick is now spent. Left in place it would
-        // silently re-pin a stale release the next time this album downloads.
-        if (_pendingPinKey) {
-            delete _pendingAlbumPins[_pendingPinKey];
-            _pendingPinKey = null;
-        }
 
         // Update Beatport backend state with download_process_id now that we have the batchId
         if (playlistId.startsWith('beatport_')) {
@@ -2953,6 +2040,56 @@ async function startMissingTracksProcess(playlistId) {
 }
 
 
+function isAlbumContextPlaylistId(playlistId) {
+    return ['artist_album_', 'enhanced_search_album_', 'discover_album_', 'seasonal_album_',
+        'spotify_library_', 'issue_download_', 'library_redownload_', 'beatport_release_']
+        .some(prefix => playlistId.startsWith(prefix));
+}
+
+// the library half of Begin Analysis, read-only, so the modal opens knowing
+// what's owned instead of a column of 'pending'. nothing is queued.
+async function previewModalOwnership(playlistId) {
+    const process = activeDownloadProcesses[playlistId];
+    if (!process || !process.tracks?.length) return;
+    const isAlbum = isAlbumContextPlaylistId(playlistId);
+    const progressText = document.getElementById(`analysis-progress-text-${playlistId}`);
+    if (progressText) progressText.textContent = 'Checking your library...';
+    let data = null;
+    try {
+        const response = await fetch(`/api/playlists/${playlistId}/ownership-preview`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                tracks: process.tracks,
+                is_album_download: isAlbum,
+                album_context: isAlbum ? process.album : null,
+                artist_context: isAlbum ? process.artist : null,
+            }),
+        });
+        data = await response.json();
+    } catch (error) {
+        console.debug('ownership preview failed:', error);
+    }
+    // begin analysis ran (or the modal closed) while we waited: its answer wins
+    if (activeDownloadProcesses[playlistId] !== process || process.status !== 'idle') return;
+    if (!data?.success || !Array.isArray(data.results)) {
+        if (progressText) progressText.textContent = 'Ready to start';
+        return;
+    }
+    updateTrackAnalysisResults(playlistId, data.results);
+    const found = data.results.filter(r => r.found).length;
+    const missing = data.results.length - found;
+    const foundEl = document.getElementById(`stat-found-${playlistId}`);
+    const missingEl = document.getElementById(`stat-missing-${playlistId}`);
+    if (foundEl) foundEl.textContent = found;
+    if (missingEl) missingEl.textContent = missing;
+    if (progressText) {
+        progressText.textContent = missing
+            ? `${found} in your library, ${missing} missing`
+            : 'All in your library';
+    }
+}
+
 function updateTrackAnalysisResults(playlistId, results) {
     // Update match results for all rows (tracks are now pre-populated)
     for (const result of results) {
@@ -2984,6 +2121,39 @@ function getModalTrackAlbumTitle(track, process = null) {
 
 function renderModalTrackPlayButton(playlistId, trackIndex) {
     return `<button class="modal-track-play-btn" onclick="event.stopPropagation(); playDownloadModalTrack('${escapeForInlineJs(playlistId)}', ${trackIndex})" title="Play track">&#9654;</button>`;
+}
+
+// the add-to-playlist picker lives in the react bundle (features/playlists),
+// so this only hands it the row's artist + title
+function renderModalTrackPlaylistButton(playlistId, trackIndex) {
+    return `<button class="modal-track-play-btn modal-track-add-btn" onclick="event.stopPropagation(); addDownloadModalTrackToPlaylist('${escapeForInlineJs(playlistId)}', ${trackIndex}, this)" title="Add to playlist" aria-label="Add to playlist"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z"/></svg></button>`
+        // Commissary: search every source for this track (commissary-track-inspector.js)
+        + (typeof window.commissaryInspectButton === 'function' ? window.commissaryInspectButton(playlistId, trackIndex) : '');
+}
+
+function addDownloadModalTrackToPlaylist(playlistId, trackIndex, button) {
+    const process = activeDownloadProcesses[playlistId];
+    const track = process?.tracks?.[trackIndex] || playlistTrackCache[playlistId]?.[trackIndex];
+    if (!track) {
+        showToast('Track is no longer available in this modal', 'error');
+        return;
+    }
+    if (typeof window.openAddToPlaylist !== 'function') {
+        showToast('Playlists are still loading, try again in a moment', 'error');
+        return;
+    }
+    // the main artist, not the joined credit: identify matches on it
+    const artists = Array.isArray(track.artists) ? track.artists : [];
+    const first = artists[0];
+    let artistName = (typeof first === 'string' ? first : first?.name)
+        || getModalTrackArtistName(track, process?.artist?.name || '');
+    if (artistName === 'Unknown Artist') artistName = '';
+    window.openAddToPlaylist({
+        track_name: track.name || track.title || '',
+        artist_name: artistName || '',
+        album_name: getModalTrackAlbumTitle(track, process) || '',
+        duration_ms: Number(track.duration_ms) || 0,
+    }, button);
 }
 
 async function playTrackFromLibraryOrStream(track, albumTitle = '', artistName = '') {
@@ -3079,7 +2249,7 @@ function startGlobalDownloadPolling() {
         Object.entries(activeDownloadProcesses).forEach(([playlistId, process]) => {
             // Include running AND recently-completed batches — ensures late task
             // status updates still reach the modal so rows don't freeze mid-download
-            if (process.batchId && (process.status === 'running' || process.status === 'complete')) {
+            if (process.batchId && !process.batchGone && (process.status === 'running' || process.status === 'complete')) {
                 activeBatchIds.push(process.batchId);
                 batchToPlaylistMap[process.batchId] = playlistId;
             }
@@ -3129,6 +2299,10 @@ function startGlobalDownloadPolling() {
             console.debug(`📊 [Global Polling] Received batched update for ${Object.keys(data.batches).length} processes`);
 
             // Process each batch's status data using existing logic
+            // a batch the server dropped is over: end it here too (#1384)
+            _vanishedBatchIds(activeBatchIds, data.batches, _batchMissCounts)
+                .forEach((batchId) => _endVanishedProcess(batchToPlaylistMap[batchId]));
+
             Object.entries(data.batches).forEach(([batchId, statusData]) => {
                 const playlistId = batchToPlaylistMap[batchId];
                 if (!playlistId || statusData.error) {
@@ -3191,7 +2365,7 @@ function startGlobalDownloadPollingWithInterval(interval) {
         let hasOpenWishlistModal = false;
 
         Object.entries(activeDownloadProcesses).forEach(([playlistId, process]) => {
-            if (process.batchId && (process.status === 'running' || process.status === 'complete')) {
+            if (process.batchId && !process.batchGone && (process.status === 'running' || process.status === 'complete')) {
                 activeBatchIds.push(process.batchId);
                 batchToPlaylistMap[process.batchId] = playlistId;
             }
@@ -3238,6 +2412,10 @@ function startGlobalDownloadPollingWithInterval(interval) {
 
             const data = await response.json();
             console.debug(`📊 [Global Polling] Received batched update for ${Object.keys(data.batches).length} processes`);
+
+            // a batch the server dropped is over: end it here too (#1384)
+            _vanishedBatchIds(activeBatchIds, data.batches, _batchMissCounts)
+                .forEach((batchId) => _endVanishedProcess(batchToPlaylistMap[batchId]));
 
             Object.entries(data.batches).forEach(([batchId, statusData]) => {
                 const playlistId = batchToPlaylistMap[batchId];
@@ -3333,10 +2511,18 @@ function _ensureCandidatesClickListener(statusEl) {
         _hideErrorTooltip();
         const taskId = this.dataset.taskId;
         if (!taskId) return;
-        // Decide at click-time from dataset set each render: completed and
-        // quarantined rows open the rich track-detail modal (it carries the
-        // play/listen + Accept/Search actions); plain failed/not-found go
-        // straight to the search modal.
+        // Decide at click-time from dataset set each render: in-flight rows
+        // open the live pop-in (#1156); completed and quarantined rows open
+        // the rich track-detail modal (it carries the play/listen +
+        // Accept/Search actions); plain failed/not-found go straight to the
+        // search modal.
+        if (this.dataset.liveOpen) {
+            _toggleLivePopover(taskId, this);
+            return;
+        }
+        // Cell clicks stopPropagation, so the outside-click closer never sees
+        // them — close any open pop-in before opening something else.
+        _hideLivePopover();
         if (this.dataset.detailOpen && typeof openTrackDetail === 'function') {
             openTrackDetail(taskId);
         } else {
@@ -3345,421 +2531,233 @@ function _ensureCandidatesClickListener(statusEl) {
     });
 }
 
-/**
- * Open the multi-source picker for a track nothing has downloaded yet.
- *
- * The picker itself already searched every configured source — it just needed
- * an existing failed download to hang off, which is why the only route to a
- * track used to be the wishlist. This creates that task first (no automatic
- * search runs, so nothing races the choice) and then opens the SAME modal, so
- * a manual pick still goes through /download-candidate and keeps the AcoustID
- * and quality checks rather than routing around them.
- *
- * `track` accepts either Spotify's nested shape or the flat
- * {name/title, artist, album} that search and wishlist rows carry.
- */
-async function openManualSearchFor(track, btnEl) {
-    const label = btnEl ? btnEl.innerHTML : null;
-    if (btnEl) { btnEl.disabled = true; btnEl.innerHTML = '…'; }
-    try {
-        const resp = await fetch('/api/downloads/manual-search/task', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ track_info: track }),
+// --- Live status pop-in (#1156): click an in-flight status cell to watch ---
+// Renders from the SAME 2s batch frames processModalStatusUpdate already
+// receives (socket + poll), so there is no extra transport: each render
+// stashes the task frame on the cell, the pop-in re-renders on every frame
+// while open, and closes itself the moment the task leaves the in-flight
+// states — wishx's "if it's no longer searching it just closes".
+const _LIVE_POPOVER_STATUSES = ['pending', 'searching', 'downloading', 'queued', 'post_processing'];
+let _livePopoverTaskId = null;
+
+function _getLivePopover() {
+    let el = document.getElementById('live-status-popover');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'live-status-popover';
+        document.body.appendChild(el);
+        // Outside click closes; clicks inside the pop-in don't.
+        document.addEventListener('click', (e) => {
+            if ((_livePopoverTaskId || _livePopoverBundleId) && !el.contains(e.target)) _hideLivePopover();
         });
-        const data = await resp.json().catch(() => null);
-        if (!resp.ok || !data || !data.task_id) {
-            const msg = (data && data.error) || 'Could not open the search';
-            if (typeof showToast === 'function') showToast(msg, 'error');
-            return;
-        }
-        await showCandidatesModal(data.task_id);
-    } catch (err) {
-        if (typeof showToast === 'function') showToast('Could not open the search', 'error');
-    } finally {
-        if (btnEl) { btnEl.disabled = false; if (label !== null) btnEl.innerHTML = label; }
+    }
+    return el;
+}
+
+function _hideLivePopover() {
+    _livePopoverTaskId = null;
+    _livePopoverBundleId = null;
+    const el = document.getElementById('live-status-popover');
+    if (el) el.classList.remove('visible');
+}
+
+function _fmtLiveBytes(n) {
+    const v = Number(n);
+    if (!Number.isFinite(v) || v <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = v, unit = 0;
+    while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+    return `${size.toFixed(size >= 10 || unit === 0 ? 0 : 1)} ${units[unit]}`;
+}
+
+function _liveDetailLines(task) {
+    // Keep in step with liveDetailLines in the React downloads page
+    // (webui/src/routes/active-downloads/-adl.helpers.ts) — same payload,
+    // same narration.
+    const d = task.live_detail || {};
+    const lines = [];
+    if (d.source && !d.username) lines.push(['Searching', d.source]);
+    if (d.query) {
+        const ladder = d.query_count ? ` (${(d.query_index || 0) + 1}/${d.query_count})` : '';
+        lines.push(['Query', `"${d.query}"${ladder}`]);
+    }
+    if (d.results != null) {
+        const peers = d.responses ? ` from ${d.responses} peer${d.responses === 1 ? '' : 's'}` : '';
+        lines.push(['Found', `${d.results} result${d.results === 1 ? '' : 's'}${peers}`]);
+    }
+    if (d.by_source && Object.keys(d.by_source).length) {
+        lines.push(['By source', Object.entries(d.by_source)
+            .sort((a, b) => b[1] - a[1]).map(([s, n]) => `${s} ${n}`).join(' · ')]);
+    }
+    if (d.username) {
+        lines.push(['Source', d.source === 'Soulseek' ? `Soulseek · peer ${d.username}` : (d.source || d.username)]);
+    }
+    if (d.filename) lines.push(['File', d.filename]);
+    if (d.candidate_count) lines.push(['Candidate', `${(d.candidate_index || 0) + 1} of ${d.candidate_count}`]);
+    if (d.picked) {
+        const bits = [];
+        if (d.picked.quality) bits.push(String(d.picked.quality).toUpperCase());
+        if (d.picked.bitrate) bits.push(`${d.picked.bitrate} kbps`);
+        if (d.picked.size) bits.push(_fmtLiveBytes(d.picked.size));
+        if (d.picked.confidence != null) bits.push(`confidence ${d.picked.confidence}`);
+        if (bits.length) lines.push(['Picked', bits.join(' · ')]);
+    }
+    if (d.picked && (d.picked.queue_length != null || d.picked.free_upload_slots != null)) {
+        // why a 'Queued, Remotely' is what it is: the peer's own queue and slots
+        const bits = [];
+        if (d.picked.free_upload_slots != null) bits.push(`${d.picked.free_upload_slots} free slots`);
+        if (d.picked.queue_length != null) bits.push(`queue ${d.picked.queue_length}`);
+        const avg = _fmtLiveBytes(d.picked.upload_speed);
+        if (avg) bits.push(`${avg}/s avg`);
+        if (bits.length) lines.push(['Peer stats', bits.join(' · ')]);
+    }
+    if (d.slskd_state) lines.push(['Queue state', d.slskd_state]);
+    if (d.queued_seconds != null) lines.push(['Waited', `${d.queued_seconds}s in the remote queue`]);
+    const speed = _fmtLiveBytes(d.speed);
+    if (speed) lines.push(['Speed', `${speed}/s`]);
+    if (d.size) {
+        const done = d.bytes ? `${_fmtLiveBytes(d.bytes)} / ` : '';
+        lines.push(['Size', `${done}${_fmtLiveBytes(d.size)}`]);
+    }
+    if (d.tried_sources) lines.push(['Tried', `${d.tried_sources} peer/file pairs so far`]);
+    if (d.exhausted_sources && d.exhausted_sources.length) lines.push(['Exhausted', d.exhausted_sources.join(' · ')]);
+    if (task.retry_info) lines.push(['Retry', String(task.retry_info)]);
+    return lines;
+}
+
+function _renderLivePopover(task) {
+    const el = _getLivePopover();
+    el.textContent = '';
+    const lines = _liveDetailLines(task);
+    if (!lines.length) {
+        el.textContent = "Waiting for the engine's next update…";
+        return;
+    }
+    for (const [label, value] of lines) {
+        const row = document.createElement('div');
+        const tag = document.createElement('span');
+        tag.className = 'live-popover-label';
+        tag.textContent = `${label}: `;
+        row.appendChild(tag);
+        row.appendChild(document.createTextNode(String(value)));
+        el.appendChild(row);
     }
 }
-window.openManualSearchFor = openManualSearchFor;
 
-// ── "you already have this album" ───────────────────────────────────────────
-// Picking a release for an album you already own is a DIFFERENT act from
-// picking one you don't. The batch's ownership analysis ends the run before the
-// pinned release is ever grabbed, so without an explicit replace-intent the
-// pick quietly does nothing — the failure the user sees is "I chose a torrent
-// and no download started". Say it before the pick, and ask at the pick.
-//
-// The answer rides the pin (see setPendingAlbumPin) rather than the modal's
-// Force toggle: the toggle lives in a modal that opens AFTER this one closes,
-// so steering it from here would be a race, and silently ticking a box the user
-// never saw is the wrong way to obtain consent for overwriting their files.
-function _ownedAlbumSummary(o) {
-    if (!o || !o.owned) return '';
-    const fmt = (o.formats && o.formats.length)
-        ? ` as ${o.formats.map(f => escapeHtml(String(f))).join(' + ')}` : '';
-    if (o.expected && o.owned < o.expected) {
-        return `You already have <strong>${o.owned} of ${o.expected}</strong> tracks from this album${fmt}.`;
+function _positionLivePopover(anchor) {
+    const el = _getLivePopover();
+    el.classList.add('visible');
+    const rect = anchor.getBoundingClientRect();
+    const popupRect = el.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - popupRect.width / 2;
+    let top = rect.bottom + 8;
+    if (left < 8) left = 8;
+    if (left + popupRect.width > window.innerWidth - 8) left = window.innerWidth - 8 - popupRect.width;
+    if (top + popupRect.height > window.innerHeight - 8) top = rect.top - popupRect.height - 8;
+    el.style.left = left + 'px';
+    el.style.top = top + 'px';
+}
+
+function _toggleLivePopover(taskId, statusEl) {
+    if (_livePopoverTaskId === taskId) { _hideLivePopover(); return; }
+    _hideLivePopover();
+    _livePopoverTaskId = taskId;
+    _renderLivePopover(statusEl._liveTask || {});
+    _positionLivePopover(statusEl);
+    // Dismiss when the scrollable modal body scrolls (anchor moves away).
+    const scrollParent = statusEl.closest('.download-missing-modal-body');
+    if (scrollParent && !scrollParent._livePopoverScrollBound) {
+        scrollParent._livePopoverScrollBound = true;
+        scrollParent.addEventListener('scroll', _hideLivePopover, { passive: true });
     }
-    return `You already have <strong>all ${o.owned} track${o.owned !== 1 ? 's' : ''}</strong> of this album${fmt}.`;
 }
 
-// Resolves to 'replace', 'fill', or null for cancelled. Never throws — a
-// cancelled prompt leaves the picker open so another release can be chosen.
-function _confirmOwnedAlbumPick(ownership, releaseTitle) {
-    return new Promise(resolve => {
-        const complete = !ownership.expected || ownership.owned >= ownership.expected;
-        const missing = complete ? 0 : (ownership.expected - ownership.owned);
-        const overlay = document.createElement('div');
-        overlay.className = 'candidates-modal-overlay album-owned-overlay';
-        overlay.innerHTML = `
-            <div class="candidates-modal album-owned-modal">
-                <div class="candidates-modal-header">
-                    <h2 class="candidates-modal-title">You already have this album</h2>
-                </div>
-                <div class="candidates-modal-body">
-                    <div class="album-owned-summary">${_ownedAlbumSummary(ownership)}</div>
-                    <div class="album-owned-release">Chosen release: ${escapeHtml(releaseTitle || '(untitled)')}</div>
-                    <div class="album-owned-note">
-                        ${complete
-                            ? `Nothing is missing, so this release can only <strong>replace</strong> what you have.
-                               Replacing deletes the current files and imports the ones from this release.`
-                            : `You can take just the ${missing} missing track${missing !== 1 ? 's' : ''} from this
-                               release, or <strong>replace</strong> all ${ownership.owned} you already have.
-                               Replacing deletes the current files and imports the ones from this release.`}
-                    </div>
-                    <div class="album-owned-actions">
-                        ${complete ? '' : `<button class="candidates-manual-search-btn" id="album-owned-fill">
-                            Get the ${missing} missing track${missing !== 1 ? 's' : ''}
-                        </button>`}
-                        <button class="candidates-manual-search-btn album-owned-replace" id="album-owned-replace">
-                            Replace all ${ownership.owned} with this release
-                        </button>
-                        <button class="candidates-manual-search-btn album-owned-cancel" id="album-owned-cancel">
-                            Cancel
-                        </button>
-                    </div>
-                </div>
-            </div>`;
-        document.body.appendChild(overlay);
-        const reveal = () => overlay.classList.add('visible');
-        requestAnimationFrame(reveal);
-        setTimeout(reveal, 50);
-
-        let settled = false;
-        const finish = (answer) => {
-            if (settled) return;
-            settled = true;
-            overlay.remove();
-            resolve(answer);
-        };
-        overlay.onclick = (e) => { if (e.target === overlay) finish(null); };
-        overlay.querySelector('#album-owned-cancel').addEventListener('click', () => finish(null));
-        overlay.querySelector('#album-owned-replace').addEventListener('click', () => finish('replace'));
-        const fillBtn = overlay.querySelector('#album-owned-fill');
-        if (fillBtn) fillBtn.addEventListener('click', () => finish('fill'));
-    });
-}
-
-// ── Album source picker ─────────────────────────────────────────────────────
-// The track picker can't serve albums: picking a track-level candidate for an
-// album would import ONE file named after the album. So albums get their own
-// picker over the AlbumResult lists the plugins already return, and the choice
-// is carried as `pinned_release` into the batch the normal album flow starts.
-//
-// `onPicked(pin, opts)` receives the pin (or null for "choose automatically")
-// plus `{replace}` — the answer to the owned-album prompt below — and is what
-// actually kicks off the download. This function only chooses.
-async function openAlbumSourcePicker(album, artist, onPicked) {
-    const existing = document.getElementById('album-sources-overlay');
-    if (existing) existing.remove();
-
-    const overlay = document.createElement('div');
-    overlay.id = 'album-sources-overlay';
-    overlay.className = 'candidates-modal-overlay';
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    overlay.innerHTML = `
-        <div class="candidates-modal">
-            <div class="candidates-modal-header">
-                <div>
-                    <h2 class="candidates-modal-title">Choose a release</h2>
-                    <div class="candidates-modal-subtitle">${escapeHtml(album)} — ${escapeHtml(artist)}</div>
-                </div>
-                <button class="candidates-modal-close" id="album-sources-close">&#x2715;</button>
-            </div>
-            <div class="candidates-modal-body">
-                <div class="candidates-release-note">
-                    Only sources that index whole albums appear here. Picking one downloads
-                    <strong>that exact release</strong> instead of letting Commissary guess, then the
-                    normal per-track matching imports the tracks you're missing from it.
-                </div>
-                <div class="album-sources-query">
-                    <label class="album-sources-query-field">
-                        <span>Artist</span>
-                        <input type="text" id="album-sources-artist" autocomplete="off" spellcheck="false">
-                    </label>
-                    <label class="album-sources-query-field album-sources-query-album">
-                        <span>Album or release name</span>
-                        <input type="text" id="album-sources-album" autocomplete="off" spellcheck="false">
-                    </label>
-                    <button class="candidates-manual-search-btn" id="album-sources-go">Search</button>
-                </div>
-                <div class="album-sources-query-hint">
-                    Both boxes are joined into one query, so you can empty the artist and put a
-                    whole release name in the second box. This only changes what is
-                    <em>searched for</em> — whichever release you pick is still imported as
-                    the album you opened this from.
-                </div>
-                <div class="album-sources-owned" id="album-sources-owned" style="display: none;"></div>
-                <div class="candidates-manual-search-status" id="album-sources-status">Searching…</div>
-                <div id="album-sources-groups"></div>
-                <div class="album-sources-footer">
-                    <button class="candidates-manual-search-btn" id="album-sources-auto">
-                        Let Commissary choose
-                    </button>
-                </div>
-            </div>
-        </div>`;
-    document.body.appendChild(overlay);
-    // rAF alone doesn't fire in a non-compositing tab; the timeout is the
-    // fallback that keeps the panel from being built but never revealed.
-    const reveal = () => overlay.classList.add('visible');
-    requestAnimationFrame(reveal);
-    setTimeout(reveal, 50);
-
-    const close = () => overlay.remove();
-    const groupsHost = overlay.querySelector('#album-sources-groups');
-    const statusEl = overlay.querySelector('#album-sources-status');
-    const ownedEl = overlay.querySelector('#album-sources-owned');
-    const sourceMeta = {};
-    // What the library already holds, from the header event. Null until it
-    // arrives, and null forever if the lookup failed — in which case picking
-    // behaves exactly as it did before, rather than being blocked on a warning
-    // we could not compute. Declared here, above the handlers that close over
-    // it, so the reading order matches the dependency order.
-    let ownership = null;
-    let found = 0;
-
-    const albumInput = overlay.querySelector('#album-sources-album');
-    const artistInput = overlay.querySelector('#album-sources-artist');
-    const goBtn = overlay.querySelector('#album-sources-go');
-    // Property, not attribute — see the note on the markup above.
-    albumInput.value = album || '';
-    artistInput.value = artist || '';
-
-    overlay.querySelector('#album-sources-close').addEventListener('click', close);
-    overlay.querySelector('#album-sources-auto').addEventListener('click', async () => {
-        // Choosing automatically on an album you own hits the SAME dead end as a
-        // pinned pick would — analysis finds nothing missing and the batch ends.
-        // So it asks the same question; there is just no release to pin with it.
-        let replace = false;
-        if (ownership && ownership.owned > 0) {
-            const answer = await _confirmOwnedAlbumPick(ownership, 'whichever release Commissary picks');
-            if (!answer) return;
-            replace = (answer === 'replace');
-        }
-        close();
-        onPicked(null, {replace: replace});
-    });
-
-    const groupFor = (sourceId, label) => {
-        const domId = 'album-src-' + String(sourceId).replace(/[^a-zA-Z0-9_-]/g, '');
-        let g = groupsHost.querySelector('#' + domId);
-        if (g) return g;
-        g = document.createElement('div');
-        g.id = domId;
-        g.className = 'candidates-source-group';
-        g.innerHTML = `
-            <div class="candidates-source-group-header">
-                <span class="candidates-source-group-name">${escapeHtml(label || sourceId)}</span>
-                <span class="candidates-source-group-count" data-count="0">0</span>
-            </div>
-            <div class="album-sources-list"></div>`;
-        groupsHost.appendChild(g);
-        return g;
-    };
-
-    const setCount = (g, text, isError) => {
-        const c = g.querySelector('.candidates-source-group-count');
-        if (!c) return;
-        c.textContent = text;
-        if (isError) c.classList.add('candidates-source-group-count-error');
-    };
-
-    const addRows = (sourceId, candidates) => {
-        const g = groupFor(sourceId, (sourceMeta[sourceId] || {}).label);
-        const list = g.querySelector('.album-sources-list');
-        candidates.forEach(c => {
-            const row = document.createElement('div');
-            row.className = 'album-source-row' + (c.pinnable ? '' : ' album-source-row-unpinnable');
-            const bits = [];
-            if (c.quality) bits.push(escapeHtml(String(c.quality).toUpperCase()));
-            if (c.track_count) bits.push(`${c.track_count} track${c.track_count !== 1 ? 's' : ''}`);
-            if (c.total_size) bits.push(_candidatesFmtSize(c.total_size));
-            if (c.seeders !== null && c.seeders !== undefined) bits.push(`${c.seeders} seeders`);
-            // Linked when the indexer gave us a details page — the tracker is
-            // the thing you actually compare releases on.
-            if (c.indexer) bits.push(_candidateTrackerHtml(c, null));
-            row.innerHTML = `
-                <div class="album-source-row-main">
-                    <div class="album-source-row-title">${escapeHtml(c.title || '(untitled)')}</div>
-                    <div class="album-source-row-meta">${bits.join(' • ')}</div>
-                </div>
-                <button class="album-source-pick-btn">${c.pinnable ? 'Use this' : 'Use this source'}</button>`;
-            row.querySelector('.album-source-pick-btn').addEventListener('click', async () => {
-                // An unpinnable source has no download_album_to_staging, so the
-                // most we can honestly promise is "get it from here" — say so
-                // rather than implying we pinned a release we can't pin.
-                const pin = c.pinnable
-                    ? {source: c.source, token: c.token, title: c.title,
-                       username: c.username, folder_path: c.folder_path}
-                    : null;
-                let replace = false;
-                if (ownership && ownership.owned > 0) {
-                    const answer = await _confirmOwnedAlbumPick(ownership, c.title);
-                    if (!answer) return;      // cancelled — keep the picker open
-                    replace = (answer === 'replace');
-                }
-                close();
-                onPicked(pin, {replace: replace});
-            });
-            list.appendChild(row);
-        });
-        found += candidates.length;
-        const n = list.children.length;
-        setCount(g, `${n} release${n !== 1 ? 's' : ''}`, false);
-        statusEl.textContent = `${found} release${found !== 1 ? 's' : ''} so far…`;
-    };
-
-    // One search, re-runnable. `searchGen` exists because the streams are long
-    // and a second Search can be pressed while the first is still arriving: the
-    // stale reader would otherwise keep appending rows into a list the new
-    // search had already cleared, so results from two different queries would
-    // interleave with nothing saying so.
-    let searchGen = 0;
-
-    async function runSearch() {
-        const myGen = ++searchGen;
-        const qAlbum = (albumInput.value || '').trim();
-        const qArtist = (artistInput.value || '').trim();
-        if (qAlbum.length < 2) {
-            statusEl.textContent = 'Enter an album or release name to search for.';
-            albumInput.focus();
-            return;
-        }
-        found = 0;
-        groupsHost.innerHTML = '';
-        statusEl.textContent = 'Searching…';
-        goBtn.disabled = true;
-        try {
-            const resp = await fetch('/api/downloads/album/sources', {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    album: qAlbum, artist: qArtist,
-                    // The ownership warning must stay bound to the album this
-                    // download is FOR, not to whatever was typed to find a
-                    // release for it. Without this, editing the search text
-                    // would quietly suppress the replace prompt and bring back
-                    // the silent no-op it exists to prevent.
-                    owned_album: album, owned_artist: artist,
-                }),
-            });
-            if (myGen !== searchGen) return;
-            if (!resp.ok) {
-                let msg = 'Search failed';
-                try { const p = await resp.json(); if (p && p.error) msg = p.error; } catch (_) {}
-                statusEl.textContent = msg;
-                return;
-            }
-            const reader = resp.body.getReader();
-            const decoder = new TextDecoder();
-            let buffer = '';
-            while (true) {
-                const {value, done} = await reader.read();
-                if (done) break;
-                if (myGen !== searchGen) { try { await reader.cancel(); } catch (_) {} return; }
-                buffer += decoder.decode(value, {stream: true});
-                let end;
-                while ((end = buffer.indexOf('\n')) >= 0) {
-                    const line = buffer.slice(0, end).trim();
-                    buffer = buffer.slice(end + 1);
-                    if (!line) continue;
-                    let msg;
-                    try { msg = JSON.parse(line); } catch (_) { continue; }
-                    if (msg.type === 'header') {
-                        (msg.available_sources || []).forEach(s => { sourceMeta[s.id] = s; });
-                        ownership = msg.ownership || null;
-                        if (ownership && ownership.owned > 0 && ownedEl) {
-                            ownedEl.innerHTML = _ownedAlbumSummary(ownership)
-                                + ' Picking a release here will ask whether to replace them.';
-                            ownedEl.style.display = '';
-                        }
-                    } else if (msg.type === 'source_results') {
-                        if (msg.candidates && msg.candidates.length) {
-                            addRows(msg.source, msg.candidates);
-                        } else {
-                            setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
-                                     'no releases', false);
-                        }
-                    } else if (msg.type === 'source_error') {
-                        setCount(groupFor(msg.source, (sourceMeta[msg.source] || {}).label),
-                                 'failed', true);
-                    } else if (msg.type === 'done') {
-                        statusEl.textContent = found === 0
-                            ? 'No source has this album as a single release — try a different name above, or "Let Commissary choose" to download it track by track.'
-                            : `${found} release${found !== 1 ? 's' : ''}`;
-                    }
-                }
-            }
-        } catch (err) {
-            console.error('Album source search failed:', err);
-            if (myGen === searchGen) statusEl.textContent = 'Search request failed';
-        } finally {
-            if (myGen === searchGen) goBtn.disabled = false;
-        }
-    }
-
-    goBtn.addEventListener('click', () => { runSearch(); });
-    [albumInput, artistInput].forEach(el => el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') { e.preventDefault(); runSearch(); }
-    }));
-
-    await runSearch();
-}
-window.openAlbumSourcePicker = openAlbumSourcePicker;
-
-// A release chosen in the picker has to survive until the download modal's
-// start button fires, which is a separate user action. Keyed by the virtual
-// playlist id the album flow already uses, so re-picking overwrites cleanly
-// and an abandoned pick can't attach itself to a different album.
-// Which virtual playlist ids carry ALBUM context — the ones whose download
-// request sends is_album_download and may therefore carry a pinned release.
-// A function rather than a repeated expression because two places now need the
-// same answer: startMissingTracksProcess, which honours a pin, and the modal
-// footer, which offers the button that creates one. If those two ever disagree
-// the button still opens, the user still chooses, and the choice is silently
-// discarded — the worst kind of wrong.
-function isAlbumContextPlaylistId(playlistId) {
-    const id = String(playlistId || '');
-    return id.startsWith('artist_album_') || id.startsWith('enhanced_search_album_')
-        || id.startsWith('discover_album_') || id.startsWith('seasonal_album_')
-        || id.startsWith('spotify_library_') || id.startsWith('issue_download_')
-        || id.startsWith('library_redownload_') || id.startsWith('beatport_release_');
-}
-window.isAlbumContextPlaylistId = isAlbumContextPlaylistId;
-
-const _pendingAlbumPins = {};
-// Replace-intent travels WITH the pin rather than beside it. They are one
-// decision, taken in one dialog, and they have to expire together: split across
-// two maps, clearing the pin would leave a live "overwrite my files" flag
-// attached to the next download of the same album.
-function setPendingAlbumPin(virtualPlaylistId, pin, opts) {
-    const replace = !!(opts && opts.replace);
-    if (pin || replace) {
-        _pendingAlbumPins[virtualPlaylistId] = {pin: pin || null, replace: replace};
+function _refreshLivePopoverFromFrame(task) {
+    if (!_livePopoverTaskId || task.task_id !== _livePopoverTaskId) return;
+    if (_LIVE_POPOVER_STATUSES.includes(task.status)) {
+        _renderLivePopover(task);
     } else {
-        delete _pendingAlbumPins[virtualPlaylistId];
+        _hideLivePopover();
     }
 }
-window.setPendingAlbumPin = setPendingAlbumPin;
+
+// The album-bundle variant (#1156): during phase 'album_downloading' there are
+// no per-track tasks — the release downloads as one unit. The waiting cells
+// (and the progress line) open the same pop-in, rendered from the batch's
+// album_bundle frame instead of a task frame.
+let _livePopoverBundleId = null;
+const _lastBundleFrames = {};
+
+function _bundleDetailLines(bundle) {
+    const b = bundle || {};
+    const lines = [];
+    if (b.source) lines.push(['Source', _downloadModalSourceLabel(b.source)]);
+    if (b.state) lines.push(['Stage', _downloadModalBundleStateLabel(b.state)]);
+    if (b.query) lines.push(['Query', `"${b.query}"`]);
+    if (b.count != null && String(b.state || '').toLowerCase() === 'selecting') {
+        lines.push(['Releases', String(b.count)]);
+    }
+    if (b.release) lines.push(['Release', b.release]);
+    if (b.seeders != null) lines.push(['Seeders', String(b.seeders)]);
+    if (b.grabs != null) lines.push(['Grabs', String(b.grabs)]);
+    const speed = _fmtLiveBytes(b.speed);
+    if (speed) lines.push(['Speed', `${speed}/s`]);
+    if (b.size) {
+        const done = b.downloaded ? `${_fmtLiveBytes(b.downloaded)} / ` : '';
+        lines.push(['Size', `${done}${_fmtLiveBytes(b.size)}`]);
+    }
+    if (b.progress_percent != null || b.progress != null) {
+        lines.push(['Progress', `${_downloadModalBundleProgressPercent(b)}%`]);
+    }
+    return lines;
+}
+
+function _renderBundlePopover(bundle) {
+    const el = _getLivePopover();
+    el.textContent = '';
+    const lines = _bundleDetailLines(bundle);
+    if (!lines.length) {
+        el.textContent = "Waiting for the release downloader's next update…";
+        return;
+    }
+    for (const [label, value] of lines) {
+        const row = document.createElement('div');
+        const tag = document.createElement('span');
+        tag.className = 'live-popover-label';
+        tag.textContent = `${label}: `;
+        row.appendChild(tag);
+        row.appendChild(document.createTextNode(String(value)));
+        el.appendChild(row);
+    }
+}
+
+function _toggleBundlePopover(playlistId, anchor) {
+    if (_livePopoverBundleId === playlistId) { _hideLivePopover(); return; }
+    _hideLivePopover();
+    _livePopoverBundleId = playlistId;
+    _renderBundlePopover(_lastBundleFrames[playlistId]);
+    _positionLivePopover(anchor);
+    const scrollParent = anchor.closest('.download-missing-modal-body');
+    if (scrollParent && !scrollParent._livePopoverScrollBound) {
+        scrollParent._livePopoverScrollBound = true;
+        scrollParent.addEventListener('scroll', _hideLivePopover, { passive: true });
+    }
+}
+
+function _refreshBundlePopoverFromFrame(playlistId, bundle) {
+    _lastBundleFrames[playlistId] = bundle;
+    if (_livePopoverBundleId === playlistId) _renderBundlePopover(bundle);
+}
+
+function _ensureBundleClickListener(el, playlistId) {
+    if (el._bundleClickBound) return;
+    el._bundleClickBound = true;
+    el.addEventListener('click', function (e) {
+        e.stopPropagation();
+        _hideErrorTooltip();
+        _toggleBundlePopover(playlistId, this);
+    });
+}
 
 async function showCandidatesModal(taskId) {
     try {
@@ -3803,23 +2801,18 @@ function _ssShortFileLabel(filename) {
     return filename.split(/[/\\]/).pop();
 }
 
-/**
- * Which tracker served a result, linked to its details page when there is one.
- *
- * Prowlarr aggregates many indexers behind one "torrent" source, so "torrent"
- * alone doesn't answer the question you actually have when choosing between
- * two releases — which tracker is this, and can I go look at it.
- *
- * `info_url` is scheme-checked server-side (core.prowlarr_client.safe_info_url)
- * before it ever reaches the browser; it is escaped again here for the
- * attribute, and opened detached so clicking never navigates the app away
- * mid-download.
- */
+// Commissary: which tracker served a torrent/usenet result, linked to its
+// details page when there is one. Prowlarr puts many indexers behind one
+// "torrent" source, so "torrent" alone doesn't say which release is which.
+// info_url is scheme- and secret-checked server-side
+// (core/commissary/tracker_link.py), escaped again here, and opened detached
+// so a click never navigates the app away mid-download.
 function _candidateTrackerHtml(c, fallback) {
     if (!c || !c.indexer) return escapeHtml(fallback || '-');
     const name = escapeHtml(c.indexer);
-    if (!c.info_url) return name;
-    return `<a class="candidates-tracker-link" href="${escapeHtml(c.info_url)}"` +
+    const url = String(c.info_url || '');
+    if (!/^https?:\/\//i.test(url)) return name;
+    return `<a class="candidates-tracker-link" href="${escapeHtml(url)}"` +
            ` target="_blank" rel="noopener noreferrer"` +
            ` title="Open this release on ${name}">${name} ↗</a>`;
 }
@@ -3838,7 +2831,12 @@ function _renderCandidateRow(c, index, rowClass, showSourceBadge) {
         <td class="candidates-col-quality">${qBadge}${c.bitrate ? ` ${c.bitrate}kbps` : ''}</td>
         <td class="candidates-col-size">${_candidatesFmtSize(c.size)}</td>
         <td class="candidates-col-duration">${_candidatesFmtDur(c.duration)}</td>
-        <td class="candidates-col-user" title="Queue: ${c.queue_length || 0} | Slots: ${c.free_upload_slots || 0}">${_candidateTrackerHtml(c, c.username)}</td>
+        <td class="candidates-col-user" title="Queue: ${c.queue_length || 0} | Slots: ${c.free_upload_slots || 0}">${
+            // only SOULSEEK peers are messageable (torrent/youtube "usernames" aren't Soulseek users)
+            (c.username && (!c.source || /soulseek/i.test(String(c.source))))
+                ? `<button type="button" class="chat-user-link" data-chat-msg-user="${escapeHtml(c.username).replace(/"/g, '&quot;')}" title="Message this user on Soulseek">${escapeHtml(c.username)}</button>`
+                : _candidateTrackerHtml(c, c.username)  // Commissary: tracker name + link
+        }</td>
         <td class="candidates-col-action"><button class="candidates-download-btn" data-index="${index}" title="Download this file">⬇</button></td>
     </tr>`;
 }
@@ -3853,50 +2851,43 @@ function _renderCandidatesModal(data) {
     const errorMsg = data.error_message || '';
     const downloadMode = data.download_mode || 'soulseek';
     const availableSources = Array.isArray(data.available_sources) ? data.available_sources : [];
-    // The dropdown used to appear only in hybrid mode. Now that the source
-    // list is every CONFIGURED source rather than only the ones in the
-    // fallback chain (see _list_available_download_sources), a user in
-    // single-source mode can also have several to search — so the picker is
-    // driven by how many there actually are, not by the mode name.
-    const multiSource = availableSources.length > 1;
+    // Hybrid mode shows the dropdown; everything else implies a single source.
+    // Commissary: every configured source is offered, so more than one shows
+    // the dropdown and the source badges in any mode (core/commissary/search_sources.py)
+    const isHybrid = downloadMode === 'hybrid' || availableSources.length > 1;
 
     let tableRows = '';
     if (candidates.length === 0) {
         tableRows = `<tr><td colspan="7" style="text-align:center; color: rgba(255,255,255,0.5); padding: 30px;">
             No candidates were found during search.</td></tr>`;
     } else {
-        // Source badges only earn their space when more than one source is in play.
+        // Auto-candidates only show source badges in hybrid mode (where the
+        // user can't infer source from the dropdown).
         candidates.forEach((c, i) => {
-            tableRows += _renderCandidateRow(c, i, 'candidates-row-auto', multiSource);
+            tableRows += _renderCandidateRow(c, i, 'candidates-row-auto', isHybrid);
         });
     }
 
     // ----- Manual search bar -----
     let sourceControl;
-    if (multiSource) {
+    if (isHybrid && availableSources.length > 0) {
+        // Commissary: the download chain first, the other sources grouped below it
+        const _opt = s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`;
+        const _chain = availableSources.filter(s => s.in_chain !== false);
+        const _others = availableSources.filter(s => s.in_chain === false);
         const optionsHtml = ['<option value="all">All sources</option>']
-            .concat(availableSources.map(s =>
-                `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`
-            ))
+            .concat(_others.length && _chain.length
+                ? [`<optgroup label="Your download order">${_chain.map(_opt).join('')}</optgroup>`,
+                   `<optgroup label="Other sources">${_others.map(_opt).join('')}</optgroup>`]
+                : availableSources.map(_opt))
             .join('');
         sourceControl = `<select class="candidates-manual-source" id="candidates-manual-source">${optionsHtml}</select>`;
     } else {
-        // Exactly one source configured — a static label, not a one-item dropdown.
+        // Single-source mode — render a small static label, not a dropdown.
         const onlySrc = availableSources[0];
         const label = onlySrc ? onlySrc.label : (downloadMode || 'configured source');
         sourceControl = `<span class="candidates-manual-source-label">Searching ${escapeHtml(label)}</span>`;
     }
-
-    // Pre-fill with the track this modal is about. The header already names it,
-    // so an empty box left the user retyping what the dialog had just told them —
-    // and the Search button sat disabled ("type at least 2 characters") next to a
-    // title spelling out the exact query. Artist first, matching how the search
-    // sources index tracks. It stays fully editable; this is a starting point,
-    // which is the whole reason to open a MANUAL search.
-    const prefill = [trackArtist, trackName]
-        .filter(v => v && !/^Unknown (Track|Artist)$/.test(v))
-        .join(' ')
-        .slice(0, 300);
 
     const manualSearchHtml = `
         <div class="candidates-manual-search">
@@ -3905,8 +2896,7 @@ function _renderCandidatesModal(data) {
                 <input type="text"
                        class="candidates-manual-search-input"
                        id="candidates-manual-search-input"
-                       placeholder="Search, or paste a Tidal / Qobuz track link…"
-                       value="${escapeHtml(prefill)}"
+                       placeholder="Search, or paste a Tidal / Qobuz / Deezer link..."
                        maxlength="300" />
                 ${sourceControl}
                 <button class="candidates-manual-search-btn"
@@ -3961,13 +2951,13 @@ function _renderCandidatesModal(data) {
     });
 
     // Wire manual search controls.
-    _wireManualSearch(overlay, data.task_id, trackName, multiSource, availableSources);
+    _wireManualSearch(overlay, data.task_id, trackName, isHybrid);
 }
 
 // Manual-search wiring — input/button/dropdown. Kept separate from
 // _renderCandidatesModal so the existing render path stays readable and
 // any future refactor can lift this into its own module.
-function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSources) {
+function _wireManualSearch(overlay, taskId, trackName, isHybrid) {
     const input = overlay.querySelector('#candidates-manual-search-input');
     const button = overlay.querySelector('#candidates-manual-search-btn');
     const hint = overlay.querySelector('#candidates-manual-search-hint');
@@ -3995,91 +2985,38 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
         }
     };
 
-    // Per-source metadata, so a results block can label itself and know
-    // whether the source searches releases or tracks. Sources not in the
-    // list (a stream can name one the list didn't) fall back to their id.
-    const sourceMeta = {};
-    (availableSources || []).forEach(s => { if (s && s.id) sourceMeta[s.id] = s; });
-    const _meta = (id) => sourceMeta[id] || { id: id, label: id, release_level: false };
-
-    const _renderTableShell = () => {
+    const _renderTableShell = (query) => {
         resultsContainer.innerHTML = `
-            <div class="candidates-manual-search-status" id="candidates-manual-search-status">Searching…</div>
-            <div id="candidates-manual-groups"></div>
-            <div id="candidates-manual-releases" class="candidates-release-section" style="display: none;">
-                <div class="candidates-release-note">
-                    <strong>Full releases.</strong> These sources index whole albums, not single
-                    tracks. Picking one downloads the entire release and keeps only the track that
-                    matches — if the release doesn't actually contain it, the download fails rather
-                    than importing the wrong file.
-                </div>
-            </div>`;
-    };
-
-    // Find-or-create a results block for one source. Track-level sources
-    // stack in arrival order; release-level ones are corralled into the
-    // section at the bottom that explains what picking them does.
-    const _groupFor = (sourceId) => {
-        const meta = _meta(sourceId);
-        const domId = `candidates-group-${String(sourceId).replace(/[^a-zA-Z0-9_-]/g, '')}`;
-        let group = resultsContainer.querySelector(`#${domId}`);
-        if (group) return group;
-
-        const host = meta.release_level
-            ? resultsContainer.querySelector('#candidates-manual-releases')
-            : resultsContainer.querySelector('#candidates-manual-groups');
-        if (!host) return null;
-        if (meta.release_level) host.style.display = '';
-
-        group = document.createElement('div');
-        group.id = domId;
-        group.className = 'candidates-source-group';
-        // With one source configured the header just repeats what the search
-        // bar already says, so it only earns its space when grouping means
-        // something. The count element still exists (hidden) so the empty /
-        // failed markers below have somewhere to write.
-        group.innerHTML = `
-            <div class="candidates-source-group-header"${multiSource ? '' : ' style="display:none;"'}>
-                <span class="candidates-source-group-name">${escapeHtml(meta.label || sourceId)}</span>
-                <span class="candidates-source-group-count" data-count="0">0</span>
-            </div>
-            <div class="candidates-table-wrapper">
+            <div class="candidates-manual-search-status" id="candidates-manual-search-status">Searching...</div>
+            <div class="candidates-table-wrapper" style="display: none;" id="candidates-manual-table-wrapper">
                 <table class="candidates-table">
                     <thead><tr>
                         <th>#</th><th>File</th><th>Quality</th><th>Size</th><th>Duration</th><th>User</th><th></th>
                     </tr></thead>
-                    <tbody></tbody>
+                    <tbody id="candidates-manual-tbody"></tbody>
                 </table>
             </div>`;
-        host.appendChild(group);
-        return group;
     };
 
-    const _appendRows = (sourceId, newCandidates) => {
+    const _appendRows = (newCandidates, query) => {
         if (!newCandidates || newCandidates.length === 0) return;
-        const group = _groupFor(sourceId);
-        if (!group) return;
-        const tbody = group.querySelector('tbody');
-        if (!tbody) return;
-
         const startIdx = currentResults.length;
         currentResults = currentResults.concat(newCandidates);
 
+        const wrapper = resultsContainer.querySelector('#candidates-manual-table-wrapper');
+        const tbody = resultsContainer.querySelector('#candidates-manual-tbody');
+        const statusEl = resultsContainer.querySelector('#candidates-manual-search-status');
+        if (!tbody || !wrapper) return;
+
         let rowsHtml = '';
         newCandidates.forEach((c, i) => {
-            // The group header already names the source, so the per-row badge
-            // would just repeat it.
-            rowsHtml += _renderCandidateRow(c, startIdx + i, 'candidates-row-manual', false);
+            rowsHtml += _renderCandidateRow(c, startIdx + i, 'candidates-row-manual', isHybrid);
         });
         tbody.insertAdjacentHTML('beforeend', rowsHtml);
-
-        const countEl = group.querySelector('.candidates-source-group-count');
-        if (countEl) {
-            const n = tbody.querySelectorAll('tr').length;
-            countEl.dataset.count = String(n);
-            countEl.textContent = `${n} result${n !== 1 ? 's' : ''}`;
+        wrapper.style.display = '';
+        if (statusEl) {
+            statusEl.textContent = `${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far...`;
         }
-        _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''} so far…`);
 
         // Wire newly-appended buttons
         tbody.querySelectorAll('.candidates-download-btn').forEach(btn => {
@@ -4091,26 +3028,6 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
                 if (c) downloadCandidate(taskId, c, trackName);
             });
         });
-    };
-
-    // A source that answered with nothing is worth showing — "Qobuz: 0" is a
-    // real answer to "who has this?", and silence looks like a hang.
-    const _noteEmptySource = (sourceId) => {
-        const group = _groupFor(sourceId);
-        if (!group) return;
-        const countEl = group.querySelector('.candidates-source-group-count');
-        if (countEl && countEl.dataset.count === '0') countEl.textContent = 'no results';
-    };
-
-    const _noteSourceError = (sourceId, message) => {
-        const group = _groupFor(sourceId);
-        if (!group) return;
-        const countEl = group.querySelector('.candidates-source-group-count');
-        if (countEl) {
-            countEl.textContent = 'failed';
-            countEl.classList.add('candidates-source-group-count-error');
-            countEl.title = message || 'Search failed';
-        }
     };
 
     const _setStatus = (text) => {
@@ -4135,9 +3052,9 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
         inFlight = true;
         button.disabled = true;
         const originalLabel = button.textContent;
-        button.textContent = 'Searching…';
+        button.textContent = 'Searching...';
         currentResults = [];
-        _renderTableShell();
+        _renderTableShell(q);
 
         try {
             const resp = await fetch(`/api/downloads/task/${encodeURIComponent(taskId)}/manual-search`, {
@@ -4175,24 +3092,17 @@ function _wireManualSearch(overlay, taskId, trackName, multiSource, availableSou
                     try { msg = JSON.parse(line); } catch (_) { continue; }
 
                     if (msg.type === 'source_results') {
-                        if (msg.candidates && msg.candidates.length) {
-                            _appendRows(msg.source, msg.candidates);
-                        } else {
-                            _noteEmptySource(msg.source);
-                        }
+                        _appendRows(msg.candidates || [], q);
                     } else if (msg.type === 'source_error') {
                         errors.push(`${msg.source}: ${msg.error}`);
-                        _noteSourceError(msg.source, msg.error);
                     } else if (msg.type === 'done') {
                         if (currentResults.length === 0) {
-                            // Keep the per-source blocks. "Nothing anywhere" and
-                            // "three sources errored, the rest had nothing" are
-                            // different answers, and wiping the container to a
-                            // single line threw away the one that tells you which.
                             const errorNote = errors.length
-                                ? ` — ${errors.length} source${errors.length !== 1 ? 's' : ''} failed`
+                                ? `<div class="candidates-manual-search-empty-note">${errors.length} source${errors.length !== 1 ? 's' : ''} failed</div>`
                                 : '';
-                            _setStatus(`No results for "${q}"${errorNote}`);
+                            resultsContainer.innerHTML = `
+                                <div class="candidates-manual-search-empty">No manual search results for "${escapeHtml(q)}"</div>
+                                ${errorNote}`;
                         } else {
                             _setStatus(`${currentResults.length} result${currentResults.length !== 1 ? 's' : ''}`);
                         }
@@ -4261,7 +3171,7 @@ async function approveQuarantineFromDownloadRow(button) {
 
     const originalText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Approving…';
+    button.textContent = 'Approving...';
     try {
         const response = await fetch(`/api/quarantine/${encodeURIComponent(entryId)}/approve`, {
             method: 'POST',
@@ -4344,8 +3254,12 @@ function _downloadModalSourceLabel(source) {
 function _downloadModalBundleStateLabel(state) {
     const labels = {
         searching: 'searching for release',
+        selecting: 'choosing a release',
+        queued: 'release queued',
         downloading: 'downloading release',
+        staging: 'staging files',
         staged: 'matching tracks',
+        fallback: 'falling back to per-track',
         failed: 'release failed'
     };
     const key = String(state || '').toLowerCase();
@@ -4357,10 +3271,17 @@ function _downloadModalBundleProgressText(bundle) {
     const source = _downloadModalSourceLabel(bundle && bundle.source);
     const state = _downloadModalBundleStateLabel(bundle && bundle.state);
     const release = bundle && bundle.release ? ` - ${bundle.release}` : '';
+    // The search/selection phases used to render as dead air (#1156): show
+    // the query being searched and how many releases came back.
+    const stateKey = String((bundle && bundle.state) || '').toLowerCase();
+    const query = bundle && bundle.query && !bundle.release && (stateKey === 'searching' || stateKey === 'selecting')
+        ? ` — "${bundle.query}"` : '';
+    const found = bundle && bundle.count != null && stateKey === 'selecting'
+        ? ` · ${bundle.count} release${bundle.count === 1 ? '' : 's'}` : '';
     const speed = _downloadModalFormatSpeed(bundle && bundle.speed);
     const size = _downloadModalFormatBytes(bundle && bundle.size);
     const detail = speed || size ? ` (${[speed, size].filter(Boolean).join(' of ')})` : '';
-    return `${source} ${state} ${percent}%${release}${detail}`;
+    return `${source} ${state} ${percent}%${release}${query}${found}${detail}`;
 }
 
 function processModalStatusUpdate(playlistId, data) {
@@ -4390,9 +3311,35 @@ function processModalStatusUpdate(playlistId, data) {
     }
 
     console.debug(`📊 [Status Update] Processing update for ${playlistId}: phase=${data.phase}, tasks=${(data.tasks || []).length}`);
+    _patchOverlayActive();
 
-    // Note: Wishlist modal visibility is now managed by handleWishlistButtonClick() only
-    // Auto-show logic has been simplified to prevent conflicts
+
+    // a batch cancelled on the server (downloads page, a card, anywhere but
+    // this modal's own Cancel All) ends here. no phase branch below took
+    // 'cancelled', and the one that tried sat inside the complete/error
+    // check, so it could never run: the modal read "running" until the
+    // server reaped the batch five minutes later, then polled it forever
+    // (#1384). first, too, so a cancel never reads as "Download complete!"
+    if (data.phase === 'cancelled') {
+        if (process.status !== 'cancelled') {
+            process.status = 'cancelled';
+            const cancelBtn = document.getElementById(`cancel-all-btn-${playlistId}`);
+            if (cancelBtn) cancelBtn.style.display = 'none';
+            updatePlaylistCardUI(playlistId);
+
+            // Reset YouTube playlist phase to 'discovered' if this is a YouTube playlist on cancel
+            if (playlistId.startsWith('youtube_')) {
+                const urlHash = playlistId.replace('youtube_', '');
+                updateYouTubeCardPhase(urlHash, 'discovered');
+                if (urlHash.startsWith('mirrored_')) {
+                    updateMirroredCardPhase(urlHash, 'discovered');
+                }
+            }
+
+            showToast(`Process cancelled for ${(process.playlist && process.playlist.name) || 'this download'}.`, 'info');
+        }
+        return;
+    }
 
     if (data.phase === 'queued') {
         // Submitted to the executor but no worker has picked it up yet.
@@ -4435,8 +3382,14 @@ function processModalStatusUpdate(playlistId, data) {
         if (downloadFill) downloadFill.style.width = `${percent}%`;
         if (downloadText) {
             downloadText.textContent = _downloadModalBundleProgressText(bundle);
-            downloadText.title = 'Commissary downloads one album release first, then matches the selected tracks from the staged files.';
+            downloadText.title = 'SoulSync downloads one album release first, then matches the selected tracks from the staged files. Click for live release status.';
+            downloadText.classList.add('has-candidates');
+            _ensureBundleClickListener(downloadText, playlistId);
         }
+
+        // The pop-in (#1156) renders from these frames; keep the latest and
+        // refresh an open one every 2s so the release search/grab narrates.
+        _refreshBundlePopoverFromFrame(playlistId, bundle);
 
         const modal = document.getElementById(`download-missing-modal-${playlistId}`);
         if (modal) {
@@ -4445,11 +3398,19 @@ function processModalStatusUpdate(playlistId, data) {
                 if (!statusEl.textContent || statusEl.textContent === '-' || statusEl.textContent.includes('Pending')) {
                     statusEl.textContent = 'Waiting for release';
                     statusEl.classList.add('album-bundle-waiting');
-                    statusEl.title = 'The album release is downloading first. Tracks will move to processing once Commissary can match files from it.';
+                    statusEl.title = 'The album release is downloading first. Click for live release status.';
                 }
+                // Every waiting cell opens the bundle pop-in — there are no
+                // per-track tasks during a release download, so this is the
+                // only per-row affordance the phase can have.
+                statusEl.classList.add('has-candidates');
+                _ensureBundleClickListener(statusEl, playlistId);
             });
         }
     } else if (data.phase === 'downloading' || data.phase === 'complete' || data.phase === 'error') {
+        // Leaving the album-bundle phase: a bundle pop-in for this batch has
+        // nothing live to show anymore.
+        if (_livePopoverBundleId === playlistId) _hideLivePopover();
         console.debug(`📊 [Status Update] Processing ${data.phase} phase for playlistId: ${playlistId}, tasks: ${(data.tasks || []).length}`);
 
         if (document.getElementById(`analysis-progress-fill-${playlistId}`).style.width !== '100%') {
@@ -4482,7 +3443,7 @@ function processModalStatusUpdate(playlistId, data) {
         if (data.phase === 'downloading' && missingCount > 0 && (!data.tasks || data.tasks.length === 0)) {
             // No tasks yet, but we're in downloading phase with missing tracks
             if (downloadProgressText) {
-                downloadProgressText.textContent = 'Preparing downloads…';
+                downloadProgressText.textContent = 'Preparing downloads...';
                 console.log(`📥 [Download Phase] Preparing ${missingCount} downloads...`);
             }
         }
@@ -4520,21 +3481,21 @@ function processModalStatusUpdate(playlistId, data) {
             let isQuarantinedTask = false;
             // V2 SYSTEM: Handle UI state override for cancelling tasks
             if (isV2Task && uiState === 'cancelling' && task.status !== 'cancelled') {
-                statusText = '🔄 Cancelling…';
+                statusText = '🔄 Cancelling...';
             } else {
                 switch (task.status) {
                     case 'pending': statusText = '⏸️ Pending'; break;
                     case 'searching':
-                        statusText = '🔍 Searching…';
+                        statusText = '🔍 Searching...';
                         // Quarantine-retry engine: show which attempt we're on
                         // ("retry 2/5") while it walks the next-best candidates.
                         if (task.retry_info) statusText += ` 🔁 retry ${task.retry_info}`;
                         break;
                     case 'downloading':
-                        statusText = `⏬ Downloading… ${Math.round(task.progress || 0)}%`;
+                        statusText = `⏬ Downloading... ${Math.round(task.progress || 0)}%`;
                         if (task.retry_info) statusText += ` 🔁 retry ${task.retry_info}`;
                         break;
-                    case 'post_processing': statusText = '⌛ Processing…'; break;
+                    case 'post_processing': statusText = '⌛ Processing...'; break;
                     case 'completed': {
                         statusText = '✅ Completed';
                         // Verification badge — how this file passed verification:
@@ -4586,6 +3547,7 @@ function processModalStatusUpdate(playlistId, data) {
                 delete statusEl.dataset.quarantineReason;
                 delete statusEl.dataset.quarantineTrack;
                 delete statusEl.dataset.detailOpen;
+                delete statusEl.dataset.liveOpen;
                 // statusText is static markup only; the verif-badge span is the
                 // one case that needs HTML. Everything else stays textContent
                 // (XSS-safe default).
@@ -4624,7 +3586,18 @@ function processModalStatusUpdate(playlistId, data) {
                         statusEl.dataset.detailOpen = '1';
                     }
                     _ensureCandidatesClickListener(statusEl);
+                } else if (_LIVE_POPOVER_STATUSES.includes(task.status)) {
+                    // In-flight rows open the live pop-in (#1156): where it's
+                    // searching, what it found, who it's pulling from.
+                    statusEl.classList.add('has-candidates');
+                    statusEl.dataset.taskId = task.task_id;
+                    statusEl.dataset.liveOpen = '1';
+                    _ensureCandidatesClickListener(statusEl);
                 }
+                // The pop-in renders from these frames; stash the latest and
+                // refresh (or auto-close) an open one on every frame.
+                statusEl._liveTask = task;
+                _refreshLivePopoverFromFrame(task);
                 console.debug(`✅ [Status Update] Updated track ${task.track_index} to: ${statusText}${isV2Task ? ' (V2)' : ''}`);
             } else {
                 console.warn(`❌ [Status Update] Status element not found: download-${playlistId}-${task.track_index}`);
@@ -4634,7 +3607,7 @@ function processModalStatusUpdate(playlistId, data) {
             if (actionsEl && !['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
                 // Check if we're in a cancelling state
                 if (isV2Task && uiState === 'cancelling') {
-                    actionsEl.innerHTML = '<span style="color: #666;">Cancelling…</span>';
+                    actionsEl.innerHTML = '<span style="color: #666;">Cancelling...</span>';
                 } else {
                     // Create V2 cancel button for all active tasks
                     const onclickHandler = isV2Task ? 'cancelTrackDownloadV2' : 'cancelTrackDownload';
@@ -4647,23 +3620,12 @@ function processModalStatusUpdate(playlistId, data) {
                 if (approveBtn) {
                     approveBtn.addEventListener('click', () => approveQuarantineFromDownloadRow(approveBtn));
                 }
-            } else if (actionsEl && ['failed', 'cancelled', 'not_found'].includes(task.status)) {
-                // Batch downloads run the unattended cascade, so a track that
-                // ended up here is exactly where a human wants to choose the
-                // copy themselves. The picker already reached these rows —
-                // the status cell has been clickable all along — but nothing
-                // said so, so the only discoverable route was the wishlist.
-                actionsEl.innerHTML =
-                    `<button class="track-sources-btn" title="Search every configured source and pick which copy to download">🔍 Sources</button>`;
-                const srcBtn = actionsEl.querySelector('.track-sources-btn');
-                if (srcBtn) {
-                    srcBtn.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        showCandidatesModal(task.task_id);
-                    });
+            } else if (actionsEl && ['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
+                actionsEl.innerHTML = '-'; // No actions available for terminal or processing states
+                // Commissary: a failed row says it can be picked by hand (commissary-track-inspector.js)
+                if (typeof window.commissarySourcesButton === 'function') {
+                    actionsEl.innerHTML = window.commissarySourcesButton(task, isQuarantinedTask) || '-';
                 }
-            } else if (actionsEl && ['completed', 'post_processing'].includes(task.status)) {
-                actionsEl.innerHTML = '-'; // Nothing to act on: done, or still working
             }
         });
 
@@ -4715,6 +3677,7 @@ function processModalStatusUpdate(playlistId, data) {
             // Hide cancel button and mark as complete
             document.getElementById(`cancel-all-btn-${playlistId}`).style.display = 'none';
             process.status = 'complete';
+            _announceDownloadsFinished(playlistId, completedCount);
             updatePlaylistCardUI(playlistId);
 
             // Save M3U once on completion (not during progress polling)
@@ -4782,22 +3745,7 @@ function processModalStatusUpdate(playlistId, data) {
 
             // Note: Auto-show logic removed - wishlist modal visibility managed by user interaction only
 
-            if (data.phase === 'cancelled') {
-                if (process.status !== 'cancelled') {
-                    process.status = 'cancelled';
-
-                    // Reset YouTube playlist phase to 'discovered' if this is a YouTube playlist on cancel
-                    if (playlistId.startsWith('youtube_')) {
-                        const urlHash = playlistId.replace('youtube_', '');
-                        updateYouTubeCardPhase(urlHash, 'discovered');
-                        if (urlHash.startsWith('mirrored_')) {
-                            updateMirroredCardPhase(urlHash, 'discovered');
-                        }
-                    }
-
-                    showToast(`Process cancelled for ${process.playlist.name}.`, 'info');
-                }
-            } else if (data.phase === 'error') {
+            if (data.phase === 'error') {
                 if (process.status !== 'complete') {
                     process.status = 'complete';
                     updatePlaylistCardUI(playlistId); // Update card to show ready for review
@@ -4817,6 +3765,7 @@ function processModalStatusUpdate(playlistId, data) {
                 if (process.status !== 'complete') {
                     process.status = 'complete';
                     updatePlaylistCardUI(playlistId); // Update card to show ready for review
+                    _announceDownloadsFinished(playlistId, completedCount);
 
                     // Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
                     if (playlistId.startsWith('youtube_')) {
@@ -4950,6 +3899,7 @@ function startModalDownloadPolling(playlistId) {
 
     // Mark process as running to be picked up by global poller
     process.status = 'running';
+    updateMusicSyncTask({ active: true });
 
     // Start global polling if not already running
     startGlobalDownloadPolling();
@@ -5031,7 +3981,7 @@ async function updateModalWithLiveDownloadProgress() {
                     const state = downloadInfo.state || '';
 
                     if (statusElement && state.includes('InProgress') && progress > 0) {
-                        statusElement.textContent = `⏬ Downloading… ${Math.round(progress)}%`;
+                        statusElement.textContent = `⏬ Downloading... ${Math.round(progress)}%`;
                         statusElement.className = 'track-download-status download-downloading';
                     } else if (statusElement && (state.includes('Completed') || state.includes('Succeeded'))) {
                         statusElement.textContent = '✅ Completed';
@@ -5094,6 +4044,65 @@ function updateTrackSelectionCount(playlistId) {
     }
 }
 
+// a finished download changes what the library owns. pages that show "in
+// library" badges (search) re-check on this; before it, search kept an album
+// you'd just downloaded unbadged until a browser refresh (#1386)
+function _announceDownloadsFinished(playlistId, completedCount) {
+    if (!(completedCount > 0)) return;
+    window.dispatchEvent(new CustomEvent('ss:downloads-finished', {
+        detail: { playlistId, completed: completedCount },
+    }));
+}
+
+// a batch the server no longer has is over: cancelled from the downloads
+// page, or cleaned up as stale. the modal only hears about an end through a
+// status update and a deleted batch never sends one, so it read "running"
+// for good and the global poller asked for it every 2s (#1384). two misses
+// in a row, so a batch caught mid-handover doesn't end early.
+const _batchMissCounts = {};
+
+function _vanishedBatchIds(requested, returned, misses) {
+    const gone = [];
+    for (const id of requested) {
+        if (Object.prototype.hasOwnProperty.call(returned || {}, id)) {
+            delete misses[id];
+            continue;
+        }
+        misses[id] = (misses[id] || 0) + 1;
+        if (misses[id] >= 2) {
+            gone.push(id);
+            delete misses[id];
+        }
+    }
+    return gone;
+}
+
+function _endVanishedProcess(playlistId) {
+    const process = playlistId ? activeDownloadProcesses[playlistId] : null;
+    if (!process) return;
+    // either way the poller stops asking for it
+    process.batchGone = true;
+    // a finished download the server reaped after its 5 minutes: nothing is
+    // wrong, the modal stays viewable as it was
+    if (process.status !== 'running') return;
+    // still "running" with no batch behind it: it ended somewhere this page
+    // never heard about (cancelled elsewhere, or finished while the tab was
+    // hidden and the poller paused)
+    process.status = 'cancelled';
+    if (process.poller) {
+        clearInterval(process.poller);
+        process.poller = null;
+    }
+    const hidden = !process.modalElement || process.modalElement.style.display === 'none';
+    if (hidden) {
+        // the normal close: drops the process and its search/artist/discover
+        // bubble, so reopening the playlist starts fresh
+        closeDownloadMissingModal(playlistId);
+    } else {
+        showToast(`${(process.playlist && process.playlist.name) || 'This download'} is no longer running.`, 'info');
+    }
+}
+
 async function cancelAllOperations(playlistId) {
     const process = activeDownloadProcesses[playlistId];
     if (!process) return;
@@ -5107,7 +4116,7 @@ async function cancelAllOperations(playlistId) {
 
     console.log(`🚫 Cancel All clicked for playlist ${playlistId} - closing modal and cleaning up server`);
 
-    showToast('Cancelling all operations and closing modal…', 'info');
+    showToast('Cancelling all operations and closing modal...', 'info');
 
     // Mark process as complete immediately so polling stops
     process.status = 'complete';
@@ -5227,13 +4236,13 @@ async function cancelTrackDownloadV2(playlistId, trackIndex) {
 
     // Show loading state only - no optimistic "cancelled" state
     if (statusEl) {
-        statusEl.textContent = '🔄 Cancelling…';
+        statusEl.textContent = '🔄 Cancelling...';
     }
 
     // Disable the cancel button to prevent double-clicks
     const actionsEl = document.getElementById(`actions-${playlistId}-${trackIndex}`);
     if (actionsEl) {
-        actionsEl.innerHTML = '<span style="color: #666;">Cancelling…</span>';
+        actionsEl.innerHTML = '<span style="color: #666;">Cancelling...</span>';
     }
 
     try {
@@ -5308,7 +4317,7 @@ async function cancelTrackDownload(playlistId, trackIndex) {
 
     // UI update for immediate feedback - mark as cancelled FIRST to prevent race conditions
     row.dataset.locallyCancelled = 'true';
-    document.getElementById(`download-${playlistId}-${trackIndex}`).textContent = '🚫 Cancelling…';
+    document.getElementById(`download-${playlistId}-${trackIndex}`).textContent = '🚫 Cancelling...';
     document.getElementById(`actions-${playlistId}-${trackIndex}`).innerHTML = '-';
 
     try {
@@ -5370,7 +4379,7 @@ async function startPlaylistSync(playlistId, syncModeOverride = null) {
     const syncBtn = document.getElementById(`sync-btn-${playlistId}`);
     if (syncBtn) {
         syncBtn.disabled = true;
-        syncBtn.textContent = '⏳ Syncing…';
+        syncBtn.textContent = '⏳ Syncing...';
     }
 
     // Ensure we have the full track list before starting
@@ -5494,6 +4503,10 @@ function startSyncPolling(playlistId) {
             const response = await fetch(`/api/sync/status/${playlistId}`);
             const state = await response.json();
             console.log(`📊 Poll response:`, state);
+            const playlistName = state.playlist_name || state.progress?.playlist_name || '';
+            const syncFrame = { playlist_id: playlistId, playlist_name: playlistName, ...state };
+            window.dispatchEvent(new CustomEvent('ss:sync-progress', { detail: syncFrame }));
+            updateMusicSyncTask(syncFrame);
 
             if (state.status === 'syncing') {
                 const progress = state.progress;
@@ -5623,9 +4636,9 @@ function updateRefreshButtonState() {
         const hasActiveSyncs = Object.keys(activeSyncPollers).length > 0;
         const hasSequentialSync = sequentialSyncManager && sequentialSyncManager.isRunning;
         if (hasActiveSyncs || hasSequentialSync) {
-            refreshBtn.textContent = '🔄 Syncing…';
+            refreshBtn.textContent = '🔄 Syncing...';
         } else {
-            refreshBtn.textContent = '📥 Downloading…';
+            refreshBtn.textContent = '📥 Downloading...';
         }
     } else {
         refreshBtn.disabled = false;
@@ -5640,7 +4653,7 @@ function updateCardToSyncing(playlistId, percent, progress = null) {
     const progressBar = card.querySelector('.sync-progress-indicator');
     progressBar.style.display = 'block';
 
-    let progressText = 'Starting…';
+    let progressText = 'Starting...';
     let actualPercent = percent || 0;
 
     if (progress) {
@@ -5752,7 +4765,16 @@ function updateModalSyncProgress(playlistId, progress) {
             const failed = progress.failed_tracks || 0;
 
             if (totalEl) totalEl.textContent = total;
-            if (matchedEl) matchedEl.textContent = matched;
+            if (matchedEl) {
+                if (progress.duplicate_tracks > 0) {
+                    const synced = progress.synced_tracks || (matched - progress.duplicate_tracks);
+                    matchedEl.textContent = `${matched} (${synced} synced)`;
+                    matchedEl.title = `${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)`;
+                } else {
+                    matchedEl.textContent = matched;
+                    matchedEl.removeAttribute('title');
+                }
+            }
             if (failedEl) failedEl.textContent = failed;
 
             // Calculate percentage like GUI
@@ -5772,536 +4794,14 @@ function updateModalSyncProgress(playlistId, progress) {
 }
 
 
-// ── Basic-search source picker ──────────────────────────────────────────────
-// Tracks which download source the user has selected in the chip row. Null
-// means "use the orchestrator's default" (same as pre-redesign behaviour).
-let _bsActiveSource = null;
-
-async function initBasicSearchSources() {
-    const row = document.getElementById('bs-source-row');
-    if (!row) return;
-    try {
-        const resp = await fetch('/api/search/sources');
-        if (!resp.ok) return;
-        const { mode, sources } = await resp.json();
-        if (!sources || !sources.length) return;
-
-        row.innerHTML = '';
-        const isSingle = mode !== 'hybrid' || sources.length < 2;
-
-        sources.forEach((src, i) => {
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'bs-source-chip' + (i === 0 ? ' active' : '');
-            btn.dataset.source = src.name;
-            btn.setAttribute('role', 'tab');
-            btn.setAttribute('aria-selected', i === 0 ? 'true' : 'false');
-            btn.setAttribute('title', src.display_name);
-            btn.innerHTML = `<span class="bs-source-label">${_escBsHtml(src.display_name)}</span>`;
-
-            if (isSingle) {
-                // Non-interactive: single source, just a label.
-                btn.classList.add('single');
-                btn.disabled = true;
-            } else {
-                btn.addEventListener('click', () => {
-                    row.querySelectorAll('.bs-source-chip').forEach(c => {
-                        c.classList.remove('active');
-                        c.setAttribute('aria-selected', 'false');
-                    });
-                    btn.classList.add('active');
-                    btn.setAttribute('aria-selected', 'true');
-                    _bsActiveSource = src.name;
-                    // Re-run last search with new source if results already showing.
-                    const query = document.getElementById('downloads-search-input')?.value?.trim();
-                    if (query && window.currentSearchResults?.length) {
-                        performDownloadsSearch();
-                    }
-                });
-            }
-            row.appendChild(btn);
-        });
-
-        // Default active source = first in chain.
-        _bsActiveSource = isSingle ? null : sources[0]?.name ?? null;
-    } catch (_err) {
-        // Non-fatal — search still works without the picker.
-    }
-}
-
-function _escBsHtml(str) {
-    return String(str || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-
-// Raw download-source file search (basic search tab).
-async function performDownloadsSearch() {
-    const query = document.getElementById('downloads-search-input').value.trim();
-    if (!query) {
-        showToast('Please enter a search term', 'error');
-        return;
-    }
-
-    // --- UI Element References ---
-    const searchInput = document.getElementById('downloads-search-input');
-    const searchButton = document.getElementById('downloads-search-btn');
-    const cancelButton = document.getElementById('downloads-cancel-btn');
-    const statusText = document.getElementById('search-status-text');
-    const spinner = document.querySelector('.spinner-animation');
-    const dots = document.querySelector('.dots-animation');
-
-    // --- Start a new AbortController for this search ---
-    searchAbortController = new AbortController();
-
-    try {
-        // --- 1. Update UI to "Searching" State ---
-        searchInput.disabled = true;
-        searchButton.disabled = true;
-        cancelButton.classList.remove('hidden');
-        spinner.classList.remove('hidden');
-        dots.classList.remove('hidden');
-        statusText.textContent = `Searching for '${query}'…`;
-        displayDownloadsResults([]); // Clear previous results
-
-        // --- 2. Perform the Fetch Request ---
-        // Source param routes the search to a specific download source in
-        // hybrid mode. Omitted in single-source mode (backend falls through
-        // to orchestrator.search() which targets the configured source).
-        const body = { query };
-        if (_bsActiveSource) body.source = _bsActiveSource;
-        const response = await fetch('/api/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: searchAbortController.signal // Link fetch to the AbortController
-        });
-
-        const data = await response.json();
-
-        if (data.error) {
-            throw new Error(data.error);
-        }
-
-        const results = data.results || [];
-        allSearchResults = results;
-        resetFilters();
-        applyFiltersAndSort();
-
-        // --- 3. Update UI with Success State ---
-        if (results.length === 0) {
-            statusText.textContent = `No results found for '${query}'`;
-            showToast('No results found', 'error');
-        } else {
-            const filtersEl = document.getElementById('filters-container');
-            if (filtersEl) filtersEl.classList.remove('hidden');
-
-            // Count albums and singles like the GUI app
-            let totalAlbums = 0;
-            let totalTracks = 0;
-
-            results.forEach(result => {
-                if (result.result_type === 'album') {
-                    totalAlbums++;
-                } else {
-                    totalTracks++;
-                }
-            });
-
-            statusText.textContent = `✨ Found ${results.length} results • ${totalAlbums} albums, ${totalTracks} singles`;
-            showToast(`Found ${results.length} results`, 'success');
-        }
-
-    } catch (error) {
-        // --- 4. Handle Errors, Including Cancellation ---
-        if (error.name === 'AbortError') {
-            // This specific error is thrown when the user clicks "Cancel"
-            statusText.textContent = 'Search was cancelled.';
-            showToast('Search cancelled', 'info');
-            displayDownloadsResults([]); // Clear any partial results
-        } else {
-            console.error('Search failed:', error);
-            statusText.textContent = `Search failed: ${error.message}`;
-            showToast('Search failed', 'error');
-        }
-    } finally {
-        // --- 5. Clean Up UI Regardless of Outcome ---
-        searchInput.disabled = false;
-        searchButton.disabled = false;
-        cancelButton.classList.add('hidden');
-        spinner.classList.add('hidden');
-        dots.classList.add('hidden');
-        searchAbortController = null; // Clear the controller
-    }
-}
-
-function displayDownloadsResults(results) {
-    const resultsArea = document.getElementById('search-results-area');
-    if (!resultsArea) return;
-
-    if (!results.length) {
-        resultsArea.innerHTML = '<div class="search-results-placeholder"><p>No search results found.</p></div>';
-        return;
-    }
-
-    let html = '';
-    results.forEach((result, index) => {
-        const isAlbum = result.result_type === 'album';
-
-        if (isAlbum) {
-            const trackCount = result.tracks ? result.tracks.length : 0;
-            const totalSize = result.total_size ? `${(result.total_size / 1024 / 1024).toFixed(1)} MB` : 'Unknown size';
-
-            // Generate individual track items
-            let trackListHtml = '';
-            if (result.tracks && result.tracks.length > 0) {
-                // Detect disc boundaries from track number resets for multi-disc albums
-                let currentDisc = 1;
-                let lastTrackNum = 0;
-                let discBreaks = new Set();
-                result.tracks.forEach((track, trackIndex) => {
-                    const tn = track.track_number || 0;
-                    if (trackIndex > 0 && tn > 0 && tn <= lastTrackNum) {
-                        currentDisc++;
-                        discBreaks.add(trackIndex);
-                    }
-                    if (tn > 0) lastTrackNum = tn;
-                });
-                const isMultiDisc = discBreaks.size > 0;
-                if (isMultiDisc) {
-                    trackListHtml += `<div class="disc-separator" style="padding: 6px 12px; font-weight: 600; font-size: 0.85em; color: var(--text-secondary, #aaa); border-bottom: 1px solid var(--border-color, #333); margin-bottom: 4px;">Disc 1</div>`;
-                }
-                let discNum = 1;
-                result.tracks.forEach((track, trackIndex) => {
-                    if (discBreaks.has(trackIndex)) {
-                        discNum++;
-                        trackListHtml += `<div class="disc-separator" style="padding: 6px 12px; font-weight: 600; font-size: 0.85em; color: var(--text-secondary, #aaa); border-bottom: 1px solid var(--border-color, #333); margin: 8px 0 4px 0;">Disc ${discNum}</div>`;
-                    }
-                    const trackSize = track.size ? `${(track.size / 1024 / 1024).toFixed(1)} MB` : 'Unknown size';
-                    const trackBitrate = track.bitrate ? `${track.bitrate}kbps` : '';
-                    trackListHtml += `
-                        <div class="track-item">
-                            <div class="track-item-info">
-                                <div class="track-item-title">${escapeHtml(track.title || `Track ${trackIndex + 1}`)}</div>
-                                <div class="track-item-details">
-                                    ${track.track_number ? `${track.track_number}. ` : ''}${escapeHtml(track.artist || result.artist || 'Unknown Artist')} • ${trackSize} • ${escapeHtml(track.quality || 'Unknown')} ${trackBitrate}
-                                </div>
-                            </div>
-                            <div class="track-item-actions">
-                                <button onclick="streamAlbumTrack(${index}, ${trackIndex})" class="track-stream-btn">Stream ▶</button>
-                                <button onclick="downloadAlbumTrack(${index}, ${trackIndex})" class="track-download-btn">Download ⬇</button>
-                                <button onclick="matchedDownloadAlbumTrack(${index}, ${trackIndex})" class="track-matched-btn" title="Matched Download">Matched Download 🎯</button>
-                            </div>
-                        </div>
-                    `;
-                });
-            }
-
-            html += `
-                <div class="album-result-card" data-album-index="${index}">
-                    <div class="album-card-header" onclick="toggleAlbumExpansion(${index})">
-                        <div class="album-expand-indicator">▶</div>
-                        <div class="album-icon">💿</div>
-                        <div class="album-info">
-                            <div class="album-title">${escapeHtml(result.album_title || result.title || 'Unknown Album')}</div>
-                            <div class="album-artist">by ${escapeHtml(result.artist || 'Unknown Artist')}</div>
-                            <div class="album-details">
-                                ${trackCount} tracks • ${totalSize} • ${escapeHtml(result.quality || 'Mixed')}
-                            </div>
-                            <div class="album-uploader">Shared by ${escapeHtml(result.username || 'Unknown')}</div>
-                        </div>
-                        <div class="album-actions" onclick="event.stopPropagation()">
-                            <button onclick="downloadAlbum(${index})" class="album-download-btn">⬇ Download Album</button>
-                            <button onclick="matchedDownloadAlbum(${index})" class="album-matched-btn" title="Matched Album Download">Matched Album🎯</button>
-                        </div>
-                    </div>
-                    <div class="album-track-list" style="display: none;">
-                        ${trackListHtml}
-                    </div>
-                </div>
-            `;
-        } else {
-            const sizeText = result.size ? `${(result.size / 1024 / 1024).toFixed(1)} MB` : 'Unknown size';
-            const bitrateText = result.bitrate ? `${result.bitrate}kbps` : '';
-            html += `
-                <div class="track-result-card">
-                    <div class="track-icon">🎵</div>
-                    <div class="track-info">
-                        <div class="track-title">${escapeHtml(result.title || 'Unknown Title')}</div>
-                        <div class="track-artist">by ${escapeHtml(result.artist || 'Unknown Artist')}</div>
-                        <div class="track-details">
-                            ${sizeText} • ${escapeHtml(result.quality || 'Unknown')} ${bitrateText}
-                        </div>
-                        <div class="track-uploader">Shared by ${escapeHtml(result.username || 'Unknown')}</div>
-                    </div>
-                    <div class="track-actions">
-                        <button onclick="streamTrack(${index})" class="track-stream-btn" title="Stream Track">Stream ▶</button>
-                        <button onclick="downloadTrack(${index})" class="track-download-btn" title="Download">Download ⬇</button>
-                        <button onclick="matchedDownloadTrack(${index})" class="track-matched-btn" title="Matched Download">Matched Download🎯</button>
-                    </div>
-                </div>
-            `;
-        }
-    });
-
-    resultsArea.innerHTML = html;
-    // Store results globally for download functions
-    window.currentSearchResults = results;
-}
-
-async function downloadTrack(index) {
-    const results = window.currentSearchResults;
-    if (!results || !results[index]) return;
-
-    const track = results[index];
-
-    try {
-        const response = await fetch('/api/download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(track)
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(`Download started: ${track.title}`, 'success');
-        } else {
-            showToast(`Download failed: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Download error:', error);
-        showToast('Failed to start download', 'error');
-    }
-}
-
-async function downloadAlbum(index) {
-    const results = window.currentSearchResults;
-    if (!results || !results[index]) return;
-
-    const album = results[index];
-
-    try {
-        const response = await fetch('/api/download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(album)
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(data.message, 'success');
-        } else {
-            showToast(`Album download failed: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Album download error:', error);
-        showToast('Failed to start album download', 'error');
-    }
-}
-
-// Matched download functions
-function matchedDownloadTrack(index) {
-    const results = window.currentSearchResults;
-    if (!results || !results[index]) return;
-
-    const track = results[index];
-    console.log('🎯 Starting matched download for single track:', track);
-
-    // Open matching modal for single track
-    openMatchingModal(track, false, null);
-}
-
-function matchedDownloadAlbum(index) {
-    const results = window.currentSearchResults;
-    if (!results || !results[index]) return;
-
-    const album = results[index];
-    console.log('🎯 Starting matched download for album:', album);
-
-    // Open matching modal for album download
-    openMatchingModal(album, true, album);
-}
-
-function matchedDownloadAlbumTrack(albumIndex, trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex]) return;
-
-    const album = results[albumIndex];
-    if (!album.tracks || !album.tracks[trackIndex]) return;
-
-    const track = album.tracks[trackIndex];
-
-    // Ensure track has necessary properties from parent album
-    track.username = album.username;
-    track.artist = track.artist || album.artist;
-    track.album = album.album_title || album.title;
-
-    console.log('🎯 Starting matched download for album track:', track);
-
-    // Open matching modal for single track (from album context)
-    openMatchingModal(track, false, null);
-}
-
-function toggleAlbumExpansion(albumIndex) {
-    const albumCard = document.querySelector(`[data-album-index="${albumIndex}"]`);
-    if (!albumCard) return;
-
-    const trackList = albumCard.querySelector('.album-track-list');
-    const indicator = albumCard.querySelector('.album-expand-indicator');
-
-    if (trackList.style.display === 'none' || !trackList.style.display) {
-        // Expand
-        trackList.style.display = 'block';
-        indicator.textContent = '▼';
-        albumCard.classList.add('expanded');
-    } else {
-        // Collapse
-        trackList.style.display = 'none';
-        indicator.textContent = '▶';
-        albumCard.classList.remove('expanded');
-    }
-}
-
-async function downloadAlbumTrack(albumIndex, trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex] || !results[albumIndex].tracks || !results[albumIndex].tracks[trackIndex]) return;
-
-    const track = results[albumIndex].tracks[trackIndex];
-
-    try {
-        const response = await fetch('/api/download', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                ...track,
-                result_type: 'track'
-            })
-        });
-
-        const data = await response.json();
-
-        if (data.success) {
-            showToast(`Download started: ${track.title}`, 'success');
-        } else {
-            showToast(`Track download failed: ${data.error}`, 'error');
-        }
-    } catch (error) {
-        console.error('Track download error:', error);
-        showToast('Failed to start track download', 'error');
-    }
-}
-
-// ===============================
-// STREAMING WRAPPER FUNCTIONS
-// ===============================
-
-async function streamTrack(index) {
-    // Stream a single track from search results
-    try {
-        console.log(`🎵 streamTrack called with index: ${index}`);
-        console.log(`🎵 window.currentSearchResults:`, window.currentSearchResults);
-
-        if (!window.currentSearchResults || !window.currentSearchResults[index]) {
-            console.error(`❌ No search results or invalid index. Results length: ${window.currentSearchResults ? window.currentSearchResults.length : 'undefined'}`);
-            showToast('Track not found', 'error');
-            return;
-        }
-
-        const result = window.currentSearchResults[index];
-        console.log(`🎵 Streaming track:`, result);
-
-        // Check for unsupported formats before streaming (streaming sources use encoded filenames, skip check)
-        const isStreamingSource = result.username === 'youtube' || result.username === 'tidal' || result.username === 'qobuz' || result.username === 'hifi';
-        if (!isStreamingSource && result.filename) {
-            const format = getFileExtension(result.filename);
-            console.log(`🎵 [STREAM CHECK] File: ${result.filename}, Extension: ${format}`);
-
-            const isSupported = isAudioFormatSupported(result.filename);
-            console.log(`🎵 [STREAM CHECK] Format ${format} supported: ${isSupported}`);
-
-            if (!isSupported) {
-                showToast(`Sorry, ${format.toUpperCase()} format is not supported in your browser. Try downloading instead.`, 'error');
-                return;
-            }
-        }
-
-        await startStream(result);
-
-    } catch (error) {
-        console.error('Track streaming error:', error);
-        showToast('Failed to start track stream', 'error');
-    }
-}
-
-
-async function streamAlbumTrack(albumIndex, trackIndex) {
-    // Stream a specific track from an album
-    try {
-        console.log(`🎵 streamAlbumTrack called with albumIndex: ${albumIndex}, trackIndex: ${trackIndex}`);
-        console.log(`🎵 window.currentSearchResults:`, window.currentSearchResults);
-
-        if (!window.currentSearchResults || !window.currentSearchResults[albumIndex]) {
-            console.error(`❌ No search results or invalid album index. Results length: ${window.currentSearchResults ? window.currentSearchResults.length : 'undefined'}`);
-            showToast('Album not found', 'error');
-            return;
-        }
-
-        const album = window.currentSearchResults[albumIndex];
-        console.log(`🎵 Album data:`, album);
-
-        // Surgical Fix: Handle YouTube/Tidal results which are "flat" (no tracks array)
-        if (album.username === 'youtube' || album.username === 'tidal' || album.username === 'qobuz' || album.username === 'hifi') {
-            // For YouTube/Tidal results, the "album" is actually the track itself
-            const track = album;
-            const trackData = {
-                ...track,
-                username: track.username,
-                filename: track.filename,
-                artist: track.artist,
-                album: track.title, // Use title as album name for player
-                title: track.title
-            };
-            console.log(`🎵 Streaming YouTube track directly:`, trackData);
-            await startStream(trackData);
-            return;
-        }
-
-        if (!album.tracks || !album.tracks[trackIndex]) {
-            console.error(`❌ No tracks in album or invalid track index. Tracks length: ${album.tracks ? album.tracks.length : 'undefined'}`);
-            showToast('Track not found in album', 'error');
-            return;
-        }
-
-        const track = album.tracks[trackIndex];
-        console.log(`🎵 Streaming album track:`, track);
-
-        // Ensure album tracks have required fields
-        const trackData = {
-            ...track,
-            username: track.username || album.username,
-            filename: track.filename || track.path,
-            artist: track.artist || album.artist,
-            album: track.album || album.title || album.album
-        };
-
-        console.log(`🎵 Enhanced track data:`, trackData);
-
-        // Check for unsupported formats before streaming (streaming sources use encoded filenames, skip check)
-        const isStreamingSource2 = trackData.username === 'youtube' || trackData.username === 'tidal' || trackData.username === 'qobuz' || trackData.username === 'hifi';
-        if (!isStreamingSource2 && trackData.filename && !isAudioFormatSupported(trackData.filename)) {
-            const format = getFileExtension(trackData.filename);
-            showToast(`Sorry, ${format.toUpperCase()} format is not supported in web browsers. Try downloading instead.`, 'error');
-            return;
-        }
-
-        await startStream(trackData);
-
-    } catch (error) {
-        console.error('Album track streaming error:', error);
-        showToast('Failed to start track stream', 'error');
-    }
-}
+// Basic (Soulseek/download-source file) search lived here: the source chip
+// row, performDownloadsSearch, displayDownloadsResults and the download,
+// matched-download and stream handlers for its result cards. All of it is
+// React's now — webui/src/routes/search/-basic.*.
+//
+// The three matchedDownload* handlers that were here never ran: they are
+// declared again in wishlist-tools.js, which loads after this file, so those
+// copies won. The live ones are what was ported.
 
 async function loadArtistsData() {
     try {
@@ -6337,7 +4837,7 @@ async function loadArtistsData() {
 // UTILITY FUNCTIONS
 // ===============================
 
-function showLoadingOverlay(message = 'Loading…') {
+function showLoadingOverlay(message = 'Loading...') {
     const overlay = document.getElementById('loading-overlay');
     const messageElement = overlay.querySelector('.loading-message');
     messageElement.textContent = message;
@@ -6362,7 +4862,60 @@ const _notifState = {
     filter: 'all',       // panel type filter: all | success | error | warning | info
     pending: [],         // toasts awaiting the fire-and-forget journal flush
     flushTimer: null,
+    sysStats: null,      // last dashboard:stats frame — feeds the tray's system footer
 };
+
+// ── system status in the tray ────────────────────────────────────────────
+// The dashboard's System Stats strip retired (Boulder: telemetry belongs
+// where you act on it, not as a home-page section). The live numbers moved
+// HERE: the tray footer shows downloads/speed/uptime/memory, and the bell
+// wears a small second badge with the active-download count — the same
+// at-a-glance signal the sidebar downloads button gives. Fed by the global
+// dashboard:stats socket re-broadcast; refreshed once on panel open so a
+// dead socket still shows current numbers.
+window.addEventListener('ss:dashboard-stats', function (e) {
+    _notifState.sysStats = e.detail || null;
+    _updateNotifDlBadge();
+    const host = document.querySelector('[data-notif-sys]');
+    if (host) host.innerHTML = _notifSysHTML();
+});
+
+function _updateNotifDlBadge() {
+    const el = document.getElementById('notif-bell-dl');
+    if (!el) return;
+    const n = (_notifState.sysStats && _notifState.sysStats.active_downloads) || 0;
+    el.textContent = n > 99 ? '99+' : n;
+    el.style.display = n > 0 ? '' : 'none';
+}
+
+function _notifSysHTML() {
+    const s = _notifState.sysStats;
+    if (!s) return '';
+    const bits = [];
+    const dl = s.active_downloads || 0;
+    bits.push('<span class="notif-sys-item notif-sys-item--link" ' +
+        'onclick="navigateToPage(\'active-downloads\')" title="Open the download manager">' +
+        '⬇ ' + dl + ' active' +
+        (dl > 0 && s.download_speed ? ' · ' + _escToast(String(s.download_speed)) : '') +
+        '</span>');
+    if (s.uptime) bits.push('<span class="notif-sys-item" title="Application runtime">⏱ ' + _escToast(String(s.uptime)) + '</span>');
+    if (s.memory_usage) {
+        bits.push('<span class="notif-sys-item" title="System memory' +
+            (s.process_memory ? ' — SoulSync uses ' + _escAttr(String(s.process_memory)) : '') + '">▦ ' +
+            _escToast(String(s.memory_usage)) + '</span>');
+    }
+    return bits.join('<span class="notif-sys-sep">·</span>');
+}
+
+function _seedNotifSys() {
+    fetch('/api/system/stats').then(r => r.ok ? r.json() : null).then(data => {
+        if (!data) return;
+        _notifState.sysStats = data;
+        _updateNotifDlBadge();
+        const host = document.querySelector('[data-notif-sys]');
+        if (host) host.innerHTML = _notifSysHTML();
+    }).catch(() => {});
+}
 
 // Journal toasts to the server so a reflexive "Clear All" loses nothing —
 // batched, fire-and-forget, never blocks the UI.
@@ -6413,10 +4966,6 @@ function updateOverlayTask(data) {
 // Pull current state on demand (panel open / page load) so we're accurate even if
 // a socket event was missed or a job was already running before we connected.
 function _seedOverlayTask() {
-    // Locked (login / PIN screen): auth-gated, and these seed on page load —
-    // after auth-hold.js has already released, so the class check is what
-    // catches them. Resumes on unlock.
-    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/overlays/apply/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateOverlayTask(s); })
@@ -6427,10 +4976,551 @@ function _overlayTaskActive() {
     return !!(_overlayTask && (_overlayTask.running || _overlayTask.phase === 'starting' || _overlayTask.phase === 'running'));
 }
 
+// ── Music-side active tasks (automation, scans, repairs, sync/downloads) ─────
+// Video already pins long jobs in the bell. These mirror the same standard for
+// music jobs that already emit socket progress elsewhere in the app.
+const _musicAutomationTasks = {};
+const _musicRepairTasks = {};
+let _musicWatchlistTask = null;
+let _musicWatchlistClearTimer = null;
+let _musicMediaScanTask = null;
+let _musicMediaScanClearTimer = null;
+let _musicWishlistTask = null;
+let _musicWishlistClearTimer = null;
+let _musicSyncPulse = null;
+let _musicSyncClearTimer = null;
+let _lastfmImportTask = null;
+let _lastfmImportClearTimer = null;
+let _lastfmImportCompletion = null;
+let _listenbrainzImportTask = null;
+let _listenbrainzImportClearTimer = null;
+let _listenbrainzImportCompletion = null;
+
+function _taskClampPct(value, fallback = 0) {
+    let pct = Number(value);
+    if (!Number.isFinite(pct)) pct = Number(fallback);
+    if (!Number.isFinite(pct)) pct = 0;
+    // Tolerate a 0-1 FRACTION, but never mistake an honest 1% for one (#1197).
+    // `pct <= 1` meant a scan sitting at exactly 1 percent — the value every
+    // long job reports for a while — was multiplied to 100, so the card read
+    // "100%" while the counts underneath said 2,347 / 157,122. it corrected
+    // itself at 2%, which is why it looked like another automation finishing
+    // had caused it. an integer 1 is one percent; only a real fraction is <1.
+    if (pct > 0 && pct < 1) pct *= 100;
+    return Math.max(0, Math.min(100, Math.round(pct)));
+}
+
+function _taskHasPct(value) {
+    return value != null && value !== '' && Number.isFinite(Number(value));
+}
+
+function _taskPct(done, total, phase) {
+    const totalNum = Number(total);
+    if (Number.isFinite(totalNum) && totalNum > 0) return _taskClampPct((Number(done) || 0) / totalNum * 100);
+    return phase === 'done' || phase === 'finished' || phase === 'complete' ? 100 : null;
+}
+
+function _taskCount(value, fallback = 0) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : fallback;
+}
+
+function _taskCardHTML(title, pct, line, cls = '', actionHTML = '') {
+    const safePct = _taskHasPct(pct) ? _taskClampPct(pct) : 0;
+    return `
+        <div class="${_taskCardClass(cls, pct)}">
+            <div class="notif-active-head">
+                <span class="notif-active-title">${_escToast(title)}</span>
+                <span class="notif-active-pct">${_taskPctText(pct)}</span>
+            </div>
+            <div class="notif-active-bar"><div class="notif-active-fill" ${_taskFillStyle(pct, safePct)}></div></div>
+            <div class="notif-active-sub">${line}${actionHTML}</div>
+        </div>`;
+}
+
+function _taskCardClass(cls, pct) {
+    return ['notif-active', cls ? `notif-active-${cls}` : '', _taskHasPct(pct) ? '' : 'notif-active-indeterminate']
+        .filter(Boolean).join(' ');
+}
+
+function _taskPctText(pct) {
+    return _taskHasPct(pct) ? `${_taskClampPct(pct)}%` : 'Active';
+}
+
+function _taskFillStyle(pct, safePct = _taskClampPct(pct)) {
+    return _taskHasPct(pct) ? `style="width:${safePct}%"` : '';
+}
+
+function _notifActionHTML(label, page) {
+    return `<button type="button" class="notif-active-link" onclick="navigateToPage('${_escAttr(page)}')">${_escToast(label)}</button>`;
+}
+
+function updateMusicAutomationTask(data) {
+    if (!data) return;
+    if (Object.keys(data).length === 0) {
+        for (const aid of Object.keys(_musicAutomationTasks)) delete _musicAutomationTasks[aid];
+        _updateOverlayBell();
+        _patchOverlayActive();
+        return;
+    }
+    for (const [aid, state] of Object.entries(data)) {
+        if (!state) continue;
+        const status = state.status || 'running';
+        _musicAutomationTasks[aid] = { ...state, id: aid, updated_at: Date.now() };
+        if (status === 'finished' || status === 'error') {
+            const updatedAt = _musicAutomationTasks[aid].updated_at;
+            setTimeout(() => {
+                const cur = _musicAutomationTasks[aid];
+                if (cur && cur.updated_at === updatedAt && cur.status !== 'running') {
+                    delete _musicAutomationTasks[aid];
+                    _updateOverlayBell();
+                    _patchOverlayActive();
+                }
+            }, 30000);
+        }
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _musicAutomationActive() {
+    return Object.values(_musicAutomationTasks).some(t => t && t.status === 'running');
+}
+
+function _musicAutomationActiveHTML() {
+    return Object.values(_musicAutomationTasks).map(t => {
+        if (!t) return '';
+        const running = t.status === 'running';
+        const pct = running ? (_taskHasPct(t.progress) ? _taskClampPct(t.progress) : null) : 100;
+        const name = t.automation_name || t.name || t.action_type || 'Automation';
+        const latest = Array.isArray(t.log) && t.log.length ? t.log[t.log.length - 1].text : '';
+        const line = _escToast(t.phase || latest || (running ? 'Running' : t.status || 'Finished'));
+        const cls = t.status === 'error' ? 'error' : (!running ? 'done' : '');
+        return _taskCardHTML(`Automation: ${name}`, pct, line, cls, _notifActionHTML('Open Automations', 'automations'));
+    }).join('');
+}
+
+function updateMusicRepairTask(data) {
+    if (!data) return;
+    if (Object.keys(data).length === 0) {
+        for (const jobId of Object.keys(_musicRepairTasks)) delete _musicRepairTasks[jobId];
+        _updateOverlayBell();
+        _patchOverlayActive();
+        return;
+    }
+    for (const [jobId, state] of Object.entries(data)) {
+        if (!state) continue;
+        _musicRepairTasks[jobId] = { ...state, id: jobId, updated_at: Date.now() };
+        if (state.status === 'finished' || state.status === 'error') {
+            const updatedAt = _musicRepairTasks[jobId].updated_at;
+            setTimeout(() => {
+                const cur = _musicRepairTasks[jobId];
+                if (cur && cur.updated_at === updatedAt && cur.status !== 'running') {
+                    delete _musicRepairTasks[jobId];
+                    _updateOverlayBell();
+                    _patchOverlayActive();
+                }
+            }, 12000);
+        }
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _musicRepairActive() {
+    return Object.values(_musicRepairTasks).some(t => t && t.status === 'running');
+}
+
+function _musicRepairActiveHTML() {
+    return Object.values(_musicRepairTasks).map(t => {
+        if (!t) return '';
+        const total = t.total || 0;
+        const done = t.scanned || t.processed || 0;
+        const rawPct = t.percent != null ? t.percent : (t.progress != null ? t.progress : _taskPct(done, total, t.status));
+        const pct = _taskHasPct(rawPct) ? _taskClampPct(rawPct) : null;
+        const cls = t.status === 'error' ? 'error' : (t.status === 'finished' ? 'done' : '');
+        const line = `${(done || 0).toLocaleString()} / ${total ? total.toLocaleString() : '…'}` +
+            (t.current_item ? ' · ' + _escToast(t.current_item) : '');
+        // display_name is what the server has always sent (_repair_job_start in
+        // web_server.py puts it in the progress state); this read the wrong key,
+        // so every running job rendered as the same generic "Library
+        // maintenance" card and four at once were indistinguishable (#1211).
+        // t.id is the job_id and beats the generic label if a state ever lands
+        // without a display name.
+        const jobName = t.display_name || t.name || t.job_name || t.id || 'Library maintenance';
+        // _taskCardHTML escapes the title itself, so no _escToast here.
+        return _taskCardHTML(jobName, pct, line, cls, _notifActionHTML('Open Tools', 'tools'));
+    }).join('');
+}
+
+function updateMusicWatchlistScanTask(data) {
+    if (!data) return;
+    if (_musicWatchlistClearTimer) { clearTimeout(_musicWatchlistClearTimer); _musicWatchlistClearTimer = null; }
+    const active = data.status === 'scanning' || data.is_scanning || data.running;
+    if (active) {
+        _musicWatchlistTask = { ...data, updated_at: Date.now() };
+    } else if (_musicWatchlistTask && (data.status === 'complete' || data.status === 'completed' || data.status === 'error')) {
+        _musicWatchlistTask = { ...data, updated_at: Date.now() };
+        _musicWatchlistClearTimer = setTimeout(() => { _musicWatchlistTask = null; _updateOverlayBell(); _patchOverlayActive(); }, 8000);
+    } else if (!active) {
+        _musicWatchlistTask = null;
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _musicWatchlistActive() {
+    return !!(_musicWatchlistTask && (_musicWatchlistTask.status === 'scanning' || _musicWatchlistTask.is_scanning || _musicWatchlistTask.running));
+}
+
+function _musicWatchlistActiveHTML() {
+    const t = _musicWatchlistTask;
+    if (!t) return '';
+    const total = t.total_artists || t.total || 0;
+    const done = t.processed_artists || t.processed || 0;
+    const pct = _taskPct(done, total, t.status);
+    const cls = t.status === 'error' ? 'error' : (!_musicWatchlistActive() ? 'done' : '');
+    const line = total ? `${done} / ${total} artists` : (t.current_artist ? _escToast(t.current_artist) : 'Scanning watchlist');
+    return _taskCardHTML('Scanning watchlist', pct, line, cls, _notifActionHTML('Open Watchlist', 'watchlist'));
+}
+
+function updateMusicMediaScanTask(data) {
+    const s = data && (typeof data.status === 'object' ? data.status : data);
+    if (!s) return;
+    if (_musicMediaScanClearTimer) { clearTimeout(_musicMediaScanClearTimer); _musicMediaScanClearTimer = null; }
+    const active = s.is_scanning || s.status === 'scanning' || s.phase === 'scanning';
+    if (active) {
+        _musicMediaScanTask = { ...s, updated_at: Date.now() };
+    } else if (_musicMediaScanTask && (s.status === 'complete' || s.status === 'completed' || s.phase === 'complete')) {
+        _musicMediaScanTask = { ...s, updated_at: Date.now(), phase: 'done' };
+        _musicMediaScanClearTimer = setTimeout(() => { _musicMediaScanTask = null; _updateOverlayBell(); _patchOverlayActive(); }, 8000);
+    } else {
+        _musicMediaScanTask = null;
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _musicMediaScanActive() {
+    return !!(_musicMediaScanTask && (_musicMediaScanTask.is_scanning || _musicMediaScanTask.status === 'scanning' || _musicMediaScanTask.phase === 'scanning'));
+}
+
+function _musicMediaScanActiveHTML() {
+    const t = _musicMediaScanTask;
+    if (!t) return '';
+    const active = _musicMediaScanActive();
+    const rawPct = t.progress != null ? t.progress : t.percent;
+    const pct = active ? (_taskHasPct(rawPct) ? _taskClampPct(rawPct) : null) : 100;
+    const cls = t.error_message ? 'error' : (!_musicMediaScanActive() ? 'done' : '');
+    const line = _escToast(t.current_item || t.phase || t.status || 'Updating library');
+    return _taskCardHTML('Updating music library', pct, line, cls, _notifActionHTML('Open Tools', 'tools'));
+}
+
+function updateMusicWishlistTask(data) {
+    if (!data) return;
+    if (_musicWishlistClearTimer) { clearTimeout(_musicWishlistClearTimer); _musicWishlistClearTimer = null; }
+    const hasActiveBatchSignal = data.active_batches != null;
+    const activeBatches = Number(data.active_batches || 0);
+    const active = !!data.is_auto_processing && (!hasActiveBatchSignal || activeBatches > 0);
+    if (active) {
+        _musicWishlistTask = { ...data, updated_at: Date.now() };
+    } else if (_musicWishlistTask) {
+        _musicWishlistTask = { ...data, is_auto_processing: false, updated_at: Date.now() };
+        _musicWishlistClearTimer = setTimeout(() => { _musicWishlistTask = null; _updateOverlayBell(); _patchOverlayActive(); }, 8000);
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _musicWishlistActive() {
+    return !!(_musicWishlistTask && _musicWishlistTask.is_auto_processing);
+}
+
+function _musicWishlistActiveHTML() {
+    const t = _musicWishlistTask;
+    if (!t) return '';
+    const pct = _musicWishlistActive() ? null : 100;
+    const cls = _musicWishlistActive() ? '' : 'done';
+    const activeBatches = Number(t.active_batches || 0);
+    const line = _musicWishlistActive()
+        ? (activeBatches ? `${activeBatches} wishlist batch${activeBatches === 1 ? '' : 'es'} running` : 'Processing queued wishlist tracks')
+        : 'Wishlist processing finished';
+    return _taskCardHTML('Processing wishlist', pct, line, cls, _notifActionHTML('Open Wishlist', 'wishlist'));
+}
+
+function updateMusicSyncTask(data) {
+    if (_musicSyncClearTimer) { clearTimeout(_musicSyncClearTimer); _musicSyncClearTimer = null; }
+    const incoming = data || {};
+    const hasSyncList = Array.isArray(incoming.syncs);
+    const hasProcessPayload = !!(incoming.playlist_id || incoming.playlist_name || incoming.progress);
+
+    if (hasSyncList && !incoming.syncs.length && !hasProcessPayload) {
+        _musicSyncPulse = null;
+        _updateOverlayBell();
+        _patchOverlayActive();
+        return;
+    }
+
+    if (hasSyncList && incoming.syncs.length) {
+        _musicSyncPulse = { ...incoming, processes: incoming.syncs, updated_at: Date.now() };
+    } else {
+        const previous = _musicSyncPulse || {};
+        const previousProcesses = Array.isArray(previous.processes) ? previous.processes : [];
+        const process = hasProcessPayload ? incoming : null;
+        _musicSyncPulse = {
+            ...previous,
+            ...incoming,
+            processes: process ? [process] : previousProcesses,
+            updated_at: Date.now(),
+        };
+    }
+    const terminal = ['finished', 'error', 'cancelled', 'complete'].includes(_musicSyncPulse.status);
+    _musicSyncClearTimer = setTimeout(() => { _musicSyncPulse = null; _updateOverlayBell(); _patchOverlayActive(); }, terminal ? 12000 : 7000);
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _activeMusicDownloads() {
+    return Object.entries(activeDownloadProcesses || {})
+        .filter(([, p]) => p && p.status === 'running' && p.batchId)
+        .map(([playlistId, p]) => ({ playlistId, ...p }));
+}
+
+function _syncProcessName(process) {
+    const progress = process?.progress || {};
+    return process?.playlist?.name || process?.playlistName || process?.playlist_name || process?.playlist_name
+        || progress.playlist_name
+        || process?.name || process?.playlist_id || process?.playlistId || 'Playlist';
+}
+
+function _syncProcessProgress(process) {
+    const progress = process?.progress || {};
+    const pct = progress.progress != null ? progress.progress : process?.percent;
+    if (pct != null) return _taskClampPct(pct);
+    const matched = progress.matched_tracks || process?.matched_tracks || 0;
+    const failed = progress.failed_tracks || process?.failed_tracks || 0;
+    const total = progress.total_tracks || process?.total_tracks || 0;
+    if (total) return _taskClampPct(((matched + failed) / total) * 100);
+    return process?.status === 'starting' ? 0 : null;
+}
+
+function _syncProcessLine(process) {
+    const progress = process?.progress || {};
+    const matched = progress.matched_tracks || process?.matched_tracks || 0;
+    const failed = progress.failed_tracks || process?.failed_tracks || 0;
+    const total = progress.total_tracks || process?.total_tracks || 0;
+    const current = progress.current_track || process?.current_track || '';
+    const step = progress.current_step || process?.current_step || process?.status || 'Syncing';
+    const counts = total ? `${matched}/${total} matched${failed ? `, ${failed} failed` : ''}` : step;
+    return _escToast(current ? `${step} · ${current}` : counts);
+}
+
+function _musicSyncSources() {
+    const active = _activeMusicDownloads();
+    if (active.length) return active;
+    return Array.isArray(_musicSyncPulse?.processes) ? _musicSyncPulse.processes : [];
+}
+
+function _musicSyncActive() {
+    return _musicSyncSources().length > 0;
+}
+
+function _musicSyncActiveHTML() {
+    const sources = _musicSyncSources();
+    if (!sources.length && !_musicSyncActive()) return '';
+    const first = sources[0];
+    const pct = sources.length ? _syncProcessProgress(first) : null;
+    const title = sources.length === 1
+        ? `Syncing ${_syncProcessName(first)}`
+        : `Syncing ${sources.length} playlists`;
+    const line = sources.length
+        ? (sources.length === 1 ? _syncProcessLine(first) : sources.map(p => _escToast(_syncProcessName(p))).slice(0, 3).join(', '))
+        : 'Playlist sync is running';
+    return _taskCardHTML(title, pct, line, '', _notifActionHTML('Open Downloads', 'active-downloads'));
+}
+
+function updateLastfmListeningImportTask(data) {
+    if (!data) return;
+    if (_lastfmImportClearTimer) { clearTimeout(_lastfmImportClearTimer); _lastfmImportClearTimer = null; }
+    const terminal = ['complete', 'error', 'cancelled'].includes(data.status);
+    const active = !terminal && (data.running === true || data.status === 'running');
+    if (active) {
+        _lastfmImportCompletion = null;
+        _lastfmImportTask = { ...data, updated_at: Date.now() };
+    } else if (terminal || _lastfmImportTask) {
+        // Status snapshots are persisted indefinitely and reloaded on panel open.
+        // Replays must not restart the grace period or resurrect an expired card.
+        const key = JSON.stringify([data.username, data.started_at, data.finished_at, data.status]);
+        if (!_lastfmImportCompletion || _lastfmImportCompletion.key !== key) {
+            // The importer writes naive UTC timestamps, not browser-local time.
+            let stamp = String(data.finished_at || '').replace(' ', 'T');
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(stamp)) stamp += 'Z';
+            const finished = Date.parse(stamp);
+            _lastfmImportCompletion = {
+                key,
+                expiresAt: Math.min(Date.now(), Number.isFinite(finished) ? finished : Date.now()) + 10000,
+            };
+        }
+        const remaining = _lastfmImportCompletion.expiresAt - Date.now();
+        _lastfmImportTask = remaining > 0 ? { ...data, running: false, updated_at: Date.now() } : null;
+        if (remaining > 0) {
+            _lastfmImportClearTimer = setTimeout(() => {
+                _lastfmImportClearTimer = null;
+                _lastfmImportTask = null;
+                _updateOverlayBell();
+                _patchOverlayActive();
+            }, remaining);
+        }
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _lastfmImportActive() {
+    return !!(_lastfmImportTask && (_lastfmImportTask.running || _lastfmImportTask.status === 'running'));
+}
+
+function _lastfmImportActiveHTML() {
+    const t = _lastfmImportTask;
+    if (!t) return '';
+    const active = _lastfmImportActive();
+    const hasProgress = _taskHasPct(t.progress);
+    const pct = active
+        ? (hasProgress ? _taskClampPct(t.progress) : null)
+        : (t.status === 'complete' ? 100 : (hasProgress ? _taskClampPct(t.progress) : null));
+    const cls = t.status === 'error' ? 'error' : (!active ? 'done' : '');
+    const inserted = Number(t.inserted || 0);
+    const duplicates = Number(t.duplicates || 0);
+    const total = Number(t.total_scrobbles || 0);
+    const page = Number(t.page || 0);
+    const totalPages = Number(t.total_pages || 0);
+    const pageLine = page && totalPages ? ` · page ${page.toLocaleString()}/${totalPages.toLocaleString()}` : '';
+    const line = active
+        ? `${inserted.toLocaleString()} added${duplicates ? `, ${duplicates.toLocaleString()} skipped` : ''}${total ? ` · ${total.toLocaleString()} total` : ''}${pageLine}`
+        : (t.status === 'error' ? _escToast(t.error || 'Last.fm import failed') : _escToast(t.phase || 'Last.fm listening is up to date'));
+    return _taskCardHTML('Importing Last.fm listening', pct, line, cls, _notifActionHTML('Open Stats', 'stats'));
+}
+
+function updateListenbrainzListeningImportTask(data) {
+    if (!data) return;
+    if (_listenbrainzImportClearTimer) { clearTimeout(_listenbrainzImportClearTimer); _listenbrainzImportClearTimer = null; }
+    const terminal = ['complete', 'error', 'cancelled'].includes(data.status);
+    const active = !terminal && (data.running === true || data.status === 'running');
+    if (active) {
+        _listenbrainzImportCompletion = null;
+        _listenbrainzImportTask = { ...data, updated_at: Date.now() };
+    } else if (terminal || _listenbrainzImportTask) {
+        const key = JSON.stringify([data.username, data.started_at, data.finished_at, data.status]);
+        if (!_listenbrainzImportCompletion || _listenbrainzImportCompletion.key !== key) {
+            let stamp = String(data.finished_at || '').replace(' ', 'T');
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(stamp)) stamp += 'Z';
+            const finished = Date.parse(stamp);
+            _listenbrainzImportCompletion = {
+                key,
+                expiresAt: Math.min(Date.now(), Number.isFinite(finished) ? finished : Date.now()) + 10000,
+            };
+        }
+        const remaining = _listenbrainzImportCompletion.expiresAt - Date.now();
+        _listenbrainzImportTask = remaining > 0 ? { ...data, running: false, updated_at: Date.now() } : null;
+        if (remaining > 0) {
+            _listenbrainzImportClearTimer = setTimeout(() => {
+                _listenbrainzImportClearTimer = null;
+                _listenbrainzImportTask = null;
+                _updateOverlayBell();
+                _patchOverlayActive();
+            }, remaining);
+        }
+    }
+    _updateOverlayBell();
+    _patchOverlayActive();
+}
+
+function _listenbrainzImportActive() {
+    return !!(_listenbrainzImportTask && (_listenbrainzImportTask.running || _listenbrainzImportTask.status === 'running'));
+}
+
+function _listenbrainzImportActiveHTML() {
+    const t = _listenbrainzImportTask;
+    if (!t) return '';
+    const active = _listenbrainzImportActive();
+    const hasProgress = _taskHasPct(t.progress);
+    const pct = active
+        ? (hasProgress ? _taskClampPct(t.progress) : null)
+        : (t.status === 'complete' ? 100 : (hasProgress ? _taskClampPct(t.progress) : null));
+    const cls = t.status === 'error' ? 'error' : (!active ? 'done' : '');
+    const inserted = Number(t.inserted || 0);
+    const duplicates = Number(t.duplicates || 0);
+    const total = Number(t.total_scrobbles || t.total_listens || 0);
+    const page = Number(t.page || 0);
+    const totalPages = Number(t.total_pages || 0);
+    const pageLine = page && totalPages ? ` · page ${page.toLocaleString()}/${totalPages.toLocaleString()}` : '';
+    const line = active
+        ? `${inserted.toLocaleString()} added${duplicates ? `, ${duplicates.toLocaleString()} skipped` : ''}${total ? ` · ${total.toLocaleString()} total` : ''}${pageLine}`
+        : (t.status === 'error' ? _escToast(t.error || 'ListenBrainz import failed') : _escToast(t.phase || 'ListenBrainz listening is up to date'));
+    return _taskCardHTML('Importing ListenBrainz listening', pct, line, cls, _notifActionHTML('Open Stats', 'stats'));
+}
+
+function _musicTasksActive() {
+    return _musicAutomationActive() || _musicRepairActive() || _musicWatchlistActive()
+        || _musicMediaScanActive() || _musicWishlistActive() || _musicSyncActive()
+        || _lastfmImportActive() || _listenbrainzImportActive();
+}
+
+function _musicActiveHTML() {
+    return _musicAutomationActiveHTML() + _musicSyncActiveHTML() + _musicWishlistActiveHTML()
+        + _lastfmImportActiveHTML() + _listenbrainzImportActiveHTML() + _musicWatchlistActiveHTML() + _musicMediaScanActiveHTML() + _musicRepairActiveHTML();
+}
+
+function _seedMusicAutomationTask() {
+    fetch('/api/automations/progress')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s) updateMusicAutomationTask(s); })
+        .catch(() => {});
+}
+
+function _seedMusicDownloadTask() {
+    fetch('/api/active-processes')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => {
+            if (!s || !Array.isArray(s.active_processes)) return;
+            const batches = s.active_processes.filter(p => p.type === 'batch');
+            if (batches.length) updateMusicSyncTask({ active: true, processes: batches });
+        })
+        .catch(() => {});
+}
+
+function _seedMusicRepairTask() {
+    fetch('/api/repair/progress')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s) updateMusicRepairTask(s); })
+        .catch(() => {});
+}
+
+function _seedMusicMediaScanTask() {
+    fetch('/api/scan/status')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s) updateMusicMediaScanTask(s); })
+        .catch(() => {});
+}
+
+function _seedLastfmImportTask() {
+    fetch('/api/lastfm/listening-import/status')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s && s.success) updateLastfmListeningImportTask(s); })
+        .catch(() => {});
+}
+
+function _seedListenbrainzImportTask() {
+    fetch('/api/listenbrainz/listening-import/status')
+        .then(r => r.ok ? r.json() : null)
+        .then(s => { if (s && s.success) updateListenbrainzListeningImportTask(s); })
+        .catch(() => {});
+}
+
 function _updateOverlayBell() {
     const btn = document.getElementById('notif-bell-btn');
     if (btn) btn.classList.toggle('notif-bell-working',
-        _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive());
+        _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive() || _musicTasksActive());
     _ensureTaskPolling();
 }
 
@@ -6439,13 +5529,19 @@ function _updateOverlayBell() {
 // strand an Active card in its last "running" state. Stops itself when idle.
 let _taskPollTimer = null;
 function _ensureTaskPolling() {
-    const active = _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive();
+    const active = _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive() || _musicTasksActive();
     if (active && !_taskPollTimer) {
         _taskPollTimer = setInterval(() => {
             _seedOverlayTask();
             _seedCollectionSyncTask();
             _seedCollectionArtTask();
             _seedVideoBulkTask();
+            _seedMusicAutomationTask();
+            _seedMusicDownloadTask();
+            _seedMusicRepairTask();
+            _seedMusicMediaScanTask();
+            _seedLastfmImportTask();
+            _seedListenbrainzImportTask();
         }, 12000);
     } else if (!active && _taskPollTimer) {
         clearInterval(_taskPollTimer);
@@ -6474,10 +5570,6 @@ function updateCollectionArtTask(data) {
 }
 
 function _seedCollectionArtTask() {
-    // Locked (login / PIN screen): auth-gated, and these seed on page load —
-    // after auth-hold.js has already released, so the class check is what
-    // catches them. Resumes on unlock.
-    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/collections/posters/regenerate/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateCollectionArtTask(s); })
@@ -6491,16 +5583,16 @@ function _colArtTaskActive() {
 function _colArtActiveHTML() {
     const t = _colArtTask;
     if (!t) return '';
-    const total = t.total || 0, done = t.done || 0;
-    const pct = total ? Math.min(100, Math.round(done / total * 100)) : (t.phase === 'done' ? 100 : 4);
+    const total = _taskCount(t.total), done = _taskCount(t.done);
+    const pct = _taskPct(done, total, t.phase);
     let line, cls = '';
     if (t.phase === 'done') { line = `Done · ${t.rendered || 0} rendered` + (t.failed ? `, ${t.failed} failed` : ''); cls = 'done'; }
     else if (t.phase === 'error') { line = 'Failed: ' + _escToast(t.error || 'error'); cls = 'error'; }
     else line = `${done} / ${total || '…'}` + (t.name ? ' · ' + _escToast(t.name) : '');
     return `
-        <div class="notif-active notif-active-${cls}">
-            <div class="notif-active-head"><span class="notif-active-title">Refreshing collection artwork</span><span class="notif-active-pct">${pct}%</span></div>
-            <div class="notif-active-bar"><div class="notif-active-fill" style="width:${pct}%"></div></div>
+        <div class="${_taskCardClass(cls, pct)}">
+            <div class="notif-active-head"><span class="notif-active-title">Refreshing collection artwork</span><span class="notif-active-pct">${_taskPctText(pct)}</span></div>
+            <div class="notif-active-bar"><div class="notif-active-fill" ${_taskFillStyle(pct)}></div></div>
             <div class="notif-active-sub">${line}</div>
         </div>`;
 }
@@ -6528,10 +5620,6 @@ function updateVideoBulkTask(data) {
 }
 
 function _seedVideoBulkTask() {
-    // Locked (login / PIN screen): auth-gated, and these seed on page load —
-    // after auth-hold.js has already released, so the class check is what
-    // catches them. Resumes on unlock.
-    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/bulk/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateVideoBulkTask(s); })
@@ -6545,17 +5633,17 @@ function _videoBulkTaskActive() {
 function _videoBulkActiveHTML() {
     const t = _videoBulkTask;
     if (!t) return '';
-    const total = t.total || 0, done = t.done || 0;
-    const pct = total ? Math.min(100, Math.round(done / total * 100)) : (t.phase === 'done' ? 100 : 4);
+    const total = _taskCount(t.total), done = _taskCount(t.done);
+    const pct = _taskPct(done, total, t.phase);
     let line, cls = '';
     if (t.phase === 'done') { line = `Done · ${t.ok || 0} updated` + (t.failed ? `, ${t.failed} failed` : ''); cls = 'done'; }
     else if (t.phase === 'error') { line = 'Failed: ' + _escToast(t.error || 'error'); cls = 'error'; }
     else line = `${done} / ${total || '…'}`;
     const title = t.label ? _escToast(t.label) : 'Bulk metadata edit';
     return `
-        <div class="notif-active notif-active-${cls}">
-            <div class="notif-active-head"><span class="notif-active-title">${title}</span><span class="notif-active-pct">${pct}%</span></div>
-            <div class="notif-active-bar"><div class="notif-active-fill" style="width:${pct}%"></div></div>
+        <div class="${_taskCardClass(cls, pct)}">
+            <div class="notif-active-head"><span class="notif-active-title">${title}</span><span class="notif-active-pct">${_taskPctText(pct)}</span></div>
+            <div class="notif-active-bar"><div class="notif-active-fill" ${_taskFillStyle(pct)}></div></div>
             <div class="notif-active-sub">${line}</div>
         </div>`;
 }
@@ -6583,10 +5671,6 @@ function updateCollectionSyncTask(data) {
 }
 
 function _seedCollectionSyncTask() {
-    // Locked (login / PIN screen): auth-gated, and these seed on page load —
-    // after auth-hold.js has already released, so the class check is what
-    // catches them. Resumes on unlock.
-    if (document.body.classList.contains('app-locked')) return;
     fetch('/api/video/collections/sync/status')
         .then(r => r.ok ? r.json() : null)
         .then(s => { if (s) updateCollectionSyncTask(s); })
@@ -6600,8 +5684,8 @@ function _colSyncTaskActive() {
 function _colSyncActiveHTML() {
     const t = _colSyncTask;
     if (!t) return '';
-    const total = t.total || 0, done = t.done || 0;
-    const pct = total ? Math.min(100, Math.round(done / total * 100)) : (t.phase === 'done' ? 100 : 4);
+    const total = _taskCount(t.total), done = _taskCount(t.done);
+    const pct = _taskPct(done, total, t.phase);
     let line, cls = '';
     if (t.phase === 'done') {
         line = `Done · ${t.synced || 0} synced` +
@@ -6612,9 +5696,9 @@ function _colSyncActiveHTML() {
     } else if (t.phase === 'error') { line = 'Failed: ' + _escToast(t.error || 'error'); cls = 'error'; }
     else line = `${done} / ${total || '…'}` + (t.name ? ' · ' + _escToast(t.name) : '');
     return `
-        <div class="notif-active notif-active-${cls}">
-            <div class="notif-active-head"><span class="notif-active-title">Syncing collections</span><span class="notif-active-pct">${pct}%</span></div>
-            <div class="notif-active-bar"><div class="notif-active-fill" style="width:${pct}%"></div></div>
+        <div class="${_taskCardClass(cls, pct)}">
+            <div class="notif-active-head"><span class="notif-active-title">Syncing collections</span><span class="notif-active-pct">${_taskPctText(pct)}</span></div>
+            <div class="notif-active-bar"><div class="notif-active-fill" ${_taskFillStyle(pct)}></div></div>
             <div class="notif-active-sub">${line}</div>
         </div>`;
 }
@@ -6622,27 +5706,29 @@ function _colSyncActiveHTML() {
 function _overlayActiveHTML() {
     const t = _overlayTask;
     if (!t) return '';
-    const total = t.total || 0, done = t.done || 0;
-    const pct = total ? Math.min(100, Math.round(done / total * 100)) : (t.phase === 'done' ? 100 : 4);
+    const total = _taskCount(t.total), done = _taskCount(t.done);
+    const pct = _taskPct(done, total, t.phase);
     const verb = t.mode === 'remove' ? 'Removing overlays' : t.mode === 'reset' ? 'Resetting posters' : 'Applying overlays';
     let line, cls = '';
     if (t.phase === 'done') { line = `Done · ${t.applied || 0} updated, ${t.skipped || 0} unchanged` + (t.failed ? `, ${t.failed} failed` : ''); cls = 'done'; }
     else if (t.phase === 'error') { line = 'Failed: ' + _escToast(t.error || 'error'); cls = 'error'; }
     else line = `${done.toLocaleString()} / ${total ? total.toLocaleString() : '…'}` + (t.title ? ' · ' + _escToast(t.title) : '');
     return `
-        <div class="notif-active notif-active-${cls}">
-            <div class="notif-active-head"><span class="notif-active-title">${verb}</span><span class="notif-active-pct">${pct}%</span></div>
-            <div class="notif-active-bar"><div class="notif-active-fill" style="width:${pct}%"></div></div>
+        <div class="${_taskCardClass(cls, pct)}">
+            <div class="notif-active-head"><span class="notif-active-title">${verb}</span><span class="notif-active-pct">${_taskPctText(pct)}</span></div>
+            <div class="notif-active-bar"><div class="notif-active-fill" ${_taskFillStyle(pct)}></div></div>
             <div class="notif-active-sub">${line}</div>
         </div>`;
 }
 
 function _patchOverlayActive() {
     const host = document.querySelector('#notif-panel [data-notif-active-host]');
-    if (host) host.innerHTML = _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML();
+    if (host) host.innerHTML = _musicActiveHTML() + _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML();
 }
 
-function showToast(message, type = 'success', helpSection = null) {
+// opts.journal === false skips the server journal: for notes the server
+// already logged itself (profile:notify)
+function showToast(message, type = 'success', helpSection = null, opts = null) {
     const toastKey = `${type}:${message}`;
     const now = Date.now();
 
@@ -6657,7 +5743,7 @@ function showToast(message, type = 'success', helpSection = null) {
     if (_notifState.history.length > _notifState.maxHistory) _notifState.history.pop();
     _notifState.unreadCount++;
     _updateNotifBadge();
-    _queueNotifJournal(type, message);
+    if (!opts || opts.journal !== false) _queueNotifJournal(type, message);
 
     // Show compact toast — dismiss current if showing
     const container = document.getElementById('toast-container');
@@ -6707,6 +5793,87 @@ function _updateNotifBadge() {
     }
 }
 
+// ── system health, as symbols in the panel header ────────────────────────────
+// Health is a STATE, not an event: "slskd is unreachable" stays true until it is
+// fixed. So it does not belong in the notification history, where reading an
+// entry marks it done and a dismissed warning is a warning you no longer have.
+// It lives in the header of that panel instead — always visible while the panel
+// is open, costing one line, with the detail a click away.
+let _notifHealth = null;
+
+function _notifHealthHTML() {
+    if (!_notifHealth) return '';
+    const checks = _notifHealth.checks || [];
+    if (!checks.length) return '';
+    const n = s => checks.filter(c => c.status === s).length;
+    const bits = [];
+    // Only non-zero counts get a symbol: a "0 problems" badge is noise, and the
+    // green tick already carries that news.
+    if (n('error')) bits.push(`<span class="notif-health-sym notif-health-sym--error">🔴 ${n('error')}</span>`);
+    if (n('warning')) bits.push(`<span class="notif-health-sym notif-health-sym--warn">⚠️ ${n('warning')}</span>`);
+    if (n('ok')) bits.push(`<span class="notif-health-sym notif-health-sym--ok">✓ ${n('ok')}</span>`);
+    const worst = n('error') ? 'error' : n('warning') ? 'warning' : 'ok';
+    return `<button class="notif-health-btn notif-health-btn--${worst}" type="button"
+                onclick="_openHealthModal()" title="System health — click for detail">${bits.join('')}</button>`;
+}
+
+function _seedNotifHealth() {
+    return fetch('/api/video/health', { headers: { Accept: 'application/json' } })
+        .then(r => (r.ok ? r.json() : null))
+        .then(h => {
+            _notifHealth = h;
+            const host = document.querySelector('[data-notif-health]');
+            if (host) host.innerHTML = _notifHealthHTML();
+        })
+        .catch(() => { /* the panel is useful without it */ });
+}
+
+function _closeHealthModal() {
+    const ov = document.getElementById('notif-health-overlay');
+    if (ov) { ov.classList.remove('visible'); setTimeout(() => ov.remove(), 200); }
+}
+
+function _healthRowsHTML() {
+    const checks = (_notifHealth && _notifHealth.checks) || [];
+    if (!checks.length) return '<div class="notif-panel-empty">Nothing to report.</div>';
+    const icons = { error: '\ud83d\udd34', warning: '\u26a0\ufe0f', ok: '\u2713' };
+    const esc = s => String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    return checks.map(c => `
+        <div class="notif-health-row notif-health-row--${c.status}">
+            <span class="notif-health-ico">${icons[c.status] || '\u2139\ufe0f'}</span>
+            <div class="notif-health-text">
+                <div class="notif-health-label">${esc(c.label)}</div>
+                <div class="notif-health-detail">${esc(c.detail)}</div>
+            </div>
+        </div>`).join('');
+}
+
+function _openHealthModal() {
+    _closeNotifPanel();
+    _closeHealthModal();
+    const overlay = document.createElement('div');
+    overlay.id = 'notif-health-overlay';
+    overlay.className = 'notif-history-overlay';
+    overlay.innerHTML = `
+        <div class="notif-history-modal">
+            <div class="notif-history-header">
+                <span class="notif-history-title">\ud83e\ude7a System Health</span>
+                <button class="notif-history-close" onclick="_closeHealthModal()">\u2715</button>
+            </div>
+            <div class="notif-history-body" data-notif-health-body>${_healthRowsHTML()}</div>
+        </div>`;
+    overlay.addEventListener('click', e => { if (e.target === overlay) _closeHealthModal(); });
+    document.body.appendChild(overlay);
+    requestAnimationFrame(() => overlay.classList.add('visible'));
+    // Re-read on open: the panel may have been sitting there a while, and stale
+    // health is the one thing this modal must not show.
+    return _seedNotifHealth().then(() => {
+        const body = overlay.querySelector('[data-notif-health-body]');
+        if (body) body.innerHTML = _healthRowsHTML();
+    });
+}
+
 function toggleNotifPanel() {
     if (_notifState.panelOpen) {
         _closeNotifPanel();
@@ -6733,19 +5900,28 @@ function _openNotifPanel() {
     panel.innerHTML = `
         <div class="notif-panel-header">
             <span class="notif-panel-title">Notifications</span>
+            <span class="notif-health" data-notif-health>${_notifHealthHTML()}</span>
             <button class="notif-panel-clear" onclick="_openNotifHistory()">History</button>
             ${entries.length > 0 ? '<button class="notif-panel-clear" onclick="_clearNotifHistory()">Clear All</button>' : ''}
         </div>
         <div class="notif-filter-row">${_notifFilterChipsHTML()}</div>
-        <div class="notif-active-host" data-notif-active-host>${_overlayActiveHTML()}</div>
+        <div class="notif-active-host" data-notif-active-host>${_musicActiveHTML() + _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML()}</div>
         <div class="notif-panel-body">${_notifEntriesHTML()}</div>
+        <div class="notif-panel-sys" data-notif-sys>${_notifSysHTML()}</div>
     `;
 
     document.body.appendChild(panel);
+    _seedNotifHealth();   // system health symbols (see _notifHealthHTML)
+    _seedNotifSys();      // fresh system numbers even when the socket is down
     _seedOverlayTask();   // refresh the Active cards from the server on open (socket keeps them live after)
     _seedCollectionSyncTask();
     _seedCollectionArtTask();
     _seedVideoBulkTask();
+    _seedMusicAutomationTask();
+    _seedMusicDownloadTask();
+    _seedMusicRepairTask();
+    _seedMusicMediaScanTask();
+    _seedLastfmImportTask();
 
     // Position above the bell button
     if (btn) {
@@ -7163,15 +6339,6 @@ let _gsController = null;
     else { _doInit(); setTimeout(_gsUpdateVisibility, 500); }
 })();
 
-// Init basic-search source chip row once the DOM is ready.
-(function _bsInit() {
-    const run = () => {
-        if (typeof initBasicSearchSources === 'function') initBasicSearchSources();
-    };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run);
-    else run();
-})();
-
 // On load, seed the overlay-apply + collection-sync tasks so the bell reflects a
 // job that was already running before this page connected (the socket keeps them
 // live thereafter).
@@ -7232,35 +6399,19 @@ function _gsNavigateToSearchPage(query, src) {
     // metadata results when they clicked the Soulseek icon.
     setTimeout(() => {
         if (src === 'soulseek') {
-            const basicInput = document.getElementById('downloads-search-input');
-            if (basicInput && query) basicInput.value = query;
-
-            // Sync the Search page controller's state.query to the widget's
-            // query BEFORE clicking the Soulseek icon. Otherwise the icon
-            // click fires onSoulseekSelected(state.query) where state.query
-            // is whatever the user last typed on /search (often stale), and
-            // the callback would overwrite basicInput.value with that stale
-            // value before running performDownloadsSearch.
-            if (typeof _searchPageController !== 'undefined' && _searchPageController) {
-                _searchPageController.state.query = query || '';
+            // Sync the query into the search page BEFORE clicking the Soulseek
+            // icon: the click hands off whatever query that page is holding,
+            // and it keeps its query across navigation, so without this the
+            // widget's term would lose to one from a previous visit.
+            if (typeof window._searchPageSetQuery === 'function') {
+                window._searchPageSetQuery(query || '');
             }
-
             const soulseekIcon = document.querySelector('#enh-source-row [data-source="soulseek"]');
-            if (soulseekIcon) {
-                soulseekIcon.click();
-                return;
-            }
-            // Fallback: controller hasn't initialized yet (slow /api/settings
-            // fetches at first /search visit). Run the search directly + swap
-            // sections so the user still gets results. Icon row will catch up
-            // visually on the next render.
-            const basicSection = document.getElementById('basic-search-section');
-            const enhancedSection = document.getElementById('enhanced-search-section');
-            if (basicSection) basicSection.classList.add('active');
-            if (enhancedSection) enhancedSection.classList.remove('active');
-            if (basicInput && basicInput.value && typeof performDownloadsSearch === 'function') {
-                performDownloadsSearch();
-            }
+            if (soulseekIcon) soulseekIcon.click();
+            // No fallback branch: the icon row is React-rendered with the page,
+            // so it is there whenever the page is. The old one poked at
+            // #basic-search-section and called performDownloadsSearch, neither
+            // of which exists any more.
             return;
         }
         const input = document.getElementById('enhanced-search-input');
@@ -7312,7 +6463,7 @@ function _gsRenderFromState(state) {
     // In-flight, nothing cached yet — loading state.
     if (isLoading && !cached) {
         const info = SOURCE_LABELS[activeSrc];
-        body.innerHTML = `<div class="gsearch-loading"><div class="server-search-spinner"></div>Searching ${_escToast((info && info.text) || activeSrc)}…</div>`;
+        body.innerHTML = `<div class="gsearch-loading"><div class="server-search-spinner"></div>Searching ${_escToast((info && info.text) || activeSrc)}...</div>`;
         results.classList.add('visible');
         return;
     }
@@ -7460,7 +6611,7 @@ async function _gsLazyLoadArtistImages() {
 async function _gsClickAlbum(albumId, albumName, artistName, imageUrl, source) {
     _gsDeactivate();
     // Same flow as handleEnhancedSearchAlbumClick — fetch album, open download modal
-    showLoadingOverlay('Loading album…');
+    showLoadingOverlay('Loading album...');
     try {
         const params = new URLSearchParams({ name: albumName, artist: artistName });
         if (source && source !== 'spotify') params.set('source', source);
@@ -7528,7 +6679,7 @@ async function _gsClickTrack(artistName, trackName, albumName, trackId, imageUrl
     const playlistName = `${artistName} - ${trackName}`;
 
     try {
-        showLoadingOverlay('Loading track…');
+        showLoadingOverlay('Loading track...');
         await openDownloadMissingModalForArtistAlbum(
             virtualPlaylistId, playlistName, [enrichedTrack], albumObject, artistObject, false
         );
@@ -7561,7 +6712,7 @@ async function _gsClickTrack(artistName, trackName, albumName, trackId, imageUrl
 
 async function _gsPlayTrack(trackName, artistName, albumName) {
     try {
-        showToast('Searching for stream…', 'info');
+        showToast('Searching for stream...', 'info');
         const res = await fetch('/api/enhanced-search/stream-track', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -7684,7 +6835,16 @@ async function _gsLibraryCheck() {
 function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
-    return div.innerHTML;
+    // textContent/innerHTML escapes & < > but NOT a double quote, because a
+    // text node does not need one. Almost every caller interpolates the
+    // result into a double-quoted ATTRIBUTE, where a raw quote closes the
+    // attribute early: a track called 'Crazy (12" mix)' reached MusicBrainz
+    // as 'Crazy (12' with everything after it dropped (#1230).
+    //
+    // Safe in both places: the output is always inserted via innerHTML, so
+    // &quot; renders as a plain quote in text and parses correctly in an
+    // attribute.
+    return div.innerHTML.replace(/"/g, '&quot;');
 }
 
 /**
@@ -7766,8 +6926,8 @@ async function checkForUpdates() {
                 if (notified !== updateKey) {
                     sessionStorage.setItem('soulsync-update-notified', updateKey);
                     const what = data.latest_version
-                        ? `Commissary v${data.latest_version} is available!`
-                        : 'A new Commissary update is available!';
+                        ? `SoulSync v${data.latest_version} is available!`
+                        : 'A new SoulSync update is available!';
                     showToast(data.is_docker
                         ? what + ' The Docker image will be updated soon.'
                         : what, severity === 'critical' ? 'error' : 'info');
@@ -7821,7 +6981,7 @@ async function showVersionInfo() {
         : [];
     const versionData = {
         version,
-        title: "What's New in Commissary",
+        title: "What's New in SoulSync",
         subtitle: version ? `Version ${version} — Latest Changes` : 'Latest Changes',
         sections,
     };
@@ -8113,3 +7273,4 @@ const additionalStyles = `
 document.head.insertAdjacentHTML('beforeend', additionalStyles);
 
 // ============================================================================
+

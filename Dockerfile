@@ -1,7 +1,7 @@
 # SoulSync WebUI Dockerfile
 # Multi-architecture support for AMD64 and ARM64
 
-FROM node:24-slim AS webui-builder
+FROM --platform=$BUILDPLATFORM node:24-slim AS webui-builder
 
 WORKDIR /app/webui
 
@@ -42,30 +42,23 @@ RUN echo "yt-dlp nightly for build ${COMMIT_SHA}" && \
 # Stage 2: Runtime — only runtime dependencies, no build tools
 FROM python:3.11-slim
 
-# Build-time commit SHA for update detection
-ARG COMMIT_SHA=""
-ENV SOULSYNC_COMMIT_SHA=${COMMIT_SHA}
-
-# Copy pre-built virtualenv from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Set working directory
-WORKDIR /app
-
 # Install runtime-only system dependencies (no gcc/build tools).
 # unzip is needed by the Deno installer below.
 # flac: the Corrupt File Detector's preferred decode test (`flac -t` also
 # verifies the STREAMINFO MD5 — catches damage that still decodes; #1000).
+# rubberband-cli: sample studio renders saved chops with it. without it the
+# pitch/tempo falls back to librosa, which smears drum hits.
+# libarchive-tools: bsdtar, for the RAR/7z subtitle archives subsource still
+# serves (zip is read in python; without bsdtar a RAR is just a miss).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     gosu \
     ffmpeg \
     flac \
+    libarchive-tools \
     libchromaprint-tools \
+    rubberband-cli \
     unzip \
-    tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Deno — JavaScript runtime for yt-dlp. YouTube gates its downloadable formats
@@ -77,8 +70,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh && \
     deno --version
 
+# Copy pre-built virtualenv from builder
+COPY --from=builder /opt/venv /opt/venv
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Set working directory
+WORKDIR /app
+
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash --uid 1000 soulsync
+
+# Build-time commit SHA for update detection.
+# Placed here rather than at the top of this stage: the value changes on every
+# commit, so every layer below it is rebuilt every build. Above the source COPY it
+# costs nothing, since that COPY invalidates the rest anyway, and it leaves the
+# venv copy, the apt install and the Deno install cacheable.
+ARG COMMIT_SHA=""
+ENV SOULSYNC_COMMIT_SHA=${COMMIT_SHA}
 
 # Copy application code with ownership baked in.
 # Using `COPY --chown` instead of `COPY` + `chown -R /app` avoids an
@@ -118,8 +127,7 @@ RUN mkdir -p /app/config /app/data /app/logs /app/downloads /app/Transfer /app/S
 # These will be used by entrypoint.sh to initialize empty volumes
 RUN mkdir -p /defaults && \
     cp /app/config/config.example.json /defaults/config.json && \
-    cp /app/config/settings.py /defaults/settings.py && \
-    chmod 644 /defaults/config.json /defaults/settings.py
+    chmod 644 /defaults/config.json
 
 # Create volume mount points
 # NOTE: Changed /app/database to /app/data to avoid overwriting Python package
@@ -148,6 +156,9 @@ ENV DATABASE_PATH=/app/data/music_library.db
 # recreate wiped video_library.db (watchlists, collections, overlays, issues,
 # the YouTube ownership ledger).
 ENV VIDEO_DATABASE_PATH=/app/data/video_library.db
+# Same for audiobooks: without it database/audiobooks.db lived in the image
+# layer and every recreate wiped the audiobook wishlist and download history.
+ENV AUDIOBOOK_DATABASE_PATH=/app/data/audiobooks.db
 ENV PUID=1000
 ENV PGID=1000
 ENV UMASK=022

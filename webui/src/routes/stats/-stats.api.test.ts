@@ -4,10 +4,14 @@ import { HttpResponse, http, server } from '@/test/msw';
 
 import {
   fetchListeningStatsStatus,
+  fetchListenbrainzListeningImportStatus,
   fetchStatsCached,
+  fetchStatsListeningEvents,
   fetchStatsDbStorage,
   fetchStatsLibraryDiskUsage,
   resolveStatsTrack,
+  runLastfmListeningImport,
+  runListenbrainzListeningImport,
   streamStatsTrack,
   triggerListeningStatsSync,
 } from './-stats.api';
@@ -106,6 +110,38 @@ describe('stats api', () => {
     await expect(triggerListeningStatsSync()).resolves.toBeUndefined();
   });
 
+  it('fetches listening detail rows for day and month buckets', async () => {
+    const seen: Array<Record<string, string | null>> = [];
+    server.use(
+      http.get('/api/stats/listening-events', ({ request }) => {
+        const url = new URL(request.url);
+        seen.push({
+          range: url.searchParams.get('range'),
+          type: url.searchParams.get('type'),
+          date: url.searchParams.get('date'),
+          limit: url.searchParams.get('limit'),
+        });
+        return HttpResponse.json({ success: true, title: 'details', total: 0, items: [] });
+      }),
+    );
+
+    await expect(
+      fetchStatsListeningEvents('7d', { type: 'date', date: '2026-08-22' }),
+    ).resolves.toMatchObject({
+      success: true,
+    });
+    await expect(
+      fetchStatsListeningEvents('12m', { type: 'date', date: '2026-08' }),
+    ).resolves.toMatchObject({
+      success: true,
+    });
+
+    expect(seen).toEqual([
+      { range: '7d', type: 'date', date: '2026-08-22', limit: '100' },
+      { range: '12m', type: 'date', date: '2026-08', limit: '100' },
+    ]);
+  });
+
   it('resolves and streams tracks through the stats playback helpers', async () => {
     server.use(
       http.post('/api/stats/resolve-track', async ({ request }) => {
@@ -139,5 +175,44 @@ describe('stats api', () => {
     await expect(streamStatsTrack('Track', 'Artist', 'Album')).resolves.toEqual({
       stream_url: '/api/stream/1',
     });
+  });
+
+  it('fetches listenbrainz listening import status and runs import', async () => {
+    server.use(
+      http.get('/api/listenbrainz/listening-import/status', () =>
+        HttpResponse.json({
+          success: true,
+          username: 'lbuser',
+          status: 'idle',
+          token_configured: true,
+        }),
+      ),
+      http.post('/api/listenbrainz/listening-import/run', async ({ request }) => {
+        const body = (await request.json()) as { username?: string; enabled?: boolean };
+        expect(body).toEqual({ username: 'lbuser', enabled: true });
+        return HttpResponse.json({ success: true, status: 'started' });
+      }),
+    );
+
+    await expect(fetchListenbrainzListeningImportStatus()).resolves.toMatchObject({
+      success: true,
+      username: 'lbuser',
+    });
+    await expect(runListenbrainzListeningImport('lbuser')).resolves.toMatchObject({
+      success: true,
+      status: 'started',
+    });
+  });
+  it('uses saved settings when either history sync is started without a username', async () => {
+    for (const service of ['lastfm', 'listenbrainz']) {
+      server.use(
+        http.post(`/api/${service}/listening-import/run`, async ({ request }) => {
+          expect(await request.json()).toEqual({ enabled: true });
+          return HttpResponse.json({ success: true, status: 'started' });
+        }),
+      );
+    }
+    await runLastfmListeningImport();
+    await runListenbrainzListeningImport();
   });
 });

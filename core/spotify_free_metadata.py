@@ -2,7 +2,7 @@
 
 Goal: stand in as a READ-ONLY Spotify metadata source when the user has no
 Spotify auth (or is rate-limited), mapping SpotipyFree's outputs onto the same
-Spotify-compatible shapes the rest of Commissary already consumes
+Spotify-compatible shapes the rest of SoulSync already consumes
 (see core/spotify_client.py + core/search/sources.py).
 
 Unofficial / web-player scraping — best-effort, fragile, and NOT a substitute
@@ -81,7 +81,7 @@ def should_use_free_fallback(authenticated: bool, rate_limited: bool,
 
 
 def should_offer_spotify_metadata(authenticated: bool, free_available: bool) -> bool:
-    """The availability gate: Commissary can serve *some* Spotify metadata when
+    """The availability gate: SoulSync can serve *some* Spotify metadata when
     either real auth is present, or the no-creds fallback is available. The
     upstream gates (search resolve, enrichment worker, watchlist) use this so
     the fallback is actually reachable — without changing what
@@ -108,13 +108,34 @@ def should_block_rate_limited_resume(rate_limited: bool, metadata_available: boo
 # Normalizers (pure — unit-testable against captured fixtures)
 # --------------------------------------------------------------------------
 
+def images_largest_first(sources) -> list:
+    """Order raw web-player image sources widest-first, like the official API.
+
+    The Spotify Web API documents `images` as ordered largest to smallest, and
+    the whole codebase relies on it — every consumer takes `images[0]` for the
+    display URL (amazon_worker, artist_source_detail, auto_import_worker, ...).
+    The web player hands back the same 64/300/640 set but does NOT promise that
+    order, so passing `coverArt.sources` straight through meant a Spotify-Free
+    user could get the 64px thumbnail wherever a Premium user got 640px. Same
+    art, a quarter of the resolution, for no reason other than list order.
+
+    Entries missing width/height sort last rather than winning by accident.
+    """
+    usable = [s for s in (sources or []) if isinstance(s, dict) and s.get('url')]
+    return sorted(
+        usable,
+        key=lambda s: (s.get('width') or s.get('height') or 0),
+        reverse=True,
+    )
+
+
 def normalize_artist(raw: dict) -> dict:
     """Map a raw SpotipyFree/spotapi artist object (from ``artist()`` or an
     ``artist_search`` item's ``data``) onto the Spotify-compatible artist dict
-    Commissary expects: ``{id, name, images, genres, followers, external_urls}``.
+    SoulSync expects: ``{id, name, images, genres, followers, external_urls}``.
 
     Artist-search items carry no usable image (only color swatches), so
-    ``images`` may be empty there — Commissary lazy-loads artist art separately.
+    ``images`` may be empty there — SoulSync lazy-loads artist art separately.
     Genres aren't provided by the web player at all.
     """
     raw = raw or {}
@@ -123,15 +144,11 @@ def normalize_artist(raw: dict) -> dict:
     artist_id = raw.get('id') or (uri.split(':')[-1] if uri else '')
     name = profile.get('name') or raw.get('name') or ''
 
-    images = []
     avatar = (raw.get('visuals') or {}).get('avatarImage') or {}
-    for src in (avatar.get('sources') or []):
-        if src.get('url'):
-            images.append({
-                'url': src['url'],
-                'height': src.get('height'),
-                'width': src.get('width'),
-            })
+    images = [
+        {'url': src['url'], 'height': src.get('height'), 'width': src.get('width')}
+        for src in images_largest_first(avatar.get('sources'))
+    ]
 
     followers = (raw.get('stats') or {}).get('followers')
 
@@ -153,7 +170,7 @@ def normalize_artist(raw: dict) -> dict:
 # --------------------------------------------------------------------------
 
 class SpotifyFreeMetadataClient:
-    """Read-only Spotify metadata via SpotipyFree, normalized to Commissary's
+    """Read-only Spotify metadata via SpotipyFree, normalized to SoulSync's
     Spotify-compatible shapes. Methods mirror the metadata-source interface."""
 
     def __init__(self):
@@ -277,10 +294,68 @@ class SpotifyFreeMetadataClient:
             logger.debug(f"SpotipyFree get_artist({artist_id}) failed: {e}")
             return None
 
+    def _fetch_discography_sections(self, artist_id: str) -> dict:
+        """The raw artist discography from ONE upstream call (spotapi)."""
+        import spotapi
+        artist = spotapi.Artist().get_artist(artist_id)
+        return ((artist or {}).get('data') or {}).get('artistUnion', {}).get('discography') or {}
+
+    @staticmethod
+    def _normalize_discography_release(release: Any, album_type: str) -> Optional[dict]:
+        """Listing-shape normalizer for a raw discography release entry."""
+        if not isinstance(release, dict):
+            return None
+        rid = release.get('id') or str(release.get('uri') or '').split(':')[-1]
+        if not rid:
+            return None
+        date = release.get('date') or {}
+        iso = date.get('isoString')
+        if iso:
+            release_date = str(iso).split('T')[0]
+        elif date.get('year'):
+            release_date = str(date['year'])
+        else:
+            release_date = ''
+        return {
+            'id': rid,
+            'name': release.get('name') or '',
+            'album_type': album_type,
+            'release_date': release_date,
+            'images': images_largest_first((release.get('coverArt') or {}).get('sources')),
+            'total_tracks': ((release.get('tracks') or {}).get('totalCount')) or 0,
+            'uri': release.get('uri') or f'spotify:album:{rid}',
+            'external_urls': {'spotify': f'https://open.spotify.com/album/{rid}'},
+            # Raw discography artist entries carry the name under profile.name;
+            # downstream consumers (Album.from_spotify_album) expect 'name'.
+            'artists': [
+                {'name': (a.get('profile') or {}).get('name') or a.get('name') or '',
+                 'id': str(a.get('uri') or '').split(':')[-1] or a.get('id') or ''}
+                for a in (release.get('artists') or {}).get('items', [])
+                if isinstance(a, dict)
+            ] if isinstance(release.get('artists'), dict) else (release.get('artists') or []),
+        }
+
     def get_artist_albums_list(self, artist_id: str, limit: int = 50) -> list[dict]:
+        # NOT SpotipyFree.artist_albums: that helper re-scrapes EVERY release
+        # individually (a full PublicAlbum fetch per id, sequential), which made
+        # a big artist's discography take minutes and time out the artist page.
+        # The raw discography payload already carries everything a LISTING needs
+        # (id, name, date, cover art, track count) for all three sections in ONE
+        # request — normalize it ourselves, tag album_type per section (the
+        # package hardcodes 'album'), and leave per-release track fetches to
+        # get_album/get_album_tracks on click.
         try:
-            res = self._sf_client().artist_albums(artist_id) or {}
-            return (res.get('items') or [])[:limit]
+            discog = self._fetch_discography_sections(artist_id)
         except Exception as e:
-            logger.debug(f"SpotipyFree get_artist_albums_list({artist_id}) failed: {e}")
+            logger.debug(f"SpotipyFree discography fetch({artist_id}) failed: {e}")
             return []
+        items: list[dict] = []
+        for section, group in (('albums', 'album'), ('singles', 'single'),
+                               ('compilations', 'compilation')):
+            for bucket in ((discog.get(section) or {}).get('items') or []):
+                releases = ((bucket or {}).get('releases') or {}).get('items') or []
+                for release in releases:
+                    norm = self._normalize_discography_release(release, group)
+                    if norm:
+                        items.append(norm)
+        return items[:limit]

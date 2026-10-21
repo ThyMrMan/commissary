@@ -1,0 +1,661 @@
+import type { ResponsePromise } from 'ky';
+
+import { apiClient, readJson } from '@/app/api-client';
+
+import type {
+  AdlDeletedList,
+  ClientOverview,
+  ClientSlskdItem,
+  ClientTorrentItem,
+  ClientUsenetItem,
+  AdlBatchHistoryEntry,
+  AdlDownloadsResponse,
+  AdlQuarantineEntry,
+  AdlReviewSummary,
+  AdlTaskDetail,
+  AdlVerificationConfig,
+} from './-adl.types';
+
+/** Shape every mutating endpoint here answers with. */
+export interface AdlResult {
+  success?: boolean;
+  error?: string;
+}
+
+// ── Reads ─────────────────────────────────────────────────────────────────
+
+/**
+ * The whole downloads list plus live batch summaries.
+ *
+ * The 300 cap is the vanilla's and matters downstream: it is exactly why the
+ * page must NOT compute the nav badge from this array — see the controller.
+ * A failure returns empty rather than throwing, because this runs on a 2s
+ * poll and one bad response must not tear the page down.
+ */
+export async function fetchDownloads(): Promise<AdlDownloadsResponse> {
+  try {
+    const data = await readJson<AdlDownloadsResponse>(
+      apiClient.get('downloads/all', { searchParams: { limit: 300 } }),
+    );
+    return data?.success ? data : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Per-task detail for an expanded terminal row (#1156) — merges the live task
+ * with its library_history record (source, quality, AcoustID verdict, file
+ * path, expected-vs-downloaded). Null on any failure: the expansion degrades
+ * to the fields the row already carries rather than erroring.
+ */
+export async function fetchTaskDetail(taskId: string): Promise<AdlTaskDetail | null> {
+  try {
+    const data = await readJson<{ success?: boolean; detail?: AdlTaskDetail }>(
+      apiClient.get(`downloads/task/${encodeURIComponent(taskId)}/detail`),
+    );
+    return data?.success && data.detail ? data.detail : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Completed batches for the history rail — 7 days, 50 max, as the vanilla asked. */
+export async function fetchBatchHistory(): Promise<AdlBatchHistoryEntry[]> {
+  try {
+    const data = await readJson<{ success?: boolean; history?: AdlBatchHistoryEntry[] }>(
+      apiClient.get('downloads/batch-history', { searchParams: { days: 7, limit: 50 } }),
+    );
+    return data?.success ? (data.history ?? []) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Whether the unverified review queue can exist at all.
+ *
+ * Two ways it cannot: AcoustID is off (nothing ever gets a verification
+ * status), or require_verified is on (unconfirmed tracks are quarantined
+ * instead of imported unverified). The caller collapses to quarantine-only in
+ * both cases. A failed fetch assumes ENABLED — hiding the queue because a
+ * config read blipped would be worse than showing an empty one.
+ */
+export async function fetchVerificationConfig(): Promise<AdlVerificationConfig> {
+  try {
+    return await readJson<AdlVerificationConfig>(apiClient.get('verification/config'));
+  } catch {
+    return { acoustid_enabled: true };
+  }
+}
+
+/**
+ * Counts for the review badge.
+ *
+ * Separate from `fetchQuarantine` on purpose: that one reads every sidecar to
+ * build the list, this is a listdir plus one indexed count, so it can ride a
+ * poll without costing anything.
+ */
+export async function fetchReviewQueueSummary(): Promise<AdlReviewSummary | null> {
+  try {
+    const data = await readJson<{ success?: boolean } & Partial<AdlReviewSummary>>(
+      apiClient.get('review-queue/summary'),
+    );
+    if (!data?.success) return null;
+    return {
+      quarantine: data.quarantine ?? 0,
+      unverified: data.unverified ?? 0,
+      total: data.total ?? 0,
+    };
+  } catch {
+    // null, not zeroes. a blipped fetch must not redraw the badge as "nothing
+    // to review" when there might be plenty.
+    return null;
+  }
+}
+
+/**
+ * The list, or the reason it could not be fetched. Failure must be
+ * distinguishable from empty: the server reads one sidecar per entry, so a
+ * big quarantine can outlast ky's 10s default - swallowing that into []
+ * showed "hundreds in the badge, list empty" (user report, aug 25).
+ */
+export async function fetchQuarantine(): Promise<
+  { entries: AdlQuarantineEntry[] } | { error: string }
+> {
+  try {
+    const data = await readJson<{
+      success?: boolean;
+      error?: string;
+      entries?: AdlQuarantineEntry[];
+    }>(apiClient.get('quarantine/list', { timeout: 60000 }));
+    if (data?.success && Array.isArray(data.entries)) return { entries: data.entries };
+    return { error: data?.error || 'the server said no' };
+  } catch (error) {
+    return { error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+// ── Deleted-files manager (the music recycle bin) ─────────────────────────
+
+export async function fetchDeletedFiles(): Promise<AdlDeletedList | null> {
+  try {
+    const data = await readJson<{ success?: boolean } & Partial<AdlDeletedList>>(
+      apiClient.get('deleted-files'),
+    );
+    if (!data?.success) return null;
+    return {
+      entries: Array.isArray(data.entries) ? data.entries : [],
+      total_size: data.total_size ?? 0,
+      count: data.count ?? 0,
+      keep_days: data.keep_days ?? 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export interface DeletedActionResult extends AdlResult {
+  restored?: string[];
+  purged?: string[];
+  errors?: { id: string; error: string }[];
+}
+
+export function restoreDeletedFiles(ids: string[]): Promise<DeletedActionResult> {
+  return readJson<DeletedActionResult>(apiClient.post('deleted-files/restore', { json: { ids } }));
+}
+
+export function purgeDeletedFiles(ids: string[] | null, all = false): Promise<DeletedActionResult> {
+  return readJson<DeletedActionResult>(
+    apiClient.post('deleted-files/purge', { json: all ? { all: true } : { ids: ids ?? [] } }),
+  );
+}
+
+export function setDeletedRetention(days: number): Promise<AdlResult & { keep_days?: number }> {
+  return readJson<AdlResult & { keep_days?: number }>(
+    apiClient.post('deleted-files/retention', { json: { days } }),
+  );
+}
+
+// ── Downloads mutations ───────────────────────────────────────────────────
+
+export interface ClearCompletedResult extends AdlResult {
+  cleared?: number;
+  total_cleared?: number;
+}
+
+export function clearCompleted(): Promise<ClearCompletedResult> {
+  return readJson<ClearCompletedResult>(apiClient.post('downloads/clear-completed'));
+}
+
+export interface DownloadNextResult extends AdlResult {
+  task_id?: string;
+  batch_id?: string;
+  batch_position?: number;
+}
+
+export function downloadTaskNext(taskId: string): Promise<DownloadNextResult> {
+  return readJson<DownloadNextResult>(
+    apiClient.post('downloads/task/download-next', { json: { task_id: taskId } }),
+  );
+}
+
+export interface DownloadBatchNextResult extends AdlResult {
+  batch_id?: string;
+}
+
+export function downloadBatchNext(batchId: string): Promise<DownloadBatchNextResult> {
+  return readJson<DownloadBatchNextResult>(
+    apiClient.post('downloads/batch/download-next', { json: { batch_id: batchId } }),
+  );
+}
+export interface CancelTaskResult extends AdlResult {
+  task_info?: { track_name?: string };
+}
+
+/**
+ * Cancel one queued/active track.
+ *
+ * Coordinates are (playlist_id, track_index) — NOT task_id. This is the same
+ * atomic endpoint the download modals use, which is what frees the worker slot
+ * properly; cancelling by task id alone leaves the slot held.
+ */
+export function cancelTask(playlistId: string, trackIndex: number): Promise<CancelTaskResult> {
+  return readJson<CancelTaskResult>(
+    apiClient.post('downloads/cancel_task_v2', {
+      json: { playlist_id: playlistId, track_index: trackIndex },
+    }),
+  );
+}
+
+export interface CancelBatchResult extends AdlResult {
+  cancelled_tasks?: number;
+}
+
+/** Note the path: batches cancel through /api/playlists/, not /api/downloads/. */
+export function cancelBatch(batchId: string): Promise<CancelBatchResult> {
+  return readJson<CancelBatchResult>(
+    apiClient.post(`playlists/${encodeURIComponent(batchId)}/cancel_batch`),
+  );
+}
+
+// ── Verification (imported-but-unconfirmed) ───────────────────────────────
+
+export function verificationPlay(historyId: string): Promise<AdlResult> {
+  return readJson<AdlResult>(apiClient.post(`verification/${encodeURIComponent(historyId)}/play`));
+}
+
+export interface CompareStreamResult extends AdlResult {
+  /** A search result the media player can stream, shaped like a download row. */
+  result?: unknown;
+}
+
+export function verificationCompareStream(historyId: string): Promise<CompareStreamResult> {
+  return readJson<CompareStreamResult>(
+    apiClient.post(`verification/${encodeURIComponent(historyId)}/compare-stream`),
+  );
+}
+
+export interface EntryResult extends AdlResult {
+  entry?: unknown;
+}
+
+export function verificationEntry(historyId: string): Promise<EntryResult> {
+  return readJson<EntryResult>(
+    apiClient.get(`verification/${encodeURIComponent(historyId)}/entry`),
+  );
+}
+
+export function verificationApprove(historyId: string): Promise<AdlResult> {
+  return readJson<AdlResult>(
+    apiClient.post(`verification/${encodeURIComponent(historyId)}/approve`),
+  );
+}
+
+export function verificationDelete(historyId: string): Promise<AdlResult> {
+  return readJson<AdlResult>(
+    apiClient.post(`verification/${encodeURIComponent(historyId)}/delete`),
+  );
+}
+
+export interface CleanOrphansResult extends AdlResult {
+  removed?: number;
+  checked?: number;
+}
+
+export function verificationCleanOrphans(): Promise<CleanOrphansResult> {
+  return readJson<CleanOrphansResult>(apiClient.post('verification/clean-orphans'));
+}
+
+// ── Quarantine (never imported) ───────────────────────────────────────────
+
+export function quarantinePlay(id: string): Promise<AdlResult> {
+  return readJson<AdlResult>(apiClient.post(`quarantine/${encodeURIComponent(id)}/play`));
+}
+
+export function quarantineCompareStream(id: string): Promise<CompareStreamResult> {
+  return readJson<CompareStreamResult>(
+    apiClient.post(`quarantine/${encodeURIComponent(id)}/compare-stream`),
+  );
+}
+
+export function quarantineEntry(id: string): Promise<EntryResult> {
+  return readJson<EntryResult>(apiClient.get(`quarantine/${encodeURIComponent(id)}/entry`));
+}
+
+export interface QuarantineApproveResult extends AdlResult {
+  removed_siblings?: unknown[];
+}
+
+export interface QuarantineDeleteResult extends AdlResult {
+  /** How many entries actually went - 1 for a single delete, N for a group. */
+  deleted?: number;
+}
+
+/**
+ * Approve and re-import one quarantined file.
+ *
+ * `remove_siblings: true` is not optional dressing — a quarantined track
+ * usually has several rejected candidates alongside it, and approving one
+ * without clearing the rest leaves duplicates behind in the queue.
+ */
+export function quarantineApprove(id: string): Promise<QuarantineApproveResult> {
+  return readJson<QuarantineApproveResult>(
+    apiClient.post(`quarantine/${encodeURIComponent(id)}/approve`, {
+      json: { remove_siblings: true },
+    }),
+  );
+}
+
+/** For legacy sidecars with no embedded context — the only option they have. */
+export function quarantineRecover(id: string): Promise<AdlResult> {
+  return readJson<AdlResult>(apiClient.post(`quarantine/${encodeURIComponent(id)}/recover`));
+}
+
+/**
+ * Delete one quarantined entry, or the whole group of candidates it belongs to
+ * (#1208). `siblings` is resolved server-side off the same group key the list
+ * folds rows by, so one request clears a hundred rejected attempts.
+ */
+export function quarantineDelete(
+  id: string,
+  options: { siblings?: boolean } = {},
+): Promise<QuarantineDeleteResult> {
+  const path = `quarantine/${encodeURIComponent(id)}`;
+  return readJson<QuarantineDeleteResult>(
+    apiClient.delete(options.siblings ? `${path}?siblings=1` : path),
+  );
+}
+
+export function quarantineClear(): Promise<AdlResult> {
+  return readJson<AdlResult>(apiClient.post('quarantine/clear'));
+}
+
+// ── The Clients tab (external download clients) ───────────────────────────
+
+/**
+ * Either the overview or the reason it could not be fetched. The failure
+ * carries its message on purpose: the first version returned null and the
+ * section sat on "loading…" forever with no way to see why.
+ */
+export type ClientFetch<T> =
+  | { ok: true; overview: ClientOverview<T> }
+  | { ok: false; message: string };
+
+async function fetchClientOverview<T>(path: string): Promise<ClientFetch<T>> {
+  try {
+    const data = await readJson<{ success?: boolean; error?: string } & Partial<ClientOverview<T>>>(
+      // 30s: a cold adapter call can sit on a slow client handshake longer
+      // than ky's 10s default.
+      apiClient.get(path, { timeout: 30000 }),
+    );
+    if (!data?.success) return { ok: false, message: data?.error || 'the server said no' };
+    return {
+      ok: true,
+      overview: {
+        configured: Boolean(data.configured),
+        connected: Boolean(data.connected),
+        type: data.type,
+        error: data.error,
+        items: Array.isArray(data.items) ? data.items : [],
+        uploads: Array.isArray(data.uploads) ? data.uploads : undefined,
+        counts: data.counts,
+      },
+    };
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+export function fetchTorrentClient(): Promise<ClientFetch<ClientTorrentItem>> {
+  return fetchClientOverview('clients/torrent');
+}
+
+export function fetchUsenetClient(): Promise<ClientFetch<ClientUsenetItem>> {
+  return fetchClientOverview('clients/usenet');
+}
+
+export function fetchSlskdClient(): Promise<ClientFetch<ClientSlskdItem>> {
+  return fetchClientOverview('clients/slskd');
+}
+
+export type ClientAction = 'pause' | 'resume' | 'remove';
+
+export function torrentClientAction(
+  id: string,
+  action: ClientAction,
+  deleteFiles = false,
+): Promise<AdlResult> {
+  return readJson<AdlResult>(
+    apiClient.post('clients/torrent/action', {
+      json: { id, action, delete_files: deleteFiles },
+    }),
+  );
+}
+
+export function usenetClientAction(
+  id: string,
+  action: ClientAction,
+  deleteFiles = false,
+): Promise<AdlResult> {
+  return readJson<AdlResult>(
+    apiClient.post('clients/usenet/action', {
+      json: { id, action, delete_files: deleteFiles },
+    }),
+  );
+}
+
+export interface ClientBulkResult extends AdlResult {
+  done?: number;
+  failed?: string[];
+}
+
+export function torrentClientBulk(
+  ids: string[],
+  action: ClientAction,
+  deleteFiles = false,
+): Promise<ClientBulkResult> {
+  return readJson<ClientBulkResult>(
+    apiClient.post('clients/torrent/action', {
+      json: { ids, action, delete_files: deleteFiles },
+      timeout: 60000,
+    }),
+  );
+}
+
+export function usenetClientBulk(
+  ids: string[],
+  action: ClientAction,
+  deleteFiles = false,
+): Promise<ClientBulkResult> {
+  return readJson<ClientBulkResult>(
+    apiClient.post('clients/usenet/action', {
+      json: { ids, action, delete_files: deleteFiles },
+      timeout: 60000,
+    }),
+  );
+}
+
+export function torrentClientAdd(url: string): Promise<AdlResult & { ref?: string }> {
+  return readJson<AdlResult & { ref?: string }>(
+    apiClient.post('clients/torrent/add', { json: { url }, timeout: 60000 }),
+  );
+}
+
+export function usenetClientAdd(url: string): Promise<AdlResult & { ref?: string }> {
+  return readJson<AdlResult & { ref?: string }>(
+    apiClient.post('clients/usenet/add', { json: { url }, timeout: 60000 }),
+  );
+}
+
+export function slskdClearCompleted(): Promise<AdlResult> {
+  return readJson<AdlResult>(apiClient.post('clients/slskd/clear-completed', { timeout: 60000 }));
+}
+
+export interface ClientLinks {
+  slskd: string;
+  torrent: string;
+  usenet: string;
+}
+
+export async function fetchClientLinks(): Promise<ClientLinks | null> {
+  try {
+    const data = await readJson<{ success?: boolean } & Partial<ClientLinks>>(
+      apiClient.get('clients/links'),
+    );
+    if (!data?.success) return null;
+    return { slskd: data.slskd ?? '', torrent: data.torrent ?? '', usenet: data.usenet ?? '' };
+  } catch {
+    return null;
+  }
+}
+
+export function slskdClientCancel(
+  id: string,
+  username: string,
+  remove = false,
+): Promise<AdlResult> {
+  return readJson<AdlResult>(
+    apiClient.post('clients/slskd/action', { json: { id, username, action: 'cancel', remove } }),
+  );
+}
+
+// ── Match & import ──────────────────────────────────────────────────────────
+// A download in the client that SoulSync didn't send, matched by hand and then
+// handed to the same tracking the matching grab would have written.
+
+export type MatchKind = 'album' | 'track' | 'movie' | 'episode' | 'season' | 'audiobook';
+
+export interface MatchSuggestion {
+  kind: MatchKind | null;
+  query: string;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+}
+
+/** A first guess at the type and search, from the release name. */
+export async function fetchMatchSuggestion(name: string): Promise<MatchSuggestion> {
+  try {
+    const data = await readJson<MatchSuggestion & AdlResult>(
+      apiClient.get('clients/match/suggest', { searchParams: { name } }),
+    );
+    return {
+      kind: data.kind ?? null,
+      query: data.query || name,
+      year: data.year ?? null,
+      season: data.season ?? null,
+      episode: data.episode ?? null,
+    };
+  } catch {
+    return { kind: null, query: name, year: null, season: null, episode: null };
+  }
+}
+
+export interface MatchFiles {
+  visible: boolean;
+  reportedPath: string;
+}
+
+/** A Soulseek match is a folder: who it is from and the transfers in it. */
+export interface SoulseekFolder {
+  username: string;
+  files: { filename: string; size: number }[];
+}
+
+/** Whether SoulSync can read the download's files. null when it couldn't ask. */
+export async function fetchMatchFiles(
+  client: 'torrent' | 'usenet' | 'soulseek',
+  id: string,
+  folder?: SoulseekFolder,
+): Promise<MatchFiles | null> {
+  try {
+    const searchParams = new URLSearchParams({ client, id });
+    if (folder) {
+      searchParams.set('username', folder.username);
+      for (const file of folder.files) searchParams.append('file', file.filename);
+    }
+    const data = await readJson<{ visible?: boolean; reported_path?: string } & AdlResult>(
+      apiClient.get('clients/match/files', { searchParams }),
+    );
+    if (!data.success) return null;
+    return { visible: Boolean(data.visible), reportedPath: data.reported_path || '' };
+  } catch {
+    return null;
+  }
+}
+
+export interface VideoSearchHit {
+  kind: 'movie' | 'show' | 'person';
+  tmdb_id: number;
+  title: string;
+  year?: string | null;
+  poster?: string | null;
+}
+
+/** TMDB movies and shows, the same search the video pages use. */
+export async function searchVideoTitles(query: string): Promise<VideoSearchHit[]> {
+  if (!query.trim()) return [];
+  try {
+    const data = await readJson<{ results?: VideoSearchHit[] }>(
+      apiClient.get('video/search', { searchParams: { q: query.trim() } }),
+    );
+    return (data.results ?? []).filter((r) => r.kind === 'movie' || r.kind === 'show');
+  } catch {
+    return [];
+  }
+}
+
+export interface MatchOutcome {
+  ok: boolean;
+  error: string;
+}
+
+async function submitMatch(call: () => ResponsePromise): Promise<MatchOutcome> {
+  try {
+    const data = await readJson<{ ok?: boolean; success?: boolean; error?: string }>(call());
+    const ok = Boolean(data.ok ?? data.success);
+    return { ok, error: ok ? '' : data.error || 'The match was not accepted.' };
+  } catch (err) {
+    // readJson carries the server's reason (already followed, no library folder)
+    return { ok: false, error: err instanceof Error ? err.message : 'The match failed.' };
+  }
+}
+
+export function adoptAudiobook(body: {
+  source: 'torrent' | 'usenet' | 'soulseek';
+  client_ref: string;
+  /** soulseek only: the folder's peer and remote filenames */
+  username?: string;
+  files?: string[];
+  asin: string;
+  release_title: string;
+  size_bytes: number;
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('audiobooks/adopt', { json: body }));
+}
+
+export function adoptVideo(body: {
+  source: 'torrent' | 'usenet' | 'soulseek';
+  client_ref: string;
+  /** soulseek only: the folder's peer and files */
+  username?: string;
+  files?: { filename: string; size: number }[];
+  kind: 'movie' | 'show';
+  title: string;
+  year?: string | number | null;
+  media_id: number;
+  media_source: 'tmdb';
+  poster_url?: string | null;
+  release_title: string;
+  size_bytes: number;
+  search_ctx: {
+    scope: 'movie' | 'episode' | 'season';
+    title: string;
+    year?: string | number | null;
+    season?: number | null;
+    episode?: number | null;
+  };
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('video/downloads/adopt', { json: body }));
+}
+
+export function matchMusic(body: {
+  client: 'torrent' | 'usenet' | 'soulseek';
+  id: string;
+  /** soulseek only: the folder's peer and remote filenames */
+  username?: string;
+  files?: string[];
+  kind: 'album' | 'track';
+  match: {
+    id: string;
+    name: string;
+    artist: string;
+    source: string;
+    image_url?: string | null;
+    album?: string | null;
+  };
+  release_title: string;
+}): Promise<MatchOutcome> {
+  return submitMatch(() => apiClient.post('clients/match/music', { json: body }));
+}

@@ -39,18 +39,7 @@ async function ensureBeatportContentLoaded() {
             throwIfBeatportLoadAborted();
             await loadBeatportChartsFromBackend();
             throwIfBeatportLoadAborted();
-
-            initializeBeatportRebuildSlider();
-            initializeBeatportReleasesSlider();
-            initializeBeatportHypePicksSlider();
-            initializeBeatportChartsSlider();
-            initializeBeatportDJSlider();
-            throwIfBeatportLoadAborted();
-            await Promise.all([
-                loadBeatportTop10Lists(),
-                loadBeatportTop10Releases()
-            ]);
-            throwIfBeatportLoadAborted();
+            // the sliders and top 10 lists went with beatport-ui.js
             showBeatportDownloadsSection();
 
             beatportContentState.loaded = true;
@@ -1393,7 +1382,7 @@ function createYouTubeCardFromBackendState(playlistInfo) {
 
 function getActionButtonText(phase) {
     switch (phase) {
-        case 'fresh': return 'Discover';
+        case 'fresh': return 'Identify';
         case 'discovering': return 'View Progress';
         case 'discovered': return 'View Results';
         case 'syncing': return 'View Sync';
@@ -1406,12 +1395,12 @@ function getActionButtonText(phase) {
 
 function getPhaseText(phase) {
     switch (phase) {
-        case 'fresh': return 'Ready to discover';
-        case 'discovering': return 'Discovering…';
-        case 'discovered': return 'Discovery Complete';
-        case 'syncing': return 'Syncing…';
+        case 'fresh': return 'Ready to identify';
+        case 'discovering': return 'Identifying...';
+        case 'discovered': return 'Identification Complete';
+        case 'syncing': return 'Syncing...';
         case 'sync_complete': return 'Sync Complete';
-        case 'downloading': return 'Downloading…';
+        case 'downloading': return 'Downloading...';
         case 'download_complete': return 'Download Complete';
         default: return phase;
     }
@@ -1599,9 +1588,9 @@ async function loadSpotifyPlaylists() {
     const container = document.getElementById('spotify-playlist-container');
     const refreshBtn = document.getElementById('spotify-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists…</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists...</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading…';
+    refreshBtn.textContent = '🔄 Loading...';
 
     try {
         const response = await fetch('/api/spotify/playlists');
@@ -1689,7 +1678,7 @@ function updatePlaylistCardUI(playlistId) {
         progressBtn.classList.remove('hidden');
         progressBtn.textContent = 'View Progress';
         progressBtn.style.backgroundColor = '';  // Reset any custom styling
-        actionBtn.textContent = '📥 Downloading…';
+        actionBtn.textContent = '📥 Downloading...';
         actionBtn.disabled = true;
 
         // Remove completion styling from card
@@ -1835,7 +1824,7 @@ async function openPlaylistDetailsModal(event, playlistId) {
     const playlist = spotifyPlaylists.find(p => p.id === playlistId);
     if (!playlist) return;
 
-    showLoadingOverlay(`Loading playlist: ${playlist.name}…`);
+    showLoadingOverlay(`Loading playlist: ${playlist.name}...`);
 
     try {
         const cacheStale = typeof playlistTrackCacheIsStale === 'function'
@@ -2191,7 +2180,7 @@ function applyProgressiveTrackRendering(playlistId, totalTrackCount) {
 }
 
 async function openDownloadMissingModal(playlistId) {
-    showLoadingOverlay('Loading playlist…');
+    showLoadingOverlay('Loading playlist...');
 
     // **NEW**: Check if a process is already active for this playlist
     const playlistMeta = spotifyPlaylists.find(p => p.id === playlistId);
@@ -2357,7 +2346,7 @@ async function openDownloadMissingModal(playlistId) {
                                                    onchange="updateTrackSelectionCount('${playlistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${playlistId}-${index}">🔍 Pending</td>
@@ -2385,14 +2374,8 @@ async function openDownloadMissingModal(playlistId) {
                     <button class="download-control-btn primary" id="begin-analysis-btn-${playlistId}" onclick="startMissingTracksProcess('${playlistId}')">
                         Begin Analysis
                     </button>
-                    <button class="download-control-btn" id="manual-search-btn-${playlistId}"
-                            onclick="openManualSearchForModalSelection('${playlistId}')"
-                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
-                            style="background-color: #0ea5e9; color: white;">
-                        🔎 Manual Search
-                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${playlistId}" onclick="addModalTracksToWishlist('${playlistId}')" style="background-color: #9333ea; color: white;">
-                        Add to Wishlist
+                        ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
                     <button class="download-control-btn danger" id="cancel-all-btn-${playlistId}" onclick="cancelAllOperations('${playlistId}')" style="display: none;">
                         Cancel All

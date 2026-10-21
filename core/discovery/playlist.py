@@ -37,51 +37,29 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from core.discovery.canonical import canonical_best_score
 from core.discovery.manual_match import should_rediscover
-from core.discovery.suggestions import build_discovery_suggestions
 
 logger = logging.getLogger(__name__)
 
 
-def _score_candidates(deps, title, artist, duration_ms, results, near_misses):
-    """``discovery_score_candidates`` -- or, with the ranker wired, the top of the
-    ranking, every ranked candidate kept in ``near_misses`` for suggestions."""
-    rank = getattr(deps, 'discovery_rank_candidates', None)
-    if rank is None:
-        return deps.discovery_score_candidates(title, artist, duration_ms, results)
-    ranked = rank(title, artist, duration_ms, results)
-    if near_misses is not None:
-        near_misses.extend(ranked)
-    if not ranked:
-        return None, 0.0, -1
-    confidence, index, match = ranked[0]
-    return match, confidence, index
-
-
-def _canonical_best_score(deps, title, artist, duration_ms, results, near_misses=None):
-    """Score search results against the source track, trying the canonicalized
-    title/artist too and keeping the better confidence (#785).
-
-    YouTube playlists have their "Artist - Title" / channel decoration stripped
-    at ingest, but file/CSV-imported playlists keep raw titles — so a track
-    titled "Arctic Monkeys - Do I Wanna Know?" scored verbatim against the
-    library's "Do I Wanna Know?" never matched. canonical_source_track is
-    conservative (only strips an "<artist> - " prefix when it equals the
-    artist), so this can only ADD a better candidate, never weaken a match.
-    Returns (match, confidence). Candidates ranked on the way are added to
-    ``near_misses`` when it's given."""
-    match, confidence, _ = _score_candidates(deps, title, artist, duration_ms, results, near_misses)
+def _matched_primary_artist(matched_data) -> str:
+    """The match's primary artist name, or ''. matched_data carries artists
+    as [{'name': ...}] (built here) or [str] (older cache rows)."""
     try:
-        from core.text.source_title import canonical_source_track
-        canon_title, canon_artist = canonical_source_track(title or '', artist or '')
+        artists = (matched_data or {}).get('artists') or []
+        first = artists[0] if artists else None
+        if isinstance(first, dict):
+            return str(first.get('name') or '').strip()
+        return str(first or '').strip()
     except Exception:
-        return match, confidence
-    if (canon_title, canon_artist) != (title, artist):
-        alt_match, alt_conf, _ = _score_candidates(
-            deps, canon_title, canon_artist, duration_ms, results, near_misses)
-        if alt_match and alt_conf > confidence:
-            return alt_match, alt_conf
-    return match, confidence
+        return ''
+
+
+# Moved to core.discovery.canonical so the YouTube worker can share it rather
+# than grow a second copy (#785 introduced it here). Kept under the old private
+# name because this module's callers and tests reference it.
+_canonical_best_score = canonical_best_score
 
 
 @dataclass
@@ -103,11 +81,10 @@ class PlaylistDiscoveryDeps:
     discovery_score_candidates: Callable
     get_metadata_cache: Callable[[], Any]
     build_discovery_wing_it_stub: Callable
-    # Ranks every candidate that clears the similarity floors (best first), so a
-    # Wing It guess keeps its near misses as suggestions. Optional.
-    discovery_rank_candidates: Callable = None
-    # Looks a track's ISRC up exactly (core.discovery.isrc_match). Optional.
-    resolve_isrc_match: Callable = None
+    # Resolve alternate spellings of an artist name (see
+    # MusicBrainzService.lookup_artist_aliases). Optional — discovery works
+    # without it, it just can't rescue an aliased artist.
+    lookup_artist_aliases: Callable[[str], list] = None
 
 
 def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistDiscoveryDeps = None):
@@ -133,6 +110,11 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
         total_discovered = 0
         total_failed = 0
         total_skipped = 0
+        # S6: Wing It stubs are rows written, not metadata matches — counted
+        # separately so counters stay honest. total_discovered keeps meaning
+        # "rows written" (matched + wing-it) for progress/event compatibility;
+        # total_matched is derived as total_discovered - total_wing_it.
+        total_wing_it = 0
         total_tracks = 0
         last_playlist_name = ''
 
@@ -199,7 +181,7 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                     logger.warning(f"Playlist discovery cancelled (automation {automation_id})")
                     deps.update_automation_progress(automation_id, status='finished', progress=100,
                                                  phase='Discovery cancelled',
-                                                 log_line=f'Cancelled: {total_discovered} discovered, {total_failed} failed',
+                                                 log_line=f'Cancelled: {total_discovered - total_wing_it} matched, {total_wing_it} wing-it, {total_failed} failed',
                                                  log_type='info')
                     return
 
@@ -209,42 +191,49 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                 artist_name = track.get('artist_name', '')
                 duration_ms = track.get('duration_ms', 0)
 
-                # Step 0: an ISRC names the recording exactly -- look it up before the
-                # cache or any search. A hit comes from Deezer whatever the discovery
-                # source is, and is marked so it is never re-discovered or drifted.
-                if getattr(deps, 'resolve_isrc_match', None) is not None and track.get('isrc'):
-                    isrc_hit = deps.resolve_isrc_match(track['isrc'], duration_ms)
-                    if isrc_hit:
-                        db.update_mirrored_track_extra_data(track_id, {
-                            'discovered': True,
-                            'provider': isrc_hit.get('source', 'deezer'),
-                            'confidence': 1.0,
-                            'matched_data': isrc_hit,
-                            'isrc_match': True,
-                            'suggestions': [],
-                        })
-                        total_discovered += 1
-                        logger.info(f"ISRC [{i+1}/{len(undiscovered_tracks)}]: {track_name} -> {isrc_hit.get('name', '?')}")
-                        deps.update_automation_progress(automation_id,
-                            progress=((total_skipped + total_discovered + total_failed) / max(1, grand_total)) * 100,
-                            current_item=track_name,
-                            log_line=f'{track_name} → {isrc_hit.get("name", "?")} (ISRC)', log_type='success')
-                        continue
+                # same service on both ends (#1566): the mirror already has this
+                # track's own id, so fetch it. it runs before the cache because a
+                # cached name match may be a stale wrong version, and the id is
+                # the track. a failed lookup leaves it empty and the old path runs.
+                # a user playlist's track has no service of its own, but often
+                # an id anyway: the one its page handed over when it was added,
+                # or the one the enrichment workers found for the same song in
+                # the library. a synced mirror is just its own source + id.
+                from core.discovery.direct_match import direct_source_match
+                from core.playlists.track_origin import origin_ids
+                direct_track = None
+                direct_by = source
+                for id_source, id_value in origin_ids(db, source, track).items():
+                    direct_track = direct_source_match(
+                        id_source, discovery_source, use_spotify, id_value,
+                        spotify_client=deps.spotify_client, fallback_client=itunes_client_instance)
+                    if direct_track:
+                        direct_by = id_source
+                        break
+                if direct_track:
+                    logger.info(f"DIRECT [{i+1}/{len(undiscovered_tracks)}]: {track_name} → "
+                                f"{getattr(direct_track, 'name', '?')} (by {direct_by} id)")
 
                 # Step 1: Check discovery cache
                 cache_key = deps.get_discovery_cache_key(track_name, artist_name)
                 try:
-                    cached_match = db.get_discovery_cache_match(cache_key[0], cache_key[1], discovery_source)
+                    cached_match = None if direct_track else db.get_discovery_cache_match(
+                        cache_key[0], cache_key[1], discovery_source)
                     if cached_match and deps.validate_discovery_cache_artist(artist_name, cached_match):
                         extra_data = {
                             'discovered': True,
                             'provider': discovery_source,
                             'confidence': cached_match.get('confidence', 0.85),
                             'matched_data': cached_match,
-                            'suggestions': [],
-                            'isrc_match': False,
                         }
                         db.update_mirrored_track_extra_data(track_id, extra_data)
+                        # Best-effort (see the fresh-match path): raising here
+                        # would abort the cache hit and fall through to a fresh
+                        # search — a double write for an already-matched track.
+                        try:
+                            db.adopt_discovered_artist(track_id, _matched_primary_artist(cached_match))
+                        except Exception as e:
+                            logger.debug("artist adoption failed for track %s: %s", track_id, e)
                         total_discovered += 1
                         logger.info(f"CACHE [{i+1}/{len(undiscovered_tracks)}]: {track_name} → {cached_match.get('name', '?')}")
                         deps.update_automation_progress(automation_id,
@@ -281,22 +270,28 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                     logger.debug("canonical search-query add failed: %s", _cq_err)
 
                 # Step 3: Search and score
-                best_match = None
-                best_confidence = 0.0
+                best_match = direct_track
+                best_confidence = 1.0 if direct_track else 0.0
                 min_confidence = 0.7
-                near_misses = []
+
+                # deezer's free text can leave the original out entirely
+                # (#1565), so its first query also asks search_song
+                from core.metadata.song_search import with_song_first_pass
+                _source = with_song_first_pass(itunes_client_instance, track_name, artist_name)
 
                 for search_query in search_queries:
+                    if best_confidence >= 0.9:
+                        break
                     try:
                         if use_spotify:
                             results = deps.spotify_client.search_tracks(search_query, limit=10)
                         else:
-                            results = itunes_client_instance.search_tracks(search_query, limit=10)
+                            results = _source.search_tracks(search_query, limit=10)
                         if not results:
                             continue
 
                         match, confidence = _canonical_best_score(
-                            deps, track_name, artist_name, duration_ms, results, near_misses
+                            deps, track_name, artist_name, duration_ms, results
                         )
 
                         if match and confidence > best_confidence:
@@ -315,16 +310,104 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                         if use_spotify:
                             extended = deps.spotify_client.search_tracks(query, limit=50)
                         else:
-                            extended = itunes_client_instance.search_tracks(query, limit=50)
+                            # the source's own best song search: field-scoped on
+                            # deezer (its free-text skipped studio "Numb"), other
+                            # stores on itunes (#1398)
+                            from core.metadata.song_search import search_song
+                            extended = search_song(itunes_client_instance, track_name, artist_name, limit=50)
                         if extended:
                             match, confidence = _canonical_best_score(
-                                deps, track_name, artist_name, duration_ms, extended, near_misses
+                                deps, track_name, artist_name, duration_ms, extended
                             )
                             if match and confidence > best_confidence:
                                 best_confidence = confidence
                                 best_match = match
                     except Exception as e:
                         logger.debug("extended discovery search failed: %s", e)
+
+                # Alias fallback: the source's artist name and the provider's
+                # can be different names for the same person, not variations of
+                # one string — "mgk" vs "Machine Gun Kelly", "Yorushika" vs
+                # "ヨルシカ". No amount of cleaning bridges those, and
+                # _discovery_score_candidates enforces a 0.5 artist floor
+                # BEFORE it looks at the title, so a perfect title match is
+                # discarded and the track becomes a Wing It stub.
+                #
+                # Runs only after everything else missed, so the common path
+                # pays nothing. lookup_artist_aliases is itself cached
+                # (library row → musicbrainz_cache → live MB) and caches its
+                # misses, so a given artist costs one MB call ever.
+                if (not best_match or best_confidence < min_confidence) and deps.lookup_artist_aliases:
+                    # File/CSV-imported titles can still carry a raw "Artist -
+                    # Title" prefix (see the canonical search-query block
+                    # above, #785) — canonicalize once, against the ORIGINAL
+                    # artist_name, so an alias query for "mgk - sun to me"
+                    # becomes "Machine Gun Kelly sun to me", not
+                    # "Machine Gun Kelly mgk - sun to me".
+                    alias_track_name = track_name
+                    try:
+                        from core.text.source_title import canonical_source_track
+                        alias_track_name, _ = canonical_source_track(track_name, artist_name)
+                    except Exception as e:
+                        logger.debug("alias-query canonicalization failed for %r: %s", track_name, e)
+                    try:
+                        aliases = deps.lookup_artist_aliases(artist_name) or []
+                    except Exception as e:
+                        logger.debug("artist alias lookup failed for %r: %s", artist_name, e)
+                        aliases = []
+                    seen_alias = {(artist_name or '').casefold()}
+                    for alias in aliases:
+                        alias = (alias or '').strip()
+                        if not alias or alias.casefold() in seen_alias:
+                            continue
+                        seen_alias.add(alias.casefold())
+                        try:
+                            alias_query = f"{alias} {alias_track_name}"
+                            if use_spotify:
+                                alias_results = deps.spotify_client.search_tracks(alias_query, limit=10)
+                            else:
+                                alias_results = itunes_client_instance.search_tracks(alias_query, limit=10)
+                            if not alias_results:
+                                continue
+                            # Score with the ALIAS as the source artist — scoring
+                            # against the original would re-fail the same floor
+                            # that sent us here.
+                            match, confidence, _ = deps.discovery_score_candidates(
+                                alias_track_name, alias, duration_ms, alias_results
+                            )
+                            if match and confidence > best_confidence:
+                                best_confidence = confidence
+                                best_match = match
+                                logger.info(
+                                    "Alias match: %r resolved via %r (confidence %.2f)",
+                                    artist_name, alias, confidence,
+                                )
+                            if best_confidence >= 0.9:
+                                break
+                        except Exception as e:
+                            logger.debug("alias search failed for %r: %s", alias, e)
+
+                # a track that came with a spotify id gets fetched by it and
+                # tried again before it becomes a wing it stub (#1721)
+                second = None
+                if not best_match or best_confidence < min_confidence:
+                    from core.discovery.spotify_second_pass import (
+                        SPOTIFY_ID_SOURCES, spotify_second_pass)
+                    for id_source, id_value in origin_ids(db, source, track).items():
+                        if id_source not in SPOTIFY_ID_SOURCES:
+                            continue
+                        second = spotify_second_pass(
+                            id_source=id_source, source_track_id=id_value,
+                            discovery_source=discovery_source, use_spotify=use_spotify,
+                            title=track_name, artist=artist_name,
+                            primary_client=itunes_client_instance,
+                            score_candidates=deps.discovery_score_candidates,
+                            spotify_client=deps.spotify_client)
+                        if second:
+                            best_match = second.track
+                            best_confidence = second.confidence
+                            break
+                match_source = second.provider if second else discovery_source
 
                 # Step 4: Store results
                 if best_match and best_confidence >= min_confidence:
@@ -340,7 +423,12 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                     # that the Track dataclass strips to just a name string
                     track_number = None
                     disc_number = None
-                    if hasattr(best_match, 'id') and best_match.id:
+                    if second and second.album:
+                        # a spotify keep brings its whole album along
+                        album_obj = dict(second.album)
+                        track_number = second.track_number
+                        disc_number = second.disc_number
+                    elif hasattr(best_match, 'id') and best_match.id:
                         try:
                             cache = deps.get_metadata_cache()
                             _raw = cache.get_entity(discovery_source if not use_spotify else 'spotify', 'track', best_match.id)
@@ -383,7 +471,7 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                         'album': album_obj,
                         'duration_ms': best_match.duration_ms if hasattr(best_match, 'duration_ms') else 0,
                         'image_url': match_image,
-                        'source': discovery_source,
+                        'source': match_source,
                         'track_number': track_number if track_number else (
                             getattr(best_match, 'track_number', None)
                         ),
@@ -394,26 +482,45 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
 
                     extra_data = {
                         'discovered': True,
-                        'provider': discovery_source,
+                        'provider': match_source,
                         'confidence': best_confidence,
                         'matched_data': matched_data,
-                        # Always written: extra_data merges on save, and a match
-                        # must clear the suggestions a guess had.
-                        'suggestions': [],
-                        'isrc_match': False,
+                        # extra_data merges, so a track that was wing it once
+                        # kept the flag after a real match and got rediscovered
+                        # every run. it's a real match now, say so.
+                        'wing_it_fallback': False,
                     }
+                    if matched_data.get('track_number') is None:
+                        # M12: the provider genuinely doesn't know the track
+                        # number — record the enrichment attempt so the
+                        # pipeline pre-scan gate (should_rediscover) treats
+                        # this match as complete instead of re-discovering
+                        # (and rewriting identically) on every run.
+                        extra_data['track_number_unknown_enrichment_attempted'] = True
                     db.update_mirrored_track_extra_data(track_id, extra_data)
+                    # A match on an "Unknown Artist" row should FIX the row —
+                    # matched_data alone leaves the mirror displaying (and
+                    # searching as) Unknown Artist forever (#1136 review).
+                    # Best-effort: a failure here must not skip the cache save,
+                    # counters, or the completion event below.
+                    try:
+                        db.adopt_discovered_artist(track_id, _matched_primary_artist(matched_data))
+                    except Exception as e:
+                        logger.debug("artist adoption failed for track %s: %s", track_id, e)
                     total_discovered += 1
 
-                    # Save to discovery cache
-                    try:
-                        db.save_discovery_cache_match(
-                            cache_key[0], cache_key[1], discovery_source,
-                            best_confidence, matched_data,
-                            track_name, artist_name
-                        )
-                    except Exception as e:
-                        logger.debug("save discovery cache match failed: %s", e)
+                    # Save to discovery cache. not a spotify keep: the cache
+                    # is filed under the primary source, and every other
+                    # playlist that reads it expects one
+                    if match_source == discovery_source:
+                        try:
+                            db.save_discovery_cache_match(
+                                cache_key[0], cache_key[1], discovery_source,
+                                best_confidence, matched_data,
+                                track_name, artist_name
+                            )
+                        except Exception as e:
+                            logger.debug("save discovery cache match failed: %s", e)
 
                     logger.info(f"[{i+1}/{len(undiscovered_tracks)}] {track_name} → {matched_data['name']} ({best_confidence:.2f})")
                     deps.update_automation_progress(automation_id,
@@ -430,12 +537,10 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                         'confidence': 0,
                         'wing_it_fallback': True,
                         'matched_data': stub,
-                        'suggestions': build_discovery_suggestions(
-                            near_misses, discovery_source, below=min_confidence),
-                        'isrc_match': False,
                     }
                     db.update_mirrored_track_extra_data(track_id, extra_data)
                     total_discovered += 1
+                    total_wing_it += 1
                     logger.info(f"[{i+1}/{len(undiscovered_tracks)}] Wing It: {track_name} by {artist_name}")
                     deps.update_automation_progress(automation_id,
                         progress=((total_skipped + total_discovered + total_failed) / max(1, grand_total)) * 100,
@@ -446,7 +551,9 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                 time.sleep(0.15)
 
         # Emit completion event only if new tracks were actually discovered
-        # (no point triggering downstream sync if nothing changed)
+        # (no point triggering downstream sync if nothing changed). Wing It
+        # rows count: they were written, so downstream still triggers.
+        total_matched = total_discovered - total_wing_it
         try:
             if deps.automation_engine and total_discovered > 0:
                 _disc_pl_id = str(playlists[0]['id']) if len(playlists) == 1 else ''
@@ -454,17 +561,22 @@ def run_playlist_discovery_worker(playlists, automation_id=None, deps: PlaylistD
                     'playlist_name': last_playlist_name if len(playlists) == 1 else f'{len(playlists)} playlists',
                     'playlist_id': _disc_pl_id,
                     'total_tracks': str(total_tracks),
+                    # S6: honest breakdown. discovered_count keeps its
+                    # historical meaning (total rows written: matched +
+                    # wing-it) so existing consumers keep working.
                     'discovered_count': str(total_discovered),
+                    'matched_count': str(total_matched),
+                    'wing_it_count': str(total_wing_it),
                     'failed_count': str(total_failed),
                     'skipped_count': str(total_skipped),
                 })
         except Exception as e:
             logger.debug("discovery_completed emit failed: %s", e)
 
-        logger.error(f"Playlist discovery complete: {total_discovered} discovered, {total_failed} failed, {total_skipped} skipped")
+        logger.error(f"Playlist discovery complete: {total_matched} matched, {total_wing_it} wing-it, {total_failed} failed, {total_skipped} skipped")
         deps.update_automation_progress(automation_id, status='finished', progress=100,
                                      phase='Discovery complete',
-                                     log_line=f'Done: {total_discovered} discovered, {total_failed} failed, {total_skipped} skipped',
+                                     log_line=f'Done: {total_matched} matched, {total_wing_it} wing-it, {total_failed} failed, {total_skipped} skipped',
                                      log_type='success')
 
     except Exception as e:

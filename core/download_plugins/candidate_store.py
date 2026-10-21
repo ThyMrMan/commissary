@@ -16,10 +16,11 @@ the store is size-capped so an indexer flood can't grow it unbounded.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import secrets
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 # Recognizable, URL-unlike token prefix ("soulsync candidate, v1").
 TOKEN_PREFIX = "ssc1-"
@@ -42,27 +43,22 @@ class CandidateStore:
         self._lock = threading.Lock()
         self._by_token: Dict[str, Tuple[str, float]] = {}   # token -> (url, expires_at)
         self._by_url: Dict[str, str] = {}                   # url -> token (dedup)
-        # token -> the SAME release's magnet, when the indexer offered both.
-        # A separate map rather than a wider tuple: every existing reader of
-        # _by_token keeps working unchanged, and a token with no magnet simply
-        # has no entry here. See put() for why the magnet is carried at all.
-        self._magnet_by_token: Dict[str, str] = {}
+        # Structured indexer evidence needed at grab time. Kept beside the URL
+        # so it remains server-side and cannot be forged by the browser.
+        self._metadata_by_token: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def is_token(value: Optional[str]) -> bool:
         return bool(value) and value.startswith(TOKEN_PREFIX)
 
-    def put(self, url: str, magnet: Optional[str] = None) -> str:
+    def put(self, url: str, metadata: Optional[Dict[str, Any]] = None) -> str:
         """Register a URL; returns its opaque token. The same URL within the
         TTL returns the same token (repeated searches don't grow the store).
 
-        ``magnet`` is the same release's magnet URI when the indexer offered
-        both. Grabs prefer the .torrent URL — a magnet gives the client an
-        info-hash and nothing else, and one that cannot reach the swarm parks
-        on "downloading metadata" indefinitely — but in a split install where
-        Commissary cannot reach the indexer and the CLIENT can, that preference
-        would lose a magnet that worked. Carrying it here is what makes
-        preferring the file safe. It never reaches the browser either."""
+        Optional metadata follows the same TTL and never crosses the client
+        trust boundary. It carries structured evidence such as Prowlarr's
+        category IDs from search to the later strict pre-grab gate.
+        """
         with self._lock:
             # Captured under the lock, not before it: expires_at must
             # reflect actual insertion order so a call that loses the race
@@ -76,51 +72,45 @@ class CandidateStore:
             if token is not None and token in self._by_token:
                 # Refresh the TTL — the candidate was just seen again.
                 self._by_token[token] = (url, now + self._ttl)
-                if magnet:
-                    self._magnet_by_token[token] = magnet
+                if metadata is not None:
+                    self._metadata_by_token[token] = deepcopy(metadata)
                 return token
             token = TOKEN_PREFIX + secrets.token_urlsafe(24)
             self._by_token[token] = (url, now + self._ttl)
             self._by_url[url] = token
-            if magnet:
-                self._magnet_by_token[token] = magnet
+            self._metadata_by_token[token] = deepcopy(metadata or {})
             if len(self._by_token) > self._max:
                 self._evict_oldest_locked()
             return token
 
     def resolve(self, token: str) -> Optional[str]:
         """The URL behind a token, or None when unknown/expired."""
+        url, _metadata = self.resolve_with_metadata(token)
+        return url
+
+    def resolve_with_metadata(self, token: str) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Return ``(url, metadata)`` or ``(None, {})`` when unavailable."""
         if not self.is_token(token):
-            return None
+            return None, {}
         now = time.monotonic()
         with self._lock:
             entry = self._by_token.get(token)
             if entry is None:
-                return None
+                return None, {}
             url, expires_at = entry
             if expires_at < now:
                 self._by_token.pop(token, None)
                 self._by_url.pop(url, None)
-                self._magnet_by_token.pop(token, None)
-                return None
-            return url
-
-    def resolve_magnet(self, token: str) -> Optional[str]:
-        """The same release's magnet, or None. Read at grab time so a refused
-        URL handoff can retry as a magnet instead of failing outright."""
-        if not self.is_token(token):
-            return None
-        with self._lock:
-            if token not in self._by_token:
-                return None
-            return self._magnet_by_token.get(token)
+                self._metadata_by_token.pop(token, None)
+                return None, {}
+            return url, deepcopy(self._metadata_by_token.get(token, {}))
 
     def _purge_locked(self, now: float) -> None:
         expired = [t for t, (_u, exp) in self._by_token.items() if exp < now]
         for token in expired:
             url, _exp = self._by_token.pop(token)
             self._by_url.pop(url, None)
-            self._magnet_by_token.pop(token, None)
+            self._metadata_by_token.pop(token, None)
 
     def _evict_oldest_locked(self) -> None:
         overflow = len(self._by_token) - self._max
@@ -130,7 +120,7 @@ class CandidateStore:
         for token, (url, _exp) in oldest:
             self._by_token.pop(token, None)
             self._by_url.pop(url, None)
-            self._magnet_by_token.pop(token, None)
+            self._metadata_by_token.pop(token, None)
 
 
 _store = CandidateStore()

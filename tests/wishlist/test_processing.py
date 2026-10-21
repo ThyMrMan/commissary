@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from core.wishlist import processing
@@ -13,7 +14,7 @@ def test_resolve_album_bundle_threshold_uses_default_when_config_missing():
     """Default 2 matches the bumped ``min_tracks_per_album`` floor in
     ``group_wishlist_tracks_by_album`` — single-track wishlist items
     take the per-track path, multi-track items take the bundle path."""
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = processing._DEFAULT_ALBUM_BUNDLE_MIN_TRACKS
         assert processing._resolve_album_bundle_threshold() == 2
 
@@ -22,7 +23,7 @@ def test_resolve_album_bundle_threshold_honors_config_override():
     """Power users who want bundle for every wishlist track (old
     behaviour) can set the key to 1. Users who want bundle only on
     bigger gaps can set higher."""
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = 1
         assert processing._resolve_album_bundle_threshold() == 1
         cm.get.return_value = 5
@@ -33,7 +34,7 @@ def test_resolve_album_bundle_threshold_falls_back_on_garbage():
     """Non-numeric / non-positive / config-manager-raise all fall back
     to the safe default. Same defensive shape as get_poll_interval /
     get_transient_miss_threshold."""
-    with patch('config.settings.config_manager') as cm:
+    with patch('core.settings.config_manager') as cm:
         cm.get.return_value = 'oops'
         assert processing._resolve_album_bundle_threshold() == 2
         cm.get.return_value = 0
@@ -108,7 +109,8 @@ class _FakeLock:
 def test_remove_completed_tracks_from_wishlist_calls_remover():
     batch = {"queue": ["a", "b"]}
     download_tasks = {
-        "a": {"status": "completed", "track_info": {"name": "Song A"}},
+        "a": {"status": "completed", "track_info": {"name": "Song A"},
+              "final_file_path": "/library/Artist/Album/01.mp3"},
         "b": {"status": "failed", "track_info": {"name": "Song B"}},
     }
     calls = []
@@ -116,12 +118,18 @@ def test_remove_completed_tracks_from_wishlist_calls_remover():
     removed = processing.remove_completed_tracks_from_wishlist(
         batch,
         download_tasks,
-        lambda context: calls.append(context),
+        lambda context, **kw: calls.append((context, kw)),
         logger=_FakeLogger(),
     )
 
     assert removed == 1
-    assert calls == [{"track_info": {"name": "Song A"}, "original_search_result": {"name": "Song A"}}]
+    # #1289: the remover is handed where the import actually landed, so its
+    # guard can tell a published track from one still in staging or still in
+    # the downloads folder.
+    assert calls == [(
+        {"track_info": {"name": "Song A"}, "original_search_result": {"name": "Song A"}},
+        {"published_path": "/library/Artist/Album/01.mp3", "quiet_refusal": True},
+    )]
 
 
 def test_add_cancelled_tracks_to_failed_tracks_builds_entries():
@@ -389,7 +397,7 @@ def test_automatic_wishlist_cleanup_after_db_update_removes_library_matches():
         def get_wishlist_tracks_for_download(self, profile_id=1):
             return list(self.tracks)
 
-        def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1):
+        def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1, **kwargs):
             self.removed.append((spotify_track_id, success, error_message, profile_id))
             return True
 
@@ -398,9 +406,11 @@ def test_automatic_wishlist_cleanup_after_db_update_removes_library_matches():
             return [{"id": 1}]
 
     class _CleanupMusicDatabase:
-        def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None):
+        def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None, include_downloads=False):
             if track_name == "Song A" and artist_name == "Artist A":
-                return {"id": "db-track"}, 0.9
+                return SimpleNamespace(id='db-track', title=track_name,
+                                       artist_name=artist_name, album_title=album,
+                                       file_path='/music/owned.flac'), 0.9
             return None, 0.0
 
     wishlist_service = _CleanupWishlistService(
@@ -479,7 +489,7 @@ class _CleanupWishlistService:
     def get_wishlist_tracks_for_download(self, profile_id=1):
         return list(self._tracks)
 
-    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1):
+    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1, **kwargs):
         self.removed.append((spotify_track_id, success, error_message, profile_id))
         return True
 
@@ -488,10 +498,12 @@ class _CleanupMusicDatabase:
     def __init__(self):
         self.track_checks = []
 
-    def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None):
+    def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None, include_downloads=False):
         self.track_checks.append((track_name, artist_name, server_source, album))
         if track_name == "Owned Song" and artist_name == "Artist A":
-            return {"id": "db-track"}, 0.9
+            return SimpleNamespace(id='db-track', title=track_name,
+                                   artist_name=artist_name, album_title=album,
+                                   file_path='/music/owned.flac'), 0.9
         if track_name == "Broken Song":
             raise RuntimeError("boom")
         return None, 0.0
@@ -657,48 +669,10 @@ def test_db_update_cleanup_runs_on_dedicated_thread_not_shared_pool():
     """Source guard: the post-DB-update cleanup must not ride the shared
     3-worker missing_download_executor (it starves download post-processing)."""
     from pathlib import Path
-    src = Path(processing.__file__).resolve().parents[2] / "web_server.py"
-    text = src.read_text(encoding="utf-8")
-    assert "missing_download_executor.submit(_automatic_wishlist_cleanup_after_db_update)" not in text
-    assert 'name="WishlistCleanup"' in text
-
-
-# ── the completion summary's log level (from a real 12-hour app.log) ─────────
-# 30 of these were logged at ERROR, including runs where nothing failed at all.
-# `tracks_added` IS the failed set going back on the wishlist, not a second
-# group beside it, so "20 added to wishlist, 20 failed" also read as 40 tracks
-# with half of them fine. Neither is true, and both made a genuinely stuck
-# wishlist (every run failing all 20) look like routine noise.
-
-def _finalize_with(summary, logger):
-    processing.finalize_auto_wishlist_completion(
-        "batch-1",
-        summary,
-        download_batches={"batch-1": {"current_cycle": "albums"}},
-        tasks_lock=_FakeLock(),
-        reset_processing_state=lambda: None,
-        add_activity_item=lambda *args: None,
-        automation_engine=_FakeAutomationEngine(),
-        db_factory=_FakeDB,
-        logger=logger,
-    )
-    return logger
-
-
-def test_a_clean_wishlist_run_is_not_logged_as_an_error():
-    log = _finalize_with({"tracks_added": 0, "total_failed": 0, "errors": 0}, _FakeLogger())
-    assert log.errors == []
-    assert log.warnings == []
-    assert any("nothing failed" in m for m in log.infos)
-
-
-def test_failures_are_reported_once_not_as_two_numbers():
-    """The old line read '20 added to wishlist, 20 failed' — the same 20 tracks
-    counted twice, which looks like half the batch succeeded."""
-    log = _finalize_with({"tracks_added": 20, "total_failed": 20, "errors": 0}, _FakeLogger())
-    assert log.errors == []
-    assert len(log.warnings) == 1
-    msg = log.warnings[0]
-    assert "20 track(s) failed" in msg
-    assert "back on the wishlist" in msg
-    assert msg.count("20") == 1          # ...once, not twice
+    root = Path(processing.__file__).resolve().parents[2]
+    # the spawn site moved to api/database_admin.py (aug 25 lift); the ban
+    # holds in both homes
+    for name in ("web_server.py", "api/database_admin.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "missing_download_executor.submit(_automatic_wishlist_cleanup_after_db_update)" not in text
+    assert 'name="WishlistCleanup"' in (root / "api/database_admin.py").read_text(encoding="utf-8")

@@ -1,23 +1,7 @@
 import os
 
-import pytest
-
 import core.imports.album_naming as album_naming
 import core.imports.paths as import_paths
-
-
-@pytest.fixture(autouse=True)
-def _no_music_libraries(monkeypatch):
-    """These are unit tests of TEMPLATING — they inject their own config and
-    should not depend on what happens to be in the database.
-
-    The destination root now comes from the Music Libraries table, falling
-    back to ``soulseek.transfer_path`` when none are configured. Without this
-    stub, the row seeded from the real config would silently outrank each
-    test's injected transfer_path and every expected path would be wrong for
-    a reason that has nothing to do with what the test is checking.
-    """
-    monkeypatch.setattr(import_paths, "_get_music_libraries", lambda: [])
 
 
 class _Config:
@@ -83,8 +67,22 @@ def test_itunes_single_albumartist_falls_back_to_track_artist(monkeypatch, tmp_p
     """#989: an iTunes single's collection carries a placeholder 'Unknown Artist'
     album artist while the track artist is real. The album_path must use the real
     artist for $albumartist, not bury the file under 'Unknown Artist'. FAILS pre-fix
-    (the placeholder album-context artist overrode the real track artist)."""
-    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _album_path_config(tmp_path))
+    (the placeholder album-context artist overrode the real track artist).
+
+    The fixture keeps the DEFAULT single_path on purpose: a customized
+    single_path now routes explicit singles through the single branch (Hirvi),
+    which would bypass the album-branch fallback this test is pinning."""
+    _cfg = _Config({
+        "soulseek.transfer_path": str(tmp_path / "Transfer"),
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/$albumartist - $album/$track - $title",
+            "single_path": "$albumartist/$albumartist - $title/$title",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    })
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _cfg)
     monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
     ctx = {
         "source": "itunes",
@@ -101,6 +99,76 @@ def test_itunes_single_albumartist_falls_back_to_track_artist(monkeypatch, tmp_p
         ctx, {"name": "Forevert", "id": "123456"}, info, ".flac", create_dirs=False)
     assert final_path == str(tmp_path / "Transfer" / "Forevert" / "Forevert - CHAOSRIFT" / "01 - CHAOSRIFT.flac")
     assert "Unknown Artist" not in final_path
+
+
+def test_customized_single_path_wins_for_explicit_singles(monkeypatch, tmp_path):
+    """Hirvi: a customized Single Path Template must be honored for singles the
+    source explicitly typed as 'single'. build_import_album_info routes those
+    through album_path (so $albumtype in the ALBUM template keeps working), but
+    that silently ignored a customized single_path — every single landed in its
+    own title-named folder instead of the template's Singles folder."""
+    _cfg = _Config({
+        "soulseek.transfer_path": str(tmp_path / "Transfer"),
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/${album}/$track - $title",
+            "single_path": "${albumartist}/Singles/${title}",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    })
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _cfg)
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+    ctx = {
+        "source": "deezer",
+        "artist": {"name": "Artistname", "id": "d1"},
+        "album": {"name": "Some Song", "id": "al1", "album_type": "single",
+                  "release_date": "2024-01-01", "artists": [{"name": "Artistname"}]},
+        "track_info": {"name": "Some Song", "track_number": 1, "disc_number": 1,
+                       "artists": [{"name": "Artistname"}]},
+        "original_search_result": {"title": "Some Song", "clean_title": "Some Song",
+                                   "artists": [{"name": "Artistname"}]},
+    }
+    # Deezer explicitly typed this "single", so is_album is True and the album
+    # name falls back to the track title (#980) — the single template must win.
+    info = {"is_album": True, "album_name": "Some Song", "album_type": "single",
+            "track_number": 1, "disc_number": 1}
+    final_path, _ = import_paths.build_final_path_for_track(
+        ctx, {"name": "Artistname", "id": "d1"}, info, ".opus", create_dirs=False)
+    assert final_path == str(tmp_path / "Transfer" / "Artistname" / "Singles" / "Some Song.opus")
+
+
+def test_default_single_path_keeps_album_routing_for_explicit_singles(monkeypatch, tmp_path):
+    """The $albumtype-in-album-template contract: with a default (uncustomized)
+    single_path, explicitly-typed singles keep routing through album_path, so a
+    '${albumtype}s/...' album template still files them under Singles."""
+    _cfg = _Config({
+        "soulseek.transfer_path": str(tmp_path / "Transfer"),
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/${albumtype}s/${album}/$track - $title",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    })
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _cfg)
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+    ctx = {
+        "source": "deezer",
+        "artist": {"name": "Artistname", "id": "d1"},
+        "album": {"name": "Some Song", "id": "al1", "album_type": "single",
+                  "release_date": "2024-01-01", "artists": [{"name": "Artistname"}]},
+        "track_info": {"name": "Some Song", "track_number": 1, "disc_number": 1,
+                       "artists": [{"name": "Artistname"}]},
+        "original_search_result": {"title": "Some Song", "clean_title": "Some Song",
+                                   "artists": [{"name": "Artistname"}]},
+    }
+    info = {"is_album": True, "album_name": "Some Song", "album_type": "single",
+            "track_number": 1, "disc_number": 1}
+    final_path, _ = import_paths.build_final_path_for_track(
+        ctx, {"name": "Artistname", "id": "d1"}, info, ".opus", create_dirs=False)
+    assert final_path == str(tmp_path / "Transfer" / "Artistname" / "Singles"
+                             / "Some Song" / "01 - Some Song.opus")
 
 
 def test_compilation_uses_compilation_path_template(monkeypatch, tmp_path):
@@ -126,6 +194,31 @@ def test_compilation_uses_compilation_path_template(monkeypatch, tmp_path):
     assert "Big Comp" in final_path
     assert "Guest Singer" in final_path
     assert "Various Artists" not in final_path
+
+
+def test_compilation_path_uses_track_artist_when_album_artist_is_shared(monkeypatch, tmp_path):
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _album_path_config(tmp_path))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+    ctx = {
+        "album": {"name": "Magnatron 2.0", "album_type": "compilation", "artists": []},
+        "track_info": {"name": "Omricon", "artists": [{"name": "Woob"}]},
+        "original_search_result": {"title": "Omricon", "artists": [{"name": "Woob"}]},
+    }
+    info = {"is_album": True, "album_name": "Magnatron 2.0", "track_number": 6}
+
+    final_path, _ = import_paths.build_final_path_for_track(
+        ctx, {"name": "Various Artists"}, info, ".mp3", create_dirs=False,
+    )
+
+    assert final_path == str(tmp_path / "Transfer" / "Compilations" / "Magnatron 2.0"
+                             / "06 - Woob - Omricon.mp3")
+
+    info["track_number"] = 0
+    unknown_path, _ = import_paths.build_final_path_for_track(
+        ctx, {"name": "Various Artists"}, info, ".mp3", create_dirs=False,
+    )
+    assert unknown_path == str(tmp_path / "Transfer" / "Compilations" / "Magnatron 2.0"
+                               / "00 - Woob - Omricon.mp3")
 
 
 def test_create_dirs_true_still_creates_folders(monkeypatch, tmp_path):
@@ -891,3 +984,196 @@ def test_collab_mode_all_keeps_the_combined_folder(monkeypatch):
     monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _collab_cfg(mode="all"))
     folder, _ = import_paths.get_file_path_from_template(_single_ctx(), "single_path")
     assert folder.split(os.sep)[0] == "Larry June, Currensy & The Alchemist"
+
+
+# ── #1109: an enhance/upgrade must never makedirs an unmapped library root ──
+#
+# The stored library path is the MEDIA SERVER's view ("/music/..."). Inside the
+# SoulSync container that root is usually not mounted at all, so the old code's
+# unconditional makedirs(dirname(original_file_path)) tried to CREATE "/music"
+# and died with PermissionError — post-processing aborted, the finished file
+# was left unsorted, and the retry loop repeated the same crash forever.
+
+def _enhance_config(tmp_path):
+    return _Config({
+        "soulseek.transfer_path": str(tmp_path / "Transfer"),
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/$albumartist - $album/$track - $title",
+            "single_path": "$artist/$artist - $title",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    })
+
+
+def _enhance_context(original_file_path):
+    ctx = _album_context()
+    ctx["track_info"]["source_info"] = {
+        "enhance": True,
+        "original_file_path": original_file_path,
+    }
+    return ctx
+
+
+def test_enhance_never_creates_an_unreachable_library_root(monkeypatch, tmp_path):
+    """#1109: '/music/...' is not mounted here. The builder must NOT try to
+    create it — it must fall back to the normal template destination."""
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _enhance_config(tmp_path))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    unreachable = str(tmp_path / "not-mounted" / "Lenka" / "Lenka" / "01 - The Show.mp3")
+
+    final_path, created = import_paths.build_final_path_for_track(
+        _enhance_context(unreachable), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac",
+    )
+
+    assert created is True
+    assert not (tmp_path / "not-mounted").exists()
+    assert final_path == str(
+        tmp_path / "Transfer" / "Lenka" / "Lenka - Lenka" / "01 - The Show.flac")
+
+
+def test_enhance_replaces_in_place_when_the_original_dir_exists(monkeypatch, tmp_path):
+    """The normal case is unchanged: the old file is reachable, so the upgrade
+    keeps its exact folder and stem (only the extension follows the new file)."""
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _enhance_config(tmp_path))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    album_dir = tmp_path / "Library" / "Lenka" / "Lenka"
+    album_dir.mkdir(parents=True)
+    original = album_dir / "01 - The Show.mp3"
+    original.write_bytes(b"old")
+
+    final_path, created = import_paths.build_final_path_for_track(
+        _enhance_context(str(original)), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac",
+    )
+
+    assert created is True
+    assert final_path == str(album_dir / "01 - The Show.flac")
+
+
+def test_enhance_resolves_a_media_server_path_to_its_local_mount(monkeypatch, tmp_path):
+    """The DB stores the media server's path. When the same file IS reachable
+    under a configured library root, the upgrade must land on the LOCAL path —
+    not on the unmapped server path, and not in the transfer root."""
+    music_root = tmp_path / "mnt" / "music"
+    album_dir = music_root / "Lenka" / "Lenka"
+    album_dir.mkdir(parents=True)
+    (album_dir / "01 - The Show.mp3").write_bytes(b"old")
+
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _Config({
+        "soulseek.transfer_path": str(tmp_path / "Transfer"),
+        "library.music_paths": [str(music_root)],
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/$albumartist - $album/$track - $title",
+            "single_path": "$artist/$artist - $title",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    }))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    server_path = "/music/Lenka/Lenka/01 - The Show.mp3"
+
+    final_path, created = import_paths.build_final_path_for_track(
+        _enhance_context(server_path), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac",
+    )
+
+    assert created is True
+    assert final_path == str(album_dir / "01 - The Show.flac")
+
+
+def test_enhance_preview_still_creates_nothing(monkeypatch, tmp_path):
+    """create_dirs=False (reorganize dry run) must stay side-effect free."""
+    monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _enhance_config(tmp_path))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    album_dir = tmp_path / "Library" / "Lenka" / "Lenka"
+    album_dir.mkdir(parents=True)
+    original = album_dir / "01 - The Show.mp3"
+    original.write_bytes(b"old")
+
+    final_path, _ = import_paths.build_final_path_for_track(
+        _enhance_context(str(original)), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac", create_dirs=False,
+    )
+
+    assert final_path == str(album_dir / "01 - The Show.flac")
+    assert not (tmp_path / "Transfer").exists()
+
+
+# ── a relative library root must still produce an absolute destination ───────
+#
+# "./Transfer" is the shipped default and what the settings page shows. It was
+# passed through docker_resolve_path (which only maps Windows drive letters) and
+# used verbatim, so the destination the builder returned — and therefore the path
+# written into the catalogue — was RELATIVE. Every consumer that realpath()s a
+# path (the repair filesystem scan) then saw "/app/Transfer/…" for the very same
+# file, and every consumer that compared roots with startswith() silently missed.
+# Same file, three spellings, no two of them equal.
+
+def _relative_root_config():
+    return _Config({
+        "soulseek.transfer_path": "./Transfer",
+        "file_organization.enabled": True,
+        "file_organization.templates": {
+            "album_path": "$albumartist/$album/$track - $title",
+            "single_path": "$albumartist/$albumartist - $title/$title",
+        },
+        "file_organization.collab_artist_mode": "first",
+        "file_organization.disc_label": "Disc",
+    })
+
+
+def test_relative_transfer_root_yields_an_absolute_album_destination(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(import_paths, "_get_config_manager", _relative_root_config)
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    final_path, _ = import_paths.build_final_path_for_track(
+        _album_context(), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac", create_dirs=False,
+    )
+
+    assert os.path.isabs(final_path), f"catalogue would store a relative path: {final_path}"
+    assert final_path == str(tmp_path / "Transfer" / "Lenka" / "Lenka" / "01 - The Show.flac")
+
+
+def test_relative_transfer_root_yields_an_absolute_single_destination(monkeypatch, tmp_path):
+    """The single/simple builder took the same raw value through pathlib.Path,
+    which additionally ate the leading './' — a THIRD spelling of one root."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(import_paths, "_get_config_manager", _relative_root_config)
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    final_path, _ = import_paths.build_final_path_for_track(
+        _album_context(), {"name": "Lenka"}, None, ".flac", create_dirs=False,
+    )
+
+    assert os.path.isabs(final_path), f"catalogue would store a relative path: {final_path}"
+    assert final_path.startswith(str(tmp_path / "Transfer") + os.sep)
+
+
+def test_an_absolute_root_is_left_exactly_as_configured(monkeypatch, tmp_path):
+    """Canonicalising must not rewrite a root the user already gave in full."""
+    monkeypatch.setattr(import_paths, "_get_config_manager",
+                        lambda: _album_path_config(tmp_path))
+    monkeypatch.setattr(import_paths, "_get_album_tracks_for_source", lambda *a: None)
+
+    final_path, _ = import_paths.build_final_path_for_track(
+        _album_context(), {"name": "Lenka"},
+        {"is_album": True, "album_name": "Lenka", "track_number": 1, "disc_number": 1},
+        ".flac", create_dirs=False,
+    )
+
+    assert final_path == str(tmp_path / "Transfer" / "Lenka" / "Lenka - Lenka" / "01 - The Show.flac")

@@ -67,7 +67,7 @@ class MediaServerEngine:
 
         Args:
             registry: Plugin registry. Defaults to the four built-in
-                servers (Plex, Jellyfin, Navidrome, Commissary).
+                servers (Plex, Jellyfin, Navidrome, SoulSync).
             active_server_resolver: Callable returning the current
                 active server name (e.g. ``'plex'``). Defaults to
                 ``config_manager.get_active_media_server``. Tests
@@ -99,7 +99,7 @@ class MediaServerEngine:
             self.registry.initialize()
 
         if active_server_resolver is None:
-            from config.settings import config_manager
+            from core.settings import config_manager
             active_server_resolver = config_manager.get_active_media_server
         self._resolve_active = active_server_resolver
 

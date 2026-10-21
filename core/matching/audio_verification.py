@@ -10,12 +10,14 @@ thresholds, normalization, alias-aware comparison, cross-script handling, versio
 gate and duration guard are defined exactly once.
 """
 
+import math
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from enum import Enum
 from typing import Any, List, Optional
 
+from core.text.title_match import is_trailing_version_qualifier
 from utils.logging_config import get_logger
 
 logger = get_logger("audio_verification")
@@ -25,6 +27,50 @@ MIN_ACOUSTID_SCORE = 0.80       # Minimum fingerprint score to trust a match.
 TITLE_MATCH_THRESHOLD = 0.70    # Title similarity to consider a match.
 ARTIST_MATCH_THRESHOLD = 0.60   # Artist similarity to consider a match.
 CLEAR_MISMATCH_THRESHOLD = 0.30  # Below this artist sim = clear wrong song.
+# Spotify's version separator is a SPACED dash (' - Remastered 2011'), so the
+# rule needs whitespace next to the dash — with `\s*` a bare intra-word hyphen
+# matched and 'Post-Remix' normalized to 'post'. ONE side is enough, and has to
+# be: real catalogue rows write ']- Single' ('Cold Water … [Anirudh Diwali
+# Edition]- Single'), where the bracket strip has already eaten the space in
+# front. En/em dashes appear in the same role in provider metadata.
+# The dash class covers what real metadata actually writes: ASCII hyphen, the
+# unicode hyphen/en/em dashes, the minus sign, and the FULLWIDTH hyphen-minus a
+# Japanese tagger produces (残酷な天使のテーゼ － Instrumental).
+_DASH_CHARS = r"\-‐‑‒–—―−－"
+# The qualifier may carry ONE optional trailing dash: provider metadata wraps
+# subtitles as '-Blue Forest Version-' (#1627), and the old dash-free-to-$ rule
+# left those normalizing differently from their '(…)' twin. The OPENING
+# delimiter keeps its whitespace-adjacency requirement — loosening that
+# reintroduces the 'Post-Remix' → 'post' over-strip the comment above
+# documents.
+_DASH_QUALIFIER_RE = re.compile(
+    rf"(?:\s[{_DASH_CHARS}]\s*|\s*[{_DASH_CHARS}]\s)"
+    rf"(?P<qualifier>[^{_DASH_CHARS}]+)(?:[{_DASH_CHARS}])?$"
+)
+# Tilde/wave-dash-wrapped version qualifiers ('~Acoustic~', '〜Live〜',
+# '～Remaster～'). A SEPARATE pattern, not a widened _DASH_CHARS: a bare '~'
+# inside a title (stylized spellings) must never become a strip delimiter —
+# only the explicit open+close pair strips, and only when the wrapped text
+# reads as a version qualifier.
+_TILDE_CHARS = r"~〜～"
+_TILDE_QUALIFIER_RE = re.compile(
+    rf"\s[{_TILDE_CHARS}](?P<qualifier>[^{_TILDE_CHARS}]+)[{_TILDE_CHARS}]\s*$"
+)
+
+
+def _version_tail_match(s: str):
+    """The trailing version-tail annotation on ``s``, if any.
+
+    The dash form (' - Remastered 2011', '-Blue Forest Version-') or a
+    tilde/wave-dash-wrapped form ('~Acoustic~', '〜Live〜'). The caller still
+    gates on :func:`is_trailing_version_qualifier`, and ``similarity`` still
+    scores the un-stripped reading too — a wrong strip costs a few points,
+    never a quarantine.
+    """
+    match = _DASH_QUALIFIER_RE.search(s)
+    if match is None:
+        match = _TILDE_QUALIFIER_RE.search(s)
+    return match
 
 
 class Decision(Enum):
@@ -43,29 +89,7 @@ class Outcome:
     reason: str = ""
 
 
-def normalize(text: str) -> str:
-    """Normalize a title/artist for comparison.
-
-    lowercase; strip ``()`` / ``[]`` / ``<>`` annotations (version tags,
-    performer credits like ``<Vocal: MIKA KOBAYASHI>``); strip trailing
-    version / featuring tags; KEEP CJK characters (``\\w`` is unicode-aware) so
-    Japanese/Chinese/Korean titles produce a comparable form instead of an empty
-    string; collapse whitespace.
-    """
-    if not text:
-        return ""
-    s = text.lower().strip()
-    # Annotations that are metadata, not core identity.
-    s = re.sub(r'\s*\([^)]*\)', '', s)
-    s = re.sub(r'\s*\[[^\]]*\]', '', s)
-    s = re.sub(r'\s*<[^>]*>', '', s)
-    # Trailing featuring / version tags.
-    s = re.sub(r'\s+(?:feat\.?|ft\.?|featuring)\s+.*$', '', s, flags=re.IGNORECASE)
-    s = re.sub(
-        r'\s*-\s*(?:vocal|instrumental|acoustic|live|remix|cover|clean|explicit|'
-        r'radio\s*edit|original\s*mix|extended\s*mix|club\s*mix)\s*$',
-        '', s, flags=re.IGNORECASE,
-    )
+def _finish_normalization(s: str) -> str:
     s = re.sub(r'\s*-\s*from\s+.+$', '', s, flags=re.IGNORECASE)
     # Path/separator punctuation -> space so a title keeps matching a source
     # filename that substituted '_' for an illegal '/' or ':' (#851): the on-disk
@@ -74,18 +98,96 @@ def normalize(text: str) -> str:
     s = re.sub(r'[\\/:_]+', ' ', s)
     # Drop remaining punctuation but keep word chars (incl. CJK) + spaces.
     s = re.sub(r'[^\w\s]', '', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def _normalized_readings(text: str) -> tuple:
+    """``(canonical, verbatim)`` normalized forms of ``text``.
+
+    ``verbatim`` is ``None`` unless a ``' - <qualifier>'`` version tail was
+    actually dropped, in which case it is the same normalization with the tail
+    kept. No token rule can tell ``Taylor Swift - Long Live`` (artist + title)
+    from ``Halo - Long Live`` (title + version tag) — both end in a version
+    marker — so :func:`similarity` scores both readings and keeps the better
+    one. That is what stops the strip from being load-bearing: a wrong strip
+    costs a few points instead of collapsing a real title to the artist name
+    and quarantining a correct file.
+
+    When stripping would remove the entire string (a bracket-only title like
+    ``[untitled]``), the annotation IS the title, so the content is kept
+    (``untitled``) instead of collapsing to ``""`` (#1353).
+    """
+    if not text:
+        return "", None
+    s = text.lower().strip()
+    original = s
+    # Annotations that are metadata, not core identity.
+    s = re.sub(r'\s*\([^)]*\)', '', s)
+    s = re.sub(r'\s*\[[^\]]*\]', '', s)
+    s = re.sub(r'\s*<[^>]*>', '', s)
+    # Trailing featuring / version tags.
+    s = re.sub(r'\s+(?:feat\.?|ft\.?|featuring)\s+.*$', '', s, flags=re.IGNORECASE)
+    tail = _version_tail_match(s)
+    if tail and is_trailing_version_qualifier(tail.group("qualifier")):
+        canonical = _finish_normalization(s[:tail.start()].rstrip())
+        verbatim = _finish_normalization(s)
+        if not canonical:
+            # The base title may have been entirely inside brackets. Recover
+            # it before scoring either the stripped or the verbatim reading.
+            original_tail = _version_tail_match(original)
+            base = original[:original_tail.start()].rstrip() if original_tail else original
+            canonical = _finish_normalization(base) or base
+            verbatim = _finish_normalization(original) or original
+        return (
+            canonical,
+            verbatim,
+        )
+    canonical = _finish_normalization(s)
+    if canonical:
+        return canonical, None
+    # #1353: a bracket-only annotation is the whole title. Preserve a
+    # punctuation-only title too, so it stays distinct from other titles.
+    return _finish_normalization(original) or original, None
+
+
+def normalize(text: str, *, strip_version_tail: bool = True) -> str:
+    """Normalize a title/artist for comparison.
+
+    lowercase; strip ``()`` / ``[]`` / ``<>`` annotations (version tags,
+    performer credits like ``<Vocal: MIKA KOBAYASHI>``); strip trailing
+    version / featuring tags; KEEP CJK characters (``\\w`` is unicode-aware) so
+    Japanese/Chinese/Korean titles produce a comparable form instead of an empty
+    string; collapse whitespace. When stripping would remove the whole string
+    (``[untitled]``), the bracket content is kept — the annotation is the title
+    (#1353).
+
+    ``strip_version_tail=False`` keeps a ``' - <qualifier>'`` tail — the second
+    reading :func:`similarity` scores, see :func:`_normalized_readings`.
+    """
+    canonical, verbatim = _normalized_readings(text)
+    if not strip_version_tail and verbatim is not None:
+        return verbatim
+    return canonical
 
 
 def similarity(a: str, b: str) -> float:
-    """Similarity (0.0–1.0) between two strings after normalization."""
-    na, nb = normalize(a), normalize(b)
-    if not na or not nb:
+    """Similarity (0.0–1.0) between two strings after normalization.
+
+    Scored across both readings of each side (see :func:`_normalized_readings`),
+    best pairing wins. Only a stripped dash tail produces a second reading, so
+    the common path is the single comparison it has always been.
+    """
+    va = [v for v in _normalized_readings(a) if v]
+    vb = [v for v in _normalized_readings(b) if v]
+    if not va or not vb:
         return 0.0
-    if na == nb:
-        return 1.0
-    return SequenceMatcher(None, na, nb).ratio()
+    best = 0.0
+    for na in va:
+        for nb in vb:
+            if na == nb:
+                return 1.0
+            best = max(best, SequenceMatcher(None, na, nb).ratio())
+    return best
 
 
 _match_engine = None
@@ -100,7 +202,19 @@ def _detect_title_version(title: str) -> str:
         from core.matching_engine import MusicMatchingEngine
         _match_engine = MusicMatchingEngine()
     version_type, _ = _match_engine.detect_version_type(title)
+    # an explicit cut is the recording musicbrainz lists under the bare title
+    # (it never writes "explicit" in a recording title), so for verification
+    # it's the original. deezer names whole albums "(Album Version Explicit)",
+    # and every track of one was quarantined as the wrong version (#1579).
+    # the clean edit is the one that really differs and stays strict. ranking
+    # (#923) keeps the explicit type, it reads detect_version_type directly
+    if version_type in _SAME_RECORDING_AS_ORIGINAL:
+        return 'original'
     return version_type
+
+
+# version labels that name the same recording as the bare title
+_SAME_RECORDING_AS_ORIGINAL = frozenset({'explicit'})
 
 
 def _alias_aware_artist_sim(expected_artist: str, actual_artist: str,
@@ -143,33 +257,267 @@ def _alias_aware_artist_sim(expected_artist: str, actual_artist: str,
 
 def _find_best_title_artist_match(recordings, expected_title, expected_artist,
                                   aliases=None):
-    """Return (best_recording, title_sim, artist_sim) — title weighted higher."""
+    """Return (best_recording, title_sim, artist_sim) — title weighted higher.
+
+    Ties are broken in favour of a candidate whose VERSION matches the expected
+    one. `normalize` deliberately strips bracketed version tags, so "Celebrity"
+    and "Celebrity (karaoke)" both score title_sim 1.0 against an expected
+    "Celebrity" — an exact tie. With a strict `>` the winner was simply whichever
+    MusicBrainz happened to list first, and `evaluate`'s version gate then failed
+    on it and reported "Wrong download: 'Celebrity' is actually 'Celebrity
+    (karaoke)'" — for a file that is perfectly correct, with the matching
+    recording sitting in the same candidate list (#1132).
+
+    Reversing the candidate order flipped the verdict between FAIL and PASS,
+    which is what makes this a bug rather than a judgement call.
+    """
+    expected_version = _detect_title_version(expected_title or '')
     best_rec = None
     best_title_sim = 0.0
     best_artist_sim = 0.0
-    best_combined = 0.0
+    best_key = None
     for rec in recordings:
         title = rec.get('title') or ''
         artist = rec.get('artist') or ''
         title_sim = similarity(expected_title, title)
         artist_sim = _alias_aware_artist_sim(expected_artist, artist, aliases)
         combined = (title_sim * 0.6) + (artist_sim * 0.4)
-        if combined > best_combined:
-            best_combined = combined
+        # Similarity dominates; version agreement only settles a draw.
+        key = (combined, 1 if _detect_title_version(title) == expected_version else 0)
+        if best_key is None or key > best_key:
+            best_key = key
             best_rec = rec
             best_title_sim = title_sim
             best_artist_sim = artist_sim
     return best_rec, best_title_sim, best_artist_sim
 
 
+def _release_title_identity_match(expected_title, recordings, expected_version,
+                                  *, fingerprint_score, accept_version=None):
+    """``(recording, alternate_title, source)`` when MusicBrainz lists the
+    expected title as a title of one of the fingerprinted recordings on
+    another release (``source == 'release'``) or as a recording alias
+    (``source == 'alias'``), else ``None``.
+
+    AcoustID reports a recording under its canonical MusicBrainz title, but
+    the same recording is sold under different track titles on different
+    releases — regional editions routinely retitle it. The English release
+    of a Genshin Impact soundtrack calls one recording "Myriad Sins"; the
+    recording's canonical title, and the only one AcoustID lists, is the
+    Chinese "众罪如霜露", and its artist credit there is the group HOYO-MiX
+    where the expected metadata names the composer — so title similarity
+    scored 0% and artist 11% and a correct file was reported as a wrong
+    download (#1700). String similarity between two languages' titles for
+    the SAME recording carries no information, but here the question can
+    be answered outright instead of scored: a recording's ``alternate_titles``
+    all name THIS recording (they were resolved from its MusicBrainz ID),
+    so an exact match against one of them is identity, not similarity.
+
+    Conservative on purpose — identity is only claimed when every gate
+    agrees, because a PASS here overrides a clear artist mismatch:
+
+    - the fingerprint itself must be strong in absolute terms
+      (``fingerprint_score`` >= MIN_ACOUSTID_SCORE), not merely the best
+      of a weak bunch;
+    - only the fingerprint's TOP-scoring candidates can establish it,
+      the top must be a SINGLE distinct recording, and the fingerprint
+      must not be ambiguous (:func:`fingerprint_is_ambiguous`): a stray
+      low-scored or mis-linked candidate naming the expected title
+      proves nothing about this file, and a tied top — even two
+      recordings sharing one canonical title, an original and a cover —
+      is a coin flip this check must not call;
+    - the candidate must have a canonical title at all: a title-less
+      AcoustID result has no name for an alternate to be alternate TO;
+    - only an ALTERNATE title counts. The canonical title is what the
+      ordinary title/artist comparison already judges, so a same-title
+      cover by a different artist fails exactly as before;
+    - the match must be exact under :func:`_recording_identity`, which
+      KEEPS version qualifiers — "Song (Piano Version)" on another
+      release is not the expected "Song", however the bracket-stripping
+      similarity score reads it;
+    - the recording's own version (its canonical title's label) and the
+      alternate's version label must each agree with the expected one —
+      a release that dropped the "(Instrumental)" qualifier from its
+      track listing does not un-instrumental the recording — unless the
+      caller asked for that version on purpose (``accept_version``, the
+      same loosening the version gate applies). With ``accept_version``
+      set, the two labels may therefore straddle it (canonical carries
+      the asked-for version, the alternate the bare title): that is the
+      version gate's own semantics — the recording's version is what was
+      fetched on purpose, the alternate is only the name bridge.
+
+    Known and accepted masking, in the open like this module's other
+    trade-offs: no artist evidence is required. For the reported shape
+    none exists anywhere — MusicBrainz credits the group on every
+    release while the provider credits the composer — so requiring some
+    would make the rescue impossible. What keeps a wrong file from being
+    blessed instead is the conjunction above: the wrong file's recording
+    must be the fingerprint's unambiguous top match AND carry the
+    expected title, qualifier for qualifier, as its own title on another
+    release. A skipped wrong file costs a download slot; a failed right
+    file is quarantined and never retried.
+    """
+    if not expected_title or not recordings:
+        return None
+    # A non-finite fingerprint score (NaN / inf arriving via remote JSON,
+    # where 1e999 and NaN parse to them) is no score at all: NaN compares
+    # False against the floor and inf clears every top-score gate, so
+    # both are treated as absent rather than as evidence.
+    fp_score = fingerprint_score if isinstance(
+        fingerprint_score, (int, float)) else 0.0
+    if not math.isfinite(fp_score) or fp_score < MIN_ACOUSTID_SCORE:
+        return None
+    if fingerprint_is_ambiguous(recordings):
+        return None
+
+    def _finite_score(rec):
+        score = rec.get('score')
+        if isinstance(score, (int, float)) and math.isfinite(score):
+            return float(score)
+        return None
+
+    scored = [s for s in (_finite_score(r) for r in recordings)
+              if s is not None]
+    top_score = max(scored) if scored else None
+    expected_identity = _recording_identity(expected_title)
+    if not expected_identity:
+        return None
+
+    def _top_group_key(rec):
+        return (
+            rec.get('mbid') or '',
+            _recording_identity(rec.get('title') or ''),
+            _recording_identity(rec.get('artist') or ''),
+        )
+
+    # The candidates identity may draw on: the top-scoring group, or —
+    # when no candidate carries a usable score — every candidate (an
+    # unscored list must not bypass the unique-top gate below: a
+    # same-title original/cover pair is a coin flip scored or not).
+    if top_score is not None:
+        eligible = [r for r in recordings
+                    if _finite_score(r) is not None
+                    and _finite_score(r) >= top_score]
+    else:
+        eligible = list(recordings)
+    if len({_top_group_key(r) for r in eligible}) > 1:
+        return None
+    gated = []
+    for rec in eligible:
+        if not (rec.get('title') or '').strip():
+            continue
+        canonical_version = _detect_title_version(rec.get('title') or '')
+        if (canonical_version != expected_version
+                and canonical_version != accept_version):
+            continue
+        gated.append((rec, _recording_identity(rec.get('title') or '')))
+    # Release track titles are the strong evidence and are checked
+    # first — across ALL eligible candidates, so a release listing on
+    # one copy is never reported as an alias match from another copy.
+    # Recording aliases are also official alternate names for the
+    # recording, but crowd-sourced and weaker, so they are only
+    # consulted when no release title identifies it — and the caller
+    # reports which kind matched, so the PASS reason never claims a
+    # release listing for what was an alias.
+    for key, source in (('alternate_titles', 'release'),
+                        ('alias_titles', 'alias')):
+        for rec, canonical_identity in gated:
+            alternates = rec.get(key) or []
+            if not isinstance(alternates, (list, tuple)):
+                continue
+            for alt in alternates:
+                if not isinstance(alt, str) or not alt:
+                    continue
+                if _recording_identity(alt) == canonical_identity:
+                    continue
+                alt_version = _detect_title_version(alt)
+                if (alt_version != expected_version
+                        and alt_version != accept_version):
+                    continue
+                if _recording_identity(alt) == expected_identity:
+                    return rec, alt, source
+    return None
+
+
+def fingerprint_is_ambiguous(recordings: List[dict]) -> bool:
+    """True when the fingerprint's best-scoring recordings name DIFFERENT songs.
+
+    AcoustID returns results, and each result carries a whole LIST of MusicBrainz
+    recordings that all share that result's single score (see
+    ``acoustid.parse_lookup_result``). So "the top match" is frequently a tie
+    between several recordings, and their order is just MusicBrainz's — not a
+    ranking. Mature AcoustID entries accumulate mis-submitted links, so that tie
+    can span genuinely different songs by the same artist.
+
+    When that happens the fingerprint honestly cannot say which track this is,
+    and any single "it's actually X" claim is a coin flip. #1132: a file of
+    Chicago's "You're the Inspiration" was reported as "Saturday in the Park",
+    and the reporter found "almost all suggestions are wrong" — different songs,
+    or instrumental/karaoke/acoustic variants of the right one.
+
+    Deciding whether the file is MISLABELLED is still sound (that asks whether
+    ANY candidate matches, which ties don't affect). Only the claim about what
+    the file actually IS has to be withheld.
+    """
+    if not recordings:
+        return False
+    scored = [r for r in recordings if r.get('score') is not None]
+    if not scored:
+        # No per-recording scores to compare — treat >1 distinct title as
+        # ambiguous, since nothing distinguishes them.
+        titles = {_recording_identity(r.get('title')) for r in recordings}
+        titles.discard('')
+        return len(titles) > 1
+    top = max(r['score'] for r in scored)
+    top_titles = {
+        _recording_identity(r.get('title'))
+        for r in scored if r['score'] >= top
+    }
+    top_titles.discard('')
+    return len(top_titles) > 1
+
+
+def _recording_identity(title: Optional[str]) -> str:
+    """Case/punctuation-insensitive key for "is this the same RECORDING".
+
+    Deliberately NOT `normalize`: that strips bracketed version tags (so
+    "Song" and "Song (Instrumental)" collapse to one string — which is what
+    makes the separate version gate necessary). Here an instrumental IS a
+    different recording, and reporting one in place of the other is exactly
+    what #1132 complained about, so the qualifier has to survive.
+    """
+    if not title:
+        return ""
+    s = str(title).lower().strip()
+    s = re.sub(r'[^\w\s]+', ' ', s)
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 def evaluate(expected_title: str, expected_artist: str,
              recordings: List[dict], *, fingerprint_score: float,
-             aliases_provider: Optional[Any] = None) -> Outcome:
+             aliases_provider: Optional[Any] = None,
+             accept_version: Optional[str] = None) -> Outcome:
     """Decide PASS / SKIP / FAIL for a fingerprinted file against expected
     title/artist. Pure: no I/O. Shared by import verification and library scan.
 
     ``aliases_provider``: iterable or callable of expected-artist aliases
     (kanji/cyrillic/etc) used to bridge cross-script comparisons.
+
+    A recording dict may carry ``alternate_titles`` (its track title on
+    other releases) and ``alias_titles`` (its recording aliases): the
+    other titles MusicBrainz lists for that same recording. An exact
+    match between the expected title and one of those titles, under the
+    gates in :func:`_release_title_identity_match`, is identity — the
+    same recording under a different name (#1700) — and passes
+    regardless of how the canonical title/artist strings score.
+
+    ``accept_version``: a version label the caller went and fetched ON PURPOSE
+    (Settings → prefer a version), so the version gate must not call it a wrong
+    song. The source title says "Song" and the file really is "Song (Extended
+    Mix)" — that difference is the point, not a fault. Only the version gate
+    loosens; title and artist still have to agree, so a genuinely wrong song
+    fails exactly as before. None (the default, and the library scan always)
+    leaves the gate strict.
 
     Note: fingerprint-collision duration checks are the caller's responsibility
     (the library scan pre-checks the top recording's length before calling this)
@@ -177,7 +525,6 @@ def evaluate(expected_title: str, expected_artist: str,
     """
     from core.matching.script_compat import is_cross_script_mismatch
     from core.matching.version_mismatch import is_acceptable_version_mismatch
-    from core.text.language_version import is_language_version_label
 
     # No expected artist on record (legacy/compilation rows): compare on title
     # only — the old scanner treated this as artist-match=1.0 and a missing DB
@@ -195,34 +542,95 @@ def evaluate(expected_title: str, expected_artist: str,
     matched_title = best_rec.get('title', '?') or '?'
     matched_artist = best_rec.get('artist', '?') or '?'
 
+    # Is each dimension's score EVIDENCE at all? A similarity between two
+    # different writing systems carries no information — romaji vs kanji scores
+    # 0.00 whether or not it names the same thing — so such a dimension is
+    # UNKNOWN, never FAILED, and must never be what a FAIL rests on. Two
+    # production findings came from ignoring that: a 100% fingerprint with a
+    # 100% title match was reported as "Wrong download" because
+    # 'Sawano Hiroyuki' vs '澤野弘之' scored 0.00 and 0.00 is below
+    # CLEAR_MISMATCH_THRESHOLD. Same-script disagreement stays real evidence,
+    # so a genuinely wrong artist or song fails exactly as before.
+    title_comparable = not is_cross_script_mismatch(expected_title, matched_title)
+    artist_comparable = not is_cross_script_mismatch(expected_artist, matched_artist)
+
     def out(dec, reason):
         return Outcome(dec, title_sim, artist_sim, matched_title, matched_artist, reason)
 
     # Version gate: original vs instrumental/live/remix is a real difference.
     expected_version = _detect_title_version(expected_title)
     matched_version = _detect_title_version(matched_title)
-    if (expected_version != matched_version
-            and (is_language_version_label(expected_version)
-                 or is_language_version_label(matched_version))):
-        # Both language versions of a song often share one fingerprint -- the same
-        # backing track -- and their normalized titles tie, so whichever recording
-        # AcoustID listed first used to decide. Prefer one in the language the
-        # caller expected; only when none is listed is the file really the other.
-        for rec in recordings:
-            rec_title = rec.get('title') or ''
-            if _detect_title_version(rec_title) != expected_version:
-                continue
-            rec_title_sim = similarity(expected_title, rec_title)
-            rec_artist_sim = (1.0 if no_expected_artist else _alias_aware_artist_sim(
-                expected_artist, rec.get('artist', ''), aliases_provider))
-            if rec_title_sim >= TITLE_MATCH_THRESHOLD and rec_artist_sim >= ARTIST_MATCH_THRESHOLD:
-                best_rec, title_sim, artist_sim = rec, rec_title_sim, rec_artist_sim
-                matched_title = rec_title or '?'
-                matched_artist = rec.get('artist', '?') or '?'
-                matched_version = expected_version
-                break
+
+    # Same recording, different release title (#1700): MusicBrainz lists
+    # the expected title as this recording's title on another release, so
+    # the fingerprinted recording IS the expected song under a different
+    # name. Checked BEFORE the version gate: the gate judges the
+    # best-by-similarity recording, which may be a different candidate
+    # entirely (an instrumental namesake at a lower fingerprint score),
+    # and its verdict must not veto an identity established on the
+    # fingerprint's own top candidate — the identity check applies the
+    # version discipline to the identity recording itself (its canonical
+    # and alternate labels must both agree), so nothing the gate guards
+    # is weakened for the recording that actually identifies the file.
+    # The title/artist string scores against the canonical title are not
+    # evidence against identity established by the recording's own
+    # MusicBrainz ID — a regional retitle can score 0% on title and name
+    # a differently-credited artist while naming the same recording.
+    identity = _release_title_identity_match(
+        expected_title, recordings, expected_version,
+        fingerprint_score=fingerprint_score,
+        accept_version=accept_version)
+    if identity is not None and not no_expected_artist:
+        # no artist evidence is only waived for a retitle into another
+        # script (the reported shape: chinese canonical, english release
+        # title, composer vs group credit). a same-script retitle with a
+        # mismatched artist is how a wrong song by someone else that one
+        # release happens to list as "Intro" would get blessed.
+        _id_rec = identity[0]
+        _id_artist = _id_rec.get('artist') or ''
+        if not (is_cross_script_mismatch(expected_title, _id_rec.get('title') or '')
+                or is_cross_script_mismatch(expected_artist, _id_artist)
+                or _alias_aware_artist_sim(expected_artist, _id_artist,
+                                           aliases_provider) >= ARTIST_MATCH_THRESHOLD):
+            identity = None
+    if identity is not None:
+        id_rec, id_alt, id_source = identity
+        # Reported for the log/outcome only — plain similarity, NOT the
+        # alias-aware score: resolving artist aliases can trigger a
+        # DB/MusicBrainz lookup chain, and the identity decision does not
+        # rest on this number, so it must not pay for it.
+        id_artist_sim = 1.0 if no_expected_artist else similarity(
+            expected_artist, id_rec.get('artist') or '')
+        logger.info(
+            "Release-title identity rescued comparison: expected=%r is a "
+            "%s title of the fingerprinted recording %r by %r "
+            "(canonical title %r, artist sim=%.2f)",
+            expected_title, id_source, id_alt, id_rec.get('artist'),
+            id_rec.get('title'), id_artist_sim,
+        )
+        if id_source == 'alias':
+            id_reason = (
+                f"Same recording under a different name: MusicBrainz lists "
+                f"'{id_alt}' as an alias of this recording")
+        else:
+            id_reason = (
+                f"Same recording under a different release title: "
+                f"MusicBrainz lists this recording as '{id_alt}' on "
+                f"another release")
+        return Outcome(
+            Decision.PASS,
+            similarity(expected_title, id_alt),
+            id_artist_sim,
+            id_rec.get('title', '?') or '?',
+            id_rec.get('artist', '?') or '?',
+            id_reason,
+        )
+
     if expected_version != matched_version:
-        if not is_acceptable_version_mismatch(
+        # the caller asked for this exact version, so the file reporting it is
+        # the setting working, not a mismatch.
+        _asked_for_it = bool(accept_version) and matched_version == accept_version
+        if not _asked_for_it and not is_acceptable_version_mismatch(
             expected_version, matched_version,
             fingerprint_score=fingerprint_score,
             title_similarity=title_sim, artist_similarity=artist_sim,
@@ -242,7 +650,57 @@ def evaluate(expected_title: str, expected_artist: str,
                 expected_artist, rec.get('artist', ''), aliases_provider,
             ) >= ARTIST_MATCH_THRESHOLD:
                 return out(Decision.PASS, "Expected artist found in AcoustID results")
+        if not artist_comparable:
+            # The title already agrees and the artist score is unreadable, so
+            # there is nothing here that says the file is wrong.
+            #
+            # Deliberate and known: a cover of the right song by a non-Latin
+            # artist is a real wrong download and is unreportable through this
+            # branch. Nothing cheap distinguishes it — MusicBrainz alias lists
+            # are incomplete often enough that "the aliases did not match" is
+            # not evidence either, and a fingerprint bar here would re-quarantine
+            # the correct files this change exists for. A matching title after a
+            # matching fingerprint is corroboration; we take it.
+            return out(Decision.SKIP,
+                       f"Title matches and the artist is written in a different "
+                       f"script, so the names cannot be compared: "
+                       f"'{matched_title}' by '{matched_artist}' "
+                       f"(expected '{expected_artist}')")
         if artist_sim < CLEAR_MISMATCH_THRESHOLD:
+            # #1628: the "winner" is only the best-scoring recording, not the
+            # only candidate — a Latin stray credit ('They Die', 0.20) can
+            # outrank the real non-Latin artist (宇多田ヒカル, 0.00
+            # cross-script) on the same matching title, and the 0.20 then
+            # reads as a CLEAR mismatch. But a same-title recording whose
+            # artist is cross-script-incomparable with the expected one is
+            # exactly the shape this module already treats as "unknown, never
+            # failed": the score says nothing about the names. Scan every
+            # recording — if one names this title with an unreadable artist,
+            # the FAIL would rest on a ranking accident, so stay silent
+            # instead of quarantining.
+            #
+            # Accepted masking (deliberate trade-off, not a gap): this SKIP can
+            # hide a genuinely wrong file — e.g. the file is really Hamasaki's
+            # and a same-title 浜崎あゆみ recording exists, where the old code
+            # FAILed. Unresolvable in principle: with the artist names
+            # cross-script incomparable, nothing separates "expected artist,
+            # unreadable credit" from "different artist, unreadable credit",
+            # and failing on the title alone would re-quarantine the correct
+            # files this change exists to protect. Same standing trade-off as
+            # the module's other SKIP branches: a skipped wrong file stays
+            # downloadable and retryable; a failed right file is quarantined
+            # and never retried. The former costs a download slot, the latter
+            # costs the track.
+            for rec in recordings:
+                if (similarity(expected_title, rec.get('title') or '')
+                        >= TITLE_MATCH_THRESHOLD
+                        and is_cross_script_mismatch(expected_artist,
+                                                     rec.get('artist') or '')):
+                    return out(Decision.SKIP,
+                               f"Title matches and a same-title recording's "
+                               f"artist ('{rec.get('artist')}') is written in a "
+                               f"different script, so the names cannot be "
+                               f"compared")
             return out(Decision.FAIL,
                        f"Audio mismatch: '{matched_title}' by '{matched_artist}' "
                        f"— expected artist not found")
@@ -278,9 +736,30 @@ def evaluate(expected_title: str, expected_artist: str,
                                          and artist_sim >= ARTIST_MATCH_THRESHOLD)
     cross_script_artist_skip = (fingerprint_score >= MIN_ACOUSTID_SCORE
                                 and artist_sim >= ARTIST_MATCH_THRESHOLD
-                                and is_cross_script_mismatch(expected_artist, matched_artist))
+                                and not artist_comparable)
+    # The title is the dimension that disagreed — but if it is written in
+    # another script its score was never readable, and the artist either agrees
+    # or is unreadable too. Nothing comparable disagrees, so no claim can be
+    # made. `language_script_skip` above covered a slice of this behind a
+    # fingerprint >= 0.95 bar, which left an ordinary 0.90 match on a
+    # Japanese-titled track quarantined; the script signal does not depend on
+    # how well the fingerprint scored.
+    #
+    # Known and accepted: when BOTH dimensions are unreadable there is no
+    # evidence in either direction, so a genuinely wrong non-Latin download is
+    # unreportable here. Re-adding a fingerprint bar for that case was tried and
+    # reverted — it does not separate the two, because the score says nothing
+    # about the NAMES. What it does instead is quarantine the correct file this
+    # change exists for: "Zankoku na Tenshi no These" by "Yoko Takahashi"
+    # against 残酷な天使のテーゼ by 高橋洋子 at a perfectly ordinary 0.90 is the
+    # same shape as a wrong one, and that is the direction that costs a user
+    # their file. Silence is the safe half of an unanswerable question.
+    incomparable_title_skip = (
+        not title_comparable
+        and (not artist_comparable or artist_sim >= ARTIST_MATCH_THRESHOLD)
+    )
     if (language_script_skip or high_confidence_strong_match_skip
-            or cross_script_artist_skip):
+            or cross_script_artist_skip or incomparable_title_skip):
         return out(Decision.SKIP, "Likely same song in different language/script")
 
     return out(Decision.FAIL,

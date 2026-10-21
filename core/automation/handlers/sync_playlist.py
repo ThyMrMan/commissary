@@ -74,6 +74,15 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
                 'album': album_obj,
                 'duration_ms': md.get('duration_ms', 0),
                 'id': md.get('id', ''),
+                # Carried purely so the sync can write its per-track verdict back
+                # onto this row. `id` above is the SOURCE id and cannot serve:
+                # for a ListenBrainz playlist it is a 'file:...' reference, and
+                # after discovery it is whichever provider matched (often Deezer).
+                # SpotifyTrack reads named fields, so this rides along unused.
+                'db_track_id': t.get('id'),
+                # the playlist's own id, which `id` above is not: Find & Add
+                # files a manual match under it, so the sync needs both (#1289)
+                'source_track_id': t.get('source_track_id') or '',
             }
             if md.get('track_number'):
                 _track_entry['track_number'] = md['track_number']
@@ -112,6 +121,8 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
                     'album': album_obj,
                     'duration_ms': t.get('duration_ms', 0),
                     'id': hint['id'],
+                    'db_track_id': t.get('id'),
+                    'source_track_id': t.get('source_track_id') or '',
                 })
             elif t.get('source_track_id') and (t.get('track_name') or '').strip():
                 # Has a valid source ID and track name — usable for wishlist.
@@ -121,6 +132,8 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
                     'album': album_obj,
                     'duration_ms': t.get('duration_ms', 0),
                     'id': t['source_track_id'],
+                    'db_track_id': t.get('id'),
+                    'source_track_id': t['source_track_id'],
                 })
             else:
                 skipped_count += 1  # No usable ID or name — truly can't process.
@@ -128,14 +141,22 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
     if not tracks_json:
         deps.update_progress(
             auto_id,
-            log_line=f'No discovered tracks — {skipped_count} need discovery first',
+            log_line=f'No identified tracks — {skipped_count} need identification first',
             log_type='skip',
         )
         return {
             'status': 'skipped',
-            'reason': f'No discovered tracks to sync ({skipped_count} tracks need discovery first)',
+            'reason': f'No identified tracks to sync ({skipped_count} tracks need identification first)',
             'skipped_tracks': str(skipped_count),
         }
+
+    # The mirror owns this assignment.  Carry it on every track so both the
+    # direct sync-time wishlist path and any later failed-download path use
+    # the same profile, independent of Library v2.
+    quality_profile_id = pl.get('quality_profile_id')
+    if quality_profile_id is not None:
+        for track in tracks_json:
+            track['quality_profile_id'] = quality_profile_id
 
     # Preflight: hash the track list and compare against last sync.
     # Skip if the exact same set of tracks was already synced and
@@ -154,6 +175,17 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
     )
     mirror_tracks_hash = hashlib.md5(mirror_ids_str.encode()).hexdigest() if mirror_ids_str else ''
 
+    # #1704: the mirror's own mode, then the pipeline's, else None so the
+    # global setting decides. junk in either is skipped, not trusted
+    from core.sync.playlist_edit import VALID_SYNC_MODES, resolve_sync_mode
+    own_sync_mode = next(
+        (m for m in (pl.get('sync_mode'), config.get('sync_mode')) if m in VALID_SYNC_MODES),
+        None,
+    )
+    _cm_get = getattr(getattr(deps, 'config_manager', None), 'get', None)
+    _global_mode = _cm_get('playlist_sync.mode', 'reconcile') if callable(_cm_get) else None
+    sync_mode = resolve_sync_mode(own_sync_mode, _global_mode)
+
     event_data = config.get('_event_data') or {}
     try:
         tracks_added = int(event_data.get('added') or 0)
@@ -169,13 +201,55 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
         last_matched = last_status.get('matched_tracks', -1)
 
         mirror_changed = bool(mirror_tracks_hash) and mirror_tracks_hash != last_mirror_hash
-        if (
+        # An authoritative Quality Profile change is a state change even when
+        # not a single track id moved: the existing Wishlist rows still have to
+        # be re-stamped. The fingerprint used to cover only the track list, so
+        # a profile-only edit was silently skipped forever (P1-03).
+        #
+        # A status written before this key existed reads as None. After the
+        # Foundation backfill every mirror HAS a profile, so an upgraded install
+        # forces exactly one extra sync per mirror and is then self-consistent.
+        last_quality_profile_id = last_status.get('quality_profile_id')
+        quality_profile_changed = last_quality_profile_id != quality_profile_id
+        # same for the mode (#1704): same tracks synced in a new mode is a
+        # change, or switching a pipeline to replace never reached the server.
+        # a status from before the key existed ran in the global mode
+        last_sync_mode = last_status.get('sync_mode') or resolve_sync_mode(None, _global_mode)
+        sync_mode_changed = last_sync_mode != sync_mode
+        # unchanged tracks are not enough: a matched file deleted since the last
+        # sync changes nothing above, and skipping then never re-matched or
+        # wishlisted it (#1417). checked last, it is the only part that reads
+        # the library.
+        unchanged = (
             not force_sync
             and not mirror_changed
+            and not quality_profile_changed
+            and not sync_mode_changed
             and last_hash == tracks_hash
             and last_matched >= len(tracks_json)
-        ):
-            # Exact same tracks, all matched last time — nothing to do.
+        )
+        library_lost = False
+        if unchanged:
+            from core.sync.library_presence import matched_tracks_still_present
+            library_lost = not matched_tracks_still_present(db, tracks)
+        if unchanged and not library_lost:
+            # Exact same tracks, all matched last time — nothing to DOWNLOAD.
+            # The run still happened, so it still gets recorded: skipping the
+            # bookkeeping too is what left the dashboard card with no run to
+            # show, saying "no runs yet" and refusing to open, for a playlist
+            # whose pipeline had just completed (Boulder, Aug 2026).
+            try:
+                from core.downloads.history import record_sync_history_noop
+                record_sync_history_noop(
+                    db,
+                    sync_id_key,
+                    pl.get('name') or '',
+                    tracks_json,
+                    profile_id=pl.get('profile_id'),
+                    quality_profile_id=quality_profile_id,
+                )
+            except Exception as hist_err:  # noqa: BLE001 - never fail a sync on bookkeeping
+                deps.logger.debug("no-op sync history failed: %s", hist_err)
             deps.update_progress(
                 auto_id,
                 log_line=f'All {len(tracks_json)} tracks unchanged since last sync — skipping',
@@ -194,10 +268,25 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
                 ),
                 log_type='info',
             )
+        elif library_lost:
+            deps.update_progress(
+                auto_id,
+                log_line='A track from the last sync is no longer in the library, running sync',
+                log_type='info',
+            )
         elif mirror_changed:
             deps.update_progress(
                 auto_id,
                 log_line='Mirror track list changed — running sync',
+                log_type='info',
+            )
+        elif quality_profile_changed:
+            deps.update_progress(
+                auto_id,
+                log_line=(
+                    f'Quality Profile changed ({last_quality_profile_id} → '
+                    f'{quality_profile_id}) — re-running sync'
+                ),
                 log_type='info',
             )
     except Exception as e:
@@ -205,14 +294,20 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
 
     # Sync under the user's custom alias when set, else the upstream name (#865
     # follow-up). The server-side playlist is named with this.
-    from core.playlists.naming import effective_mirrored_name
-    sync_name = effective_mirrored_name(pl) or pl.get('name') or 'Playlist'
+    # the server playlist is found by name, so a mirror that would land on
+    # another mirror's playlist gets a distinct name (core/playlists/sync_names)
+    from core.playlists.sync_names import sync_name_for
+    try:
+        _active_server = deps.config_manager.get_active_media_server()
+    except Exception:
+        _active_server = None
+    sync_name = sync_name_for(db, _active_server, pl) or pl.get('name') or 'Playlist'
 
     deps.update_progress(
         auto_id,
         progress=50,
         phase=f'Syncing "{sync_name}"',
-        log_line=f'{len(tracks_json)} discovered, {skipped_count} skipped',
+        log_line=f'{len(tracks_json)} identified, {skipped_count} skipped',
         log_type='info',
     )
 
@@ -223,11 +318,37 @@ def auto_sync_playlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str
         log_line=f'Starting sync: {len(tracks_json)} tracks',
         log_type='success',
     )
-    skip_wishlist_add = bool(pl.get('organize_by_playlist'))
+    # Organize-by-playlist skips sync-time wishlist adds (its batch failure
+    # handling covers missing tracks instead). A pipeline run whose
+    # resolved skip_wishlist is set — the automation's "Skip wishlist
+    # processing" checkbox or the global wishlist_missing_tracks toggle
+    # (#1455) — must skip the adds too (#1689): the wishlist-phase skip
+    # alone still let every sync wishlist the tracks it was syncing.
+    # a standalone "Sync Playlist" automation never sets the key: nobody chose
+    # per click there, so the global toggle decides, as its help text says
+    # ("turn it off and syncs skip the wishlist step").
+    organize_by_playlist = bool(pl.get('organize_by_playlist'))
+    skip_add = config.get('skip_wishlist_add')
+    if skip_add is None:
+        _cm_get = getattr(getattr(deps, 'config_manager', None), 'get', None)
+        skip_add = callable(_cm_get) and not _cm_get('playlist_sync.wishlist_missing_tracks', True)
+    skip_wishlist_add = organize_by_playlist or bool(skip_add)
     threading.Thread(
         target=deps.run_sync_task,
-        args=(sync_id, sync_name, tracks_json, auto_id, 1, pl.get('image_url', '')),
-        kwargs={'skip_wishlist_add': skip_wishlist_add},
+        args=(
+            sync_id, sync_name, tracks_json, auto_id,
+            int(pl.get('profile_id') or 1), pl.get('image_url', ''),
+        ),
+        kwargs={
+            'skip_wishlist_add': skip_wishlist_add,
+            # Kept separate from skip_wishlist_add (#1689): the post-sync
+            # followup starts an organize download batch only for a real
+            # organize-by-playlist skip, never for a wishlist-toggle skip.
+            'organize_by_playlist': organize_by_playlist,
+            # a playlist's own Sync & download click, not a schedule (#1603)
+            'user_initiated': bool(config.get('user_initiated')),
+            'sync_mode': own_sync_mode,
+        },
         daemon=True,
         name=f'auto-sync-{playlist_id}',
     ).start()

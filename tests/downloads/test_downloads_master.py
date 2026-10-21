@@ -24,6 +24,15 @@ def reset_state():
     download_batches.clear()
 
 
+@pytest.fixture(autouse=True)
+def no_persisted_album_pins(monkeypatch):
+    # the preflight goes through the persistent album -> release pin. a pin one
+    # test records must not answer another test's preflight
+    from core.metadata import album_mbid_cache
+    monkeypatch.setattr(album_mbid_cache, 'lookup', lambda *a, **k: None)
+    monkeypatch.setattr(album_mbid_cache, 'record', lambda *a, **k: True)
+
+
 class _FakeConfig:
     def __init__(self, values=None):
         self._v = values or {}
@@ -45,7 +54,7 @@ class _FakeDB:
         self.track_results_calls = []
         self.manual_matches = []
 
-    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None, album=None):
+    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None, album=None, include_downloads=False):
         key = (title.lower().strip(), artist.lower().strip())
         if key in self.found_tracks:
             conf = self.found_tracks[key]
@@ -149,6 +158,14 @@ class _FakeAlbumBundleSoulseek:
         self.calls.append((album, artist, staging, kwargs))
         emit({'state': 'staged', 'count': len(self.outcome.get('files', []))})
         return self.outcome
+
+
+class _UnconfiguredAlbumBundlePlugin(_FakeAlbumBundleSoulseek):
+    def is_configured(self):
+        return False
+
+    def download_album_to_staging(self, *args, **kwargs):
+        raise AssertionError("an unconfigured album source must be skipped")
 
 
 class _FakePreflightAlbumBundleSoulseek(_FakeSoulseek):
@@ -495,6 +512,45 @@ def test_no_missing_marks_batch_complete(monkeypatch):
     assert db.sync_history_calls  # sync history written
 
 
+def test_completion_clears_the_album_bundle_progress_mirror(monkeypatch):
+    """A finished album must stop rendering a bundle row.
+
+    album_bundle_state is a LIVE MIRROR of the plugin's progress — _emit writes
+    whatever the last payload said — and it has no completion value: only
+    'searching', 'fallback', 'staged' and 'failed' are ever assigned. Nothing
+    cleared it, and _build_album_bundle_status emits a bundle row whenever the
+    field is truthy, so a finished album showed "downloading release 42%" on the
+    Downloads page forever, frozen at the last tick.
+
+    Cleared at completion and NOT earlier: task_worker reads
+    `album_bundle_state == 'staged'` while the per-track flow runs.
+    """
+    db = _FakeDB(found_tracks={('t1', 'a'): 0.9})
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    deps = _build_deps()
+    _seed_batch(
+        'B5b',
+        album_bundle_state='downloading',
+        album_bundle_progress=0.42,
+        album_bundle_speed=2048,
+        album_bundle_source='torrent',
+        album_bundle_release='The Life of a Showgirl [FLAC]',
+    )
+
+    mw.run_full_missing_tracks_process('B5b', 'P1', [{'name': 'T1', 'artists': ['A']}], deps)
+
+    batch = download_batches['B5b']
+    assert batch['phase'] == 'complete'
+    # Falsy state is what makes _build_album_bundle_status return {} — no row.
+    assert not batch['album_bundle_state']
+    assert 'album_bundle_progress' not in batch
+    assert 'album_bundle_speed' not in batch
+    # The provenance stays: how the album arrived is still reportable.
+    assert batch['album_bundle_source'] == 'torrent'
+    assert batch['album_bundle_release'] == 'The Life of a Showgirl [FLAC]'
+
+
 def test_no_missing_updates_youtube_playlist_state(monkeypatch):
     """YouTube playlist phase set to 'download_complete' on no-missing."""
     db = _FakeDB(found_tracks={('t1', 'a'): 0.9})
@@ -614,7 +670,7 @@ def test_mb_release_preflight_caches_mbid(monkeypatch):
 
     fake_release = {'id': 'mbid-xyz', 'title': 'Test Album'}
 
-    def fake_find_best_release(album, artist, count, svc):
+    def fake_find_best_release(album, artist, count, svc, **_kwargs):
         return fake_release
 
     import core.album_consistency as ac
@@ -638,6 +694,107 @@ def test_mb_release_preflight_caches_mbid(monkeypatch):
     assert ('test album', 'artist') in cache
     assert cache[('test album', 'artist')] == 'mbid-xyz'
     assert detail_cache['mbid-xyz'] == fake_release
+
+
+def test_mb_release_preflight_is_skipped_for_an_album_already_owned(monkeypatch):
+    """boulder: "click begin analysis ... takes a while before any tracks
+    start marking as owned or missing". the preflight (an MB search plus
+    up to eight full release fetches, 1 req/s, 503 retries) used to run
+    before a single track was checked, and it exists only to tag files
+    that get downloaded. an album you own downloads nothing."""
+    db = _FakeDB(album=_DBAlbum(id_=7, title='Owned Album'), album_tracks=[_DBTrack('T1')])
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    calls = []
+
+    import core.album_consistency as ac
+    monkeypatch.setattr(ac, '_find_best_release',
+                        lambda album, artist, count, svc, **_k: calls.append(album) or {'id': 'mbid-1'})
+    cache = {}
+    deps = _build_deps(mb_worker=_FakeMBWorker(svc=_FakeMBSvc()), mb_release_cache=cache)
+    _seed_batch('B12', is_album_download=True,
+                album_context={'name': 'Owned Album', 'total_tracks': 1},
+                artist_context={'name': 'Artist'})
+
+    mw.run_full_missing_tracks_process('B12', 'album:1', [{'name': 'T1', 'artists': ['Artist']}], deps)
+
+    assert download_batches['B12']['phase'] == 'complete'
+    assert calls == [], "nothing to download, nothing to pin"
+    assert cache == {}
+
+
+def test_mb_release_preflight_runs_after_every_track_is_analysed(monkeypatch):
+    """the analysis (what the modal shows) must finish before the network wait starts."""
+    # one owned, one missing, so the album path both analyses and downloads
+    db = _FakeDB(album=_DBAlbum(id_=8, title='Album'), album_tracks=[_DBTrack('T1')])
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    order = []
+    real_lookup = db.get_tracks_by_album
+
+    def spying_lookup(*a, **k):
+        order.append('analysed')
+        return real_lookup(*a, **k)
+    db.get_tracks_by_album = spying_lookup
+
+    import core.album_consistency as ac
+    monkeypatch.setattr(ac, '_find_best_release',
+                        lambda album, artist, count, svc, **_k: order.append('preflight') or {'id': 'mbid-1'})
+    deps = _build_deps(mb_worker=_FakeMBWorker(svc=_FakeMBSvc()), mb_release_cache={})
+    _seed_batch('B13', is_album_download=True,
+                album_context={'name': 'Album', 'total_tracks': 2},
+                artist_context={'name': 'Artist'})
+
+    mw.run_full_missing_tracks_process('B13', 'album:1',
+                                       [{'name': 'T1', 'artists': ['Artist']},
+                                        {'name': 'T2', 'artists': ['Artist']}], deps)
+
+    assert 'preflight' in order and 'analysed' in order
+    assert order.index('preflight') > order.index('analysed')
+
+
+def test_mb_release_preflight_scores_against_the_whole_album(monkeypatch):
+    """#1618: three late nirvana tracks searched as a 3-track album, and a
+    2-track 1980 single from another band outscored the 14-track album."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    counts = []
+
+    import core.album_consistency as ac
+    monkeypatch.setattr(ac, '_find_best_release',
+                        lambda album, artist, count, svc, **_k: counts.append(count) or {'id': 'mbid-1'})
+    deps = _build_deps(mb_worker=_FakeMBWorker(svc=_FakeMBSvc()), mb_release_cache={})
+    _seed_batch('B14', is_album_download=True,
+                album_context={'name': 'Nirvana', 'total_tracks': 14},
+                artist_context={'name': 'Nirvana'})
+
+    mw.run_full_missing_tracks_process('B14', 'album:1',
+                                       [{'name': n, 'artists': ['Nirvana']} for n in ('Rape Me', 'Dumb', 'Lithium')],
+                                       deps)
+
+    assert counts == [14]
+
+
+def test_mb_release_preflight_keeps_the_release_the_album_is_pinned_to(monkeypatch):
+    """#1618: the first batch pinned the album's release. the preflight for its
+    leftover tracks searched afresh and cached a different release over it."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    from core.metadata import album_mbid_cache
+    monkeypatch.setattr(album_mbid_cache, 'lookup', lambda album, artist: 'pinned-1')
+    pinned = {'id': 'pinned-1', 'title': 'With the Lights Out'}
+    svc = _FakeMBSvc()
+    svc.mb_client = SimpleNamespace(get_release=lambda mbid, includes=None: pinned if mbid == 'pinned-1' else None)
+
+    import core.album_consistency as ac
+    monkeypatch.setattr(ac, '_find_best_release', lambda *a, **k: pytest.fail('searched past the pin'))
+    cache = {}
+    deps = _build_deps(mb_worker=_FakeMBWorker(svc=svc), mb_release_cache=cache)
+    _seed_batch('B15', is_album_download=True,
+                album_context={'name': 'With the Lights Out', 'total_tracks': 81},
+                artist_context={'name': 'Nirvana'})
+
+    mw.run_full_missing_tracks_process('B15', 'album:1', [{'name': 'T1', 'artists': ['Nirvana']}], deps)
+
+    assert cache[('with the lights out', 'nirvana')] == 'pinned-1'
 
 
 def test_mb_release_preflight_skipped_when_no_mb_worker(monkeypatch):
@@ -709,6 +866,168 @@ def test_soulseek_album_preflight_scores_release_folder_over_larger_wrong_editio
         'folder_path': 'Artist/Test Album (2020)',
     }
     assert download_batches['B22']['source_folder_tracks'] == correct_tracks
+
+
+def test_soulseek_album_score_rejects_partial_folder_despite_good_metadata():
+    from core.downloads.master import _score_album_folder
+
+    expected = [
+        {'name': f'Track {number}', 'artists': ['Artist'], 'track_number': number}
+        for number in range(1, 11)
+    ]
+    partial = [_slsk_track(f'Track {number}', number, folder='Artist/Test Album')
+               for number in range(1, 6)]
+    album = _album_result('peer', 'Artist/Test Album', 'Test Album', partial,
+                          quality_score=1.0)
+    assert _score_album_folder(
+        album, {'name': 'Test Album', 'total_tracks': 10}, {'name': 'Artist'},
+        expected, partial,
+    ) == 0.0
+
+
+def test_soulseek_album_score_accepts_complete_artistless_folder():
+    from core.downloads.master import _score_album_folder
+
+    expected = [
+        {'name': f'Track {number}', 'artists': ['Queen'], 'track_number': number}
+        for number in range(1, 4)
+    ]
+    tracks = [_slsk_track(f'Track {number}', number, folder='Music/A Night at the Opera (1975) [FLAC]')
+              for number in range(1, 4)]
+    album = _album_result('peer', 'Music/A Night at the Opera (1975) [FLAC]',
+                          'A Night at the Opera', tracks, artist='', year='1975')
+
+    assert _score_album_folder(
+        album, {'name': 'A Night at the Opera', 'total_tracks': 3}, {'name': 'Queen'},
+        expected, tracks,
+    ) >= 0.62
+
+
+def test_soulseek_album_score_reads_artist_from_a_parent_directory():
+    from core.downloads.master import _score_album_folder
+
+    expected = [
+        {'name': f'Track {number}', 'artists': ['Doves'], 'track_number': number}
+        for number in range(1, 4)
+    ]
+    tracks = [_slsk_track(f'Track {number}', number, folder='Doves/(2000) Lost Souls')
+              for number in range(1, 4)]
+    with_parent = _album_result('peer', 'Doves/(2000) Lost Souls', 'Lost Souls', tracks,
+                                artist='', year='2000')
+    without = _album_result('peer', 'Shared/(2000) Lost Souls', 'Lost Souls', tracks,
+                            artist='', year='2000')
+    context = ({'name': 'Lost Souls', 'total_tracks': 3}, {'name': 'Doves'})
+
+    assert _score_album_folder(with_parent, *context, expected, tracks) > \
+        _score_album_folder(without, *context, expected, tracks)
+
+
+def test_soulseek_album_title_similarity_keeps_existing_baseline():
+    from core.downloads.master import _album_title_similarity, _similarity
+
+    assert _album_title_similarity('', 'Artist', '2020', 'Album', 'Artist/Album') == 0.0
+    assert _album_title_similarity('Album', 'Artist', '2020', 'Album', '') == 1.0
+    assert _album_title_similarity('Album', 'Artist', '2020', 'Other', 'Other') == _similarity('Album', 'Other')
+
+
+@pytest.mark.parametrize(('artist', 'year', 'text'), [
+    ('Artist', '', 'Artist Album'),
+    ('', '2020', 'Album 2020'),
+    ('Artist', '2020', 'Artist Album 2020'),
+    ('Artist', '2020', 'Artist A-B 2020'),
+])
+def test_soulseek_album_title_similarity_removes_distinct_metadata(artist, year, text):
+    from core.downloads.master import _album_title_similarity
+
+    album = 'A-B' if 'A-B' in text else 'Album'
+    assert _album_title_similarity(album, artist, year, text, '') == 1.0
+
+
+def test_soulseek_album_title_similarity_can_use_path_metadata():
+    from core.downloads.master import _album_title_similarity
+
+    assert _album_title_similarity('Album', 'Artist', '2020', '', 'Artist/Album/2020') == 1.0
+
+
+def test_soulseek_album_title_similarity_repeated_spans_preserve_length_ratio():
+    from core.downloads.master import _album_title_similarity
+
+    assert _album_title_similarity('Album', 'Artist', '2020',
+                                   'Album Artist 2020 Album', '') == 5 / 11
+
+
+@pytest.mark.parametrize(('artist', 'year', 'text'), [
+    ('Artist', '', 'Artist Artist Album'),
+    ('', '2020', '2020 Album 2020'),
+    ('Summer 2020', '2020', 'Summer 2020 Album'),
+    ('AlbumArtist', '', 'AlbumArtist Album'),
+])
+def test_soulseek_album_title_similarity_removes_all_distinct_metadata(artist, year, text):
+    from core.downloads.master import _album_title_similarity
+
+    assert _album_title_similarity('Album', artist, year, text, '') == 1.0
+
+
+def test_soulseek_album_title_similarity_requires_whole_words_and_distinct_spans():
+    from core.downloads.master import _album_title_similarity, _similarity
+
+    assert _album_title_similarity('Album', 'One', '', 'Someone Album', '') == _similarity('Album', 'Someone Album')
+    assert _album_title_similarity('Album', '', '2020', 'Album 20205', '') == _similarity('Album', 'Album 20205')
+    assert _album_title_similarity('One', 'One', '', 'One Bonus', '') == _similarity('One', 'One Bonus')
+    assert _album_title_similarity('One', 'One', '', 'One One', '') == 1.0
+    assert _album_title_similarity('Summer 1999', '', '1999', 'Summer 1999 Bonus', '') == _similarity(
+        'Summer 1999', 'Summer 1999 Bonus')
+
+
+def test_soulseek_album_title_similarity_does_not_guess_release_labels():
+    from core.downloads.master import _album_title_similarity, _similarity
+
+    title = 'GUNSHIP - Album - 2015 - GUNSHIP'
+    score = _album_title_similarity('GUNSHIP', 'Gunship', '2015', title, '')
+    assert _similarity('GUNSHIP', title) < score < 0.65
+
+
+def test_soulseek_eponymous_album_search_uses_year_instead_of_duplicate_name():
+    from core.downloads.master import _album_search_queries
+
+    assert _album_search_queries('Gunship', 'GUNSHIP', '2015') == [
+        'Gunship 2015', 'GUNSHIP',
+    ]
+    assert _album_search_queries('Gunship', 'GUNSHIP', '') == ['GUNSHIP']
+    assert _album_search_queries('Massive Attack', 'Mezzanine', '1998') == [
+        'Massive Attack Mezzanine', 'Mezzanine',
+    ]
+
+
+def test_soulseek_album_preflight_prefers_available_peer_in_equivalent_band(monkeypatch):
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+    expected = [{'name': 'T1', 'artists': ['Artist'], 'track_number': 1}]
+    slow_tracks = [_slsk_track('T1', 1, folder='Artist/Test Album')]
+    fast_tracks = [_slsk_track('T1', 1, folder='Artist/Test Album')]
+    slow = _album_result('slow', 'Artist/Test Album', 'Test Album', slow_tracks,
+                         quality_score=0.91)
+    slow.free_upload_slots = 0
+    slow.queue_length = 8
+    slow.upload_speed = 50_000
+    fast = _album_result('fast', 'Artist/Test Album', 'Test Album', fast_tracks,
+                         quality_score=0.90)
+    fast.free_upload_slots = 1
+    fast.queue_length = 0
+    fast.upload_speed = 2_000_000
+    slsk = _FakeSoulseek(album_results=[slow, fast], browse_files=None,
+                         parsed_tracks=fast_tracks)
+    deps = _build_deps(
+        config=_FakeConfig({'download_source.mode': 'soulseek'}),
+        soulseek=_FakeSoulseekWrapper(slsk),
+    )
+    _seed_batch('B29', is_album_download=True,
+                album_context={'name': 'Test Album', 'total_tracks': 1},
+                artist_context={'name': 'Artist'})
+
+    mw.run_full_missing_tracks_process('B29', 'album:1', expected, deps)
+
+    assert download_batches['B29']['last_good_source']['username'] == 'fast'
 
 
 def test_soulseek_album_preflight_runs_when_soulseek_is_hybrid_primary(monkeypatch):
@@ -790,7 +1109,7 @@ def test_soulseek_album_bundle_runs_after_missing_analysis(monkeypatch):
     album, artist, staging, kwargs = plugin.calls[0]
     assert (album, artist) == ('Test Album', 'Artist')
     assert staging.replace('\\', '/').endswith('storage/album_bundle_staging/B25')
-    assert kwargs == {}
+    assert kwargs == {'expected_tracks': tracks}
     assert download_batches['B25']['album_bundle_source'] == 'soulseek'
     assert download_batches['B25']['album_bundle_private_staging'] is True
     assert download_batches['B25']['album_bundle_state'] == 'staged'
@@ -855,11 +1174,13 @@ def test_soulseek_album_bundle_uses_preflight_source_without_preloading_reuse(mo
 
     assert len(slsk.calls) == 1
     assert slsk.calls[0][3] == {
+        'expected_tracks': tracks,
         'preferred_source': {
             'username': 'peer',
             'folder_path': 'Artist/Test Album',
         },
         'preferred_tracks': folder_tracks,
+        'preferred_alternatives': [],
     }
     assert download_batches['B28']['album_bundle_private_staging'] is True
     assert 'last_good_source' not in download_batches['B28']
@@ -890,6 +1211,222 @@ def test_hybrid_first_torrent_uses_album_bundle_before_per_track(monkeypatch):
 
     assert len(plugin.calls) == 1
     assert download_batches['B27']['album_bundle_source'] == 'torrent'
+
+
+def test_hybrid_album_bundle_falls_through_torrent_to_usenet(monkeypatch):
+    """Consecutive release sources are real fallbacks, not a dead-end prefix."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    torrent = _FakeAlbumBundleSoulseek({
+        'success': False,
+        'fallback': True,
+        'error': 'No torrent release matched the profile',
+    })
+    usenet = _FakeAlbumBundleSoulseek({
+        'success': True,
+        'files': ['/tmp/a.flac'],
+    })
+    deps = _build_deps(
+        config=_FakeConfig({
+            'download_source.mode': 'hybrid',
+            'download_source.hybrid_order': ['torrent', 'usenet', 'soulseek'],
+        }),
+        soulseek=_FakePluginWrapper({'torrent': torrent, 'usenet': usenet}),
+    )
+    _seed_batch(
+        'B27-fallback',
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 1},
+        artist_context={'name': 'Artist'},
+    )
+
+    mw.run_full_missing_tracks_process(
+        'B27-fallback',
+        'album:1',
+        [{'name': 'T1', 'artists': ['Artist'], 'track_number': 1}],
+        deps,
+    )
+
+    assert len(torrent.calls) == 1
+    assert len(usenet.calls) == 1
+    batch = download_batches['B27-fallback']
+    assert batch['album_bundle_source'] == 'usenet'
+    assert batch['album_bundle_private_staging'] is True
+    assert batch['album_bundle_state'] == 'staged'
+    assert batch['album_bundle_error'] is None
+
+
+def test_hybrid_album_bundle_skips_unconfigured_middle_source(monkeypatch):
+    """A registered client without setup cannot terminate later fallbacks."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    torrent = _FakeAlbumBundleSoulseek({
+        'success': False,
+        'fallback': True,
+        'error': 'No torrent release',
+    })
+    usenet = _UnconfiguredAlbumBundlePlugin()
+    soulseek = _FakePreflightAlbumBundleSoulseek()
+    deps = _build_deps(
+        config=_FakeConfig({
+            'download_source.mode': 'hybrid',
+            'download_source.hybrid_order': ['torrent', 'usenet', 'soulseek'],
+        }),
+        soulseek=_FakePluginWrapper({
+            'torrent': torrent,
+            'usenet': usenet,
+            'soulseek': soulseek,
+        }),
+    )
+    _seed_batch(
+        'B27-unconfigured',
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 1},
+        artist_context={'name': 'Artist'},
+    )
+
+    mw.run_full_missing_tracks_process(
+        'B27-unconfigured',
+        'album:1',
+        [{'name': 'T1', 'artists': ['Artist'], 'track_number': 1}],
+        deps,
+    )
+
+    assert len(torrent.calls) == 1
+    assert usenet.calls == []
+    assert len(soulseek.calls) == 1
+    batch = download_batches['B27-unconfigured']
+    assert batch['album_bundle_source'] == 'soulseek'
+    assert batch['album_bundle_state'] == 'staged'
+
+
+@pytest.mark.parametrize(
+    'batch_id,order',
+    [
+        ('B27-soulseek-suffix', ['torrent', 'soulseek', 'usenet']),
+        ('B27-soulseek-first-suffix', ['soulseek', 'usenet']),
+    ],
+)
+def test_hybrid_album_bundle_continues_after_soulseek_fallback(
+    monkeypatch, batch_id, order,
+):
+    """Soulseek preflight must not discard the release-source suffix."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    torrent = _FakeAlbumBundleSoulseek({
+        'success': False,
+        'fallback': True,
+        'error': 'No torrent release',
+    })
+    soulseek = _FakePreflightAlbumBundleSoulseek(outcome={
+        'success': False,
+        'fallback': True,
+        'error': 'No complete Soulseek folder',
+    })
+    usenet = _FakeAlbumBundleSoulseek({
+        'success': True,
+        'files': ['/tmp/a.flac'],
+    })
+    deps = _build_deps(
+        config=_FakeConfig({
+            'download_source.mode': 'hybrid',
+            'download_source.hybrid_order': order,
+        }),
+        soulseek=_FakePluginWrapper({
+            'torrent': torrent,
+            'soulseek': soulseek,
+            'usenet': usenet,
+        }),
+    )
+    _seed_batch(
+        batch_id,
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 1},
+        artist_context={'name': 'Artist'},
+    )
+
+    mw.run_full_missing_tracks_process(
+        batch_id,
+        'album:1',
+        [{'name': 'T1', 'artists': ['Artist'], 'track_number': 1}],
+        deps,
+    )
+
+    assert len(torrent.calls) == (1 if 'torrent' in order else 0)
+    assert len(soulseek.calls) == 1
+    assert len(usenet.calls) == 1
+    batch = download_batches[batch_id]
+    assert batch['album_bundle_source'] == 'usenet'
+    assert batch['album_bundle_state'] == 'staged'
+    assert batch['album_bundle_private_staging'] is True
+
+
+def test_hybrid_album_bundle_does_not_skip_over_per_track_source(monkeypatch):
+    """A later Usenet source cannot jump ahead of a configured streaming tier."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    torrent = _FakeAlbumBundleSoulseek({
+        'success': False,
+        'fallback': True,
+        'error': 'No torrent release',
+    })
+    usenet = _FakeAlbumBundleSoulseek()
+    deps = _build_deps(
+        config=_FakeConfig({
+            'download_source.mode': 'hybrid',
+            'download_source.hybrid_order': ['torrent', 'hifi', 'usenet'],
+        }),
+        soulseek=_FakePluginWrapper({'torrent': torrent, 'usenet': usenet}),
+    )
+    _seed_batch(
+        'B27-priority',
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 1},
+        artist_context={'name': 'Artist'},
+    )
+
+    mw.run_full_missing_tracks_process(
+        'B27-priority',
+        'album:1',
+        [{'name': 'T1', 'artists': ['Artist'], 'track_number': 1}],
+        deps,
+    )
+
+    assert len(torrent.calls) == 1
+    assert usenet.calls == []
+    assert download_batches['B27-priority']['album_bundle_state'] == 'fallback'
+
+
+def test_album_bundle_receives_batch_quality_profile(monkeypatch):
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    plugin = _FakeAlbumBundleSoulseek()
+    deps = _build_deps(
+        config=_FakeConfig({'download_source.mode': 'usenet'}),
+        soulseek=_FakePluginWrapper({'usenet': plugin}),
+    )
+    _seed_batch(
+        'B-quality',
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 1},
+        artist_context={'name': 'Artist'},
+        quality_profile_id=37,
+    )
+    tracks = [{
+        'name': 'T1',
+        'artists': ['Artist'],
+        'track_number': 1,
+        'quality_profile_id': 37,
+    }]
+
+    mw.run_full_missing_tracks_process('B-quality', 'album:1', tracks, deps)
+
+    assert plugin.calls[0][3] == {'quality_profile_id': 37}
 
 
 def test_album_bundle_fallback_clears_private_staging(monkeypatch):
@@ -1198,141 +1735,133 @@ def test_batch_removed_before_phase_two_returns_cleanly(monkeypatch):
     assert next_batch_calls == []
 
 
-# ---------------------------------------------------------------------------
-# Prefer deluxe editions (wishlist.prefer_deluxe_editions)
-# ---------------------------------------------------------------------------
-# Owning "X" used to count as owning every song "X (Deluxe Edition)" shares with
-# it, so a deluxe download fetched only the bonus tracks, into a folder of their
-# own, and the album was split. With the option on, an owned SMALLER edition does
-# not own the deluxe's songs; off, the analysis is exactly what it was.
+def test_album_bundle_passes_the_expected_release_duration(monkeypatch):
+    """The size gate needs the album's length, and only the batch knows it.
 
-_STANDARD_TITLE = 'Curtain Call: The Hits'
-_DELUXE_TITLE = 'Curtain Call: The Hits (Deluxe Edition)'
-_STANDARD_SONGS = ['My Name Is', 'The Way I Am', 'Stan', 'Without Me', 'Mockingbird']
-_BONUS_SONGS = ['Intro', 'FACK', 'Shit On You', 'Criminal']
-_DELUXE_SONGS = _BONUS_SONGS[:2] + _STANDARD_SONGS + _BONUS_SONGS[2:]
-
-
-class _LibraryAlbum:
-    def __init__(self, id_, title, songs):
-        self.id = id_
-        self.title = title
-        self.track_count = len(songs)
-
-
-class _LibraryTrack:
-    def __init__(self, title, album):
-        self.title = title
-        self.album_id = album.id
-        self.album_title = album.title
-
-
-class _EditionLibraryDB(_FakeDB):
-    """Whole albums: the album match, per-album tracks and the global per-track
-    search all read the same rows, in the order the albums were given."""
-
-    def __init__(self, albums, matched=None):
-        super().__init__()
-        self._albums = {}
-        self._tracks = {}
-        for album_id, (title, songs) in albums.items():
-            album = _LibraryAlbum(album_id, title, songs)
-            self._albums[album_id] = album
-            self._tracks[album_id] = [_LibraryTrack(song, album) for song in songs]
-        self._matched = matched
-
-    def check_album_exists_with_editions(self, title, artist, confidence_threshold=0.7,
-                                         expected_track_count=None, server_source=None,
-                                         expected_year=None):
-        if self._matched is None:
-            return (None, 0.0)
-        return (self._albums[self._matched], 0.95)
-
-    def get_tracks_by_album(self, album_id):
-        return list(self._tracks.get(album_id, []))
-
-    def get_album_title_year(self, album_id):
-        album = self._albums.get(album_id)
-        return (album.title, 2005) if album else None
-
-    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None, album=None):
-        for tracks in self._tracks.values():
-            for track in tracks:
-                if track.title.lower() == title.lower():
-                    return (track, 0.95)
-        return (None, 0.0)
-
-
-def _queued_songs(monkeypatch, batch_id, db, *, album, songs, prefer, allow_duplicates=True):
+    The picker refuses a release whose bytes cannot support its quality claim,
+    but only when it is told how long the album is. That number is summed from
+    the batch's own track list.
+    """
+    db = _FakeDB()
     monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
-    deps = _build_deps(config=_FakeConfig({
-        'wishlist.prefer_deluxe_editions': prefer,
-        'wishlist.allow_duplicate_tracks': allow_duplicates,
-    }))
-    _seed_batch(batch_id, is_album_download=True,
-                album_context={'name': album, 'total_tracks': len(songs)},
-                artist_context={'name': 'Eminem'})
+
+    plugin = _FakeAlbumBundleSoulseek()
+    deps = _build_deps(
+        config=_FakeConfig({'download_source.mode': 'usenet'}),
+        soulseek=_FakePluginWrapper({'usenet': plugin}),
+    )
+    _seed_batch(
+        'B-duration',
+        is_album_download=True,
+        album_context={'name': 'Test Album', 'total_tracks': 2},
+        artist_context={'name': 'Artist'},
+    )
+    tracks = [
+        {'name': 'T1', 'artists': ['Artist'], 'track_number': 1, 'duration_ms': 210_000},
+        {'name': 'T2', 'artists': ['Artist'], 'track_number': 2, 'duration_ms': 195_000},
+    ]
+
+    mw.run_full_missing_tracks_process('B-duration', 'album:1', tracks, deps)
+
+    assert plugin.calls[0][3] == {'expected_duration_seconds': 405}
+
+
+def test_a_track_list_without_durations_says_nothing_about_length():
+    """No duration is not a duration of zero — the gate must stay silent."""
+    assert mw.expected_release_duration_seconds([
+        {'name': 'T1'}, {'name': 'T2', 'duration_ms': 0},
+    ]) is None
+
+
+def test_release_duration_reads_a_nested_track_payload():
+    assert mw.expected_release_duration_seconds([
+        {'track': {'duration_ms': 200_000}},
+        {'duration_ms': 100_000},
+    ]) == 300
+
+
+def test_a_partial_track_list_gives_no_duration_at_all():
+    """A subtotal is not a duration, and it rejects real releases.
+
+    Ten tracks with one known 180 second duration summed to 180, and the size
+    gate then read a legitimate 90 MB MP3 album as 4000 kbit/s and refused it.
+    Anything short of every track being known has to stay silent.
+    """
+    assert mw.expected_release_duration_seconds([
+        {'name': 'T1', 'duration_ms': 180_000},
+        {'name': 'T2'},
+        {'name': 'T3', 'duration_ms': 0},
+    ]) is None
+
+
+def test_a_complete_track_list_still_answers():
+    assert mw.expected_release_duration_seconds([
+        {'duration_ms': 180_000}, {'duration_ms': 120_000},
+    ]) == 300
+
+
+@pytest.mark.parametrize('source_mode', ['soulseek', 'torrent'])
+def test_album_completion_skips_whole_album_bundles(monkeypatch, source_mode):
+    """Completion requests missing tracks without downloading a whole release."""
+    db = _FakeDB()
+    monkeypatch.setattr('database.music_database.MusicDatabase', lambda: db)
+
+    plugin = _FakeAlbumBundleSoulseek()
+    deps = _build_deps(
+        config=_FakeConfig({'download_source.mode': source_mode}),
+        soulseek=_FakePluginWrapper({source_mode: plugin}),
+    )
+    batch_id = f'completion-{source_mode}'
+    album_ctx = {'name': 'Test Album', 'total_tracks': 10}
+    artist_ctx = {'name': 'Artist'}
+    _seed_batch(
+        batch_id,
+        is_album_download=True,
+        album_completion_only=True,
+        album_context=album_ctx,
+        artist_context=artist_ctx,
+    )
+    missing_tracks = [
+        {'name': 'Missing Track', 'artists': ['Artist'], 'track_number': 8}
+    ]
+
     mw.run_full_missing_tracks_process(
-        batch_id, 'album:1', [{'name': song, 'artists': ['Eminem']} for song in songs], deps)
-    return sorted(download_tasks[task_id]['track_info']['name']
-                  for task_id in download_batches[batch_id]['queue'])
+        batch_id, 'album:1', missing_tracks, deps,
+    )
+
+    assert plugin.calls == [], 'Album completion must not fetch a whole release'
+    assert len(download_batches[batch_id]['queue']) == 1
+    task_id = download_batches[batch_id]['queue'][0]
+    track_info = download_tasks[task_id]['track_info']
+    assert track_info['name'] == 'Missing Track'
+    assert track_info['_explicit_album_context'] == album_ctx
+    assert track_info['_explicit_artist_context'] == artist_ctx
 
 
-def test_prefer_deluxe_downloads_the_whole_deluxe_when_the_standard_is_owned(monkeypatch):
-    db = _EditionLibraryDB({1: (_STANDARD_TITLE, _STANDARD_SONGS)}, matched=1)
-    queued = _queued_songs(monkeypatch, 'PD1', db, album=_DELUXE_TITLE, songs=_DELUXE_SONGS,
-                           prefer=True)
-    assert queued == sorted(_DELUXE_SONGS)
+def test_album_completion_bypasses_mirrored_playlist_folder(monkeypatch):
+    """Album completion must never consult mirrored-playlist folder settings."""
+    db = _FakeDB()
+    monkeypatch.setattr("database.music_database.MusicDatabase", lambda: db)
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Album completion consulted mirrored-playlist folder settings")
+    monkeypatch.setattr("core.downloads.playlist_folder.resolve_playlist_folder_mode_for_batch", forbidden)
+    deps = _build_deps(config=_FakeConfig({"download_source.mode": "soulseek"}))
+    _seed_batch("completion-folder", is_album_download=True, album_completion_only=True, playlist_folder_mode=False, album_context={"name": "Test Album"}, artist_context={"name": "Artist"})
+    mw.run_full_missing_tracks_process("completion-folder", "album:1", [{"name": "Missing Track", "artists": ["Artist"], "track_number": 8}], deps)
+    assert download_batches["completion-folder"]["playlist_folder_mode"] is False
 
 
-def test_without_prefer_deluxe_the_deluxe_gets_only_its_bonus_tracks(monkeypatch):
-    """The split the option exists to avoid, pinned so the default stays put."""
-    db = _EditionLibraryDB({1: (_STANDARD_TITLE, _STANDARD_SONGS)}, matched=1)
-    queued = _queued_songs(monkeypatch, 'PD2', db, album=_DELUXE_TITLE, songs=_DELUXE_SONGS,
-                           prefer=False)
-    assert queued == sorted(_BONUS_SONGS)
-
-
-def test_an_owned_deluxe_still_satisfies_a_standard_download(monkeypatch):
-    db = _EditionLibraryDB({2: (_DELUXE_TITLE, _DELUXE_SONGS)}, matched=2)
-    queued = _queued_songs(monkeypatch, 'PD3', db, album=_STANDARD_TITLE, songs=_STANDARD_SONGS,
-                           prefer=True)
-    assert queued == []
-    assert download_batches['PD3']['phase'] == 'complete'
-
-
-def test_a_split_library_gets_the_rest_of_the_deluxe_with_duplicates_off(monkeypatch):
-    """The library the old behaviour leaves: the standard album plus a deluxe row
-    holding two bonus tracks. The album match finds that deluxe row; the shared
-    songs fall back to the global search, which lands on the standard album."""
-    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS), 2: (_DELUXE_TITLE, ['Intro', 'FACK'])}
-    queued = _queued_songs(monkeypatch, 'PD4', _EditionLibraryDB(library, matched=2),
-                           album=_DELUXE_TITLE, songs=_DELUXE_SONGS, prefer=True,
-                           allow_duplicates=False)
-    assert queued == sorted(_STANDARD_SONGS + ['Shit On You', 'Criminal'])
-
-
-def test_a_split_library_without_the_option_keeps_counting_the_standard(monkeypatch):
-    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS), 2: (_DELUXE_TITLE, ['Intro', 'FACK'])}
-    queued = _queued_songs(monkeypatch, 'PD5', _EditionLibraryDB(library, matched=2),
-                           album=_DELUXE_TITLE, songs=_DELUXE_SONGS, prefer=False,
-                           allow_duplicates=False)
-    assert queued == ['Criminal', 'Shit On You']
-
-
-def test_duplicates_off_with_no_album_match_uses_the_same_gate(monkeypatch):
-    library = {1: (_STANDARD_TITLE, _STANDARD_SONGS)}
-    on = _queued_songs(monkeypatch, 'PD6', _EditionLibraryDB(library), album=_DELUXE_TITLE,
-                       songs=_DELUXE_SONGS, prefer=True, allow_duplicates=False)
-    off = _queued_songs(monkeypatch, 'PD7', _EditionLibraryDB(library), album=_DELUXE_TITLE,
-                        songs=_DELUXE_SONGS, prefer=False, allow_duplicates=False)
-    assert on == sorted(_DELUXE_SONGS)
-    assert off == sorted(_BONUS_SONGS)
-
-
-def test_a_remaster_is_not_treated_as_a_bigger_edition(monkeypatch):
-    songs = ['One', 'Two', 'Three']
-    db = _EditionLibraryDB({1: ('Album X', songs)}, matched=1)
-    queued = _queued_songs(monkeypatch, 'PD8', db, album='Album X (Remastered)',
-                           songs=songs + ['Four'], prefer=True)
-    assert queued == ['Four']
+def test_album_completion_worker_uses_batch_owner_library(monkeypatch):
+    """Completion analysis uses its batch owner, not the active profile."""
+    from core import library_scope as ls
+    scopes = []
+    monkeypatch.setattr(ls, "library_scope_for_profile", lambda pid: (scopes.append(pid), "owner-library")[1])
+    monkeypatch.setattr(mw, "_run_full_missing_tracks_process", lambda *args: ls.current_library_scope())
+    _seed_batch("completion-owner", profile_id=7, album_completion_only=True)
+    before = ls.current_library_scope()
+    deps = _build_deps()
+    scopes.clear()
+    result = mw.run_full_missing_tracks_process("completion-owner", "album:1", [], deps)
+    assert scopes == [7]
+    assert result == "owner-library"
+    assert ls.current_library_scope() == before

@@ -1,6 +1,8 @@
 import { useRouteContext, useRouter } from '@tanstack/react-router';
 import { useEffect, useLayoutEffect } from 'react';
 
+import { appURL } from '@/platform/url-base';
+
 import { getProfileHomePath, type ShellContext, type ShellPageId } from './bridge';
 
 export const ROUTER_ROOT_ID = 'webui-react-root';
@@ -52,7 +54,7 @@ export function useReactPageShell(pageId: ShellPageId) {
     if (!bridge) return;
 
     if (!bridge.isPageAllowed(pageId)) {
-      void router.navigate({ href: getProfileHomePath(bridge), replace: true });
+      void router.navigate({ href: appURL(getProfileHomePath(bridge)), replace: true });
       return;
     }
   }, [bridge, pageId, router]);

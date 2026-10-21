@@ -4,7 +4,7 @@
                                   movie/show results annotated with library_id
                                   if already owned.
 
-Everything resolves back into Commissary — results link to the library detail
+Everything resolves back into SoulSync — results link to the library detail
 (owned) or the TMDB-backed detail (not owned); people open the in-app person
 page. Reads only the video engine + video.db.
 """
@@ -16,6 +16,17 @@ from flask import jsonify, request
 from utils.logging_config import get_logger
 
 logger = get_logger("video_api.search")
+
+
+def _kids_movies(page_payload):
+    """a studio's movie page through the kids cap (these cards carry no kind)."""
+    from .kids import filter_tmdb_items, video_cap
+    cap = video_cap()
+    if cap is None or not isinstance(page_payload, dict):
+        return page_payload
+    from . import get_video_db
+    rows = [dict(r, kind=r.get("kind") or "movie") for r in page_payload.get("results") or []]
+    return {**page_payload, "results": filter_tmdb_items(get_video_db(), rows, cap)}
 
 
 def register_routes(bp):
@@ -33,6 +44,12 @@ def register_routes(bp):
         except Exception:
             logger.exception("video search failed for %r", q)
             results = []
+        # kids profiles: only titles the library can vouch for (people pass)
+        from . import get_video_db
+        from .kids import filter_tmdb_items, video_cap
+        cap = video_cap()
+        if cap is not None:
+            results = filter_tmdb_items(get_video_db(), results, cap)
         return jsonify({"results": results, "query": q})
 
     @bp.route("/search/studios", methods=["GET"])
@@ -68,7 +85,12 @@ def register_routes(bp):
         try:
             presets = studio_presets()             # logos are baked in → no TMDB round-trips
             try:
-                followed = get_video_db().watchlist_state("studio", preset_member_ids())
+                from core.profile_context import get_current_profile_id
+                try:
+                    _pid = int(get_current_profile_id() or 1)
+                except Exception:
+                    _pid = 1
+                followed = get_video_db().watchlist_state("studio", preset_member_ids(), profile_id=_pid)
             except Exception:   # noqa: BLE001 - picker still works without follow state
                 followed = {}
             for p in presets:
@@ -90,7 +112,7 @@ def register_routes(bp):
             if not detail:
                 return jsonify({"success": False, "error": "not found"}), 404
             return jsonify({"success": True, "studio": detail,
-                            "movies": eng.company_movies(company_id, page=1, sort=_studio_sort())})
+                            "movies": _kids_movies(eng.company_movies(company_id, page=1, sort=_studio_sort()))})
         except Exception:
             logger.exception("studio detail failed for %s", company_id)
             return jsonify({"success": False, "error": "failed"}), 500
@@ -102,7 +124,8 @@ def register_routes(bp):
             from core.video.enrichment.engine import get_video_enrichment_engine
             page = max(1, int(request.args.get("page") or 1))
             return jsonify({"success": True,
-                            **get_video_enrichment_engine().company_movies(company_id, page=page, sort=_studio_sort())})
+                            **_kids_movies(get_video_enrichment_engine().company_movies(
+                                company_id, page=page, sort=_studio_sort()))})
         except (ValueError, TypeError):
             return jsonify({"success": False, "results": [], "total_pages": 0}), 400
         except Exception:
@@ -117,4 +140,9 @@ def register_routes(bp):
         except Exception:
             logger.exception("video trending failed")
             results = []
+        from . import get_video_db
+        from .kids import filter_tmdb_items, video_cap
+        cap = video_cap()
+        if cap is not None:
+            results = filter_tmdb_items(get_video_db(), results, cap)
         return jsonify({"results": results})

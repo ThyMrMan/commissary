@@ -1,4 +1,4 @@
-// Commissary shell bridge glue
+// SoulSync shell bridge glue
 // Keep this file loaded after init.js so the legacy shell runtime state is ready.
 
 function getWebRouter() {
@@ -43,19 +43,6 @@ function setActivePageChrome(pageId) {
     currentPage = pageId;
     if (typeof _updateSidebarLibraryBreadcrumb === 'function') _updateSidebarLibraryBreadcrumb();
     if (typeof _gsUpdateVisibility === 'function') _gsUpdateVisibility();
-    const downloadSidebar = document.getElementById('discover-download-sidebar');
-    if (downloadSidebar) {
-        if (pageId === 'discover') {
-            const activeDownloads = typeof discoverDownloads !== 'undefined'
-                ? Object.keys(discoverDownloads).length
-                : 0;
-            if (activeDownloads > 0 && typeof updateDiscoverDownloadBar === 'function') {
-                updateDiscoverDownloadBar();
-            }
-        } else {
-            downloadSidebar.classList.add('hidden');
-        }
-    }
     // Defer to next frame so the page switch paints before particle/orb reinitialization
     requestAnimationFrame(() => {
         if (window.pageParticles && window._particlesEnabled !== false) window.pageParticles.setPage(pageId);
@@ -99,12 +86,34 @@ function activateLegacyPath(pathname) {
     _optimisticNavPageId = null;
 
     notifyPageWillChange(targetPage);
+
+    // A REACT-owned page must never go through activatePage(): showLegacyPage
+    // strips `active` from #webui-react-root and hands it to `#<page>-page`,
+    // which no longer exists once that page's vanilla markup has been deleted.
+    // The host goes dark and nothing replaces it — React is still mounted, just
+    // hidden, which is why navigating elsewhere and back "fixes" it.
+    //
+    // This is reachable from the VIDEO side: its URLs (/video-dashboard) match
+    // no React route, so the catch-all route ($.tsx -> LegacyRouteController)
+    // calls in here, and _getPageFromPath maps any unknown path to 'dashboard'
+    // (init.js 2961). Switching back to music then leaves a blank page.
+    //
+    // syncActivePageFromLocation below already does this check; this function
+    // simply never got it. The `!legacyPageElement` arm covers a page that is
+    // still marked legacy in the manifest but whose markup has gone.
+    const route = router?.routeManifest?.find((entry) => entry.pageId === targetPage);
+    const legacyPageElement = document.getElementById(`${targetPage}-page`);
+    if (route?.kind === 'react' || !legacyPageElement) {
+        showReactHost(targetPage);
+        setActivePageChrome(targetPage);
+        return;
+    }
     activatePage(targetPage, { forceReload: true });
 }
 
 function syncActivePageFromLocation() {
     const router = getWebRouter();
-    const targetPage = router?.resolvePageId?.(window.location.pathname) || _getPageFromPath(window.location.pathname);
+    const targetPage = router?.resolvePageId?.((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) || _getPageFromPath((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname));
     if (!targetPage) return;
 
     if (!isPageAllowed(targetPage)) {
@@ -211,8 +220,47 @@ window.SoulSyncWebShellBridge = {
     },
 };
 
+// A touch that MOVED before lifting is a scroll, not a tap. Tracked here rather
+// than in init.js because both nav paths below are document-level CAPTURE
+// listeners: capture runs outermost-first, so a guard bound to .sidebar can
+// never run before them, no matter what it does. This has to sit in front of
+// the same handlers it protects.
+const _TAP_SLOP_PX = 8;   // a tap wobbles a few px; a drag does not
+let _touchOrigin = null;
+let _touchDragged = false;
+
+document.addEventListener('touchstart', (event) => {
+    _touchOrigin = event.touches.length === 1
+        ? { x: event.touches[0].clientX, y: event.touches[0].clientY }
+        : null;
+    _touchDragged = false;
+}, { passive: true, capture: true });
+
+document.addEventListener('touchmove', (event) => {
+    if (!_touchOrigin) return;
+    // Distance, not just vertical travel: a drag across the drawer moves mostly
+    // sideways, and a Y-only check waves it straight through.
+    const dx = event.touches[0].clientX - _touchOrigin.x;
+    const dy = event.touches[0].clientY - _touchOrigin.y;
+    if (Math.hypot(dx, dy) > _TAP_SLOP_PX) _touchDragged = true;
+}, { passive: true, capture: true });
+
+function _consumeTouchDrag() {
+    if (!_touchDragged) return false;
+    _touchDragged = false;   // one suppression per gesture; never latch
+    return true;
+}
+
 function _handleShellLinkClick(event) {
     if (event.defaultPrevented || event.button !== 0 || _isModifiedLinkClick(event)) return;
+
+    // The gesture that produced this click was a scroll. Swallow it, or dragging
+    // the mobile drawer opens whichever entry the finger started on.
+    if (_consumeTouchDrag()) {
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+    }
 
     const anchor = event.target?.closest?.('a[href]');
     if (!anchor || (anchor.target && anchor.target !== '_self')) return;
@@ -226,7 +274,8 @@ function _handleShellLinkClick(event) {
     const href = anchor.getAttribute('href');
     if (!href || href === '#' || href.startsWith('javascript:')) return;
 
-    const pathname = anchor.pathname || new URL(anchor.href, window.location.href).pathname;
+    const rawPath = anchor.pathname || new URL(anchor.href, window.location.href).pathname;
+    const pathname = window.SoulSyncURL?.strip(rawPath) ?? rawPath;
     const navPageId = anchor.matches('.nav-button[data-page]') ? anchor.getAttribute('data-page') : null;
     if (navPageId) {
         event.preventDefault();
@@ -236,6 +285,15 @@ function _handleShellLinkClick(event) {
 
     if (pathname.startsWith('/artist-detail/')) {
         _handleArtistDetailLinkClick(event, pathname, anchor);
+        return;
+    }
+
+    // Label cards render plain /label-detail/<id> hrefs (search results,
+    // watchlist). Left to the browser that's a FULL page reload — app
+    // reboot, in-memory search gone — and it skips navigateToLabelDetail,
+    // so the label page's Back button loses its return target.
+    if (pathname.startsWith('/label-detail/')) {
+        _handleLabelDetailLinkClick(event, pathname, anchor);
         return;
     }
 }
@@ -255,17 +313,38 @@ function _handleArtistDetailLinkClick(event, pathname, anchor) {
     // has nothing to resolve against. The card already stashes it as a data
     // attribute (renderCompactSection); the href's own ?name= query (set by
     // buildArtistDetailPath) is the fallback for anchors that don't.
+    const linkParams = new URLSearchParams(anchor?.search || '');
     const artistName = anchor?.dataset?.artistName
-        || new URLSearchParams(anchor?.search || '').get('name')
+        || linkParams.get('name')
         || '';
+    // ?album= (the library's album grid) names the album to open on arrival.
+    // It must survive this handoff — without it the deep link silently
+    // degrades to the plain artist page.
+    const focusAlbumId = linkParams.get('album') || '';
 
     event.preventDefault();
     void navigateToPage('artist-detail', {
         artistId,
         artistSource: source,
         artistName,
+        focusAlbumId,
         forceReload: true,
     });
+}
+
+function _handleLabelDetailLinkClick(event, pathname, anchor) {
+    const parts = pathname.split('/').filter(Boolean);
+    if (parts.length < 2) return;
+
+    const labelId = decodeURIComponent(parts.slice(1).join('/'));
+    if (!labelId) return;
+    // Without the navigator the default navigation is still a working page
+    // — just the slow one — so only claim the click when we can do better.
+    if (typeof navigateToLabelDetail !== 'function') return;
+
+    const name = new URLSearchParams(anchor?.search || '').get('name') || null;
+    event.preventDefault();
+    navigateToLabelDetail(labelId, name);
 }
 
 function _isModifiedLinkClick(event) {
@@ -276,8 +355,19 @@ window.addEventListener('popstate', syncActivePageFromLocation);
 document.addEventListener('click', _handleShellLinkClick, true);
 
 // Fire nav on pointerdown (fires on press, 100-200ms before click) for instant sidebar response.
-// navigateToPage's early-return guard (pageId === currentPage) prevents double-navigation on click.
+// The click-phase call is absorbed by navigateToPage's echo token, so this never double-navigates.
+//
+// MOUSE AND PEN ONLY. With a mouse, pressing is unambiguous: you don't scroll
+// by pressing, so acting on pointerdown is pure latency win. On touch it is the
+// opposite — a press is also the FIRST FRAME of a scroll, and there is no
+// movement yet to tell the two apart. Navigating here meant that dragging the
+// drawer to scroll it opened whichever entry the finger happened to land on,
+// every time. The drag guard in init.js (TAP_SLOP_PX) could never help: it
+// arbitrates the click, and the click came long after this had already
+// navigated. Touch now falls through to the normal click path, where that
+// guard sees the movement and swallows the tap.
 document.addEventListener('pointerdown', (event) => {
+    if (event.pointerType === 'touch') return;
     if (event.button !== 0 || _isModifiedLinkClick(event)) return;
     const btn = event.target?.closest?.('.nav-button[data-page]');
     if (!btn) return;

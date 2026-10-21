@@ -2,23 +2,213 @@
 
 import sqlite3
 import json
-import logging
 import string
+import logging
 import os
 import re
+import sys
 import threading
 import time
-from datetime import datetime
+from functools import lru_cache
+from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 from utils.logging_config import get_logger
+from core.quality.schema import normalize_release_import_mode
 
 logger = get_logger("music_database")
 
 _database_initialized_paths = set()
 _database_sidecar_warnings = set()
 _database_initialization_lock = threading.Lock()
+
+# normalized-text columns (title_norm / name_norm / track_artist_norm). one
+# backfill at a time per db path, and a short-lived "is every row filled"
+# answer so a matcher loop doesn't re-probe on every call.
+_norm_backfill_lock = threading.Lock()
+_norm_backfill_threads = {}
+# above this many unfilled rows a reader kicks a background backfill and
+# runs the slow query instead of stalling whoever called it
+_NORM_INLINE_LIMIT = 5000
+_NORM_CHUNK = 20000
+# below this many rows a backfill skips the ANALYZE + wal checkpoint
+_NORM_STATS_MIN_ROWS = 1000
+# rows ANALYZE samples per index. same plans as a full ANALYZE on a 300k
+# track library (same 400 ownership decisions, same matched rows) in 78 ms
+# instead of 1.9 s, so it can run after every scan without blocking writers.
+_PLANNER_ANALYSIS_LIMIT = 1000
+_planner_stats_lock = threading.Lock()
+_planner_stats_threads = {}
+
+
+def _calling_functions(depth: int = 3) -> str:
+    """'caller <- its caller <- ...' from just above _get_connection."""
+    names = []
+    frame = sys._getframe(2)
+    while frame is not None and len(names) < depth:
+        names.append(frame.f_code.co_name)
+        frame = frame.f_back
+    return " <- ".join(names)
+
+# a per-track credit like "A feat. B" or "A; B" is one string in the tracks
+# row; track_credits holds each credited name separately, indexed, so "is B
+# credited anywhere" is a lookup and not a substring scan. same delimiters
+# the confidence scorer splits on.
+_CREDIT_SPLIT_RE = re.compile(r'\s*(?:[;,&]|\b(?:feat|ft|featuring|vs)\.?(?=\s|$)|(?<=\s)x(?=\s))\s*', re.IGNORECASE)
+
+
+# Characters stripped from the START of a name/title for alphabetical library
+# sorting, so '"Weird Al" Yankovic' sorts under W and '*NSYNC' under N instead
+# of floating to the top ahead of 2PAC. Digits are deliberately kept — numbers
+# still sort in the '#' bucket. Leading articles ('A', 'The') are deliberately
+# NOT stripped.
+_LIBRARY_SORT_STRIP_CHARS = (
+    " \"'!#$%&()*+,-./:;<=>?@[\\]^_`{|}~"  # ASCII punctuation + space
+    "¡¿«»"                                  # inverted marks, guillemets
+    "\u201c\u201d\u201e\u2018\u2019"        # curly quotes
+    "\u2014\u2013\u2026"                    # em/en dash, ellipsis
+)
+
+
+def _library_stripped_sql(column: str) -> str:
+    """SQL expression for a name/title with leading punctuation and special
+    characters removed, for sort/filter purposes. Single quotes are doubled
+    for the SQL string literal."""
+    chars = _LIBRARY_SORT_STRIP_CHARS.replace("'", "''")
+    return f"LTRIM({column}, '{chars}')"
+
+
+def _library_sort_key_sql(column: str) -> str:
+    """SQL ORDER BY key for alphabetical library sorting that ignores leading
+    punctuation/special characters (case-insensitive)."""
+    return f"{_library_stripped_sql(column)} COLLATE NOCASE"
+
+
+def split_credit_names(track_artist_norm: str) -> List[str]:
+    """the distinct credited names inside a normalized per-track artist
+    string, plus the whole string. '' and None give []."""
+    if not track_artist_norm:
+        return []
+    names = [track_artist_norm.strip()]
+    for piece in _CREDIT_SPLIT_RE.split(track_artist_norm):
+        piece = piece.strip()
+        if piece and piece not in names:
+            names.append(piece)
+    return names
+
+
+def _row_value(row, column: str, default=None):
+    """Read a column off a sqlite3.Row that may not have it.
+
+    Upgraded databases can lag the code by a migration, and indexing a Row for a
+    missing column raises IndexError rather than returning None. The upsert paths
+    read columns that only newer schemas carry, and a raised IndexError there
+    would fail the whole scan, so absent means default."""
+    if row is None:
+        return default
+    try:
+        value = row[column]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
+# Release-kind markers: "X (Single)" is the single release of X, not a
+# different recording (SeadogsBooty: a library file tagged "Ocean Avenue
+# (Single)" must match the "Ocean Avenue" card, and the card titled
+# "Ocean Avenue (Single)" must match a plain "Ocean Avenue" file tag).
+# End-anchored: the marker is a suffix, never mid-title. "(Single Edit)"
+# is deliberately NOT stripped — a single edit can be a different cut,
+# like the radio-edit markers the track cleaner keeps.
+_SINGLE_KIND_SUFFIX_PATTERNS = (
+    r'\s*\(single\)$',
+    r'\s*\[single\]$',
+    r'\s*-\s*single\s*$',
+)
+
+
+def strip_single_kind_suffix(title: str) -> str:
+    """Remove a trailing release-kind marker ("(Single)", "[Single]", "- Single").
+
+    Single-card lookups only: a "(Single)"-titled row IS the single release,
+    but it is not the album/EP of the same name, so album/EP cards must not
+    strip. Shared by the album-title cleaner (release matching) and the
+    single-completion track check (the card name is the release title there).
+    """
+    cleaned = title or ''
+    for pattern in _SINGLE_KIND_SUFFIX_PATTERNS:
+        cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
+
+
+def _deezer_id_conflicts_with_card(db, candidate_album_id, card_source_id) -> bool:
+    """Does the library candidate carry a stored Deezer id that conflicts with the card's?
+
+    A stored id that differs from the card's is hard proof of different releases
+    (e.g. owned standard vs deluxe card), so the #1289 year-gate exemption must
+    not fire. Returns False — no conflict — when the card has no id, the
+    candidate has no stored Deezer id, a stored id equals the card's, or the
+    lookup is unavailable: a year mismatch alone cannot prove "different
+    release" for Deezer cards.
+    """
+    want = str(card_source_id or "").strip()
+    if not want:
+        return False
+    get_ids = getattr(db, "get_album_source_ids", None)
+    if not callable(get_ids):
+        return False
+    try:
+        id_map = get_ids([candidate_album_id]) or {}
+    except Exception:
+        return False
+    vals = id_map.get(candidate_album_id) or {}
+    for col in ("deezer_id", "album_deezer_id"):
+        stored = vals.get(col)
+        if stored and str(stored).strip() and str(stored).strip() != want:
+            return True
+    return False
+
+# ── MetaSync export column sets ──────────────────────────────────────────
+#
+# Named explicitly, never SELECT *: column ORDER differs between a fresh
+# install and an upgraded one, and a future column must not silently join the
+# export. ``id`` is selected only so the route can build the keyset cursor —
+# the allowlist serializers in api/serializers.py drop it before it is served,
+# because a media-server primary key is install-local and meaningless off-box.
+_EXPORT_PROVIDER_STATUSES = (
+    'musicbrainz_match_status', 'spotify_match_status', 'itunes_match_status',
+    'deezer_match_status', 'audiodb_match_status', 'tidal_match_status',
+    'qobuz_match_status', 'jiosaavn_match_status', 'amazon_match_status',
+)
+
+_EXPORT_ARTIST_COLUMNS = (
+    'id', 'soul_id', 'soul_id_path', 'name', 'genres', 'updated_at',
+    'musicbrainz_id', 'spotify_artist_id', 'itunes_artist_id', 'deezer_id',
+    'discogs_id', 'amazon_id', 'tidal_id', 'qobuz_id', 'audiodb_id',
+    'genius_id', 'jiosaavn_id',
+    *_EXPORT_PROVIDER_STATUSES, 'discogs_match_status', 'genius_match_status',
+)
+
+_EXPORT_ALBUM_COLUMNS = (
+    'id', 'soul_id', 'title', 'year', 'release_date', 'track_count',
+    'record_type', 'label', 'genres', 'updated_at',
+    'musicbrainz_release_id', 'spotify_album_id', 'itunes_album_id',
+    'deezer_id', 'discogs_id', 'amazon_id', 'tidal_id', 'qobuz_id',
+    'audiodb_id', 'jiosaavn_id', 'bandcamp_url', 'upc',
+    'canonical_source', 'canonical_album_id', 'canonical_score',
+    *_EXPORT_PROVIDER_STATUSES, 'discogs_match_status', 'bandcamp_match_status',
+)
+
+_EXPORT_TRACK_COLUMNS = (
+    'id', 'soul_id', 'album_soul_id', 'title', 'track_number', 'disc_number',
+    'duration', 'bpm', 'explicit', 'year', 'isrc', 'updated_at',
+    'musicbrainz_recording_id', 'spotify_track_id', 'itunes_track_id',
+    'deezer_id', 'amazon_id', 'tidal_id', 'qobuz_id', 'audiodb_id',
+    'genius_id', 'jiosaavn_id', 'bandcamp_url',
+    *_EXPORT_PROVIDER_STATUSES, 'genius_match_status', 'bandcamp_match_status',
+)
+
 
 # Import matching engine for enhanced similarity logic
 try:
@@ -77,6 +267,11 @@ class DatabaseTrackWithMetadata:
     duration: Optional[int] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    # Per-track credit, when the row carries one. The sync match cache
+    # revalidation (#1721) scores this row as a candidate: without the
+    # credit, compilation/soundtrack evidence was invisible to the artist
+    # scorer and legitimate cached matches failed validation.
+    track_artist: Optional[str] = None
 
 @dataclass
 class WatchlistArtist:
@@ -101,12 +296,25 @@ class WatchlistArtist:
     include_acoustic: bool = False
     include_compilations: bool = False
     include_instrumentals: bool = False
+    # When False (default), the watchlist scan only wishlists tracks credited
+    # to the monitored artist — tribute albums, soundtracks and compilations
+    # no longer flood the wishlist with other artists' tracks. When True,
+    # restores the old behaviour (every track on associated releases).
+    include_other_artists: bool = False
     lookback_days: Optional[int] = None  # Per-artist override; None = use global setting
     preferred_metadata_source: Optional[str] = None  # Per-artist override; None = use global setting
     # When False ("follow only"), the watchlist scan still discovers + surfaces new
     # releases for this artist but does NOT auto-add them to the wishlist (so they
     # don't auto-download). Default True = current behaviour.
     auto_download: bool = True
+    # Three-state preference behind auto_download: None = follow the global
+    # default, 0 = never, 1 = always. The scanner resolves the pair into
+    # `auto_download` (core.watchlist_auto_download).
+    auto_download_pref: Optional[int] = None
+    # App-wide quality_profiles row used for every release queued by this
+    # artist.  Stored on the Watchlist itself so consumers do not need to know
+    # about Library v2 (or any other UI that created the watch).
+    quality_profile_id: Optional[int] = None
     profile_id: int = 1
 
 @dataclass
@@ -166,8 +374,49 @@ class RecentRelease:
     track_count: int
     added_date: datetime
 
+def mirrored_cover_from_match(extra_data: dict) -> str:
+    """The cover art hiding inside a discovery match, or '' if there is none.
+
+    Most playlist sources hand us no poster at all when a playlist is mirrored —
+    Spotify links, YouTube, ListenBrainz, Last.fm and SoulSync Discovery all
+    arrive art-less, and Tidal's only started supplying one recently, so older
+    mirrors have nothing stored either. What they DO get, once discovery runs,
+    is a matched track with real metadata behind it, and that carries album art.
+
+    So a playlist's cover is derived from the first track discovery matches.
+    `_build_fix_modal_spotify_data` deliberately carries the image in two places
+    ("image_url is carried both at top level and inside album.images for parity
+    with Spotify API responses"), and older rows only have the nested one, so
+    both are read here.
+    """
+    if not isinstance(extra_data, dict):
+        return ''
+    if not extra_data.get('discovered'):
+        return ''
+    match = extra_data.get('matched_data') or extra_data.get('spotify_data')
+    if not isinstance(match, dict):
+        return ''
+
+    direct = match.get('image_url')
+    if isinstance(direct, str) and direct:
+        return direct
+
+    album = match.get('album')
+    if isinstance(album, dict):
+        images = album.get('images')
+        if isinstance(images, list):
+            for image in images:
+                if isinstance(image, dict):
+                    url = image.get('url')
+                    if isinstance(url, str) and url:
+                        return url
+                elif isinstance(image, str) and image:
+                    return image
+    return ''
+
+
 class MusicDatabase:
-    """SQLite database manager for Commissary music library data"""
+    """SQLite database manager for SoulSync music library data"""
     
     def __init__(self, database_path: str = None):
         # Use env var if path is None OR if it's the default path
@@ -235,16 +484,45 @@ class MusicDatabase:
             if db_key in _database_initialized_paths:
                 return
 
+            self._ensure_wal_mode()
             self._initialize_database()
             _database_initialized_paths.add(db_key)
+        # first boot after the norm-column upgrade: start filling now rather
+        # than when the first ownership check trips over the gap
+        try:
+            conn = self._get_connection()
+            try:
+                self._norm_ready(conn.cursor())
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"norm readiness check at init skipped: {e}")
+        self._kick_planner_stats_thread()
     
+    def _ensure_wal_mode(self):
+        """put the database in wal mode, once per process. the mode lives in
+        the file, so every later connection inherits it without asking."""
+        try:
+            conn = sqlite3.connect(str(self.database_path), timeout=30.0)
+            try:
+                conn.execute("PRAGMA busy_timeout = 30000")
+                mode = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+                if mode and str(mode[0]).lower() != 'wal':
+                    logger.warning("could not switch %s to wal mode (journal_mode=%s)", self.database_path, mode[0])
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.warning("wal mode check failed for %s: %s", self.database_path, e)
+
     def _get_connection(self) -> sqlite3.Connection:
         """Get a NEW database connection for each operation (thread-safe)"""
         last_error = None
         for attempt in range(4):
             connection = None
+            _t_open = time.perf_counter()
             try:
                 connection = sqlite3.connect(str(self.database_path), timeout=30.0)
+                _t_connected = time.perf_counter()
                 connection.row_factory = sqlite3.Row
                 # Register Unicode-normalizing function for diacritics-aware LIKE queries
                 try:
@@ -252,12 +530,38 @@ class MusicDatabase:
                     connection.create_function("unidecode_lower", 1, lambda x: _ud(x).lower() if x else "")
                 except ImportError:
                     connection.create_function("unidecode_lower", 1, lambda x: x.lower() if x else "")
+                # the exact function the *_norm columns hold, so a query can
+                # COALESCE a not-yet-backfilled row to the same value
+                from core.text.normalize import normalize_for_comparison as _nfc
+                connection.create_function("norm_text", 1, lambda x: _nfc(x) if x else "", deterministic=True)
                 # Enable foreign key constraints and WAL mode for better concurrency.
                 # Docker Desktop bind mounts can briefly fail while SQLite opens the
                 # sidecar WAL/SHM files; retrying avoids surfacing transient 500s.
-                connection.execute("PRAGMA foreign_keys = ON")
-                connection.execute("PRAGMA journal_mode = WAL")
+                # busy_timeout first, so anything below that has to wait for a
+                # writer waits politely instead of failing
                 connection.execute("PRAGMA busy_timeout = 30000")  # 30 second timeout
+                connection.execute("PRAGMA foreign_keys = ON")
+                # synchronous is per-connection, unlike journal_mode.
+                journal_mode = connection.execute("PRAGMA journal_mode").fetchone()
+                if journal_mode and str(journal_mode[0]).lower() == "wal":
+                    connection.execute("PRAGMA synchronous = NORMAL")
+                # NOT `PRAGMA journal_mode = WAL` here. wal mode is persistent in
+                # the file and is set once per process in _ensure_wal_mode; the
+                # pragma takes a lock, and on an install with enrichment
+                # workers writing constantly every fresh connection sat ~250 ms
+                # in the busy backoff behind them before it could run a single
+                # query. with a connection per db call that was 1-2 s on every
+                # request that touched the database.
+                # diagnostic: say so when an open is still slow.
+                _elapsed = time.perf_counter() - _t_open
+                if _elapsed > 0.2:
+                    # who was waiting. without it the log says something is
+                    # slow ~2,000 times a day and nothing about where.
+                    logger.warning(
+                        "slow sqlite connect: %.0f ms total (connect %.0f ms, pragmas %.0f ms) for %s, from %s [%s]",
+                        _elapsed * 1000, (_t_connected - _t_open) * 1000,
+                        (time.perf_counter() - _t_connected) * 1000, self.database_path,
+                        _calling_functions(), threading.current_thread().name)
                 return connection
             except sqlite3.OperationalError as e:
                 last_error = e
@@ -320,6 +624,8 @@ class MusicDatabase:
                     bitrate INTEGER,
                     file_size INTEGER,  -- bytes; populated by deep scan from media-server API
                     year INTEGER,  -- per-track release year from file tags (albums.year is canonical)
+                    acquired_quality_json TEXT,  -- quality before intentional downsample/lossy retention
+                    retention_json TEXT,  -- JSON transform provenance for the retained representation
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (album_id) REFERENCES albums (id) ON DELETE CASCADE,
@@ -327,6 +633,96 @@ class MusicDatabase:
                 )
             """)
             
+            # Sample Studio analysis cache — one row per library track. Written by
+            # the sample analysis worker (core/sample/worker.py); rows are
+            # re-computed when core.sample.analyze.ANALYZER_VERSION increases.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sample_analysis (
+                    track_id TEXT PRIMARY KEY,
+                    bpm REAL,
+                    onsets_json TEXT,  -- JSON array of onset times in seconds
+                    duration_s REAL,
+                    analyzed_at REAL,
+                    analyzer_version INTEGER DEFAULT 1
+                )
+            """)
+
+            # Sample Studio stash — saved chops. Each row is BOTH the file
+            # record (file_path -> data/sample-studio/chops/) and the
+            # lightweight bookmark (track_id + start/end + pitch/target_bpm),
+            # so a chop can be re-rendered or traced back to its source.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sample_stash (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    tags_json TEXT,  -- JSON array of tag strings
+                    track_id INTEGER NOT NULL,
+                    start_s REAL NOT NULL,
+                    end_s REAL NOT NULL,
+                    pitch_st REAL DEFAULT 0,
+                    target_bpm REAL,
+                    format TEXT DEFAULT 'wav16',
+                    file_path TEXT NOT NULL,
+                    created_at REAL
+                )
+            """)
+            # (ledger back-fill for sample_stash_v1 rides _KNOWN_MIGRATION_SIGNALS below)
+
+            # Phase 4: which stem a chop was cut from (NULL = the full mix).
+            # Tolerant ALTER — existing installs get the column on next boot.
+            try:
+                cursor.execute("ALTER TABLE sample_stash ADD COLUMN stem TEXT")
+            except sqlite3.OperationalError:
+                pass  # already there
+
+            # Phase 6: which configured sample folder the chop was saved to
+            # (the configured path string at save time). file_path stays the
+            # resolvable absolute path, so removing a folder from settings
+            # never breaks existing chops.
+            try:
+                cursor.execute("ALTER TABLE sample_stash ADD COLUMN folder TEXT")
+            except sqlite3.OperationalError:
+                pass  # already there
+
+            # Sample Studio stems — per-track separation cache. One row per
+            # (track_id, stem); the four WAVs live under
+            # data/sample-studio/stems/<track_id>/. "Separate once, cache
+            # forever" — re-running is keyed off separator_version.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS sample_stems (
+                    track_id INTEGER NOT NULL,
+                    stem TEXT NOT NULL,  -- drums | vocals | bass | other
+                    file_path TEXT NOT NULL,
+                    status TEXT DEFAULT 'done',
+                    backend TEXT,  -- demucs-htdemucs | stub
+                    separator_version INTEGER DEFAULT 1,
+                    created_at REAL,
+                    PRIMARY KEY (track_id, stem)
+                )
+            """)
+            # (ledger back-fill for sample_stems_v1 rides _KNOWN_MIGRATION_SIGNALS below)
+
+            # sample studio: detected key + a signature of the source file (so
+            # a replaced file re-analyzes and re-separates), and the fx recipe
+            # each saved chop was rendered with. tolerant ALTERs like above.
+            for _table, _col, _type in (
+                ("sample_analysis", "key_name", "TEXT"),
+                ("sample_analysis", "key_confidence", "REAL"),
+                ("sample_analysis", "source_sig", "TEXT"),
+                ("sample_stems", "source_sig", "TEXT"),
+                ("sample_stash", "normalize", "TEXT"),
+                ("sample_stash", "fade_ms", "REAL"),
+                ("sample_stash", "reverse", "INTEGER"),
+                ("sample_stash", "space", "REAL"),
+                ("sample_stash", "delay_json", "TEXT"),
+            ):
+                try:
+                    cursor.execute(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}")
+                except sqlite3.OperationalError:
+                    pass  # already there
+
+            self._migrate_sample_analysis_text_ids(cursor)
+
             # Metadata table for storing system information like last refresh dates
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -335,6 +731,35 @@ class MusicDatabase:
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+
+            # Per-user curation signals read back off the media server —
+            # what people deliberately CHOSE about a track (favourited,
+            # rated, added to a playlist), as opposed to play_count which
+            # only records what happened. Feeds the Expired Download
+            # Cleaner's keep decision.
+            #
+            # Keyed by ``track_key`` (normalised trailing path segments, see
+            # _path_suffix_key) rather than the media server's item id on
+            # purpose: item ids change when the library is rebuilt, and
+            # SoulSync's stored path and the server's differ on Docker/NAS.
+            # The path suffix survives both.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS curation_signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server TEXT NOT NULL,
+                    user_key TEXT NOT NULL,
+                    track_key TEXT NOT NULL,
+                    favorite INTEGER DEFAULT 0,
+                    rating REAL,
+                    in_playlist INTEGER DEFAULT 0,
+                    source_path TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(server, user_key, track_key)
+                )
+            """)
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_curation_track_key "
+                "ON curation_signals (track_key)")
 
             # Migration ledger — a single, readable record of which one-time
             # migrations have run. ADDITIVE backstop only: existing migrations
@@ -347,6 +772,28 @@ class MusicDatabase:
                     name TEXT PRIMARY KEY,
                     applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
+            """)
+
+            # Bulk library reorganize used to queue entirely in process memory.
+            # A gunicorn worker recycle - an OOM SIGKILL in the report that found
+            # this - took every queued album with it, silently, while the job
+            # still reported success, leaving the library half-converted with no
+            # error anywhere. Only OUTSTANDING work lives here: a row exists while
+            # an item is queued or running and is deleted when it reaches a
+            # terminal state, so the table stays the size of the backlog rather
+            # than of the history.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS reorganize_queue (
+                    queue_id TEXT PRIMARY KEY,
+                    album_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    enqueued_at REAL NOT NULL,
+                    payload TEXT NOT NULL          -- json snapshot of the QueueItem
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_reorg_queue_status
+                    ON reorganize_queue(status, enqueued_at)
             """)
             
             # Wishlist table for storing failed download tracks for retry
@@ -363,6 +810,44 @@ class MusicDatabase:
                     source_info TEXT  -- JSON of source context (playlist name, album info, etc.)
                 )
             """)
+
+            # Wishlist removal audit (#1289). A wishlist row is deleted, not
+            # tombstoned, so when a user asks "where did this track go?" there
+            # was nothing to look at: the only trace was a log line carrying an
+            # id and no reason, no path and no batch. Tracking down the atomic-
+            # publish dropout meant correlating timestamps across three loggers
+            # by hand. This is small, append-only and trimmed, and turns that
+            # into one query.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS wishlist_removals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    spotify_track_id TEXT NOT NULL,
+                    profile_ids TEXT,          -- JSON list, or NULL for an all-profile sweep
+                    rows_removed INTEGER DEFAULT 0,
+                    reason TEXT,               -- download_complete / atomic_published / already_owned / ...
+                    final_path TEXT,
+                    batch_id TEXT,
+                    source TEXT,
+                    removed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wishlist_removals_track "
+                           "ON wishlist_removals (spotify_track_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_wishlist_removals_at "
+                           "ON wishlist_removals (removed_at)")
+
+            # Purge any podcast items that erroneously leaked into wishlist_tracks
+            try:
+                cursor.execute("""
+                    DELETE FROM wishlist_tracks
+                    WHERE source_type = 'podcast'
+                       OR spotify_track_id LIKE 'podcast-%'
+                       OR source_info LIKE '%"source_page": "Podcasts"%'
+                       OR source_info LIKE '%"download_source": "Podcast"%'
+                       OR source_info LIKE '%"playlist_id": "podcasts"%'
+                """)
+            except Exception as purge_err:
+                logger.debug("Initial podcast wishlist purge skipped or failed: %s", purge_err)
 
             # Wishlist ignore-list (#874): a TTL'd skip-gate. When a user
             # removes a track from the wishlist or cancels an in-flight
@@ -386,6 +871,50 @@ class MusicDatabase:
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_wishlist_ignore_profile ON wishlist_ignore (profile_id, track_id)")
 
+            # Artists whose music downloads are filed in the audiobook library
+            # instead (core/audiobook_routing.py). Keyed on the normalized
+            # artist name: every download path knows the artist, none of them
+            # reliably knows the playlist.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS audiobook_routes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL DEFAULT 'artist',
+                    route_key TEXT NOT NULL,
+                    label TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(kind, route_key)
+                )
+            """)
+
+            # #652 again. the "don't pick this same bad upload again" list used
+            # to be built by reading the sidecars sitting in ss_quarantine. so
+            # the review queue WAS the blocklist, and emptying the queue (approve,
+            # delete, clear all) also wiped the memory of what already failed.
+            # ranking is deterministic, so the same file wins again, downloads
+            # again, fails the same check again. that's why approving something
+            # five times keeps bringing it back.
+            #
+            # so the verdict lives here now, it survives the folder getting
+            # cleared. nothing in the review queue removes these rows, approve
+            # included, see approve_quarantine_entry for why. deleting means
+            # "this file is bad" which is the best reason there is to keep
+            # blocking it, and approving is either harmless (the track imported,
+            # nobody searches for it again) or the only thing that breaks the
+            # loop (it didn't import, so pick someone else next time).
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS quarantine_source_blocks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL,
+                    filename TEXT NOT NULL,
+                    trigger TEXT DEFAULT 'unknown',
+                    expected_artist TEXT DEFAULT '',
+                    expected_track TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(username, filename)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_qsb_source ON quarantine_source_blocks (username, filename)")
+
             # Notification history (Kazimir): every toast the UI raises is
             # journaled here so a reflexive "Clear All" in the bell panel
             # loses nothing — the History modal reads this, filterable +
@@ -402,9 +931,121 @@ class MusicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_notification_history_profile "
                            "ON notification_history (profile_id, id)")
 
-            # The Soulseek chat feature was removed; shed its archive table
-            # so an upgraded database doesn't carry dead rows forever.
-            cursor.execute("DROP TABLE IF EXISTS chat_room_messages")
+            # Soulseek chat archive (chatbic P2): slskd only holds room
+            # messages in memory since it joined — an slskd restart wipes the
+            # room. This is the durable copy (text stored DECODED + rich flag,
+            # decoding happens at ingest), fed by the push loop + page hydrate,
+            # deduped on the natural key, pruned per room. Rooms only — slskd
+            # already persists PM conversations itself.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_room_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    rich INTEGER NOT NULL DEFAULT 0,
+                    timestamp TEXT NOT NULL,
+                    reply TEXT,
+                    file TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(room, username, timestamp, message) ON CONFLICT IGNORE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_room_messages_room "
+                           "ON chat_room_messages (room, timestamp)")
+            # Reactions. They travel as empty-text carriers, which the unwrap
+            # pulls OUT of the message list, so the message archive never saw
+            # them: a reaction lived exactly as long as slskd's room buffer and
+            # was gone after a restart. Reactions cannot be un-sent (there is no
+            # remove carrier), so storing them additively is the whole model —
+            # nothing here can resurrect something a user took back.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_room_reactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room TEXT NOT NULL,
+                    target_key TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(room, target_key, emoji, username) ON CONFLICT IGNORE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_room_reactions_room "
+                           "ON chat_room_reactions (room, target_key)")
+            # Arcade game carriers. Protocol carriers are normally ephemeral --
+            # they are machine coordination and replaying a stale jukebox vote
+            # would resurrect a dead queue -- but a GAME is durable state that
+            # happens to be carried as messages. slskd forgets the room on
+            # restart and the client only keeps the last 300 protocol events,
+            # so without this a match played across days simply vanishes once
+            # nobody in the room still holds it. Games only: never jbx.*, typ,
+            # hello or pins.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_game_carriers (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    room TEXT NOT NULL,
+                    game_id TEXT NOT NULL,
+                    username TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(room, username, timestamp, payload) ON CONFLICT IGNORE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_chat_game_carriers_room "
+                           "ON chat_game_carriers (room, timestamp)")
+            # Arcade play-money bank. Local and per profile, refilled to the
+            # daily allowance the first time it is read on a new local day.
+            # DELIBERATELY not authoritative for anything between players: a
+            # balance nobody else can verify cannot back a bet. It exists for
+            # solo games (the slot machine) where there is nobody to defraud.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS arcade_bank (
+                    profile_id INTEGER PRIMARY KEY,
+                    balance INTEGER NOT NULL DEFAULT 0,
+                    refilled_on TEXT NOT NULL DEFAULT '',
+                    lifetime_won INTEGER NOT NULL DEFAULT 0,
+                    lifetime_lost INTEGER NOT NULL DEFAULT 0,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Local, private notes on Soulseek users ("great jazz rips") —
+            # shown on the chat user card. Never leaves this install.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS chat_user_notes (
+                    username TEXT PRIMARY KEY,
+                    note TEXT NOT NULL DEFAULT '',
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # the table shipped one commit before the reply column — live dbs
+            # already created it, so the column rides a tolerant ALTER
+            try:
+                cursor.execute("ALTER TABLE chat_room_messages ADD COLUMN reply TEXT")
+            except sqlite3.OperationalError:
+                pass    # already there
+            # file-share card metadata (name/size/mime) — without it, archived
+            # file messages lost their card + preview + save-to-library button
+            # and rendered as a bare link. Same tolerant-ALTER pattern as reply.
+            try:
+                cursor.execute("ALTER TABLE chat_room_messages ADD COLUMN file TEXT")
+            except sqlite3.OperationalError:
+                pass    # already there
+            # Channel / thread / avatar envelope tags. Without these the
+            # archive flattened every message into #general on reload: the
+            # push loop archived DECODED dicts, and decoding is exactly the
+            # step that strips the envelope, so the tags existed nowhere
+            # the frontend could reach. Same tolerant-ALTER pattern.
+            # 'overlay' carries a shared template. It rides its own envelope key
+            # and a share has NO text, so before this the archive dropped the
+            # whole row (add_chat_messages requires a message) and a template
+            # shared into the room simply vanished on reload.
+            for _chat_col in ('chan TEXT', 'thread TEXT', 'thread_name TEXT', 'av INTEGER',
+                              'edit_target TEXT', 'overlay TEXT', 'np TEXT', 'want TEXT', 'badge TEXT'):
+                try:
+                    cursor.execute("ALTER TABLE chat_room_messages ADD COLUMN " + _chat_col)
+                except sqlite3.OperationalError:
+                    pass    # already there
 
             # Watchlist table for storing artists to monitor for new releases
             cursor.execute("""
@@ -417,6 +1058,7 @@ class MusicDatabase:
                     musicbrainz_artist_id TEXT,
                     amazon_artist_id TEXT,
                     artist_name TEXT NOT NULL,
+                    quality_profile_id INTEGER DEFAULT NULL,
                     date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_scan_timestamp TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -447,6 +1089,128 @@ class MusicDatabase:
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_labels_mbid "
                            "ON watchlist_labels (musicbrainz_label_id)")
+
+            # Podcast watchlist (podcasts feature) — follow podcast shows to monitor
+            # their new episodes, mirroring artists and labels. Purely ADDITIVE.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS watchlist_podcasts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    feed_url TEXT NOT NULL,
+                    itunes_id INTEGER,
+                    title TEXT NOT NULL,
+                    author TEXT,
+                    description TEXT,
+                    artwork_url TEXT,
+                    website TEXT,
+                    auto_download INTEGER NOT NULL DEFAULT 1,
+                    retention_days INTEGER NOT NULL DEFAULT 14,
+                    episode_count INTEGER,
+                    date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_scan_timestamp TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    profile_id INTEGER DEFAULT 1,
+                    UNIQUE(feed_url, profile_id)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_podcasts_feed "
+                           "ON watchlist_podcasts (feed_url)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_podcasts_itunes "
+                           "ON watchlist_podcasts (itunes_id)")
+
+            # feed_url used to be unique on its own, which reads fine until a
+            # second profile follows a show the first one already follows: the
+            # insert hit ON CONFLICT(feed_url) and UPDATED the first profile's
+            # row instead of making a new one, so the second person got a
+            # success and an empty watchlist. the rows are per profile, so the
+            # constraint has to be per profile too.
+            #
+            # sqlite cannot alter a constraint, so the table is rebuilt. it only
+            # holds subscriptions, so it is small, and the whole thing runs in
+            # one transaction - either the new table is in place with every row
+            # copied or nothing changed at all.
+            try:
+                _wp_sql = cursor.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='watchlist_podcasts'"
+                ).fetchone()
+                _wp_sql = (_wp_sql[0] if _wp_sql else "") or ""
+                _wp_norm = " ".join(_wp_sql.split())
+                # two ways to be wrong: no pair constraint at all, or a pair
+                # constraint sitting next to the old column-level UNIQUE, which
+                # still refuses the second profile. either shape gets rebuilt.
+                _wp_needs_rebuild = (
+                    "UNIQUE(feed_url, profile_id)" not in _wp_norm
+                    or "feed_url TEXT UNIQUE" in _wp_norm
+                )
+                if _wp_sql and _wp_needs_rebuild:
+                    logger.info("Migrating watchlist_podcasts to a per-profile unique key")
+                    cursor.execute("""
+                        CREATE TABLE watchlist_podcasts_migrating (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            feed_url TEXT NOT NULL,
+                            itunes_id INTEGER,
+                            title TEXT NOT NULL,
+                            author TEXT,
+                            description TEXT,
+                            artwork_url TEXT,
+                            website TEXT,
+                            auto_download INTEGER NOT NULL DEFAULT 1,
+                            retention_days INTEGER NOT NULL DEFAULT 14,
+                            episode_count INTEGER,
+                            date_added TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_scan_timestamp TIMESTAMP,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            profile_id INTEGER DEFAULT 1,
+                            UNIQUE(feed_url, profile_id)
+                        )
+                    """)
+                    cursor.execute("""
+                        INSERT INTO watchlist_podcasts_migrating (
+                            id, feed_url, itunes_id, title, author, description,
+                            artwork_url, website, auto_download, retention_days,
+                            episode_count, date_added, last_scan_timestamp,
+                            created_at, updated_at, profile_id
+                        )
+                        SELECT id, feed_url, itunes_id, title, author, description,
+                               artwork_url, website, auto_download, retention_days,
+                               episode_count, date_added, last_scan_timestamp,
+                               created_at, updated_at, COALESCE(profile_id, 1)
+                        FROM watchlist_podcasts
+                    """)
+                    cursor.execute("DROP TABLE watchlist_podcasts")
+                    cursor.execute("ALTER TABLE watchlist_podcasts_migrating "
+                                   "RENAME TO watchlist_podcasts")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_podcasts_feed "
+                                   "ON watchlist_podcasts (feed_url)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_podcasts_itunes "
+                                   "ON watchlist_podcasts (itunes_id)")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idx_watchlist_podcasts_profile "
+                                   "ON watchlist_podcasts (profile_id)")
+            except Exception as _wp_err:
+                # a failed migration must not stop the database opening. the old
+                # shape still works for one profile, which is what it did before.
+                logger.error("watchlist_podcasts migration skipped: %s", _wp_err)
+
+            # Downloaded podcast episodes tracker (for auto-download deduplication and retention pruning)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS downloaded_podcast_episodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    feed_url TEXT NOT NULL,
+                    guid TEXT,
+                    enclosure_url TEXT NOT NULL,
+                    title TEXT,
+                    pub_date TIMESTAMP,
+                    file_path TEXT,
+                    downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    pruned_at TIMESTAMP,
+                    UNIQUE(feed_url, enclosure_url)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_podcasts_feed "
+                           "ON downloaded_podcast_episodes (feed_url)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_downloaded_podcasts_guid "
+                           "ON downloaded_podcast_episodes (guid)")
 
             # Create indexes for performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums (artist_id)")
@@ -553,14 +1317,20 @@ class MusicDatabase:
             self._add_profile_support_v2(cursor)
             self._add_profile_support_v3(cursor)
             self._add_profile_support_v4(cursor)
+            self._fix_profile_one_owner_rows(cursor)
             self._add_profile_settings(cursor)
             self._add_profile_sides(cursor)
             self._add_profile_listenbrainz_support(cursor)
             self._add_profile_password_support(cursor)
             self._add_profile_recovery_support(cursor)
             self._add_profile_service_credentials(cursor)
+            self._add_profile_navidrome_login(cursor)
+            self._add_profile_lastfm_username(cursor)
+            self._add_profile_plex_home_user(cursor)
+            self._add_profile_controls(cursor)
+            self._add_own_library_columns(cursor)
+            self._repair_own_jellyfin_artist_ids(cursor)
             self._add_service_credential_sets(cursor)
-            self._add_profile_plex_link(cursor)
             self._add_soul_id_columns(cursor)
             self._add_listening_history_table(cursor)
 
@@ -569,6 +1339,9 @@ class MusicDatabase:
             # from an explicit column list, so any column added before them gets
             # dropped. Adding it here (after the last recreate) makes it stick.
             self._add_watchlist_auto_download_column(cursor)
+            # Same ordering rule: must land AFTER the recreates, or it is dropped.
+            self._add_watchlist_auto_download_pref_column(cursor)
+            self._add_watchlist_quality_profile_column(cursor)
 
             # Spotify library cache
             self._add_spotify_library_cache_table(cursor)
@@ -578,6 +1351,28 @@ class MusicDatabase:
 
             # Repair worker v2 tables (findings + job runs)
             self._add_repair_worker_tables(cursor)
+            self._add_norm_columns(cursor)
+            self._add_lookup_indexes(cursor)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS genre_translation_cache (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    whitelist_hash TEXT NOT NULL,
+                    source_genre TEXT NOT NULL,
+                    normalized_source_genre TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    matched_genre TEXT,
+                    score REAL,
+                    margin REAL,
+                    candidates_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    access_count INTEGER DEFAULT 1,
+                    UNIQUE(whitelist_hash, normalized_source_genre)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_gtc_hash ON genre_translation_cache (whitelist_hash)")
 
             # Mirrored playlists — persistent backup of parsed playlists from any service
             cursor.execute("""
@@ -591,6 +1386,7 @@ class MusicDatabase:
                     image_url TEXT,
                     track_count INTEGER DEFAULT 0,
                     profile_id INTEGER DEFAULT 1,
+                    quality_profile_id INTEGER DEFAULT NULL,
                     mirrored_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(source, source_playlist_id, profile_id)
@@ -608,7 +1404,6 @@ class MusicDatabase:
                     image_url TEXT,
                     source_track_id TEXT,
                     extra_data TEXT,
-                    isrc TEXT,
                     FOREIGN KEY (playlist_id) REFERENCES mirrored_playlists(id) ON DELETE CASCADE,
                     UNIQUE(playlist_id, position)
                 )
@@ -682,9 +1477,14 @@ class MusicDatabase:
 
             # Add explored_at to mirrored_playlists (migration)
             self._add_mirrored_playlist_explored_column(cursor)
+            self._add_mirrored_playlist_cover_tiles_column(cursor)
+            self._add_mirrored_playlist_server_link_columns(cursor)
             self._add_mirrored_playlist_organize_column(cursor)
             self._add_mirrored_playlist_custom_name_column(cursor)
-            self._add_mirrored_playlist_tracks_isrc_column(cursor)
+            self._add_mirrored_playlist_sync_mode_column(cursor)
+            self._add_mirrored_playlist_quality_profile_column(cursor)
+            self._add_mirrored_playlist_source_skipped_column(cursor)
+            self._add_mirrored_playlist_track_added_at_column(cursor)
 
             # Add notification columns to automations (migration)
             self._add_automation_notify_columns(cursor)
@@ -692,56 +1492,6 @@ class MusicDatabase:
             self._add_automation_then_actions_column(cursor)
             self._add_automation_group_name_column(cursor)
             self._add_automation_owned_by_column(cursor)
-
-            # Flags a downloaded track as not-yet-purchased (migration)
-            self._add_to_be_purchased_column(cursor)
-
-            # Durable purchase record — when a to-be-purchased track/album is
-            # actually bought (migration)
-            self._add_purchased_at_column(cursor)
-
-            # ── Music Libraries ────────────────────────────────────────────
-            # Where finished music is filed. Music had exactly ONE destination
-            # (soulseek.transfer_path) since its Soulseek-era design, while the
-            # video side has had a table of labelled root folders for a long
-            # time — so "send this to the archive drive" was expressible for a
-            # film and not for an album.
-            #
-            # `path` is UNIQUE: two rows pointing at the same folder would make
-            # "which library is this file in?" unanswerable for every scanner
-            # and repair job that resolves a file back to its root.
-            #
-            # `sort_order` lowest = the default destination, matching the video
-            # root_folders convention so both sides read the same way.
-            #
-            # NULL naming_template / quality_profile_id mean "inherit the
-            # global setting" rather than "no template / no profile" — an
-            # install that never edits a library keeps behaving as it did.
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS music_root_folders (
-                    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path               TEXT NOT NULL UNIQUE,
-                    label              TEXT,
-                    sort_order         INTEGER NOT NULL DEFAULT 0,
-                    naming_template    TEXT,
-                    quality_profile_id INTEGER,
-                    created_at         TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_music_roots_order "
-                "ON music_root_folders (sort_order)"
-            )
-            self._seed_music_root_folder(cursor)
-
-            # ...and repair the folder/library mismatch 1.9.2 could leave
-            # behind, which otherwise persists until the user happens to save
-            # Settings again.
-            self._reconcile_default_music_library(cursor)
-
-            # Which library a wishlist track is destined for. NULL = the
-            # default library, i.e. exactly where it would have gone before.
-            self._add_wishlist_root_folder_column(cursor)
 
             # Library issues — user-reported problems with tracks/albums/artists
             cursor.execute("""
@@ -787,6 +1537,10 @@ class MusicDatabase:
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_lh_event_type ON library_history (event_type)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_lh_created_at ON library_history (created_at DESC)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_lh_target ON library_history "
+                           "(title COLLATE NOCASE, artist_name COLLATE NOCASE, id DESC) "
+                           "WHERE event_type IN ('download', 'import')")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_lh_path ON library_history (file_path, id DESC)")
 
             # Migration: add download_source column
             cursor.execute("PRAGMA table_info(library_history)")
@@ -935,7 +1689,9 @@ class MusicDatabase:
                     playlist_folder_mode INTEGER DEFAULT 0,
                     started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     completed_at TIMESTAMP,
-                    track_results TEXT
+                    track_results TEXT,
+                    profile_id INTEGER,
+                    quality_profile_id INTEGER
                 )
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_sh_started_at ON sync_history (started_at DESC)")
@@ -961,6 +1717,41 @@ class MusicDatabase:
                 except Exception as e:
                     logger.debug("Failed to add source_page column: %s", e)
 
+            # Migration: give sync_history a SoulSync profile and a Quality
+            # Profile (P1-04). Without them every profile saw and could delete
+            # every other profile's runs, and a "re-add to wishlist" recreated
+            # the track as admin with the global default quality. Existing rows
+            # keep NULL, which reads as "legacy / admin" — see get_sync_history.
+            for _sh_col, _sh_type in (('profile_id', 'INTEGER'),
+                                      ('quality_profile_id', 'INTEGER')):
+                try:
+                    cursor.execute(f"SELECT {_sh_col} FROM sync_history LIMIT 1")
+                except Exception:
+                    try:
+                        cursor.execute(
+                            f"ALTER TABLE sync_history ADD COLUMN {_sh_col} {_sh_type}"
+                        )
+                        logger.info("Added %s column to sync_history table", _sh_col)
+                    except Exception as e:
+                        logger.debug("Failed to add %s column: %s", _sh_col, e)
+
+            # Repair: single tracks and some albums were recorded as playlists
+            # and showed on the dashboard's playlist card (#1591). cheap and
+            # idempotent, so it just runs every start.
+            try:
+                from core.downloads.history import ALBUM_PREFIXES, SINGLE_TRACK_PREFIXES
+                for _sh_type, _sh_prefixes in (('track', SINGLE_TRACK_PREFIXES),
+                                               ('album', ALBUM_PREFIXES)):
+                    _sh_like = " OR ".join("playlist_id LIKE ?" for _ in _sh_prefixes)
+                    cursor.execute(
+                        f"UPDATE sync_history SET sync_type = ? "
+                        f"WHERE (sync_type = 'playlist' OR sync_type IS NULL OR sync_type = '') "
+                        f"AND ({_sh_like})",
+                        (_sh_type, *(p + '%' for p in _sh_prefixes)),
+                    )
+            except Exception as e:
+                logger.debug("Failed to repair sync_history types: %s", e)
+
             # Migration: add track_artist column for per-track artist on compilations/DJ mixes
             try:
                 cursor.execute("SELECT track_artist FROM tracks LIMIT 1")
@@ -976,7 +1767,7 @@ class MusicDatabase:
             # filesystem on every request. Populated by the deep scan from
             # whatever the media server reports (Plex MediaPart.size,
             # Jellyfin MediaSources[].Size, Navidrome <song size="...">,
-            # Commissary standalone os.path.getsize). NULL on existing rows
+            # SoulSync standalone os.path.getsize). NULL on existing rows
             # until the next deep scan fills them in — UI handles the
             # NULL case by showing "(run a Deep Scan to populate)".
             try:
@@ -1135,7 +1926,30 @@ class MusicDatabase:
             except Exception as qp_err:
                 logger.error(f"Quality-profile migration failed: {qp_err}")
 
+            # Watchlist artists and mirrored playlists predate named Quality
+            # Profiles.  Pin every legacy row to the profile that is global at
+            # migration time, matching the behavior it had before this feature.
+            self._backfill_native_quality_profile_assignments(cursor)
+
             self._ensure_core_media_schema_columns(cursor)
+            self._ensure_art_lock_columns(cursor)
+            self._ensure_genres_lock_columns(cursor)
+            self._ensure_manual_metadata_schema(cursor)
+            # every artist credited on a track, from the enrichment workers.
+            # after the provider id columns above, the triggers watch them
+            try:
+                from core.library.artist_credits import ensure_schema as _ensure_artist_credits
+                _ensure_artist_credits(cursor)
+            except Exception as e:
+                logger.error(f"track_artist_credits schema init failed: {e}")
+            # clients-tab music matches: a download followed to the import page
+            try:
+                from core.client_match import ensure_schema as _ensure_client_matches
+                _ensure_client_matches(cursor)
+            except Exception as e:
+                logger.error(f"client_music_matches schema init failed: {e}")
+            self._requeue_similar_artists_rematch(cursor)
+            self._purge_beatport_positional_matches(cursor)
             self._normalize_genres_to_json(cursor)
             # Unify scattered migration state into the ledger + stamp the schema
             # version. Additive backstop — runs last, gates nothing.
@@ -1152,6 +1966,16 @@ class MusicDatabase:
                 apply_pending_quality_profile_config_writes(self)
             except Exception as qp_err:
                 logger.error(f"Could not apply quality-profile migration config write(s): {qp_err}")
+
+            # A profile deletion commits the DB and only THEN clears the matching
+            # config override; those two writes cannot be atomic. The DB is the
+            # source of truth, so retry the cleanup on every boot until it sticks
+            # (P3-02).
+            try:
+                from core.quality.migrate_to_profiles import reconcile_stale_quality_profile_config
+                reconcile_stale_quality_profile_config(self)
+            except Exception as qp_err:
+                logger.error(f"Could not reconcile stale quality-profile config: {qp_err}")
 
             logger.info("Database initialized successfully")
 
@@ -1221,7 +2045,13 @@ class MusicDatabase:
         'deezer_cache_v2':          ('table', '_deezer_cache_v2_migrated'),
         'cache_junk_artist_purged': ('table', '_cache_junk_artist_purged'),
         'genius_search_fix':        ('table', '_genius_search_fix_applied'),
+        'tidal_search_fix':         ('table', '_tidal_search_fix_applied'),
         'quality_profiles_schema':  ('table', 'quality_profiles'),
+        'sample_analysis_v1':        ('table', 'sample_analysis'),
+        'sample_stash_v1':            ('table', 'sample_stash'),
+        'sample_stems_v1':            ('table', 'sample_stems'),
+        'similar_artists_rematch':  ('table', '_similar_artists_rematch_applied'),
+        'beatport_positional_purged': ('table', '_beatport_positional_purged'),
     }
 
     def _record_migration(self, cursor, name):
@@ -1344,6 +2174,12 @@ class MusicDatabase:
             if track_cols and 'disc_number' not in track_cols:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN disc_number INTEGER DEFAULT 1")
                 logger.info("Repaired missing disc_number column on tracks table (#927)")
+            # #1573: where the media server says the file is. file_path is where
+            # SoulSync opens it; the two differ whenever the containers mount the
+            # music folder under different names. NULL until a scan fills it.
+            if track_cols and 'server_path' not in track_cols:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN server_path TEXT")
+                logger.info("Added server_path column to tracks table (#1573)")
 
             cursor.execute("PRAGMA table_info(albums)")
             album_cols = {c[1] for c in cursor.fetchall()}
@@ -1373,13 +2209,258 @@ class MusicDatabase:
                 # auto resolve job (and any re-resolution) must never overwrite
                 # a locked pin, so a manual match stays put across cycles.
                 'canonical_locked': 'INTEGER DEFAULT 0',
+                # the pinned release's track count, remembered the first time
+                # it is fetched. a release's tracklist does not change, so the
+                # artist page reads it here instead of asking musicbrainz live
+                # (and waiting through its retries) on every completion check.
+                # NULL until fetched; cleared by a re-pin.
+                'canonical_track_count': 'INTEGER DEFAULT NULL',
             }
             for _col, _typedef in _canonical_cols.items():
                 if album_cols and _col not in album_cols:
                     cursor.execute(f"ALTER TABLE albums ADD COLUMN {_col} {_typedef}")
                     logger.info("Added %s column to albums table (canonical version)", _col)
+
+            # #1701: where reorganize last placed the album. the release it used
+            # and a fingerprint of the naming settings at the time, so a later
+            # scan keeps that release and only re-flags when the user changes
+            # their naming or pins a different version. NULL = never placed.
+            _placement_cols = {
+                'reorganize_source': 'TEXT DEFAULT NULL',
+                'reorganize_album_id': 'TEXT DEFAULT NULL',
+                'reorganize_fp': 'TEXT DEFAULT NULL',
+            }
+            for _col, _typedef in _placement_cols.items():
+                if album_cols and _col not in album_cols:
+                    cursor.execute(f"ALTER TABLE albums ADD COLUMN {_col} {_typedef}")
+                    logger.info("Added %s column to albums table (#1701)", _col)
+
         except Exception as e:
             logger.error("Error repairing core media schema columns: %s", e)
+
+    def _art_lock_supported(self, cursor, table: str) -> bool:
+        """Does this database have ``<table>.art_locked`` yet?
+
+        The sync upserts REFERENCE the column, and SQLite raises "no such
+        column" for the whole statement if it is absent — which the upsert's
+        broad ``except`` swallows into a False return, losing the row silently.
+        A scan that quietly stops saving albums is far worse than art that
+        forgets it was pinned, so the lock degrades instead of exploding:
+        no column ⇒ exactly the pre-lock behaviour.
+
+        Reachable whenever the schema is older than the code: a database whose
+        migration failed, and any caller that builds a bare albums table and
+        drives the upsert directly (which several tests legitimately do).
+
+        Memoized per instance — a PRAGMA per upsert would be a real cost on a
+        full library scan. `getattr` because callers may bypass ``__init__``."""
+        cache = getattr(self, '_art_lock_cols', None)
+        if cache is None:
+            cache = {}
+            self._art_lock_cols = cache
+        if table not in cache:
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cache[table] = any(row[1] == 'art_locked' for row in cursor.fetchall())
+            except Exception:
+                cache[table] = False
+        return cache[table]
+
+    def _ensure_manual_metadata_schema(self, cursor):
+        """Hand-tagged ("tag it yourself") albums: the files, and a lock flag.
+
+        the user typed the metadata for a release no service knows. the lock
+        keeps enrichment and the maintenance jobs from "correcting" it into the
+        studio release. its OWN method with its OWN try, like art_locked: no
+        sync upsert references these columns in its main statement, so a
+        missing column degrades to "not locked", never to a lost scan."""
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS manual_metadata_files (
+                    path_key TEXT PRIMARY KEY,
+                    file_path TEXT,
+                    album_title TEXT,
+                    album_artist TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            logger.error("Could not ensure manual_metadata_files: %s", e)
+        for table in ('albums', 'tracks'):
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cols = {c[1] for c in cursor.fetchall()}
+                if cols and 'metadata_locked' not in cols:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN metadata_locked INTEGER DEFAULT 0")
+                    logger.info("Added metadata_locked column to %s table (hand-tagged)", table)
+            except Exception as e:
+                logger.error("Could not ensure %s.metadata_locked: %s", table, e)
+
+    @staticmethod
+    def manual_path_key(file_path) -> str:
+        """artist/album/file, lowercased. a media server mounts the library
+        somewhere else than SoulSync does, the tail is what both agree on"""
+        parts = [p for p in str(file_path or '').replace('\\', '/').split('/') if p]
+        return '/'.join(parts[-3:]).lower()
+
+    def record_manual_metadata_file(self, file_path, album_title: str = '', album_artist: str = '') -> int:
+        """remember a hand-tagged file and lock whatever rows already point at
+        it. returns how many track rows got locked right now (a media-server
+        library locks its rows later, when the scan brings them in)"""
+        key = self.manual_path_key(file_path)
+        if not key:
+            return 0
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO manual_metadata_files (path_key, file_path, album_title, album_artist) "
+                "VALUES (?, ?, ?, ?)", (key, str(file_path), album_title or '', album_artist or ''))
+            name = key.rsplit('/', 1)[-1]
+            like = '%' + name.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+            cursor.execute("SELECT id, album_id, file_path FROM tracks WHERE file_path LIKE ? ESCAPE '\\'", (like,))
+            hits = [(tid, aid) for tid, aid, fp in cursor.fetchall() if self.manual_path_key(fp) == key]
+            for track_id, album_id in hits:
+                self._lock_manual_rows(cursor, track_id, album_id)
+            conn.commit()
+            return len(hits)
+        finally:
+            conn.close()
+
+    def manual_path_keys(self) -> set:
+        """every hand-tagged file's path key, for jobs that walk the disk: one
+        query up front, then a set lookup per file"""
+        try:
+            conn = self._get_connection()
+            try:
+                return {row[0] for row in conn.execute("SELECT path_key FROM manual_metadata_files")}
+            finally:
+                conn.close()
+        except Exception as e:  # noqa: BLE001 - old schema: nothing is hand-tagged
+            logger.debug("manual_path_keys unavailable: %s", e)
+            return set()
+
+    def clear_manual_lock(self, album_id) -> bool:
+        """the user unlocked a hand-tagged album: enrichment and the jobs may
+        look at it again. 'manual' statuses go back to NULL so every worker
+        picks the rows up fresh, and its files stop re-locking on rescans.
+        False when the album doesn't exist."""
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM albums WHERE id = ?", (album_id,))
+            if not cursor.fetchone():
+                return False
+            cursor.execute("SELECT id, file_path FROM tracks WHERE album_id = ?", (album_id,))
+            tracks = cursor.fetchall()
+            keys = [self.manual_path_key(fp) for _tid, fp in tracks if fp]
+            if keys:
+                try:
+                    cursor.executemany("DELETE FROM manual_metadata_files WHERE path_key = ?", [(k,) for k in keys])
+                except Exception as e:  # noqa: BLE001 - old schema, nothing to forget
+                    logger.debug("clear_manual_lock: %s", e)
+            for table, ids in (('tracks', [t[0] for t in tracks]), ('albums', [album_id])):
+                cols = self._match_status_columns(cursor, table)
+                sets = ', '.join([f"{c} = CASE WHEN {c} = 'manual' THEN NULL ELSE {c} END" for c in cols]
+                                 + ['metadata_locked = 0'])
+                cursor.executemany(f"UPDATE {table} SET {sets} WHERE id = ?", [(i,) for i in ids])
+            conn.commit()
+            return True
+        finally:
+            conn.close()
+
+    def _match_status_columns(self, cursor, table: str) -> List[str]:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return [c[1] for c in cursor.fetchall() if c[1].endswith('_match_status')]
+
+    def _lock_manual_rows(self, cursor, track_id, album_id) -> None:
+        """every per-source match status to 'manual' (every enrichment worker
+        only picks NULL / not_found / error, so this stands all of them down)
+        plus metadata_locked for the maintenance jobs"""
+        for table, row_id in (('tracks', track_id), ('albums', album_id)):
+            if row_id is None:
+                continue
+            cols = self._match_status_columns(cursor, table)
+            sets = ', '.join([f"{c} = 'manual'" for c in cols] + ['metadata_locked = 1'])
+            cursor.execute(f"UPDATE {table} SET {sets} WHERE id = ?", (row_id,))
+
+    def _apply_manual_lock_for_track(self, cursor, track_id, album_id, file_path) -> bool:
+        """a scan wrote this track row. if its file is one the user hand-tagged,
+        lock it and its album. cheap when nothing is hand-tagged: one indexed
+        lookup that misses"""
+        key = self.manual_path_key(file_path)
+        if not key:
+            return False
+        cursor.execute("SELECT 1 FROM manual_metadata_files WHERE path_key = ?", (key,))
+        if not cursor.fetchone():
+            return False
+        self._lock_manual_rows(cursor, track_id, album_id)
+        return True
+
+    def _ensure_genres_lock_columns(self, cursor):
+        """genres soulsync's own genre jobs settled (Cremonies, discord).
+
+        genre enrichment and the whitelist cleanup write the db. the next media
+        server scan used to put back whatever the server read from the files,
+        so the cleanup quietly undid itself. a locked row keeps its genres
+        through scans until the files catch up (write tags). 0 = follow the
+        server, today's behaviour for every existing row. its own method and
+        try, same reason as art_locked: the scan upserts reference it."""
+        for table in ('albums', 'artists'):
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cols = {c[1] for c in cursor.fetchall()}
+                if cols and 'genres_locked' not in cols:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN genres_locked INTEGER DEFAULT 0")
+                    logger.info("Added genres_locked column to %s table", table)
+            except Exception as e:
+                logger.error("Could not ensure %s.genres_locked: %s", table, e)
+
+    def _genres_lock_supported(self, cursor, table: str) -> bool:
+        """does this db have ``<table>.genres_locked`` yet. no column means the
+        scan behaves exactly like before, never a lost upsert. same reasoning
+        and memo as _art_lock_supported."""
+        cache = getattr(self, '_genres_lock_cols', None)
+        if cache is None:
+            cache = {}
+            self._genres_lock_cols = cache
+        if table not in cache:
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cache[table] = any(row[1] == 'genres_locked' for row in cursor.fetchall())
+            except Exception:
+                cache[table] = False
+        return cache[table]
+
+    def _ensure_art_lock_columns(self, cursor):
+        """Art chosen by hand (TheHomeGuy). Same shape as ``canonical_locked``:
+        a manual pick must survive every automatic writer.
+
+        The art picker used to be "pinned" only by accident — enrichment workers
+        fill art solely ``WHERE thumb_url IS NULL OR ''``, so a non-empty value
+        happened to survive them. A library sync is a different writer with
+        different rules, and it overwrote the pick with whatever the media server
+        returned. Nothing in the row said a human chose this, so nothing could
+        protect it. Additive, defaults to 0 = "follow the server", i.e. exactly
+        today's behaviour for every existing row.
+
+        Deliberately its OWN method with its OWN try, not part of
+        ``_ensure_core_media_schema_columns``: that one wraps every repair in a
+        single try, so one unrelated failure would skip everything after it. The
+        sync upserts now REFERENCE ``art_locked``, and a missing column there
+        raises "no such column" for every album and artist — swallowed by the
+        upsert's broad except, which would silently lose the whole scan. This
+        column has to be the one thing that cannot be skipped by someone else's
+        error."""
+        for table in ('albums', 'artists'):
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cols = {c[1] for c in cursor.fetchall()}
+                if cols and 'art_locked' not in cols:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN art_locked INTEGER DEFAULT 0")
+                    logger.info("Added art_locked column to %s table (custom artwork)", table)
+            except Exception as e:
+                logger.error("Could not ensure %s.art_locked: %s", table, e)
 
     def _ensure_wishlist_quality_columns(self, cursor):
         """Give every wishlist row a pointer to its own quality profile.
@@ -1440,6 +2521,12 @@ class MusicDatabase:
             if cols and 'quality_profile_id' not in cols:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN quality_profile_id INTEGER DEFAULT NULL")
                 logger.info("Added quality_profile_id column to tracks table (quality-profile pipeline)")
+            if cols and 'acquired_quality_json' not in cols:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN acquired_quality_json TEXT DEFAULT NULL")
+                logger.info("Added acquired_quality_json column to tracks table (retention provenance)")
+            if cols and 'retention_json' not in cols:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN retention_json TEXT DEFAULT NULL")
+                logger.info("Added retention_json column to tracks table (retention provenance)")
         except Exception as e:
             logger.error("Error adding library quality-profile column: %s", e)
 
@@ -1459,9 +2546,17 @@ class MusicDatabase:
             # Auto writes can't clobber a manual lock; manual writes always apply.
             guard = "" if locked else " AND (canonical_locked IS NULL OR canonical_locked = 0)"
             cursor.execute(
+                # updated_at moves with the canonical claim (L2-011): these
+                # columns are part of the MetaSync payload, so a claim that did
+                # not touch the timestamp changed what a full export says while
+                # every incremental export kept omitting the row.
                 "UPDATE albums SET canonical_source = ?, canonical_album_id = ?, "
                 "canonical_score = ?, canonical_locked = ?, "
-                "canonical_resolved_at = CURRENT_TIMESTAMP "
+                "canonical_resolved_at = CURRENT_TIMESTAMP, "
+                # a different release has a different tracklist: forget the
+                # remembered count so the next check fetches this one's once
+                "canonical_track_count = NULL, "
+                "updated_at = CURRENT_TIMESTAMP "
                 f"WHERE id = ?{guard}",
                 (source, str(canonical_album_id), float(score), 1 if locked else 0, album_id),
             )
@@ -1483,7 +2578,8 @@ class MusicDatabase:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT canonical_source, canonical_album_id, canonical_score, "
-                "canonical_resolved_at, canonical_locked FROM albums WHERE id = ?",
+                "canonical_resolved_at, canonical_locked, canonical_track_count "
+                "FROM albums WHERE id = ?",
                 (album_id,),
             )
             row = cursor.fetchone()
@@ -1495,10 +2591,38 @@ class MusicDatabase:
                 'score': row[2],
                 'resolved_at': row[3],
                 'locked': bool(row[4]),
+                # None until the release has been fetched once
+                'track_count': int(row[5]) if row[5] else None,
             }
         except Exception as e:
             logger.error("Error reading album canonical for %s: %s", album_id, e)
             return None
+        finally:
+            conn.close()
+
+    def set_album_canonical_track_count(self, album_id, source: str, canonical_album_id: str, track_count: int) -> bool:
+        """remember the pinned release's track count. guarded on the pin still
+        being (source, canonical_album_id) so a count fetched for one release
+        can't land on a pin that changed underneath the fetch."""
+        try:
+            count = int(track_count)
+        except (TypeError, ValueError):
+            return False
+        if count <= 0:
+            return False
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE albums SET canonical_track_count = ? "
+                "WHERE id = ? AND canonical_source = ? AND canonical_album_id = ?",
+                (count, album_id, source, str(canonical_album_id)),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error setting canonical track count for %s: %s", album_id, e)
+            return False
         finally:
             conn.close()
 
@@ -1578,6 +2702,95 @@ class MusicDatabase:
         finally:
             conn.close()
 
+    # Names/titles per entity table for the degenerate-title scan — computed
+    # once per verify call, shared across all services.
+    _VERIFY_ENTITY_NAME_COLS = {'artist': ('artists', 'name'),
+                                'album': ('albums', 'title'),
+                                'track': ('tracks', 'title')}
+
+    def get_owned_album_count_by_artist_name(self, artist_name: str) -> int:
+        """How many of this artist's albums are IN the library — the discover
+        hero's ownership meter. Case-insensitive exact name match, riding
+        idx_artists_name + idx_albums_artist_id."""
+        if not (artist_name or '').strip():
+            return 0
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """SELECT COUNT(al.id) FROM albums al
+                       JOIN artists ar ON al.artist_id = ar.id
+                       WHERE ar.name = ? COLLATE NOCASE""",
+                (artist_name.strip(),),
+            )
+            row = cursor.fetchone()
+            return int(row[0]) if row else 0
+        finally:
+            conn.close()
+
+    def degenerate_entity_ids(self) -> dict:
+        """{entity_type: [ids]} of rows whose display title is DEGENERATE
+        (normalizes to nothing) — the empty-normalization false-match class.
+        Service-independent, so callers compute it once and reset per service."""
+        from core.enrichment.unmatched import degenerate_title
+        out = {}
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            for entity, (table, col) in self._VERIFY_ENTITY_NAME_COLS.items():
+                try:
+                    cursor.execute(f"SELECT id, {col} FROM {table}")
+                    out[entity] = [r[0] for r in cursor.fetchall() if degenerate_title(r[1])]
+                except Exception as e:
+                    logger.debug(f"degenerate scan skipped for {table}: {e}")
+                    out[entity] = []
+            return out
+        finally:
+            conn.close()
+
+    def verify_enrichment_matches(self, service: str, degenerates: dict = None) -> dict:
+        """Targeted repair of the pre-fix corruption classes for ONE service
+        (see core/enrichment/unmatched.py's Verify-matches block): reset every
+        artist id-collision cluster (the smear fingerprint) and every MATCHED
+        row with a degenerate title (the empty-normalization class). Returns
+        {'collision_clusters', 'collision_rows', 'degenerate_reset'}. Pure
+        SQL + a local title scan — no API calls; the fixed workers rematch
+        the reset rows on their next pass."""
+        from core.enrichment.unmatched import (build_artist_collision_queries,
+                                               build_degenerate_reset_query)
+        result = {'collision_clusters': 0, 'collision_rows': 0, 'degenerate_reset': 0}
+        if degenerates is None:
+            degenerates = self.degenerate_entity_ids()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            queries = build_artist_collision_queries(service)
+            if queries:
+                count_clusters, count_rows, reset = queries
+                try:
+                    cursor.execute(count_clusters)
+                    result['collision_clusters'] = cursor.fetchone()[0] or 0
+                    cursor.execute(count_rows)
+                    result['collision_rows'] = cursor.fetchone()[0] or 0
+                    if result['collision_rows']:
+                        cursor.execute(reset)
+                except Exception as e:
+                    logger.warning(f"collision repair skipped for {service}: {e}")
+            for entity, ids in (degenerates or {}).items():
+                built = build_degenerate_reset_query(service, entity, ids)
+                if not built:
+                    continue
+                sql, params = built
+                try:
+                    cursor.execute(sql, params)
+                    result['degenerate_reset'] += cursor.rowcount or 0
+                except Exception as e:
+                    logger.debug(f"degenerate repair skipped for {service}/{entity}: {e}")
+            conn.commit()
+            return result
+        finally:
+            conn.close()
+
     def _add_mirrored_playlist_explored_column(self, cursor):
         """Add explored_at column to mirrored_playlists to persist explore badge."""
         try:
@@ -1602,6 +2815,18 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error adding organize_by_playlist column to mirrored_playlists: {e}")
 
+    def _add_mirrored_playlist_sync_mode_column(self, cursor):
+        """Per-playlist sync mode (#1704). null means use the global
+        playlist_sync.mode, so existing mirrors keep doing what they did."""
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlists)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'sync_mode' not in cols:
+                cursor.execute("ALTER TABLE mirrored_playlists ADD COLUMN sync_mode TEXT DEFAULT NULL")
+                logger.info("Added sync_mode column to mirrored_playlists table")
+        except Exception as e:
+            logger.error(f"Error adding sync_mode column to mirrored_playlists: {e}")
+
     def _add_mirrored_playlist_custom_name_column(self, cursor):
         """Add custom_name (a user alias) for a mirrored playlist.
 
@@ -1619,19 +2844,161 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error adding custom_name column to mirrored_playlists: {e}")
 
-    def _add_mirrored_playlist_tracks_isrc_column(self, cursor):
-        """Add isrc to mirrored_playlist_tracks: the recording's code, so discovery
-        can match it exactly. Its own column rather than extra_data, which a
-        re-mirror replaces for any track that arrives with some -- that would wipe
-        the track's discovery results."""
+    def _add_mirrored_playlist_server_link_columns(self, cursor):
+        """Which server playlist a mirror corresponds to, once we know.
+
+        Today the relationship is matched BY NAME at read time: the server tab
+        fetches the mirrored list and marks a server playlist synced when the
+        names line up, and the disambiguation modal exists because that guess
+        can hit more than one. Nothing is stored, so the guess is made again on
+        every visit.
+
+        These columns record the answer when it has actually been resolved.
+        NOTHING READS THEM YET, deliberately: the write lands first and gets
+        checked against real data before any behaviour depends on it. Nullable
+        throughout, so every existing row means "not linked" and behaves exactly
+        as it does today.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlists)")
+            cols = [c[1] for c in cursor.fetchall()]
+            for name, decl in (
+                ('server_playlist_id', 'TEXT DEFAULT NULL'),
+                ('server_type', 'TEXT DEFAULT NULL'),
+                ('server_linked_at', 'TIMESTAMP DEFAULT NULL'),
+            ):
+                if name not in cols:
+                    cursor.execute(
+                        f"ALTER TABLE mirrored_playlists ADD COLUMN {name} {decl}"
+                    )
+                    logger.info(f"Added {name} column to mirrored_playlists table")
+        except Exception as e:
+            logger.error(f"Error adding server link columns to mirrored_playlists: {e}")
+
+    def _add_mirrored_playlist_cover_tiles_column(self, cursor):
+        """Up to four distinct album covers, for the 2x2 collage.
+
+        `image_url` stays what it always was: the ONE poster a source supplied,
+        which still wins when it exists — a real playlist cover beats a mosaic
+        of its albums. This column is the fallback for the many sources that
+        send no poster at all, filled from what discovery matched.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlists)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'cover_tiles' not in cols:
+                cursor.execute("ALTER TABLE mirrored_playlists ADD COLUMN cover_tiles TEXT DEFAULT NULL")
+                logger.info("Added cover_tiles column to mirrored_playlists table")
+        except Exception as e:
+            logger.error(f"Error adding cover_tiles column to mirrored_playlists: {e}")
+
+    def _add_mirrored_playlist_track_added_at_column(self, cursor):
+        """when each track joined the playlist, for "sort by date added".
+
+        every edit rewrites a playlist's track rows, so mirror_playlist carries
+        this across by source_track_id the same way it carries extra_data. NULL
+        for rows from before the column; they sort by position.
+        """
         try:
             cursor.execute("PRAGMA table_info(mirrored_playlist_tracks)")
             cols = [c[1] for c in cursor.fetchall()]
-            if 'isrc' not in cols:
-                cursor.execute("ALTER TABLE mirrored_playlist_tracks ADD COLUMN isrc TEXT DEFAULT NULL")
-                logger.info("Added isrc column to mirrored_playlist_tracks table")
+            if 'added_at' not in cols:
+                cursor.execute("ALTER TABLE mirrored_playlist_tracks ADD COLUMN added_at TEXT DEFAULT NULL")
+                logger.info("Added added_at column to mirrored_playlist_tracks table")
         except Exception as e:
-            logger.error(f"Error adding isrc column to mirrored_playlist_tracks: {e}")
+            logger.error(f"Error adding added_at column to mirrored_playlist_tracks: {e}")
+
+    def _add_mirrored_playlist_source_skipped_column(self, cursor):
+        """add source_skipped: what the source never handed over (#1613).
+
+        json like {"videos": 1, "unavailable": 29}, NULL when nothing was
+        skipped. tidal drops tracks outside the account's region before
+        the mirror sees them, so without this a 395 track playlist mirrors
+        as 365 and nothing says why.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlists)")
+            cols = {c[1] for c in cursor.fetchall()}
+            if cols and 'source_skipped' not in cols:
+                cursor.execute("ALTER TABLE mirrored_playlists ADD COLUMN source_skipped TEXT DEFAULT NULL")
+                logger.info("Added source_skipped column to mirrored_playlists table")
+        except Exception as e:
+            logger.error(f"Error adding source_skipped column to mirrored_playlists: {e}")
+
+    @staticmethod
+    def _source_skipped_json(skipped) -> Optional[str]:
+        """the stored form of a skipped-counts dict, None when nothing was skipped."""
+        if not isinstance(skipped, dict):
+            return None
+        clean = {}
+        for key in ('videos', 'unavailable'):
+            try:
+                n = int(skipped.get(key) or 0)
+            except (TypeError, ValueError):
+                n = 0
+            if n > 0:
+                clean[key] = n
+        return json.dumps(clean) if clean else None
+
+    def _add_mirrored_playlist_quality_profile_column(self, cursor):
+        """Add the native per-playlist Quality Profile assignment.
+
+        The value is intentionally stored on ``mirrored_playlists`` rather
+        than in an automation config: manual syncs, Download Missing, and
+        every scheduled refresh must all resolve the same durable choice.
+        Existing NULL rows are backfilled after ``quality_profiles`` has been
+        ensured later in startup.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(mirrored_playlists)")
+            columns = {column[1] for column in cursor.fetchall()}
+            if columns and 'quality_profile_id' not in columns:
+                cursor.execute(
+                    "ALTER TABLE mirrored_playlists "
+                    "ADD COLUMN quality_profile_id INTEGER DEFAULT NULL"
+                )
+                logger.info("Added quality_profile_id column to mirrored_playlists")
+        except Exception as e:
+            logger.error(f"Error adding mirrored playlist quality profile column: {e}")
+
+    def _backfill_native_quality_profile_assignments(self, cursor):
+        """Repair missing/dangling Watchlist and playlist assignments.
+
+        This runs only after ``quality_profiles`` has been seeded and the old
+        global settings have been materialized.  It is idempotent and also
+        self-heals references left by interrupted/older profile deletions.
+        """
+        try:
+            row = cursor.execute(
+                "SELECT id FROM quality_profiles WHERE is_default=1 "
+                "ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                row = cursor.execute(
+                    "SELECT id FROM quality_profiles ORDER BY id LIMIT 1"
+                ).fetchone()
+            if row is None:
+                return
+            default_id = int(row[0])
+            for table in ('watchlist_artists', 'mirrored_playlists'):
+                columns = {
+                    column[1]
+                    for column in cursor.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if 'quality_profile_id' not in columns:
+                    continue
+                cursor.execute(
+                    f"""UPDATE {table}
+                           SET quality_profile_id=?
+                         WHERE quality_profile_id IS NULL
+                            OR NOT EXISTS (
+                                SELECT 1 FROM quality_profiles qp
+                                 WHERE qp.id={table}.quality_profile_id
+                            )""",
+                    (default_id,),
+                )
+        except Exception as e:
+            logger.error(f"Error backfilling native quality profile assignments: {e}")
 
     def _add_automation_notify_columns(self, cursor):
         """Add notification and result columns to automations table."""
@@ -1689,145 +3056,6 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error adding automation owned_by column: {e}")
 
-    def _add_to_be_purchased_column(self, cursor):
-        """Flags a track as downloaded-but-not-yet-purchased — set automatically
-        when a real download lands in the library (core/imports/side_effects.py's
-        record_soulsync_library_entry), cleared once bought via
-        mark_tracks_purchased (see _add_purchased_at_column below)."""
-        try:
-            cursor.execute("PRAGMA table_info(tracks)")
-            cols = [c[1] for c in cursor.fetchall()]
-            if 'to_be_purchased' not in cols:
-                cursor.execute("ALTER TABLE tracks ADD COLUMN to_be_purchased INTEGER NOT NULL DEFAULT 0")
-                logger.info("Added to_be_purchased column to tracks table")
-        except Exception as e:
-            logger.error(f"Error adding to_be_purchased column: {e}")
-
-    def _add_purchased_at_column(self, cursor):
-        """Durable purchase record — set (to CURRENT_TIMESTAMP) by
-        mark_tracks_purchased when a track/album is actually bought, cleared
-        by unmark_tracks_purchased. Deliberately NOT in TRACK_EDITABLE_FIELDS
-        (never an arbitrary client-supplied value — always server-stamped) so
-        it can only be set through those two methods, keeping the Purchased
-        page's history trustworthy."""
-        try:
-            cursor.execute("PRAGMA table_info(tracks)")
-            cols = [c[1] for c in cursor.fetchall()]
-            if 'purchased_at' not in cols:
-                cursor.execute("ALTER TABLE tracks ADD COLUMN purchased_at TEXT DEFAULT NULL")
-                logger.info("Added purchased_at column to tracks table")
-        except Exception as e:
-            logger.error(f"Error adding purchased_at column: {e}")
-
-    def _seed_music_root_folder(self, cursor):
-        """Create the first Music Library from the existing transfer path.
-
-        This is what makes multi-library non-breaking. Every install already
-        has exactly one destination — ``soulseek.transfer_path`` — so seeding
-        it as row 1 means an install that never opens the new settings writes
-        files to precisely where it wrote them yesterday, with no migration
-        step and nothing to configure.
-
-        Only ever seeds into an EMPTY table: once the user manages libraries
-        themselves, re-adding a row for a transfer_path they may have since
-        removed would resurrect a destination they deleted on purpose.
-        """
-        try:
-            cursor.execute("SELECT COUNT(*) FROM music_root_folders")
-            if (cursor.fetchone() or [0])[0]:
-                return
-            try:
-                from config.settings import config_manager
-                path = str(config_manager.get('soulseek.transfer_path', '') or '').strip()
-            except Exception:   # noqa: BLE001 - config unavailable during early init
-                path = ''
-            if not path:
-                # Nothing configured yet (fresh install mid-setup). Leave the
-                # table empty; resolution falls back to transfer_path anyway,
-                # and the seed runs again on the next startup once it's set.
-                return
-            cursor.execute(
-                "INSERT OR IGNORE INTO music_root_folders (path, label, sort_order) "
-                "VALUES (?, ?, 0)",
-                (path, 'Music Library'),
-            )
-            if cursor.rowcount:
-                logger.info("Seeded the first Music Library from soulseek.transfer_path: %s", path)
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error seeding the default music root folder: {e}")
-
-    def _reconcile_default_music_library(self, cursor):
-        """Re-align the default Music Library with ``soulseek.transfer_path``.
-
-        Settings → Music Library Folder and the first row of Music Libraries are
-        one setting shown twice, and both write paths maintain that: saving
-        Settings syncs the row, saving the library list mirrors back to the
-        config key. So on a healthy install this is a no-op.
-
-        It exists for the installs 1.9.2 broke. There, editing the folder left
-        the row on the old path, and 1.9.3's fix only heals on the NEXT settings
-        save — which the user has no reason to perform, because the field
-        already shows the value they want. Their imports would keep landing on
-        the stale path indefinitely while the UI insisted otherwise. Repairing
-        the invariant at startup is what makes the fix reach them.
-
-        The config key wins because it is the only side that can hold an edit
-        the other never saw; drift in the opposite direction has no producer.
-        """
-        try:
-            try:
-                from config.settings import config_manager
-                path = str(config_manager.get('soulseek.transfer_path', '') or '').strip()
-            except Exception:   # noqa: BLE001 - config unavailable during early init
-                return
-            if not path:
-                return
-            cursor.execute(
-                "SELECT id, path FROM music_root_folders ORDER BY sort_order, id LIMIT 1")
-            row = cursor.fetchone()
-            # An empty table is the seeder's business, not ours — seeding
-            # deliberately does not resurrect a destination the user removed.
-            if row is None or row[1] == path:
-                return
-            # A second library already points here; promote it rather than
-            # duplicating the path and violating UNIQUE.
-            cursor.execute("SELECT id FROM music_root_folders WHERE path=? AND id<>?",
-                           (path, row[0]))
-            dupe = cursor.fetchone()
-            if dupe:
-                cursor.execute("UPDATE music_root_folders SET sort_order = sort_order + 1")
-                cursor.execute("UPDATE music_root_folders SET sort_order = 0 WHERE id=?",
-                               (dupe[0],))
-                logger.warning(
-                    "Music Library Folder (%s) did not match the default library (%s) — "
-                    "made the existing library at that path the default. Imports since "
-                    "the mismatch began went to %s.", path, row[1], row[1])
-                return
-            cursor.execute("UPDATE music_root_folders SET path=? WHERE id=?", (path, row[0]))
-            logger.warning(
-                "Music Library Folder (%s) did not match the default library (%s) — "
-                "repaired. Anything imported since the mismatch began is under %s.",
-                path, row[1], row[1])
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error reconciling the default music library: {e}")
-
-    def _add_wishlist_root_folder_column(self, cursor):
-        """Which Music Library a wishlist track should be filed into.
-
-        NULL means the default library — the same destination the track would
-        have had before libraries existed — so existing rows need no backfill.
-        Mirrors the video wishlist's own ``root_folder_id``.
-        """
-        try:
-            cursor.execute("PRAGMA table_info(wishlist_tracks)")
-            cols = {c[1] for c in cursor.fetchall()}
-            if cols and 'root_folder_id' not in cols:
-                cursor.execute(
-                    "ALTER TABLE wishlist_tracks ADD COLUMN root_folder_id INTEGER DEFAULT NULL")
-                logger.info("Added root_folder_id column to wishlist_tracks table (music libraries)")
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error adding root_folder_id column to wishlist_tracks: {e}")
-
     def _add_automation_then_actions_column(self, cursor):
         """Add then_actions column to automations table and migrate existing notify data."""
         try:
@@ -1881,6 +3109,17 @@ class MusicDatabase:
                 
             # Create indexes for server_source columns for performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_server_source ON artists (server_source)")
+            # the library page picks one row per (server, name) with a
+            # correlated MIN(id) subquery, for the count and again for the
+            # page. this index covers it, so neither statement reads the
+            # table: ~750 ms each per click on a 5k-artist install -> 4 ms.
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_source_name_id ON artists (server_source, name, id)")
+            # /api/database/stats asks MAX(updated_at) per server on all three
+            # tables; without these it read every track row (2 s warm, 21 s
+            # cold on 300k tracks) on every dashboard and library load
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_source_updated ON tracks (server_source, updated_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_source_updated ON albums (server_source, updated_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_source_updated ON artists (server_source, updated_at)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_server_source ON albums (server_source)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_server_source ON tracks (server_source)")
             
@@ -1888,6 +3127,52 @@ class MusicDatabase:
             logger.error(f"Error adding server_source columns: {e}")
             # Don't raise - this is a migration, database can still function without it
     
+    def _migrate_sample_analysis_text_ids(self, cursor):
+        """sample_analysis.track_id was an INTEGER PRIMARY KEY, which sqlite
+        refuses text in. tracks.id is TEXT (jellyfin guids, navidrome ids), so
+        no track from those libraries could ever be analyzed. rebuild it keyed
+        by TEXT; plex ids carry over as their digits."""
+        try:
+            cursor.execute("PRAGMA table_info(sample_analysis)")
+            cols = {row[1]: row for row in cursor.fetchall()}
+            track_col = cols.get("track_id")
+            if not track_col or str(track_col[2]).upper() == "TEXT":
+                return
+            keep = ["bpm", "onsets_json", "duration_s", "analyzed_at", "analyzer_version",
+                    "key_name", "key_confidence", "source_sig"]
+            keep = [c for c in keep if c in cols]
+            cursor.execute("SAVEPOINT sample_analysis_text_ids")
+            cursor.execute("DROP TABLE IF EXISTS sample_analysis_text")
+            cursor.execute("""
+                CREATE TABLE sample_analysis_text (
+                    track_id TEXT PRIMARY KEY,
+                    bpm REAL,
+                    onsets_json TEXT,
+                    duration_s REAL,
+                    analyzed_at REAL,
+                    analyzer_version INTEGER DEFAULT 1,
+                    key_name TEXT,
+                    key_confidence REAL,
+                    source_sig TEXT
+                )
+            """)
+            col_list = ", ".join(keep)
+            cursor.execute(
+                f"INSERT INTO sample_analysis_text (track_id, {col_list}) "
+                f"SELECT CAST(track_id AS TEXT), {col_list} FROM sample_analysis")
+            cursor.execute("DROP TABLE sample_analysis")
+            cursor.execute("ALTER TABLE sample_analysis_text RENAME TO sample_analysis")
+            cursor.execute("RELEASE sample_analysis_text_ids")
+            logger.info("sample_analysis now keyed by text track ids")
+        except Exception as e:
+            # put the old table back. numeric ids keep working on it
+            try:
+                cursor.execute("ROLLBACK TO sample_analysis_text_ids")
+                cursor.execute("RELEASE sample_analysis_text_ids")
+            except Exception as rollback_err:
+                logger.debug(f"sample_analysis rollback: {rollback_err}")
+            logger.error(f"sample_analysis text-id migration failed: {e}")
+
     def _migrate_id_columns_to_text(self, cursor):
         """Migrate ID columns from INTEGER to TEXT to support both Plex (int) and Jellyfin (GUID) IDs"""
         try:
@@ -1990,6 +3275,17 @@ class MusicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_album_id ON tracks (album_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_artist_id ON tracks (artist_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_server_source ON artists (server_source)")
+            # the library page picks one row per (server, name) with a
+            # correlated MIN(id) subquery, for the count and again for the
+            # page. this index covers it, so neither statement reads the
+            # table: ~750 ms each per click on a 5k-artist install -> 4 ms.
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_source_name_id ON artists (server_source, name, id)")
+            # /api/database/stats asks MAX(updated_at) per server on all three
+            # tables; without these it read every track row (2 s warm, 21 s
+            # cold on 300k tracks) on every dashboard and library load
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_source_updated ON tracks (server_source, updated_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_source_updated ON albums (server_source, updated_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_source_updated ON artists (server_source, updated_at)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_server_source ON albums (server_source)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_server_source ON tracks (server_source)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_name ON artists (name)")
@@ -2190,6 +3486,16 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE similar_artists ADD COLUMN similar_artist_musicbrainz_id TEXT")
                 logger.info("Added similar_artist_musicbrainz_id column to similar_artists table")
 
+            # which provider's namespace source_artist_id lives in. without it a
+            # deezer id and an itunes id are the same bare string, and two
+            # unrelated artists' edges cross-match on numeric equality.
+            # legacy rows stay NULL deliberately: their origin is not provable,
+            # and the readers treat an unprovable row as unusable rather than
+            # guessing (core/discovery/bylt.py::classify_edge).
+            if 'source_provider' not in similar_artists_columns:
+                cursor.execute("ALTER TABLE similar_artists ADD COLUMN source_provider TEXT")
+                logger.info("Added source_provider column to similar_artists table")
+
             # Migration: Add iTunes columns to recent_releases for dual-source discovery
             cursor.execute("PRAGMA table_info(recent_releases)")
             recent_releases_columns = [column[1] for column in cursor.fetchall()]
@@ -2310,6 +3616,7 @@ class MusicDatabase:
                                 similarity_rank INTEGER DEFAULT 1,
                                 occurrence_count INTEGER DEFAULT 1,
                                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                                source_provider TEXT,
                                 UNIQUE(source_artist_id, similar_artist_name)
                             )
                         """)
@@ -2317,10 +3624,12 @@ class MusicDatabase:
                             INSERT OR IGNORE INTO similar_artists_new
                             (source_artist_id, similar_artist_spotify_id, similar_artist_itunes_id,
                              similar_artist_deezer_id, similar_artist_musicbrainz_id,
-                             similar_artist_name, similarity_rank, occurrence_count, last_updated)
+                             similar_artist_name, similarity_rank, occurrence_count, last_updated,
+                             source_provider)
                             SELECT source_artist_id, similar_artist_spotify_id, similar_artist_itunes_id,
                                    similar_artist_deezer_id, similar_artist_musicbrainz_id,
-                                   similar_artist_name, similarity_rank, occurrence_count, last_updated
+                                   similar_artist_name, similarity_rank, occurrence_count, last_updated,
+                                   source_provider
                             FROM similar_artists
                         """)
                         migration_cursor.execute("DROP TABLE similar_artists")
@@ -2422,6 +3731,8 @@ class MusicDatabase:
                     track_title TEXT,
                     track_artist TEXT,
                     track_album TEXT,
+                    acquired_quality_json TEXT,
+                    retention_json TEXT,
                     status TEXT DEFAULT 'completed',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -2456,6 +3767,9 @@ class MusicDatabase:
                     added_external = True
             if added_external:
                 logger.info(f"Added external-ID columns to track_downloads: {', '.join(external_id_cols)}")
+            for _col in ('acquired_quality_json', 'retention_json', 'recording_disambiguation'):
+                if _col not in td_columns:
+                    cursor.execute(f"ALTER TABLE track_downloads ADD COLUMN {_col} TEXT")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_spotify_id ON track_downloads (spotify_track_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_itunes_id ON track_downloads (itunes_track_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_deezer_id ON track_downloads (deezer_track_id)")
@@ -2465,6 +3779,43 @@ class MusicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_audiodb_id ON track_downloads (audiodb_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_soul_id ON track_downloads (soul_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_td_isrc ON track_downloads (isrc)")
+
+            # Why an automatic grab took the file it took, or why nothing
+            # passed: the winner, the closest alternatives and a count of
+            # rejections by reason code (core/downloads/decisions.py). One row
+            # per download task; cleared with the download history.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS download_decisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    track_download_id INTEGER,
+                    task_key TEXT NOT NULL,
+                    track_title TEXT,
+                    track_artist TEXT,
+                    quality_profile_id INTEGER,
+                    outcome TEXT NOT NULL,
+                    chosen_json TEXT,
+                    alternatives_json TEXT,
+                    search_mode TEXT,
+                    searched_at TEXT,
+                    policy_run_id TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dd_task_key ON download_decisions (task_key)")
+
+            # Provenance: which search produced the decision, when (UTC), and the
+            # 12-char policy run id. One provenance per automatic worker run and
+            # one per interactive inspection (core/downloads/provenance.py).
+            # MUST come before the index below: an old table has no
+            # search_mode/searched_at/policy_run_id columns, and indexing a
+            # missing column aborts DB init.
+            cursor.execute("PRAGMA table_info(download_decisions)")
+            dd_cols = {c[1] for c in cursor.fetchall()}
+            for _col in ['search_mode', 'searched_at', 'policy_run_id']:
+                if _col not in dd_cols:
+                    cursor.execute(f"ALTER TABLE download_decisions ADD COLUMN {_col} TEXT")
+                    logger.info(f"Added {_col} column to download_decisions")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_dd_track_download ON download_decisions (track_download_id)")
 
             # Durable record of completed TORRENT grabs so the seeding sweep
             # (core/downloads/seeding.py) can manage the tail: seed until the
@@ -2574,6 +3925,106 @@ class MusicDatabase:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocklist_spotify ON blocklist (spotify_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_blocklist_name ON blocklist (name COLLATE NOCASE)")
             self._migrate_discovery_blacklist_into_blocklist(cursor)
+
+            # What a profile told discovery about a recommendation: more /
+            # less like this, or not now (expires). Blocks are NOT here, they
+            # live in the blocklist, so resetting taste never clears them.
+            # One row per (profile, entity, kind); more and less replace each
+            # other. core/discovery/feedback.py reads it.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS discovery_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL DEFAULT 1,
+                    entity_type TEXT NOT NULL,        -- artist | album | track
+                    entity_key TEXT NOT NULL,         -- normalised artist[, title]
+                    name TEXT NOT NULL,
+                    artist_name TEXT,
+                    ids_json TEXT,                    -- {source: id}
+                    kind TEXT NOT NULL,               -- more | less | not_now
+                    seed_context_json TEXT,           -- the explanation it was shown with
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP              -- not_now only
+                )
+            """)
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_feedback_entity "
+                           "ON discovery_feedback (profile_id, entity_type, entity_key, kind)")
+
+            # The discovery inbox: releases, upcoming releases, saved recs and
+            # concerts worth coming back to, per profile. A refresh adds items
+            # as unread and never resets a state someone chose.
+            # core/discovery/inbox.py owns it.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS discovery_inbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL DEFAULT 1,
+                    kind TEXT NOT NULL,               -- new_release | upcoming | saved_rec | concert | artist_news
+                    entity_key TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    artist_name TEXT,
+                    image_url TEXT,
+                    item_date TEXT,                   -- release or event date, YYYY-MM-DD
+                    payload_json TEXT,
+                    state TEXT NOT NULL DEFAULT 'unread',  -- unread | saved | dismissed | added
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE (profile_id, kind, entity_key)
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_discovery_inbox_state "
+                           "ON discovery_inbox (profile_id, state)")
+
+            # Per-profile discover page layout: which of the 19 sections
+            # (core/discovery/layout.py) shows in which of the 4 zones, in
+            # what order, enabled or not. Empty for a profile means the
+            # defaults — the API merges saved rows over them.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS discovery_layout (
+                    profile_id INTEGER NOT NULL,
+                    section_id TEXT NOT NULL,
+                    zone TEXT NOT NULL,
+                    position INTEGER NOT NULL DEFAULT 0,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    PRIMARY KEY (profile_id, section_id)
+                )
+            """)
+
+            # Persistent failed-download blocklist: files that burned every
+            # quarantine retry and hit a terminal import give-up. Fingerprint
+            # = SHA1(service | normalized artist | normalized title | size);
+            # Soulseek peers collapse to the service 'soulseek'. 90-day
+            # expiry, capped at 5000 rows. Separate from the user's download
+            # blocklist (username/filename they flagged) and the quarantine.
+            # core/downloads/failed_blocklist.py owns it.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS failed_download_blocklist (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    service TEXT NOT NULL DEFAULT '',
+                    artist TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP NOT NULL
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_failed_blocklist_expires "
+                           "ON failed_download_blocklist (expires_at)")
+
+            # Renewable mixes: a recipe (seeds / genres, years, source mix,
+            # length, schedule) per row; each generation is stored as a
+            # curated payload keyed mix_recipe_<id>. core/personalized/recipes.py.
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS mix_recipes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_id INTEGER NOT NULL DEFAULT 1,
+                    recipe_json TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mix_recipes_profile "
+                           "ON mix_recipes (profile_id)")
 
             # Liked artists pool — aggregated followed/liked artists from connected services
             cursor.execute("""
@@ -2696,7 +4147,8 @@ class MusicDatabase:
                 'include_remixes': ('INTEGER', '0'),        # 0 = False (exclude remixes by default)
                 'include_acoustic': ('INTEGER', '0'),       # 0 = False (exclude acoustic by default)
                 'include_compilations': ('INTEGER', '0'),   # 0 = False (exclude compilations by default)
-                'include_instrumentals': ('INTEGER', '0')   # 0 = False (exclude instrumentals by default)
+                'include_instrumentals': ('INTEGER', '0'),  # 0 = False (exclude instrumentals by default)
+                'include_other_artists': ('INTEGER', '0'),  # 0 = False (only the watched artist's tracks by default)
             }
 
             for column_name, (column_type, default_value) in columns_to_add.items():
@@ -2722,6 +4174,59 @@ class MusicDatabase:
                 logger.info("Added auto_download column to watchlist_artists table")
         except Exception as e:
             logger.error(f"Error adding auto_download column to watchlist_artists: {e}")
+
+    def _add_watchlist_auto_download_pref_column(self, cursor):
+        """Add the three-state auto-download preference (swiftpawpaw's request).
+
+        ``auto_download`` is ``NOT NULL DEFAULT 1``, so every untouched artist
+        already reads 1 and nothing can tell "the user chose this" from "nobody
+        ever set it". A global default would be powerless against those rows —
+        which is exactly the problem: 225 artists, all reading 1, no way to turn
+        them off but one at a time.
+
+        ``auto_download_pref`` is NULLABLE and carries the third state:
+            NULL -> follow the global default
+            0    -> never, whatever the global says
+            1    -> always, whatever the global says
+
+        The backfill is lossless: rows already at ``auto_download=0`` are
+        deliberate follow-only choices and become an explicit 0; everything else
+        stays NULL and inherits. Nothing is discarded, because today "explicitly
+        on" and "on by default" behave identically — the difference was never
+        expressible."""
+        try:
+            cursor.execute("PRAGMA table_info(watchlist_artists)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'auto_download_pref' in columns:
+                return
+            cursor.execute("ALTER TABLE watchlist_artists ADD COLUMN auto_download_pref INTEGER")
+            if 'auto_download' in columns:
+                # Preserve every deliberate follow-only; leave the rest inheriting.
+                cursor.execute("UPDATE watchlist_artists SET auto_download_pref = 0 "
+                               "WHERE auto_download = 0")
+            logger.info("Added auto_download_pref column to watchlist_artists "
+                        "(explicit follow-only rows preserved)")
+        except Exception as e:
+            logger.error(f"Error adding auto_download_pref to watchlist_artists: {e}")
+
+    def _add_watchlist_quality_profile_column(self, cursor):
+        """Add the native per-artist Quality Profile assignment.
+
+        This migration deliberately runs after the profile-table recreation
+        migrations, which use explicit watchlist column lists.  Running it
+        earlier would let an older install silently drop the new column.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(watchlist_artists)")
+            columns = {column[1] for column in cursor.fetchall()}
+            if columns and 'quality_profile_id' not in columns:
+                cursor.execute(
+                    "ALTER TABLE watchlist_artists "
+                    "ADD COLUMN quality_profile_id INTEGER DEFAULT NULL"
+                )
+                logger.info("Added quality_profile_id column to watchlist_artists")
+        except Exception as e:
+            logger.error(f"Error adding watchlist quality profile column: {e}")
 
     def _add_watchlist_lookback_days_column(self, cursor):
         """Add per-artist lookback_days column to watchlist_artists table"""
@@ -2807,6 +4312,428 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error clearing deezer-as-itunes watchlist ids: {e}")
 
+    # ── normalized text columns ─────────────────────────────────────────────
+    # every ownership check used to run `unidecode_lower(tracks.title) LIKE ?`,
+    # a python function sqlite calls per row, so one lookup was one pass of the
+    # whole tracks table through python (3.2 s per check on 300k tracks, 6-10 s
+    # on a miss). the normalized text lives in a column now, indexed, filled by
+    # a backfill rather than by every writer: an UPDATE that changes the raw
+    # text nulls the norm (trigger, no udf needed so external tools keep
+    # working) and the next reader fills the gap. see PERF_REVIEW_SYNC_SCAN.md
+    # section 3.
+    _NORM_COLUMNS = (
+        # (table, raw column, norm column, normalizer name)
+        # 'norm' = normalize_for_comparison (accents folded, lowercased);
+        # 'key'  = normalize_key (that, then non-alphanumerics dropped), the
+        #          form the search library-check matches artists by
+        ('artists', 'name', 'name_norm', 'norm'),
+        ('artists', 'name', 'name_key', 'key'),
+        ('albums', 'title', 'title_norm', 'norm'),
+        ('tracks', 'title', 'title_norm', 'norm'),
+        ('tracks', 'track_artist', 'track_artist_norm', 'norm'),
+    )
+
+    # plenty of lookups still ask `LOWER(title) = LOWER(?)` (discover's
+    # playable check, curated playlists, exports, the history importers).
+    # LOWER() on the column skips idx_tracks_title, so each one read all
+    # 300k tracks: 330 ms a call, 0.1 ms with these. an index on the same
+    # expression answers exactly what the query asks, nothing changes about
+    # what matches.
+    _LOWER_TEXT_INDEXES = (
+        ('idx_tracks_title_lower', 'tracks', 'title'),
+        ('idx_albums_title_lower', 'albums', 'title'),
+        ('idx_artists_name_lower', 'artists', 'name'),
+    )
+
+    # tracks never had an index on file_path. the import pipeline, its side
+    # effects, verification, the missing-track import and the repair jobs all
+    # look tracks up or update them by exact path, often once per track, and
+    # each one read the whole table: 110-170 ms warm, seconds cold. 0.01 ms
+    # with it.
+    _PLAIN_LOOKUP_INDEXES = (
+        ('idx_tracks_file_path', 'tracks', 'file_path'),
+    )
+
+    def _add_lookup_indexes(self, cursor):
+        try:
+            for name, table, column in self._LOWER_TEXT_INDEXES:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} (LOWER({column}))")
+            for name, table, column in self._PLAIN_LOOKUP_INDEXES:
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({column})")
+        except Exception as e:
+            logger.error(f"Error adding lookup indexes: {e}")
+
+    @staticmethod
+    def _normalizer(kind: str):
+        from core.text.normalize import normalize_for_comparison, normalize_key
+        return normalize_key if kind == 'key' else normalize_for_comparison
+
+    def _add_norm_columns(self, cursor):
+        """add the *_norm columns, their indexes and the nulling triggers."""
+        try:
+            for table, raw, norm, _kind in self._NORM_COLUMNS:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cols = [c[1] for c in cursor.fetchall()]
+                if norm not in cols:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {norm} TEXT")
+                    logger.info(f"Added {norm} column to {table}")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_{norm} ON {table} ({norm})")
+                # a writer that changes the raw text without touching the norm
+                # leaves a stale norm behind, and a stale norm can match the
+                # OLD title. null it; the backfill recomputes. skipped when the
+                # statement set the norm itself.
+                cursor.execute(f"""
+                    CREATE TRIGGER IF NOT EXISTS trg_{table}_{norm}_stale
+                    AFTER UPDATE OF {raw} ON {table}
+                    WHEN NEW.{raw} IS NOT OLD.{raw} AND NEW.{norm} IS OLD.{norm}
+                    BEGIN
+                        UPDATE {table} SET {norm} = NULL WHERE rowid = NEW.rowid;
+                    END
+                """)
+            cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'track_credits'")
+            credits_existed = cursor.fetchone() is not None
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS track_credits (
+                    track_id TEXT NOT NULL,
+                    name_norm TEXT NOT NULL,
+                    PRIMARY KEY (track_id, name_norm)
+                ) WITHOUT ROWID
+            """)
+            if not credits_existed:
+                # credits are derived during the track_artist_norm backfill;
+                # a db that already had the norm filled needs that pass again
+                cursor.execute("UPDATE tracks SET track_artist_norm = NULL WHERE track_artist_norm IS NOT NULL")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_track_credits_name ON track_credits (name_norm)")
+            # credits are derived from track_artist_norm; when that is nulled
+            # (raw credit changed) or the track goes, the credits go with it
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_track_credits_stale
+                AFTER UPDATE OF track_artist_norm ON tracks
+                WHEN NEW.track_artist_norm IS NULL
+                BEGIN
+                    DELETE FROM track_credits WHERE track_id = NEW.id;
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_track_credits_gone
+                AFTER DELETE ON tracks
+                BEGIN
+                    DELETE FROM track_credits WHERE track_id = OLD.id;
+                END
+            """)
+            self._add_albums_fts(cursor)
+        except Exception as e:
+            logger.error(f"Error adding normalized text columns: {e}")
+
+    def _add_albums_fts(self, cursor):
+        """a full-text index over albums.title_norm, so a title search that
+        used to be `title_norm LIKE '%…%'` over every album (1-2 s warm, 12 s
+        cold on a 70k-album library; run once per unowned card on an artist
+        page) becomes a token lookup. external-content fts5 kept in step by
+        triggers; rebuilt once when created. optional: an sqlite without
+        fts5 logs once and every reader falls back to the scan."""
+        try:
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'albums_fts'")
+            row = cursor.fetchone()
+            if row and "tokenize='trigram'" in (row[0] or ''):
+                return
+            if row:
+                # an index built with another tokenizer answers a LIKE by
+                # scanning; only the trigram one indexes it. rebuild.
+                logger.info("albums_fts was built with another tokenizer; rebuilding as trigram")
+                for trg in ('trg_albums_fts_ai', 'trg_albums_fts_ad', 'trg_albums_fts_au'):
+                    cursor.execute(f"DROP TRIGGER IF EXISTS {trg}")
+                cursor.execute("DROP TABLE IF EXISTS albums_fts")
+            # trigram: LIKE on the fts table has the scan's exact substring
+            # semantics (mid-word needles included) and uses the index for
+            # any pattern of three or more characters. sqlite >= 3.34.
+            cursor.execute("""
+                CREATE VIRTUAL TABLE albums_fts USING fts5(
+                    title_norm, content='albums', content_rowid='rowid', tokenize='trigram'
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_albums_fts_ai AFTER INSERT ON albums BEGIN
+                    INSERT INTO albums_fts(rowid, title_norm) VALUES (NEW.rowid, NEW.title_norm);
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_albums_fts_ad AFTER DELETE ON albums BEGIN
+                    INSERT INTO albums_fts(albums_fts, rowid, title_norm) VALUES ('delete', OLD.rowid, OLD.title_norm);
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_albums_fts_au AFTER UPDATE OF title_norm ON albums BEGIN
+                    INSERT INTO albums_fts(albums_fts, rowid, title_norm) VALUES ('delete', OLD.rowid, OLD.title_norm);
+                    INSERT INTO albums_fts(rowid, title_norm) VALUES (NEW.rowid, NEW.title_norm);
+                END
+            """)
+            cursor.execute("INSERT INTO albums_fts(albums_fts) VALUES ('rebuild')")
+            logger.info("Built albums_fts full-text index over album titles")
+        except Exception as e:
+            logger.warning(f"albums_fts unavailable (title searches use the scan): {e}")
+
+    def _norm_unfilled_count(self, cursor, table: str, norm: str, limit: int) -> int:
+        cursor.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 FROM {table} WHERE {norm} IS NULL LIMIT ?)",
+            (limit,))
+        return int(cursor.fetchone()[0] or 0)
+
+    def _backfill_norm_chunk(self, conn, table: str, raw: str, norm: str, chunk: int, kind: str = 'norm') -> int:
+        """fill up to `chunk` null rows of one norm column. the caller commits:
+        once per full chunk on a big backfill, once in total for the few-row
+        inline fill a reader does after an import (five commits is five
+        fsyncs, and that was most of the cost of a check after a raw insert)."""
+        normalize_for_comparison = self._normalizer(kind)
+        cursor = conn.cursor()
+        id_col = "id" if table == 'tracks' else "rowid"
+        cursor.execute(f"SELECT {id_col}, {raw} FROM {table} WHERE {norm} IS NULL LIMIT ?", (chunk,))
+        rows = cursor.fetchall()
+        if not rows:
+            return 0
+        # '' for a null raw value so NULL keeps meaning "not computed yet"
+        normed = [(normalize_for_comparison(r[1]) if r[1] else '', r[0]) for r in rows]
+        cursor.executemany(f"UPDATE {table} SET {norm} = ? WHERE {id_col} = ?", normed)
+        if table == 'tracks' and norm == 'track_artist_norm':
+            cursor.executemany("DELETE FROM track_credits WHERE track_id = ?", [(r[0],) for r in rows])
+            cursor.executemany(
+                "INSERT OR IGNORE INTO track_credits (track_id, name_norm) VALUES (?, ?)",
+                [(tid, name) for value, tid in normed for name in split_credit_names(value)])
+        return len(rows)
+
+    def ensure_norm_backfilled(self, *, chunk: int = _NORM_CHUNK, max_rows: Optional[int] = None) -> int:
+        """fill every null *_norm row, in chunks, one transaction per chunk.
+        cheap when there is nothing to do (one indexed probe per column).
+        returns the number of rows filled. safe to call from anywhere; only
+        one backfill runs per db at a time and later callers wait for it."""
+        filled = 0
+        with _norm_backfill_lock:
+            try:
+                conn = self._get_connection()
+                try:
+                    for table, raw, norm, kind in self._NORM_COLUMNS:
+                        while True:
+                            if max_rows is not None and filled >= max_rows:
+                                conn.commit()
+                                return filled
+                            n = self._backfill_norm_chunk(conn, table, raw, norm, chunk, kind)
+                            filled += n
+                            if n < chunk:
+                                break
+                            conn.commit()
+                            if filled and filled % (chunk * 5) == 0:
+                                logger.info(f"norm backfill: {filled} rows so far ({table}.{norm})")
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.error(f"norm backfill failed after {filled} rows: {e}")
+                return filled
+        if filled >= _NORM_STATS_MIN_ROWS:
+            # only a real backfill changes the shape of the data enough to
+            # matter to the planner; the few-row inline fills a reader does
+            # after an import are not worth an ANALYZE and a checkpoint each
+            logger.info(f"norm backfill: filled {filled} rows")
+            self.refresh_planner_stats()
+            # a library-sized backfill rewrites every row; give the wal a
+            # chance to fold back into the main file instead of growing until
+            # the next quiet moment
+            try:
+                conn = self._get_connection()
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.debug(f"wal checkpoint after backfill skipped: {e}")
+        return filled
+
+    _PLANNER_STATS_TABLES = ('tracks', 'artists', 'albums', 'track_credits')
+
+    def refresh_planner_stats(self, tables=None) -> None:
+        """ANALYZE the matching tables. without statistics sqlite guesses, and
+        on a real library it guessed the server_source index (one value for
+        every row) over the artist and credit indexes, turning indexed lookups
+        back into full scans. sampled, so cheap; run after backfills and scans."""
+        try:
+            conn = self._get_connection()
+            try:
+                conn.execute(f"PRAGMA analysis_limit = {_PLANNER_ANALYSIS_LIMIT}")
+                for table in (tables or self._PLANNER_STATS_TABLES):
+                    conn.execute(f'ANALYZE "{table}"')
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"ANALYZE skipped: {e}")
+
+    @staticmethod
+    def _tables_missing_planner_stats(cursor) -> list:
+        """tables big enough to matter with an index sqlite has no statistics
+        for. an index without stats is assumed to narrow an equality to ~10
+        rows, so idx_tracks_source_owner (added after the last ANALYZE) looked
+        like the best way to find a track: every title search walked all 300k
+        rows through it, 1.4 s per missing track in a watchlist scan."""
+        has_stat1 = cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'sqlite_stat1'").fetchone()
+        analyzed = set()
+        if has_stat1:
+            analyzed = {(t, i) for t, i in cursor.execute(
+                "SELECT tbl, idx FROM sqlite_stat1 WHERE idx IS NOT NULL")}
+        stale = []
+        tables = [r[0] for r in cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%' AND sql NOT LIKE 'CREATE VIRTUAL%'")]
+        for table in tables:
+            # a WITHOUT ROWID table's primary key stats are filed under the
+            # table's own name, not its sqlite_autoindex name
+            indexes = [table if r[3] == 'pk' and (table, table) in analyzed else r[1]
+                       for r in cursor.execute(f'PRAGMA index_list("{table}")')]
+            if not any((table, i) not in analyzed for i in indexes):
+                continue
+            big = cursor.execute(
+                f'SELECT 1 FROM "{table}" LIMIT 1 OFFSET {_NORM_STATS_MIN_ROWS - 1}').fetchone()
+            if big:
+                stale.append(table)
+        return stale
+
+    def _kick_planner_stats_thread(self):
+        """at boot, analyze whatever has an index without stats, off the boot
+        path. the check is a few pragmas; the thread only starts when there is
+        work, so a fresh or test database never starts one."""
+        try:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                upgrades = self._match_status_indexes_to_upgrade(cursor)
+                big_upgrades = [u for u in upgrades if self._table_is_big(cursor, u[1])]
+                stale = self._tables_missing_planner_stats(cursor)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug(f"planner stats check skipped: {e}")
+            return
+        if upgrades and not big_upgrades:
+            # small tables: a rebuild is instant, no thread needed
+            self.upgrade_match_status_indexes(upgrades)
+        if not stale and not big_upgrades:
+            return
+        key = str(self.database_path)
+        with _planner_stats_lock:
+            t = _planner_stats_threads.get(key)
+            if t is not None and t.is_alive():
+                return
+            t = threading.Thread(target=self._boot_index_maintenance, args=(big_upgrades, stale),
+                                 name="planner-stats", daemon=True)
+            _planner_stats_threads[key] = t
+        if big_upgrades:
+            logger.info(f"enrichment queue indexes: rebuilding {len(big_upgrades)} as (status, id)")
+        if stale:
+            logger.info(f"planner stats: analyzing {len(stale)} table(s) with unanalyzed indexes: {', '.join(stale)}")
+        t.start()
+
+    def _boot_index_maintenance(self, upgrades, stale) -> None:
+        self.upgrade_match_status_indexes(upgrades)
+        tables = list(dict.fromkeys(list(stale) + [u[1] for u in upgrades]))
+        if tables:
+            self.refresh_planner_stats(tables)
+
+    @staticmethod
+    def _table_is_big(cursor, table) -> bool:
+        return cursor.execute(
+            f'SELECT 1 FROM "{table}" LIMIT 1 OFFSET {_NORM_STATS_MIN_ROWS - 1}').fetchone() is not None
+
+    # every enrichment worker asks for its next item with
+    # `WHERE <svc>_match_status IS NULL ORDER BY id LIMIT 1`. on an index of
+    # the status alone sqlite has to sort every pending row to return one:
+    # 120-240 ms per item while a big library's queue is full, for each of 13
+    # workers. on (status, id) the first index entry is the answer. same rows,
+    # and the old index is a prefix of the new one, so nothing else loses it.
+    _MATCH_STATUS_TABLES = ('artists', 'albums', 'tracks')
+    _SINGLE_STATUS_INDEX = re.compile(r'CREATE INDEX "?\w+"? ON "?\w+"? ?\((\w+_match_status)\)\s*$', re.I)
+
+    @classmethod
+    def _match_status_indexes_to_upgrade(cls, cursor) -> list:
+        """(index, table, column) for every match_status index still built on
+        the status alone."""
+        out = []
+        for name, table, sql in cursor.execute(
+                "SELECT name, tbl_name, sql FROM sqlite_master WHERE type = 'index' "
+                f"AND tbl_name IN ({','.join('?' * len(cls._MATCH_STATUS_TABLES))}) AND sql IS NOT NULL",
+                cls._MATCH_STATUS_TABLES):
+            m = cls._SINGLE_STATUS_INDEX.match(sql.strip())
+            if m:
+                out.append((name, table, m.group(1)))
+        return out
+
+    def upgrade_match_status_indexes(self, upgrades) -> None:
+        """rebuild each as (status, id), one transaction each so a reader never
+        finds the index missing. re-checked inside the transaction, so two
+        processes booting at once don't rebuild the same one twice."""
+        for name, table, column in upgrades:
+            try:
+                conn = self._get_connection()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+                                       (name,)).fetchone()
+                    if row and self._SINGLE_STATUS_INDEX.match((row[0] or '').strip()):
+                        conn.execute(f'DROP INDEX "{name}"')
+                        conn.execute(f'CREATE INDEX "{name}" ON "{table}" ({column}, id)')
+                    conn.commit()
+                finally:
+                    conn.close()
+            except Exception as e:
+                logger.warning(f"could not rebuild {name} as ({column}, id): {e}")
+
+    def _kick_norm_backfill_thread(self):
+        """one background backfill per db path per process. a big library's
+        first boot after the upgrade fills hundreds of thousands of rows;
+        that must not sit inside whichever request or worker noticed first."""
+        key = str(self.database_path)
+        with _norm_backfill_lock:
+            t = _norm_backfill_threads.get(key)
+            if t is not None and t.is_alive():
+                return
+            t = threading.Thread(target=self.ensure_norm_backfilled, name="norm-backfill", daemon=True)
+            _norm_backfill_threads[key] = t
+        logger.info("norm backfill: starting in the background (readers use the slow path until it finishes)")
+        t.start()
+
+    def _norm_ready(self, cursor) -> bool:
+        """True when every *_norm column is filled, so a reader may use the
+        indexed columns outright. a small gap (a just-imported album) is filled
+        inline; a large one (first boot after the upgrade, a full rescan) is
+        handed to a background thread and the reader takes the slow path this
+        time.
+
+        probed every call, on purpose: five indexed IS NULL lookups cost tens
+        of microseconds, and a cached "ready" would let a row inserted raw a
+        moment ago (an import, a repair job) be invisible to the indexed path
+        until the cache expired — reported missing, and re-downloaded."""
+        try:
+            # probe every column before filling anything: a ten-row gap in one
+            # column must not drag a 500k-row gap in another into this call
+            gaps = [self._norm_unfilled_count(cursor, table, norm, _NORM_INLINE_LIMIT + 1)
+                    for table, raw, norm, _kind in self._NORM_COLUMNS]
+            if any(n > _NORM_INLINE_LIMIT for n in gaps):
+                self._kick_norm_backfill_thread()
+                return False
+            if any(gaps):
+                self.ensure_norm_backfilled()
+            return True
+        except Exception as e:
+            logger.debug(f"norm readiness probe failed: {e}")
+            return False
+
+    def _norm_expr(self, ready: bool, table: str, raw: str, norm: str) -> str:
+        """the sql expression that yields the normalized text for a row:
+        the column when the backfill is complete, else a COALESCE that only
+        calls the udf for rows the backfill hasn't reached."""
+        if ready:
+            return f"{table}.{norm}"
+        return f"COALESCE({table}.{norm}, norm_text({table}.{raw}))"
+
     def _add_similar_artists_last_featured_column(self, cursor):
         """Add last_featured column to similar_artists for hero slider cycling"""
         try:
@@ -2828,6 +4755,21 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error adding columns to similar_artists: {e}")
             # Don't raise - this is a migration, database can still function
+
+    def _fix_profile_one_owner_rows(self, cursor):
+        """Repair rows stamped owner_profile_id=1 by the pre-#1660 import bug.
+
+        Profile 1 is the shared library scope (owner_profile_id IS NULL), but
+        record_soulsync_library_entry used to write owner_profile_id=1 for
+        profile-1 downloads. Those rows were invisible to every shared-scope
+        lookup. This is idempotent: only touches rows that still have the
+        bad value.
+        """
+        try:
+            for table in ("tracks", "albums", "artists"):
+                cursor.execute(f"UPDATE {table} SET owner_profile_id = NULL WHERE owner_profile_id = 1")
+        except Exception as e:
+            logger.debug(f"Profile-1 owner repair skipped: {e}")
 
     def _fix_watchlist_spotify_id_nullable(self, cursor):
         """
@@ -2877,6 +4819,7 @@ class MusicDatabase:
                             include_acoustic INTEGER DEFAULT 0,
                             include_compilations INTEGER DEFAULT 0,
                             include_instrumentals INTEGER DEFAULT 0,
+                            include_other_artists INTEGER DEFAULT 0,
                             lookback_days INTEGER DEFAULT NULL,
                             itunes_artist_id TEXT,
                             deezer_artist_id TEXT,
@@ -2909,6 +4852,7 @@ class MusicDatabase:
                             include_acoustic INTEGER DEFAULT 0,
                             include_compilations INTEGER DEFAULT 0,
                             include_instrumentals INTEGER DEFAULT 0,
+                            include_other_artists INTEGER DEFAULT 0,
                             lookback_days INTEGER DEFAULT NULL,
                             itunes_artist_id TEXT,
                             deezer_artist_id TEXT,
@@ -2927,7 +4871,7 @@ class MusicDatabase:
                             'last_scan_timestamp', 'created_at', 'updated_at', 'image_url',
                             'include_albums', 'include_eps', 'include_singles', 'include_live',
                             'include_remixes', 'include_acoustic', 'include_compilations',
-                            'include_instrumentals', 'lookback_days',
+                            'include_instrumentals', 'include_other_artists', 'lookback_days',
                             'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id',
                             'musicbrainz_artist_id', 'amazon_artist_id',
                             'preferred_metadata_source', 'auto_download', 'profile_id']
@@ -2973,7 +4917,7 @@ class MusicDatabase:
                 columns_added = True
             # MusicBrainz exposes alternate-spelling aliases on every artist
             # record (Japanese kanji ↔ romanized, Cyrillic ↔ Latin, etc.).
-            # Commissary's artist matching used to compare expected vs actual
+            # SoulSync's artist matching used to compare expected vs actual
             # name with raw similarity — cross-script comparison scored 0%
             # and the file got quarantined even when MusicBrainz knew both
             # names belonged to the same artist (issue #442). Persist the
@@ -3011,6 +4955,9 @@ class MusicDatabase:
             if 'musicbrainz_recording_id' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN musicbrainz_recording_id TEXT")
                 added_tracks = True
+            if 'recording_disambiguation' not in tracks_columns:
+                cursor.execute("ALTER TABLE tracks ADD COLUMN recording_disambiguation TEXT")
+                added_tracks = True
             if 'musicbrainz_last_attempted' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN musicbrainz_last_attempted TIMESTAMP")
                 added_tracks = True
@@ -3045,11 +4992,11 @@ class MusicDatabase:
             
             # Create indexes (safe even if columns were already present)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_mbid ON artists (musicbrainz_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_mb_status ON artists (musicbrainz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_mb_status ON artists (musicbrainz_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_mbid ON albums (musicbrainz_release_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_mb_status ON albums (musicbrainz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_mb_status ON albums (musicbrainz_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_mbid ON tracks (musicbrainz_recording_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_mb_status ON tracks (musicbrainz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_mb_status ON tracks (musicbrainz_match_status, id)")
             
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mb_cache_entity ON musicbrainz_cache (entity_type, entity_name)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mb_cache_mbid ON musicbrainz_cache (musicbrainz_id)")
@@ -3097,6 +5044,7 @@ class MusicDatabase:
             if 'itunes_track_id' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN itunes_track_id TEXT")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_spotify_id ON tracks (spotify_track_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_spotify_nocase ON tracks (spotify_track_id COLLATE NOCASE)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_itunes_id ON tracks (itunes_track_id)")
 
         except Exception as e:
@@ -3118,7 +5066,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN audiodb_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_audiodb_id ON artists (audiodb_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_audiodb_status ON artists (audiodb_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_audiodb_status ON artists (audiodb_match_status, id)")
 
             if 'style' not in artists_columns:
                 cursor.execute("ALTER TABLE artists ADD COLUMN style TEXT")
@@ -3141,7 +5089,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN audiodb_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_audiodb_id ON albums (audiodb_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_audiodb_status ON albums (audiodb_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_audiodb_status ON albums (audiodb_match_status, id)")
 
             if 'style' not in albums_columns:
                 cursor.execute("ALTER TABLE albums ADD COLUMN style TEXT")
@@ -3160,7 +5108,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN audiodb_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_audiodb_id ON tracks (audiodb_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_audiodb_status ON tracks (audiodb_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_audiodb_status ON tracks (audiodb_match_status, id)")
 
             if 'style' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN style TEXT")
@@ -3186,7 +5134,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN discogs_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_discogs_id ON artists (discogs_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_discogs_status ON artists (discogs_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_discogs_status ON artists (discogs_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3204,7 +5152,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN discogs_rating_count INTEGER")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_discogs_id ON albums (discogs_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_discogs_status ON albums (discogs_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_discogs_status ON albums (discogs_match_status, id)")
 
             logger.info("Discogs enrichment columns added/verified successfully")
 
@@ -3229,9 +5177,64 @@ class MusicDatabase:
             if 'similar_artists_last_attempted' not in artists_columns:
                 cursor.execute("ALTER TABLE artists ADD COLUMN similar_artists_last_attempted TIMESTAMP")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_similarartists_status ON artists (similar_artists_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_similarartists_status ON artists (similar_artists_match_status, id)")
         except Exception as e:
             logger.error(f"Error adding similar-artists worker columns: {e}")
+
+    def _requeue_similar_artists_rematch(self, cursor):
+        """one-time: fetch every artist's similar artists again.
+
+        names used to resolve to the first search hit, so stored similars hold
+        namesakes (a thai pop act as Korn, Colde for Cold). the worker never
+        re-runs a matched artist and the watchlist only refetches after 30
+        days, so neither would heal them. requeue both; replace_similar_artists
+        swaps each set as it lands. occurrence_count goes back to one per row:
+        every refetch had bumped it and the reader sums it."""
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_similar_artists_rematch_applied'")
+            if cursor.fetchone():
+                return
+            cursor.execute("UPDATE artists SET similar_artists_match_status = NULL "
+                           "WHERE similar_artists_match_status IS NOT NULL")
+            requeued = max(cursor.rowcount, 0)
+            cursor.execute("UPDATE similar_artists SET occurrence_count = 1, "
+                           "last_updated = datetime('now', '-60 days')")
+            cursor.execute("CREATE TABLE _similar_artists_rematch_applied (applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            self._record_migration(cursor, 'similar_artists_rematch')
+            logger.info("similar artists rematch: requeued %s library artists", requeued)
+        except Exception as e:
+            logger.error(f"Error requeueing similar artists rematch: {e}")
+
+    def _purge_beatport_positional_matches(self, cursor):
+        """one-time: drop what the old beatport ids and enrichment left behind.
+
+        every beatport chart called its tracks beatport_chart_0, _1, ... by
+        position, so a sync match saved for chart A's track 1 came back for
+        every chart's track 1 (maV, oct 12 2026: a trance chart synced with
+        tracks from the beatport top 10). those rows can't be told apart, so
+        they all go, along with manual matches filed under the same ids. the
+        cached beatport track pages go too: the old enrichment stored charts
+        as tracks there, and the json reads refill them correctly."""
+        try:
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {r[0] for r in cursor.fetchall()}
+            if '_beatport_positional_purged' in tables:
+                return
+            counts = {}
+            if 'sync_match_cache' in tables:
+                cursor.execute("DELETE FROM sync_match_cache WHERE spotify_track_id LIKE 'beatport\\_chart\\_%' ESCAPE '\\'")
+                counts['sync_match_cache'] = max(cursor.rowcount, 0)
+            if 'manual_library_track_matches' in tables:
+                cursor.execute("DELETE FROM manual_library_track_matches WHERE source_track_id LIKE 'beatport\\_chart\\_%' ESCAPE '\\'")
+                counts['manual_library_track_matches'] = max(cursor.rowcount, 0)
+            if 'metadata_cache_entities' in tables:
+                cursor.execute("DELETE FROM metadata_cache_entities WHERE source = 'beatport' AND entity_type = 'track'")
+                counts['metadata_cache_entities'] = max(cursor.rowcount, 0)
+            cursor.execute("CREATE TABLE _beatport_positional_purged (applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+            self._record_migration(cursor, 'beatport_positional_purged')
+            logger.info("beatport positional id purge: %s", counts)
+        except Exception as e:
+            logger.error(f"Error purging beatport positional matches: {e}")
 
     def _add_amazon_columns(self, cursor):
         """Add Amazon enrichment tracking columns to artists, albums, and tracks."""
@@ -3248,7 +5251,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN amazon_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_amazon_id ON artists (amazon_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_amazon_status ON artists (amazon_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_amazon_status ON artists (amazon_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3262,7 +5265,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN amazon_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_amazon_id ON albums (amazon_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_amazon_status ON albums (amazon_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_amazon_status ON albums (amazon_match_status, id)")
 
             # --- Tracks ---
             cursor.execute("PRAGMA table_info(tracks)")
@@ -3276,7 +5279,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN amazon_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_amazon_id ON tracks (amazon_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_amazon_status ON tracks (amazon_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_amazon_status ON tracks (amazon_match_status, id)")
 
             logger.info("Amazon columns added/verified successfully")
         except Exception as e:
@@ -3311,7 +5314,7 @@ class MusicDatabase:
                     cursor.execute(f"ALTER TABLE {table} ADD COLUMN bandcamp_label TEXT")
 
                 cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_bandcamp_id ON {table} (bandcamp_id)")
-                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_bandcamp_status ON {table} (bandcamp_match_status)")
+                cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_bandcamp_status ON {table} (bandcamp_match_status, id)")
 
             logger.info("Bandcamp columns added/verified successfully")
         except Exception as e:
@@ -3387,7 +5390,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN deezer_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_deezer_id ON artists (deezer_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_deezer_status ON artists (deezer_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_deezer_status ON artists (deezer_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3401,7 +5404,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN deezer_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_deezer_id ON albums (deezer_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_deezer_status ON albums (deezer_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_deezer_status ON albums (deezer_match_status, id)")
 
             if 'label' not in albums_columns:
                 cursor.execute("ALTER TABLE albums ADD COLUMN label TEXT")
@@ -3422,7 +5425,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN deezer_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_deezer_id ON tracks (deezer_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_deezer_status ON tracks (deezer_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_deezer_status ON tracks (deezer_match_status, id)")
 
             if 'bpm' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN bpm REAL")
@@ -3468,7 +5471,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN jiosaavn_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_jiosaavn_id ON artists (jiosaavn_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_jiosaavn_status ON artists (jiosaavn_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_jiosaavn_status ON artists (jiosaavn_match_status, id)")
 
             cursor.execute("PRAGMA table_info(albums)")
             albums_columns = [column[1] for column in cursor.fetchall()]
@@ -3481,7 +5484,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN jiosaavn_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_jiosaavn_id ON albums (jiosaavn_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_jiosaavn_status ON albums (jiosaavn_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_jiosaavn_status ON albums (jiosaavn_match_status, id)")
 
             cursor.execute("PRAGMA table_info(tracks)")
             tracks_columns = [column[1] for column in cursor.fetchall()]
@@ -3494,7 +5497,7 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN jiosaavn_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_jiosaavn_id ON tracks (jiosaavn_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_jiosaavn_status ON tracks (jiosaavn_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_jiosaavn_status ON tracks (jiosaavn_match_status, id)")
 
             logger.info("JioSaavn columns added/verified successfully")
         except Exception as e:
@@ -3516,8 +5519,8 @@ class MusicDatabase:
             if 'itunes_last_attempted' not in artists_columns:
                 cursor.execute("ALTER TABLE artists ADD COLUMN itunes_last_attempted TIMESTAMP")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_spotify_match_status ON artists (spotify_match_status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_itunes_match_status ON artists (itunes_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_spotify_match_status ON artists (spotify_match_status, id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_itunes_match_status ON artists (itunes_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3532,8 +5535,8 @@ class MusicDatabase:
             if 'itunes_last_attempted' not in albums_columns:
                 cursor.execute("ALTER TABLE albums ADD COLUMN itunes_last_attempted TIMESTAMP")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_spotify_match_status ON albums (spotify_match_status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_itunes_match_status ON albums (itunes_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_spotify_match_status ON albums (spotify_match_status, id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_itunes_match_status ON albums (itunes_match_status, id)")
 
             # --- Tracks ---
             cursor.execute("PRAGMA table_info(tracks)")
@@ -3548,8 +5551,8 @@ class MusicDatabase:
             if 'itunes_last_attempted' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN itunes_last_attempted TIMESTAMP")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_spotify_match_status ON tracks (spotify_match_status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_itunes_match_status ON tracks (itunes_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_spotify_match_status ON tracks (spotify_match_status, id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_itunes_match_status ON tracks (itunes_match_status, id)")
 
         except Exception as e:
             logger.error(f"Error adding Spotify/iTunes enrichment columns: {e}")
@@ -3594,9 +5597,9 @@ class MusicDatabase:
             if 'genius_url' not in artists_columns:
                 cursor.execute("ALTER TABLE artists ADD COLUMN genius_url TEXT")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_lastfm_status ON artists (lastfm_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_lastfm_status ON artists (lastfm_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_genius_id ON artists (genius_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_genius_status ON artists (genius_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_genius_status ON artists (genius_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3618,7 +5621,7 @@ class MusicDatabase:
             if 'lastfm_url' not in albums_columns:
                 cursor.execute("ALTER TABLE albums ADD COLUMN lastfm_url TEXT")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_lastfm_status ON albums (lastfm_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_lastfm_status ON albums (lastfm_match_status, id)")
 
             # --- Tracks ---
             cursor.execute("PRAGMA table_info(tracks)")
@@ -3652,9 +5655,9 @@ class MusicDatabase:
             if 'genius_url' not in tracks_columns:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN genius_url TEXT")
 
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_lastfm_status ON tracks (lastfm_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_lastfm_status ON tracks (lastfm_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_genius_id ON tracks (genius_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_genius_status ON tracks (genius_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_genius_status ON tracks (genius_match_status, id)")
 
             # One-time reset: clear all Genius matches due to blind-fallback bug in search
             # The old search_artist/search_song returned the first result with no name validation,
@@ -3704,9 +5707,9 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE artists ADD COLUMN qobuz_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_tidal_id ON artists (tidal_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_tidal_status ON artists (tidal_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_tidal_status ON artists (tidal_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_qobuz_id ON artists (qobuz_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_qobuz_status ON artists (qobuz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_artists_qobuz_status ON artists (qobuz_match_status, id)")
 
             # --- Albums ---
             cursor.execute("PRAGMA table_info(albums)")
@@ -3726,9 +5729,9 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE albums ADD COLUMN qobuz_last_attempted TIMESTAMP")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_tidal_id ON albums (tidal_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_tidal_status ON albums (tidal_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_tidal_status ON albums (tidal_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_qobuz_id ON albums (qobuz_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_qobuz_status ON albums (qobuz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_albums_qobuz_status ON albums (qobuz_match_status, id)")
 
             # --- Albums (extra metadata columns) ---
             if 'upc' not in albums_columns:
@@ -3758,10 +5761,27 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE tracks ADD COLUMN copyright TEXT")
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_tidal_id ON tracks (tidal_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_tidal_status ON tracks (tidal_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_tidal_status ON tracks (tidal_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_qobuz_id ON tracks (qobuz_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_qobuz_status ON tracks (qobuz_match_status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_qobuz_status ON tracks (qobuz_match_status, id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_isrc ON tracks (isrc)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_tracks_isrc_nocase ON tracks (isrc COLLATE NOCASE)")
+
+            # one-time requeue (#1290): tidal retired /searchResults/{query},
+            # so every search 400'd and got recorded as not_found. those rows
+            # would sit out the 30-day retry. only not_found goes back, a real
+            # match is left alone.
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_tidal_search_fix_applied'")
+            if not cursor.fetchone():
+                requeued = 0
+                for table in ('artists', 'albums', 'tracks'):
+                    cursor.execute(f"""
+                        UPDATE {table} SET tidal_match_status = NULL, tidal_last_attempted = NULL
+                        WHERE tidal_match_status = 'not_found'
+                    """)
+                    requeued += max(cursor.rowcount, 0)
+                cursor.execute("CREATE TABLE _tidal_search_fix_applied (applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                logger.info(f"Tidal search fix applied: requeued {requeued} not_found rows for enrichment")
 
         except Exception as e:
             logger.error(f"Error adding Tidal/Qobuz enrichment columns: {e}")
@@ -3891,6 +5911,7 @@ class MusicDatabase:
                             include_acoustic INTEGER DEFAULT 0,
                             include_compilations INTEGER DEFAULT 0,
                             include_instrumentals INTEGER DEFAULT 0,
+                            include_other_artists INTEGER DEFAULT 0,
                             lookback_days INTEGER DEFAULT NULL,
                             itunes_artist_id TEXT,
                             deezer_artist_id TEXT,
@@ -3910,7 +5931,7 @@ class MusicDatabase:
                                 'last_scan_timestamp', 'created_at', 'updated_at', 'image_url',
                                 'include_albums', 'include_eps', 'include_singles', 'include_live',
                                 'include_remixes', 'include_acoustic', 'include_compilations',
-                                'include_instrumentals', 'lookback_days',
+                                'include_instrumentals', 'include_other_artists', 'lookback_days',
                                 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id',
                                 'musicbrainz_artist_id', 'amazon_artist_id',
                             'preferred_metadata_source', 'auto_download', 'profile_id']
@@ -3964,23 +5985,6 @@ class MusicDatabase:
                     logger.info("Rebuilt wishlist_tracks with profile-scoped UNIQUE constraints")
             except Exception as e:
                 logger.error(f"Error rebuilding wishlist_tracks for profiles: {e}")
-
-            # 5b. One-time sweep of self-duplicate wishlist rows.
-            #
-            # A composite id ('<track>::<album>') is only legitimate when the
-            # base row holds the same track from a DIFFERENT album. add_to_wishlist
-            # used to fork one whenever the base id merely existed, so a track
-            # re-added from the SAME album (every drain cycle, for anything that
-            # keeps failing) grew a second row that duplicated the first.
-            #
-            # Those forks are invisible to record_failed_attempt, which stamps the
-            # base id — so their retry_count stays 0, they are permanently "due",
-            # and the retry backoff can never quiet them. Deleting them is safe
-            # precisely because the base row already covers the same track+album.
-            try:
-                self._prune_self_duplicate_wishlist_rows(cursor)
-            except Exception as e:
-                logger.error(f"Error pruning duplicate wishlist rows: {e}")
 
             # 6. Rebuild bubble_snapshots for profile-scoped PRIMARY KEY
             try:
@@ -4273,6 +6277,7 @@ class MusicDatabase:
                             metadata_updated_at TIMESTAMP,
                             last_featured TIMESTAMP,
                             profile_id INTEGER DEFAULT 1,
+                            source_provider TEXT,
                             UNIQUE(profile_id, source_artist_id, similar_artist_name)
                         )
                     """)
@@ -4282,7 +6287,8 @@ class MusicDatabase:
                                 'similar_artist_musicbrainz_id', 'similar_artist_name',
                                 'similarity_rank', 'occurrence_count',
                                 'last_updated', 'image_url', 'genres', 'popularity',
-                                'metadata_updated_at', 'last_featured', 'profile_id']
+                                'metadata_updated_at', 'last_featured', 'profile_id',
+                                'source_provider']
                     shared_cols = [c for c in new_cols if c in old_cols]
                     cols_str = ', '.join(shared_cols)
 
@@ -4356,6 +6362,87 @@ class MusicDatabase:
 
         except Exception as e:
             logger.error(f"Error in profile support v4 migration: {e}")
+
+    # columns this migration owns, with their defaults
+    _PROFILE_CONTROL_COLUMNS = (
+        ("request_limit", "INTEGER DEFAULT 0"),        # asks per window, 0 = no limit
+        ("request_limit_days", "INTEGER DEFAULT 7"),
+        ("hide_explicit", "INTEGER DEFAULT 0"),        # kids: explicit music stays out of sight
+        ("max_rating", "TEXT DEFAULT NULL"),           # kids: highest movie/tv rating, NULL = any
+        ("session_epoch", "INTEGER DEFAULT 0"),        # bump = every signed-in browser signs out
+        ("disabled", "INTEGER DEFAULT 0"),             # turned off: kept, but nobody can open it
+    )
+
+    def _add_profile_controls(self, cursor):
+        """request quotas, kids content limits and the session epoch
+        (sept 25 2026), plus the admin audit log and invite links. idempotent
+        on columns, so a half-applied run finishes next boot."""
+        try:
+            cursor.execute("PRAGMA table_info(profiles)")
+            cols = {c[1] for c in cursor.fetchall()}
+            if not cols:
+                return
+            for col, decl in self._PROFILE_CONTROL_COLUMNS:
+                if col not in cols:
+                    cursor.execute(f"ALTER TABLE profiles ADD COLUMN {col} {decl}")
+            # actor_id / target_id, never profile_id: the delete sweep removes
+            # every profile_id row, and the log is about deletions too
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS profile_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_id INTEGER,
+                    actor_name TEXT,
+                    action TEXT NOT NULL,
+                    target_id INTEGER,
+                    target_name TEXT,
+                    detail TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_profile_audit_created ON profile_audit (created_at)")
+            # one row per signed-in browser. owner_id, never profile_id (the
+            # delete sweep); delete_profile clears them itself
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS profile_devices (
+                    id TEXT PRIMARY KEY,
+                    owner_id INTEGER NOT NULL,
+                    label TEXT,
+                    ip TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    revoked_at TIMESTAMP
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_profile_devices_by_profile ON profile_devices (owner_id)")
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS profile_invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token_hash TEXT NOT NULL UNIQUE,
+                    created_by INTEGER,
+                    preset TEXT NOT NULL DEFAULT '{}',
+                    note TEXT,
+                    expires_at TIMESTAMP NOT NULL,
+                    used_at TIMESTAMP,
+                    used_by INTEGER,
+                    revoked_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except Exception as e:
+            logger.error(f"Error in profile controls migration: {e}")
+
+    @staticmethod
+    def _profile_controls(row, columns) -> Dict[str, Any]:
+        def val(col, default):
+            return row[col] if col in columns and row[col] is not None else default
+        return {
+            'request_limit': int(val('request_limit', 0) or 0),
+            'request_limit_days': int(val('request_limit_days', 7) or 7),
+            'hide_explicit': bool(val('hide_explicit', 0)),
+            'max_rating': val('max_rating', None),
+            'session_epoch': int(val('session_epoch', 0) or 0),
+            'disabled': bool(val('disabled', 0)),
+        }
 
     def _add_profile_sides(self, cursor):
         """Add the allowed_sides column ('music'|'video'|'both') to profiles.
@@ -4490,7 +6577,7 @@ class MusicDatabase:
     def set_profile_listenbrainz(self, profile_id: int, token: str, base_url: str = '', username: str = '') -> bool:
         """Save encrypted ListenBrainz credentials for a profile"""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             encrypted_token = config_manager._encrypt_value(token) if token else None
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -4509,7 +6596,7 @@ class MusicDatabase:
     def get_profile_listenbrainz(self, profile_id: int) -> Dict[str, Any]:
         """Get decrypted ListenBrainz credentials for a profile"""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -4547,10 +6634,42 @@ class MusicDatabase:
             logger.error(f"Error clearing ListenBrainz credentials for profile {profile_id}: {e}")
             return False
 
+    def reset_listening_pile(self, profile_id: int, source: str = 'listenbrainz') -> int:
+        """drop one source's plays from a profile's own pile, plus its caches and
+        that source's import state. for when it switches listenbrainz or last.fm
+        accounts: the old account's history isn't this person's anymore (#1293).
+
+        plays from anywhere else (the web player) stay, they're still theirs.
+        never touches the shared pile. returns rows removed."""
+        from core.listening_scope import SHARED_OWNER, owner_key, pile_cache_keys
+        try:
+            pid = int(profile_id)
+        except (TypeError, ValueError):
+            return 0
+        if pid == SHARED_OWNER:
+            return 0
+        # the other service's resume state is still good, only this one's goes
+        keys = pile_cache_keys(pid) + [owner_key(f'{source}_listening_import_state', pid)]
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM listening_import_events WHERE profile_id = ? AND source = ?",
+                               (pid, source))
+                cursor.execute("DELETE FROM listening_history WHERE profile_id = ? AND server_source = ?",
+                               (pid, source))
+                removed = cursor.rowcount
+                for key in keys:
+                    cursor.execute("DELETE FROM metadata WHERE key = ?", (key,))
+                conn.commit()
+                return removed
+        except Exception as e:
+            logger.error(f"Error resetting listening pile for profile {pid}: {e}")
+            return 0
+
     def get_profiles_with_listenbrainz(self) -> List[Dict[str, Any]]:
         """Get all profiles that have ListenBrainz tokens configured"""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -4614,6 +6733,354 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error in per-profile service credentials migration: {e}")
 
+    def _add_profile_navidrome_login(self, cursor):
+        """a navidrome login per profile. subsonic writes playlists as whoever
+        authenticated and has no admin impersonation, so a profile's playlists
+        only land on their navidrome user if the app can log in as them
+        (#1265). the password is stored as a fernet token, same as the config."""
+        for sql in (
+            "ALTER TABLE profiles ADD COLUMN navidrome_username TEXT DEFAULT NULL",
+            "ALTER TABLE profiles ADD COLUMN navidrome_password TEXT DEFAULT NULL",
+        ):
+            try:
+                cursor.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+    def _add_profile_lastfm_username(self, cursor):
+        """a last.fm username per profile (#1293). reading someone's scrobbles
+        only takes the app's api key and their name, so there's no token."""
+        try:
+            cursor.execute("ALTER TABLE profiles ADD COLUMN lastfm_username TEXT DEFAULT NULL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+    def set_profile_lastfm(self, profile_id: int, username: Optional[str]) -> bool:
+        """save (or with an empty name clear) a profile's own last.fm username."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE profiles SET lastfm_username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    ((username or '').strip() or None, profile_id),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error setting Last.fm username for profile {profile_id}: {e}")
+            return False
+
+    def get_profile_lastfm(self, profile_id: int) -> Dict[str, Any]:
+        """{'username': ...} for a profile's own last.fm, '' when it has none."""
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute("SELECT lastfm_username FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+                return {'username': (row[0] or '') if row else ''}
+        except Exception as e:
+            logger.error(f"Error getting Last.fm username for profile {profile_id}: {e}")
+            return {'username': ''}
+
+    def clear_profile_lastfm(self, profile_id: int) -> bool:
+        return self.set_profile_lastfm(profile_id, None)
+
+    def set_profile_navidrome_login(self, profile_id: int, username: Optional[str], password: Optional[str]) -> bool:
+        """save (or with empty values clear) a profile's own navidrome login."""
+        try:
+            from core.settings import config_manager
+            username = (username or '').strip() or None
+            token = config_manager._encrypt_value(password) if (username and password) else None
+            if username and not token:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE profiles SET navidrome_username = ?, navidrome_password = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (username, token, profile_id))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error saving navidrome login for profile {profile_id}: {e}")
+            return False
+
+    def get_profile_navidrome_login(self, profile_id: int) -> Optional[Tuple[str, str]]:
+        """(username, password) for the profile, or None when it has no login
+        of its own (which means: act as the configured account, as always)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT navidrome_username, navidrome_password FROM profiles WHERE id = ?",
+                               (profile_id,))
+                row = cursor.fetchone()
+            if not row or not row[0] or not row[1]:
+                return None
+            from core.settings import config_manager
+            password = config_manager._decrypt_value(row[1])
+            if not isinstance(password, str) or not password:
+                return None
+            return row[0], password
+        except Exception as e:
+            logger.error(f"Error reading navidrome login for profile {profile_id}: {e}")
+            return None
+
+    def _add_profile_plex_home_user(self, cursor):
+        """a plex home user per profile (#1265): who the profile is on the plex
+        server, and the per-user server access token minted for them. plex
+        writes playlists as the connection's token, so this is what puts a
+        profile's playlists on their own plex user. token is a fernet token."""
+        for sql in (
+            "ALTER TABLE profiles ADD COLUMN plex_home_user_id TEXT DEFAULT NULL",
+            "ALTER TABLE profiles ADD COLUMN plex_home_user_title TEXT DEFAULT NULL",
+            "ALTER TABLE profiles ADD COLUMN plex_home_user_token TEXT DEFAULT NULL",
+            # who signed in with plex as this profile. set ONLY by plex sign-in,
+            # never by the home-user link: that link says where playlists go
+            # and any profile can point it at any unprotected home user, so
+            # it can't prove who someone is
+            "ALTER TABLE profiles ADD COLUMN plex_account_id TEXT DEFAULT NULL",
+        ):
+            try:
+                cursor.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+
+    def set_profile_plex_home_user(self, profile_id: int, user_id: Optional[str], title: Optional[str],
+                                   token: Optional[str]) -> bool:
+        """link (or with empty values unlink) a profile's plex home user."""
+        try:
+            from core.settings import config_manager
+            user_id = (str(user_id) if user_id else '').strip() or None
+            enc = config_manager._encrypt_value(token) if (user_id and token) else None
+            if user_id and not enc:
+                return False
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE profiles SET plex_home_user_id = ?, plex_home_user_title = ?, plex_home_user_token = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (user_id, (title or None) if user_id else None, enc, profile_id))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error saving plex home user for profile {profile_id}: {e}")
+            return False
+
+    def get_profile_by_plex_account(self, plex_account_id: str) -> Optional[Dict[str, Any]]:
+        """the profile a plex account signed in as before (plex sign-in's own
+        record, never the home-user link), or None.
+        {'id', 'name', 'is_admin', 'disabled'}"""
+        if not plex_account_id:
+            return None
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(profiles)")
+                cols = {c[1] for c in cursor.fetchall()}
+                if 'plex_account_id' not in cols:
+                    return None
+                has_disabled = 'disabled' in cols
+                cursor.execute(
+                    f"SELECT id, name, is_admin{', disabled' if has_disabled else ''} FROM profiles "
+                    "WHERE plex_account_id = ? ORDER BY id LIMIT 1", (str(plex_account_id),))
+                row = cursor.fetchone()
+            if not row:
+                return None
+            return {'id': row['id'], 'name': row['name'], 'is_admin': bool(row['is_admin']),
+                    'disabled': bool(row['disabled']) if has_disabled else False}
+        except Exception as e:
+            logger.error(f"Error looking up profile by plex account {plex_account_id}: {e}")
+            return None
+
+    def set_profile_plex_account(self, profile_id: int, plex_account_id: Optional[str]) -> bool:
+        """record (or with None clear) which plex account signs in as a profile"""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE profiles SET plex_account_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (str(plex_account_id) if plex_account_id else None, profile_id))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error saving plex account for profile {profile_id}: {e}")
+            return False
+
+    def get_profile_plex_home_user(self, profile_id: int) -> Optional[Dict[str, str]]:
+        """{'id', 'title', 'token'} for the profile's linked plex home user,
+        or None when it has none (act as the app account, as always)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT plex_home_user_id, plex_home_user_title, plex_home_user_token "
+                               "FROM profiles WHERE id = ?", (profile_id,))
+                row = cursor.fetchone()
+            if not row or not row[0] or not row[2]:
+                return None
+            from core.settings import config_manager
+            token = config_manager._decrypt_value(row[2])
+            if not isinstance(token, str) or not token:
+                return None
+            return {'id': row[0], 'title': row[1] or '', 'token': token}
+        except Exception as e:
+            logger.error(f"Error reading plex home user for profile {profile_id}: {e}")
+            return None
+
+    # ── own library per profile (#1199) ──────────────────────────────────
+    #
+    # a profile can have a library of its own: its own output folder and
+    # its own library on the media server. rows the scan of THAT library
+    # writes carry the profile as owner; rows of the shared library carry
+    # NULL, which is every row that existed before this. the shared client
+    # scans and reads as always; an own-library profile scans and reads its
+    # own rows. the admin is on the shared library like anyone else.
+    #
+    # the owner index is (server_source, owner_profile_id, id): the scan's
+    # per-library listings, counts and wipes are "this server, this owner"
+    # and read it covering. a bare owner index was worse than none: sqlite
+    # took it for "owner IS NULL" over the title and artist indexes and
+    # walked the whole library per search. an install that got that index
+    # has it dropped here.
+
+    def _add_own_library_columns(self, cursor):
+        for sql in (
+            "ALTER TABLE profiles ADD COLUMN library_mode TEXT DEFAULT 'shared'",
+            "ALTER TABLE profiles ADD COLUMN library_root TEXT DEFAULT NULL",
+            "ALTER TABLE tracks ADD COLUMN owner_profile_id INTEGER DEFAULT NULL",
+            "ALTER TABLE albums ADD COLUMN owner_profile_id INTEGER DEFAULT NULL",
+            "ALTER TABLE artists ADD COLUMN owner_profile_id INTEGER DEFAULT NULL",
+            "DROP INDEX IF EXISTS idx_tracks_owner",
+            "DROP INDEX IF EXISTS idx_albums_owner",
+            "DROP INDEX IF EXISTS idx_artists_owner",
+            "CREATE INDEX IF NOT EXISTS idx_tracks_source_owner ON tracks (server_source, owner_profile_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_albums_source_owner ON albums (server_source, owner_profile_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_artists_source_owner ON artists (server_source, owner_profile_id, id)",
+        ):
+            try:
+                cursor.execute(sql)
+            except sqlite3.OperationalError:
+                pass  # Column / index already exists
+
+    def _repair_own_jellyfin_artist_ids(self, cursor):
+        """Split legacy cross-library artist parents without losing enrichment or children."""
+        from core.library_scope import library_artist_id
+        cursor.execute("""
+            SELECT artist_id, owner_profile_id FROM albums
+            WHERE server_source = 'jellyfin' AND owner_profile_id IS NOT NULL
+            UNION SELECT artist_id, owner_profile_id FROM tracks
+            WHERE server_source = 'jellyfin' AND owner_profile_id IS NOT NULL
+            UNION SELECT id, owner_profile_id FROM artists
+            WHERE server_source = 'jellyfin' AND owner_profile_id IS NOT NULL
+        """)
+        rows = cursor.fetchall()
+        columns = [r[1] for r in cursor.execute('PRAGMA table_info(artists)').fetchall()]
+        quoted = ', '.join('"' + c + '"' for c in columns)
+        selection = ', '.join('?' if c in ('id', 'owner_profile_id') else '"' + c + '"' for c in columns)
+        for old_id, owner in rows:
+            new_id = library_artist_id(old_id, 'jellyfin', owner)
+            if new_id == old_id:
+                continue
+            values = [new_id if c == 'id' else owner for c in columns if c in ('id', 'owner_profile_id')]
+            cursor.execute(f'INSERT OR IGNORE INTO artists ({quoted}) SELECT {selection} FROM artists WHERE id = ?',
+                           [*values, old_id])
+            for table in ('albums', 'tracks'):
+                cursor.execute(f'UPDATE {table} SET artist_id = ? WHERE artist_id = ? AND owner_profile_id = ? AND server_source = ?',
+                               (new_id, old_id, owner, 'jellyfin'))
+            # Keep the native parent when the shared library references it.
+            cursor.execute("""UPDATE artists SET owner_profile_id = NULL WHERE id = ? AND (
+                EXISTS (SELECT 1 FROM albums WHERE artist_id = ? AND owner_profile_id IS NULL)
+                OR EXISTS (SELECT 1 FROM tracks WHERE artist_id = ? AND owner_profile_id IS NULL))""",
+                           (old_id, old_id, old_id))
+            cursor.execute("""DELETE FROM artists WHERE id = ? AND owner_profile_id = ?
+                AND NOT EXISTS (SELECT 1 FROM albums WHERE artist_id = ?)
+                AND NOT EXISTS (SELECT 1 FROM tracks WHERE artist_id = ?)""", (old_id, owner, old_id, old_id))
+
+    def set_profile_library(self, profile_id: int, mode: str, root: Optional[str]) -> bool:
+        """'shared' (the default, the one library everyone has always used) or
+        'own' with the profile's output folder."""
+        mode = 'own' if mode == 'own' else 'shared'
+        root = (root or '').strip() or None
+        if mode == 'own' and not root:
+            return False
+        if mode == 'shared':
+            root = None
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE profiles SET library_mode = ?, library_root = ?, updated_at = CURRENT_TIMESTAMP "
+                               "WHERE id = ?", (mode, root, profile_id))
+                saved = cursor.rowcount > 0
+                if saved and mode == 'shared':
+                    # back on the shared library, the rows of its own are
+                    # nobody's: no scope reads them again. the next scan
+                    # rebuilds them if it is ever switched back
+                    self._delete_own_library_rows(cursor, profile_id)
+                conn.commit()
+                return saved
+        except Exception as e:
+            logger.error(f"Error saving library mode for profile {profile_id}: {e}")
+            return False
+
+    def _delete_own_library_rows(self, cursor, profile_id: int) -> None:
+        """drop a profile's own-library rows (tracks first: the credits
+        trigger and the album/artist order both want it that way)"""
+        for table in ('tracks', 'albums', 'artists'):
+            cursor.execute(f"DELETE FROM {table} WHERE owner_profile_id = ?", (int(profile_id),))   # noqa: S608
+            if cursor.rowcount:
+                logger.info("own library: removed %d %s row(s) of profile %s", cursor.rowcount, table, profile_id)
+
+    def get_profile_library(self, profile_id: int) -> Dict[str, Any]:
+        """{'mode': 'shared'|'own', 'root': str|None}. profile 1 is always shared."""
+        if not profile_id or int(profile_id) == 1:
+            return {'mode': 'shared', 'root': None}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT library_mode, library_root FROM profiles WHERE id = ?", (profile_id,))
+                row = cursor.fetchone()
+            if not row or row[0] != 'own' or not row[1]:
+                return {'mode': 'shared', 'root': None}
+            return {'mode': 'own', 'root': row[1]}
+        except Exception as e:
+            logger.error(f"Error reading library mode for profile {profile_id}: {e}")
+            return {'mode': 'shared', 'root': None}
+
+    def get_own_library_profiles(self, *, strict: bool = False) -> List[Dict[str, Any]]:
+        """every profile with a library of its own: id, name, root."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, name, library_root FROM profiles "
+                               "WHERE library_mode = 'own' AND library_root IS NOT NULL AND library_root != '' "
+                               "ORDER BY id")
+                return [{'id': r[0], 'name': r[1], 'root': r[2]} for r in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error listing own-library profiles: {e}")
+            if strict:
+                raise
+            return []
+
+    @staticmethod
+    def _owner_scope_sql(scope, column: str = 'owner_profile_id') -> Tuple[str, list]:
+        """the WHERE fragment for a library scope from core.library_scope:
+        'shared' = the rows with no owner, an int = that profile's rows,
+        None = everything. always returns a fragment so callers can append
+        it with AND unconditionally.
+
+        the unary + on the column keeps the planner off it: the scope is a
+        filter on the rows a query's real predicates found, never the index
+        it walks. a plain "owner_profile_id IS NULL" had sqlite pick the
+        owner index over title/artist ones and walk every row of the
+        library for a search (2ms became 18s on a 300k-track db)."""
+        if scope is None:
+            return "1=1", []
+        if scope == 'shared':
+            return f"+{column} IS NULL", []
+        return f"+{column} = ?", [int(scope)]
+
+    def _current_scope_sql(self, column: str = 'owner_profile_id') -> Tuple[str, list]:
+        """the scope of the caller (request profile or background profile)."""
+        from core.library_scope import current_library_scope
+        return self._owner_scope_sql(current_library_scope(), column)
+
     def _add_service_credential_sets(self, cursor):
         """Named, switchable credential sets per auth service + each profile's
         selection of which set is active (Phase 0 foundation).
@@ -4675,7 +7142,7 @@ class MusicDatabase:
         """Create a named credential set for a service. Returns the new id, or
         None on failure / duplicate (service, label). Payload is encrypted."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             enc = config_manager._encrypt_value(payload) if payload else None
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -4697,7 +7164,7 @@ class MusicDatabase:
         """Update a credential set's label and/or payload. Only provided fields
         change. Returns True if a row was updated."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             sets, params = [], []
             if label is not None:
                 sets.append("label = ?")
@@ -4772,7 +7239,7 @@ class MusicDatabase:
         """Get a credential set WITH its decrypted payload, or None. For the
         resolver / client wiring — not for shipping to the browser."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -4845,6 +7312,17 @@ class MusicDatabase:
             if 'soul_id' not in artist_cols:
                 cursor.execute("ALTER TABLE artists ADD COLUMN soul_id TEXT DEFAULT NULL")
                 logger.info("Added soul_id column to artists table")
+            # Which derivation produced the artist soul_id: 'canonical' (name +
+            # a provider's artist id), 'album' (name + the alphabetically-first
+            # album title IN THIS LIBRARY) or 'name' (name alone). Only
+            # 'canonical' is reproducible on another install — the album
+            # fallback depends on what that user happens to own, so two
+            # libraries holding the same artist derive different ids. Nothing
+            # recorded how much to trust a given artist soul_id before this.
+            # NULL means unknown (generated before this column existed).
+            if 'soul_id_path' not in artist_cols:
+                cursor.execute("ALTER TABLE artists ADD COLUMN soul_id_path TEXT DEFAULT NULL")
+                logger.info("Added soul_id_path column to artists table")
 
             # Albums: soul_id
             cursor.execute("PRAGMA table_info(albums)")
@@ -4856,7 +7334,7 @@ class MusicDatabase:
             # Albums: api_track_count — cached expected track count from the
             # metadata provider, separate from track_count which is the
             # OBSERVED count written by server syncs (Plex leafCount,
-            # Commissary standalone len(tracks)). Without a separate column,
+            # SoulSync standalone len(tracks)). Without a separate column,
             # the Album Completeness job can't tell apart "you have all the
             # tracks" from "Plex says this album has N tracks and you have
             # N tracks" — the latter looks complete but might be missing
@@ -4913,8 +7391,16 @@ class MusicDatabase:
                 )
             """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_listening_played_at ON listening_history (played_at)")
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_listening_weekday_hour_played_at
+                ON listening_history (
+                    CAST(strftime('%w', played_at) AS INTEGER),
+                    CAST(strftime('%H', played_at) AS INTEGER),
+                    played_at DESC
+                )
+            """)
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_listening_artist ON listening_history (artist)")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_listening_dedup ON listening_history (track_id, played_at, server_source)")
+            self._add_listening_history_owner(cursor)
 
             # Add play_count and last_played to tracks table
             cursor.execute("PRAGMA table_info(tracks)")
@@ -4936,63 +7422,101 @@ class MusicDatabase:
                 cursor.execute("ALTER TABLE listening_history ADD COLUMN scrobbled_listenbrainz INTEGER DEFAULT 0")
                 logger.info("Added scrobbled_listenbrainz column to listening_history")
 
+            # Whether a play may be scrobbled to Last.fm / ListenBrainz.
+            # A media server attests its own plays, so its history is
+            # eligible. Web-player rows start at 0: a 10s log is a "play" for
+            # SoulSync's own stats, but only becomes a scrobble once the
+            # player reports the Last.fm threshold was reached (half the
+            # track or 4 minutes, whichever comes first).
+            if 'scrobble_eligible' not in lh_cols:
+                cursor.execute("ALTER TABLE listening_history ADD COLUMN scrobble_eligible INTEGER DEFAULT 0")
+                logger.info("Added scrobble_eligible column to listening_history")
+                # every attested source: media servers attest their own plays,
+                # and lastfm/listenbrainz rows are attested imports (their
+                # pending cross-service forwards must keep working).
+                cursor.execute("""
+                    UPDATE listening_history SET scrobble_eligible = 1
+                    WHERE server_source IN ('plex', 'jellyfin', 'navidrome',
+                                            'lastfm', 'listenbrainz')
+                """)
+
         except Exception as e:
             logger.error(f"Error creating listening_history table: {e}")
 
+    def _add_listening_history_owner(self, cursor):
+        """#1293: whose pile each play is in. every existing row is the shared
+        pile (1), because that's the only pile there was.
+
+        the dedup key gets the owner too, or two profiles on the same
+        listenbrainz collide and the second one's play never lands."""
+        cursor.execute("PRAGMA table_info(listening_history)")
+        if 'profile_id' not in [c[1] for c in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE listening_history ADD COLUMN profile_id INTEGER NOT NULL DEFAULT 1")
+            logger.info("Added profile_id column to listening_history")
+        cursor.execute("DROP INDEX IF EXISTS idx_listening_dedup")
+        # the same index under its first name, only ever on dev installs
+        cursor.execute("DROP INDEX IF EXISTS idx_listening_dedup_owner")
+        # owner LAST: this index is for the insert's exact lookup, it must never
+        # look like an owner index to the planner
+        cursor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_listening_dedup_pile "
+            "ON listening_history (track_id, played_at, server_source, profile_id)"
+        )
+        # which media-server account played it (plex's history says). a play
+        # is filed in the pile of the profile linked to that account, and a
+        # later link or unlink re-files it, so the account has to be kept
+        cursor.execute("PRAGMA table_info(listening_history)")
+        if 'server_account_id' not in [c[1] for c in cursor.fetchall()]:
+            cursor.execute("ALTER TABLE listening_history ADD COLUMN server_account_id TEXT DEFAULT NULL")
+            logger.info("Added server_account_id column to listening_history")
+        from core.listening_import.dedup import ensure_import_events_table
+        ensure_import_events_table(cursor.connection)
+
     def insert_listening_events(self, events):
-        """Bulk insert listening events, skipping duplicates."""
-        if not events:
-            return 0
-        conn = None
+        """Insert server/player events through the same matcher as history imports.
+
+        an event's profile_id is its pile, none means the shared one. 0 is
+        a real answer (UNCLAIMED: an account linked to nobody), never shared."""
+        from core.listening_import.dedup import insert_import_events
+        from core.listening_scope import SHARED_OWNER
+
+        grouped = {}
+        for event in events or []:
+            owner = event.get('profile_id')
+            if owner is None:
+                owner = SHARED_OWNER
+            grouped.setdefault((event.get('server_source') or '', owner), []).append(event)
         inserted = 0
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            for event in events:
-                try:
-                    cursor.execute("""
-                        INSERT OR IGNORE INTO listening_history
-                            (track_id, title, artist, album, played_at, duration_ms, server_source, db_track_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        event.get('track_id'),
-                        event.get('title', ''),
-                        event.get('artist', ''),
-                        event.get('album', ''),
-                        event.get('played_at'),
-                        event.get('duration_ms', 0),
-                        event.get('server_source', ''),
-                        event.get('db_track_id'),
-                    ))
-                    if cursor.rowcount > 0:
-                        inserted += 1
-                except Exception as e:
-                    logger.debug("Failed to insert listening event: %s", e)
-            conn.commit()
-            return inserted
-        except Exception as e:
-            logger.error(f"Error inserting listening events: {e}")
-            return 0
-        finally:
-            if conn:
-                conn.close()
+        for (source, owner), batch in grouped.items():
+            try:
+                inserted += insert_import_events(self, batch, source, profile_id=owner)
+            except Exception as e:
+                logger.error(f"Error inserting listening events: {e}")
+        return inserted
 
     def record_web_player_play(self, event):
-        """Record a single Commissary web-player play: insert the listening_history
+        """Record a single SoulSync web-player play: insert the listening_history
         row AND bump tracks.play_count / last_played for the smart-radio recency
         signal. ``event`` is the dict from core.playback.play_log.build_play_event.
 
-        Returns True if the history row was newly inserted.
+        Returns the listening_history row id for the play, or None when the
+        event was matched onto an existing row from another source (that row
+        is server-attested and already scrobble-eligible) or the insert
+        failed. The player uses the id to mark the row scrobble-eligible
+        once the Last.fm threshold is reached.
         """
+        from core.listening_scope import SHARED_OWNER
+        from core.listening_import.dedup import canonical_played_at
+
         if not event:
-            return False
-        inserted = self.insert_listening_events([event])
+            return None
+        self.insert_listening_events([event])
         db_id = event.get('db_track_id')
-        if db_id is not None:
-            conn = None
-            try:
-                conn = self._get_connection()
-                cursor = conn.cursor()
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            if db_id is not None:
                 cursor.execute("""
                     UPDATE tracks
                     SET play_count = COALESCE(play_count, 0) + 1,
@@ -5000,12 +7524,70 @@ class MusicDatabase:
                     WHERE id = ?
                 """, (event.get('played_at'), db_id))
                 conn.commit()
-            except Exception as e:
-                logger.error(f"Error bumping play_count for track {db_id}: {e}")
-            finally:
-                if conn:
-                    conn.close()
-        return inserted > 0
+            # IS is NULL-safe for track_id (streams may carry None). The lookup
+            # uses the canonical played_at because insert_import_events stores
+            # the canonicalized form, not the raw event value. When the event
+            # was matched onto an existing row from another source there is no
+            # soulsync_web row, and None is the right answer: that row is
+            # server-attested and already scrobble-eligible.
+            owner = event.get('profile_id')
+            if owner is None:
+                owner = SHARED_OWNER
+            played_at = canonical_played_at(event.get('played_at')) or event.get('played_at')
+            cursor.execute("""
+                SELECT id FROM listening_history
+                WHERE track_id IS ? AND played_at IS ?
+                  AND server_source = 'soulsync_web' AND profile_id = ?
+                ORDER BY id DESC LIMIT 1
+            """, (event.get('track_id'), played_at, owner))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error recording web player play: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def mark_play_scrobble_eligible(self, play_id, profile_id=None):
+        """Mark a SoulSync web-player play as scrobble-eligible.
+
+        The player calls this once playback crosses the Last.fm threshold
+        (half the track or 4 minutes, whichever comes first). Only
+        soulsync_web rows in the caller's own pile can be flipped here:
+        server and import rows are eligible from insert, and this must never
+        touch them. Tracks of 30s or less never scrobble (duration_ms 0 means
+        unknown, e.g. a stream, and is allowed through).
+
+        Returns True when a row was actually flipped.
+        """
+        from core.listening_scope import SHARED_OWNER
+
+        if isinstance(play_id, bool):
+            return False
+        try:
+            play_id = int(play_id)
+            owner = int(profile_id) if profile_id is not None else SHARED_OWNER
+        except (TypeError, ValueError):
+            return False
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE listening_history SET scrobble_eligible = 1
+                WHERE id = ? AND server_source = 'soulsync_web'
+                  AND profile_id = ? AND scrobble_eligible = 0
+                  AND (duration_ms = 0 OR duration_ms > 30000)
+            """, (play_id, owner))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error marking play {play_id} scrobble-eligible: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
 
     def update_track_play_counts(self, counts):
         """Update play_count and last_played on the tracks table.
@@ -5031,30 +7613,50 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def get_listening_stats(self, time_range='all'):
+    def get_listening_stats(self, time_range='all', profile_id=None):
         """Get aggregate listening stats for a time range.
 
         Args:
             time_range: '7d', '30d', '12m', or 'all'
+            profile_id: whose plays, see core/listening_scope.py
 
         Returns:
             Dict with total_plays, total_time_ms, unique_artists, unique_albums, unique_tracks
         """
+        return self._listening_overview(
+            self._listening_time_filter(time_range, owner=self._listening_owner(profile_id)))
+
+    _EMPTY_OVERVIEW = {'total_plays': 0, 'total_time_ms': 0, 'unique_artists': 0,
+                       'unique_albums': 0, 'unique_tracks': 0}
+
+    def _listening_overview(self, where):
+        """The overview aggregate for an arbitrary WHERE clause.
+
+        One query body shared by the current window and the previous one, so the
+        two can never drift into measuring subtly different things — which is
+        exactly what would make a "vs last month" delta lie."""
+        if not where:
+            return dict(self._EMPTY_OVERVIEW)
+        from core.listening_scope import total_play_ms_sql
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range)
-
+            # the plays are read once into the cte, the time total then looks
+            # each played track up once instead of once per play
             cursor.execute(f"""
+                WITH plays AS MATERIALIZED (
+                    SELECT artist, album, title, duration_ms, db_track_id
+                    FROM listening_history
+                    {where}
+                )
                 SELECT
                     COUNT(*) as total_plays,
-                    COALESCE(SUM(duration_ms), 0) as total_time_ms,
+                    {total_play_ms_sql('plays')} as total_time_ms,
                     COUNT(DISTINCT artist) as unique_artists,
                     COUNT(DISTINCT album) as unique_albums,
                     COUNT(DISTINCT title || '|||' || COALESCE(artist, '')) as unique_tracks
-                FROM listening_history
-                {where}
+                FROM plays
             """)
             row = cursor.fetchone()
             return {
@@ -5066,19 +7668,169 @@ class MusicDatabase:
             }
         except Exception as e:
             logger.error(f"Error getting listening stats: {e}")
-            return {'total_plays': 0, 'total_time_ms': 0, 'unique_artists': 0, 'unique_albums': 0, 'unique_tracks': 0}
+            return dict(self._EMPTY_OVERVIEW)
         finally:
             if conn:
                 conn.close()
 
-    def get_top_artists(self, time_range='all', limit=10):
-        """Get top artists by play count."""
+    # ── When you listen (stats P3) ───────────────────────────────────────
+    #
+    # TIMEZONE NOTE: played_at is stored utc (core.listening_import.dedup
+    # CANONICAL), the same clock as datetime('now'), so the range filters are
+    # exact. an hour of the day is the listener's though, so the clock reads
+    # played_at in the server's local time ('localtime'). the drill-down in
+    # core/stats/queries.py must read it the same way or a cell's plays
+    # won't match its count.
+
+    def get_listening_clock(self, time_range='all', profile_id=None):
+        """Plays by weekday x hour — the shape of a listening week.
+
+        Returns a dict with a dense 7x24 ``grid`` (weekday 0=Sunday, matching
+        strftime %w) plus the peak cell. Dense on purpose: a heatmap needs a
+        value for every cell, and making the UI fill gaps is how an empty hour
+        becomes an undefined square."""
+        where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
+        grid = [[0] * 24 for _ in range(7)]
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range)
+            cursor.execute(f"""
+                SELECT CAST(strftime('%w', played_at, 'localtime') AS INTEGER) AS weekday,
+                       CAST(strftime('%H', played_at, 'localtime') AS INTEGER) AS hour,
+                       COUNT(*) AS plays
+                FROM listening_history
+                {where}
+                GROUP BY weekday, hour
+            """)
+            peak = {'weekday': None, 'hour': None, 'plays': 0}
+            total = 0
+            for weekday, hour, plays in cursor.fetchall():
+                # strftime returns NULL for an unparseable timestamp; skip
+                # rather than letting None index the grid.
+                if weekday is None or hour is None:
+                    continue
+                if not (0 <= weekday <= 6 and 0 <= hour <= 23):
+                    continue
+                grid[weekday][hour] = plays
+                total += plays
+                if plays > peak['plays']:
+                    peak = {'weekday': weekday, 'hour': hour, 'plays': plays}
+            return {'grid': grid, 'peak': peak, 'total': total}
+        except Exception as e:
+            logger.error(f"Error building listening clock: {e}")
+            return {'grid': grid, 'peak': {'weekday': None, 'hour': None, 'plays': 0}, 'total': 0}
+        finally:
+            if conn:
+                conn.close()
 
+    def get_listening_rhythm(self, time_range='all', profile_id=None):
+        """Streaks and the biggest day — listening as a habit, not a total.
+
+        ``current_streak`` counts back from today, and tolerates today having
+        no plays yet: a streak should not read as broken at 9am just because
+        you have not put anything on."""
+        where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
+        empty = {'current_streak': 0, 'longest_streak': 0,
+                 'busiest_day': {'date': None, 'plays': 0}, 'active_days': 0}
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT DATE(played_at) AS day, COUNT(*) AS plays
+                FROM listening_history
+                {where}
+                GROUP BY day
+                ORDER BY day
+            """)
+            rows = [(day, plays) for day, plays in cursor.fetchall() if day]
+            if not rows:
+                return dict(empty)
+
+            from datetime import date as _date, timedelta as _timedelta
+
+            days = []
+            for day, plays in rows:
+                try:
+                    days.append((_date.fromisoformat(day), plays))
+                except (TypeError, ValueError):
+                    continue
+            if not days:
+                return dict(empty)
+
+            busiest = max(days, key=lambda d: d[1])
+
+            longest = run = 1
+            for i in range(1, len(days)):
+                if days[i][0] - days[i - 1][0] == _timedelta(days=1):
+                    run += 1
+                    longest = max(longest, run)
+                else:
+                    run = 1
+
+            # Count back from the most recent day, but only call it CURRENT if
+            # that day is today or yesterday — an unbroken run that ended last
+            # month is history, not a streak you are on.
+            today = _date.today()
+            last_day = days[-1][0]
+            current = 0
+            if (today - last_day).days <= 1:
+                current = 1
+                for i in range(len(days) - 1, 0, -1):
+                    if days[i][0] - days[i - 1][0] == _timedelta(days=1):
+                        current += 1
+                    else:
+                        break
+
+            return {
+                'current_streak': current,
+                'longest_streak': longest,
+                'busiest_day': {'date': busiest[0].isoformat(), 'plays': busiest[1]},
+                'active_days': len(days),
+            }
+        except Exception as e:
+            logger.error(f"Error building listening rhythm: {e}")
+            return dict(empty)
+        finally:
+            if conn:
+                conn.close()
+
+    def get_listening_stats_previous(self, time_range='all', profile_id=None):
+        """The overview for the period immediately BEFORE ``time_range``.
+
+        Returns None when there is no previous window ('all'), so the UI omits
+        the comparison instead of rendering a delta against nothing."""
+        where = self._listening_previous_filter(time_range, owner=self._listening_owner(profile_id))
+        if not where:
+            return None
+        return self._listening_overview(where)
+
+    def listening_history_scope(self, profile_id=None) -> str:
+        """'profile' or 'shared' - whose listening history this profile reads.
+
+        'profile' when it has its own listenbrainz and reads only its own plays.
+        'shared' for the admin and every profile without one: they all read the
+        one install-wide pile. the recommendation payloads carry this string so
+        the product can say so instead of implying a personal history it does
+        not have.
+        """
+        from core.listening_scope import SHARED_OWNER
+        try:
+            pid = int(profile_id) if profile_id is not None else SHARED_OWNER
+        except (TypeError, ValueError):
+            return 'shared'
+        if pid == SHARED_OWNER:
+            return 'shared'
+        return 'profile' if self._listening_owner(pid) == pid else 'shared'
+
+    def get_top_artists(self, time_range='all', limit=10, profile_id=None):
+        """Get top artists by play count, from the pile profile_id reads."""
+        conn = None
+        try:
+            where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
+            conn = self._get_connection()
+            cursor = conn.cursor()
             cursor.execute(f"""
                 SELECT artist, COUNT(*) as play_count
                 FROM listening_history
@@ -5096,13 +7848,13 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def get_top_albums(self, time_range='all', limit=10):
+    def get_top_albums(self, time_range='all', limit=10, profile_id=None):
         """Get top albums by play count."""
         conn = None
         try:
+            where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range)
 
             cursor.execute(f"""
                 SELECT album, artist, COUNT(*) as play_count
@@ -5121,13 +7873,13 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def get_top_tracks(self, time_range='all', limit=10):
+    def get_top_tracks(self, time_range='all', limit=10, profile_id=None):
         """Get top tracks by play count."""
         conn = None
         try:
+            where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range)
 
             cursor.execute(f"""
                 SELECT title, artist, album, COUNT(*) as play_count
@@ -5146,13 +7898,13 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def get_listening_timeline(self, time_range='30d', granularity='day'):
+    def get_listening_timeline(self, time_range='30d', granularity='day', profile_id=None):
         """Get play count per time period for chart rendering."""
         conn = None
         try:
+            where = self._listening_time_filter(time_range, owner=self._listening_owner(profile_id))
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range)
 
             if granularity == 'month':
                 date_fmt = '%Y-%m'
@@ -5176,25 +7928,17 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def get_genre_breakdown(self, time_range='all'):
+    def get_genre_breakdown(self, time_range='all', profile_id=None):
         """Get genre distribution by play count (joins listening_history to tracks/artists)."""
         conn = None
         try:
+            where = self._listening_time_filter(time_range, alias='lh', owner=self._listening_owner(profile_id))
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = self._listening_time_filter(time_range, alias='lh')
 
-            cursor.execute(f"""
-                SELECT a.genres, COUNT(*) as play_count
-                FROM listening_history lh
-                JOIN tracks t ON t.id = lh.db_track_id
-                JOIN artists a ON a.id = t.artist_id
-                {where}
-                AND a.genres IS NOT NULL AND a.genres != ''
-                GROUP BY a.genres
-                ORDER BY play_count DESC
-                LIMIT 50
-            """)
+            # every payload, not the top 50. a genre spread over lots of small
+            # artist payloads used to fall off the cut and undercount.
+            cursor.execute(self._played_genres_sql(where))
             # Parse genre JSON and aggregate
             genre_counts = {}
             for row in cursor.fetchall():
@@ -5217,12 +7961,427 @@ class MusicDatabase:
             total = sum(genre_counts.values()) or 1
             result = sorted(
                 [{'genre': g, 'play_count': c, 'percentage': round(c / total * 100, 1)} for g, c in genre_counts.items()],
-                key=lambda x: x['play_count'], reverse=True
+                # name breaks ties, or which one makes the cut is up to sqlite
+                key=lambda x: (-x['play_count'], str(x['genre']))
             )[:15]
             return result
         except Exception as e:
             logger.error(f"Error getting genre breakdown: {e}")
             return []
+        finally:
+            if conn:
+                conn.close()
+
+    # ── Own vs play (stats P4) ───────────────────────────────────────────
+    #
+    # The one thing only SoulSync can say. Spotify has no library; Plex has no
+    # acquisition history. We have both halves, so we can answer "you own 40%
+    # metal and play 12% of it" — which is a fact about the user, not a number
+    # about the software.
+
+    @staticmethod
+    def _played_genres_sql(where):
+        """plays per artist genre payload, as (genres, plays) rows. counts each
+        track's plays first, then joins each played track once. joining per
+        play hit tracks 150k times for 11k distinct tracks, 0.5 s on every
+        genre shelf."""
+        return f"""
+            WITH played AS MATERIALIZED (
+                SELECT lh.db_track_id AS tid, COUNT(*) AS n
+                FROM listening_history lh
+                {where} AND lh.db_track_id IS NOT NULL
+                GROUP BY lh.db_track_id
+            )
+            SELECT a.genres, SUM(played.n) AS plays
+            FROM played
+            -- CAST: tracks.id is TEXT, db_track_id INTEGER; without it the
+            -- join scans tracks per history row (see core/stats/queries.py)
+            JOIN tracks t ON t.id = CAST(played.tid AS TEXT)
+            JOIN artists a ON a.id = t.artist_id
+            WHERE a.genres IS NOT NULL AND a.genres != ''
+            GROUP BY a.genres
+        """
+
+    @staticmethod
+    def _accumulate_genres(genre_counts, genres_str, weight):
+        """Fold one artist's genre payload into a running tally.
+
+        Shared by the owned and played sides so a genre can never be spelled
+        one way in one half and another way in the other — the percentages sit
+        beside each other and a parsing difference would read as a real gap."""
+        if not genres_str:
+            return
+        try:
+            import json
+            genres = json.loads(genres_str)
+            if isinstance(genres, list):
+                names = [str(g).strip() for g in genres]
+            else:
+                names = [str(genres).strip()]
+        except (ValueError, TypeError):
+            names = [g.strip() for g in str(genres_str).split(',')]
+        for name in names:
+            if name:
+                genre_counts[name] = genre_counts.get(name, 0) + weight
+
+    def get_genre_own_vs_play(self, time_range='all', limit=12, profile_id=None):
+        """What share of the library each genre is, against what share of plays.
+
+        Both sides are percentages of the GENRE-KNOWN population (tracks whose
+        artist carries genres), so they are directly comparable — an untagged
+        artist is absent from both, not counted as zero on one side.
+
+        Returns rows sorted by the size of the gap, because the interesting
+        rows are the ones where owning and listening disagree — not the
+        biggest genre, which you already know."""
+        conn = None
+        try:
+            owner = self._listening_owner(profile_id)
+            conn = self._get_connection()
+            cursor = conn.cursor()
+
+            owned = {}
+            cursor.execute("""
+                SELECT a.genres, COUNT(*) AS owned_tracks
+                FROM tracks t
+                JOIN artists a ON a.id = t.artist_id
+                WHERE a.genres IS NOT NULL AND a.genres != ''
+                GROUP BY a.genres
+            """)
+            for genres_str, count in cursor.fetchall():
+                self._accumulate_genres(owned, genres_str, count)
+
+            played = {}
+            where = self._listening_time_filter(time_range, alias='lh', owner=owner)
+            cursor.execute(self._played_genres_sql(where))
+            for genres_str, count in cursor.fetchall():
+                self._accumulate_genres(played, genres_str, count)
+
+            owned_total = sum(owned.values())
+            played_total = sum(played.values())
+            if not owned_total:
+                return []
+
+            rows = []
+            for genre in set(owned) | set(played):
+                owned_pct = owned.get(genre, 0) / owned_total * 100
+                # No plays at all in range: every genre is 0% played, which is
+                # honest — "you have not listened to anything" — rather than a
+                # division by zero.
+                played_pct = (played.get(genre, 0) / played_total * 100) if played_total else 0.0
+                rows.append({
+                    'genre': genre,
+                    'owned_pct': round(owned_pct, 1),
+                    'played_pct': round(played_pct, 1),
+                    'gap': round(played_pct - owned_pct, 1),
+                    'owned_tracks': owned.get(genre, 0),
+                    'plays': played.get(genre, 0),
+                })
+
+            rows.sort(key=lambda r: abs(r['gap']), reverse=True)
+            return rows[:limit]
+        except Exception as e:
+            logger.error(f"Error building own-vs-play: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def get_neglected_albums(self, limit=12):
+        """Albums you own where nothing has ever been played.
+
+        ``unplayed_count`` was already on the page as a dead number. An album
+        you can act on is worth more than a total you cannot."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT al.id, al.title, ar.name AS artist, COUNT(t.id) AS tracks,
+                       MAX(COALESCE(t.play_count, 0)) AS best_play_count
+                FROM albums al
+                JOIN tracks t ON t.album_id = al.id
+                JOIN artists ar ON ar.id = al.artist_id
+                GROUP BY al.id
+                HAVING best_play_count = 0 AND tracks > 0
+                ORDER BY tracks DESC
+                LIMIT ?
+            """, (limit,))
+            return [
+                {'id': row[0], 'name': row[1], 'artist': row[2], 'tracks': row[3]}
+                for row in cursor.fetchall()
+            ]
+        except Exception as e:
+            logger.error(f"Error finding neglected albums: {e}")
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    # ── Year in Listening (stats P5) ─────────────────────────────────────
+    #
+    # A FIXED PERIOD, not another filter. That is the whole difference between
+    # this and the rest of the page: the range picker asks the user to choose,
+    # and a Wrapped tells them what happened. Everything below is one window,
+    # decided here, with the boundary printed on the page.
+    #
+    # ROLLING twelve calendar months ending with the current (partial) one —
+    # not Jan-Dec. A self-hosted app gets opened in August, and a fixed
+    # calendar year would hand a five-month-old install an empty story for
+    # seven of its twelve slots. The period label states the real range so
+    # nothing is implied that the data does not cover.
+    #
+    # TIMEZONE: unlike the range filters (which compare local `played_at`
+    # against SQLite's UTC `datetime('now')` and are skewed by the server's
+    # offset — see STATS_PAGE_PLAN.md), this window is computed from the
+    # LOCAL clock and compared with `date(played_at)`. That matches the local
+    # wall-clock the column actually stores, so the year is skew-free. Using
+    # date() rather than a raw string compare also means both stored shapes
+    # parse — the web player writes an ISO 'T' separator and plex_client
+    # writes a space, and a lexicographic compare orders those differently at
+    # the boundary.
+
+    _MONTH_LABELS = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                     'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+
+    @staticmethod
+    def _year_month_keys(now, months=12):
+        """The ``months`` calendar-month keys ending with ``now``'s month.
+
+        Returned oldest-first as ('YYYY-MM', 'Mon YYYY') pairs. Generated in
+        Python rather than read off the data so the strip is DENSE — a month
+        you listened to nothing in is a fact about the year, and letting it
+        fall out of a GROUP BY would silently close the gap."""
+        base = now.year * 12 + (now.month - 1)
+        keys = []
+        for offset in range(months - 1, -1, -1):
+            total = base - offset
+            year, month0 = divmod(total, 12)
+            keys.append((f'{year:04d}-{month0 + 1:02d}',
+                         f'{MusicDatabase._MONTH_LABELS[month0]} {year}'))
+        return keys
+
+    _EMPTY_YEAR_TOTALS = {'plays': 0, 'minutes': 0, 'artists': 0,
+                          'albums': 0, 'tracks': 0, 'active_days': 0}
+
+    @staticmethod
+    def _pick_month_leaders(rows):
+        """``{month: winning artist}`` from ``(month, artist, plays)`` rows.
+
+        A fold rather than a ROW_NUMBER() window: window functions need SQLite
+        3.25+, and this would have been the only query in the codebase to
+        require it.
+
+        Split out from the query so the TIE-BREAK is testable. A tie resolves
+        to the lower-cased-alphabetically-first name, and it has to resolve the
+        same way every rebuild — SQLite makes no promise about the order it
+        hands back grouped rows, so a fold that just kept the first one it saw
+        would let the month strip change its mind between two renders of
+        identical data. Given rows in any order, this returns one answer."""
+        leaders = {}
+        for month, artist, plays in rows:
+            if not month:
+                continue
+            best = leaders.get(month)
+            if (best is None
+                    or plays > best[1]
+                    or (plays == best[1]
+                        and str(artist).lower() < str(best[0]).lower())):
+                leaders[month] = (artist, plays)
+        return {month: name for month, (name, _) in leaders.items()}
+
+    def get_year_in_listening(self, now=None, months=12, profile_id=None):
+        """The whole Year in Listening story in one payload.
+
+        ``now`` is injectable so the story is reproducible in tests — every
+        boundary in here derives from it rather than from a scattered
+        datetime.now(), which is also what lets the worker cache it."""
+        from datetime import datetime as _dt
+
+        now = now or _dt.now()
+        month_keys = self._year_month_keys(now, months)
+        start_key = month_keys[0][0]
+        start_date = f'{start_key}-01'
+        # Inclusive end: today. A row dated in the future is a clock artefact,
+        # not listening, and must not inflate the current month.
+        end_date = now.strftime('%Y-%m-%d')
+        period = {
+            'start': start_date,
+            'end': end_date,
+            'label': f'{month_keys[0][1]} — {month_keys[-1][1]}',
+            'months': months,
+        }
+        empty = {
+            'period': period,
+            'has_data': False,
+            'totals': dict(self._EMPTY_YEAR_TOTALS),
+            'months': [{'month': k, 'label': lbl, 'plays': 0, 'minutes': 0,
+                        'top_artist': None} for k, lbl in month_keys],
+            'top_artists': [], 'top_albums': [], 'top_tracks': [],
+            'discoveries': [],
+            'peak_day': {'date': None, 'plays': 0},
+            'top_hour': {'hour': None, 'plays': 0},
+        }
+
+        conn = None
+        try:
+            from core.listening_scope import owner_clause, play_duration_sql
+            scope = owner_clause(self._listening_owner(profile_id))
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            window = f"WHERE date(played_at) >= ? AND date(played_at) <= ? AND {scope}"
+            span = (start_date, end_date)
+
+            cursor.execute(f"""
+                SELECT COUNT(*),
+                       COALESCE(SUM({play_duration_sql()}), 0),
+                       COUNT(DISTINCT LOWER(artist)),
+                       COUNT(DISTINCT LOWER(album)),
+                       COUNT(DISTINCT LOWER(title) || '|||' || LOWER(COALESCE(artist, ''))),
+                       COUNT(DISTINCT date(played_at))
+                FROM listening_history {window}
+            """, span)
+            row = cursor.fetchone() or (0, 0, 0, 0, 0, 0)
+            plays = row[0] or 0
+            if not plays:
+                return empty
+
+            totals = {
+                'plays': plays,
+                # Whole minutes. The page turns this into "that's N days", and
+                # a fractional minute would only ever be noise there.
+                'minutes': int((row[1] or 0) // 60000),
+                'artists': row[2] or 0,
+                'albums': row[3] or 0,
+                'tracks': row[4] or 0,
+                'active_days': row[5] or 0,
+            }
+
+            # Per-month plays + minutes, folded onto the dense strip.
+            cursor.execute(f"""
+                SELECT strftime('%Y-%m', played_at) AS ym,
+                       COUNT(*), COALESCE(SUM({play_duration_sql()}), 0)
+                FROM listening_history {window}
+                GROUP BY ym
+            """, span)
+            by_month = {r[0]: (r[1], r[2]) for r in cursor.fetchall() if r[0]}
+
+            # The #1 artist of each month — the month strip's actual story.
+            # Folded in Python rather than ranked with ROW_NUMBER(): window
+            # functions need SQLite 3.25+, and this is the only query in the
+            # codebase that would have required it. Twelve months of grouped
+            # rows is nothing to walk, and a tie breaks on the lower-cased
+            # name so the same month never renders two different leaders.
+            cursor.execute(f"""
+                SELECT strftime('%Y-%m', played_at) AS ym, artist, COUNT(*) AS plays
+                FROM listening_history {window}
+                  AND artist IS NOT NULL AND artist != ''
+                GROUP BY ym, LOWER(artist)
+            """, span)
+            month_leader = self._pick_month_leaders(cursor.fetchall())
+
+            month_rows = []
+            for key, label in month_keys:
+                plays_m, ms_m = by_month.get(key, (0, 0))
+                month_rows.append({
+                    'month': key,
+                    'label': label,
+                    'plays': plays_m,
+                    'minutes': int((ms_m or 0) // 60000),
+                    'top_artist': month_leader.get(key),
+                })
+
+            def _top(sql, mapper, limit=5):
+                cursor.execute(sql, (*span, limit))
+                return [mapper(r) for r in cursor.fetchall()]
+
+            top_artists = _top(f"""
+                SELECT artist, COUNT(*) AS plays
+                FROM listening_history {window}
+                  AND artist IS NOT NULL AND artist != ''
+                GROUP BY LOWER(artist)
+                ORDER BY plays DESC LIMIT ?
+            """, lambda r: {'name': r[0], 'plays': r[1]})
+
+            # How many of the twelve months each finalist actually led. This is
+            # the fact that separates "played a lot once" from "your year".
+            crowns = {}
+            for leader in month_leader.values():
+                crowns[str(leader).lower()] = crowns.get(str(leader).lower(), 0) + 1
+            for entry in top_artists:
+                entry['months_on_top'] = crowns.get(str(entry['name']).lower(), 0)
+
+            top_albums = _top(f"""
+                SELECT album, artist, COUNT(*) AS plays
+                FROM listening_history {window}
+                  AND album IS NOT NULL AND album != ''
+                GROUP BY LOWER(album), LOWER(artist)
+                ORDER BY plays DESC LIMIT ?
+            """, lambda r: {'name': r[0], 'artist': r[1], 'plays': r[2]})
+
+            top_tracks = _top(f"""
+                SELECT title, artist, album, COUNT(*) AS plays,
+                       MIN(played_at), MAX(played_at)
+                FROM listening_history {window}
+                  AND title IS NOT NULL AND title != ''
+                GROUP BY LOWER(title), LOWER(artist)
+                ORDER BY plays DESC LIMIT ?
+            """, lambda r: {'name': r[0], 'artist': r[1], 'album': r[2],
+                            'plays': r[3], 'first_played': r[4], 'last_played': r[5]})
+
+            # Discoveries: artists whose FIRST EVER play falls inside the
+            # window. The comparison is against ALL of history, not against the
+            # window — an artist you first played in 2019 and came back to this
+            # year is a rediscovery, not a discovery, and calling it one would
+            # be the single most obviously wrong number on the page.
+            cursor.execute(f"""
+                SELECT artist, first_play, plays FROM (
+                    SELECT artist,
+                           MIN(date(played_at)) AS first_play,
+                           COUNT(*) AS plays
+                    FROM listening_history
+                    WHERE artist IS NOT NULL AND artist != '' AND {scope}
+                    GROUP BY LOWER(artist)
+                )
+                WHERE first_play >= ? AND first_play <= ?
+                ORDER BY plays DESC
+                LIMIT 12
+            """, span)
+            discoveries = [{'name': r[0], 'first_played': r[1], 'plays': r[2]}
+                           for r in cursor.fetchall()]
+
+            cursor.execute(f"""
+                SELECT date(played_at) AS d, COUNT(*) AS plays
+                FROM listening_history {window}
+                GROUP BY d ORDER BY plays DESC, d DESC LIMIT 1
+            """, span)
+            peak = cursor.fetchone()
+
+            cursor.execute(f"""
+                SELECT CAST(strftime('%H', played_at, 'localtime') AS INTEGER) AS h, COUNT(*) AS plays
+                FROM listening_history {window}
+                GROUP BY h HAVING h IS NOT NULL
+                ORDER BY plays DESC, h ASC LIMIT 1
+            """, span)
+            hour = cursor.fetchone()
+
+            return {
+                'period': period,
+                'has_data': True,
+                'totals': totals,
+                'months': month_rows,
+                'top_artists': top_artists,
+                'top_albums': top_albums,
+                'top_tracks': top_tracks,
+                'discoveries': discoveries,
+                'peak_day': {'date': peak[0], 'plays': peak[1]} if peak and peak[0]
+                            else {'date': None, 'plays': 0},
+                'top_hour': {'hour': hour[0], 'plays': hour[1]} if hour
+                            else {'hour': None, 'plays': 0},
+            }
+        except Exception as e:
+            logger.error(f"Error building year in listening: {e}")
+            return empty
         finally:
             if conn:
                 conn.close()
@@ -5428,24 +8587,63 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
+    def _listening_owner(self, profile_id=None):
+        """the pile a profile reads, see core/listening_scope.py."""
+        from core.listening_scope import listening_owner
+        return listening_owner(self, profile_id)
+
     @staticmethod
-    def _listening_time_filter(time_range, alias=''):
-        """Build a WHERE clause for time-range filtering."""
+    def _listening_time_filter(time_range, alias='', owner=None):
+        """Build a WHERE clause for time-range filtering.
+
+        always scoped to one pile. no owner means the shared one, so a caller
+        that forgets can never read a profile's private plays."""
+        from core.listening_scope import owner_clause
         prefix = f"{alias}." if alias else ""
+        scope = owner_clause(owner, alias)
         if time_range == '7d':
-            return f"WHERE {prefix}played_at >= datetime('now', '-7 days')"
+            return f"WHERE {prefix}played_at >= datetime('now', '-7 days') AND {scope}"
         elif time_range == '30d':
-            return f"WHERE {prefix}played_at >= datetime('now', '-30 days')"
+            return f"WHERE {prefix}played_at >= datetime('now', '-30 days') AND {scope}"
         elif time_range == '12m':
-            return f"WHERE {prefix}played_at >= datetime('now', '-12 months')"
+            return f"WHERE {prefix}played_at >= datetime('now', '-12 months') AND {scope}"
         else:
-            return "WHERE 1=1"
+            return f"WHERE {scope}"
+
+    # The window of the SAME length immediately before the current one, so a
+    # stat can say "vs last month" instead of standing alone. A total with no
+    # reference point is trivia; the comparison is what makes it a signal.
+    #
+    # 'all' has no previous window by definition — the caller must not render a
+    # delta for it rather than us inventing a zero to compare against.
+    _PREVIOUS_WINDOW = {
+        '7d': ('-14 days', '-7 days'),
+        '30d': ('-60 days', '-30 days'),
+        '12m': ('-24 months', '-12 months'),
+    }
+
+    @staticmethod
+    def _listening_previous_filter(time_range, alias='', owner=None):
+        """WHERE clause for the period immediately BEFORE ``time_range``.
+
+        Returns None for 'all' (and anything unrecognised) — there is no
+        "before everything", and a caller that gets None must omit the
+        comparison rather than compare against nothing."""
+        from core.listening_scope import owner_clause
+        window = MusicDatabase._PREVIOUS_WINDOW.get(time_range)
+        if not window:
+            return None
+        start, end = window
+        prefix = f"{alias}." if alias else ""
+        return (f"WHERE {prefix}played_at >= datetime('now', '{start}') "
+                f"AND {prefix}played_at < datetime('now', '{end}') "
+                f"AND {owner_clause(owner, alias)}")
 
     def set_profile_spotify(self, profile_id: int, client_id: str, client_secret: str,
                             redirect_uri: str = '') -> bool:
         """Save Spotify API credentials for a profile (encrypted)."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             enc_id = config_manager._encrypt_value(client_id) if client_id else None
             enc_secret = config_manager._encrypt_value(client_secret) if client_secret else None
             with self._get_connection() as conn:
@@ -5465,7 +8663,7 @@ class MusicDatabase:
     def get_profile_spotify(self, profile_id: int) -> Dict[str, Any]:
         """Get decrypted Spotify credentials for a profile."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
@@ -5490,7 +8688,7 @@ class MusicDatabase:
     def set_profile_spotify_tokens(self, profile_id: int, access_token: str, refresh_token: str) -> bool:
         """Save Spotify OAuth tokens for a profile (from auth callback)."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             enc_access = config_manager._encrypt_value(access_token) if access_token else None
             enc_refresh = config_manager._encrypt_value(refresh_token) if refresh_token else None
             with self._get_connection() as conn:
@@ -5512,7 +8710,7 @@ class MusicDatabase:
         per-profile Tidal client's token refresh — keeps a profile's refresh from
         ever touching the global tidal_tokens slot."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             enc_access = config_manager._encrypt_value(access_token) if access_token else None
             enc_refresh = config_manager._encrypt_value(refresh_token) if refresh_token else None
             with self._get_connection() as conn:
@@ -5532,7 +8730,7 @@ class MusicDatabase:
     def get_profile_tidal(self, profile_id: int) -> Dict[str, Any]:
         """Get decrypted Tidal tokens for a profile ({} if none)."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -5576,7 +8774,8 @@ class MusicDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT plex_library_id, jellyfin_user_id, jellyfin_library_id, navidrome_library_id
+                    SELECT plex_library_id, jellyfin_user_id, jellyfin_library_id, navidrome_library_id,
+                           navidrome_username, plex_home_user_id, plex_home_user_title
                     FROM profiles WHERE id = ?
                 """, (profile_id,))
                 row = cursor.fetchone()
@@ -5587,6 +8786,11 @@ class MusicDatabase:
                     'jellyfin_user_id': row[1],
                     'jellyfin_library_id': row[2],
                     'navidrome_library_id': row[3],
+                    # the username only; the password never leaves the db
+                    'navidrome_username': row[4],
+                    # who the profile is on plex; the token never leaves the db
+                    'plex_home_user_id': row[5],
+                    'plex_home_user_title': row[6],
                 }
         except Exception as e:
             logger.error(f"Error getting server library for profile {profile_id}: {e}")
@@ -5726,7 +8930,12 @@ class MusicDatabase:
         try:
             cursor.execute("SELECT value FROM metadata WHERE key = 'repair_worker_v2' LIMIT 1")
             if cursor.fetchone():
-                return  # Already migrated
+                # Tables exist — but LATER columns/indexes still have to reach
+                # this database. The marker only guards the CREATE below; the
+                # migrations run on every boot (they self-check) so a DB made
+                # before this release is not stranded on the old shape.
+                self._migrate_repair_worker_columns(cursor)
+                return
 
             logger.info("Creating repair worker v2 tables...")
 
@@ -5774,10 +8983,55 @@ class MusicDatabase:
 
             cursor.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('repair_worker_v2', '1')")
 
+            # Fresh DBs take the same migration path, so the column set is
+            # defined in exactly one place.
+            self._migrate_repair_worker_columns(cursor)
+
             logger.info("Repair worker v2 tables created successfully")
 
         except Exception as e:
             logger.error(f"Error creating repair worker v2 tables: {e}")
+
+    def _migrate_repair_worker_columns(self, cursor):
+        """Columns + indexes added to the repair tables after v2 shipped.
+
+        Idempotent and cheap (PRAGMA + CREATE INDEX IF NOT EXISTS), and it runs
+        on EVERY boot rather than behind the repair_worker_v2 marker — that
+        marker is set once, so anything gated by it never reaches an existing
+        install.
+        """
+        try:
+            cursor.execute("PRAGMA table_info(repair_findings)")
+            finding_cols = {c[1] for c in cursor.fetchall()}
+            if 'last_error' not in finding_cols:
+                # Why a fix failed, kept ON the finding. Bulk runs used to hold
+                # errors only in memory (capped at 20), so a finding that
+                # refused to fix just sat there pending with no reason anywhere.
+                cursor.execute("ALTER TABLE repair_findings ADD COLUMN last_error TEXT")
+                logger.info("Added last_error column to repair_findings")
+
+            cursor.execute("PRAGMA table_info(repair_job_runs)")
+            run_cols = {c[1] for c in cursor.fetchall()}
+            if 'error_text' not in run_cols:
+                # Why a RUN failed. Runs were hardcoded 'completed', so the
+                # history tab could not distinguish a clean scan from a crash.
+                cursor.execute("ALTER TABLE repair_job_runs ADD COLUMN error_text TEXT")
+                logger.info("Added error_text column to repair_job_runs")
+
+            # The dedup lookup filters on (entity_type, entity_id) and on
+            # file_path once per candidate item of every scan; both were full
+            # scans of an unbounded, never-GC'd table.
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rf_entity "
+                "ON repair_findings (entity_type, entity_id)")
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rf_path ON repair_findings (file_path)")
+            # The findings inbox groups by type and filters by status.
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rf_type_status "
+                "ON repair_findings (finding_type, status)")
+        except Exception as e:
+            logger.error(f"Error migrating repair worker columns: {e}")
 
     def _init_manual_library_match_table(self):
         """Create manual_library_track_matches table and indexes."""
@@ -5863,14 +9117,15 @@ class MusicDatabase:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM tracks WHERE file_path = ? LIMIT 1", (file_path,))
+            scope_sql, scope_params = self._current_scope_sql()
+            cursor.execute(f"SELECT id FROM tracks WHERE file_path = ? AND {scope_sql} LIMIT 1", (file_path, *scope_params))
             row = cursor.fetchone()
             if row:
                 return str(row[0])
             import os as _os
             fname = _os.path.basename(str(file_path).replace('\\', '/'))
             if fname:
-                cursor.execute("SELECT id FROM tracks WHERE file_path LIKE ? LIMIT 1", (f"%{fname}",))
+                cursor.execute(f"SELECT id FROM tracks WHERE file_path LIKE ? AND {scope_sql} LIMIT 1", (f"%{fname}", *scope_params))
                 row = cursor.fetchone()
                 if row:
                     return str(row[0])
@@ -5894,6 +9149,52 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"get_manual_library_match error: {e}")
             return None
+
+    def get_manual_library_match_by_id(self, match_id: int,
+                                           profile_id: int) -> Optional[Dict[str, Any]]:
+        """Return a manual match row by PK id, scoped to profile_id.
+
+        #1289: the delete path needs the row's source_track_id BEFORE
+        deleting so mirrored in-library flags can be reset. The capped
+        list_manual_library_matches() cannot serve this — a match older than
+        the 100 most-recently-updated would silently skip the flag reset.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM manual_library_track_matches
+                    WHERE id = ? AND profile_id = ?
+                """, (match_id, profile_id))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"get_manual_library_match_by_id error: {e}")
+            return None
+
+    def find_all_manual_library_matches_by_source_track_id(
+        self, profile_id: int, source_track_id: str
+    ) -> list:
+        """Return ALL manual matches for a source track ID, any server_source.
+
+        #1289: the delete path's surviving-match guard must be
+        server-agnostic AND consider every survivor. The server-filtered
+        finder's SQL (`AND (server_source = ? OR server_source = '')`)
+        cannot see a survivor under a different server_source, and a
+        LIMIT 1 would let one dead survivor mask a live one — either
+        wrongly clears the mirrored in-library flag.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM manual_library_track_matches
+                    WHERE profile_id = ? AND source_track_id = ?
+                """, (profile_id, source_track_id))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"find_all_manual_library_matches_by_source_track_id error: {e}")
+            return []
 
     def find_manual_library_match_by_source_track_id(self, profile_id: int,
                                                      source_track_id: str,
@@ -5954,13 +9255,20 @@ class MusicDatabase:
             return None
 
     def delete_manual_library_match(self, match_id: int, profile_id: int) -> bool:
-        """Delete match by PK id, scoped to profile_id."""
+        """Delete match by PK id, scoped to profile_id.
+
+        Returns whether a row was ACTUALLY removed (#1138). This used to return
+        True whenever the statement didn't raise, so a delete that matched
+        nothing — wrong id, or a match saved under a different profile — was
+        reported to the UI as a success. The row then reappeared on the next
+        load with no explanation, which is what "I tried to remove it but I
+        couldn't" looks like from the outside."""
         try:
             with self._get_connection() as conn:
-                conn.execute("""
+                cursor = conn.execute("""
                     DELETE FROM manual_library_track_matches WHERE id = ? AND profile_id = ?
                 """, (match_id, profile_id))
-                return True
+                return bool(cursor.rowcount)
         except Exception as e:
             logger.error(f"delete_manual_library_match error: {e}")
             return False
@@ -5990,7 +9298,7 @@ class MusicDatabase:
                 cursor = conn.cursor()
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='profiles'")
                 if not cursor.fetchone():
-                    return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False, 'plex_account_id': None}]
+                    return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False}]
                 cursor.execute("SELECT * FROM profiles ORDER BY id")
                 rows = cursor.fetchall()
                 columns = [desc[0] for desc in cursor.description]
@@ -6013,15 +9321,16 @@ class MusicDatabase:
                         'can_download': bool(row['can_download']) if 'can_download' in columns else True,
                         'has_listenbrainz': row['listenbrainz_token'] is not None if 'listenbrainz_token' in columns else False,
                         'listenbrainz_username': row['listenbrainz_username'] if 'listenbrainz_username' in columns else None,
-                        'plex_account_id': row['plex_account_id'] if 'plex_account_id' in columns else None,
-                        'plex_username': row['plex_username'] if 'plex_username' in columns else None,
+                        'library_mode': (row['library_mode'] if 'library_mode' in columns else None) or 'shared',
+                        'library_root': row['library_root'] if 'library_root' in columns else None,
                         'created_at': row['created_at'],
                         'updated_at': row['updated_at'],
+                        **self._profile_controls(row, columns),
                     })
                 return results
         except Exception as e:
             logger.error(f"Error getting profiles: {e}")
-            return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False, 'plex_account_id': None}]
+            return [{'id': 1, 'name': 'Admin', 'avatar_color': '#6366f1', 'avatar_url': None, 'is_admin': True, 'has_pin': False}]
 
     def get_profile(self, profile_id: int) -> Optional[Dict[str, Any]]:
         """Get a single profile by ID"""
@@ -6049,10 +9358,11 @@ class MusicDatabase:
                         'can_download': bool(row['can_download']) if 'can_download' in columns else True,
                         'has_listenbrainz': row['listenbrainz_token'] is not None if 'listenbrainz_token' in columns else False,
                         'listenbrainz_username': row['listenbrainz_username'] if 'listenbrainz_username' in columns else None,
-                        'plex_account_id': row['plex_account_id'] if 'plex_account_id' in columns else None,
-                        'plex_username': row['plex_username'] if 'plex_username' in columns else None,
+                        'library_mode': (row['library_mode'] if 'library_mode' in columns else None) or 'shared',
+                        'library_root': row['library_root'] if 'library_root' in columns else None,
                         'created_at': row['created_at'],
                         'updated_at': row['updated_at'],
+                        **self._profile_controls(row, columns),
                     }
                 return None
         except Exception as e:
@@ -6062,27 +9372,9 @@ class MusicDatabase:
     def create_profile(self, name: str, avatar_color: str = '#6366f1',
                        pin_hash: Optional[str] = None, is_admin: bool = False,
                        avatar_url: Optional[str] = None, home_page: Optional[str] = None,
-                       allowed_pages: Optional[list] = None, can_download: Optional[bool] = None,
-                       allowed_sides: Optional[str] = None,
-                       plex_account_id: Optional[int] = None, plex_username: Optional[str] = None,
-                       plex_thumb: Optional[str] = None) -> Optional[int]:
-        """Create a new profile. Returns new profile ID or None on error.
-        plex_account_id/plex_username/plex_thumb link this profile to a Plex
-        account (bulk import or Sign in with Plex auto-provisioning) — the
-        caller is responsible for checking get_profile_by_plex_id() first to
-        avoid a duplicate link (no DB-level uniqueness on plex_account_id).
-
-        ``can_download`` unset means "match the role": ON for an admin, OFF for
-        everyone else. It used to default ON for every profile, so a standard
-        user the admin created could start downloads and cancel the admin's —
-        the permission had to be noticed and turned off to be safe. Granting is
-        a deliberate act now; the switch is still per-profile in Manage
-        Profiles. An explicit True/False is always honoured, so Plex
-        provisioning (which passes False) and any caller that means it are
-        unaffected. EXISTING profiles are untouched — this only decides what a
-        NEW one starts with."""
-        if can_download is None:
-            can_download = bool(is_admin)
+                       allowed_pages: Optional[list] = None, can_download: bool = True,
+                       allowed_sides: Optional[str] = None) -> Optional[int]:
+        """Create a new profile. Returns new profile ID or None on error."""
         if allowed_sides not in ('music', 'video', 'both'):
             allowed_sides = None   # NULL = the shipped default (music for non-admin)
         try:
@@ -6090,9 +9382,9 @@ class MusicDatabase:
                 cursor = conn.cursor()
                 ap_json = json.dumps(allowed_pages) if allowed_pages is not None else None
                 cursor.execute("""
-                    INSERT INTO profiles (name, avatar_color, pin_hash, is_admin, avatar_url, home_page, allowed_pages, can_download, allowed_sides, plex_account_id, plex_username, plex_thumb)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (name, avatar_color, pin_hash, int(is_admin), avatar_url, home_page, ap_json, int(can_download), allowed_sides, plex_account_id, plex_username, plex_thumb))
+                    INSERT INTO profiles (name, avatar_color, pin_hash, is_admin, avatar_url, home_page, allowed_pages, can_download, allowed_sides)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, avatar_color, pin_hash, int(is_admin), avatar_url, home_page, ap_json, int(can_download), allowed_sides))
                 conn.commit()
                 return cursor.lastrowid
         except sqlite3.IntegrityError:
@@ -6103,9 +9395,9 @@ class MusicDatabase:
             return None
 
     def update_profile(self, profile_id: int, **kwargs) -> bool:
-        """Update profile fields. Accepts: name, avatar_color, avatar_url, pin_hash, is_admin, home_page, allowed_pages, can_download, allowed_sides, plex_account_id, plex_username, plex_thumb."""
+        """Update profile fields. Accepts: name, avatar_color, avatar_url, pin_hash, is_admin, home_page, allowed_pages, can_download."""
         allowed = {'name', 'avatar_color', 'avatar_url', 'pin_hash', 'is_admin', 'home_page', 'allowed_pages', 'can_download', 'allowed_sides',
-                  'plex_account_id', 'plex_username', 'plex_thumb'}
+                   'request_limit', 'request_limit_days', 'hide_explicit', 'max_rating', 'disabled'}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         # Serialize allowed_pages list to JSON string for storage
         if 'allowed_pages' in updates:
@@ -6136,6 +9428,194 @@ class MusicDatabase:
             logger.error(f"Error updating profile {profile_id}: {e}")
             return False
 
+    def bump_profile_session_epoch(self, profile_id: int) -> Optional[int]:
+        """sign this profile out everywhere: every session carries the epoch it
+        was signed in under, and one that no longer matches has no profile."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._add_profile_controls(cursor)
+                cursor.execute("UPDATE profiles SET session_epoch = COALESCE(session_epoch, 0) + 1 WHERE id = ?",
+                               (int(profile_id),))
+                conn.commit()
+                cursor.execute("SELECT session_epoch FROM profiles WHERE id = ?", (int(profile_id),))
+                row = cursor.fetchone()
+                return int(row[0]) if row else None
+        except Exception as e:
+            logger.error(f"Error bumping session epoch for {profile_id}: {e}")
+            return None
+
+    # ── signed-in devices ────────────────────────────────────────────────
+    def add_profile_device(self, device_id: str, owner_id: int, label: str, ip: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._add_profile_controls(cursor)
+                cursor.execute("INSERT OR REPLACE INTO profile_devices (id, owner_id, label, ip) VALUES (?, ?, ?, ?)",
+                               (device_id, int(owner_id), (label or '')[:200], (ip or '')[:64]))
+                # a browser that signs in again as someone else leaves no ghosts:
+                # keep the newest 50 per profile
+                cursor.execute("DELETE FROM profile_devices WHERE owner_id = ? AND id NOT IN "
+                               "(SELECT id FROM profile_devices WHERE owner_id = ? ORDER BY last_seen DESC LIMIT 50)",
+                               (int(owner_id), int(owner_id)))
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.debug("add_profile_device failed: %s", e)
+            return False
+
+    def get_profile_device(self, device_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM profile_devices WHERE id = ?", (device_id,))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.debug("get_profile_device failed: %s", e)
+            return None
+
+    def touch_profile_device(self, device_id: str) -> None:
+        try:
+            with self._get_connection() as conn:
+                conn.execute("UPDATE profile_devices SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (device_id,))
+                conn.commit()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("touch_profile_device failed: %s", e)
+
+    def list_profile_devices(self, owner_id: int) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._add_profile_controls(cursor)
+                cursor.execute("SELECT id, label, ip, created_at, last_seen FROM profile_devices "
+                               "WHERE owner_id = ? AND revoked_at IS NULL ORDER BY last_seen DESC", (int(owner_id),))
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.debug("list_profile_devices failed: %s", e)
+            return []
+
+    def revoke_profile_device(self, owner_id: int, device_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE profile_devices SET revoked_at = CURRENT_TIMESTAMP "
+                               "WHERE id = ? AND owner_id = ? AND revoked_at IS NULL", (device_id, int(owner_id)))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.debug("revoke_profile_device failed: %s", e)
+            return False
+
+    # ── admin audit log ──────────────────────────────────────────────────
+    _AUDIT_KEEP = 5000
+
+    def add_profile_audit(self, *, actor_id, actor_name, action: str, target_id=None,
+                          target_name=None, detail: Optional[str] = None) -> None:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO profile_audit (actor_id, actor_name, action, target_id, target_name, detail) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (actor_id, actor_name, action, target_id, target_name, (detail or None) and str(detail)[:500]))
+                cursor.execute("DELETE FROM profile_audit WHERE id <= (SELECT MAX(id) - ? FROM profile_audit)",
+                               (self._AUDIT_KEEP,))
+                conn.commit()
+        except Exception as e:  # noqa: BLE001 - the log never fails the action it records
+            logger.debug("profile audit write failed: %s", e)
+
+    def list_profile_audit(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM profile_audit ORDER BY id DESC LIMIT ? OFFSET ?",
+                               (max(1, min(500, int(limit))), max(0, int(offset))))
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.debug("profile audit read failed: %s", e)
+            return []
+
+    # ── invite links ─────────────────────────────────────────────────────
+    def create_profile_invite(self, *, token_hash: str, created_by: int, preset: Dict[str, Any],
+                              note: Optional[str], expires_at: str) -> Optional[int]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "INSERT INTO profile_invites (token_hash, created_by, preset, note, expires_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (token_hash, int(created_by), json.dumps(preset or {}), note, expires_at))
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Error creating invite: {e}")
+            return None
+
+    def get_profile_invite_by_hash(self, token_hash: str) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT * FROM profile_invites WHERE token_hash = ?", (token_hash,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                d = dict(row)
+                try:
+                    d['preset'] = json.loads(d.get('preset') or '{}')
+                except (ValueError, TypeError):
+                    d['preset'] = {}
+                return d
+        except Exception as e:
+            logger.error(f"Error reading invite: {e}")
+            return None
+
+    def list_profile_invites(self) -> List[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id, created_by, preset, note, expires_at, used_at, used_by, revoked_at, "
+                               "created_at FROM profile_invites ORDER BY id DESC LIMIT 100")
+                out = []
+                for r in cursor.fetchall():
+                    d = dict(r)
+                    try:
+                        d['preset'] = json.loads(d.get('preset') or '{}')
+                    except (ValueError, TypeError):
+                        d['preset'] = {}
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error(f"Error listing invites: {e}")
+            return []
+
+    def claim_profile_invite(self, invite_id: int, used_by: int) -> bool:
+        """one use: only an unused, unrevoked, unexpired invite flips."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE profile_invites SET used_at = CURRENT_TIMESTAMP, used_by = ? "
+                    "WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > CURRENT_TIMESTAMP",
+                    (int(used_by), int(invite_id)))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error claiming invite: {e}")
+            return False
+
+    def revoke_profile_invite(self, invite_id: int) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("UPDATE profile_invites SET revoked_at = CURRENT_TIMESTAMP "
+                               "WHERE id = ? AND used_at IS NULL AND revoked_at IS NULL", (int(invite_id),))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error revoking invite: {e}")
+            return False
+
     def delete_profile(self, profile_id: int) -> bool:
         """Delete a profile and ALL its per-profile data.
 
@@ -6151,6 +9631,16 @@ class MusicDatabase:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                # open issues are problems with the library, not with the
+                # person: they stay in the admin's queue (closed ones go)
+                try:
+                    row = cursor.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+                    kept = self.issue_threads.hand_open_issues_to_admin(
+                        conn, profile_id, row['name'] if row else '')
+                    if kept:
+                        logger.info("delete_profile: kept %d open issue(s) for the admin", kept)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("keeping open issues on profile delete failed: %s", e)
                 tables = [r[0] for r in cursor.execute(
                     "SELECT name FROM sqlite_master WHERE type='table' "
                     "AND name NOT LIKE 'sqlite_%'").fetchall()]
@@ -6169,6 +9659,19 @@ class MusicDatabase:
                                             cursor.rowcount, table)
                     except Exception as e:
                         logger.debug("Failed to delete from %s for profile: %s", table, e)
+                # its signed-in devices (owner_id, so the sweep above skips them)
+                try:
+                    cursor.execute("DELETE FROM profile_devices WHERE owner_id = ?", (profile_id,))
+                except Exception as e:  # noqa: BLE001 - table may predate this install
+                    logger.debug("device cleanup on delete: %s", e)
+                # its own library's rows go with it (#1199)
+                self._delete_own_library_rows(cursor, profile_id)
+                # and its listening pile's caches (#1293). the rows went with
+                # the profile_id sweep, these are metadata keys, and a reused
+                # id must never open on the last person's stats
+                from core.listening_scope import pile_keys
+                for key in pile_keys(profile_id):
+                    cursor.execute("DELETE FROM metadata WHERE key = ?", (key,))
                 cursor.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
                 conn.commit()
                 return cursor.rowcount > 0
@@ -6251,23 +9754,6 @@ class MusicDatabase:
                 return {'id': row['id'], 'name': row['name'], 'is_admin': bool(row['is_admin'])}
         except Exception as e:
             logger.error(f"Error looking up profile by name '{name}': {e}")
-            return None
-
-    def get_profile_by_plex_id(self, plex_account_id: int) -> Optional[Dict[str, Any]]:
-        """Look up a profile by its linked Plex account id (bulk import /
-        Sign in with Plex). None if no profile is linked to that account yet."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT id, name, is_admin FROM profiles WHERE plex_account_id = ?",
-                    (plex_account_id,))
-                row = cursor.fetchone()
-                if not row:
-                    return None
-                return {'id': row['id'], 'name': row['name'], 'is_admin': bool(row['is_admin'])}
-        except Exception as e:
-            logger.error(f"Error looking up profile by plex_account_id '{plex_account_id}': {e}")
             return None
 
     def _add_profile_password_support(self, cursor):
@@ -6374,31 +9860,6 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error in recovery-question migration: {e}")
 
-    def _add_profile_plex_link(self, cursor):
-        """Add Plex-account-linkage columns (bulk import + Sign in with Plex).
-        No DB-level UNIQUE on plex_account_id — SQLite's ALTER TABLE ADD COLUMN
-        doesn't support inline constraints; uniqueness is enforced in code via
-        get_profile_by_plex_id() before insert."""
-        try:
-            cursor.execute("SELECT value FROM metadata WHERE key = 'profiles_plex_link_v1' LIMIT 1")
-            if cursor.fetchone():
-                return  # Already migrated
-            logger.info("Applying profile Plex-link migration...")
-            for col_sql in (
-                "ALTER TABLE profiles ADD COLUMN plex_account_id INTEGER DEFAULT NULL",
-                "ALTER TABLE profiles ADD COLUMN plex_username TEXT DEFAULT NULL",
-                "ALTER TABLE profiles ADD COLUMN plex_thumb TEXT DEFAULT NULL",
-            ):
-                try:
-                    cursor.execute(col_sql)
-                except sqlite3.OperationalError:
-                    pass  # Column already exists
-            cursor.execute(
-                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('profiles_plex_link_v1', '1')")
-            logger.info("Profile Plex-link migration completed")
-        except Exception as e:
-            logger.error(f"Error in profile Plex-link migration: {e}")
-
     def close(self):
         """Close database connection (no-op since we create connections per operation)"""
         # Each operation creates and closes its own connection, so nothing to do here
@@ -6428,7 +9889,9 @@ class MusicDatabase:
             logger.error(f"Error getting database statistics: {e}")
             return {'artists': 0, 'albums': 0, 'tracks': 0}
     
-    def get_statistics_for_server(self, server_source: str = None) -> Dict[str, int]:
+    _ANY_OWNER = object()   # "do not filter by library owner"
+
+    def get_statistics_for_server(self, server_source: str = None, owner_profile_id=_ANY_OWNER) -> Dict[str, int]:
         """Get database statistics filtered by server source"""
         try:
             with self._get_connection() as conn:
@@ -6436,23 +9899,25 @@ class MusicDatabase:
                 
                 if server_source:
                     # Get counts for specific server (deduplicate by name like general count)
-                    cursor.execute("SELECT COUNT(DISTINCT name) FROM artists WHERE server_source = ?", (server_source,))
+                    owner_sql, owner_params = ("", []) if owner_profile_id is self._ANY_OWNER else (" AND owner_profile_id IS ?", [owner_profile_id])
+                    cursor.execute(f"SELECT COUNT(DISTINCT name) FROM artists WHERE server_source = ?{owner_sql}", [server_source] + owner_params)
                     artist_count = cursor.fetchone()[0]
                     
-                    cursor.execute("SELECT COUNT(*) FROM albums WHERE server_source = ?", (server_source,))
+                    cursor.execute(f"SELECT COUNT(*) FROM albums WHERE server_source = ?{owner_sql}", [server_source] + owner_params)
                     album_count = cursor.fetchone()[0]
                     
-                    cursor.execute("SELECT COUNT(*) FROM tracks WHERE server_source = ?", (server_source,))
+                    cursor.execute(f"SELECT COUNT(*) FROM tracks WHERE server_source = ?{owner_sql}", [server_source] + owner_params)
                     track_count = cursor.fetchone()[0]
                 else:
-                    # Get total counts (all servers)
-                    cursor.execute("SELECT COUNT(*) FROM artists")
+                    # Get total counts (all servers), for the caller's library
+                    scope_sql, scope_params = self._current_scope_sql('owner_profile_id')
+                    cursor.execute(f"SELECT COUNT(*) FROM artists WHERE {scope_sql}", scope_params)
                     artist_count = cursor.fetchone()[0]
-                    
-                    cursor.execute("SELECT COUNT(*) FROM albums")
+
+                    cursor.execute(f"SELECT COUNT(*) FROM albums WHERE {scope_sql}", scope_params)
                     album_count = cursor.fetchone()[0]
-                    
-                    cursor.execute("SELECT COUNT(*) FROM tracks")
+
+                    cursor.execute(f"SELECT COUNT(*) FROM tracks WHERE {scope_sql}", scope_params)
                     track_count = cursor.fetchone()[0]
                 
                 return {
@@ -6500,23 +9965,43 @@ class MusicDatabase:
     def _is_transient_sqlite_io_error(exc: Exception) -> bool:
         return "disk i/o error" in str(exc).lower()
     
-    def clear_server_data(self, server_source: str):
-        """Clear data for specific server only (server-aware full refresh)"""
+    def clear_server_data(self, server_source: str, owner_profile_id=None):
+        """Clear data for specific server only (server-aware full refresh).
+        one library at a time: the shared library's rows (owner None) by
+        default; a profile's own rows when its id is given (#1199)."""
         for attempt in range(2):
             try:
                 with self._get_connection() as conn:
                     cursor = conn.cursor()
 
-                    # Delete only data from the specified server
+                    # Delete only data from the specified server and library owner
                     # Order matters: tracks -> albums -> artists (foreign key constraints)
-                    cursor.execute("DELETE FROM tracks WHERE server_source = ?", (server_source,))
+                    cursor.execute("DELETE FROM tracks WHERE server_source = ? AND owner_profile_id IS ?",
+                                   (server_source, owner_profile_id))
                     tracks_deleted = cursor.rowcount
 
-                    cursor.execute("DELETE FROM albums WHERE server_source = ?", (server_source,))
+                    cursor.execute("DELETE FROM albums WHERE server_source = ? AND owner_profile_id IS ?",
+                                   (server_source, owner_profile_id))
                     albums_deleted = cursor.rowcount
 
-                    cursor.execute("DELETE FROM artists WHERE server_source = ?", (server_source,))
+                    cursor.execute("DELETE FROM artists WHERE server_source = ? AND owner_profile_id IS ?",
+                                   (server_source, owner_profile_id))
                     artists_deleted = cursor.rowcount
+
+                    # Stamp the rebuild. Wiping the library destroys every local
+                    # signal about a track — play_count above all — while
+                    # library_history keeps each download's original created_at,
+                    # so afterwards a much-loved track reads to the Expired
+                    # Download Cleaner as "old and never played". Recording WHEN
+                    # the library was rebuilt lets that job treat everything
+                    # downloaded before it as out of scope, permanently. Written
+                    # in the same transaction as the delete so a crash can never
+                    # leave the wipe applied without the stamp.
+                    cursor.execute(
+                        "INSERT OR REPLACE INTO metadata (key, value, updated_at) "
+                        "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                        ('library_rebuilt_at', datetime.now().isoformat()),
+                    )
 
                     conn.commit()
 
@@ -6545,52 +10030,103 @@ class MusicDatabase:
                 logger.error(f"Error clearing {server_source} database data: {e}")
                 raise
     
-    def cleanup_orphaned_records(self) -> Dict[str, int]:
-        """Remove artists and albums that have no associated tracks"""
+    def cleanup_orphaned_records(self, protected_artist_ids=None,
+                                 protected_album_ids=None) -> Dict[str, int]:
+        """Remove artists and albums that have no associated tracks.
+
+        Rows the CURRENT scan run wrote are protected (#1216). A run inserts the
+        album row first and its tracks after, so between those two steps a real
+        album legitimately has zero tracks. If the server's track list for that
+        album comes back short on that one call - no exception, no timeout, just
+        an incomplete answer - this cleanup deletes the album the same run just
+        created. That is not a recoverable loss: with the row gone the server
+        stops reporting the album as recently added, so no later incremental
+        scan rediscovers it either. The album is simply gone until a deep scan.
+
+        Only rows left trackless by an EARLIER run are genuinely orphaned, so
+        the caller passes the ids it touched and they are held back.
+        """
+        def _norm(ids):
+            return {str(i) for i in ids} if ids else set()
+
+        protected_artists = _norm(protected_artist_ids)
+        protected_albums = _norm(protected_album_ids)
+
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                
-                # Find orphaned artists (no tracks)
+
+                # Select the ids rather than counting, so the protected ones can
+                # be held back and the reported counts stay honest.
                 cursor.execute("""
-                    SELECT COUNT(*) FROM artists 
+                    SELECT id FROM artists
                     WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)
                 """)
-                orphaned_artists_count = cursor.fetchone()[0]
-                
-                # Find orphaned albums (no tracks)
+                artist_ids = [str(row[0]) for row in cursor.fetchall()]
+
                 cursor.execute("""
-                    SELECT COUNT(*) FROM albums 
+                    SELECT id FROM albums
                     WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)
                 """)
-                orphaned_albums_count = cursor.fetchone()[0]
-                
-                # Delete orphaned artists
-                if orphaned_artists_count > 0:
-                    cursor.execute("""
-                        DELETE FROM artists 
-                        WHERE id NOT IN (SELECT DISTINCT artist_id FROM tracks WHERE artist_id IS NOT NULL)
-                    """)
-                    logger.info(f"Removed {orphaned_artists_count} orphaned artists")
-                
-                # Delete orphaned albums  
-                if orphaned_albums_count > 0:
-                    cursor.execute("""
-                        DELETE FROM albums 
-                        WHERE id NOT IN (SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL)
-                    """)
-                    logger.info(f"Removed {orphaned_albums_count} orphaned albums")
-                
+                album_ids = [str(row[0]) for row in cursor.fetchall()]
+
+                # An artist delete CASCADES to its albums (PRAGMA foreign_keys is
+                # ON), so an artist owning a protected album is not deletable
+                # either - dropping it would take the protected row with it and
+                # put #1216 straight back. The worker always writes the artist
+                # before its albums, so today it protects both; this keeps the
+                # guarantee here rather than resting on that.
+                if protected_albums:
+                    owners = list(protected_albums)
+                    for start in range(0, len(owners), 500):
+                        chunk = owners[start:start + 500]
+                        placeholders = ','.join('?' * len(chunk))
+                        cursor.execute(
+                            f"SELECT DISTINCT artist_id FROM albums WHERE id IN ({placeholders})",
+                            chunk)
+                        protected_artists |= {
+                            str(row[0]) for row in cursor.fetchall() if row[0] is not None}
+
+                artists_to_remove = [i for i in artist_ids if i not in protected_artists]
+                albums_to_remove = [i for i in album_ids if i not in protected_albums]
+                artists_held = len(artist_ids) - len(artists_to_remove)
+                albums_held = len(album_ids) - len(albums_to_remove)
+
+                def _delete(table, ids):
+                    # Chunked: SQLite caps the number of bound variables, and an
+                    # orphan sweep after a big scan can exceed it.
+                    for start in range(0, len(ids), 500):
+                        chunk = ids[start:start + 500]
+                        placeholders = ','.join('?' * len(chunk))
+                        cursor.execute(
+                            f"DELETE FROM {table} WHERE id IN ({placeholders})", chunk)
+
+                if artists_to_remove:
+                    _delete('artists', artists_to_remove)
+                    logger.info(f"Removed {len(artists_to_remove)} orphaned artists")
+
+                if albums_to_remove:
+                    _delete('albums', albums_to_remove)
+                    logger.info(f"Removed {len(albums_to_remove)} orphaned albums")
+
+                if artists_held or albums_held:
+                    logger.info(
+                        f"Kept {artists_held} artists and {albums_held} albums this run "
+                        f"just wrote - trackless for now, not orphaned")
+
                 conn.commit()
-                
+
                 return {
-                    'orphaned_artists_removed': orphaned_artists_count,
-                    'orphaned_albums_removed': orphaned_albums_count
+                    'orphaned_artists_removed': len(artists_to_remove),
+                    'orphaned_albums_removed': len(albums_to_remove),
+                    'artists_protected': artists_held,
+                    'albums_protected': albums_held,
                 }
-                
+
         except Exception as e:
             logger.error(f"Error cleaning up orphaned records: {e}")
-            return {'orphaned_artists_removed': 0, 'orphaned_albums_removed': 0}
+            return {'orphaned_artists_removed': 0, 'orphaned_albums_removed': 0,
+                    'artists_protected': 0, 'albums_protected': 0}
     
     def merge_duplicate_artists(self) -> Dict[str, int]:
         """
@@ -6602,11 +10138,13 @@ class MusicDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                # Find duplicate artist groups (same name + server_source, different IDs)
+                # Find duplicate artist groups (same name + server_source + library
+                # owner, different IDs). two profiles' own copies of one artist are
+                # two rows on purpose (#1199), never a duplicate to merge.
                 cursor.execute("""
                     SELECT name, server_source, GROUP_CONCAT(id) as ids, COUNT(*) as cnt
                     FROM artists
-                    GROUP BY name, server_source
+                    GROUP BY name, server_source, owner_profile_id
                     HAVING cnt > 1
                 """)
                 duplicate_groups = cursor.fetchall()
@@ -6711,38 +10249,107 @@ class MusicDatabase:
 
     # --- Removal detection helpers ---
 
-    def get_all_artist_ids_for_server(self, server_source: str) -> set:
-        """Get all artist IDs stored in the database for a specific server."""
+    def get_all_artist_ids_for_server(self, server_source: str, owner_profile_id=None) -> set:
+        """Get all artist IDs stored in the database for a specific server (and
+        library owner: None = the shared library's rows)."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id FROM artists WHERE server_source = ?", (server_source,))
+                cursor.execute("SELECT id FROM artists WHERE server_source = ? AND owner_profile_id IS ?",
+                               (server_source, owner_profile_id))
                 return {row[0] for row in cursor.fetchall()}
         except Exception as e:
             logger.error(f"Error getting artist IDs for {server_source}: {e}")
             return set()
 
-    def get_all_album_ids_for_server(self, server_source: str) -> set:
-        """Get all album IDs stored in the database for a specific server."""
+    def clear_phantom_artist_thumbs(self, artist_ids, server_source: str) -> int:
+        """drop the stored photo url for artists the server just said have no
+        image, when that url is the server-built one that 404s (#1253).
+
+        surgical on purpose: only the exact ``/Items/<id>/Images/Primary``
+        shape for that id, only unlocked rows. a hand-picked photo or one an
+        enrichment worker wrote is not ours to touch. returns rows cleared.
+        """
+        ids = [str(i) for i in (artist_ids or []) if i]
+        if not ids:
+            return 0
+        cleared = 0
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id FROM albums WHERE server_source = ?", (server_source,))
+                lock_clause = (
+                    "AND COALESCE(art_locked, 0) = 0"
+                    if self._art_lock_supported(cursor, 'artists') else ""
+                )
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start:start + 500]
+                    placeholders = ','.join('?' * len(chunk))
+                    cursor.execute(f"""
+                        UPDATE artists
+                        SET thumb_url = NULL, updated_at = CURRENT_TIMESTAMP
+                        WHERE server_source = ?
+                          AND id IN ({placeholders})
+                          AND thumb_url = '/Items/' || id || '/Images/Primary'
+                          {lock_clause}
+                    """, [server_source, *chunk])
+                    cleared += cursor.rowcount
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error clearing phantom artist thumbs for {server_source}: {e}")
+        return cleared
+
+    def get_all_album_ids_for_server(self, server_source: str, owner_profile_id=None) -> set:
+        """Get all album IDs stored in the database for a specific server (and
+        library owner: None = the shared library's rows)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT id FROM albums WHERE server_source = ? AND owner_profile_id IS ?",
+                               (server_source, owner_profile_id))
                 return {row[0] for row in cursor.fetchall()}
         except Exception as e:
             logger.error(f"Error getting album IDs for {server_source}: {e}")
             return set()
 
-    def get_all_track_ids_for_server(self, server_source: str) -> set:
-        """Get all track IDs stored in the database for a specific server."""
+    def get_all_track_ids_for_server(self, server_source: str, owner_profile_id=None) -> set:
+        """Get all track IDs stored in the database for a specific server (and
+        library owner: None = the shared library's rows)."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT id FROM tracks WHERE server_source = ?", (server_source,))
+                cursor.execute("SELECT id FROM tracks WHERE server_source = ? AND owner_profile_id IS ?",
+                               (server_source, owner_profile_id))
                 return {row[0] for row in cursor.fetchall()}
         except Exception as e:
             logger.error(f"Error getting track IDs for {server_source}: {e}")
             return set()
+
+    def get_track_ids_under_scopes(self, server_source: str, artist_ids: set, album_ids: set) -> Optional[set]:
+        """ids of this server's tracks that live under any of the given artists
+        or albums. the deep scan uses it to fence off the rows it could not
+        verify (an artist whose album listing failed, an album whose track
+        listing failed) so they never count as stale. None when the query
+        itself failed: a fence that might be missing rows is no fence, and
+        the caller has to skip removal rather than trust a partial one."""
+        if not artist_ids and not album_ids:
+            return set()
+        found: set = set()
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                for column, ids in (("artist_id", artist_ids), ("album_id", album_ids)):
+                    id_list = [str(i) for i in (ids or ()) if i is not None]
+                    for start in range(0, len(id_list), 500):
+                        batch = id_list[start:start + 500]
+                        placeholders = ','.join('?' * len(batch))
+                        cursor.execute(
+                            f"SELECT id FROM tracks WHERE server_source = ? AND {column} IN ({placeholders})",
+                            [server_source] + batch)
+                        found.update(row[0] for row in cursor.fetchall())
+        except Exception as e:
+            logger.error(f"Error getting scoped track IDs for {server_source}: {e}")
+            return None
+        return found
 
     def delete_stale_tracks(self, stale_track_ids: set, server_source: str) -> int:
         """Delete tracks by ID+server_source that no longer exist on the media server.
@@ -6775,6 +10382,90 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error deleting stale tracks for {server_source}: {e}")
             return 0
+
+    # columns the server writes on every scan; everything else on a track row
+    # is enrichment or user state and travels with the file when its row is
+    # superseded
+    _TRACK_SERVER_COLUMNS = frozenset({
+        'id', 'album_id', 'artist_id', 'title', 'track_number', 'disc_number',
+        'duration', 'file_path', 'bitrate', 'file_size', 'server_source',
+        'title_norm', 'created_at', 'updated_at',
+    })
+
+    @staticmethod
+    def _track_file_key(row) -> tuple:
+        """same album, same disc, same file name, same length = the same file.
+        the path itself is not compared: a reorganize stores the local form
+        and the server reports its own, so they differ on any mapped setup."""
+        path = str(row['file_path'] or '')
+        name = path.replace('\\', '/').rsplit('/', 1)[-1].lower()
+        duration = row['duration'] or 0
+        return (row['album_id'], row['disc_number'] or 1, name, int(duration // 1000))
+
+    def absorb_superseded_tracks(self, album_ids, seen_track_ids, server_source: str) -> int:
+        """fold rows the server no longer lists into the live row for the same file.
+
+        after a move the server trashes the old item and mints a new one, so
+        the album carries two rows for one file: the old id (repointed by the
+        reorganize) and the new. the live row keeps its id, takes every
+        enrichment column the old row had that it lacks, inherits the old
+        row's play history, and the old row goes. only rows whose id this
+        scan did NOT see are absorbed, and only into a row it did, so two
+        items the server genuinely lists are never merged (#1257)."""
+        if not album_ids or not seen_track_ids:
+            return 0
+        absorbed = 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                columns = [c[1] for c in cursor.execute("PRAGMA table_info(tracks)").fetchall()]
+                carry = [c for c in columns if c not in self._TRACK_SERVER_COLUMNS]
+                album_list = list(album_ids)
+                for i in range(0, len(album_list), 400):
+                    batch = album_list[i:i + 400]
+                    placeholders = ','.join('?' * len(batch))
+                    rows = cursor.execute(
+                        f"""SELECT id, album_id, disc_number, file_path, duration FROM tracks
+                            WHERE album_id IN ({placeholders}) AND server_source = ?
+                              AND file_path IS NOT NULL AND file_path != ''""",
+                        [str(a) for a in batch] + [server_source]).fetchall()
+                    groups: Dict[tuple, list] = {}
+                    for row in rows:
+                        groups.setdefault(self._track_file_key(row), []).append(str(row['id']))
+                    for ids in groups.values():
+                        if len(ids) < 2:
+                            continue
+                        live = [t for t in ids if t in seen_track_ids]
+                        gone = [t for t in ids if t not in seen_track_ids]
+                        if not live or not gone:
+                            continue
+                        keeper = live[0]
+                        for old_id in gone:
+                            self._absorb_track_row(cursor, old_id, keeper, carry)
+                            absorbed += 1
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Superseded track pass failed for {server_source}: {e}")
+            return absorbed
+        if absorbed:
+            logger.info(f"Superseded track rows folded for {server_source}: {absorbed}")
+        return absorbed
+
+    def _absorb_track_row(self, cursor, old_id: str, keeper_id: str, carry: list) -> None:
+        """move what the old row knew onto the keeper, then drop the old row."""
+        if carry:
+            sets = ', '.join(
+                f"{c} = COALESCE({c}, (SELECT {c} FROM tracks WHERE id = ?))" for c in carry)
+            cursor.execute(f"UPDATE tracks SET {sets} WHERE id = ?",
+                           [old_id] * len(carry) + [keeper_id])
+        try:
+            cursor.execute("UPDATE listening_history SET db_track_id = ? WHERE db_track_id = ?",
+                           (keeper_id, old_id))
+        except Exception as e:
+            logger.debug("listening_history repoint skipped: %s", e)
+        cursor.execute("DELETE FROM track_credits WHERE track_id = ?", (old_id,))
+        cursor.execute("DELETE FROM tracks WHERE id = ?", (old_id,))
+        logger.debug(f"Track row {old_id} folded into {keeper_id}")
 
     def delete_removed_content(self, removed_artist_ids: set, removed_album_ids: set,
                                server_source: str):
@@ -6866,14 +10557,15 @@ class MusicDatabase:
         """Insert or update artist from Plex artist object - DEPRECATED: Use insert_or_update_media_artist instead"""
         return self.insert_or_update_media_artist(plex_artist, server_source='plex')
     
-    def insert_or_update_media_artist(self, artist_obj, server_source: str = 'plex') -> bool:
+    def insert_or_update_media_artist(self, artist_obj, server_source: str = 'plex', owner_profile_id=None) -> bool:
         """Insert or update artist from media server artist object (Plex or Jellyfin)"""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 
                 # Convert artist ID to string (handles both Plex integer IDs and Jellyfin GUIDs)
-                artist_id = str(artist_obj.ratingKey)
+                from core.library_scope import library_artist_id
+                artist_id = library_artist_id(artist_obj.ratingKey, server_source, owner_profile_id)
                 raw_name = artist_obj.title
                 # Normalize artist name to handle quote variations and other inconsistencies
                 name = self._normalize_artist_name(raw_name)
@@ -6917,16 +10609,36 @@ class MusicDatabase:
 
                 if exists:
                     # Update existing artist
-                    cursor.execute("""
+                    # art_locked = the user picked this photo by hand; the server
+                    # does not get to replace it. Everything else still tracks
+                    # the server, and an unlocked row behaves exactly as before.
+                    # Both spellings take the same parameters, so only the
+                    # thumb_url expression changes when the column is absent.
+                    thumb_expr = (
+                        "CASE WHEN COALESCE(art_locked, 0) = 1 THEN thumb_url ELSE ? END"
+                        if self._art_lock_supported(cursor, 'artists') else "?"
+                    )
+                    # genres_locked = soulsync's genre jobs settled these, the
+                    # server's copy is what the files said before the cleanup
+                    genres_expr = (
+                        "CASE WHEN COALESCE(genres_locked, 0) = 1 THEN genres ELSE ? END"
+                        if self._genres_lock_supported(cursor, 'artists') else "?"
+                    )
+                    cursor.execute(f"""
                         UPDATE artists
-                        SET name = ?, thumb_url = ?, genres = ?, summary = ?, updated_at = CURRENT_TIMESTAMP
+                        SET name = ?,
+                            thumb_url = {thumb_expr},
+                            genres = {genres_expr}, summary = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ? AND server_source = ?
                     """, (name, thumb_url, genres_json, summary, artist_id, server_source))
                     logger.debug(f"Updated existing {server_source} artist: {name} (ID: {artist_id})")
                 else:
                     # Before inserting, check if an artist with the same name already exists
                     # for this server source (ratingKey may have changed after a library rescan)
-                    cursor.execute("SELECT id FROM artists WHERE name = ? AND server_source = ?", (name, server_source))
+                    # within the same owner only (#1199): another profile's copy of
+                    # this artist is a different row, not this one with a new id
+                    cursor.execute("SELECT id FROM artists WHERE name = ? AND server_source = ? AND owner_profile_id IS ?",
+                                   (name, server_source, owner_profile_id))
                     existing_by_name = cursor.fetchone()
 
                     if existing_by_name:
@@ -6943,18 +10655,32 @@ class MusicDatabase:
                             'style', 'mood', 'label', 'banner_url',
                             'deezer_id', 'deezer_match_status', 'deezer_last_attempted',
                             'jiosaavn_id', 'jiosaavn_match_status', 'jiosaavn_last_attempted',
+                            # See the album rekey path: without this, rebuilding the
+                            # row under a new id silently unlocks a hand-picked photo.
+                            'art_locked',
+                            # and settled genres, same reason
+                            'genres_locked',
                         ]
 
                         # Read enrichment data from old artist
                         cursor.execute("SELECT * FROM artists WHERE id = ? AND server_source = ?", (old_id, server_source))
                         old_row = cursor.fetchone()
 
+                        # A locked photo survives the rekey; otherwise the server wins,
+                        # exactly as before.
+                        preserved_thumb_url = thumb_url
+                        if _row_value(old_row, 'art_locked'):
+                            preserved_thumb_url = _row_value(old_row, 'thumb_url') or thumb_url
+                        preserved_genres = genres_json
+                        if _row_value(old_row, 'genres_locked'):
+                            preserved_genres = _row_value(old_row, 'genres')
+
                         # Insert new artist with fresh server metadata + preserved created_at
                         old_created = old_row['created_at'] if old_row else None
                         cursor.execute("""
-                            INSERT INTO artists (id, name, thumb_url, genres, summary, server_source, created_at, updated_at)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                        """, (artist_id, name, thumb_url, genres_json, summary, server_source, old_created))
+                            INSERT INTO artists (id, name, thumb_url, genres, summary, server_source, owner_profile_id, created_at, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        """, (artist_id, name, preserved_thumb_url, preserved_genres, summary, server_source, owner_profile_id, old_created))
 
                         # Copy enrichment data from old record to new record
                         if old_row:
@@ -6995,9 +10721,9 @@ class MusicDatabase:
                     else:
                         # Genuinely new artist — insert fresh record
                         cursor.execute("""
-                            INSERT INTO artists (id, name, thumb_url, genres, summary, server_source)
-                            VALUES (?, ?, ?, ?, ?, ?)
-                        """, (artist_id, name, thumb_url, genres_json, summary, server_source))
+                            INSERT INTO artists (id, name, thumb_url, genres, summary, server_source, owner_profile_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """, (artist_id, name, thumb_url, genres_json, summary, server_source, owner_profile_id))
                         logger.debug(f"Inserted new {server_source} artist: {name} (ID: {artist_id})")
 
                 conn.commit()
@@ -7057,8 +10783,10 @@ class MusicDatabase:
         """Insert or update album from Plex album object - DEPRECATED: Use insert_or_update_media_album instead"""
         return self.insert_or_update_media_album(plex_album, artist_id, server_source='plex')
     
-    def insert_or_update_media_album(self, album_obj, artist_id: str, server_source: str = 'plex') -> bool:
+    def insert_or_update_media_album(self, album_obj, artist_id: str, server_source: str = 'plex', owner_profile_id=None) -> bool:
         """Insert or update album from media server album object (Plex or Jellyfin)"""
+        from core.library_scope import library_artist_id
+        artist_id = library_artist_id(artist_id, server_source, owner_profile_id)
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -7082,14 +10810,38 @@ class MusicDatabase:
             genres_json = json.dumps(genres) if genres else None
             
             # Check if album exists with this ID (PRIMARY KEY check)
-            cursor.execute("SELECT id, server_source FROM albums WHERE id = ?", (album_id,))
+            cursor.execute("SELECT id, server_source, owner_profile_id FROM albums WHERE id = ?", (album_id,))
             existing = cursor.fetchone()
+
+            if existing and existing['owner_profile_id'] != owner_profile_id:
+                logger.error('Refusing to move album %s between library owners; check server library selections', album_id)
+                return False
 
             if existing:
                 # Album exists - update it (update server_source if different)
-                cursor.execute("""
+                # THE bug TheHomeGuy hit. COALESCE(NULLIF(?, '')) alone only
+                # protects the row when the SERVER sends nothing — and Navidrome
+                # always sends a cover URL, including for its own blue-vinyl
+                # placeholder. So a hand-picked cover lost to a manual sync every
+                # time. art_locked says a person chose it; leave it alone.
+                # Same parameters either way — only the expression differs, so a
+                # database that predates the column keeps the old behaviour
+                # instead of failing every album (see _art_lock_supported).
+                thumb_expr = (
+                    "CASE WHEN COALESCE(art_locked, 0) = 1 "
+                    "THEN thumb_url ELSE COALESCE(NULLIF(?, ''), thumb_url) END"
+                    if self._art_lock_supported(cursor, 'albums')
+                    else "COALESCE(NULLIF(?, ''), thumb_url)"
+                )
+                genres_expr = (
+                    "CASE WHEN COALESCE(genres_locked, 0) = 1 THEN genres ELSE ? END"
+                    if self._genres_lock_supported(cursor, 'albums') else "?"
+                )
+                cursor.execute(f"""
                     UPDATE albums
-                    SET artist_id = ?, title = ?, year = ?, thumb_url = COALESCE(NULLIF(?, ''), thumb_url), genres = ?,
+                    SET artist_id = ?, title = ?, year = ?,
+                        thumb_url = {thumb_expr},
+                        genres = {genres_expr},
                         track_count = ?, duration = ?, server_source = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """, (artist_id, title, year, thumb_url, genres_json, track_count, duration, server_source, album_id))
@@ -7097,8 +10849,8 @@ class MusicDatabase:
                 # Before inserting, check if an album with the same title already exists
                 # under this artist (ratingKey may have changed after a library rescan)
                 cursor.execute(
-                    "SELECT id FROM albums WHERE title = ? AND artist_id = ? AND server_source = ?",
-                    (title, artist_id, server_source))
+                    "SELECT id FROM albums WHERE title = ? AND artist_id = ? AND server_source = ? AND owner_profile_id IS ?",
+                    (title, artist_id, server_source, owner_profile_id))
                 existing_by_title = cursor.fetchone()
 
                 if existing_by_title:
@@ -7120,21 +10872,36 @@ class MusicDatabase:
                         # losing it on a ratingKey rekey would force the next
                         # completeness scan back to live API lookups (kettui PR #374).
                         'api_track_count',
+                        # Without this the rekey path quietly UNLOCKS custom art:
+                        # the row is rebuilt under a new id, art_locked defaults
+                        # back to 0, and the next sync overwrites the pick.
+                        'art_locked',
+                        # settled genres, same reason
+                        'genres_locked',
                     ]
 
                     # Read enrichment data from old album
                     cursor.execute("SELECT * FROM albums WHERE id = ?", (old_id,))
                     old_row = cursor.fetchone()
-                    preserved_thumb_url = thumb_url or (old_row['thumb_url'] if old_row and 'thumb_url' in old_row.keys() else None)
+                    old_thumb_url = _row_value(old_row, 'thumb_url')
+                    if _row_value(old_row, 'art_locked'):
+                        # Hand-picked art outranks the server even here, where the
+                        # server has just handed us a brand-new id for this album.
+                        preserved_thumb_url = old_thumb_url or thumb_url
+                    else:
+                        preserved_thumb_url = thumb_url or old_thumb_url
+                    preserved_genres = genres_json
+                    if _row_value(old_row, 'genres_locked'):
+                        preserved_genres = _row_value(old_row, 'genres')
 
                     # Insert new album with fresh server metadata + preserved created_at
                     old_created = old_row['created_at'] if old_row else None
                     cursor.execute("""
                         INSERT INTO albums (id, artist_id, title, year, thumb_url, genres,
-                                            track_count, duration, server_source, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (album_id, artist_id, title, year, preserved_thumb_url, genres_json,
-                          track_count, duration, server_source, old_created))
+                                            track_count, duration, server_source, owner_profile_id, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (album_id, artist_id, title, year, preserved_thumb_url, preserved_genres,
+                          track_count, duration, server_source, owner_profile_id, old_created))
 
                     # Copy enrichment data from old record to new record
                     if old_row:
@@ -7173,9 +10940,9 @@ class MusicDatabase:
                 else:
                     # Genuinely new album — insert fresh record
                     cursor.execute("""
-                        INSERT INTO albums (id, artist_id, title, year, thumb_url, genres, track_count, duration, server_source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (album_id, artist_id, title, year, thumb_url, genres_json, track_count, duration, server_source))
+                        INSERT INTO albums (id, artist_id, title, year, thumb_url, genres, track_count, duration, server_source, owner_profile_id)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (album_id, artist_id, title, year, thumb_url, genres_json, track_count, duration, server_source, owner_profile_id))
 
             conn.commit()
             return True
@@ -7293,8 +11060,10 @@ class MusicDatabase:
         """Insert or update track from Plex track object - DEPRECATED: Use insert_or_update_media_track instead"""
         return self.insert_or_update_media_track(plex_track, album_id, artist_id, server_source='plex')
     
-    def insert_or_update_media_track(self, track_obj, album_id: str, artist_id: str, server_source: str = 'plex') -> bool:
+    def insert_or_update_media_track(self, track_obj, album_id: str, artist_id: str, server_source: str = 'plex', owner_profile_id=None) -> bool:
         """Insert or update track from media server track object (Plex or Jellyfin) with retry logic"""
+        from core.library_scope import library_artist_id
+        artist_id = library_artist_id(artist_id, server_source, owner_profile_id)
         max_retries = 3
         retry_count = 0
         
@@ -7349,16 +11118,14 @@ class MusicDatabase:
                     file_path = track_obj.path
                 if bitrate is None and hasattr(track_obj, 'bitRate') and track_obj.bitRate:
                     bitrate = track_obj.bitRate
-                # Do NOT fabricate a bare filename when path is missing. The
-                # Subsonic API omits 'path' transiently — during a Navidrome
-                # library rescan, or a network hiccup — and a bare
-                # "My Song.flac" has no directory structure, matches nothing on
-                # disk, and overwrites the correct value on the next UPDATE.
-                # Each scan then corrupts another slice of the library and the
-                # damage accumulates. Leave it None so the COALESCE guard in the
-                # UPDATE below can protect what is already stored.
-                # (Upstream #1158, reported by shkarlsson.)
-                # File size: Jellyfin / Navidrome / Commissary-standalone
+                # Do NOT fabricate a bare filename when path is missing —
+                # the Subsonic API can omit 'path' transiently (e.g. during
+                # a Navidrome library rescan).  A bogus relative name like
+                # "My Song.flac" would overwrite the correct value on the
+                # next UPDATE.  Leave file_path as None instead; the
+                # COALESCE guard in the UPDATE statement protects the
+                # existing row.
+                # File size: Jellyfin / Navidrome / SoulSync-standalone
                 # all set track_obj.file_size on their wrapper class.
                 # Plex came in via the media.parts[0].size path above —
                 # don't clobber that.
@@ -7366,6 +11133,20 @@ class MusicDatabase:
                     _wrapper_size = getattr(track_obj, 'file_size', None)
                     if isinstance(_wrapper_size, int) and _wrapper_size > 0:
                         file_size = _wrapper_size
+
+                # #1573: keep the server's path as reported, and store where
+                # SoulSync itself opens the file. the standalone server scans
+                # SoulSync's own disk, its path already is the local one. when
+                # the file can't be found from here, file_path falls back to
+                # the server's path below, same as before.
+                server_path = file_path
+                if file_path and server_source != 'soulsync':
+                    from core.library.server_paths import local_path_for
+                    try:
+                        from core.settings import config_manager as _cm
+                    except Exception:  # noqa: BLE001 - no config, raw path only
+                        _cm = None
+                    file_path = local_path_for(file_path, _cm) or None
 
                 # Extract per-track artist for compilations/DJ mixes.
                 # Only stored when it differs from the album artist.
@@ -7398,32 +11179,59 @@ class MusicDatabase:
                             or jf_track_artist != jf_album_artist
                         ):
                             track_artist = jf_track_artist
-                # Navidrome/Subsonic: artist attribute is per-track
-                if not track_artist and hasattr(track_obj, 'artist') and isinstance(getattr(track_obj, 'artist', None), str):
-                    nav_artist = getattr(track_obj, 'artist', '').strip()
-                    # Compare against album artist name to only store when different
-                    try:
-                        artist_row = cursor.execute("SELECT name FROM artists WHERE id = ?", (artist_id,)).fetchone()
-                        album_artist_name = artist_row[0] if artist_row else ''
-                        if nav_artist and nav_artist.lower() != album_artist_name.lower():
-                            track_artist = nav_artist
-                    except Exception as e:
-                        logger.debug("Failed to load album artist for track_artist comparison: %s", e)
+                if not track_artist:
+                    raw_artist = ''
+                    for _payload_attr in ('_data', '_tags'):
+                        _payload = getattr(track_obj, _payload_attr, None)
+                        if isinstance(_payload, dict):
+                            raw_artist = (_payload.get('artist') or '').strip()
+                            if raw_artist:
+                                break
+                    if raw_artist:
+                        try:
+                            artist_row = cursor.execute("SELECT name FROM artists WHERE id = ?", (artist_id,)).fetchone()
+                            album_artist_name = (artist_row[0] or '') if artist_row else ''
+                            if raw_artist.lower() != album_artist_name.lower():
+                                track_artist = raw_artist
+                        except Exception as e:
+                            logger.debug("Failed to load album artist for track_artist comparison: %s", e)
 
                 # Extract MusicBrainz recording ID from server if available (Navidrome provides this)
                 mbid = getattr(track_obj, 'musicBrainzId', None) or None
 
                 # Check if track already exists — UPDATE to preserve enrichment columns,
                 # INSERT only for genuinely new tracks
-                cursor.execute("SELECT 1 FROM tracks WHERE id = ? LIMIT 1", (track_id,))
-                is_new_track = cursor.fetchone() is None
+                cursor.execute("SELECT owner_profile_id FROM tracks WHERE id = ? LIMIT 1", (track_id,))
+                existing = cursor.fetchone()
+                if existing is not None and existing['owner_profile_id'] != owner_profile_id:
+                    logger.error('Refusing to move track %s between library owners; check server library selections', track_id)
+                    return False
+                is_new_track = existing is None
+
+                # the scan is the bulk writer, so it fills the normalized
+                # columns itself instead of leaving a library-sized gap for the
+                # backfill after every deep scan
+                title_norm = self._normalize_for_comparison(title) if title else ''
+                track_artist_norm = self._normalize_for_comparison(track_artist) if track_artist else None
+
+                if not file_path and server_path:
+                    # not reachable from here: keep a local path SoulSync set
+                    # earlier if that file is still there, else the server's
+                    if not is_new_track:
+                        cursor.execute("SELECT file_path FROM tracks WHERE id = ?", (track_id,))
+                        _prev = cursor.fetchone()
+                        _prev_path = _prev[0] if _prev else None
+                        if _prev_path and os.path.exists(_prev_path):
+                            file_path = _prev_path
+                    if not file_path:
+                        file_path = server_path
 
                 if is_new_track:
                     cursor.execute("""
                         INSERT INTO tracks
-                        (id, album_id, artist_id, title, track_number, disc_number, duration, file_path, bitrate, file_size, server_source, track_artist, musicbrainz_recording_id, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-                    """, (track_id, album_id, artist_id, title, track_number, disc_number, duration, file_path, bitrate, file_size, server_source, track_artist, mbid))
+                        (id, album_id, artist_id, title, track_number, disc_number, duration, file_path, server_path, bitrate, file_size, server_source, track_artist, musicbrainz_recording_id, title_norm, track_artist_norm, owner_profile_id, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (track_id, album_id, artist_id, title, track_number, disc_number, duration, file_path, server_path, bitrate, file_size, server_source, track_artist, mbid, title_norm, track_artist_norm or '', owner_profile_id))
                 else:
                     # Update server-provided fields only — preserves spotify_track_id, deezer_id,
                     # isrc, bpm, and all other enrichment data. file_size uses
@@ -7433,19 +11241,32 @@ class MusicDatabase:
                     cursor.execute("""
                         UPDATE tracks
                         SET album_id = ?, artist_id = ?, title = ?, track_number = ?, disc_number = ?,
-                            duration = ?, file_path = COALESCE(?, file_path), bitrate = ?,
+                            duration = ?, file_path = COALESCE(?, file_path),
+                            server_path = COALESCE(?, server_path), bitrate = ?,
                             file_size = COALESCE(?, file_size),
                             server_source = ?,
                             track_artist = COALESCE(?, track_artist),
+                            recording_disambiguation = CASE
+                                WHEN ? IS NOT NULL AND (musicbrainz_recording_id IS NULL
+                                     OR LOWER(?) != LOWER(musicbrainz_recording_id))
+                                THEN NULL ELSE recording_disambiguation END,
                             musicbrainz_recording_id = COALESCE(?, musicbrainz_recording_id),
+                            title_norm = ?,
+                            track_artist_norm = COALESCE(?, track_artist_norm),
                             updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, (album_id, artist_id, title, track_number, disc_number, duration, file_path, bitrate, file_size, server_source, track_artist, mbid, track_id))
+                    """, (album_id, artist_id, title, track_number, disc_number, duration, file_path, server_path, bitrate, file_size, server_source, track_artist, mbid, mbid, mbid, title_norm, track_artist_norm, track_id))
+
+                if is_new_track or track_artist_norm is not None:
+                    cursor.execute("DELETE FROM track_credits WHERE track_id = ?", (track_id,))
+                    cursor.executemany(
+                        "INSERT OR IGNORE INTO track_credits (track_id, name_norm) VALUES (?, ?)",
+                        [(track_id, name) for name in split_credit_names(track_artist_norm or '')])
 
                 conn.commit()
 
                 # Backfill external metadata-source IDs from track_downloads
-                # provenance. Commissary collected them at download time but the
+                # provenance. SoulSync collected them at download time but the
                 # media-server scan can't see them — without this hook,
                 # tracks.spotify_track_id / itunes_track_id / etc. stay empty
                 # until the async enrichment workers eventually catch up
@@ -7457,6 +11278,15 @@ class MusicDatabase:
                     self.backfill_track_external_ids_from_provenance(track_id, file_path)
                 except Exception as backfill_err:
                     logger.debug(f"Provenance ID backfill skipped for track {track_id}: {backfill_err}")
+
+                # a hand-tagged file keeps its lock across every rescan, even
+                # when the server makes a fresh row for it. own try: a missing
+                # table on an old schema must never cost the scan this track
+                try:
+                    if self._apply_manual_lock_for_track(cursor, track_id, album_id, file_path):
+                        conn.commit()
+                except Exception as lock_err:
+                    logger.debug(f"Manual lock check skipped for track {track_id}: {lock_err}")
 
                 # Log new imports to library history
                 if is_new_track:
@@ -7556,15 +11386,16 @@ class MusicDatabase:
             
             # Convert to string to handle both Plex integers and Jellyfin GUIDs
             track_id_str = str(track_id)
-            cursor.execute("""
-                SELECT t.id, t.album_id, t.artist_id, t.title, t.track_number, 
-                       t.duration, t.created_at, t.updated_at,
+            scope_sql, scope_params = self._current_scope_sql('t.owner_profile_id')
+            cursor.execute(f"""
+                SELECT t.id, t.album_id, t.artist_id, t.title, t.track_number,
+                       t.duration, t.created_at, t.updated_at, t.track_artist,
                        a.name as artist_name, al.title as album_title
                 FROM tracks t
                 JOIN artists a ON t.artist_id = a.id
                 JOIN albums al ON t.album_id = al.id
-                WHERE t.id = ?
-            """, (track_id_str,))
+                WHERE t.id = ? AND {scope_sql}
+            """, (track_id_str, *scope_params))
             
             row = cursor.fetchone()
             if row:
@@ -7578,7 +11409,8 @@ class MusicDatabase:
                     track_number=row['track_number'],
                     duration=row['duration'],
                     created_at=row['created_at'],
-                    updated_at=row['updated_at']
+                    updated_at=row['updated_at'],
+                    track_artist=row['track_artist'] if 'track_artist' in row.keys() else None
                 )
             return None
             
@@ -7620,13 +11452,19 @@ class MusicDatabase:
         """All library tracks that have a file, for playlist/M3U export.
 
         Returns ``[{path, title, artist, duration}]`` ordered by artist / album / track number.
-        ``duration`` is converted to SECONDS here (the schema stores milliseconds)."""
+        ``duration`` is converted to SECONDS here (the schema stores milliseconds).
+
+        ``path`` is the media server's own path when the scan recorded one: the
+        M3U is read by the server, and file_path is SoulSync's mount (#1573)."""
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT t.file_path AS path, t.title AS title, ar.name AS artist,
+            cursor.execute("PRAGMA table_info(tracks)")
+            _path_expr = ("COALESCE(NULLIF(t.server_path, ''), t.file_path)"
+                          if any(c[1] == 'server_path' for c in cursor.fetchall()) else "t.file_path")
+            cursor.execute(f"""
+                SELECT {_path_expr} AS path, t.title AS title, ar.name AS artist,
                        t.duration AS duration_ms, t.track_number AS track_number
                 FROM tracks t
                 LEFT JOIN artists ar ON ar.id = t.artist_id
@@ -7698,21 +11536,23 @@ class MusicDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
             norm_query = f"%{self._normalize_for_comparison(query)}%"
+            name_expr = self._norm_expr(self._norm_ready(cursor), 'artists', 'name', 'name_norm').replace('artists.', '')
 
+            scope_sql, scope_params = self._current_scope_sql('owner_profile_id')
             if server_source:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT * FROM artists
-                    WHERE unidecode_lower(name) LIKE ? AND server_source = ?
+                    WHERE {name_expr} LIKE ? AND server_source = ? AND {scope_sql}
                     ORDER BY name
                     LIMIT ?
-                """, (norm_query, server_source, limit))
+                """, (norm_query, server_source, *scope_params, limit))
             else:
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT * FROM artists
-                    WHERE unidecode_lower(name) LIKE ?
+                    WHERE {name_expr} LIKE ? AND {scope_sql}
                     ORDER BY name
                     LIMIT ?
-                """, (norm_query, limit))
+                """, (norm_query, *scope_params, limit))
             
             rows = cursor.fetchall()
             
@@ -7735,6 +11575,69 @@ class MusicDatabase:
             logger.error(f"Error searching artists with query '{query}': {e}")
             return []
     
+    def _resolve_artist_ids_norm(self, cursor, artist: str) -> List[Any]:
+        """artist ids whose normalized name equals the given name. [] when the
+        artist is not in the library by name (or the backfill isn't done)."""
+        if not artist:
+            return []
+        norm = self._normalize_for_comparison(artist)
+        if not norm or not self._norm_ready(cursor):
+            return []
+        cursor.execute("SELECT id FROM artists WHERE name_norm = ?", (norm,))
+        ids = [r[0] for r in cursor.fetchall()]
+        if ids:
+            return ids
+        # "ACDC" for "AC/DC": same artist once punctuation is dropped
+        from core.text.normalize import normalize_key
+        key = normalize_key(artist)
+        if not key:
+            return []
+        cursor.execute("SELECT id FROM artists WHERE name_key = ?", (key,))
+        return [r[0] for r in cursor.fetchall()]
+
+    def _search_track_rows(self, cursor, title: str, artist: str, limit: int,
+                           server_source: Optional[str] = None, rank_artist: Optional[str] = None):
+        """the one track search, as raw rows. strategies in order, each only
+        when the previous found nothing:
+          1. literal title (and artist) match
+          1b. the base title before a ' - qualifier'
+          2. word-or fuzzy match
+        when the artist is in the library by name, every strategy stays inside
+        that artist's rows and exact per-track credits (indexed) first, then
+        widens to a substring pass over the per-track credit column for "A
+        feat. B" style credits. an unknown artist goes straight to the
+        substring passes, which run over plain columns rather than a python
+        function per row."""
+        from core.text.title_match import base_title_before_dash
+        artist_ids = self._resolve_artist_ids_norm(cursor, artist) if artist else []
+        base_title = base_title_before_dash(title) if title else ''
+        if base_title == title:
+            base_title = ''
+
+        # a known artist: its own rows first, then only the credit column for
+        # "A feat. B" rows filed under someone else. never the whole table: a
+        # word-or match across every artist in the library is where "same
+        # title, different band" false positives come from, and the scorer
+        # rejects those anyway, so the scan was pure cost.
+        if artist_ids:
+            scopes = [dict(artist_ids=artist_ids), dict(credit_only=True)]
+        else:
+            scopes = [dict()]
+        for scope in scopes:
+            rows = self._search_tracks_basic_rows(cursor, title, artist, limit, server_source, rank_artist, **scope)
+            if rows:
+                return rows
+            if base_title:
+                rows = self._search_tracks_basic_rows(cursor, base_title, artist, limit, server_source, rank_artist, **scope)
+                if rows:
+                    logger.debug("Base-title search matched '%s' via '%s'", title, base_title)
+                    return rows
+            if not scope.get('credit_only'):
+                rows = self._search_tracks_fuzzy_rows(cursor, title, artist, limit, server_source, artist_ids=scope.get('artist_ids'))
+                if rows:
+                    return rows
+        return []
+
     def search_tracks(self, title: str = "", artist: str = "", limit: int = 50, server_source: str = None,
                        rank_artist: str = None) -> List[DatabaseTrack]:
         """Search tracks by title and/or artist name with Unicode-aware fuzzy matching.
@@ -7745,42 +11648,67 @@ class MusicDatabase:
         try:
             if not title and not artist:
                 return []
-
             conn = self._get_connection()
-            cursor = conn.cursor()
-
-            # STRATEGY 1: Try basic SQL LIKE search first (fastest)
-            basic_results = self._search_tracks_basic(cursor, title, artist, limit, server_source, rank_artist)
-
-            if basic_results:
-                logger.debug(f"Basic search found {len(basic_results)} results")
-                return basic_results
-
-            # STRATEGY 1b: Spotify renders versions as "Title - Qualifier"
-            # ("Calma - Remix") but libraries usually store just the base
-            # ("Calma"), so the literal search misses. Retry on the base title
-            # BEFORE the OR-fuzzy fallback (which would flood on the common
-            # qualifier word — every "... remix" matches "remix"). #: Calma - Remix
-            if title:
-                from core.text.title_match import base_title_before_dash
-                base_title = base_title_before_dash(title)
-                if base_title and base_title != title:
-                    base_results = self._search_tracks_basic(
-                        cursor, base_title, artist, limit, server_source, rank_artist)
-                    if base_results:
-                        logger.debug("Base-title search matched '%s' via '%s'", title, base_title)
-                        return base_results
-
-            # STRATEGY 2: Broader fuzzy search - splits into individual words with OR matching
-            fuzzy_results = self._search_tracks_fuzzy_fallback(cursor, title, artist, limit, server_source)
-            if fuzzy_results:
-                logger.debug(f"Fuzzy fallback search found {len(fuzzy_results)} results")
-            
-            return fuzzy_results
-            
+            try:
+                rows = self._search_track_rows(conn.cursor(), title, artist, limit, server_source, rank_artist)
+            finally:
+                conn.close()
+            return self._rows_to_tracks(rows)
         except Exception as e:
             logger.error(f"Error searching tracks with title='{title}', artist='{artist}': {e}")
             return []
+
+    def get_quarantine_library_candidates(self, title, artists, identifiers, server_source=None):
+        """Read scoped candidates for quarantine review; database errors propagate.
+
+        Returns physical-library paths and recent import paths so a successful
+        retry is visible before the media server's next scan. The review helper
+        checks recording identity and file presence, including history scope.
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            rows = []
+            columns = {'spotify': 'spotify_track_id', 'isrc': 'isrc'}
+            ids = [(columns[key], value) for key, value in identifiers.items()
+                   if key in columns and value]
+            if ids:
+                scope, params = self._current_scope_sql('t.owner_profile_id')
+                source = ' AND t.server_source = ?' if server_source else ''
+                for column, value in ids:
+                    cursor.execute(f"""
+                        SELECT t.*, a.name AS artist_name, al.title AS album_title
+                        FROM tracks t JOIN artists a ON a.id = t.artist_id
+                        JOIN albums al ON al.id = t.album_id
+                        WHERE t.{column} = ? COLLATE NOCASE AND {scope} {source} LIMIT 100
+                    """, [value] + params + ([server_source] if server_source else []))
+                    rows.extend(dict(row) for row in cursor.fetchall())
+            for artist in artists:
+                rows.extend(dict(row) for row in self._search_track_rows(
+                    cursor, title, artist, 100, server_source))
+                cursor.execute("""
+                    SELECT title, artist_name, album_name AS album_title, file_path,
+                           quality, verification_status, 1 AS _history_only
+                    FROM library_history WHERE event_type IN ('download', 'import')
+                      AND title = ? COLLATE NOCASE AND artist_name = ? COLLATE NOCASE
+                    ORDER BY id DESC LIMIT 100
+                """, (title, artist))
+                rows.extend(dict(row) for row in cursor.fetchall())
+            paths = list({row['file_path'] for row in rows if row.get('file_path')})
+            if paths:
+                cursor.execute(f"""
+                    SELECT file_path, quality, verification_status FROM library_history
+                    WHERE file_path IN ({','.join('?' for _ in paths)}) ORDER BY id DESC
+                """, paths)
+                history = {}
+                for row in cursor.fetchall():
+                    history.setdefault(row['file_path'], dict(row))
+                for row in rows:
+                    if not row.get('_history_only'):
+                        row.update(history.get(row.get('file_path'), {}))
+            return rows
+        finally:
+            conn.close()
 
     def api_search_tracks(self, title: str = "", artist: str = "", limit: int = 50,
                           server_source: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -7791,31 +11719,119 @@ class MusicDatabase:
         try:
             if not title and not artist:
                 return []
-
             conn = self._get_connection()
-            cursor = conn.cursor()
-
-            basic_rows = self._search_tracks_basic_rows(cursor, title, artist, limit, server_source)
-            if basic_rows:
-                return [dict(r) for r in basic_rows]
-
-            # Base-title fallback for Spotify "Title - Qualifier" forms (see
-            # search_tracks STRATEGY 1b) before the OR-fuzzy flood.
-            if title:
-                from core.text.title_match import base_title_before_dash
-                base_title = base_title_before_dash(title)
-                if base_title and base_title != title:
-                    base_rows = self._search_tracks_basic_rows(
-                        cursor, base_title, artist, limit, server_source)
-                    if base_rows:
-                        return [dict(r) for r in base_rows]
-
-            fuzzy_rows = self._search_tracks_fuzzy_rows(cursor, title, artist, limit, server_source)
-            return [dict(r) for r in fuzzy_rows]
+            try:
+                rows = self._search_track_rows(conn.cursor(), title, artist, limit, server_source)
+            finally:
+                conn.close()
+            return [dict(r) for r in rows]
         except Exception as e:
             logger.error(f"API: Error searching tracks with title='{title}', artist='{artist}': {e}")
             return []
-    
+
+    def search_tracks_interactive(self, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """As-you-type library search for interactive use (Sample Studio).
+
+        ONE sql statement: substring match across the normalized title,
+        artist name and per-track artist credit, ordered so an exact title
+        hit comes first, then title prefixes, then artist hits. When that
+        finds nothing and the query has several words, ONE term-OR fallback
+        catches word-order differences.
+
+        Deliberately simpler than api_search_tracks: the download matcher's
+        base-title/fuzzy cascade costs up to six full-table scans per call
+        (artist interpretation, then title interpretation, each with basic +
+        base-title + fuzzy passes), which is what made studio search feel
+        stuck on a big library. Errors propagate so the caller can tell a
+        failed search apart from an empty one.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        limit = max(1, min(int(limit or 50), 200))
+        qn = self._normalize_for_comparison(query)
+        if not qn:
+            return []
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            # readiness probe WITHOUT kicking the norm backfill thread: the
+            # boot-time backfill owns that, and kicking here would serialize
+            # every keystroke behind a library-sized backfill.
+            gaps = [self._norm_unfilled_count(cursor, table, norm, _NORM_INLINE_LIMIT + 1)
+                    for table, raw, norm, _kind in self._NORM_COLUMNS]
+            if any(gaps):
+                if any(n > _NORM_INLINE_LIMIT for n in gaps):
+                    ready = False
+                else:
+                    self.ensure_norm_backfilled()
+                    ready = True
+            else:
+                ready = True
+            t_title = self._norm_expr(ready, "tracks", "title", "title_norm")
+            a_name = self._norm_expr(ready, "artists", "name", "name_norm")
+            t_artist = self._norm_expr(ready, "tracks", "track_artist", "track_artist_norm")
+            scope_sql, scope_params = self._current_scope_sql("tracks.owner_profile_id")
+            like_all = f"%{qn}%"
+            like_prefix = f"{qn}%"
+            params = scope_params + [like_all, like_all, like_all,
+                                    qn, like_prefix, qn, like_prefix, limit]
+            cursor.execute(
+                f"""SELECT tracks.*, artists.name AS artist_name,
+                           albums.title AS album_title,
+                           albums.thumb_url AS album_thumb_url
+                    FROM tracks
+                    JOIN artists ON tracks.artist_id = artists.id
+                    JOIN albums ON tracks.album_id = albums.id
+                    WHERE {scope_sql}
+                      AND ({t_title} LIKE ? OR {a_name} LIKE ? OR {t_artist} LIKE ?)
+                    ORDER BY
+                      CASE
+                        WHEN {t_title} = ? THEN 0
+                        WHEN {t_title} LIKE ? THEN 1
+                        WHEN {a_name} = ? THEN 2
+                        WHEN {a_name} LIKE ? THEN 3
+                        ELSE 4
+                      END,
+                      {t_title}, {a_name}
+                    LIMIT ?""",
+                params)
+            rows = [dict(r) for r in cursor.fetchall()]
+            if not rows:
+                rows = self._search_tracks_interactive_fuzzy(
+                    cursor, qn, t_title, a_name, t_artist, scope_sql, scope_params, limit)
+            return rows
+        finally:
+            conn.close()
+
+    def _search_tracks_interactive_fuzzy(self, cursor, qn: str, t_title: str, a_name: str,
+                                        t_artist: str, scope_sql: str,
+                                        scope_params: list, limit: int) -> List[Dict[str, Any]]:
+        """Term-OR fallback for search_tracks_interactive: one full scan, no
+        python-side scoring. Only runs when the primary pass found nothing."""
+        terms = [t for t in qn.split() if len(t) > 2]
+        if len(terms) < 2:
+            return []
+        ors = " OR ".join(
+            f"({t_title} LIKE ? OR {a_name} LIKE ? OR {t_artist} LIKE ?)" for _ in terms)
+        params = list(scope_params)
+        for term in terms:
+            like = f"%{term}%"
+            params += [like, like, like]
+        params.append(limit)
+        cursor.execute(
+            f"""SELECT tracks.*, artists.name AS artist_name,
+                       albums.title AS album_title,
+                       albums.thumb_url AS album_thumb_url
+                FROM tracks
+                JOIN artists ON tracks.artist_id = artists.id
+                JOIN albums ON tracks.album_id = albums.id
+                WHERE {scope_sql} AND ({ors})
+                ORDER BY {t_title}, {a_name}
+                LIMIT ?""",
+            params)
+        return [dict(r) for r in cursor.fetchall()]
+
     def get_tracks_for_m3u_resolution(self, server_source: Optional[str] = None) -> List[Dict[str, str]]:
         """Bulk-load (artist, title, file_path) for in-memory M3U path resolution.
 
@@ -7848,23 +11864,50 @@ class MusicDatabase:
         return self._rows_to_tracks(rows)
 
     def _search_tracks_basic_rows(self, cursor, title: str, artist: str, limit: int,
-                                  server_source: Optional[str] = None, rank_artist: Optional[str] = None):
+                                  server_source: Optional[str] = None, rank_artist: Optional[str] = None,
+                                  artist_ids: Optional[List[Any]] = None, credit_only: bool = False):
         """Basic SQL LIKE search returning raw rows (shared by DatabaseTrack and dict-returning callers).
 
         ``rank_artist`` is a relevance-only hint (does NOT filter): when given,
-        rows by that artist sort to the top so an exact title+artist match wins."""
+        rows by that artist sort to the top so an exact title+artist match wins.
+
+        ``artist_ids`` scopes the search to those artists' rows plus exact
+        per-track credits (all indexed). None means the substring pass over the
+        whole table, which also catches "A feat. B" credits — over plain columns
+        now, not a python udf per row, so even that is a c-speed scan."""
         where_conditions = []
         params = []
+        ready = self._norm_ready(cursor)
+        t_title = self._norm_expr(ready, 'tracks', 'title', 'title_norm')
+        t_tartist = self._norm_expr(ready, 'tracks', 'track_artist', 'track_artist_norm')
+        a_name = self._norm_expr(ready, 'artists', 'name', 'name_norm')
 
         if title:
-            where_conditions.append("unidecode_lower(tracks.title) LIKE ?")
+            where_conditions.append(f"{t_title} LIKE ?")
             params.append(f"%{self._normalize_for_comparison(title)}%")
 
         if artist:
-            norm_artist = f"%{self._normalize_for_comparison(artist)}%"
-            where_conditions.append("(unidecode_lower(artists.name) LIKE ? OR unidecode_lower(COALESCE(tracks.track_artist, '')) LIKE ?)")
-            params.append(norm_artist)
-            params.append(norm_artist)
+            norm_artist_exact = self._normalize_for_comparison(artist)
+            norm_artist = f"%{norm_artist_exact}%"
+            # when the artist is in the library by exact normalized name the
+            # scan collapses to that artist's rows (idx_tracks_artist_id) plus
+            # the per-track credit index. only an unknown artist pays for the
+            # substring scan, and that scan is over a plain column now.
+            if artist_ids:
+                placeholders = ','.join('?' for _ in artist_ids)
+                where_conditions.append(
+                    f"(tracks.artist_id IN ({placeholders}) OR tracks.track_artist_norm = ?)")
+                params.extend(artist_ids)
+                params.append(norm_artist_exact)
+            elif credit_only:
+                # "A feat. B" rows filed under A, looked up by B's credit row
+                where_conditions.append(
+                    "tracks.id IN (SELECT track_id FROM track_credits WHERE name_norm = ?)")
+                params.append(norm_artist_exact)
+            else:
+                where_conditions.append(f"({a_name} LIKE ? OR {t_tartist} LIKE ?)")
+                params.append(norm_artist)
+                params.append(norm_artist)
 
         # Add server filter if specified
         if server_source:
@@ -7873,6 +11916,11 @@ class MusicDatabase:
 
         if not where_conditions:
             return []
+
+        # whose library the caller sees (#1199)
+        scope_sql, scope_params = self._current_scope_sql('tracks.owner_profile_id')
+        where_conditions.append(scope_sql)
+        params.extend(scope_params)
 
         where_clause = " AND ".join(where_conditions)
 
@@ -7887,18 +11935,18 @@ class MusicDatabase:
         if title:
             norm_title = self._normalize_for_comparison(title)
             order_parts.append(
-                "CASE WHEN unidecode_lower(tracks.title) = ? THEN 0 "
-                "WHEN unidecode_lower(tracks.title) LIKE ? THEN 1 ELSE 2 END")
+                f"CASE WHEN {t_title} = ? THEN 0 "
+                f"WHEN {t_title} LIKE ? THEN 1 ELSE 2 END")
             order_params.extend([norm_title, f"{norm_title}%"])
         _rank_artist = artist or rank_artist
         if _rank_artist:
             norm_artist = self._normalize_for_comparison(_rank_artist)
             order_parts.append(
-                "CASE WHEN unidecode_lower(artists.name) = ? THEN 0 "
-                "WHEN unidecode_lower(artists.name) LIKE ? THEN 1 ELSE 2 END")
+                f"CASE WHEN {a_name} = ? THEN 0 "
+                f"WHEN {a_name} LIKE ? THEN 1 ELSE 2 END")
             order_params.extend([norm_artist, f"%{norm_artist}%"])
-        order_parts.append("unidecode_lower(tracks.title)")
-        order_parts.append("unidecode_lower(artists.name)")
+        order_parts.append(t_title)
+        order_parts.append(a_name)
         order_by = ", ".join(order_parts)
 
         params.extend(order_params)
@@ -7922,26 +11970,24 @@ class MusicDatabase:
         return self._rows_to_tracks(rows)
 
     @staticmethod
-    def _fuzzy_terms(text: str) -> list:
+    def _fuzzy_terms(text: str) -> List[str]:
         """Words to fuzzy-match on, with punctuation trimmed off each END.
 
         Splitting on whitespace alone leaves punctuation glued to the token, so
-        "Would've, Could've, Should've" asked the database for ``%would've,%`` —
-        which only matches a title carrying the comma too. The LAST word is the
+        "Would've, Could've, Should've" asked the database for ``%would've,%``
+        — a title only matches if the comma is there too. The LAST word is the
         only one without trailing punctuation, so it was the only one matching
-        broadly, and a library file tagged without the commas therefore matched
-        ONE term where it should have matched three. Scoring then could not tell
-        the real track from anything else sharing that single word, and the tie
-        broke alphabetically. (Upstream #1159, reported by AfonsoG6.)
+        broadly, and the scoring below then couldn't tell the real track from
+        anything else sharing that one word. That is #1159: searching for
+        "Would've, Could've, Should've" returned other "Should've" songs and
+        buried the real one at rank 3, because a library file tagged without
+        the commas matched one term where it should have matched three.
 
-        This is the FUZZY fallback, which only runs when the basic LIKE search
-        found nothing — precisely the path taken when the library's tag differs
-        from the source title, which is when it is needed most.
-
-        Ends only, so internal punctuation survives: N.W.A, P!nk, AC/DC and
-        "pepper's" are real names. Strictly broader than before — the column
-        side keeps its own punctuation, so a trimmed term matches everything the
-        untrimmed one did and more. It can raise a row's score, never lower it.
+        Trimming ENDS only, so internal punctuation survives — N.W.A, P!nk and
+        "pepper's" have to stay intact. Strictly broader than before: the column
+        side keeps its punctuation (unidecode_lower only lowercases), so a
+        trimmed term matches everything the untrimmed one did and more. It can
+        raise a row's score, never lower it.
         """
         terms = []
         for word in (text or '').split():
@@ -7951,10 +11997,17 @@ class MusicDatabase:
         return terms
 
     def _search_tracks_fuzzy_rows(self, cursor, title: str, artist: str, limit: int,
-                                  server_source: Optional[str] = None):
-        """Broadest fuzzy search returning raw rows (shared by DatabaseTrack and dict-returning callers)."""
+                                  server_source: Optional[str] = None,
+                                  artist_ids: Optional[List[Any]] = None):
+        """Broadest fuzzy search returning raw rows (shared by DatabaseTrack and dict-returning callers).
+
+        with ``artist_ids`` the word-or match runs on the title only, inside
+        those artists' rows and exact credits: a fuzzy title match across every
+        artist in the library is how a different song by someone else gets
+        credited as owned."""
         # Get broader results by searching for individual words
         search_terms = []
+        title_words = []
         if title:
             title_words = self._fuzzy_terms(self._normalize_for_comparison(title))
             search_terms.extend(title_words)
@@ -7968,18 +12021,37 @@ class MusicDatabase:
 
         like_conditions = []
         params = []
+        ready = self._norm_ready(cursor)
+        t_title = self._norm_expr(ready, 'tracks', 'title', 'title_norm')
+        t_tartist = self._norm_expr(ready, 'tracks', 'track_artist', 'track_artist_norm')
+        a_name = self._norm_expr(ready, 'artists', 'name', 'name_norm')
 
-        for term in search_terms[:5]:
-            like_conditions.append("(unidecode_lower(tracks.title) LIKE ? OR unidecode_lower(artists.name) LIKE ? OR unidecode_lower(COALESCE(tracks.track_artist, '')) LIKE ?)")
-            params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
+        if artist_ids:
+            if not title_words:
+                return []
+            for term in title_words[:5]:
+                like_conditions.append(f"{t_title} LIKE ?")
+                params.append(f"%{term}%")
+        else:
+            for term in search_terms[:5]:
+                like_conditions.append(f"({t_title} LIKE ? OR {a_name} LIKE ? OR {t_tartist} LIKE ?)")
+                params.extend([f"%{term}%", f"%{term}%", f"%{term}%"])
 
         if not like_conditions:
             return []
 
         where_parts = [f"({' OR '.join(like_conditions)})"]
+        if artist_ids:
+            placeholders = ','.join('?' for _ in artist_ids)
+            where_parts.append(f"(tracks.artist_id IN ({placeholders}) OR tracks.track_artist_norm = ?)")
+            params.extend(artist_ids)
+            params.append(self._normalize_for_comparison(artist))
         if server_source:
             where_parts.append("tracks.server_source = ?")
             params.append(server_source)
+        scope_sql, scope_params = self._current_scope_sql('tracks.owner_profile_id')
+        where_parts.append(scope_sql)
+        params.extend(scope_params)
 
         where_clause = " AND ".join(where_parts)
         params.append(limit * 3)
@@ -8043,6 +12115,30 @@ class MusicDatabase:
             tracks.append(track)
         return tracks
     
+    _FTS_MAX_ROWIDS = 20000
+
+    def _albums_fts_rowids(self, cursor, needle: str) -> Optional[List[int]]:
+        """album rowids whose normalized title contains the needle, from the
+        trigram index: the same rows `title_norm LIKE '%needle%'` finds over
+        the table, without the table scan. None means "no index, do the
+        scan": no fts table, an empty needle, or more hits than are worth
+        listing (a one-letter needle matches most of the library)."""
+        if not needle:
+            return None
+        try:
+            cursor.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'albums_fts'")
+            if not cursor.fetchone():
+                return None
+            cursor.execute("SELECT rowid FROM albums_fts WHERE title_norm LIKE ? LIMIT ?",
+                           (f"%{needle}%", self._FTS_MAX_ROWIDS + 1))
+            rowids = [r[0] for r in cursor.fetchall()]
+            if len(rowids) > self._FTS_MAX_ROWIDS:
+                return None
+            return rowids
+        except Exception as e:
+            logger.debug(f"albums_fts lookup failed, scanning instead: {e}")
+            return None
+
     def search_albums(self, title: str = "", artist: str = "", limit: int = 50, server_source: Optional[str] = None) -> List[DatabaseAlbum]:
         """Search albums by title and/or artist name with fuzzy matching"""
         try:
@@ -8053,12 +12149,27 @@ class MusicDatabase:
             where_conditions = []
             params = []
             
+            ready = self._norm_ready(cursor)
+            al_title = self._norm_expr(ready, 'albums', 'title', 'title_norm')
+            a_name = self._norm_expr(ready, 'artists', 'name', 'name_norm')
+
             if title:
-                where_conditions.append("unidecode_lower(albums.title) LIKE ?")
-                params.append(f"%{self._normalize_for_comparison(title)}%")
+                needle = self._normalize_for_comparison(title)
+                fts_rowids = self._albums_fts_rowids(cursor, needle) if ready else None
+                if fts_rowids is not None:
+                    # the trigram index answers the same LIKE; the LIKE is
+                    # still applied to the listed rows, so the rows are exactly
+                    # the scan's rows without the scan
+                    if not fts_rowids:
+                        return []
+                    ph = ','.join('?' for _ in fts_rowids)
+                    where_conditions.append(f"albums.rowid IN ({ph})")
+                    params.extend(fts_rowids)
+                where_conditions.append(f"{al_title} LIKE ?")
+                params.append(f"%{needle}%")
 
             if artist:
-                where_conditions.append("unidecode_lower(artists.name) LIKE ?")
+                where_conditions.append(f"{a_name} LIKE ?")
                 params.append(f"%{self._normalize_for_comparison(artist)}%")
 
             if server_source:
@@ -8068,6 +12179,10 @@ class MusicDatabase:
             if not where_conditions:
                 # If no search criteria, return empty list
                 return []
+
+            scope_sql, scope_params = self._current_scope_sql('albums.owner_profile_id')
+            where_conditions.append(scope_sql)
+            params.extend(scope_params)
 
             where_clause = " AND ".join(where_conditions)
             params.append(limit)
@@ -8081,32 +12196,32 @@ class MusicDatabase:
                 LIMIT ?
             """, params)
             
-            rows = cursor.fetchall()
-            
-            albums = []
-            for row in rows:
-                genres = json.loads(row['genres']) if row['genres'] else None
-                album = DatabaseAlbum(
-                    id=row['id'],
-                    artist_id=row['artist_id'],
-                    title=row['title'],
-                    year=row['year'],
-                    thumb_url=row['thumb_url'],
-                    genres=genres,
-                    track_count=row['track_count'],
-                    duration=row['duration'],
-                    created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
-                    updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
-                )
-                # Add artist info for compatibility with Plex responses
-                album.artist_name = row['artist_name']
-                albums.append(album)
-            
-            return albums
+            return [self._album_row_to_dataclass(row) for row in cursor.fetchall()]
             
         except Exception as e:
             logger.error(f"Error searching albums with title='{title}', artist='{artist}': {e}")
             return []
+
+    @staticmethod
+    def _album_row_to_dataclass(row) -> DatabaseAlbum:
+        """an albums row joined with artists.name as artist_name -> DatabaseAlbum,
+        the shape search_albums has always returned."""
+        genres = json.loads(row['genres']) if row['genres'] else None
+        album = DatabaseAlbum(
+            id=row['id'],
+            artist_id=row['artist_id'],
+            title=row['title'],
+            year=row['year'],
+            thumb_url=row['thumb_url'],
+            genres=genres,
+            track_count=row['track_count'],
+            duration=row['duration'],
+            created_at=datetime.fromisoformat(row['created_at']) if row['created_at'] else None,
+            updated_at=datetime.fromisoformat(row['updated_at']) if row['updated_at'] else None
+        )
+        # Add artist info for compatibility with Plex responses
+        album.artist_name = row['artist_name']
+        return album
         
 
 
@@ -8147,7 +12262,84 @@ class MusicDatabase:
             return list(set(variations))
 
     
-    def check_track_exists(self, title: str, artist: str, confidence_threshold: float = 0.8, server_source: str = None, album: str = None, candidate_tracks: Optional[List[DatabaseTrack]] = None) -> Tuple[Optional[DatabaseTrack], float]:
+    def _exact_norm_tracks(self, cursor, title_variations: List[str], artist_variations: List[str],
+                           server_source: Optional[str] = None, limit: int = 50) -> List[DatabaseTrack]:
+        """rows whose normalized title AND normalized artist (album artist or
+        per-track credit) equal one of the given variations. one query, every
+        term indexed. requires the norm backfill to be complete."""
+        # the base title before a ' - qualifier' or a trailing bracket group
+        # ("Song - Remastered 2011", "Song (Live)") is what the library most
+        # often holds; it goes in as a candidate and the scorer decides whether
+        # the qualifier makes it a different recording, exactly as it would for
+        # the same row found by the substring search.
+        from core.text.title_match import base_title_before_dash
+        extra = []
+        for t in title_variations:
+            if not t:
+                continue
+            base = base_title_before_dash(t)
+            if base and base != t:
+                extra.append(base)
+            stripped = re.sub(r'\s*[\(\[][^\)\]]*[\)\]]\s*$', '', t).strip()
+            if stripped and stripped != t:
+                extra.append(stripped)
+        titles = list(dict.fromkeys(self._normalize_for_comparison(t) for t in [*title_variations, *extra] if t))
+        artists = list(dict.fromkeys(self._normalize_for_comparison(a) for a in artist_variations if a))
+        if not titles or not artists:
+            return []
+        t_ph = ','.join('?' for _ in titles)
+        a_ph = ','.join('?' for _ in artists)
+        sql = f"""
+            SELECT tracks.*, artists.name as artist_name, albums.title as album_title, albums.thumb_url as album_thumb_url
+            FROM tracks
+            JOIN artists ON tracks.artist_id = artists.id
+            JOIN albums ON tracks.album_id = albums.id
+            WHERE tracks.title_norm IN ({t_ph})
+              AND (artists.name_norm IN ({a_ph}) OR tracks.track_artist_norm IN ({a_ph}))
+        """
+        params: list = [*titles, *artists, *artists]
+        if server_source:
+            sql += " AND tracks.server_source = ?"
+            params.append(server_source)
+        scope_sql, scope_params = self._current_scope_sql('tracks.owner_profile_id')
+        sql += f" AND {scope_sql}"
+        params.extend(scope_params)
+        sql += " LIMIT ?"
+        params.append(limit)
+        cursor.execute(sql, params)
+        return self._rows_to_tracks(cursor.fetchall())
+
+    def _artist_present(self, cursor, artist_variations: List[str], server_source: Optional[str] = None) -> bool:
+        """does any of these artist names appear in the library at all: as an
+        artist row, as an exact per-track credit, or as one name inside a
+        credit ("A feat. B")? three index lookups."""
+        names = list(dict.fromkeys(self._normalize_for_comparison(a) for a in artist_variations if a))
+        if not names:
+            return False
+        ph = ','.join('?' for _ in names)
+        scope_sql, scope_params = self._current_scope_sql('owner_profile_id')
+        cursor.execute(f"SELECT 1 FROM artists WHERE name_norm IN ({ph}) AND {scope_sql} LIMIT 1", names + scope_params)
+        if cursor.fetchone():
+            return True
+        # punctuation-only differences ("ACDC" for "AC/DC") are the same
+        # artist; name_key drops the punctuation on both sides
+        from core.text.normalize import normalize_key
+        keys = list(dict.fromkeys(normalize_key(a) for a in artist_variations if a))
+        keys = [k for k in keys if k]
+        if keys:
+            kph = ','.join('?' for _ in keys)
+            cursor.execute(f"SELECT 1 FROM artists WHERE name_key IN ({kph}) AND {scope_sql} LIMIT 1", keys + scope_params)
+            if cursor.fetchone():
+                return True
+        cursor.execute(f"SELECT 1 FROM tracks WHERE track_artist_norm IN ({ph}) AND {scope_sql} LIMIT 1", names + scope_params)
+        if cursor.fetchone():
+            return True
+        cursor.execute(f"SELECT 1 FROM track_credits tc JOIN tracks ON tracks.id = tc.track_id "
+                       f"WHERE tc.name_norm IN ({ph}) AND {scope_sql.replace('owner_profile_id', 'tracks.owner_profile_id')} LIMIT 1",
+                       names + scope_params)
+        return cursor.fetchone() is not None
+
+    def check_track_exists(self, title: str, artist: str, confidence_threshold: float = 0.8, server_source: str = None, album: str = None, candidate_tracks: Optional[List[DatabaseTrack]] = None, candidate_tracks_exhaustive: bool = False, include_downloads: bool = False) -> Tuple[Optional[DatabaseTrack], float]:
         """
         Check if a track exists in the database with enhanced fuzzy matching and confidence scoring.
 
@@ -8157,6 +12349,13 @@ class MusicDatabase:
                               skipping the per-variation SQL loop. Intended for callers iterating
                               a discography that already fetched the artist's tracks once via
                               get_candidate_tracks_for_albums. None preserves original behavior.
+            candidate_tracks_exhaustive: when True, an EMPTY candidate_tracks list is the
+                              caller's assertion that the artist owns nothing in the library
+                              (the pre-fetch consulted the library and found zero rows) — the
+                              legacy variation loop is skipped for a fast miss. The
+                              album-aware fallback below still runs. Callers that pass []
+                              merely because a pool lookup came back empty (no information)
+                              must leave this False so the legacy path runs (#1621).
 
         Returns (track, confidence) tuple where confidence is 0.0-1.0
         """
@@ -8164,7 +12363,7 @@ class MusicDatabase:
             best_match = None
             best_confidence = 0.0
 
-            if candidate_tracks is not None:
+            if candidate_tracks:
                 # BATCHED PATH — score every pre-fetched track in-memory.
                 # _calculate_track_confidence already handles title normalization,
                 # so no need for the per-variation SQL widening.
@@ -8174,20 +12373,69 @@ class MusicDatabase:
                     if confidence > best_confidence:
                         best_confidence = confidence
                         best_match = track
+            elif candidate_tracks is not None and candidate_tracks_exhaustive:
+                # EXHAUSTIVE-EMPTY — the caller proved the artist has no library
+                # rows (discography pre-fetch found zero albums/tracks). Skip the
+                # legacy variation loop: scoring zero candidates in-memory is the
+                # fast "owns nothing" path those callers rely on (~15-30s/track
+                # otherwise). best_confidence stays 0.0 so the album-aware
+                # fallback below still runs — identical outcome to the old
+                # batched-against-zero-candidates behavior.
+                logger.debug(f"Enhanced track matching for '{title}' by '{artist}': exhaustive empty pool — skipping variation loop")
             else:
                 # LEGACY PATH — generate title variations and fire SQL per variation.
+                # None, or an empty list WITHOUT the exhaustive flag, means "no
+                # information" (e.g. the sync candidate pool found no rows), NOT
+                # "no match": fall through to the pre-#1289 per-variation SQL loop.
+                # (#1621: a 3,228-track Liked Songs sync matched 0 because []
+                # took the batched path and this loop never ran.)
                 title_variations = self._generate_track_title_variations(title)
+                artist_variations = self._get_artist_variations(artist)
 
                 logger.debug(f"Enhanced track matching for '{title}' by '{artist}': trying {len(title_variations)} variations")
                 for i, var in enumerate(title_variations):
                     logger.debug(f"  {i+1}. '{var}'")
 
+                # exact pass first: every (title variation x artist variation)
+                # pair in ONE indexed query on the normalized columns. this is
+                # the common case for an owned track and it never touches the
+                # substring scan. then, when the artist has no rows at all (no
+                # own rows, no exact credit, no "feat." credit) there is nothing
+                # for the variation loop to find, so it is skipped and the
+                # album-aware fallback below gets its turn.
+                run_variation_loop = True
+                # variations that normalize to the same text resolve to the
+                # same rows; search each distinct form once
+                distinct_artist_variations = list({self._normalize_for_comparison(a): a for a in artist_variations if a}.values())
+                conn = self._get_connection()
+                try:
+                    cursor = conn.cursor()
+                    if self._norm_ready(cursor):
+                        for track in self._exact_norm_tracks(cursor, title_variations, artist_variations, server_source):
+                            confidence = self._calculate_track_confidence(title, artist, track)
+                            if confidence > best_confidence:
+                                best_confidence = confidence
+                                best_match = track
+                        if best_confidence >= confidence_threshold:
+                            run_variation_loop = False
+                        else:
+                            # only the forms that exist somewhere in the
+                            # library get searched; a form with no rows would
+                            # send the loop into the whole-table substring pass
+                            distinct_artist_variations = [
+                                a for a in distinct_artist_variations
+                                if self._artist_present(cursor, [a], server_source)]
+                            if not distinct_artist_variations:
+                                logger.debug(f"'{artist}' has no rows in the library — skipping title search")
+                                run_variation_loop = False
+                finally:
+                    conn.close()
+
                 # Try each title variation
-                for title_variation in title_variations:
+                for title_variation in (title_variations if run_variation_loop else []):
                     # Search for potential matches with this variation
                     potential_matches = []
-                    artist_variations = self._get_artist_variations(artist)
-                    for artist_variation in artist_variations:
+                    for artist_variation in distinct_artist_variations:
                         potential_matches.extend(self.search_tracks(title=title_variation, artist=artist_variation, limit=20, server_source=server_source))
 
                     if not potential_matches:
@@ -8211,9 +12459,116 @@ class MusicDatabase:
 
             # Album-aware fallback: find album by title (any artist), check tracks on it
             # Handles multi-artist albums filed under a different artist in the library
-            if album and best_confidence < confidence_threshold:
+            if album and (artist or '').strip() and best_confidence < confidence_threshold:
                 logger.debug(f"Artist-specific search failed, trying album-aware fallback: '{title}' on '{album}'")
                 try:
+                    # (#1715) Evidence helpers, computed once per call. A
+                    # "placeholder" artist name carries no artist evidence
+                    # either way; anything else is a real filing/credit
+                    # that can agree or conflict with the searched artist.
+                    try:
+                        from core.imports.compilation import is_various_artists_name as _is_va_name
+                    except Exception as _va_import_err:
+                        logger.debug(f"Album-aware fallback: VA-name helper unavailable: {_va_import_err}")
+                        _is_va_name = None
+                    try:
+                        from core.text.normalize import normalize_key as _artist_nkey
+                    except Exception as _nkey_import_err:
+                        logger.debug(f"Album-aware fallback: normalize_key unavailable: {_nkey_import_err}")
+                        _artist_nkey = self._normalize_for_comparison
+                    _placeholder_squashed = {
+                        'unknown', 'unknownartist', 'unknownartists',
+                        'artistunknown', 'noartist', 'unknownalbum',
+                        'unknownalbumartist', 'untitled',
+                    }
+
+                    def _placeholder_artist(name):
+                        n = (name or '').strip()
+                        if not n:
+                            return True
+                        if _is_va_name is not None and _is_va_name(n):
+                            return True
+                        # MusicBrainz/Picard spellings: '[Unknown]',
+                        # '<Unknown>', '[No Artist]' — brackets are
+                        # punctuation around the placeholder, not a name.
+                        core = self._normalize_for_comparison(n).strip(' []<>(){}')
+                        return core.replace(' ', '') in _placeholder_squashed
+
+                    # Exact artist-evidence keys for the searched artist:
+                    # every known variation, keyed the way artists.name_key
+                    # is ('AC/DC' == 'ACDC', spacing unified). Fuzzy
+                    # similarity is NOT identity — edit-distance-1 names
+                    # (John William vs John Williams) must not pass.
+                    _artist_keys = {
+                        _artist_nkey(v) for v in self._get_artist_variations(artist)
+                    } | {_artist_nkey(artist)}
+                    _split_re = r'\s*(?:[;,&]|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bvs\.?\b|\bx\b)\s*'
+
+                    def _evidence_keys(db_track):
+                        """Keyed artist names the row evidences: the album
+                        artist and the per-track credit, each whole and
+                        split on credit delimiters — a joint filing
+                        ('Simon & Garfunkel', 'Tony Bennett & Lady Gaga')
+                        evidences EACH partner, in either field."""
+                        keys = set()
+                        for name in (db_track.artist_name, getattr(db_track, 'track_artist', None)):
+                            if not name:
+                                continue
+                            keys.add(_artist_nkey(name))
+                            for piece in re.split(_split_re, self._normalize_for_comparison(name), flags=re.IGNORECASE):
+                                if piece.strip():
+                                    keys.add(_artist_nkey(piece))
+                        return keys
+
+                    def _fallback_row_confidence(db_track):
+                        """(confidence, is_evidence) for one fallback row,
+                        or None when the row must not match. (#1715) This
+                        fallback used to take title_sim as the whole
+                        confidence, so a same-titled track on a same-named
+                        album by a COMPLETELY DIFFERENT artist matched at
+                        1.0: playlist sync put the wrong song on the
+                        playlist and counted the real track as owned, so
+                        it was never wishlisted or downloaded."""
+                        _title_score, _title_passed = self._score_title_similarity(title, db_track)
+                        if not _title_passed:
+                            return None
+                        if _placeholder_artist(db_track.track_artist) and _placeholder_artist(db_track.artist_name):
+                            # No usable artist evidence anywhere on the
+                            # row (placeholder album artist and a
+                            # placeholder or missing credit — the
+                            # soundtrack-rip shape). Title+album is the
+                            # only signal, so the title must clear every
+                            # guard the scorer applies AND be
+                            # near-identical: a merely similar title here
+                            # is a different song ('Believe' vs
+                            # 'Believer'), which a raw char ratio waved
+                            # through.
+                            if _title_score < 0.95:
+                                return None
+                            return _title_score, False
+                        # The row DOES carry artist evidence — a real
+                        # per-track credit, or filing under a specific
+                        # artist. This fallback is the only path that can
+                        # surface a cross-artist row at all, so the
+                        # evidence must be exact: a keyed name/piece equal
+                        # to a searched-artist variation. Deliberate
+                        # trade: a soundtrack filed under its composer
+                        # with no per-track credit no longer matches its
+                        # performer here — that filing is
+                        # indistinguishable from the wrong-artist case
+                        # above. An exact key is artist similarity 1.0,
+                        # so the confidence is the scorer's weighting
+                        # with the artist term at full marks.
+                        if not (_evidence_keys(db_track) & _artist_keys):
+                            return None
+                        return _title_score * 0.5 + 0.5, True
+
+                    _fallback_gate = max(0.7, confidence_threshold)
+                    _evidence_best = None
+                    _evidence_best_conf = 0.0
+                    _plain_best = None
+                    _plain_best_conf = 0.0
+
                     album_candidates = self.search_albums(title=album, artist="", limit=10, server_source=server_source)
                     for album_candidate in album_candidates:
                         album_title_sim = max(
@@ -8234,8 +12589,10 @@ class MusicDatabase:
                             JOIN albums al ON al.id = t.album_id
                             WHERE t.album_id = ? {source_filter}
                         """, params)
+                        _rows = cursor.fetchall()
+                        conn.close()
 
-                        for row in cursor.fetchall():
+                        for row in _rows:
                             # DatabaseTrack is a strict dataclass — only the declared
                             # fields go in __init__; the joined artist/album/server
                             # values are attached afterwards just like _rows_to_tracks
@@ -8252,19 +12609,50 @@ class MusicDatabase:
                             db_track.album_title = row['album_title']
                             db_track.server_source = row['server_source']
                             db_track.track_artist = row['track_artist'] if 'track_artist' in row.keys() else None
-                            title_sim = max(
-                                self._string_similarity(self._normalize_for_comparison(title), self._normalize_for_comparison(db_track.title)),
-                                self._string_similarity(self._clean_track_title_for_comparison(title), self._clean_track_title_for_comparison(db_track.title))
-                            )
-                            if title_sim > best_confidence and title_sim >= 0.7:
-                                best_confidence = title_sim
-                                best_match = db_track
+                            try:
+                                _scored = _fallback_row_confidence(db_track)
+                            except Exception as _row_err:
+                                # One bad row must not abandon the whole
+                                # fallback (remaining rows/albums may hold
+                                # the real match).
+                                logger.debug(f"Album-aware fallback row scoring failed for '{db_track.title}': {_row_err}")
+                                continue
+                            if _scored is None:
+                                continue
+                            _conf, _is_evidence = _scored
+                            if _is_evidence:
+                                if _conf > _evidence_best_conf:
+                                    _evidence_best_conf = _conf
+                                    _evidence_best = db_track
+                            elif _conf > _plain_best_conf:
+                                _plain_best_conf = _conf
+                                _plain_best = db_track
 
-                        if best_match and best_confidence >= 0.7:
-                            logger.debug(f"Album-aware fallback matched: '{title}' on '{album}' -> '{best_match.title}' by '{best_match.artist_name}' (title_sim: {best_confidence:.3f})")
-                            return best_match, best_confidence
+                    # A row WITH artist evidence outranks a no-evidence row
+                    # even at a lower weighted confidence: the scales are
+                    # not comparable (pure guarded title vs title+artist),
+                    # and the credited row is the one whose artist agrees.
+                    if _evidence_best is not None and _evidence_best_conf >= _fallback_gate:
+                        logger.debug(f"Album-aware fallback matched: '{title}' on '{album}' -> '{_evidence_best.title}' by '{_evidence_best.artist_name}' (confidence: {_evidence_best_conf:.3f})")
+                        return _evidence_best, _evidence_best_conf
+                    if _plain_best is not None and _plain_best_conf >= _fallback_gate:
+                        logger.debug(f"Album-aware fallback matched: '{title}' on '{album}' -> '{_plain_best.title}' by '{_plain_best.artist_name}' (confidence: {_plain_best_conf:.3f})")
+                        return _plain_best, _plain_best_conf
+                    # Fold the strongest fallback score into the diagnostic
+                    # best the no-match return below reports.
+                    for _m, _c in ((_evidence_best, _evidence_best_conf), (_plain_best, _plain_best_conf)):
+                        if _m is not None and _c > best_confidence:
+                            best_match = _m
+                            best_confidence = _c
                 except Exception as album_fallback_err:
                     logger.debug(f"Album-aware fallback error: {album_fallback_err}")
+
+            # Only callers that ask "do we already have this file" opt in. A sync
+            # asks "is it on the media server", and a ``routed:`` id means nothing there.
+            if include_downloads:
+                routed = self._routed_download_match(title, artist, confidence_threshold)
+                if routed is not None:
+                    return routed
 
             logger.debug(f"No confident track match for '{title}' (best: {best_confidence:.3f}, threshold: {confidence_threshold})")
             return None, best_confidence
@@ -8272,6 +12660,41 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error checking track existence for '{title}' by '{artist}': {e}")
             return None, 0.0
+
+    def _routed_download_match(self, title: str, artist: str, confidence_threshold: float):
+        """Ownership for artists routed to the audiobook library.
+
+        Their files never reach the media server's library, so the ``tracks``
+        table can't know them and every sync would fetch them again. The
+        download ledger can: a completed download whose file still exists
+        counts as owned. Returns ``(track, confidence)`` or None.
+        """
+        from core.audiobook_routing import existing_download_path, is_routed_artist, route_key
+        if not is_routed_artist(artist, self):
+            return None
+        key = route_key(artist)
+        with self._get_connection() as conn:
+            rows = conn.cursor().execute(
+                "SELECT id, file_path, track_title, track_artist, track_album "
+                "FROM track_downloads WHERE status = 'completed' AND file_path IS NOT NULL "
+                "AND track_artist IS NOT NULL").fetchall()
+        best, best_confidence = None, 0.0
+        for row in rows:
+            if route_key(row['track_artist']) != key:
+                continue
+            candidate = DatabaseTrack(
+                id=f"routed:{row['id']}", album_id=None, artist_id=None,
+                title=row['track_title'] or '', file_path=row['file_path'])
+            candidate.artist_name = row['track_artist']
+            candidate.album_title = row['track_album'] or ''
+            confidence = self._calculate_track_confidence(title, artist, candidate)
+            if confidence <= best_confidence or confidence < confidence_threshold:
+                continue
+            found = existing_download_path(row['file_path'])
+            if found:
+                candidate.file_path = found
+                best, best_confidence = candidate, confidence
+        return (best, best_confidence) if best else None
     
     def check_album_exists(self, title: str, artist: str, confidence_threshold: float = 0.8) -> Tuple[Optional[DatabaseAlbum], float]:
         """
@@ -8384,14 +12807,40 @@ class MusicDatabase:
         
         return max(0.0, similarity)
     
-    def check_album_completeness(self, album_id: int, expected_track_count: Optional[int] = None) -> Tuple[int, int, bool, List[str]]:
+    def check_album_completeness(self, album_id: int, expected_track_count: Optional[int] = None, completeness_cache: Optional[Dict[Any, Any]] = None) -> Tuple[int, int, bool, List[str]]:
         """
         Check if we have all tracks for an album.
         Merges counts across split album entries (same title+year+artist) so that
         albums split by the media server (e.g. Navidrome) are treated as one.
         Returns (owned_tracks, expected_tracks, is_complete, formats)
-        where formats is a list of distinct format strings like ["FLAC"] or ["FLAC", "MP3-320"]
+        where formats is a list of distinct format strings like ["FLAC"] or ["FLAC", "MP3-320"].
+
+        When `completeness_cache` is provided (via build_candidate_completeness_cache),
+        completeness is evaluated in O(1) in-memory from pre-fetched candidate albums and tracks
+        without firing 5 SQL queries per matched album.
         """
+        if completeness_cache and album_id in completeness_cache:
+            cached = completeness_cache[album_id]
+            owned_tracks = cached.get('owned_tracks', 0)
+            stored_track_count = cached.get('stored_track_count', 0)
+            formats = cached.get('formats', [])
+
+            if (expected_track_count is not None and stored_track_count > 0
+                    and owned_tracks >= stored_track_count
+                    and stored_track_count >= expected_track_count * 0.6):
+                expected_tracks = stored_track_count
+            elif expected_track_count is not None:
+                expected_tracks = expected_track_count
+            else:
+                expected_tracks = stored_track_count
+
+            if expected_tracks and expected_tracks > 0:
+                is_complete = owned_tracks >= expected_tracks
+            else:
+                is_complete = owned_tracks > 0
+
+            return owned_tracks, expected_tracks or 0, is_complete, formats
+
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -8484,6 +12933,76 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error getting album formats: {e}")
             return []
+
+    def build_candidate_completeness_cache(self, candidate_albums: Optional[List[Any]], candidate_tracks: Optional[List[Any]]) -> Dict[Any, Any]:
+        """Precompute completeness metrics (owned tracks, stored track count, formats)
+        for all candidate albums in memory using candidate_tracks.
+        Eliminates the 5 SQL queries per matched album in check_album_completeness."""
+        if not candidate_albums:
+            return {}
+
+        from collections import defaultdict
+        groups = defaultdict(list)
+        for album in candidate_albums:
+            title = getattr(album, 'title', None)
+            artist_id = getattr(album, 'artist_id', None)
+            year = getattr(album, 'year', None)
+            groups[(title, artist_id, year)].append(album)
+
+        tracks_by_album = defaultdict(list)
+        if candidate_tracks:
+            for track in candidate_tracks:
+                aid = getattr(track, 'album_id', None)
+                if aid is not None:
+                    tracks_by_album[aid].append(track)
+
+        ascii_lower = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+        cache = {}
+        for siblings in groups.values():
+            sibling_ids = [getattr(s, 'id', None) for s in siblings if getattr(s, 'id', None) is not None]
+            stored_track_count = max(((getattr(s, 'track_count', None) or 0) for s in siblings), default=0)
+
+            sibling_tracks = []
+            for sid in sibling_ids:
+                sibling_tracks.extend(tracks_by_album.get(sid, []))
+
+            distinct_track_set = set()
+            format_set = set()
+            for t in sibling_tracks:
+                fp = getattr(t, 'file_path', None)
+                if fp is None or fp == '':
+                    continue
+                # Match SQLite LOWER: ASCII only, preserving whitespace and NULL.
+                t_title = getattr(t, 'title', None)
+                if t_title is not None:
+                    t_title = t_title.translate(ascii_lower)
+                t_num = getattr(t, 'track_number', None)
+                distinct_track_set.add((t_title, t_num))
+
+                ext = os.path.splitext(str(fp))[1].lstrip('.').upper()
+                if not ext:
+                    continue
+                bitrate = getattr(t, 'bitrate', None)
+                if ext == 'MP3' and bitrate:
+                    format_set.add(f"MP3-{bitrate}")
+                elif ext == 'MP3':
+                    format_set.add('MP3')
+                else:
+                    format_set.add(ext)
+
+            owned_tracks = len(distinct_track_set)
+            formats = sorted(format_set)
+
+            summary = {
+                'owned_tracks': owned_tracks,
+                'stored_track_count': stored_track_count,
+                'formats': formats,
+                'sibling_ids': sibling_ids,
+            }
+            for sid in sibling_ids:
+                cache[sid] = summary
+
+        return cache
     
     def get_candidate_albums_for_artist(self, artist: str, server_source: Optional[str] = None, limit: int = 200) -> List[DatabaseAlbum]:
         """
@@ -8495,7 +13014,57 @@ class MusicDatabase:
         candidates: List[DatabaseAlbum] = []
         try:
             seen_ids = set()
-            for artist_var in self._get_artist_variations(artist):
+            variations = self._get_artist_variations(artist)
+            # the artist's own rows by indexed name (norm and punctuation-folded
+            # key), then albums by artist_id. this ran search_albums per name
+            # variation, each a LIKE substring scan of every album in the
+            # library: 5.4 s for 16 albums on a 70k-album library, before a
+            # single card was checked. the substring path stays as the
+            # fallback for a name the indexes cannot resolve.
+            artist_ids: List[Any] = []
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                if self._norm_ready(cursor):
+                    from core.text.normalize import normalize_key
+                    norms = list(dict.fromkeys(self._normalize_for_comparison(v) for v in variations if v))
+                    keys = list(dict.fromkeys(normalize_key(v) for v in variations if v))
+                    keys = [k for k in keys if k]
+                    if norms:
+                        cursor.execute(f"SELECT id FROM artists WHERE name_norm IN ({','.join('?' for _ in norms)})", norms)
+                        artist_ids += [r[0] for r in cursor.fetchall()]
+                    if keys:
+                        cursor.execute(f"SELECT id FROM artists WHERE name_key IN ({','.join('?' for _ in keys)})", keys)
+                        artist_ids += [r[0] for r in cursor.fetchall()]
+                artist_ids = list(dict.fromkeys(artist_ids))
+                if artist_ids:
+                    ph = ','.join('?' for _ in artist_ids)
+                    params: list = list(artist_ids)
+                    src = ""
+                    if server_source:
+                        src = " AND albums.server_source = ?"
+                        params.append(server_source)
+                    scope_sql, scope_params = self._current_scope_sql('albums.owner_profile_id')
+                    params.extend(scope_params)
+                    params.append(limit)
+                    cursor.execute(f"""
+                        SELECT albums.*, artists.name as artist_name
+                        FROM albums
+                        JOIN artists ON albums.artist_id = artists.id
+                        WHERE albums.artist_id IN ({ph}){src} AND {scope_sql}
+                        ORDER BY albums.title, artists.name
+                        LIMIT ?
+                    """, params)
+                    for row in cursor.fetchall():
+                        if row['id'] in seen_ids:
+                            continue
+                        seen_ids.add(row['id'])
+                        candidates.append(self._album_row_to_dataclass(row))
+            finally:
+                conn.close()
+            if candidates:
+                return candidates
+            for artist_var in variations:
                 found = self.search_albums(title="", artist=artist_var, limit=limit, server_source=server_source)
                 for album in found:
                     if album.id not in seen_ids:
@@ -8508,10 +13077,26 @@ class MusicDatabase:
 
     def get_artist_tracks_indexed(self, name: str, server_source: Optional[str] = None, limit: int = 10000) -> List[DatabaseTrack]:
         """Indexed two-step lookup: artist_id by exact name (then case-insensitive
-        fallback), then tracks via `artist_id IN (...)`. Avoids the function-in-WHERE
-        pattern in search_tracks that defeats the artists.name index. Returns []
-        when the artist isn't in the library — caller can decide to fall back to
-        the slower LIKE-based path for track_artist / diacritic recall."""
+        fallback), then tracks via `artist_id IN (...)` OR an exact
+        `tracks.track_artist_norm` credit (indexed). The credit arm covers
+        compilation/soundtrack tracks credited to a single per-track artist
+        name, where the artist may not even have an artist row of their own —
+        the #1621 gap where the pool came back [] and the batched matcher
+        scored zero candidates. It is exact equality on the full normalized
+        credit string, so split "feat." credits (e.g. "Calvin Harris feat.
+        Rihanna" for a query of "Rihanna") still resolve via the legacy
+        variation loop's track_credits check, not here. Avoids the function-in-WHERE pattern in search_tracks that
+        defeats the artists.name index. Returns [] when the artist isn't in the
+        library by any of these keys — caller can decide to fall back to the
+        slower LIKE-based path for diacritic/punctuation recall.
+
+        Measurement (#1621, Oct 10 2026): on compilation shapes the credit arm
+        adds only the credited rows (Nirvana 0->2, AC/DC guest appearance 3->4,
+        ~3-6ms per lookup, both arms indexed; "Various Artists" query shows no
+        blowup) and batched match outcomes are identical to the legacy path on
+        every measured shape — no false positives. Punctuation variants (ACDC)
+        and diacritics still resolve via the caller's search_tracks fallback /
+        the legacy variation loop; intentionally not folded in here."""
         if not name:
             return []
         try:
@@ -8523,21 +13108,41 @@ class MusicDatabase:
             cursor.execute("SELECT id FROM artists WHERE name = ?", (name,))
             artist_ids = [r['id'] for r in cursor.fetchall()]
 
-            # Step 2: case-insensitive fallback if exact missed. Full scan, but only
-            # runs on the (uncommon) miss path so amortized cost stays low.
+            # Step 2: case + accent insensitive fallback if exact missed, on the
+            # indexed name_norm column (a LOWER(name) scan of artists before).
+            ready = self._norm_ready(cursor)
             if not artist_ids:
-                cursor.execute("SELECT id FROM artists WHERE LOWER(name) = LOWER(?)", (name,))
+                if ready:
+                    cursor.execute("SELECT id FROM artists WHERE name_norm = ?",
+                                   (self._normalize_for_comparison(name),))
+                else:
+                    cursor.execute("SELECT id FROM artists WHERE LOWER(name) = LOWER(?)", (name,))
                 artist_ids = [r['id'] for r in cursor.fetchall()]
 
-            if not artist_ids:
+            where_parts: list = []
+            params: list = []
+            if artist_ids:
+                placeholders = ','.join('?' for _ in artist_ids)
+                where_parts.append(f"t.artist_id IN ({placeholders})")
+                params.extend(artist_ids)
+            if ready:
+                # Per-track credit arm (#1621): tracks.track_artist_norm is
+                # indexed, so this is one cheap equality lookup, not a scan.
+                credit_norm = self._normalize_for_comparison(name)
+                if credit_norm:
+                    where_parts.append("t.track_artist_norm = ?")
+                    params.append(credit_norm)
+
+            if not where_parts:
                 return []
 
-            placeholders = ','.join('?' for _ in artist_ids)
-            where = f"t.artist_id IN ({placeholders})"
-            params: list = list(artist_ids)
+            where = "(" + " OR ".join(where_parts) + ")"
             if server_source:
                 where += " AND t.server_source = ?"
                 params.append(server_source)
+            scope_sql, scope_params = self._current_scope_sql('t.owner_profile_id')
+            where += f' AND {scope_sql}'
+            params.extend(scope_params)
             params.append(limit)
 
             cursor.execute(f"""
@@ -8567,13 +13172,14 @@ class MusicDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
             placeholders = ','.join('?' for _ in album_ids)
+            scope_sql, scope_params = self._current_scope_sql('t.owner_profile_id')
             cursor.execute(f"""
                 SELECT t.*, a.name as artist_name, al.title as album_title, al.thumb_url as album_thumb_url
                 FROM tracks t
                 JOIN artists a ON a.id = t.artist_id
                 JOIN albums al ON al.id = t.album_id
-                WHERE t.album_id IN ({placeholders})
-            """, list(album_ids))
+                WHERE t.album_id IN ({placeholders}) AND {scope_sql}
+            """, list(album_ids) + scope_params)
             rows = cursor.fetchall()
             tracks: List[DatabaseTrack] = []
             for row in rows:
@@ -8592,6 +13198,7 @@ class MusicDatabase:
                 track.album_title = row['album_title']
                 track.album_thumb_url = row['album_thumb_url'] if 'album_thumb_url' in row.keys() else ''
                 track.server_source = row['server_source'] if 'server_source' in row.keys() else ''
+                track.track_artist = row['track_artist'] if 'track_artist' in row.keys() else None
                 tracks.append(track)
             return tracks
         except Exception as e:
@@ -8607,6 +13214,60 @@ class MusicDatabase:
         'album_itunes_id', 'musicbrainz_release_id', 'qobuz_id', 'tidal_id',
         'amazon_id', 'audiodb_id', 'jiosaavn_id',
     )
+
+    def get_album_api_track_counts(self, album_ids) -> Dict[Any, int]:
+        """{album_db_id: api_track_count} for the rows that have one, one
+        query. the enrichment workers fill this column from the metadata
+        provider; the artist page reads it so an owned album's expected
+        count is a lookup, not a fetch."""
+        if not album_ids:
+            return {}
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA table_info(albums)")
+            if 'api_track_count' not in {row[1] for row in cursor.fetchall()}:
+                return {}
+            placeholders = ','.join(['?'] * len(album_ids))
+            cursor.execute(
+                f"SELECT id, api_track_count FROM albums WHERE id IN ({placeholders}) "
+                "AND api_track_count IS NOT NULL AND api_track_count > 0",
+                [str(a) for a in album_ids])
+            return {row['id']: int(row['api_track_count']) for row in cursor.fetchall()}
+        except Exception as e:
+            logger.debug("get_album_api_track_counts failed: %s", e)
+            return {}
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def set_album_api_track_count(self, album_id, count) -> bool:
+        """remember a provider's track count for an album (only when it has
+        none yet, and only a positive number). same column and same rule as
+        the enrichment workers' set_album_api_track_count."""
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            return False
+        if n <= 0:
+            return False
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE albums SET api_track_count = ? WHERE id = ? "
+                "AND (api_track_count IS NULL OR api_track_count <= 0)",
+                (n, album_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.debug("set_album_api_track_count failed for %s: %s", album_id, e)
+            return False
+        finally:
+            if conn is not None:
+                conn.close()
 
     def get_album_source_ids(self, album_ids):
         """{album_db_id: {column: value}} for the per-source enrichment id
@@ -8641,7 +13302,7 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
-    def check_album_exists_with_completeness(self, title: str, artist: str, expected_track_count: Optional[int] = None, confidence_threshold: float = 0.8, server_source: Optional[str] = None, candidate_albums: Optional[List[DatabaseAlbum]] = None, strict_discography_match: bool = False, expected_year=None) -> Tuple[Optional[DatabaseAlbum], float, int, int, bool, List[str]]:
+    def check_album_exists_with_completeness(self, title: str, artist: str, expected_track_count: Optional[int] = None, confidence_threshold: float = 0.8, server_source: Optional[str] = None, candidate_albums: Optional[List[DatabaseAlbum]] = None, strict_discography_match: bool = False, expected_year=None, completeness_cache: Optional[Dict[Any, Any]] = None, candidate_tracks: Optional[List[Any]] = None, metadata_source: Optional[str] = None, card_source_id: Optional[str] = None, strip_single_kind: bool = False) -> Tuple[Optional[DatabaseAlbum], float, int, int, bool, List[str]]:
         """
         Check if an album exists in the database with completeness information.
         Enhanced to handle edition matching (standard <-> deluxe variants).
@@ -8650,16 +13311,27 @@ class MusicDatabase:
         When `candidate_albums` is provided (via get_candidate_albums_for_artist),
         the matcher runs in-memory against that list instead of firing per-album
         SQL searches. `None` preserves the original search-every-time behavior.
+
+        `metadata_source` is the metadata provider the card came from
+        ('deezer', 'spotify', ...). Only 'deezer' relaxes the re-release year
+        gate (its release_date is the digital reissue date); any other value
+        keeps the historical behavior byte-for-byte. `card_source_id` is the
+        card's provider-side album id (Deezer album id for Deezer cards): when
+        the library candidate carries a different stored Deezer id, that is
+        hard proof of different releases and the exemption does not fire.
         """
         try:
             # Try enhanced edition-aware matching first with expected track count for Smart Edition Matching
-            album, confidence = self.check_album_exists_with_editions(title, artist, confidence_threshold, expected_track_count, server_source, candidate_albums=candidate_albums, strict_discography_match=strict_discography_match, expected_year=expected_year)
+            album, confidence = self.check_album_exists_with_editions(title, artist, confidence_threshold, expected_track_count, server_source, candidate_albums=candidate_albums, strict_discography_match=strict_discography_match, expected_year=expected_year, metadata_source=metadata_source, card_source_id=card_source_id, strip_single_kind=strip_single_kind)
 
             if not album:
                 return None, 0.0, 0, 0, False, []
 
+            if completeness_cache is None and candidate_albums is not None and candidate_tracks is not None:
+                completeness_cache = self.build_candidate_completeness_cache(candidate_albums, candidate_tracks)
+
             # Now check completeness (includes formats)
-            owned_tracks, expected_tracks, is_complete, formats = self.check_album_completeness(album.id, expected_track_count)
+            owned_tracks, expected_tracks, is_complete, formats = self.check_album_completeness(album.id, expected_track_count, completeness_cache=completeness_cache)
 
             return album, confidence, owned_tracks, expected_tracks, is_complete, formats
 
@@ -8667,7 +13339,7 @@ class MusicDatabase:
             logger.error(f"Error checking album existence with completeness for '{title}' by '{artist}': {e}")
             return None, 0.0, 0, 0, False, []
     
-    def check_album_exists_with_editions(self, title: str, artist: str, confidence_threshold: float = 0.8, expected_track_count: Optional[int] = None, server_source: Optional[str] = None, candidate_albums: Optional[List[DatabaseAlbum]] = None, strict_discography_match: bool = False, expected_year=None) -> Tuple[Optional[DatabaseAlbum], float]:
+    def check_album_exists_with_editions(self, title: str, artist: str, confidence_threshold: float = 0.8, expected_track_count: Optional[int] = None, server_source: Optional[str] = None, candidate_albums: Optional[List[DatabaseAlbum]] = None, strict_discography_match: bool = False, expected_year=None, metadata_source: Optional[str] = None, card_source_id: Optional[str] = None, strip_single_kind: bool = False) -> Tuple[Optional[DatabaseAlbum], float]:
         """
         Enhanced album existence check that handles edition variants.
         Matches standard albums with deluxe/platinum/special editions and vice versa.
@@ -8689,8 +13361,35 @@ class MusicDatabase:
                 # expected-track-count edition matching, so we don't need the
                 # per-variation SQL widening that the legacy path does.
                 logger.debug(f"Edition matching for '{title}' by '{artist}': batched against {len(candidate_albums)} candidates")
+                # #1289 (Deezer reissue dates): Deezer's release_date is the
+                # digital reissue date, so a year mismatch on a DEEZER card no
+                # longer proves "different release". When exactly ONE candidate
+                # has an exact normalized-title match, the year cannot be
+                # disambiguating anything — skip the re-release year gate for
+                # that candidate only. Scoped to Deezer: other sources'
+                # release years are trustworthy originals, so their gate (and
+                # any unknown/None source) stays byte-for-byte as before.
+                # With 0 or >=2 same-title candidates the gate stays exactly
+                # as before (>=2 is the true re-release ambiguity it was built
+                # for). Even for a single candidate the exemption does NOT fire
+                # when the library row carries a stored Deezer id that conflicts
+                # with the card's — hard proof of different releases (e.g. owned
+                # standard vs deluxe card). Normalization here is diacritics/case
+                # only, NOT edition-stripping, so "X (Deluxe)" never counts as "X".
+                gate_exempt = None
+                if expected_year is not None and (metadata_source or "").strip().lower() == "deezer":
+                    wanted_norm = self._normalize_for_comparison(title or "")
+                    if wanted_norm:
+                        exact = [a for a in candidate_albums
+                                 if self._normalize_for_comparison(getattr(a, "title", "") or "") == wanted_norm]
+                        if len(exact) == 1:
+                            candidate = exact[0]
+                            if not _deezer_id_conflicts_with_card(self, getattr(candidate, "id", None), card_source_id):
+                                gate_exempt = candidate
+                                logger.debug(f"  Year gate skipped for single exact-title candidate '{title}' (deezer card, #1289)")
                 for album in candidate_albums:
-                    confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year)
+                    ey = None if album is gate_exempt else expected_year
+                    confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=ey, strip_single_kind=strip_single_kind)
                     if confidence > best_confidence:
                         best_confidence = confidence
                         best_match = album
@@ -8723,7 +13422,7 @@ class MusicDatabase:
 
                     # Score each potential match with Smart Edition Matching
                     for album in albums:
-                        confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year)
+                        confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year, strip_single_kind=strip_single_kind)
                         logger.debug(f"  '{album.title}' confidence: {confidence:.3f}")
 
                         if confidence > best_confidence:
@@ -8759,7 +13458,7 @@ class MusicDatabase:
                             logger.debug(f"  Found {len(artist_albums)} total albums for artist fallback")
 
                         for album in artist_albums:
-                            confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year)
+                            confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year, strip_single_kind=strip_single_kind)
                             if confidence > best_confidence:
                                 best_confidence = confidence
                                 best_match = album
@@ -8778,7 +13477,7 @@ class MusicDatabase:
                 try:
                     title_only_albums = self.search_albums(title=title, artist="", limit=20, server_source=server_source)
                     for album in title_only_albums:
-                        confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year)
+                        confidence = self._calculate_album_confidence(title, artist, album, expected_track_count, strict_discography_match=strict_discography_match, expected_year=expected_year, strip_single_kind=strip_single_kind)
                         # Slightly penalize cross-artist matches to prefer same-artist when possible
                         if confidence > best_confidence:
                             best_confidence = confidence
@@ -8915,16 +13614,17 @@ class MusicDatabase:
             return False
         return abs(ey - ay) > tolerance
 
-    def _calculate_album_confidence(self, search_title: str, search_artist: str, db_album: DatabaseAlbum, expected_track_count: Optional[int] = None, strict_discography_match: bool = False, expected_year=None) -> float:
+    def _calculate_album_confidence(self, search_title: str, search_artist: str, db_album: DatabaseAlbum, expected_track_count: Optional[int] = None, strict_discography_match: bool = False, expected_year=None, strip_single_kind: bool = False) -> float:
         """Calculate confidence score for album match with Smart Edition Matching"""
         try:
             # Simple confidence based on string similarity
             title_similarity = self._string_similarity(search_title.lower(), db_album.title.lower())
-            artist_similarity = self._string_similarity(search_artist.lower(), db_album.artist_name.lower())
+            db_artist = getattr(db_album, 'artist_name', None) or search_artist
+            artist_similarity = self._string_similarity(search_artist.lower(), db_artist.lower())
 
             # Also try with cleaned versions (removing edition markers)
-            clean_search_title = self._clean_album_title_for_comparison(search_title)
-            clean_db_title = self._clean_album_title_for_comparison(db_album.title)
+            clean_search_title = self._clean_album_title_for_comparison(search_title, strip_single_kind=strip_single_kind)
+            clean_db_title = self._clean_album_title_for_comparison(db_album.title, strip_single_kind=strip_single_kind)
             clean_title_similarity = self._string_similarity(clean_search_title, clean_db_title)
 
             # Also try with normalized versions (handling diacritics) - fixes #101
@@ -8943,6 +13643,7 @@ class MusicDatabase:
                 normalized_title_similarity,
                 expected_track_count,
                 db_album.track_count,
+                strip_single_kind=strip_single_kind,
             ):
                 logger.debug("  Strict discography match rejected: '%s' -> '%s'", search_title, db_album.title)
                 return 0.0
@@ -9008,19 +13709,33 @@ class MusicDatabase:
         normalized_title_similarity: float,
         expected_track_count: Optional[int],
         db_track_count: Optional[int],
+        strip_single_kind: bool = False,
     ) -> bool:
-        """Guard artist-page owned status against generic soundtrack false positives."""
-        if not self._is_soundtrack_like_album_title(search_title) and not self._is_soundtrack_like_album_title(db_title):
-            return True
+        """Guard artist-page owned status against generic soundtrack false positives.
 
+        #1448: in the non-soundtrack branch, reject when one normalized title is
+        a proper substring of the other — edition markers were already cleaned
+        above, so leftover words are meaningful and one title containing the
+        other means different releases (e.g. "Respiro" vs "Sessão Respiro").
+        """
         normalized_search_title = self._normalize_for_comparison(search_title)
         normalized_db_title = self._normalize_for_comparison(db_title)
-        if normalized_search_title == normalized_db_title:
+        if normalized_search_title and normalized_db_title and normalized_search_title == normalized_db_title:
             return True
 
-        clean_search_title = self._normalize_for_comparison(self._clean_album_title_for_comparison(search_title))
-        clean_db_title = self._normalize_for_comparison(self._clean_album_title_for_comparison(db_title))
-        if clean_search_title and clean_search_title == clean_db_title:
+        clean_search_title = self._normalize_for_comparison(self._clean_album_title_for_comparison(search_title, strip_single_kind=strip_single_kind))
+        clean_db_title = self._normalize_for_comparison(self._clean_album_title_for_comparison(db_title, strip_single_kind=strip_single_kind))
+        if clean_search_title and clean_db_title and clean_search_title == clean_db_title:
+            return True
+
+        if not self._is_soundtrack_like_album_title(search_title) and not self._is_soundtrack_like_album_title(db_title):
+            # #1448: edition markers were cleaned above, so leftover words are
+            # meaningful — one title containing the other means different releases.
+            # (The `and` truthiness guards are load-bearing: "" in "x" is True.)
+            if normalized_search_title and normalized_db_title and (
+                    normalized_search_title in normalized_db_title
+                    or normalized_db_title in normalized_search_title):
+                return False
             return True
 
         best_title_similarity = max(title_similarity, clean_title_similarity, normalized_title_similarity)
@@ -9166,6 +13881,151 @@ class MusicDatabase:
         from core.text.normalize import normalize_for_comparison
         return normalize_for_comparison(text)
     
+    def _score_title_similarity(self, search_title: str, db_track: DatabaseTrack):
+        """The guarded title score from _calculate_track_confidence, split
+        out so the album-aware fallback can apply the SAME title guards
+        (length penalty, context/subtitle qualifier handling, word-level
+        plausibility, 0.6 floor) instead of trusting a raw char ratio
+        (#1715 review). Returns (score, passed): when passed is False the
+        score is the halved sub-threshold value _calculate_track_confidence
+        returns immediately; when True, score is the title similarity the
+        artist weighting should use."""
+        search_title_norm = self._normalize_for_comparison(search_title)
+        db_title_norm = self._normalize_for_comparison(db_track.title)
+
+        # Direct similarity with Unicode normalization
+        title_similarity = self._string_similarity(search_title_norm, db_title_norm)
+
+        # Also try with cleaned versions (removing parentheses, brackets, etc.)
+        clean_search_title = self._clean_track_title_for_comparison(search_title)
+        clean_db_title = self._clean_track_title_for_comparison(db_track.title)
+        clean_title_similarity = self._string_similarity(clean_search_title, clean_db_title)
+
+        # Use the best title similarity (direct or cleaned)
+        best_title_similarity = max(title_similarity, clean_title_similarity)
+
+        # Length ratio penalty: if the DB title is significantly longer/shorter than the
+        # search title, it's likely a different track (e.g. "Believe" vs "Believe In Me").
+        # SequenceMatcher gives high scores when the shorter string is fully contained
+        # in the longer one, which causes false positives for prefix/suffix matches.
+        len_search = len(clean_search_title) if clean_search_title else len(search_title_norm)
+        len_db = len(clean_db_title) if clean_db_title else len(db_title_norm)
+        if len_search > 0 and len_db > 0:
+            len_ratio = min(len_search, len_db) / max(len_search, len_db)
+            if len_ratio < 0.7:
+                # Titles differ in length by more than 30% — penalize heavily
+                best_title_similarity *= len_ratio
+
+        # #808: a parenthetical qualifier that merely RESTATES the release
+        # context is album context, not a version difference. Wishlist
+        # title 'Champagne Supernova (OurVinyl Sessions)' vs the library's
+        # bare 'Champagne Supernova' on the album '… (OurVinyl Sessions)':
+        # the qualifier appears in the album title, yet the length-ratio
+        # penalty above crushed the pair to ~0.17 and wishlist cleanup
+        # never recognised the owned edition. Strip qualifiers confirmed
+        # by the db album title (or by the other title) and score that
+        # variant with its OWN length guard — genuine version markers
+        # ('(Live)' on a studio album) appear in no context, keep their
+        # qualifier, and keep their penalty.
+        db_album_norm = self._normalize_for_comparison(
+            getattr(db_track, 'album_title', '') or '')
+        from core.text.title_match import strip_redundant_context_qualifiers
+        ctx_search = strip_redundant_context_qualifiers(
+            search_title_norm, db_album_norm, db_title_norm)
+        ctx_db = strip_redundant_context_qualifiers(
+            db_title_norm, db_album_norm, search_title_norm)
+        if (ctx_search, ctx_db) != (search_title_norm, db_title_norm) and ctx_search and ctx_db:
+            ctx_sim = self._string_similarity(ctx_search, ctx_db)
+            ctx_ratio = min(len(ctx_search), len(ctx_db)) / max(len(ctx_search), len(ctx_db))
+            if ctx_ratio < 0.7:
+                ctx_sim *= ctx_ratio  # 'Believe' vs 'Believe In Me' still penalised
+            best_title_similarity = max(best_title_similarity, ctx_sim)
+
+        # #825: a bracketed qualifier that is a SUBTITLE — not a version
+        # marker and not numeric — is the same song. 'Llamando a la tierra
+        # (Serenade From the Stars)' vs the library's bare 'Llamando a la
+        # tierra': the subtitle restates nothing (so #808 keeps it) and the
+        # length penalty crushed the pair to ~0.14 — sync re-added it to
+        # the wishlist forever and cleanup (same matcher) never removed it.
+        # Version qualifiers ('(Live)', '(Versión 1988)', '(Dueto 2007)')
+        # are kept by the helper, so their mismatch penalty still stands.
+        from core.text.title_match import strip_subtitle_qualifiers
+        sub_search = strip_subtitle_qualifiers(search_title_norm, db_title_norm)
+        sub_db = strip_subtitle_qualifiers(db_title_norm, search_title_norm)
+        if (sub_search, sub_db) != (search_title_norm, db_title_norm) and sub_search and sub_db:
+            sub_sim = self._string_similarity(sub_search, sub_db)
+            sub_ratio = min(len(sub_search), len(sub_db)) / max(len(sub_search), len(sub_db))
+            if sub_ratio < 0.7:
+                sub_sim *= sub_ratio  # stripped forms still length-guarded
+            best_title_similarity = max(best_title_similarity, sub_sim)
+
+        # Word-level guard: SequenceMatcher's char ratio over-credits
+        # different songs that share a long substring or only a stopword
+        # ("Dani California" vs "Californication" = 0.67; "Under The Bridge"
+        # vs "Around the World" = 0.62). Since a same-artist comparison
+        # always scores artist = 1.0, the title is the only discriminator,
+        # so a bad-but-moderate title score gets carried over the threshold
+        # (#769). Reject pairs that aren't near-identical AND share no
+        # significant word — the real track is then reported missing.
+        from core.text.title_match import titles_plausibly_same
+        if not titles_plausibly_same(
+            clean_search_title or search_title_norm,
+            clean_db_title or db_title_norm,
+            best_title_similarity,
+        ):
+            return best_title_similarity * 0.5, False  # below any threshold
+
+        # Require minimum title similarity to prevent a perfect artist match from
+        # carrying a bad title match over the threshold (e.g. "Time" vs "Time Flies")
+        if best_title_similarity < 0.6:
+            return best_title_similarity * 0.5, False  # Can never exceed 0.3, well below any threshold
+
+        return best_title_similarity, True
+
+    def _score_artist_similarity(self, search_artist: str, db_track: DatabaseTrack) -> float:
+        """The artist score from _calculate_track_confidence, split out so
+        its exact semantics can be reused and probed on their own
+        (#1715)."""
+        search_artist_norm = self._normalize_for_comparison(search_artist)
+        db_artist_norm = self._normalize_for_comparison(db_track.artist_name)
+
+        artist_similarity = self._string_similarity(search_artist_norm, db_artist_norm)
+
+        # Soundtracks/compilations: the album-level artist (artists.name via JOIN)
+        # often differs from the per-track artist (e.g. Vaiana OST is filed under
+        # Lin-Manuel Miranda but "Where You Are" is performed by Christopher
+        # Jackson). Score against tracks.track_artist too and take the better
+        # match so playlist sync can find these.
+        #
+        # Featured artists: tracks with multiple credits ("Artist1, Artist2",
+        # "Artist1 feat. Artist2", "Artist1 & Artist2") split on common
+        # delimiters and score each piece independently. Without this, a
+        # discography completion check for Artist2 would miss a track stored
+        # in the library under Artist1's album with a "feat. Artist2" credit.
+        db_track_artist = getattr(db_track, 'track_artist', None)
+        if db_track_artist:
+            db_track_artist_norm = self._normalize_for_comparison(db_track_artist)
+            # Whole-string similarity first as the floor.
+            track_artist_sim = self._string_similarity(search_artist_norm, db_track_artist_norm)
+            # Then split on multi-artist delimiters and score each piece —
+            # Spotify's "feat.", "ft.", commas, semicolons, ampersands, and
+            # "x" between names all show up here in real-world tags.
+            pieces = re.split(
+                r'\s*(?:[;,&]|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bvs\.?\b|\bx\b)\s*',
+                db_track_artist_norm,
+                flags=re.IGNORECASE,
+            )
+            for piece in pieces:
+                piece = piece.strip()
+                if not piece:
+                    continue
+                piece_sim = self._string_similarity(search_artist_norm, piece)
+                if piece_sim > track_artist_sim:
+                    track_artist_sim = piece_sim
+            artist_similarity = max(artist_similarity, track_artist_sim)
+
+        return artist_similarity
+
     def _calculate_track_confidence(self, search_title: str, search_artist: str, db_track: DatabaseTrack) -> float:
         """Calculate confidence score for track match with enhanced cleaning and Unicode normalization"""
         try:
@@ -9174,134 +14034,19 @@ class MusicDatabase:
             search_artist_norm = self._normalize_for_comparison(search_artist)
             db_title_norm = self._normalize_for_comparison(db_track.title)
             db_artist_norm = self._normalize_for_comparison(db_track.artist_name)
-            
+
             # Debug logging for Unicode normalization
             if search_title != search_title_norm or search_artist != search_artist_norm or \
                db_track.title != db_title_norm or db_track.artist_name != db_artist_norm:
                 logger.debug("Unicode normalization:")
                 logger.debug(f"   Search: '{search_title}' → '{search_title_norm}' | '{search_artist}' → '{search_artist_norm}'")
                 logger.debug(f"   Database: '{db_track.title}' → '{db_title_norm}' | '{db_track.artist_name}' → '{db_artist_norm}'")
-            
-            # Direct similarity with Unicode normalization
-            title_similarity = self._string_similarity(search_title_norm, db_title_norm)
-            artist_similarity = self._string_similarity(search_artist_norm, db_artist_norm)
 
-            # Soundtracks/compilations: the album-level artist (artists.name via JOIN)
-            # often differs from the per-track artist (e.g. Vaiana OST is filed under
-            # Lin-Manuel Miranda but "Where You Are" is performed by Christopher
-            # Jackson). Score against tracks.track_artist too and take the better
-            # match so playlist sync can find these.
-            #
-            # Featured artists: tracks with multiple credits ("Artist1, Artist2",
-            # "Artist1 feat. Artist2", "Artist1 & Artist2") split on common
-            # delimiters and score each piece independently. Without this, a
-            # discography completion check for Artist2 would miss a track stored
-            # in the library under Artist1's album with a "feat. Artist2" credit.
-            db_track_artist = getattr(db_track, 'track_artist', None)
-            if db_track_artist:
-                db_track_artist_norm = self._normalize_for_comparison(db_track_artist)
-                # Whole-string similarity first as the floor.
-                track_artist_sim = self._string_similarity(search_artist_norm, db_track_artist_norm)
-                # Then split on multi-artist delimiters and score each piece —
-                # Spotify's "feat.", "ft.", commas, semicolons, ampersands, and
-                # "x" between names all show up here in real-world tags.
-                pieces = re.split(
-                    r'\s*(?:[;,&]|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bvs\.?\b|\bx\b)\s*',
-                    db_track_artist_norm,
-                    flags=re.IGNORECASE,
-                )
-                for piece in pieces:
-                    piece = piece.strip()
-                    if not piece:
-                        continue
-                    piece_sim = self._string_similarity(search_artist_norm, piece)
-                    if piece_sim > track_artist_sim:
-                        track_artist_sim = piece_sim
-                artist_similarity = max(artist_similarity, track_artist_sim)
-            
-            # Also try with cleaned versions (removing parentheses, brackets, etc.)
-            clean_search_title = self._clean_track_title_for_comparison(search_title)
-            clean_db_title = self._clean_track_title_for_comparison(db_track.title)
-            clean_title_similarity = self._string_similarity(clean_search_title, clean_db_title)
-            
-            # Use the best title similarity (direct or cleaned)
-            best_title_similarity = max(title_similarity, clean_title_similarity)
+            best_title_similarity, title_passed = self._score_title_similarity(search_title, db_track)
+            if not title_passed:
+                return best_title_similarity
 
-            # Length ratio penalty: if the DB title is significantly longer/shorter than the
-            # search title, it's likely a different track (e.g. "Believe" vs "Believe In Me").
-            # SequenceMatcher gives high scores when the shorter string is fully contained
-            # in the longer one, which causes false positives for prefix/suffix matches.
-            len_search = len(clean_search_title) if clean_search_title else len(search_title_norm)
-            len_db = len(clean_db_title) if clean_db_title else len(db_title_norm)
-            if len_search > 0 and len_db > 0:
-                len_ratio = min(len_search, len_db) / max(len_search, len_db)
-                if len_ratio < 0.7:
-                    # Titles differ in length by more than 30% — penalize heavily
-                    best_title_similarity *= len_ratio
-
-            # #808: a parenthetical qualifier that merely RESTATES the release
-            # context is album context, not a version difference. Wishlist
-            # title 'Champagne Supernova (OurVinyl Sessions)' vs the library's
-            # bare 'Champagne Supernova' on the album '… (OurVinyl Sessions)':
-            # the qualifier appears in the album title, yet the length-ratio
-            # penalty above crushed the pair to ~0.17 and wishlist cleanup
-            # never recognised the owned edition. Strip qualifiers confirmed
-            # by the db album title (or by the other title) and score that
-            # variant with its OWN length guard — genuine version markers
-            # ('(Live)' on a studio album) appear in no context, keep their
-            # qualifier, and keep their penalty.
-            db_album_norm = self._normalize_for_comparison(
-                getattr(db_track, 'album_title', '') or '')
-            from core.text.title_match import strip_redundant_context_qualifiers
-            ctx_search = strip_redundant_context_qualifiers(
-                search_title_norm, db_album_norm, db_title_norm)
-            ctx_db = strip_redundant_context_qualifiers(
-                db_title_norm, db_album_norm, search_title_norm)
-            if (ctx_search, ctx_db) != (search_title_norm, db_title_norm) and ctx_search and ctx_db:
-                ctx_sim = self._string_similarity(ctx_search, ctx_db)
-                ctx_ratio = min(len(ctx_search), len(ctx_db)) / max(len(ctx_search), len(ctx_db))
-                if ctx_ratio < 0.7:
-                    ctx_sim *= ctx_ratio  # 'Believe' vs 'Believe In Me' still penalised
-                best_title_similarity = max(best_title_similarity, ctx_sim)
-
-            # #825: a bracketed qualifier that is a SUBTITLE — not a version
-            # marker and not numeric — is the same song. 'Llamando a la tierra
-            # (Serenade From the Stars)' vs the library's bare 'Llamando a la
-            # tierra': the subtitle restates nothing (so #808 keeps it) and the
-            # length penalty crushed the pair to ~0.14 — sync re-added it to
-            # the wishlist forever and cleanup (same matcher) never removed it.
-            # Version qualifiers ('(Live)', '(Versión 1988)', '(Dueto 2007)')
-            # are kept by the helper, so their mismatch penalty still stands.
-            from core.text.title_match import strip_subtitle_qualifiers
-            sub_search = strip_subtitle_qualifiers(search_title_norm, db_title_norm)
-            sub_db = strip_subtitle_qualifiers(db_title_norm, search_title_norm)
-            if (sub_search, sub_db) != (search_title_norm, db_title_norm) and sub_search and sub_db:
-                sub_sim = self._string_similarity(sub_search, sub_db)
-                sub_ratio = min(len(sub_search), len(sub_db)) / max(len(sub_search), len(sub_db))
-                if sub_ratio < 0.7:
-                    sub_sim *= sub_ratio  # stripped forms still length-guarded
-                best_title_similarity = max(best_title_similarity, sub_sim)
-
-            # Word-level guard: SequenceMatcher's char ratio over-credits
-            # different songs that share a long substring or only a stopword
-            # ("Dani California" vs "Californication" = 0.67; "Under The Bridge"
-            # vs "Around the World" = 0.62). Since a same-artist comparison
-            # always scores artist = 1.0, the title is the only discriminator,
-            # so a bad-but-moderate title score gets carried over the threshold
-            # (#769). Reject pairs that aren't near-identical AND share no
-            # significant word — the real track is then reported missing.
-            from core.text.title_match import titles_plausibly_same
-            if not titles_plausibly_same(
-                clean_search_title or search_title_norm,
-                clean_db_title or db_title_norm,
-                best_title_similarity,
-            ):
-                return best_title_similarity * 0.5  # below any threshold
-
-            # Require minimum title similarity to prevent a perfect artist match from
-            # carrying a bad title match over the threshold (e.g. "Time" vs "Time Flies")
-            if best_title_similarity < 0.6:
-                return best_title_similarity * 0.5  # Can never exceed 0.3, well below any threshold
+            artist_similarity = self._score_artist_similarity(search_artist, db_track)
 
             # Weight: 50% title, 50% artist (equal weight to prevent false positives)
             # Also require minimum artist similarity to prevent matching wrong artists
@@ -9312,13 +14057,18 @@ class MusicDatabase:
                 confidence *= 0.3  # Reduce confidence by 70%
 
             return confidence
-            
+
         except Exception as e:
             logger.error(f"Error calculating track confidence: {e}")
             return 0.0
-    
+
     def _clean_track_title_for_comparison(self, title: str) -> str:
         """Clean track title for comparison by normalizing brackets/dashes and removing noise"""
+        return MusicDatabase._clean_track_title_cached(title)
+
+    @staticmethod
+    @lru_cache(maxsize=131072)
+    def _clean_track_title_cached(title: str) -> str:
         cleaned = title.lower().strip()
 
         # PRE-STEP: Handle "(with Artist)" featuring BEFORE bracket removal.
@@ -9391,8 +14141,16 @@ class MusicDatabase:
 
         return cleaned
     
-    def _clean_album_title_for_comparison(self, title: str) -> str:
-        """Clean album title by removing edition markers for comparison"""
+    def _clean_album_title_for_comparison(self, title: str, strip_single_kind: bool = False) -> str:
+        """Clean album title by removing edition markers for comparison.
+
+        `strip_single_kind`: also strip release-kind markers ("(Single)",
+        "[Single]", "- Single" suffixes). Only set for single-card lookups —
+        a "(Single)"-titled row IS the single release, but it is not the
+        album/EP of the same name, so album/EP cards must not strip.
+        Known residual: "(Single Edit)" is not stripped (a single edit is a
+        different cut, like the radio-edit markers the track cleaner keeps).
+        """
         cleaned = title.lower()
 
         # Remove common edition patterns (specific first, then generic catch-alls)
@@ -9417,6 +14175,14 @@ class MusicDatabase:
 
         for pattern in patterns:
             cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
+
+        if strip_single_kind:
+            # Release-kind markers, not different recordings — shared with
+            # strip_single_kind_suffix so the row direction and the card
+            # direction strip the exact same markers. Runs after the edition
+            # patterns, so stacked suffixes ("X (Single) (Deluxe Edition)")
+            # still fully strip.
+            cleaned = strip_single_kind_suffix(cleaned)
 
         return cleaned.strip()
     
@@ -9468,6 +14234,91 @@ class MusicDatabase:
             logger.error(f"Error getting album completion stats for artist '{artist_name}': {e}")
             return {'complete': 0, 'nearly_complete': 0, 'partial': 0, 'missing': 0, 'total': 0}
     
+    # ── reorganize queue durability (issue #1235) ───────────────────────────
+    # The bulk reorganize queue lived only in process memory, so a gunicorn
+    # worker recycle discarded every queued album without a word while the job
+    # reported success. These three keep the OUTSTANDING backlog on disk; the
+    # queue's recent-history list stays in memory because it is only cosmetic.
+
+    def reorganize_queue_save(self, snapshot: dict):
+        """Insert or update one outstanding item."""
+        import json
+        try:
+            with self._get_connection() as conn:
+                conn.cursor().execute("""
+                    INSERT INTO reorganize_queue (queue_id, album_id, status, enqueued_at, payload)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(queue_id) DO UPDATE SET
+                        status = excluded.status,
+                        payload = excluded.payload
+                """, (
+                    snapshot.get('queue_id'),
+                    str(snapshot.get('album_id') or ''),
+                    str(snapshot.get('status') or 'queued'),
+                    float(snapshot.get('enqueued_at') or 0.0),
+                    json.dumps(snapshot),
+                ))
+                conn.commit()
+        except Exception as e:
+            # Never let bookkeeping break the actual reorganize. A lost row means
+            # that one album is not resumable, which is still better than the
+            # whole queue dying because the db hiccuped.
+            logger.error(f"Error persisting reorganize queue item: {e}")
+
+    def reorganize_queue_delete(self, queue_id: str):
+        """Drop an item that reached a terminal state (or was cancelled)."""
+        try:
+            with self._get_connection() as conn:
+                conn.cursor().execute(
+                    "DELETE FROM reorganize_queue WHERE queue_id = ?", (queue_id,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error deleting reorganize queue item {queue_id}: {e}")
+
+    def reorganize_queue_load_pending(self) -> list:
+        """Every item that never finished, oldest first.
+
+        Anything left in 'running' was interrupted mid-flight - the process that
+        owned it is gone - so it comes back as 'queued' to be tried again.
+        """
+        import json
+        rows = []
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT payload FROM reorganize_queue
+                    WHERE status IN ('queued', 'running')
+                    ORDER BY enqueued_at ASC
+                """)
+                rows = cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error loading reorganize queue: {e}")
+            return []
+        out = []
+        for row in rows:
+            try:
+                snap = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            if snap.get('status') == 'running':
+                snap['status'] = 'queued'
+                snap['started_at'] = None
+            out.append(snap)
+        return out
+
+    def reorganize_queue_delete_queued(self) -> int:
+        """Drop everything still waiting. Used by the queue's clear action."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM reorganize_queue WHERE status = 'queued'")
+                conn.commit()
+                return cursor.rowcount or 0
+        except Exception as e:
+            logger.error(f"Error clearing reorganize queue: {e}")
+            return 0
+
     def set_metadata(self, key: str, value: str):
         """Set a metadata value"""
         try:
@@ -9647,6 +14498,7 @@ class MusicDatabase:
             "search_mode": row["search_mode"] or "priority",
             "rank_candidates_by_quality": bool(row["rank_candidates_by_quality"]),
             "ranked_targets": ranked_targets,
+            "release_import_mode": normalize_release_import_mode(_row_value(row, "release_import_mode")),
             "acoustid_required": bool(row["acoustid_required"]),
             "downsample_enabled": bool(row["downsample_enabled"]),
             "deep_audio_verify": bool(row["deep_audio_verify"]),
@@ -9689,6 +14541,7 @@ class MusicDatabase:
             "lossy_copy_codec": str(profile.get("lossy_copy_codec") or "mp3"),
             "lossy_copy_bitrate": str(profile.get("lossy_copy_bitrate") or "320"),
             "lossy_copy_delete_original": 1 if profile.get("lossy_copy_delete_original") else 0,
+            "release_import_mode": normalize_release_import_mode(profile.get("release_import_mode")),
         }
 
     # SQLite has no native boolean type — these columns are stored as 0/1.
@@ -9714,6 +14567,7 @@ class MusicDatabase:
             profiles = []
             for row in rows:
                 profile = dict(row)
+                profile["release_import_mode"] = normalize_release_import_mode(profile.get("release_import_mode"))
                 for col in self._QUALITY_PROFILE_BOOL_COLUMNS:
                     if col in profile:
                         profile[col] = bool(profile[col])
@@ -9740,12 +14594,12 @@ class MusicDatabase:
                         search_mode, rank_candidates_by_quality, upgrade_policy,
                         upgrade_cutoff_index, acoustid_required, downsample_enabled, deep_audio_verify,
                         replace_lower_quality, lossy_copy_enabled, lossy_copy_codec,
-                        lossy_copy_bitrate, lossy_copy_delete_original, is_default)
+                        lossy_copy_bitrate, lossy_copy_delete_original, release_import_mode, is_default)
                    VALUES (:name, :description, :ranked_targets, :fallback_enabled,
                            :search_mode, :rank_candidates_by_quality, :upgrade_policy,
                            :upgrade_cutoff_index, :acoustid_required, :downsample_enabled, :deep_audio_verify,
                            :replace_lower_quality, :lossy_copy_enabled, :lossy_copy_codec,
-                           :lossy_copy_bitrate, :lossy_copy_delete_original, 0)""",
+                           :lossy_copy_bitrate, :lossy_copy_delete_original, :release_import_mode, 0)""",
                 {"name": name, "description": "Custom profile", **params},
             )
             conn.commit()
@@ -9773,6 +14627,7 @@ class MusicDatabase:
                           replace_lower_quality=:replace_lower_quality, lossy_copy_enabled=:lossy_copy_enabled,
                           lossy_copy_codec=:lossy_copy_codec, lossy_copy_bitrate=:lossy_copy_bitrate,
                           lossy_copy_delete_original=:lossy_copy_delete_original,
+                          release_import_mode=:release_import_mode,
                           updated_at=CURRENT_TIMESTAMP
                     WHERE id=:profile_id""",
                 {"profile_id": profile_id, **params},
@@ -9808,7 +14663,7 @@ class MusicDatabase:
         self.set_quality_profile(profile)
 
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             config_manager.set("acoustid.require_verified", profile["acoustid_required"])
             config_manager.set("lossy_copy.downsample_hires", profile["downsample_enabled"])
             config_manager.set("post_processing.audio_completeness_check", profile["deep_audio_verify"])
@@ -9837,7 +14692,7 @@ class MusicDatabase:
         the active profile" true in both directions.
         """
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             values = {
                 "acoustid_required": 1 if config_manager.get("acoustid.require_verified", False) else 0,
                 "downsample_enabled": 1 if config_manager.get("lossy_copy.downsample_hires", False) else 0,
@@ -9910,10 +14765,17 @@ class MusicDatabase:
           app without one.
 
         References to the deleted id are cleaned up in the same transaction
-        (wishlist rows AND library tracks are re-pointed to NULL = "use the
-        default", and a matching Auto-Import override is cleared) — and even
-        a reference missed by that (or written concurrently) safely falls
-        back to the default via `core/quality/selection.py::load_profile_by_id`.
+        (wishlist rows and library tracks fall back dynamically, while durable
+        Watchlist/playlist assignments are re-pointed to the active default,
+        and a matching Auto-Import override is cleared after the DB
+        transaction commits) — and even a reference missed by that (or
+        written concurrently) safely falls back to the default via
+        `core/quality/selection.py::load_profile_by_id`.
+
+        A default is guaranteed to exist after this call even if the profile
+        table's is_default bookkeeping was ever left inconsistent (e.g. by a
+        bug or a hand-edited DB) — not just in the common case of deleting
+        the current default.
 
         Returns ``(success, reason)`` — ``reason`` is empty on success.
         """
@@ -9927,13 +14789,35 @@ class MusicDatabase:
             target = next((r for r in rows if r["id"] == profile_id), None)
             if target is None:
                 return False, "Profile not found"
+            remaining = [r for r in rows if r["id"] != profile_id]
             if target["is_default"]:
-                promote_id = next(r["id"] for r in rows if r["id"] != profile_id)
+                promote_id = remaining[0]["id"]
                 conn.execute("UPDATE quality_profiles SET is_default=0 WHERE is_default=1")
                 conn.execute(
                     "UPDATE quality_profiles SET is_default=1, updated_at=CURRENT_TIMESTAMP WHERE id=?",
                     (promote_id,),
                 )
+            elif not any(r["is_default"] for r in remaining):
+                # Defensive: the surviving profiles have no default at all
+                # (inconsistent is_default state pre-dating this delete).
+                # Promote one now instead of leaving the app without one.
+                conn.execute(
+                    "UPDATE quality_profiles SET is_default=1, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (remaining[0]["id"],),
+                )
+            # Runs after the promotions above, so the durable Watchlist/playlist
+            # assignments below always land on a profile that really is the
+            # default — never on the row that's about to be deleted.
+            default_row = conn.execute(
+                "SELECT id FROM quality_profiles WHERE is_default=1 "
+                "AND id<>? ORDER BY id LIMIT 1",
+                (profile_id,),
+            ).fetchone()
+            replacement_id = int(
+                default_row["id"] if default_row is not None
+                else next(r["id"] for r in rows if r["id"] != profile_id)
+            )
             conn.execute(
                 "UPDATE wishlist_tracks SET quality_profile_id=NULL WHERE quality_profile_id=?",
                 (profile_id,),
@@ -9942,21 +14826,39 @@ class MusicDatabase:
                 "UPDATE tracks SET quality_profile_id=NULL WHERE quality_profile_id=?",
                 (profile_id,),
             )
+            for table in ('watchlist_artists', 'mirrored_playlists'):
+                columns = {
+                    row[1]
+                    for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if 'quality_profile_id' in columns:
+                    conn.execute(
+                        f"UPDATE {table} SET quality_profile_id=? "
+                        "WHERE quality_profile_id=?",
+                        (replacement_id, profile_id),
+                    )
             cur = conn.execute("DELETE FROM quality_profiles WHERE id=?", (profile_id,))
             conn.commit()
             if cur.rowcount == 0:
                 return False, "Profile not found"
-            # Clear a matching Auto-Import override so its Settings UI doesn't
-            # show a stale id (the pipeline would fall back correctly either
-            # way). Outside the DB transaction — config is a separate store.
+            # Clear any config override that pointed at the deleted profile so
+            # the Settings UI doesn't show an id that no longer exists (the
+            # pipeline would fall back correctly either way). This is outside the
+            # DB transaction — config is a separate store, and the two cannot be
+            # atomic. The recovery contract: the DB is authoritative and this
+            # cleanup is idempotent, so a failure here is retried on the next
+            # startup by `reconcile_stale_quality_profile_config` (P3-02).
+            # Logged at WARNING, not DEBUG, so the transient inconsistency is
+            # actually visible while it lasts.
             try:
-                from config.settings import config_manager
-                current_auto_import_profile = config_manager.get('auto_import.quality_profile_id')
-                if (current_auto_import_profile is not None
-                        and str(current_auto_import_profile) == str(profile_id)):
-                    config_manager.set('auto_import.quality_profile_id', None)
+                from core.quality.migrate_to_profiles import reconcile_stale_quality_profile_config
+                reconcile_stale_quality_profile_config(self)
             except Exception as e:  # noqa: BLE001
-                logger.debug("auto-import profile reference cleanup skipped: %s", e)
+                logger.warning(
+                    "Quality profile %s was deleted but its config reference could not be "
+                    "cleared; it will be reconciled on the next startup: %s",
+                    profile_id, e,
+                )
             return True, ""
         except Exception as e:
             logger.error(f"Failed to delete quality profile {profile_id}: {e}")
@@ -10034,7 +14936,7 @@ class MusicDatabase:
         .quality = 'hires'|'hires_max'), which #896 removed in favour of the
         global profile. Used to preserve their intent on migration."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
         except Exception:
             return False
         hires = {'hires', 'hires_max'}
@@ -10159,33 +15061,55 @@ class MusicDatabase:
             logger.error(f"Failed to save quality profile: {e}")
             return False
 
+    # The columns `_write_default_quality_profile_row` writes unconditionally
+    # (the ranked-target ladder and its flags), and the ones it writes only
+    # when the caller actually named them. See that method for why the split
+    # exists.
+    _QUALITY_LADDER_COLUMNS = (
+        "ranked_targets", "fallback_enabled", "search_mode",
+        "rank_candidates_by_quality", "upgrade_policy", "upgrade_cutoff_index",
+    )
+    _QUALITY_BUNDLE_COLUMNS = (
+        "acoustid_required", "downsample_enabled", "deep_audio_verify",
+        "replace_lower_quality", "lossy_copy_enabled", "lossy_copy_codec",
+        "lossy_copy_bitrate", "lossy_copy_delete_original", "release_import_mode",
+    )
+
     def _write_default_quality_profile_row(self, profile: dict) -> None:
         """Write-through helper for `set_quality_profile`: updates the
-        ``is_default=1`` row in `quality_profiles` to match."""
-        import json
-        try:
-            cutoff_index = max(0, int(profile.get("upgrade_cutoff_index") or 0))
-        except (TypeError, ValueError):
-            cutoff_index = 0
-        upgrade_policy = profile.get("upgrade_policy")
-        if upgrade_policy not in ("acceptable", "until_cutoff", "until_top"):
-            upgrade_policy = "acceptable"
+        ``is_default=1`` row in `quality_profiles` to match.
+
+        Writes the ladder columns always and a bundle column only when
+        ``profile`` actually carries that key. The asymmetry is the point:
+        ``GET /api/quality-profile`` returns all fourteen fields, but the
+        Settings page posts back only the six ladder ones
+        (``settings.js::collectQualityProfileFromUI``) and a Quick Set preset
+        carries even fewer. The other eight belong to the global config and
+        reach this row through
+        :meth:`sync_default_quality_profile_from_config` after a settings
+        save, so a POST that never mentioned them must leave them alone —
+        writing a coerced default for an absent key would silently reset
+        lossy-copy, AcoustID strictness and replace-lower-quality every time
+        somebody reordered the target ladder.
+
+        Naming a key still works, including turning one off: presence decides,
+        not truthiness. That is what makes a full round-trip of the GET
+        payload behave the way a caller expects, which it previously did not
+        (PR #1103 reported exactly that, but fixed it by writing all fourteen
+        unconditionally, which is the reset described above).
+        """
+        params = self._quality_profile_bundle_params(profile)
+        columns = list(self._QUALITY_LADDER_COLUMNS)
+        columns += [c for c in self._QUALITY_BUNDLE_COLUMNS if c in profile]
+        # Interpolated, but only ever from the two class-level tuples above —
+        # `profile` decides which of those names are used, never what they are.
+        assignments = ", ".join(f"{c}=:{c}" for c in columns)
         conn = self._get_connection()
         try:
             conn.execute(
-                """UPDATE quality_profiles
-                      SET ranked_targets=?, fallback_enabled=?, search_mode=?,
-                          rank_candidates_by_quality=?, upgrade_policy=?,
-                          upgrade_cutoff_index=?, updated_at=CURRENT_TIMESTAMP
-                    WHERE is_default=1""",
-                (
-                    json.dumps(profile.get("ranked_targets") or []),
-                    1 if profile.get("fallback_enabled", True) else 0,
-                    profile.get("search_mode") if profile.get("search_mode") in ("priority", "best_quality") else "priority",
-                    1 if profile.get("rank_candidates_by_quality") else 0,
-                    upgrade_policy,
-                    cutoff_index,
-                ),
+                f"UPDATE quality_profiles SET {assignments}, "
+                "updated_at=CURRENT_TIMESTAMP WHERE is_default=1",
+                {c: params[c] for c in columns},
             )
             conn.commit()
         finally:
@@ -10322,6 +15246,27 @@ class MusicDatabase:
             logger.debug("blocklist guard skipped: %s", e)
             return None
 
+    def quality_profile_exists(self, quality_profile_id) -> bool:
+        """True only for an id that really names a row in ``quality_profiles``.
+
+        Write boundaries need to tell "not supplied" (use the default) from
+        "explicitly wrong" (reject). ``_resolve_quality_profile_id`` deliberately
+        cannot: it exists to always produce *something* storable. This is the
+        strict counterpart (P2-04).
+        """
+        from core.api_validation import parse_strict_int
+        parsed = parse_strict_int(quality_profile_id)
+        if parsed is None:
+            return False
+        try:
+            with self._get_connection() as conn:
+                return conn.execute(
+                    "SELECT 1 FROM quality_profiles WHERE id=?", (parsed,)
+                ).fetchone() is not None
+        except Exception as e:
+            logger.debug("Could not check quality profile %s: %s", quality_profile_id, e)
+            return False
+
     def _resolve_quality_profile_id(self, cursor, quality_profile_id: Optional[int] = None) -> Optional[int]:
         """Resolve a ``quality_profile_id`` (or ``None`` -> the app-wide
         default) into a concrete profile id to store on a wishlist row at
@@ -10351,48 +15296,39 @@ class MusicDatabase:
             logger.debug("Could not resolve quality profile id: %s", e)
             return None
 
-    def _prune_self_duplicate_wishlist_rows(self, cursor) -> int:
-        """Delete composite wishlist rows that merely duplicate their base row.
-
-        A row keyed '<track>::<album>' is redundant when the plain '<track>' row
-        in the same profile is for that very album — the fork carried no extra
-        information and no attempt history. Rows for a genuinely different album
-        are left alone. Returns the number removed. See the caller for why these
-        exist at all."""
-        cursor.execute(
-            "SELECT id, spotify_track_id, profile_id FROM wishlist_tracks "
-            "WHERE spotify_track_id LIKE '%::%'")
-        forks = cursor.fetchall()
-        if not forks:
-            return 0
-        doomed = []
-        for row in forks:
-            base_id, _, album_id = str(row['spotify_track_id']).rpartition('::')
-            if not base_id or not album_id:
-                continue
-            cursor.execute(
-                "SELECT spotify_data FROM wishlist_tracks "
-                "WHERE spotify_track_id = ? AND profile_id = ?", (base_id, row['profile_id']))
-            base = cursor.fetchone()
-            if base and self._wishlist_row_album_id(base['spotify_data']) == album_id:
-                doomed.append(row['id'])
-        for row_id in doomed:
-            cursor.execute("DELETE FROM wishlist_tracks WHERE id = ?", (row_id,))
-        if doomed:
-            logger.info("Removed %d duplicate wishlist row(s) that shadowed their own "
-                        "base entry and could never earn a retry cooldown", len(doomed))
-        return len(doomed)
-
     @staticmethod
-    def _wishlist_row_album_id(spotify_data) -> str:
-        """The album id stored on a wishlist row, '' when absent/unparseable.
-        Used to tell 'the same track from another album' (which deserves its own
-        row) from 'the same track again' (which does not)."""
-        try:
-            album = (json.loads(spotify_data) or {}).get('album')
-            return str(album.get('id') or '') if isinstance(album, dict) else ''
-        except (ValueError, TypeError, AttributeError):
-            return ''
+    def _wishlist_outcome(status: str, track_id: Optional[str] = None,
+                          reason: Optional[str] = None) -> Dict[str, Any]:
+        """One shape for every ``add_to_wishlist_detailed`` exit.
+
+        ``status`` is one of:
+
+        ``created``    a new row was inserted.
+        ``updated``    an existing row was refreshed with this request's payload
+                       and (when explicit) its Quality Profile.
+        ``satisfied``  nothing to do because the track is already covered — a
+                       manual library match. Historically reported as ``True``.
+        ``skipped``    the row is intentionally left alone — blocklist,
+                       ignore-list, or a plain duplicate with nothing
+                       authoritative to apply.
+        ``rejected``   the request was refused (bad id, unknown profile).
+        ``error``      an unexpected failure.
+
+        ``applied`` is the question almost every caller actually asks: does the
+        wishlist now reflect what I asked for? A refreshed duplicate answers
+        yes. Collapsing that into the old bare ``False`` made Artist-Enhance
+        report every re-queued track as a hard failure (R2-03).
+
+        ``created`` reproduces the historic bool exactly, so existing callers
+        that were never updated keep behaving as before.
+        """
+        return {
+            "status": status,
+            "created": status in ("created", "satisfied"),
+            "applied": status in ("created", "updated", "satisfied"),
+            "track_id": track_id,
+            "reason": reason,
+        }
 
     def add_to_wishlist(
         self,
@@ -10404,15 +15340,40 @@ class MusicDatabase:
         track_data: Dict[str, Any] = None,
         user_initiated: bool = False,
         quality_profile_id: Optional[int] = None,
-        root_folder_id: Optional[int] = None,
     ) -> bool:
+        """``True`` when a NEW wishlist row was inserted.
+
+        Kept exactly as it was for the many callers that only log the result.
+        Anything that needs to tell "already there, refreshed" apart from
+        "refused" must use :meth:`add_to_wishlist_detailed` (R2-03).
+        """
+        return self.add_to_wishlist_detailed(
+            spotify_track_data=spotify_track_data,
+            failure_reason=failure_reason,
+            source_type=source_type,
+            source_info=source_info,
+            profile_id=profile_id,
+            track_data=track_data,
+            user_initiated=user_initiated,
+            quality_profile_id=quality_profile_id,
+        )["created"]
+
+    def add_to_wishlist_detailed(
+        self,
+        spotify_track_data: Dict[str, Any] = None,
+        failure_reason: str = "Download failed",
+        source_type: str = "unknown",
+        source_info: Dict[str, Any] = None,
+        profile_id: int = 1,
+        track_data: Dict[str, Any] = None,
+        user_initiated: bool = False,
+        quality_profile_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
         """Add a failed track to the wishlist for retry.
 
-        ``root_folder_id`` names the Music Library this track should be filed
-        into; omitted (``None``) means the default library, which is where
-        every wishlist track went before libraries existed. Stored as the id
-        only — the import pipeline resolves the library's path and naming
-        template live, so editing a library later applies immediately.
+        Returns a :meth:`_wishlist_outcome` dict rather than a bare bool, so a
+        caller can distinguish an insert, an authoritative refresh of an
+        existing row, and a genuine refusal.
 
         ``quality_profile_id`` selects which ``quality_profiles`` row this
         item's download/import must satisfy; omitted (``None``, the default)
@@ -10431,6 +15392,16 @@ class MusicDatabase:
             if track_data is not None and spotify_track_data is None:
                 spotify_track_data = track_data
 
+            # "Not supplied" means "use the default"; an id the caller INVENTED
+            # must not silently become the default, or a typo/stale id would
+            # quietly download at the wrong quality (P2-04).
+            if quality_profile_id is not None and not self.quality_profile_exists(quality_profile_id):
+                logger.error(
+                    "Cannot add track to wishlist: unknown quality_profile_id %r",
+                    quality_profile_id,
+                )
+                return self._wishlist_outcome("rejected", reason="unknown quality_profile_id")
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
@@ -10438,7 +15409,29 @@ class MusicDatabase:
                 track_id = spotify_track_data.get('id')
                 if not track_id:
                     logger.error("Cannot add track to wishlist: missing track ID")
-                    return False
+                    return self._wishlist_outcome("rejected", reason="missing track id")
+
+                # Podcast guard: podcast items are not eligible for the music wishlist
+                _is_podcast = False
+                if source_type == 'podcast' or str(track_id).startswith('podcast-'):
+                    _is_podcast = True
+                elif isinstance(source_info, dict):
+                    if (
+                        source_info.get('source_page') == 'Podcasts'
+                        or source_info.get('download_source') == 'Podcast'
+                        or source_info.get('playlist_id') == 'podcasts'
+                    ):
+                        _is_podcast = True
+                elif isinstance(source_info, str) and (
+                    '"source_page": "Podcasts"' in source_info
+                    or '"download_source": "Podcast"' in source_info
+                    or '"playlist_id": "podcasts"' in source_info
+                ):
+                    _is_podcast = True
+
+                if _is_podcast:
+                    logger.info("Skipping wishlist add — podcast items are not eligible for music wishlist: '%s'", track_id)
+                    return self._wishlist_outcome("rejected", track_id, reason="podcast_not_eligible")
 
                 # Blocklist guard (Phase 1): every auto-acquisition path funnels
                 # through here, so one check blocks a banned artist/album/track
@@ -10447,7 +15440,7 @@ class MusicDatabase:
                 if _blocked:
                     logger.info("Skipping wishlist add — %s is blocklisted: '%s'",
                                 _blocked[0], _blocked[1])
-                    return False
+                    return self._wishlist_outcome("skipped", track_id, reason="blocklisted")
 
                 # Ignore-list guard (#874): a user who removed or cancelled this
                 # track asked us to stop AUTO-requeuing it — every automatic
@@ -10460,23 +15453,30 @@ class MusicDatabase:
                         self.remove_from_wishlist_ignore(track_id, profile_id=profile_id)
                     elif self.is_track_ignored(track_id, profile_id=profile_id):
                         logger.info("Skipping wishlist add — track is on the ignore-list (#874): %s", track_id)
-                        return False
+                        return self._wishlist_outcome("skipped", track_id, reason="ignore-list")
                 except Exception as _ignore_exc:
                     logger.debug("Wishlist ignore-list check skipped (fail-open): %s", _ignore_exc)
 
-                # Only a match that still resolves may block the add. Otherwise
-                # a match to a deleted file made the track un-re-addable: this
-                # returned True (reporting success) without adding anything, so
-                # the track could never come back (upstream #1138).
                 from core.library import manual_library_match as _mlm
-                if _mlm.resolve_match(self, _mlm.get_match_for_track(self, profile_id, spotify_track_data)):
+                if _mlm.get_match_for_track(self, profile_id, spotify_track_data):
                     logger.info(
                         "Skipping wishlist add for manually matched track: '%s' (%s:%s)",
                         spotify_track_data.get('name', 'Unknown Track'),
                         spotify_track_data.get('provider') or spotify_track_data.get('source') or 'unknown',
                         track_id,
                     )
-                    return True
+                    return self._wishlist_outcome("satisfied", track_id, reason="manual library match")
+
+                # a profile that asks first and has a request quota: a NEW ask
+                # past the quota is refused (more tracks of an album already
+                # asked for this window are part of that ask, not new ones)
+                try:
+                    if self._music_request_quota_blocks(cursor, profile_id, spotify_track_data,
+                                                        source_type, track_id):
+                        logger.info("Skipping wishlist add — profile %s is at its request limit", profile_id)
+                        return self._wishlist_outcome("rejected", track_id, reason="request_limit")
+                except Exception as _quota_exc:  # noqa: BLE001 - a broken quota check never blocks an add
+                    logger.debug("request quota check skipped: %s", _quota_exc)
 
                 track_name = spotify_track_data.get('name', 'Unknown Track')
                 artists = spotify_track_data.get('artists', [])
@@ -10502,12 +15502,21 @@ class MusicDatabase:
 
                 # Check for duplicates by track name + artist (not just Spotify ID)
                 # When allow_duplicates is True (default), same song from different albums can coexist
-                from config.settings import config_manager
+                from core.settings import config_manager
                 allow_duplicates = config_manager.get('wishlist.allow_duplicate_tracks', True)
+
+                # Convert data once; existing rows and inserts use the same
+                # newest payload/context.
+                spotify_json = json.dumps(spotify_track_data)
+                source_json = json.dumps(source_info or {})
+                resolved_qp_id = self._resolve_quality_profile_id(
+                    cursor, quality_profile_id
+                )
 
                 if not allow_duplicates:
                     cursor.execute("""
-                        SELECT id, spotify_track_id, spotify_data FROM wishlist_tracks
+                        SELECT id, spotify_track_id, spotify_data, source_type
+                        FROM wishlist_tracks
                         WHERE profile_id = ?
                     """, (profile_id,))
 
@@ -10533,123 +15542,124 @@ class MusicDatabase:
                             # Case-insensitive comparison of track name and primary artist
                             if (existing_name.lower() == track_name.lower() and
                                 existing_artist.lower() == artist_name.lower()):
-                                # Enhance mode: upsert existing entry with enhance bypass context
-                                if source_type == 'enhance':
-                                    source_json = json.dumps(source_info or {})
-                                    cursor.execute("""
-                                        UPDATE wishlist_tracks
-                                        SET source_type = ?, source_info = ?, failure_reason = ?,
-                                            spotify_data = ?, spotify_track_id = ?
-                                        WHERE id = ?
-                                    """, (source_type, source_json, failure_reason,
-                                          json.dumps(spotify_track_data), track_id, existing['id']))
+                                # A caller carrying an explicit Quality Profile
+                                # is authoritative. Refresh the row rather than
+                                # dropping the request as a duplicate.
+                                if source_type == 'enhance' or quality_profile_id is not None:
+                                    updates = [
+                                        "spotify_data = ?", "failure_reason = ?",
+                                    ]
+                                    params: List[Any] = [spotify_json, failure_reason]
+                                    if source_info:
+                                        updates.append("source_info = ?")
+                                        params.append(source_json)
+                                    if quality_profile_id is not None and resolved_qp_id is not None:
+                                        updates.append("quality_profile_id = ?")
+                                        params.append(resolved_qp_id)
+                                    if source_type == 'manual' or existing['source_type'] != 'manual':
+                                        updates.append("source_type = ?")
+                                        params.append(source_type)
+                                    params.append(existing['id'])
+                                    cursor.execute(
+                                        f"UPDATE wishlist_tracks SET {', '.join(updates)} WHERE id=?",
+                                        params,
+                                    )
                                     conn.commit()
-                                    logger.info(f"Upserted wishlist entry to enhance mode: '{track_name}' by {artist_name}")
-                                    return True
+                                    logger.info(
+                                        "Refreshed existing wishlist entry: '%s' by %s",
+                                        track_name,
+                                        artist_name,
+                                    )
+                                    return self._wishlist_outcome(
+                                        "updated", existing['spotify_track_id'],
+                                    )
                                 logger.info(f"Skipping duplicate wishlist entry: '{track_name}' by {artist_name} (already exists as ID: {existing['id']})")
-                                return False  # Already exists, don't add duplicate
+                                return self._wishlist_outcome(
+                                    "skipped", existing['spotify_track_id'], reason="duplicate",
+                                )
                         except Exception as parse_error:
                             logger.warning(f"Error parsing existing wishlist track data: {parse_error}")
                             continue
 
-                # Convert data to JSON strings
-                spotify_json = json.dumps(spotify_track_data)
-                source_json = json.dumps(source_info or {})
-
-                # When allow_duplicates is on, make the key unique per album so the same
-                # track from different albums can coexist in the wishlist
+                # When duplicates are allowed, retain the established key
+                # convention: the first occurrence uses the bare track id and
+                # another album uses track::album.  Repeated authoritative
+                # intent for the same occurrence updates that row in place.
                 insert_track_id = track_id
+                existing = None
                 if allow_duplicates:
                     album_obj = spotify_track_data.get('album', {})
                     album_id = album_obj.get('id', '') if isinstance(album_obj, dict) else ''
-                    if album_id:
-                        # Check if this exact track+album combo already exists
-                        composite_id = f"{track_id}::{album_id}"
-                        cursor.execute("SELECT id FROM wishlist_tracks WHERE spotify_track_id = ? AND profile_id = ?",
-                                       (composite_id, profile_id))
-                        if cursor.fetchone():
-                            logger.debug(f"Skipping wishlist entry — same track+album already in wishlist: '{track_name}' on '{album_obj.get('name', '')}'")
-                            return False
-                        # Does the base id already hold this track — and if so, is
-                        # it a DIFFERENT album? Only then does the composite key
-                        # earn its keep.
-                        #
-                        # This used to fork on the base id existing at all, without
-                        # comparing albums, so re-adding a track from the SAME album
-                        # (which is what the wishlist drain does every cycle to a
-                        # track that failed again) created a second row that was a
-                        # duplicate of the first. Nothing ever stamped the fork's
-                        # attempt counter — record_failed_attempt stamps the base id
-                        # — so its retry_count sat at 0 forever, it was therefore
-                        # always "due", and the progressive backoff could never
-                        # apply to it. That is the endless-retry loop: a real log
-                        # shows 34 files re-downloaded and re-quarantined up to 132
-                        # times each, with zero cooldowns in twelve hours.
-                        cursor.execute("SELECT spotify_data FROM wishlist_tracks "
-                                       "WHERE spotify_track_id = ? AND profile_id = ?",
-                                       (track_id, profile_id))
-                        _existing_row = cursor.fetchone()
-                        if _existing_row and self._wishlist_row_album_id(_existing_row['spotify_data']) != album_id:
-                            # Genuinely the same track from a different album.
-                            insert_track_id = composite_id
+                    base_row = cursor.execute(
+                        "SELECT id, source_type, spotify_data FROM wishlist_tracks "
+                        "WHERE spotify_track_id=? AND profile_id=?",
+                        (track_id, profile_id),
+                    ).fetchone()
+                    if base_row is not None and album_id:
+                        try:
+                            base_album_id = (
+                                (json.loads(base_row['spotify_data']).get('album') or {})
+                                .get('id', '')
+                            )
+                        except Exception:
+                            base_album_id = ''
+                        if base_album_id == album_id:
+                            existing = base_row
+                        else:
+                            insert_track_id = f"{track_id}::{album_id}"
+                    elif base_row is not None:
+                        existing = base_row
+                    if existing is None and insert_track_id != track_id:
+                        existing = cursor.execute(
+                            "SELECT id, source_type FROM wishlist_tracks "
+                            "WHERE spotify_track_id=? AND profile_id=?",
+                            (insert_track_id, profile_id),
+                        ).fetchone()
 
-                resolved_qp_id = self._resolve_quality_profile_id(cursor, quality_profile_id)
+                if existing is not None:
+                    updates = ["spotify_data = ?"]
+                    params: List[Any] = [spotify_json]
+                    if quality_profile_id is not None and resolved_qp_id is not None:
+                        updates.append("quality_profile_id = ?")
+                        params.append(resolved_qp_id)
+                    if source_info:
+                        updates.append("source_info = ?")
+                        params.append(source_json)
+                    if source_type == 'manual' or existing['source_type'] != 'manual':
+                        updates.append("source_type = ?")
+                        params.append(source_type)
+                    params.append(existing['id'])
+                    cursor.execute(
+                        f"UPDATE wishlist_tracks SET {', '.join(updates)} WHERE id=?",
+                        params,
+                    )
+                    conn.commit()
+                    logger.debug(
+                        "Wishlist entry already present; refreshed context for '%s'",
+                        track_name,
+                    )
+                    # ``insert_track_id`` is the key of the row we just refreshed
+                    # in both sub-cases above, so it is what a caller must read
+                    # back to see its own write (R2-09).
+                    return self._wishlist_outcome("updated", insert_track_id)
 
-                # Insert the track.
-                #
-                # NOT `INSERT OR REPLACE`: that DELETEs the conflicting row and
-                # inserts a fresh one, so every column absent from the list
-                # silently reverts to its default — including `retry_count` and
-                # `last_attempted`. A failing track is re-added on every drain
-                # cycle, so the counter was wiped to 0 and re-stamped to 1 each
-                # time, and `cooldown_seconds()` returns 0 at 1. That is why the
-                # progressive retry backoff (4h → 24h → 7d) never once engaged:
-                # a real log covering 12 hours shows the same 20 tracks retried
-                # every 30 minutes, and zero cooldowns. An explicit upsert
-                # touches only the columns a re-add should actually refresh.
-                _wishlist_row = (insert_track_id, spotify_json, failure_reason, source_type,
-                                 source_json, profile_id, resolved_qp_id, root_folder_id)
-                try:
-                    cursor.execute("""
-                        INSERT INTO wishlist_tracks
-                        (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
-                         quality_profile_id, root_folder_id)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-                        ON CONFLICT(profile_id, spotify_track_id) DO UPDATE SET
-                            spotify_data = excluded.spotify_data,
-                            failure_reason = excluded.failure_reason,
-                            source_type = excluded.source_type,
-                            source_info = excluded.source_info,
-                            date_added = excluded.date_added,
-                            quality_profile_id = excluded.quality_profile_id,
-                            root_folder_id = excluded.root_folder_id
-                    """, _wishlist_row)
-                except sqlite3.OperationalError as upsert_error:
-                    # The conflict target needs the profile-scoped UNIQUE index,
-                    # which a migration adds — and that migration logs-and-
-                    # continues on failure. On a DB where it never landed, an
-                    # unusable retry counter is a far smaller problem than a
-                    # wishlist that cannot accept tracks at all, so fall back.
-                    if 'ON CONFLICT' not in str(upsert_error):
-                        raise
-                    logger.warning(
-                        "wishlist upsert unavailable (%s) — falling back to REPLACE; "
-                        "retry_count will not accumulate on this database", upsert_error)
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO wishlist_tracks
-                        (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
-                         quality_profile_id, root_folder_id)
-                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
-                    """, _wishlist_row)
+                # Insert the track
+                cursor.execute("""
+                    INSERT OR REPLACE INTO wishlist_tracks
+                    (spotify_track_id, spotify_data, failure_reason, source_type, source_info, date_added, profile_id,
+                     quality_profile_id)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+                """, (insert_track_id, spotify_json, failure_reason, source_type, source_json, profile_id,
+                      resolved_qp_id))
 
                 conn.commit()
 
                 logger.info(f"Added track to wishlist: '{track_name}' by {artist_name}")
-                return True
+                return self._wishlist_outcome("created", insert_track_id)
 
         except Exception as e:
             logger.error(f"Error adding track to wishlist: {e}")
-            return False
+            return self._wishlist_outcome("error", reason=str(e))
     
     def remove_from_wishlist(self, spotify_track_id: str, profile_id: int = 1) -> bool:
         """Remove a track from the wishlist (typically after successful download)"""
@@ -10671,10 +15681,77 @@ class MusicDatabase:
             logger.error(f"Error removing track from wishlist: {e}")
             return False
 
+    def purge_podcast_tracks_from_wishlist(self) -> int:
+        """Purge any podcast tracks that leaked into wishlist_tracks."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    DELETE FROM wishlist_tracks
+                    WHERE source_type = 'podcast'
+                       OR spotify_track_id LIKE 'podcast-%'
+                       OR source_info LIKE '%"source_page": "Podcasts"%'
+                       OR source_info LIKE '%"download_source": "Podcast"%'
+                       OR source_info LIKE '%"playlist_id": "podcasts"%'
+                    """
+                )
+                conn.commit()
+                purged = cursor.rowcount
+                if purged > 0:
+                    logger.info("Purged %d podcast tracks from wishlist_tracks", purged)
+                return purged
+        except Exception as e:
+            logger.error("Failed to purge podcast tracks from wishlist: %s", e)
+            return 0
+
     # ── Wishlist ignore-list (#874) ──────────────────────────────────────
     # A TTL'd skip-gate consulted by add_to_wishlist so user-removed /
     # user-cancelled tracks are not auto-re-queued. All methods fail-open
     # (an error here must never block a legitimate wishlist add).
+
+    def has_audiobook_route(self, kind: str, route_key: str) -> bool:
+        """True when this artist/key is routed to the audiobook library."""
+        with self._get_connection() as conn:
+            row = conn.cursor().execute(
+                "SELECT 1 FROM audiobook_routes WHERE kind = ? AND route_key = ? LIMIT 1",
+                (kind, route_key)).fetchone()
+        return row is not None
+
+    def add_audiobook_route(self, kind: str, route_key: str, label: str = "") -> bool:
+        """Route a key to the audiobook library. Re-adding refreshes the label."""
+        try:
+            with self._get_connection() as conn:
+                conn.cursor().execute(
+                    "INSERT INTO audiobook_routes (kind, route_key, label) VALUES (?, ?, ?) "
+                    "ON CONFLICT(kind, route_key) DO UPDATE SET label = excluded.label",
+                    (kind, route_key, label or ""))
+                conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding audiobook route {kind}:{route_key}: {e}")
+            return False
+
+    def remove_audiobook_route(self, kind: str, route_key: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM audiobook_routes WHERE kind = ? AND route_key = ?",
+                    (kind, route_key))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error removing audiobook route {kind}:{route_key}: {e}")
+            return False
+
+    def list_audiobook_routes(self) -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT kind, route_key, label, created_at FROM audiobook_routes "
+                "ORDER BY label COLLATE NOCASE, route_key")
+            return [dict(zip([c[0] for c in cursor.description], row, strict=True)) for row in cursor.fetchall()]
 
     def add_to_wishlist_ignore(self, track_id: str, track_name: str = "",
                                artist_name: str = "", reason: str = "removed",
@@ -10696,6 +15773,19 @@ class MusicDatabase:
                     (profile_id, track_id, track_name, artist_name, reason, created_at)
                     VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 """, (profile_id, key, track_name or "", artist_name or "", reason or "removed"))
+                # S12: opportunistic prune — expired rows otherwise accumulate
+                # forever for users who never open the ignore-list UI (the
+                # only other place that purges). Same TTL the read gate uses.
+                try:
+                    from datetime import datetime, timedelta
+                    from core.wishlist.ignore import configured_ttl_days
+                    cutoff = (datetime.now() - timedelta(days=configured_ttl_days())).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        "DELETE FROM wishlist_ignore WHERE profile_id = ? AND created_at < ?",
+                        (profile_id, cutoff))
+                except Exception as _prune_err:
+                    logger.debug("wishlist ignore prune failed (housekeeping): %s", _prune_err)
                 conn.commit()
                 logger.info("Added track to wishlist ignore-list (%s): '%s' [%s]",
                             reason or "removed", track_name or key, key)
@@ -10830,6 +15920,542 @@ class MusicDatabase:
             logger.error("Error journaling notifications: %s", e)
             return 0
 
+    _CHAT_ARCHIVE_KEEP = 5000     # per room — plenty of scrollback, bounded disk
+    _CHAT_GAME_KEEP = 2000        # per room — a 60-move game is ~62 carriers
+    ARCADE_DAILY = 10000          # play money, refilled every local midnight
+
+    def get_chat_user_note(self, username: str) -> str:
+        """The local note for a Soulseek username ('' when none)."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute("SELECT note FROM chat_user_notes WHERE username = ?",
+                               (str(username),)).fetchone()
+            return row[0] if row else ''
+        except Exception as e:
+            logger.debug("get_chat_user_note failed: %s", e)
+            return ''
+        finally:
+            if conn:
+                conn.close()
+
+    def set_chat_user_note(self, username: str, note: str) -> bool:
+        """Upsert (empty note deletes the row — no tombstones)."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            if str(note or '').strip():
+                conn.execute(
+                    "INSERT INTO chat_user_notes (username, note, updated_at) "
+                    "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(username) DO UPDATE SET note = excluded.note, "
+                    "updated_at = CURRENT_TIMESTAMP",
+                    (str(username), str(note).strip()))
+            else:
+                conn.execute("DELETE FROM chat_user_notes WHERE username = ?",
+                             (str(username),))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.error("set_chat_user_note failed: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def get_user_download_stats(self, username: str) -> Dict[str, Any]:
+        """Our HISTORY with a Soulseek peer, from track_downloads — the user
+        card differentiator no other client has: how many tracks we've pulled
+        from them, how reliably, and when we last did."""
+        out = {'downloads': 0, 'completed': 0, 'failed': 0,
+               'success_rate': None, 'last_download': None, 'total_bytes': 0}
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                """SELECT COUNT(*) AS n,
+                           SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS ok,
+                           SUM(CASE WHEN status NOT IN ('completed') THEN 1 ELSE 0 END) AS bad,
+                           MAX(created_at) AS last,
+                           COALESCE(SUM(CASE WHEN status = 'completed'
+                                             THEN COALESCE(source_size, 0) ELSE 0 END), 0) AS bytes
+                    FROM track_downloads WHERE source_username = ?""",
+                (str(username),)).fetchone()
+            if row and row['n']:
+                out['downloads'] = row['n']
+                out['completed'] = row['ok'] or 0
+                out['failed'] = row['bad'] or 0
+                out['success_rate'] = round(100.0 * (row['ok'] or 0) / row['n'], 1)
+                out['last_download'] = row['last']
+                out['total_bytes'] = row['bytes'] or 0
+        except Exception as e:
+            logger.debug("get_user_download_stats failed: %s", e)
+        finally:
+            if conn:
+                conn.close()
+        return out
+
+    def add_chat_messages(self, room: str, messages) -> int:
+        """Archive a batch of DECODED room messages ({username, message, rich,
+        timestamp}). Idempotent — the natural-key UNIQUE swallows replays from
+        the push loop + page hydrate both feeding the same slskd buffer.
+        Returns rows actually inserted."""
+        rows = []
+        for m in messages or []:
+            if not isinstance(m, dict):
+                continue
+            user = str(m.get('username') or '').strip()[:64]
+            msg = str(m.get('message') or '')[:4000]
+            ts = str(m.get('timestamp') or '').strip()[:40]
+            ovl = m.get('overlay')
+            ovl_json = None
+            if isinstance(ovl, dict) and ovl.get('n') and isinstance(ovl.get('d'), dict):
+                try:
+                    ovl_json = json.dumps({'n': str(ovl.get('n'))[:120], 'd': ovl.get('d')})
+                    if len(ovl_json) > 20000:      # matches the codec's own ceiling
+                        ovl_json = None
+                except (ValueError, TypeError):
+                    ovl_json = None
+            np = m.get('np')
+            np_json = None
+            if isinstance(np, dict) and np.get('t') and np.get('a'):
+                try:
+                    np_data = {
+                        't': str(np.get('t'))[:200],
+                        'a': str(np.get('a'))[:160],
+                    }
+                    if np.get('al'): np_data['al'] = str(np['al'])[:160]
+                    if np.get('src'): np_data['src'] = str(np['src'])[:32]
+                    if np.get('id'): np_data['id'] = str(np['id'])[:120]
+                    if np.get('img'): np_data['img'] = str(np['img'])[:1000]
+                    if np.get('dur'):
+                        try:
+                            d = int(np['dur'])
+                            if 0 < d < 10**7: np_data['dur'] = d
+                        except (TypeError, ValueError): pass
+                    if np.get('br'):
+                        try:
+                            b = int(np['br'])
+                            if 0 < b < 20000: np_data['br'] = b
+                        except (TypeError, ValueError): pass
+                    np_json = json.dumps(np_data)
+                except (ValueError, TypeError):
+                    np_json = None
+
+            want = m.get('want')
+            want_json = None
+            if isinstance(want, dict) and want.get('t') and want.get('a'):
+                try:
+                    want_data = {
+                        't': str(want.get('t'))[:200],
+                        'a': str(want.get('a'))[:160],
+                        'ty': str(want.get('ty') or 'album')[:16],
+                    }
+                    if want.get('al'): want_data['al'] = str(want['al'])[:160]
+                    if want.get('src'): want_data['src'] = str(want['src'])[:32]
+                    if want.get('id'): want_data['id'] = str(want['id'])[:120]
+                    if want.get('img'): want_data['img'] = str(want['img'])[:1000]
+                    if want.get('y'): want_data['y'] = str(want['y'])[:10]
+                    if want.get('dur'):
+                        try:
+                            d = int(want['dur'])
+                            if 0 < d < 10**7: want_data['dur'] = d
+                        except (TypeError, ValueError): pass
+                    want_json = json.dumps(want_data)
+                except (ValueError, TypeError):
+                    want_json = None
+
+            # An overlay share carries no text ON PURPOSE - the card is the
+            # message. Requiring one dropped every share from the archive.
+            if not user or not ts or (not msg and not ovl_json and not np_json and not want_json):
+                continue
+            rep = m.get('reply')
+            rep_json = None
+            if isinstance(rep, dict) and rep.get('u'):
+                rep_json = json.dumps({'u': str(rep.get('u'))[:64],
+                                       'x': str(rep.get('x') or '')[:140]})
+            fil = m.get('file')
+            fil_json = None
+            if isinstance(fil, dict) and fil.get('n'):
+                fil_json = json.dumps({'n': str(fil.get('n'))[:200],
+                                       's': fil.get('s') if isinstance(fil.get('s'), int) else None,
+                                       'm': str(fil.get('m') or '')[:80]})
+            _chan = m.get('chan')
+            _th = m.get('th')
+            _tn = m.get('tn')
+            try:
+                _av = int(m.get('av')) if m.get('av') is not None else None
+            except (TypeError, ValueError):
+                _av = None
+            _ed = m.get('ed')
+            _badge = m.get('badge')
+            rows.append((str(room), user, msg, 1 if m.get('rich') else 0, ts, rep_json, fil_json,
+                         str(_chan)[:24] if _chan else None,
+                         str(_th)[:160] if _th else None,
+                         str(_tn)[:80] if _tn else None,
+                         _av,
+                         str(_ed)[:160] if _ed else None,
+                         ovl_json,
+                         np_json,
+                         want_json,
+                         str(_badge)[:24] if _badge else None))
+        if not rows:
+            return 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                before = conn.total_changes
+                cursor.executemany(
+                    "INSERT INTO chat_room_messages (room, username, message, rich, timestamp, reply, file, chan, thread, thread_name, av, edit_target, overlay, np, want, badge) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                inserted = conn.total_changes - before
+                if inserted:
+                    cursor.execute(
+                        "DELETE FROM chat_room_messages WHERE room = ? AND id NOT IN "
+                        "(SELECT id FROM chat_room_messages WHERE room = ? "
+                        " ORDER BY timestamp DESC, id DESC LIMIT ?)",
+                        (str(room), str(room), self._CHAT_ARCHIVE_KEEP))
+                conn.commit()
+                return inserted
+        except Exception as e:
+            logger.error("Error archiving chat messages: %s", e)
+            return 0
+
+    _CHAT_REACTIONS_KEEP = 20000   # per room — rows are tiny, but still bounded
+
+    def prune_chat_messages(self, older_than_days) -> int:
+        """Time-based retention for the room archive: delete messages older
+        than ``older_than_days``. The per-room COUNT cap in add_chat_messages
+        stays as the disk bound; this is the age bound. ``0``/None/invalid =
+        disabled (count cap only). Returns rows deleted.
+
+        Timestamps are slskd ISO-ish strings ('2026-07-19 10:00:00'), which
+        sort lexicographically, so the cutoff is formatted to match. Rows
+        with malformed timestamps sort wherever they sort — they're pruned
+        only if they compare older than the cutoff."""
+        try:
+            days = float(older_than_days)
+        except (TypeError, ValueError):
+            return 0
+        if not days or days <= 0 or days != days:  # 0/negative/NaN = disabled
+            return 0
+        from datetime import timedelta
+
+        # slskd stamps are server-local naive strings, so the cutoff is one
+        # too — same clock, exact boundary, no timezone guessing.
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                before = conn.total_changes
+                cursor.execute("DELETE FROM chat_room_messages WHERE timestamp < ?", (cutoff,))
+                deleted = conn.total_changes - before
+                conn.commit()
+                return deleted
+        except Exception as e:
+            logger.error("Error pruning chat archive: %s", e)
+            return 0
+
+    def add_chat_reactions(self, room: str, reactions) -> int:
+        """Archive the aggregated reaction map ({target_key: {emoji: [users]}}).
+
+        Idempotent on (room, target, emoji, user): the hydrate re-sends the same
+        map every time it runs, and a reaction has no id of its own. Reactions
+        cannot be un-sent, so there is nothing an additive store can wrongly
+        bring back."""
+        rows = []
+        for key, by_emoji in (reactions or {}).items():
+            k = str(key or '').strip()[:80]
+            if not k or not isinstance(by_emoji, dict):
+                continue
+            for emoji, users in by_emoji.items():
+                e = str(emoji or '').strip()[:8]
+                if not e or not isinstance(users, (list, tuple)):
+                    continue
+                for u in users:
+                    u = str(u or '').strip()[:64]
+                    if u:
+                        rows.append((str(room), k, e, u))
+        if not rows:
+            return 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                before = conn.total_changes
+                cursor.executemany(
+                    "INSERT INTO chat_room_reactions (room, target_key, emoji, username) "
+                    "VALUES (?, ?, ?, ?)", rows)
+                inserted = conn.total_changes - before
+                if inserted:
+                    cursor.execute(
+                        "DELETE FROM chat_room_reactions WHERE room = ? AND id NOT IN "
+                        "(SELECT id FROM chat_room_reactions WHERE room = ? "
+                        " ORDER BY id DESC LIMIT ?)",
+                        (str(room), str(room), self._CHAT_REACTIONS_KEEP))
+                conn.commit()
+                return inserted
+        except Exception as e:
+            logger.error("Error archiving chat reactions: %s", e)
+            return 0
+
+    def get_chat_reactions(self, room: str) -> Dict[str, Any]:
+        """The archived reactions for a room, in the same
+        {target_key: {emoji: [users]}} shape the live unwrap produces, so the
+        two can be merged without either side knowing about the other."""
+        out: Dict[str, Any] = {}
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT target_key, emoji, username FROM chat_room_reactions "
+                    "WHERE room = ? ORDER BY id", (str(room),)).fetchall()
+            for r in rows:
+                by_emoji = out.setdefault(r['target_key'], {})
+                users = by_emoji.setdefault(r['emoji'], [])
+                if r['username'] not in users:
+                    users.append(r['username'])
+        except Exception as e:
+            logger.error("Error reading chat reactions: %s", e)
+            return {}
+        return out
+
+    def add_chat_game_carriers(self, room: str, events) -> int:
+        """Archive Arcade game carriers ({username, timestamp, p}). Only
+        ``gm.*`` kinds are stored: the rest of the protocol bus is live-only
+        coordination and replaying it would resurrect state that is meant to
+        be dead. Idempotent on the natural key, pruned per room."""
+        rows = []
+        for e in events or []:
+            if not isinstance(e, dict):
+                continue
+            p = e.get('p')
+            if not isinstance(p, dict):
+                continue
+            kind = str(p.get('k') or '')
+            if not kind.startswith('gm.'):
+                continue
+            gid = str(p.get('g') or '').strip()[:16]
+            user = str(e.get('username') or '').strip()[:64]
+            ts = str(e.get('timestamp') or '').strip()[:40]
+            if not gid or not user or not ts:
+                continue
+            try:
+                payload = json.dumps(p, sort_keys=True, separators=(',', ':'))
+            except (TypeError, ValueError):
+                continue
+            if len(payload) > 2000:
+                continue
+            rows.append((str(room), gid, user, ts, payload))
+        if not rows:
+            return 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                before = conn.total_changes
+                cursor.executemany(
+                    "INSERT INTO chat_game_carriers (room, game_id, username, timestamp, payload) "
+                    "VALUES (?, ?, ?, ?, ?)", rows)
+                inserted = conn.total_changes - before
+                if inserted:
+                    cursor.execute(
+                        "DELETE FROM chat_game_carriers WHERE room = ? AND id NOT IN "
+                        "(SELECT id FROM chat_game_carriers WHERE room = ? "
+                        " ORDER BY timestamp DESC, id DESC LIMIT ?)",
+                        (str(room), str(room), self._CHAT_GAME_KEEP))
+                conn.commit()
+                return inserted
+        except Exception as e:
+            logger.error("Error archiving chat game carriers: %s", e)
+            return 0
+
+    def get_arcade_bank(self, profile_id: int) -> Dict[str, Any]:
+        """The profile's play-money balance, refilling it if the local day has
+        turned over. Reading is what triggers a refill — there is no scheduler
+        involved and none is wanted: a bank nobody has looked at does not need
+        to be topped up."""
+        import datetime as _dt
+        today = _dt.date.today().isoformat()
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT balance, refilled_on, lifetime_won, lifetime_lost "
+                    "FROM arcade_bank WHERE profile_id = ?", (int(profile_id),)).fetchone()
+                if row is None:
+                    conn.execute(
+                        "INSERT INTO arcade_bank (profile_id, balance, refilled_on) "
+                        "VALUES (?, ?, ?)", (int(profile_id), self.ARCADE_DAILY, today))
+                    conn.commit()
+                    return {"balance": self.ARCADE_DAILY, "allowance": self.ARCADE_DAILY,
+                            "refilled_on": today, "lifetime_won": 0, "lifetime_lost": 0}
+                row = dict(row)
+                if row["refilled_on"] != today:
+                    # A FLOOR, not a reset. The point is that everyone can
+                    # always play today, so a balance below the allowance is
+                    # topped up to it — and a balance above it is left alone,
+                    # because winnings are yours to keep. It never ADDS the
+                    # allowance either, or sitting out a month would make you
+                    # rich for doing nothing.
+                    topped = max(int(row["balance"]), self.ARCADE_DAILY)
+                    conn.execute(
+                        "UPDATE arcade_bank SET balance = ?, refilled_on = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE profile_id = ?",
+                        (topped, today, int(profile_id)))
+                    conn.commit()
+                    row["balance"] = topped
+                    row["refilled_on"] = today
+                return {"balance": int(row["balance"]), "allowance": self.ARCADE_DAILY,
+                        "refilled_on": row["refilled_on"],
+                        "lifetime_won": int(row["lifetime_won"] or 0),
+                        "lifetime_lost": int(row["lifetime_lost"] or 0)}
+        except Exception as e:
+            logger.error("Error reading arcade bank: %s", e)
+            return {"balance": 0, "allowance": self.ARCADE_DAILY, "refilled_on": "",
+                    "lifetime_won": 0, "lifetime_lost": 0, "error": True}
+
+    def adjust_arcade_bank(self, profile_id: int, delta: int) -> Dict[str, Any]:
+        """Move the balance by ``delta``. Refuses to go negative — you cannot
+        stake what you do not have, which is the only rule this bank enforces
+        and the only one it can."""
+        cur = self.get_arcade_bank(profile_id)
+        if cur.get("error"):
+            return cur
+        try:
+            delta = int(delta)
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError is the infinity case — int(float('inf')) raises it
+            # rather than ValueError, so leaving it out let junk through.
+            return cur
+        if delta < 0 and cur["balance"] + delta < 0:
+            return dict(cur, refused=True)
+        new_balance = cur["balance"] + delta
+        won = cur["lifetime_won"] + (delta if delta > 0 else 0)
+        lost = cur["lifetime_lost"] + (-delta if delta < 0 else 0)
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    "UPDATE arcade_bank SET balance = ?, lifetime_won = ?, "
+                    "lifetime_lost = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE profile_id = ?",
+                    (new_balance, won, lost, int(profile_id)))
+                conn.commit()
+        except Exception as e:
+            logger.error("Error updating arcade bank: %s", e)
+            return cur
+        return {"balance": new_balance, "allowance": self.ARCADE_DAILY,
+                "refilled_on": cur["refilled_on"], "lifetime_won": won,
+                "lifetime_lost": lost}
+
+    def get_chat_game_carriers(self, room: str, limit: int = 200) -> List[Dict[str, Any]]:
+        """Archived game carriers, OLDEST-first — the order the fold expects."""
+        try:
+            with self._get_connection() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT username, timestamp, payload FROM chat_game_carriers "
+                    "WHERE room = ? ORDER BY timestamp DESC, id DESC LIMIT ?",
+                    (str(room), max(1, min(int(limit), 1000)))).fetchall()]
+            rows.reverse()
+            out = []
+            for r in rows:
+                try:
+                    p = json.loads(r['payload'])
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(p, dict):
+                    out.append({'username': r['username'], 'timestamp': r['timestamp'], 'p': p})
+            return out
+        except Exception as e:
+            logger.error("Error reading chat game carriers: %s", e)
+            return []
+
+    def get_chat_messages(self, room: str, before: str = None, limit: int = 100) -> List[Dict[str, Any]]:
+        """A page of archived room messages, OLDEST-first within the page
+        (ready to render). ``before`` pages backwards: only messages strictly
+        older than that timestamp."""
+        try:
+            q = ("SELECT username, message, rich, timestamp, reply, file, chan, thread, thread_name, av, edit_target, overlay, np, want, badge FROM chat_room_messages "
+                 "WHERE room = ?")
+            args: list = [str(room)]
+            if before:
+                q += " AND timestamp < ?"
+                args.append(str(before))
+            q += " ORDER BY timestamp DESC, id DESC LIMIT ?"
+            args.append(max(1, min(int(limit), 500)))
+            with self._get_connection() as conn:
+                rows = [dict(r) for r in conn.execute(q, args).fetchall()]
+            rows.reverse()
+            for r in rows:
+                r['rich'] = bool(r['rich'])
+                for k in ('reply', 'file', 'np', 'want'):
+                    if r.get(k):
+                        try:
+                            r[k] = json.loads(r[k])
+                        except (ValueError, TypeError):
+                            r[k] = None
+                    if not r.get(k):
+                        r.pop(k, None)
+                # Envelope tags back under their WIRE names — the frontend
+                # reads m.chan / m.th / m.tn / m.av, matching the live push.
+                if r.get('chan'):
+                    pass  # already the right key
+                else:
+                    r.pop('chan', None)
+                if r.get('thread'):
+                    r['th'] = r.pop('thread')
+                else:
+                    r.pop('thread', None)
+                if r.get('thread_name'):
+                    r['tn'] = r.pop('thread_name')
+                else:
+                    r.pop('thread_name', None)
+                if not r.get('av'):
+                    r.pop('av', None)
+                if r.get('edit_target'):
+                    r['ed'] = r.pop('edit_target')
+                else:
+                    r.pop('edit_target', None)
+                if not r.get('badge'):
+                    r.pop('badge', None)
+                # Rebuild the share card the live path hands the frontend:
+                # name, layer count and the asset refs it needs, so a reader
+                # can still adopt a template shared days ago.
+                if r.get('overlay'):
+                    try:
+                        _o = json.loads(r['overlay'])
+                        _d = _o.get('d') or {}
+                        from core import chat_codec as _cc
+                        r['overlay'] = {'n': _o.get('n'), 'd': _d,
+                                        'layers': len(_d.get('layers') or []),
+                                        'assets': _cc.overlay_assets(_d)}
+                    except (ValueError, TypeError, ImportError):
+                        r.pop('overlay', None)
+                else:
+                    r.pop('overlay', None)
+            return rows
+        except Exception as e:
+            logger.error("Error reading chat archive: %s", e)
+            return []
+
+    def search_chat_messages(self, room: str, query: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Archive search: messages in ``room`` whose text OR sender matches
+        ``query`` (case-insensitive substring), newest first."""
+        query = str(query or '').strip()
+        if not query:
+            return []
+        like = '%' + query.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+        try:
+            with self._get_connection() as conn:
+                rows = [dict(r) for r in conn.execute(
+                    "SELECT username, message, rich, timestamp, reply FROM chat_room_messages "
+                    "WHERE room = ? AND (message LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\') "
+                    "ORDER BY timestamp DESC, id DESC LIMIT ?",
+                    (str(room), like, like, max(1, min(int(limit), 200)))).fetchall()]
+            for r in rows:
+                r['rich'] = bool(r['rich'])
+                r.pop('reply', None)   # search results render flat
+            return rows
+        except Exception as e:
+            logger.error("Error searching chat archive: %s", e)
+            return []
+
     def get_notification_history(self, profile_id: int = 1, type_filter: str = None,
                                  search: str = None, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """A profile's journaled notifications, newest first, optionally
@@ -10885,8 +16511,28 @@ class MusicDatabase:
             logger.debug("get_wishlist_spotify_data failed: %s", e)
             return {}
 
+    def get_wishlist_track(self, track_id: str, profile_id: int = 1) -> Optional[Dict[str, Any]]:
+        """One wishlist row by provider track id, or ``None``.
+
+        Lets a native client read back what was actually stored — in particular
+        the effective ``quality_profile_id`` after an add (P1-02).
+        """
+        if not track_id:
+            return None
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT * FROM wishlist_tracks WHERE spotify_track_id = ? AND profile_id = ?",
+                    (str(track_id), profile_id),
+                ).fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.debug("get_wishlist_track failed: %s", e)
+            return None
+
     def get_wishlist_tracks(self, limit: Optional[int] = None, profile_id: int = 1,
-                            offset: int = 0, category: Optional[str] = None) -> List[Dict[str, Any]]:
+                            offset: int = 0, category: Optional[str] = None,
+                            approved_only: bool = False) -> List[Dict[str, Any]]:
         """Get tracks in the wishlist for the given profile, ordered by date added
         (oldest first for retry priority).
 
@@ -10900,12 +16546,17 @@ class MusicDatabase:
                 query = """
                     SELECT id, spotify_track_id, spotify_data, failure_reason, retry_count,
                            last_attempted, date_added, source_type, source_info,
-                           quality_profile_id, root_folder_id
+                           quality_profile_id
                     FROM wishlist_tracks
                     WHERE profile_id = ?
                 """
 
                 params: List[Any] = [profile_id]
+
+                # a profile without download rights: only what an admin approved
+                if approved_only:
+                    self._ensure_music_request_schema(cursor)
+                    query += " AND request_status = 'approved'"
 
                 if category == "albums":
                     query += " AND json_extract(spotify_data, '$.album.album_type') = 'album'"
@@ -10944,10 +16595,6 @@ class MusicDatabase:
                             'source_type': row['source_type'],
                             'source_info': source_info,
                             'quality_profile_id': row['quality_profile_id'],
-                            # Which Music Library this track is destined for.
-                            # None = the default library, i.e. where it would
-                            # have gone before libraries existed.
-                            'root_folder_id': row['root_folder_id'],
                         })
                     except json.JSONDecodeError as e:
                         logger.error(f"Error parsing wishlist track data: {e}")
@@ -10959,15 +16606,89 @@ class MusicDatabase:
             logger.error(f"Error getting wishlist tracks: {e}")
             return []
 
-    def update_wishlist_retry(self, spotify_track_id: str, success: bool, error_message: str = None, profile_id: int = 1) -> bool:
-        """Update retry count and status for a wishlist track"""
+    _WISHLIST_REMOVAL_KEEP = 5000
+
+    def _record_wishlist_removal(self, cursor, spotify_track_id, profile_ids, audit, rows_removed) -> None:
+        """Append one row to the removal audit. Best-effort by construction:
+        losing the audit must never fail the removal it describes."""
+        try:
+            audit = audit or {}
+            cursor.execute(
+                """INSERT INTO wishlist_removals
+                   (spotify_track_id, profile_ids, rows_removed, reason, final_path, batch_id, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (str(spotify_track_id),
+                 json.dumps(list(profile_ids)) if profile_ids else None,
+                 int(rows_removed or 0),
+                 str(audit.get('reason') or '') or None,
+                 str(audit.get('final_path') or '') or None,
+                 str(audit.get('batch_id') or '') or None,
+                 str(audit.get('source') or '') or None))
+            # Keep the table from growing without bound on a big library; the
+            # recent history is the part anyone ever reads.
+            cursor.execute(
+                "DELETE FROM wishlist_removals WHERE id <= "
+                "(SELECT MAX(id) - ? FROM wishlist_removals)",
+                (self._WISHLIST_REMOVAL_KEEP,))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("wishlist removal audit skipped: %s", e)
+
+    def get_wishlist_removals(self, spotify_track_id: str = None, limit: int = 100):
+        """Recent wishlist removals, newest first — the answer to "why did this
+        track disappear?"."""
+        try:
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                if spotify_track_id:
+                    cursor.execute(
+                        "SELECT * FROM wishlist_removals WHERE spotify_track_id = ? "
+                        "ORDER BY id DESC LIMIT ?", (str(spotify_track_id), int(limit)))
+                else:
+                    cursor.execute(
+                        "SELECT * FROM wishlist_removals ORDER BY id DESC LIMIT ?", (int(limit),))
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.debug("wishlist removal history unavailable: %s", e)
+            return []
+
+    def update_wishlist_retry(self, spotify_track_id: str, success: bool, error_message: str = None,
+                              profile_id: int = 1, *, profile_ids=None, audit=None) -> bool:
+        """Update retry count and status for a wishlist track.
+
+        ``profile_ids`` scopes the success DELETE to the profiles whose library
+        actually holds the published file. The unscoped sweep below is kept as
+        the default because it is right for the ordinary single-root install and
+        because leaving a stale row behind causes a duplicate download, but it
+        is wrong for an own-library profile (#1199) whose request would be
+        cleared by a download into a folder it cannot see — so callers that CAN
+        tell should always pass the owners (#1289).
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
                 if success:
-                    # Remove from ALL profiles' wishlists — track is now in shared library
-                    cursor.execute("DELETE FROM wishlist_tracks WHERE spotify_track_id = ?", (spotify_track_id,))
+                    scoped = [p for p in (profile_ids or []) if p is not None]
+                    if scoped:
+                        placeholders = ",".join("?" for _ in scoped)
+                        cursor.execute(
+                            f"DELETE FROM wishlist_tracks WHERE spotify_track_id = ? "
+                            f"AND profile_id IN ({placeholders})",
+                            (spotify_track_id, *scoped))
+                    else:
+                        # Remove from ALL profiles' wishlists — track is now in shared library
+                        cursor.execute("DELETE FROM wishlist_tracks WHERE spotify_track_id = ?", (spotify_track_id,))
+                    # Capture BEFORE the audit insert: rowcount reflects the
+                    # last statement this cursor ran, so reading it afterwards
+                    # would report the audit's own trim and tell every caller
+                    # the track was never on the wishlist.
+                    deleted = cursor.rowcount
+                    if deleted > 0:
+                        self._record_wishlist_removal(
+                            cursor, spotify_track_id, scoped or None, audit, deleted)
+                    conn.commit()
+                    return deleted > 0
                 else:
                     # Increment retry count and update failure reason
                     cursor.execute("""
@@ -10985,7 +16706,71 @@ class MusicDatabase:
             logger.error(f"Error updating wishlist retry status: {e}")
             return False
     
-    def get_wishlist_count(self, profile_id: int = 1, category: Optional[str] = None) -> int:
+    def reset_wishlist_retry_backoff(self, spotify_track_ids: Optional[List[str]] = None,
+                                     profile_id: Optional[int] = None) -> int:
+        """Clear the retry clock on failing wishlist tracks. Returns rows changed.
+
+        The progressive backoff (4h → 24h → 7d) is anchored on retry_count and
+        last_attempted, both stamped by update_wishlist_retry after every failed
+        cycle. When a whole run fails for an EXTERNAL reason — slskd down, no
+        candidates returned — hundreds of tracks get stamped together and then
+        sit out the next 24 hours or 7 days in lockstep, long after the source
+        came back (#1196: 634 of 674 stuck at retry 3-4). Nothing ever cleared
+        these counters short of the track succeeding, so "the source recovered"
+        was not a state the wishlist could act on.
+
+        Only rows that actually carry a failure are touched, so a successful
+        track's history is left alone, and the count returned is the honest
+        number of tracks unstuck.
+        """
+        try:
+            ids = [str(t) for t in (spotify_track_ids or []) if t]
+            if spotify_track_ids is not None and not ids:
+                return 0
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                # The CLOCK, not the failure: every wishlist row carries a
+                # failure_reason (it is why the track is on the list), so that
+                # column identifies nothing. retry_count / last_attempted are
+                # what the backoff actually reads, so they are what "has
+                # something to unstick" means — and it keeps the returned count
+                # honest instead of reporting untouched rows as cleared.
+                clauses = ["(retry_count > 0 OR last_attempted IS NOT NULL)"]
+                params: List[Any] = []
+                if profile_id is not None:
+                    clauses.append("profile_id = ?")
+                    params.append(profile_id)
+                if ids:
+                    # chunked: sqlite caps host parameters (999 by default) and a
+                    # wishlist this feature exists for is bigger than that
+                    changed = 0
+                    for start in range(0, len(ids), 500):
+                        chunk = ids[start:start + 500]
+                        placeholders = ",".join("?" for _ in chunk)
+                        cursor.execute(
+                            f"""UPDATE wishlist_tracks
+                                SET retry_count = 0, last_attempted = NULL
+                                WHERE {' AND '.join(clauses)}
+                                  AND spotify_track_id IN ({placeholders})""",
+                            (*params, *chunk),
+                        )
+                        changed += cursor.rowcount
+                    conn.commit()
+                    return changed
+                cursor.execute(
+                    f"""UPDATE wishlist_tracks
+                        SET retry_count = 0, last_attempted = NULL
+                        WHERE {' AND '.join(clauses)}""",
+                    tuple(params),
+                )
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Error resetting wishlist retry backoff: {e}")
+            return 0
+
+    def get_wishlist_count(self, profile_id: int = 1, category: Optional[str] = None,
+                           approved_only: bool = False) -> int:
         """Get the total number of tracks in the wishlist for the given profile,
         optionally filtered by category ('singles' or 'albums')."""
         try:
@@ -10993,6 +16778,9 @@ class MusicDatabase:
                 cursor = conn.cursor()
                 query = "SELECT COUNT(*) FROM wishlist_tracks WHERE profile_id = ?"
                 params: List[Any] = [profile_id]
+                if approved_only:
+                    self._ensure_music_request_schema(cursor)
+                    query += " AND request_status = 'approved'"
                 if category == "albums":
                     query += " AND json_extract(spotify_data, '$.album.album_type') = 'album'"
                 elif category == "singles":
@@ -11008,15 +16796,61 @@ class MusicDatabase:
             return 0
     
     def clear_wishlist(self, profile_id: int = 1) -> bool:
-        """Clear all tracks from the wishlist for the given profile"""
+        """Clear all tracks from the wishlist for the given profile.
+
+        S4: the cleared tracks get ignore-list entries (#874) in the SAME
+        transaction as the delete — without them the next automatic cycle
+        (watchlist scan, failed-track capture) re-adds exactly the tracks
+        the user just cleared, and the clear never sticks. One transaction
+        also closes the race where a producer re-adds a track after the
+        delete commits but before the ignore lands, and it means a failed
+        ignore write rolls the delete back instead of leaving a silent
+        half-clear (the clear reports failure and is retryable).
+        """
         try:
+            from datetime import datetime, timedelta
+            from core.wishlist.ignore import (
+                REASON_REMOVED, configured_ttl_days, extract_display,
+                normalize_ignore_id,
+            )
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT spotify_track_id, spotify_data FROM wishlist_tracks WHERE profile_id = ?",
+                    (profile_id,))
+                rows = cursor.fetchall()
+                ignored = 0
+                for row in rows:
+                    try:
+                        spotify_data = json.loads(row['spotify_data']) if row['spotify_data'] else {}
+                    except (json.JSONDecodeError, TypeError):
+                        spotify_data = {}
+                    name, artist = extract_display(spotify_data)
+                    key = normalize_ignore_id(row['spotify_track_id'])
+                    if not key:
+                        continue
+                    cursor.execute("""
+                        INSERT OR REPLACE INTO wishlist_ignore
+                        (profile_id, track_id, track_name, artist_name, reason, created_at)
+                        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """, (profile_id, key, name or "", artist or "", REASON_REMOVED))
+                    ignored += 1
+                # S12: prune this profile's expired ignores once per clear
+                # (not once per row) so the table can't grow unbounded.
+                try:
+                    cutoff = (datetime.now() - timedelta(days=configured_ttl_days())).strftime(
+                        "%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        "DELETE FROM wishlist_ignore WHERE profile_id = ? AND created_at < ?",
+                        (profile_id, cutoff))
+                except Exception as _prune_err:
+                    logger.debug("wishlist ignore prune failed (housekeeping): %s", _prune_err)
                 cursor.execute("DELETE FROM wishlist_tracks WHERE profile_id = ?", (profile_id,))
                 cleared_count = cursor.rowcount
                 conn.commit()
-                logger.info(f"Cleared {cleared_count} tracks from wishlist (profile: {profile_id})")
-                return True
+                logger.info(f"Cleared {cleared_count} tracks from wishlist (profile: {profile_id}); "
+                            f"wrote {ignored} ignore-list entries")
+            return True
         except Exception as e:
             logger.error(f"Error clearing wishlist: {e}")
             return False
@@ -11029,7 +16863,7 @@ class MusicDatabase:
         Keeps the oldest entry (by date_added) for each duplicate set.
         Returns the number of duplicates removed."""
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             allow_duplicates = config_manager.get('wishlist.allow_duplicate_tracks', True)
 
             with self._get_connection() as conn:
@@ -11096,94 +16930,192 @@ class MusicDatabase:
             return 0
 
     # Watchlist operations
-    def add_artist_to_watchlist(self, artist_id: str, artist_name: str, profile_id: int = 1, source: str = None) -> bool:
+    def add_artist_to_watchlist(
+        self,
+        artist_id: str,
+        artist_name: str,
+        profile_id: int = 1,
+        source: str = None,
+        quality_profile_id: Optional[int] = None,
+    ) -> bool:
         """Add an artist to the watchlist for monitoring new releases.
 
-        Automatically detects if artist_id is a Spotify ID (alphanumeric) or iTunes/Deezer ID (numeric).
-        If the artist already exists (by name match), updates the existing row with the new source ID.
+        ``source`` names the provider explicitly and is the contract a native
+        client should use. Omitting it falls back to the documented legacy guess
+        (``core.watchlist_sources.infer_source``: digits mean iTunes), which is
+        wrong for Deezer/Discogs ids and only kept for older callers. An
+        unrecognised source is rejected rather than silently filed as Spotify.
+
+        If the artist already exists (matched by provider id, or by name when no
+        id matches), updates the existing row with the new source ID. An
+        explicitly supplied Quality Profile always overwrites the existing
+        assignment; omitted values preserve an existing assignment and resolve to
+        the current global profile for a new row. An explicitly UNKNOWN Quality
+        Profile is rejected instead of quietly becoming the default (P2-04).
         """
+        from core.context_sentinels import is_context_sentinel
+        from core.watchlist_sources import (
+            ARTIST_ID_COLUMNS, artist_id_match_sql, infer_source,
+            normalize_source, source_column,
+        )
         try:
+            # a download-context placeholder is not an id. one reached this table
+            # once and the scanner keyed 25 similar artists by it (#1284).
+            if is_context_sentinel(artist_id):
+                logger.error(
+                    "Refusing to watchlist '%s': %r is a context placeholder, not an artist id",
+                    artist_name, artist_id)
+                return False
+
+            if quality_profile_id is not None and not self.quality_profile_exists(quality_profile_id):
+                logger.error(
+                    "Cannot add artist '%s' to watchlist: unknown quality_profile_id %r",
+                    artist_name, quality_profile_id,
+                )
+                return False
+
+            # Provider resolution happens BEFORE any write so an unknown source
+            # can never land in the wrong column (P1-05).
+            if source:
+                canonical_source = normalize_source(source)
+                if canonical_source is None:
+                    logger.error(
+                        "Cannot add artist '%s' to watchlist: unknown source %r",
+                        artist_name, source,
+                    )
+                    return False
+            else:
+                canonical_source = infer_source(artist_id)
+            source = canonical_source
+            col = source_column(source)
+
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                resolved_quality_profile_id = self._resolve_quality_profile_id(
+                    cursor, quality_profile_id
+                )
 
-                # Check if artist already exists by name (case-insensitive) for this profile
-                cursor.execute("""
-                    SELECT id, spotify_artist_id, itunes_artist_id, deezer_artist_id,
-                           discogs_artist_id, musicbrainz_artist_id
-                    FROM watchlist_artists
-                    WHERE LOWER(artist_name) = LOWER(?) AND profile_id = ?
-                    LIMIT 1
-                """, (artist_name, profile_id))
+                # Identity first: an exact provider-id hit is the same artist,
+                # whatever it happens to be called.
+                cursor.execute(
+                    "SELECT * FROM watchlist_artists WHERE "
+                    + artist_id_match_sql() + " AND profile_id = ? LIMIT 1",
+                    [artist_id] * len(ARTIST_ID_COLUMNS) + [profile_id],
+                )
                 existing = cursor.fetchone()
 
-                # Detect source: explicit source param, or infer from ID format
-                if not source:
-                    source = 'itunes' if artist_id.isdigit() else 'spotify'
+                if existing is None:
+                    # Fall back to the name match that makes cross-provider
+                    # linking work (add on Spotify, later add the same artist
+                    # from Deezer -> one row).
+                    cursor.execute("""
+                        SELECT * FROM watchlist_artists
+                        WHERE LOWER(artist_name) = LOWER(?) AND profile_id = ?
+                        LIMIT 1
+                    """, (artist_name, profile_id))
+                    candidate = cursor.fetchone()
+                    # …but only when it is genuinely the same artist. A row that
+                    # already holds a DIFFERENT id for THIS provider is a
+                    # different artist who merely shares a name (P1-05).
+                    if candidate is not None and col and candidate[col] and candidate[col] != artist_id:
+                        existing = None
+                    else:
+                        existing = candidate
 
                 if existing:
-                    # Artist already on watchlist — update with new source ID if missing
-                    col_map = {
-                        'spotify': 'spotify_artist_id',
-                        'itunes': 'itunes_artist_id',
-                        'deezer': 'deezer_artist_id',
-                        'discogs': 'discogs_artist_id',
-                        'musicbrainz': 'musicbrainz_artist_id',
-                    }
-                    col = col_map.get(source)
+                    # Artist already on watchlist — update a missing provider ID
+                    # and/or the explicitly requested Quality Profile in one
+                    # atomic write.  This is the contract Library v2 can call.
+                    updates = []
+                    params = []
                     if col and not existing[col]:
-                        cursor.execute(f"""
-                            UPDATE watchlist_artists
-                            SET {col} = ?, updated_at = CURRENT_TIMESTAMP
-                            WHERE id = ?
-                        """, (artist_id, existing['id']))
+                        updates.append(f"{col} = ?")
+                        params.append(artist_id)
+                    if quality_profile_id is not None:
+                        updates.append("quality_profile_id = ?")
+                        params.append(resolved_quality_profile_id)
+                    elif existing['quality_profile_id'] is None:
+                        updates.append("quality_profile_id = ?")
+                        params.append(resolved_quality_profile_id)
+                    if updates:
+                        params.append(existing['id'])
+                        cursor.execute(
+                            f"""UPDATE watchlist_artists
+                                   SET {', '.join(updates)},
+                                       updated_at = CURRENT_TIMESTAMP
+                                 WHERE id = ?""",
+                            params,
+                        )
                         conn.commit()
-                        logger.info(f"Updated existing watchlist artist '{artist_name}' with {source} ID: {artist_id}")
+                        logger.info(
+                            "Updated existing watchlist artist '%s' (%s)",
+                            artist_name,
+                            source,
+                        )
                     else:
                         logger.info(f"Artist '{artist_name}' already on watchlist (profile: {profile_id})")
                     return True
 
-                # New artist — insert with the appropriate ID column
-                if source == 'deezer':
-                    cursor.execute("""
+                # New artist — insert into the column the resolved provider owns.
+                # One registry-driven statement instead of a per-provider branch,
+                # so adding a provider can no longer be half-done (Amazon was).
+                cursor.execute(
+                    f"""
                         INSERT INTO watchlist_artists
-                        (deezer_artist_id, artist_name, date_added, updated_at, profile_id)
-                        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-                    """, (artist_id, artist_name, profile_id))
-                    logger.info(f"Added artist '{artist_name}' to watchlist (Deezer ID: {artist_id}, profile: {profile_id})")
-                elif source == 'itunes':
-                    cursor.execute("""
-                        INSERT INTO watchlist_artists
-                        (itunes_artist_id, artist_name, date_added, updated_at, profile_id)
-                        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-                    """, (artist_id, artist_name, profile_id))
-                    logger.info(f"Added artist '{artist_name}' to watchlist (iTunes ID: {artist_id}, profile: {profile_id})")
-                elif source == 'discogs':
-                    cursor.execute("""
-                        INSERT INTO watchlist_artists
-                        (discogs_artist_id, artist_name, date_added, updated_at, profile_id)
-                        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-                    """, (artist_id, artist_name, profile_id))
-                    logger.info(f"Added artist '{artist_name}' to watchlist (Discogs ID: {artist_id}, profile: {profile_id})")
-                elif source == 'musicbrainz':
-                    cursor.execute("""
-                        INSERT INTO watchlist_artists
-                        (musicbrainz_artist_id, artist_name, date_added, updated_at, profile_id)
-                        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-                    """, (artist_id, artist_name, profile_id))
-                    logger.info(f"Added artist '{artist_name}' to watchlist (MusicBrainz ID: {artist_id}, profile: {profile_id})")
-                else:
-                    cursor.execute("""
-                        INSERT INTO watchlist_artists
-                        (spotify_artist_id, artist_name, date_added, updated_at, profile_id)
-                        VALUES (?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
-                    """, (artist_id, artist_name, profile_id))
-                    logger.info(f"Added artist '{artist_name}' to watchlist (Spotify ID: {artist_id}, profile: {profile_id})")
+                        ({col}, artist_name, quality_profile_id,
+                         date_added, updated_at, profile_id)
+                        VALUES (?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+                    """,
+                    (artist_id, artist_name, resolved_quality_profile_id, profile_id),
+                )
+                logger.info(
+                    "Added artist '%s' to watchlist (%s ID: %s, profile: %s)",
+                    artist_name, source, artist_id, profile_id,
+                )
 
                 conn.commit()
                 return True
 
         except Exception as e:
             logger.error(f"Error adding artist '{artist_name}' to watchlist: {e}")
+            return False
+
+    def set_watchlist_artist_quality_profile(
+        self,
+        artist_id: str,
+        quality_profile_id: int,
+        *,
+        profile_id: int = 1,
+    ) -> bool:
+        """Persist the Quality Profile used for this artist's future releases."""
+        try:
+            with self._get_connection() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM quality_profiles WHERE id=?",
+                    (int(quality_profile_id),),
+                ).fetchone() is None:
+                    return False
+                cursor = conn.execute(
+                    """UPDATE watchlist_artists
+                          SET quality_profile_id=?, updated_at=CURRENT_TIMESTAMP
+                        WHERE profile_id=? AND (
+                              spotify_artist_id=? OR itunes_artist_id=?
+                           OR deezer_artist_id=? OR discogs_artist_id=?
+                           OR musicbrainz_artist_id=? OR amazon_artist_id=?)""",
+                    (
+                        int(quality_profile_id), int(profile_id),
+                        artist_id, artist_id, artist_id,
+                        artist_id, artist_id, artist_id,
+                    ),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                "Error updating Quality Profile for watchlist artist %s: %s",
+                artist_id,
+                e,
+            )
             return False
 
     def remove_artist_from_watchlist(self, artist_id: str, profile_id: int = 1) -> bool:
@@ -11201,11 +17133,24 @@ class MusicDatabase:
                 result = cursor.fetchone()
                 artist_name = result['artist_name'] if result else "Unknown"
 
-                cursor.execute("""
-                    DELETE FROM watchlist_artists
-                    WHERE (spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
-                           OR discogs_artist_id = ? OR musicbrainz_artist_id = ?) AND profile_id = ?
-                """, (artist_id, artist_id, artist_id, artist_id, artist_id, profile_id))
+                from core.watchlist_sources import (ARTIST_ID_COLUMNS, artist_id_match_sql,
+                                                    library_artist_provider_ids)
+                cursor.execute(
+                    "DELETE FROM watchlist_artists WHERE "
+                    + artist_id_match_sql() + " AND profile_id = ?",
+                    [artist_id] * len(ARTIST_ID_COLUMNS) + [profile_id],
+                )
+                if cursor.rowcount == 0:
+                    # a library artist row id: remove by the provider ids it
+                    # carries, the ones add stored (#1308)
+                    for provider_id in library_artist_provider_ids(cursor, artist_id):
+                        cursor.execute(
+                            "DELETE FROM watchlist_artists WHERE "
+                            + artist_id_match_sql() + " AND profile_id = ?",
+                            [provider_id] * len(ARTIST_ID_COLUMNS) + [profile_id],
+                        )
+                        if cursor.rowcount > 0:
+                            break
 
                 if cursor.rowcount > 0:
                     conn.commit()
@@ -11226,24 +17171,37 @@ class MusicDatabase:
                 cursor = conn.cursor()
 
                 # Check all ID columns and optionally artist name
+                from core.watchlist_sources import ARTIST_ID_COLUMNS, artist_id_match_sql
+                id_params = [artist_id] * len(ARTIST_ID_COLUMNS)
                 if artist_name:
-                    cursor.execute("""
-                        SELECT 1 FROM watchlist_artists
-                        WHERE (spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
-                               OR discogs_artist_id = ? OR musicbrainz_artist_id = ?
-                               OR LOWER(artist_name) = LOWER(?)) AND profile_id = ?
-                        LIMIT 1
-                    """, (artist_id, artist_id, artist_id, artist_id, artist_id, artist_name, profile_id))
+                    cursor.execute(
+                        "SELECT 1 FROM watchlist_artists WHERE ("
+                        + artist_id_match_sql()
+                        + " OR LOWER(artist_name) = LOWER(?)) AND profile_id = ? LIMIT 1",
+                        id_params + [artist_name, profile_id],
+                    )
                 else:
-                    cursor.execute("""
-                        SELECT 1 FROM watchlist_artists
-                        WHERE (spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
-                               OR discogs_artist_id = ? OR musicbrainz_artist_id = ?) AND profile_id = ?
-                        LIMIT 1
-                    """, (artist_id, artist_id, artist_id, artist_id, artist_id, profile_id))
+                    cursor.execute(
+                        "SELECT 1 FROM watchlist_artists WHERE "
+                        + artist_id_match_sql() + " AND profile_id = ? LIMIT 1",
+                        id_params + [profile_id],
+                    )
                 result = cursor.fetchone()
+                if result is not None:
+                    return True
 
-                return result is not None
+                # a library artist row id: check the provider ids it carries,
+                # the ones add actually stored (#1308)
+                from core.watchlist_sources import library_artist_provider_ids
+                for provider_id in library_artist_provider_ids(cursor, artist_id):
+                    cursor.execute(
+                        "SELECT 1 FROM watchlist_artists WHERE "
+                        + artist_id_match_sql() + " AND profile_id = ? LIMIT 1",
+                        [provider_id] * len(ARTIST_ID_COLUMNS) + [profile_id],
+                    )
+                    if cursor.fetchone() is not None:
+                        return True
+                return False
 
         except Exception as e:
             logger.error(f"Error checking if artist is in watchlist (ID: {artist_id}): {e}")
@@ -11336,6 +17294,483 @@ class MusicDatabase:
         except Exception as e:
             logger.debug("mark_watchlist_label_scanned failed: %s", e)
 
+    # ── Podcast watchlist (podcasts feature) ─────────────────────────────────
+    # Self-contained CRUD on watchlist_podcasts. Additive: no existing method
+    # touches this table, and these touch nothing else.
+
+    def add_watchlist_podcast(
+        self,
+        feed_url: str,
+        title: str,
+        *,
+        itunes_id: Optional[int] = None,
+        author: Optional[str] = None,
+        description: Optional[str] = None,
+        artwork_url: Optional[str] = None,
+        website: Optional[str] = None,
+        auto_download: bool = True,
+        retention_days: int = 14,
+        episode_count: Optional[int] = None,
+        profile_id: int = 1,
+    ) -> bool:
+        """Follow a podcast. Idempotent on feed_url."""
+        feed_url = str(feed_url or '').strip()
+        title = str(title or '').strip()
+        if not feed_url or not title:
+            return False
+        try:
+            with self._get_connection() as conn:
+                conn.execute(
+                    "INSERT INTO watchlist_podcasts ("
+                    "feed_url, itunes_id, title, author, description, artwork_url, website, "
+                    "auto_download, retention_days, episode_count, profile_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(feed_url, profile_id) DO UPDATE SET "
+                    "itunes_id=COALESCE(excluded.itunes_id, watchlist_podcasts.itunes_id), "
+                    "title=excluded.title, "
+                    "author=COALESCE(excluded.author, watchlist_podcasts.author), "
+                    "description=COALESCE(excluded.description, watchlist_podcasts.description), "
+                    "artwork_url=COALESCE(excluded.artwork_url, watchlist_podcasts.artwork_url), "
+                    "website=COALESCE(excluded.website, watchlist_podcasts.website), "
+                    "episode_count=COALESCE(excluded.episode_count, watchlist_podcasts.episode_count), "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (
+                        feed_url,
+                        itunes_id,
+                        title,
+                        author,
+                        description,
+                        artwork_url,
+                        website,
+                        1 if auto_download else 0,
+                        max(0, int(retention_days or 14)),
+                        episode_count,
+                        profile_id,
+                    ),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error("add_watchlist_podcast failed: %s", e)
+            return False
+
+    def remove_watchlist_podcast(
+        self,
+        feed_url: Optional[str] = None,
+        itunes_id: Optional[int] = None,
+        podcast_id: Optional[int] = None,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Unfollow a podcast by feed_url, itunes_id, or database id.
+
+        Scoped to one profile when profile_id is given. Without it this deleted
+        by feed_url alone, so one profile could unfollow another profile's show.
+        """
+        try:
+            with self._get_connection() as conn:
+                # profile_id None means "any profile", which is what this did
+                # before it took the argument at all. Every caller in the app
+                # passes one; leaving None working keeps older callers honest.
+                scope = "" if profile_id is None else " AND COALESCE(profile_id, 1) = ?"
+                extra = () if profile_id is None else (int(profile_id),)
+                if feed_url:
+                    cur = conn.execute(
+                        "DELETE FROM watchlist_podcasts WHERE feed_url = ?" + scope,
+                        (str(feed_url).strip(),) + extra,
+                    )
+                elif itunes_id:
+                    cur = conn.execute(
+                        "DELETE FROM watchlist_podcasts WHERE itunes_id = ?" + scope,
+                        (int(itunes_id),) + extra,
+                    )
+                elif podcast_id:
+                    cur = conn.execute(
+                        "DELETE FROM watchlist_podcasts WHERE id = ?" + scope,
+                        (int(podcast_id),) + extra,
+                    )
+                else:
+                    return False
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error("remove_watchlist_podcast failed: %s", e)
+            return False
+
+    def is_podcast_in_watchlist(
+        self,
+        feed_url: Optional[str] = None,
+        itunes_id: Optional[int] = None,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Check if a podcast is followed by feed_url or itunes_id.
+
+        Scoped to one profile when profile_id is given. Unscoped this answered
+        True for a show somebody ELSE follows, so the button read "following"
+        on a page whose watchlist did not contain it.
+        """
+        try:
+            with self._get_connection() as conn:
+                scope = "" if profile_id is None else " AND COALESCE(profile_id, 1) = ?"
+                extra = () if profile_id is None else (int(profile_id),)
+                if feed_url:
+                    row = conn.execute(
+                        "SELECT 1 FROM watchlist_podcasts WHERE feed_url = ?" + scope,
+                        (str(feed_url).strip(),) + extra,
+                    ).fetchone()
+                    if row:
+                        return True
+                if itunes_id:
+                    row = conn.execute(
+                        "SELECT 1 FROM watchlist_podcasts WHERE itunes_id = ?" + scope,
+                        (int(itunes_id),) + extra,
+                    ).fetchone()
+                    if row:
+                        return True
+                return False
+        except Exception:
+            return False
+
+    def profiles_with_podcast_rows(self) -> List[int]:
+        """Every profile that actually follows a podcast.
+
+        A timed scan has no request behind it, so there is no caller whose
+        profile it could act as - system automations all run as profile 1. That
+        meant a second person's shows were never scanned at all. The profile has
+        to come from the rows instead, which is how the audiobook wishlist
+        worker solves the same problem.
+        """
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT DISTINCT COALESCE(profile_id, 1) AS pid "
+                    "FROM watchlist_podcasts ORDER BY pid"
+                ).fetchall()
+                return [int(r["pid"]) for r in rows] or [1]
+        except Exception as e:
+            logger.error("profiles_with_podcast_rows failed: %s", e)
+            return [1]
+
+    def get_watchlist_podcasts(self, profile_id: int = 1) -> List[Dict[str, Any]]:
+        """List all watchlisted podcasts."""
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    "SELECT id, feed_url, itunes_id, title, author, description, artwork_url, website, "
+                    "auto_download, retention_days, episode_count, date_added, last_scan_timestamp "
+                    "FROM watchlist_podcasts WHERE profile_id = ? "
+                    "ORDER BY title COLLATE NOCASE",
+                    (profile_id,),
+                ).fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["auto_download"] = bool(d.get("auto_download", 0))
+                    d["retention_days"] = int(d.get("retention_days") or 14)
+                    out.append(d)
+                return out
+        except Exception as e:
+            logger.error("get_watchlist_podcasts failed: %s", e)
+            return []
+
+    def get_watchlist_podcast(
+        self,
+        feed_url: Optional[str] = None,
+        itunes_id: Optional[int] = None,
+        profile_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get a single watchlisted podcast record by feed_url or itunes_id.
+
+        Scoped to one profile when profile_id is given, so the row handed back
+        is the caller's own settings rather than whoever followed the show first.
+        """
+        try:
+            with self._get_connection() as conn:
+                scope = "" if profile_id is None else " AND COALESCE(profile_id, 1) = ?"
+                extra = () if profile_id is None else (int(profile_id),)
+                row = None
+                if feed_url:
+                    row = conn.execute(
+                        "SELECT id, feed_url, itunes_id, title, author, description, artwork_url, website, "
+                        "auto_download, retention_days, episode_count, date_added, last_scan_timestamp "
+                        "FROM watchlist_podcasts WHERE feed_url = ?" + scope,
+                        (str(feed_url).strip(),) + extra,
+                    ).fetchone()
+                if not row and itunes_id:
+                    row = conn.execute(
+                        "SELECT id, feed_url, itunes_id, title, author, description, artwork_url, website, "
+                        "auto_download, retention_days, episode_count, date_added, last_scan_timestamp "
+                        "FROM watchlist_podcasts WHERE itunes_id = ?" + scope,
+                        (int(itunes_id),) + extra,
+                    ).fetchone()
+                if row:
+                    d = dict(row)
+                    d["auto_download"] = bool(d.get("auto_download", 0))
+                    d["retention_days"] = int(d.get("retention_days") or 14)
+                    return d
+                return None
+        except Exception as e:
+            logger.debug("get_watchlist_podcast failed: %s", e)
+            return None
+
+    def update_watchlist_podcast_settings(
+        self,
+        feed_url: str,
+        *,
+        auto_download: Optional[bool] = None,
+        retention_days: Optional[int] = None,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Update auto_download or retention_days settings for a followed podcast.
+
+        Scoped to one profile when profile_id is given. Unscoped this matched on
+        feed_url alone, so changing your own retention rewrote the row of
+        whoever followed the show first.
+        """
+        feed_url = str(feed_url or '').strip()
+        if not feed_url:
+            return False
+        clauses = []
+        params = []
+        if auto_download is not None:
+            clauses.append("auto_download = ?")
+            params.append(1 if auto_download else 0)
+        if retention_days is not None:
+            clauses.append("retention_days = ?")
+            params.append(max(0, int(retention_days)))
+        if not clauses:
+            return True
+        clauses.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(feed_url)
+        scope = ""
+        if profile_id is not None:
+            scope = " AND COALESCE(profile_id, 1) = ?"
+            params.append(int(profile_id))
+        try:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    f"UPDATE watchlist_podcasts SET {', '.join(clauses)} "
+                    f"WHERE feed_url = ?{scope}",
+                    params,
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error("update_watchlist_podcast_settings failed: %s", e)
+            return False
+
+    def mark_watchlist_podcast_scanned(self, feed_url: str, episode_count: Optional[int] = None) -> None:
+        try:
+            with self._get_connection() as conn:
+                if episode_count is not None:
+                    conn.execute(
+                        "UPDATE watchlist_podcasts SET last_scan_timestamp = CURRENT_TIMESTAMP, "
+                        "episode_count = COALESCE(?, episode_count) WHERE feed_url = ?",
+                        (episode_count, str(feed_url or '').strip()),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE watchlist_podcasts SET last_scan_timestamp = CURRENT_TIMESTAMP "
+                        "WHERE feed_url = ?",
+                        (str(feed_url or '').strip(),),
+                    )
+                conn.commit()
+        except Exception as e:
+            logger.debug("mark_watchlist_podcast_scanned failed: %s", e)
+
+    def get_watchlist_podcasts_count(self, profile_id: int = 1) -> int:
+        try:
+            with self._get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) as count FROM watchlist_podcasts WHERE profile_id = ?",
+                    (profile_id,),
+                ).fetchone()
+                return row["count"] if row else 0
+        except Exception:
+            return 0
+
+    def record_downloaded_podcast_episode(
+        self,
+        feed_url: str,
+        enclosure_url: str,
+        guid: Optional[str] = None,
+        title: Optional[str] = None,
+        pub_date: Optional[Any] = None,
+        file_path: Optional[str] = None,
+    ) -> bool:
+        """Record a downloaded podcast episode so it is never re-downloaded."""
+        if not feed_url or not enclosure_url:
+            return False
+        try:
+            pub_date_str = pub_date.isoformat() if hasattr(pub_date, "isoformat") else (str(pub_date) if pub_date else None)
+            with self._get_connection() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO downloaded_podcast_episodes
+                        (feed_url, guid, enclosure_url, title, pub_date, file_path, downloaded_at)
+                    VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(feed_url, enclosure_url) DO UPDATE SET
+                        guid = COALESCE(excluded.guid, downloaded_podcast_episodes.guid),
+                        title = COALESCE(excluded.title, downloaded_podcast_episodes.title),
+                        pub_date = COALESCE(excluded.pub_date, downloaded_podcast_episodes.pub_date),
+                        file_path = COALESCE(excluded.file_path, downloaded_podcast_episodes.file_path)
+                    """,
+                    (str(feed_url).strip(), str(guid).strip() if guid else None,
+                     str(enclosure_url).strip(), str(title).strip() if title else None,
+                     pub_date_str, str(file_path).strip() if file_path else None),
+                )
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error("record_downloaded_podcast_episode failed: %s", e)
+            return False
+
+    def is_podcast_episode_downloaded(
+        self,
+        feed_url: str,
+        enclosure_url: Optional[str] = None,
+        guid: Optional[str] = None,
+        title: Optional[str] = None,
+        show_title: Optional[str] = None,
+    ) -> bool:
+        """Check if an episode has already been downloaded (or pruned).
+
+        ``show_title`` scopes the last-resort title match: without it an
+        "Episode 1" from any other show counted as this one."""
+        feed_url = str(feed_url or "").strip()
+        enc = str(enclosure_url or "").strip()
+        g = str(guid or "").strip()
+        t = str(title or "").strip()
+        if not feed_url and not enc and not g and not t:
+            return False
+        try:
+            with self._get_connection() as conn:
+                # 1. Check downloaded_podcast_episodes table. a row is written
+                # the moment an episode is QUEUED, before a byte arrives; only
+                # a row with a file (or one pruned after having a file) is a
+                # download. counting the placeholder meant a failed or
+                # cancelled auto-download was "done" forever and never retried.
+                landed = "(file_path IS NOT NULL AND file_path != '' OR pruned_at IS NOT NULL)"
+                if enc and g:
+                    row = conn.execute(
+                        "SELECT 1 FROM downloaded_podcast_episodes "
+                        f"WHERE ((feed_url = ? AND enclosure_url = ?) OR (guid = ?)) AND {landed}",
+                        (feed_url, enc, g),
+                    ).fetchone()
+                elif enc:
+                    row = conn.execute(
+                        "SELECT 1 FROM downloaded_podcast_episodes "
+                        f"WHERE feed_url = ? AND enclosure_url = ? AND {landed}",
+                        (feed_url, enc),
+                    ).fetchone()
+                elif g:
+                    row = conn.execute(
+                        f"SELECT 1 FROM downloaded_podcast_episodes WHERE guid = ? AND {landed}",
+                        (g,),
+                    ).fetchone()
+                else:
+                    row = None
+
+                if row:
+                    return True
+
+                # 2. Check library_history table fallback
+                target_ids = [x for x in (g, enc) if x]
+                if target_ids:
+                    placeholders = ",".join("?" * len(target_ids))
+                    row = conn.execute(
+                        f"SELECT 1 FROM library_history WHERE event_type = 'podcast' "
+                        f"AND source_track_id IN ({placeholders})",
+                        target_ids,
+                    ).fetchone()
+                    if row:
+                        return True
+
+                if t:
+                    show = str(show_title or "").strip()
+                    if show:
+                        row = conn.execute(
+                            "SELECT 1 FROM library_history WHERE event_type = 'podcast' "
+                            "AND title = ? AND album_name = ?",
+                            (t, show),
+                        ).fetchone()
+                    else:
+                        row = conn.execute(
+                            "SELECT 1 FROM library_history WHERE event_type = 'podcast' "
+                            "AND title = ?",
+                            (t,),
+                        ).fetchone()
+                    if row:
+                        return True
+
+                return False
+        except Exception as e:
+            logger.debug("is_podcast_episode_downloaded check failed: %s", e)
+            return False
+
+    def forget_podcast_episode_attempt(self, feed_url: str, enclosure_url: str) -> bool:
+        """Drop the placeholder a queued download wrote, when it did not land.
+
+        Only a row with no file and no prune stamp: a real download's record
+        is history and stays, whatever happens to a later attempt."""
+        if not feed_url or not enclosure_url:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    "DELETE FROM downloaded_podcast_episodes "
+                    "WHERE feed_url = ? AND enclosure_url = ? "
+                    "AND (file_path IS NULL OR file_path = '') AND pruned_at IS NULL",
+                    (str(feed_url).strip(), str(enclosure_url).strip()),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error("forget_podcast_episode_attempt failed: %s", e)
+            return False
+
+    def get_downloaded_podcast_episodes(
+        self,
+        feed_url: Optional[str] = None,
+        unpruned_only: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Return list of downloaded podcast episode records."""
+        try:
+            with self._get_connection() as conn:
+                clauses = []
+                params = []
+                if feed_url:
+                    clauses.append("feed_url = ?")
+                    params.append(str(feed_url).strip())
+                if unpruned_only:
+                    clauses.append("pruned_at IS NULL")
+                where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                cursor = conn.execute(
+                    f"SELECT id, feed_url, guid, enclosure_url, title, pub_date, "
+                    f"file_path, downloaded_at, pruned_at "
+                    f"FROM downloaded_podcast_episodes {where} ORDER BY downloaded_at DESC",
+                    params,
+                )
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.error("get_downloaded_podcast_episodes failed: %s", e)
+            return []
+
+    def mark_podcast_episode_pruned(self, episode_id: int, pruned_at: Optional[str] = None) -> bool:
+        """Flag a downloaded episode as retention-pruned (file deleted on disk)."""
+        try:
+            with self._get_connection() as conn:
+                stamp = pruned_at or datetime.now().isoformat()
+                cur = conn.execute(
+                    "UPDATE downloaded_podcast_episodes SET pruned_at = ? "
+                    "WHERE id = ? AND pruned_at IS NULL",
+                    (stamp, int(episode_id)),
+                )
+                conn.commit()
+                return cur.rowcount > 0
+        except Exception as e:
+            logger.error("mark_podcast_episode_pruned failed: %s", e)
+            return False
+
     def get_watchlist_artists(self, profile_id: int = 1) -> List[WatchlistArtist]:
         """Get all artists in the watchlist for the given profile"""
         try:
@@ -11351,8 +17786,8 @@ class MusicDatabase:
                                'last_scan_timestamp', 'created_at', 'updated_at']
                 optional_columns = ['image_url', 'itunes_artist_id', 'deezer_artist_id', 'discogs_artist_id', 'musicbrainz_artist_id', 'include_albums', 'include_eps', 'include_singles',
                                    'include_live', 'include_remixes', 'include_acoustic', 'include_compilations',
-                                   'include_instrumentals', 'lookback_days', 'preferred_metadata_source',
-                                   'auto_download']
+                                   'include_instrumentals', 'include_other_artists', 'lookback_days', 'preferred_metadata_source',
+                                   'auto_download', 'auto_download_pref', 'quality_profile_id']
 
                 columns_to_select = base_columns + [col for col in optional_columns if col in existing_columns]
 
@@ -11388,9 +17823,18 @@ class MusicDatabase:
                     include_acoustic = bool(row['include_acoustic']) if 'include_acoustic' in existing_columns else False
                     include_compilations = bool(row['include_compilations']) if 'include_compilations' in existing_columns else False
                     include_instrumentals = bool(row['include_instrumentals']) if 'include_instrumentals' in existing_columns else False
+                    include_other_artists = bool(row['include_other_artists']) if 'include_other_artists' in existing_columns else False
                     lookback_days = row['lookback_days'] if 'lookback_days' in existing_columns else None
                     preferred_metadata_source = row['preferred_metadata_source'] if 'preferred_metadata_source' in existing_columns else None
                     auto_download = bool(row['auto_download']) if 'auto_download' in existing_columns else True
+                    auto_download_pref = (row['auto_download_pref']
+                                          if 'auto_download_pref' in existing_columns else None)
+                    quality_profile_id = (
+                        int(row['quality_profile_id'])
+                        if 'quality_profile_id' in existing_columns
+                        and row['quality_profile_id'] is not None
+                        else None
+                    )
 
                     watchlist_artists.append(WatchlistArtist(
                         id=row['id'],
@@ -11413,9 +17857,12 @@ class MusicDatabase:
                         include_acoustic=include_acoustic,
                         include_compilations=include_compilations,
                         include_instrumentals=include_instrumentals,
+                        include_other_artists=include_other_artists,
                         lookback_days=lookback_days,
                         preferred_metadata_source=preferred_metadata_source,
                         auto_download=auto_download,
+                        auto_download_pref=auto_download_pref,
+                        quality_profile_id=quality_profile_id,
                         profile_id=profile_id
                     ))
 
@@ -11588,6 +18035,62 @@ class MusicDatabase:
             logger.error(f"Error getting watchlist count: {e}")
             return 0
 
+    def get_watchlist_recent_releases(self, limit: int = 20, profile_id: int = 1) -> list:
+        """Newest releases discovered across the WHOLE watchlist, flat.
+
+        ``recent_releases`` is populated by the watchlist scan and until now was
+        only ever read per-artist (the watchlist artist detail's six-release
+        strip). The dashboard's "Fresh from your artists" rail needs the same
+        rows newest-first across every watched artist, with the artist's name
+        and provider ids joined on so a card can say who it's from and link to
+        their page.
+
+        Ordered by release_date (what the user cares about), tie-broken by
+        added_date so two same-day releases keep a stable order.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT rr.album_name, rr.release_date, rr.album_cover_url,
+                           rr.track_count, rr.source,
+                           rr.album_spotify_id, rr.album_itunes_id,
+                           rr.album_deezer_id,
+                           wa.artist_name, wa.spotify_artist_id,
+                           wa.itunes_artist_id, wa.deezer_artist_id
+                    FROM recent_releases rr
+                    JOIN watchlist_artists wa ON rr.watchlist_artist_id = wa.id
+                    WHERE wa.profile_id = ?
+                    ORDER BY rr.release_date DESC, rr.added_date DESC
+                    LIMIT ?
+                """, (profile_id, limit))
+                releases = [dict(row) for row in cursor.fetchall()]
+
+                # Owned = the library already has this (artist, album) —
+                # the dashboard rail badges those, and a click plays them
+                # instead of opening the download modal. Name-match, same
+                # comparison the recently-added art backfill uses; track
+                # completeness stays the click-time check's job.
+                for release in releases:
+                    try:
+                        cursor.execute(
+                            """
+                            SELECT 1 FROM albums al
+                            JOIN artists ar ON al.artist_id = ar.id
+                            WHERE LOWER(TRIM(ar.name)) = LOWER(TRIM(?))
+                              AND LOWER(TRIM(al.title)) = LOWER(TRIM(?))
+                            LIMIT 1
+                            """,
+                            (release.get('artist_name') or '',
+                             release.get('album_name') or ''))
+                        release['owned'] = cursor.fetchone() is not None
+                    except Exception:
+                        release['owned'] = False
+                return releases
+        except Exception as e:
+            logger.error(f"Error getting watchlist recent releases: {e}")
+            return []
+
     def update_watchlist_artist_image(self, artist_id: str, image_url: str) -> bool:
         """Update the image URL for a watchlist artist (checks linked provider IDs)"""
         try:
@@ -11600,6 +18103,13 @@ class MusicDatabase:
 
                 if 'image_url' not in existing_columns:
                     logger.warning("image_url column does not exist in watchlist_artists table. Skipping update. Please restart the app to apply migrations.")
+                    return False
+
+                # a deezer "no picture" url is a real url that never renders;
+                # storing it also stops every backfill from looking further
+                from core.metadata.artwork import is_placeholder_image_url
+                if is_placeholder_image_url(image_url):
+                    logger.debug("Refusing placeholder image for watchlist artist %s: %s", artist_id, image_url)
                     return False
 
                 cursor.execute("""
@@ -11709,6 +18219,34 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error updating watchlist MusicBrainz ID: {e}")
             return False
+
+    def get_library_artist_thumbs_by_name(self, names) -> Dict[str, str]:
+        """lower-cased artist name -> raw server thumb_url, for the names given.
+
+        the watchlist's image fallback: an artist whose external source has
+        no picture usually has one on the media server already."""
+        wanted = {str(n).strip().lower() for n in (names or []) if n and str(n).strip()}
+        if not wanted:
+            return {}
+        out: Dict[str, str] = {}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                names_list = list(wanted)
+                for start in range(0, len(names_list), 500):
+                    chunk = names_list[start:start + 500]
+                    placeholders = ','.join('?' * len(chunk))
+                    cursor.execute(f"""
+                        SELECT name, thumb_url FROM artists
+                        WHERE thumb_url IS NOT NULL AND thumb_url != ''
+                          AND LOWER(name) IN ({placeholders})
+                    """, chunk)
+                    for row in cursor.fetchall():
+                        key = str(row['name']).strip().lower()
+                        out.setdefault(key, row['thumb_url'])
+        except Exception as e:
+            logger.debug("library thumb lookup failed: %s", e)
+        return out
 
     def backfill_watchlist_musicbrainz_ids_from_library(self, profile_id: int = 1) -> int:
         """Copy existing library MusicBrainz artist IDs onto matching watchlist rows.
@@ -11847,8 +18385,23 @@ class MusicDatabase:
                                       genres: Optional[list] = None,
                                       popularity: int = 0,
                                       similar_artist_deezer_id: Optional[str] = None,
-                                      similar_artist_musicbrainz_id: Optional[str] = None) -> bool:
-        """Add or update a similar artist recommendation."""
+                                      similar_artist_musicbrainz_id: Optional[str] = None,
+                                      source_provider: Optional[str] = None) -> bool:
+        """Add or update a similar artist recommendation.
+
+        source_provider names the namespace source_artist_id belongs to
+        ('spotify' / 'itunes' / 'deezer' / 'discogs' / 'musicbrainz' /
+        'watchlist_row'). readers match the PAIR, so a deezer id can never
+        resolve as an itunes one. omitting it leaves the row unprovable and
+        the recommendation readers will not use it."""
+        from core.context_sentinels import is_context_sentinel
+        # the second line of defence for #1284: whatever put the placeholder in
+        # front of us, an edge keyed by one can never be traced back to an artist.
+        if is_context_sentinel(source_artist_id):
+            logger.warning(
+                "Refusing similar artists for %r: a context placeholder is not an artist id",
+                source_artist_id)
+            return False
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -11859,10 +18412,11 @@ class MusicDatabase:
                     (source_artist_id, similar_artist_spotify_id, similar_artist_itunes_id,
                      similar_artist_deezer_id, similar_artist_musicbrainz_id, similar_artist_name,
                      similarity_rank, occurrence_count, last_updated, profile_id,
-                     image_url, genres, popularity, metadata_updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     image_url, genres, popularity, metadata_updated_at, source_provider)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
                     ON CONFLICT(profile_id, source_artist_id, similar_artist_name)
                     DO UPDATE SET
+                        source_provider = COALESCE(excluded.source_provider, source_provider),
                         similar_artist_spotify_id = COALESCE(excluded.similar_artist_spotify_id, similar_artist_spotify_id),
                         similar_artist_itunes_id = COALESCE(excluded.similar_artist_itunes_id, similar_artist_itunes_id),
                         similar_artist_deezer_id = COALESCE(excluded.similar_artist_deezer_id, similar_artist_deezer_id),
@@ -11876,7 +18430,8 @@ class MusicDatabase:
                         metadata_updated_at = CASE WHEN excluded.image_url IS NOT NULL THEN CURRENT_TIMESTAMP ELSE metadata_updated_at END
                 """, (source_artist_id, similar_artist_spotify_id, similar_artist_itunes_id,
                       similar_artist_deezer_id, similar_artist_musicbrainz_id, similar_artist_name,
-                      similarity_rank, profile_id, image_url, genres_json, popularity))
+                      similarity_rank, profile_id, image_url, genres_json, popularity,
+                      (str(source_provider).strip().lower() or None) if source_provider else None))
 
                 conn.commit()
                 return True
@@ -11884,6 +18439,67 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error adding similar artist: {e}")
             return False
+
+    def replace_similar_artists(self, source_artist_id: str, similars: List[Dict[str, Any]],
+                                profile_id: int = 1,
+                                source_provider: Optional[str] = None) -> int:
+        """swap one artist's similar artists for a fresh fetch, in one go.
+
+        the upsert only ever added. a name a better match no longer produces
+        (Colde stored for Cold) stayed forever, and every refetch bumped
+        occurrence_count, which the reader sums. the hero's rotation history
+        (last_featured) carries over by name.
+
+        each entry takes add_or_update_similar_artist's kwargs. returns how
+        many rows went in; an empty list leaves the old set alone."""
+        from core.context_sentinels import is_context_sentinel
+        if is_context_sentinel(source_artist_id):
+            logger.warning(
+                "Refusing similar artists for %r: a context placeholder is not an artist id",
+                source_artist_id)
+            return 0
+        rows = [s for s in similars or [] if s.get('similar_artist_name')]
+        if not rows:
+            return 0
+        provider = (str(source_provider).strip().lower() or None) if source_provider else None
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT similar_artist_name, last_featured FROM similar_artists
+                    WHERE profile_id = ? AND source_artist_id = ? AND last_featured IS NOT NULL
+                """, (profile_id, source_artist_id))
+                featured = {(r[0] or '').casefold(): r[1] for r in cursor.fetchall()}
+                cursor.execute(
+                    "DELETE FROM similar_artists WHERE profile_id = ? AND source_artist_id = ?",
+                    (profile_id, source_artist_id))
+                stored = 0
+                for row in rows:
+                    name = row['similar_artist_name']
+                    genres = row.get('genres')
+                    image_url = row.get('image_url')
+                    cursor.execute("""
+                        INSERT INTO similar_artists
+                        (source_artist_id, similar_artist_spotify_id, similar_artist_itunes_id,
+                         similar_artist_deezer_id, similar_artist_musicbrainz_id, similar_artist_name,
+                         similarity_rank, occurrence_count, last_updated, profile_id,
+                         image_url, genres, popularity, metadata_updated_at, source_provider,
+                         last_featured)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, ?, ?, ?, ?,
+                                CASE WHEN ? IS NOT NULL THEN CURRENT_TIMESTAMP END, ?, ?)
+                        ON CONFLICT(profile_id, source_artist_id, similar_artist_name) DO NOTHING
+                    """, (source_artist_id, row.get('similar_artist_spotify_id'),
+                          row.get('similar_artist_itunes_id'), row.get('similar_artist_deezer_id'),
+                          row.get('similar_artist_musicbrainz_id'), name,
+                          row.get('similarity_rank', 1), profile_id, image_url,
+                          json.dumps(genres) if genres else None, row.get('popularity', 0) or 0,
+                          image_url, provider, featured.get(name.casefold())))
+                    stored += max(cursor.rowcount, 0)
+                conn.commit()
+                return stored
+        except Exception as e:
+            logger.error(f"Error replacing similar artists: {e}")
+            return 0
 
     def get_similar_artists_for_source(self, source_artist_id: str, profile_id: int = 1) -> List[SimilarArtist]:
         """Get all similar artists for a given source artist"""
@@ -12159,30 +18775,23 @@ class MusicDatabase:
         return out
 
     def get_play_counts_by_name(self, names, profile_id: int = 1):
-        """Map lowercased artist name -> play count from ``listening_history`` for the given profile.
+        """Map lowercased artist name -> play count from the pile ``profile_id`` reads.
         Feeds the Discover novelty signal (demote recs you've already heard). Fail-soft -> {}."""
+        from core.listening_scope import owner_clause
         out = {}
         clean = [str(n).strip().lower() for n in (names or []) if str(n or '').strip()]
         if not clean:
             return out
         placeholders = ','.join('?' for _ in clean)
         try:
+            scope = owner_clause(self._listening_owner(profile_id))
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                # profile_id is migration-added — fall back to an unscoped count if the column isn't
-                # there yet (a fresh / pre-migration DB), so novelty still works everywhere.
-                try:
-                    cursor.execute(
-                        f"SELECT LOWER(artist) AS n, COUNT(*) AS plays FROM listening_history "
-                        f"WHERE profile_id = ? AND LOWER(artist) IN ({placeholders}) GROUP BY LOWER(artist)",
-                        [profile_id] + clean,
-                    )
-                except Exception:
-                    cursor.execute(
-                        f"SELECT LOWER(artist) AS n, COUNT(*) AS plays FROM listening_history "
-                        f"WHERE LOWER(artist) IN ({placeholders}) GROUP BY LOWER(artist)",
-                        clean,
-                    )
+                cursor.execute(
+                    f"SELECT LOWER(artist) AS n, COUNT(*) AS plays FROM listening_history "
+                    f"WHERE {scope} AND LOWER(artist) IN ({placeholders}) GROUP BY LOWER(artist)",
+                    clean,
+                )
                 for row in cursor.fetchall():
                     out[row['n']] = row['plays']
         except Exception as e:
@@ -12252,6 +18861,90 @@ class MusicDatabase:
             logger.debug(f"update_similar_artist_popularity failed: {e}")
             return 0
 
+    @staticmethod
+    def _temp_key_set(cursor, table: str, values) -> None:
+        """Materialise a small python set as a temp table the query can test against.
+
+        connections are per-operation (see _get_connection), so a TEMP table lives and
+        dies with this one call — no cleanup, no collision between threads."""
+        cursor.execute(f"CREATE TEMP TABLE {table} (v TEXT PRIMARY KEY)")  # noqa: S608 - table name is a literal
+        if values:
+            cursor.executemany(
+                f"INSERT OR IGNORE INTO {table} VALUES (?)",  # noqa: S608 - table name is a literal
+                [(v,) for v in values],
+            )
+
+    @staticmethod
+    def _watchlist_exclusion_keys(cursor, profile_id: int = 1) -> Dict[str, set]:
+        """The ids + names of this profile's watchlist artists, for exclusion.
+
+        a recommendation you already watch is not a recommendation. only truthy
+        values go in: an empty id column must never match another empty one."""
+        keys = {'spotify': set(), 'itunes': set(), 'deezer': set(), 'names': set()}
+        cursor.execute("""
+            SELECT artist_name, spotify_artist_id, itunes_artist_id, deezer_artist_id
+            FROM watchlist_artists WHERE profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            if row['spotify_artist_id']:
+                keys['spotify'].add(str(row['spotify_artist_id']))
+            if row['itunes_artist_id']:
+                keys['itunes'].add(str(row['itunes_artist_id']))
+            if row['deezer_artist_id']:
+                keys['deezer'].add(str(row['deezer_artist_id']))
+            if row['artist_name']:
+                keys['names'].add(str(row['artist_name']).lower())
+        return keys
+
+    def _deliberate_artist_source_ids(self, cursor, profile_id: int = 1) -> set:
+        """Every source_artist_id that stands for an artist this profile CHOSE.
+
+        that is: an artist in their library (owner NULL = the shared scope, or their
+        own rows) or on their watchlist. the watchlist scanner keys a row by the
+        watchlist row id when the artist has no provider id at all, so that key
+        counts too — the artist map's own query already coalesces to it."""
+        owned = set()
+        cursor.execute("""
+            SELECT spotify_artist_id, itunes_artist_id, deezer_id, musicbrainz_id
+            FROM artists WHERE +owner_profile_id IS NULL OR +owner_profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            owned.update(str(v) for v in tuple(row) if v)
+        cursor.execute("""
+            SELECT id, spotify_artist_id, itunes_artist_id, deezer_artist_id, musicbrainz_artist_id
+            FROM watchlist_artists WHERE profile_id = ?
+        """, (profile_id,))
+        for row in cursor.fetchall():
+            owned.update(str(v) for v in tuple(row) if v)
+        return owned
+
+    def _stray_similar_artist_sources(self, cursor, profile_id: int = 1) -> set:
+        """The source ids in similar_artists that trace back to nothing you chose.
+
+        the artist map caches a browse into this table under the browsed artist's id
+        (core/artists/map.py), and the download path has been seen writing under the
+        'from_sync_modal' placeholder. neither is a preference, so neither may seed
+        discovery. returned as the set to EXCLUDE because it is small — a few dozen
+        against the tens of thousands of ids a real library owns."""
+        cursor.execute(
+            "SELECT DISTINCT source_artist_id FROM similar_artists WHERE profile_id = ?",
+            (profile_id,))
+        present = {str(row[0]) for row in cursor.fetchall() if row[0] is not None}
+        if not present:
+            return set()
+        stray = present - self._deliberate_artist_source_ids(cursor, profile_id)
+        if stray and len(stray) == len(present):
+            # every stored edge is unattributable — discovery is about to go quiet, and
+            # a quiet feature gets reported as boring, never as broken. say so out loud.
+            logger.info(
+                "similar_artists: all %d source artists for profile %s resolve to no "
+                "library or watchlist artist — recommendations will be empty until one does",
+                len(present), profile_id)
+        elif stray:
+            logger.debug("similar_artists: ignoring %d of %d source artists (not library or watchlist)",
+                         len(stray), len(present))
+        return stray
+
     def get_top_similar_artists(
         self,
         limit: int = 50,
@@ -12261,6 +18954,12 @@ class MusicDatabase:
         adventurousness: float = None,
     ) -> List[SimilarArtist]:
         """Get top similar artists excluding watchlist artists, with cycling support.
+
+        Only edges whose SOURCE artist is one you chose count — an artist in your
+        library or on your watchlist. Opening the artist map caches rows here for
+        whoever you looked up, and a look-up is not a preference; see
+        _stray_similar_artist_sources.
+
         require_source: if set, only returns artists with that source ID.
         exclude_library_server: if set, also excludes artists already present in that media server.
         adventurousness: 0..1 dial. When given, the CANDIDATE SELECTION itself shifts with it — the
@@ -12336,6 +19035,25 @@ class MusicDatabase:
                         AVG(sa.similarity_rank) ASC"""
                     order_params = (_dial, _dial)
 
+                # only the artists you actually chose may seed a recommendation.
+                # browsing the artist map caches rows here too (core/artists/map.py),
+                # keyed by whoever you just looked up — curiosity, not intent. we drop
+                # the rows whose source artist is neither in your library nor on your
+                # watchlist. done by EXCLUSION: the strays are a handful, the owned ids
+                # are tens of thousands.
+                stray_sources = self._stray_similar_artist_sources(cursor, profile_id)
+                excl = self._watchlist_exclusion_keys(cursor, profile_id)
+
+                # the watchlist exclusion was a LEFT JOIN with four OR'd predicates and
+                # no index to serve any of them — every row of similar_artists scanned
+                # the whole watchlist (3.3s on a 101k-row table). the watchlist is tiny,
+                # so resolve it once in python and hand the query a set to test against.
+                self._temp_key_set(cursor, 'sa_stray_sources', stray_sources)
+                self._temp_key_set(cursor, 'sa_excl_names', excl['names'])
+                self._temp_key_set(cursor, 'sa_excl_spotify', excl['spotify'])
+                self._temp_key_set(cursor, 'sa_excl_itunes', excl['itunes'])
+                self._temp_key_set(cursor, 'sa_excl_deezer', excl['deezer'])
+
                 cursor.execute(f"""
                     SELECT
                         MAX(sa.id) as id,
@@ -12352,17 +19070,20 @@ class MusicDatabase:
                         MAX(sa.genres) as genres,
                         MAX(sa.popularity) as popularity
                     FROM similar_artists sa
-                    LEFT JOIN watchlist_artists wa ON (
-                        (sa.similar_artist_spotify_id IS NOT NULL AND sa.similar_artist_spotify_id = wa.spotify_artist_id)
-                        OR (sa.similar_artist_itunes_id IS NOT NULL AND sa.similar_artist_itunes_id = wa.itunes_artist_id)
-                        OR (sa.similar_artist_deezer_id IS NOT NULL AND sa.similar_artist_deezer_id = wa.deezer_artist_id)
-                        OR LOWER(sa.similar_artist_name) = LOWER(wa.artist_name)
-                    ) AND wa.profile_id = ?
-                    WHERE wa.id IS NULL AND sa.profile_id = ? {source_filter}
+                    WHERE sa.profile_id = ?
+                      AND sa.source_artist_id NOT IN (SELECT v FROM sa_stray_sources)
+                      AND LOWER(sa.similar_artist_name) NOT IN (SELECT v FROM sa_excl_names)
+                      AND (sa.similar_artist_spotify_id IS NULL
+                           OR sa.similar_artist_spotify_id NOT IN (SELECT v FROM sa_excl_spotify))
+                      AND (sa.similar_artist_itunes_id IS NULL
+                           OR sa.similar_artist_itunes_id NOT IN (SELECT v FROM sa_excl_itunes))
+                      AND (sa.similar_artist_deezer_id IS NULL
+                           OR sa.similar_artist_deezer_id NOT IN (SELECT v FROM sa_excl_deezer))
+                      {source_filter}
                     GROUP BY sa.similar_artist_name
                     {order_clause}
                     LIMIT ?
-                """, (profile_id, profile_id, *order_params, sql_limit))
+                """, (profile_id, *order_params, sql_limit))
 
                 rows = cursor.fetchall()
                 results = []
@@ -12615,33 +19336,149 @@ class MusicDatabase:
 
                 rows = cursor.fetchall()
                 row_keys = rows[0].keys() if rows else []
-
-                return [DiscoveryTrack(
-                    id=row['id'],
-                    spotify_track_id=row['spotify_track_id'],
-                    spotify_album_id=row['spotify_album_id'],
-                    spotify_artist_id=row['spotify_artist_id'],
-                    itunes_track_id=row['itunes_track_id'] if 'itunes_track_id' in row_keys else None,
-                    itunes_album_id=row['itunes_album_id'] if 'itunes_album_id' in row_keys else None,
-                    itunes_artist_id=row['itunes_artist_id'] if 'itunes_artist_id' in row_keys else None,
-                    deezer_track_id=row['deezer_track_id'] if 'deezer_track_id' in row_keys else None,
-                    deezer_album_id=row['deezer_album_id'] if 'deezer_album_id' in row_keys else None,
-                    deezer_artist_id=row['deezer_artist_id'] if 'deezer_artist_id' in row_keys else None,
-                    source=row['source'] if 'source' in row_keys else 'spotify',
-                    track_name=row['track_name'],
-                    artist_name=row['artist_name'],
-                    album_name=row['album_name'],
-                    album_cover_url=row['album_cover_url'],
-                    duration_ms=row['duration_ms'],
-                    popularity=row['popularity'],
-                    release_date=row['release_date'],
-                    is_new_release=bool(row['is_new_release']),
-                    track_data_json=row['track_data_json'],
-                    added_date=datetime.fromisoformat(row['added_date'])
-                ) for row in rows]
+                return [self._discovery_track_from_row(row, row_keys) for row in rows]
 
         except Exception as e:
             logger.error(f"Error getting discovery pool tracks: {e}")
+            return []
+
+    @staticmethod
+    def _discovery_track_from_row(row, row_keys) -> DiscoveryTrack:
+        """One discovery_pool row as a DiscoveryTrack. Shared by the windowed
+        read above and the exact-id read below so the two can never drift."""
+        return DiscoveryTrack(
+            id=row['id'],
+            spotify_track_id=row['spotify_track_id'],
+            spotify_album_id=row['spotify_album_id'],
+            spotify_artist_id=row['spotify_artist_id'],
+            itunes_track_id=row['itunes_track_id'] if 'itunes_track_id' in row_keys else None,
+            itunes_album_id=row['itunes_album_id'] if 'itunes_album_id' in row_keys else None,
+            itunes_artist_id=row['itunes_artist_id'] if 'itunes_artist_id' in row_keys else None,
+            deezer_track_id=row['deezer_track_id'] if 'deezer_track_id' in row_keys else None,
+            deezer_album_id=row['deezer_album_id'] if 'deezer_album_id' in row_keys else None,
+            deezer_artist_id=row['deezer_artist_id'] if 'deezer_artist_id' in row_keys else None,
+            source=row['source'] if 'source' in row_keys else 'spotify',
+            track_name=row['track_name'],
+            artist_name=row['artist_name'],
+            album_name=row['album_name'],
+            album_cover_url=row['album_cover_url'],
+            duration_ms=row['duration_ms'],
+            popularity=row['popularity'],
+            release_date=row['release_date'],
+            is_new_release=bool(row['is_new_release']),
+            track_data_json=row['track_data_json'],
+            added_date=datetime.fromisoformat(row['added_date'])
+        )
+
+    # the source-specific column each source stores its track id in
+    _POOL_ID_COLUMN = {'spotify': 'spotify_track_id', 'itunes': 'itunes_track_id',
+                       'deezer': 'deezer_track_id'}
+
+    def get_discovery_pool_tracks_by_ids(self, track_ids: List[str], source: str,
+                                         profile_id: int = 1) -> Dict[str, DiscoveryTrack]:
+        """Hydrate EXACTLY the requested pool ids, with no recency window.
+
+        the windowed read above answers "the newest N tracks", which is the
+        wrong question for a saved selection: a stored id that has fallen out
+        of the newest 5,000 rows silently disappears from the shelf. this asks
+        for the ids themselves, through the source's own id column, so a
+        missing row means the track really is gone and the caller can say so.
+
+        returns {track_id: DiscoveryTrack}; absent keys are the unavailable
+        ones. an unsupported source returns {} and the caller must report the
+        source rather than render a blank shelf.
+        """
+        column = self._POOL_ID_COLUMN.get(str(source or '').lower())
+        wanted = [str(t) for t in (track_ids or []) if str(t or '').strip()]
+        if not column or not wanted:
+            return {}
+        out: Dict[str, DiscoveryTrack] = {}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                CHUNK = 400   # stay well under SQLite's placeholder ceiling
+                for i in range(0, len(wanted), CHUNK):
+                    chunk = wanted[i:i + CHUNK]
+                    ph = ','.join('?' * len(chunk))
+                    cursor.execute(f"""
+                        SELECT * FROM discovery_pool
+                        WHERE profile_id = ? AND source = ? AND {column} IN ({ph})
+                    """, [profile_id, str(source).lower(), *chunk])
+                    rows = cursor.fetchall()
+                    row_keys = rows[0].keys() if rows else []
+                    for row in rows:
+                        key = str(row[column])
+                        if key not in out:
+                            out[key] = self._discovery_track_from_row(row, row_keys)
+            return out
+        except Exception as e:
+            logger.error(f"Error hydrating discovery pool ids: {e}")
+            return {}
+
+    def get_artist_identity_rows(self, names: Optional[List[str]] = None) -> List[dict]:
+        """Library artists with every provider id they carry, plus genres.
+
+        the identity source for recommendations. it is the CATALOGUE, not the
+        watchlist: listening to an artist never implied watching it, and the
+        watchlist-only lookup is why two of the user's own top artists could
+        not resolve a single similarity edge.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                sql = ("SELECT name, spotify_artist_id, itunes_artist_id, deezer_id, "
+                       "musicbrainz_id, genres, thumb_url FROM artists "
+                       "WHERE name IS NOT NULL AND name != ''")
+                params: List = []
+                wanted = [n for n in (names or []) if str(n or '').strip()]
+                if wanted:
+                    ph = ','.join('?' * len(wanted))
+                    sql += f" AND LOWER(name) IN ({ph})"
+                    params = [str(n).strip().lower() for n in wanted]
+                cursor.execute(sql, params)
+                return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error reading artist identity rows: {e}")
+            return []
+
+    def get_similar_artist_edges(self, source_artist_ids: List[str],
+                                 profile_id: int = 1) -> List[dict]:
+        """RAW seed-to-candidate edges, one row per stored relationship.
+
+        get_top_similar_artists is an AGGREGATE recommendation query: it groups
+        by similar-artist name and takes MAX(source_artist_id), so every edge
+        but one is destroyed, and its global LIMIT is not a per-seed budget.
+        raising that limit cannot bring the lost edges back. this returns the
+        rows themselves, source_provider included, so the caller can match
+        (provider, id) pairs and keep each seed's evidence separate.
+        """
+        wanted = [str(i) for i in (source_artist_ids or []) if str(i or '').strip()]
+        if not wanted:
+            return []
+        cols = ('source_artist_id', 'source_provider', 'similar_artist_name',
+                'similarity_rank', 'occurrence_count', 'similar_artist_spotify_id',
+                'similar_artist_itunes_id', 'similar_artist_deezer_id',
+                'similar_artist_musicbrainz_id', 'image_url', 'genres', 'popularity')
+        out: List[dict] = []
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(similar_artists)")
+                have = {r[1] for r in cursor.fetchall()}
+                select = ', '.join(c if c in have else f"NULL AS {c}" for c in cols)
+                CHUNK = 400
+                for i in range(0, len(wanted), CHUNK):
+                    chunk = wanted[i:i + CHUNK]
+                    ph = ','.join('?' * len(chunk))
+                    cursor.execute(f"""
+                        SELECT {select} FROM similar_artists
+                        WHERE profile_id = ? AND source_artist_id IN ({ph})
+                        ORDER BY similarity_rank ASC
+                    """, [profile_id, *chunk])
+                    out.extend(dict(r) for r in cursor.fetchall())
+            return out
+        except Exception as e:
+            logger.error(f"Error reading similar-artist edges: {e}")
             return []
 
     def cache_discovery_recent_album(self, album_data: Dict[str, Any], source: str = 'spotify', profile_id: int = 1) -> bool:
@@ -12986,7 +19823,7 @@ class MusicDatabase:
         """Get comprehensive database information filtered by server source"""
         try:
             # Import here to avoid circular imports
-            from config.settings import config_manager
+            from core.settings import config_manager
             
             # If no server specified, use active server
             if server_source is None:
@@ -13041,7 +19878,7 @@ class MusicDatabase:
                 'server_source': server_source
             }
 
-    def get_library_artists(self, search_query: str = "", letter: str = "", page: int = 1, limit: int = 50, watchlist_filter: str = "all", profile_id: int = 1, source_filter: str = "") -> Dict[str, Any]:
+    def get_library_artists(self, search_query: str = "", letter: str = "", page: int = 1, limit: int = 50, watchlist_filter: str = "all", profile_id: int = 1, source_filter: str = "", quality_filter: str = "", sort: str = "name", skip_server_filter: bool = False) -> Dict[str, Any]:
         """
         Get artists for the library page with search, filtering, and pagination
 
@@ -13052,6 +19889,13 @@ class MusicDatabase:
             limit: Number of results per page
             watchlist_filter: Filter by watchlist status ("all", "watched", "unwatched")
             source_filter: Filter by metadata source match (e.g. "spotify", "!spotify" for unmatched)
+            quality_filter: "upgradable" keeps artists with a track the quality
+                jobs say could be better (a pending finding)
+            sort: 'name' (A-Z, the default) or 'recent' (recently added first);
+                unknown values fall back to 'name'. A-Z sorting ignores
+                leading punctuation/special characters, so '"Weird Al"
+                Yankovic' files under W and '*NSYNC' under N; digits still
+                sort with the numbers.
 
         Returns:
             Dict containing artists list, pagination info, and total count
@@ -13068,13 +19912,19 @@ class MusicDatabase:
                     where_conditions.append("LOWER(name) LIKE LOWER(?)")
                     params.append(f"%{search_query}%")
 
+                # The alphabet filter keys off the name with leading punctuation
+                # stripped, matching the sort order — '"Weird Al"' is filed
+                # under W, not '#'.
+                stripped_name = _library_stripped_sql("a.name")
                 if letter and letter != "all":
                     if letter == "#":
-                        # Numbers and special characters
-                        where_conditions.append("SUBSTR(UPPER(name), 1, 1) NOT GLOB '[A-Z]'")
+                        # Numbers (and names that strip down to nothing)
+                        where_conditions.append(
+                            f"SUBSTR(UPPER({stripped_name}), 1, 1) NOT GLOB '[A-Z]'")
                     else:
                         # Specific letter
-                        where_conditions.append("UPPER(SUBSTR(name, 1, 1)) = UPPER(?)")
+                        where_conditions.append(
+                            f"UPPER(SUBSTR({stripped_name}, 1, 1)) = UPPER(?)")
                         params.append(letter)
 
                 # Metadata source filter — match or exclude by enrichment source
@@ -13100,13 +19950,34 @@ class MusicDatabase:
                         else:
                             where_conditions.append(f"({col} IS NOT NULL AND {col} != '')")
 
-                # Get active server for filtering
-                from config.settings import config_manager
-                active_server = config_manager.get_active_media_server()
+                from core.quality.upgrades import UPGRADE_JOBS
+                _upgrade_jobs_sql = ','.join('?' * len(UPGRADE_JOBS))
+                # artists (by name, like the dedup below) owning a track with a
+                # pending quality finding. Non-correlated: evaluated once.
+                _upgradable_names_sql = f"""
+                    SELECT ar.name, ar.server_source FROM repair_findings f
+                    JOIN tracks t ON t.id = f.entity_id
+                    JOIN artists ar ON ar.id = t.artist_id
+                    WHERE f.status = 'pending' AND f.entity_type = 'track'
+                      AND f.job_id IN ({_upgrade_jobs_sql})
+                """
+                if quality_filter == 'upgradable':
+                    where_conditions.append(f"(a.name, a.server_source) IN ({_upgradable_names_sql})")
+                    params.extend(UPGRADE_JOBS)
 
-                # Add active server filter to where conditions
-                where_conditions.append("a.server_source = ?")
-                params.append(active_server)
+                # Get active server for filtering (skip for API clients)
+                if not skip_server_filter:
+                    from core.settings import config_manager
+                    active_server = config_manager.get_active_media_server()
+
+                    # Add active server filter to where conditions
+                    where_conditions.append("a.server_source = ?")
+                    params.append(active_server)
+
+                # whose library this page shows (#1199)
+                scope_sql, scope_params = self._current_scope_sql('a.owner_profile_id')
+                where_conditions.append(scope_sql)
+                params.extend(scope_params)
 
                 where_clause = " AND ".join(where_conditions) if where_conditions else "1=1"
 
@@ -13148,13 +20019,19 @@ class MusicDatabase:
                     FROM artists a
                     WHERE {where_clause}
                         AND a.id = (SELECT MIN(a2.id) FROM artists a2
-                                    WHERE a2.name = a.name AND a2.server_source = a.server_source)
+                                    WHERE a2.name = a.name AND a2.server_source = a.server_source
+                                      AND +a2.owner_profile_id IS a.owner_profile_id)
                 """
                 cursor.execute(count_query, params)
                 total_count = cursor.fetchone()['total_count']
 
                 # Step 2: Get paginated artist rows (no album/track joins — fast)
                 offset = (page - 1) * limit
+                # Whitelisted — never interpolated from the raw request value.
+                # Name sort ignores leading punctuation/special characters.
+                order_by = {
+                    'recent': "a.created_at DESC, a.id DESC",
+                }.get(sort, f"{_library_sort_key_sql('a.name')}, a.name COLLATE NOCASE")
                 artists_query = f"""
                     SELECT
                         a.id,
@@ -13177,8 +20054,9 @@ class MusicDatabase:
                     FROM artists a
                     WHERE {where_clause}
                         AND a.id = (SELECT MIN(a2.id) FROM artists a2
-                                    WHERE a2.name = a.name AND a2.server_source = a.server_source)
-                    ORDER BY a.name COLLATE NOCASE
+                                    WHERE a2.name = a.name AND a2.server_source = a.server_source
+                                      AND +a2.owner_profile_id IS a.owner_profile_id)
+                    ORDER BY {order_by}
                     LIMIT ? OFFSET ?
                 """
                 query_params = params + [limit, offset]
@@ -13188,6 +20066,7 @@ class MusicDatabase:
                 # Step 3: Batch-fetch album/track counts only for the 75 artists on this page
                 artist_ids_on_page = [row['id'] for row in artist_rows]
                 counts_map = {}
+                upgradable_map: Dict[Any, int] = {}
                 if artist_ids_on_page:
                     # Get all artist IDs that share names with the page artists (for dedup merging)
                     name_pairs = [(row['name'], row['server_source']) for row in artist_rows]
@@ -13207,23 +20086,54 @@ class MusicDatabase:
                         or_clauses.append("(ar.name = ? AND ar.server_source = ?)")
                         or_params.extend([pi['name'], pi['server_source']])
 
+                    # per artist row, counted off the album and track indexes,
+                    # then summed per (name, server) in python. the previous
+                    # form joined every track of every artist on the page into
+                    # one GROUP BY with COUNT(DISTINCT): 470 ms per page click
+                    # on a 300k-track install; this is ~110 ms for the same
+                    # numbers (an album belongs to one artist row, a track to
+                    # one album, so the sums equal the distinct counts).
                     cursor.execute(f"""
                         SELECT
                             ar.name as artist_name, ar.server_source as artist_source,
-                            COUNT(DISTINCT al.id) as album_count,
-                            COUNT(DISTINCT t.id) as track_count
+                            (SELECT COUNT(*) FROM albums al WHERE al.artist_id = ar.id) as album_count,
+                            (SELECT COUNT(*) FROM albums al JOIN tracks t ON t.album_id = al.id
+                             WHERE al.artist_id = ar.id) as track_count
                         FROM artists ar
-                        LEFT JOIN albums al ON al.artist_id = ar.id
-                        LEFT JOIN tracks t ON t.album_id = al.id
                         WHERE {' OR '.join(or_clauses)}
-                        GROUP BY ar.name, ar.server_source
                     """, or_params)
+                    merged: Dict[tuple, list] = {}
+                    for crow in cursor.fetchall():
+                        key = (crow['artist_name'], crow['artist_source'])
+                        acc = merged.setdefault(key, [0, 0])
+                        acc[0] += crow['album_count'] or 0
+                        acc[1] += crow['track_count'] or 0
                     # Map back to canonical IDs
                     name_to_canonical = {(pi['name'], pi['server_source']): pi['id'] for pi in page_info}
-                    for crow in cursor.fetchall():
-                        cid = name_to_canonical.get((crow['artist_name'], crow['artist_source']))
+                    for key, (album_count, track_count) in merged.items():
+                        cid = name_to_canonical.get(key)
                         if cid:
-                            counts_map[cid] = (crow['album_count'], crow['track_count'])
+                            counts_map[cid] = (album_count, track_count)
+
+                    # tracks that could be better, per artist on this page
+                    try:
+                        cursor.execute(f"""
+                            SELECT ar.name AS artist_name, ar.server_source AS artist_source,
+                                   COUNT(DISTINCT f.entity_id) AS n
+                            FROM repair_findings f
+                            JOIN tracks t ON t.id = f.entity_id
+                            JOIN artists ar ON ar.id = t.artist_id
+                            WHERE f.status = 'pending' AND f.entity_type = 'track'
+                              AND f.job_id IN ({_upgrade_jobs_sql})
+                              AND ({' OR '.join(or_clauses)})
+                            GROUP BY ar.name, ar.server_source
+                        """, (*UPGRADE_JOBS, *or_params))
+                        for urow in cursor.fetchall():
+                            cid = name_to_canonical.get((urow['artist_name'], urow['artist_source']))
+                            if cid:
+                                upgradable_map[cid] = urow['n'] or 0
+                    except Exception as upgrade_err:
+                        logger.debug("upgradable counts skipped: %s", upgrade_err)
 
                 rows = artist_rows
 
@@ -13275,6 +20185,7 @@ class MusicDatabase:
                         'amazon_id': row['amazon_id'],
                         'album_count': counts_map.get(row['id'], (0, 0))[0],
                         'track_count': counts_map.get(row['id'], (0, 0))[1],
+                        'upgradable_count': upgradable_map.get(row['id'], 0),
                         'is_watched': bool(is_watched)
                     }
                     artists.append(artist_data)
@@ -13284,7 +20195,25 @@ class MusicDatabase:
                 has_prev = page > 1
                 has_next = page < total_pages
 
+                # every track in this library view that could be better, for
+                # the filter's label
+                upgradable_total = 0
+                try:
+                    cursor.execute(f"""
+                        SELECT COUNT(DISTINCT f.entity_id) AS n
+                        FROM repair_findings f
+                        JOIN tracks t ON t.id = f.entity_id
+                        JOIN artists a ON a.id = t.artist_id
+                        WHERE f.status = 'pending' AND f.entity_type = 'track'
+                          AND f.job_id IN ({_upgrade_jobs_sql})
+                          AND a.server_source = ? AND {scope_sql}
+                    """, (*UPGRADE_JOBS, active_server, *scope_params))
+                    upgradable_total = cursor.fetchone()['n'] or 0
+                except Exception as upgrade_err:
+                    logger.debug("upgradable total skipped: %s", upgrade_err)
+
                 return {
+                    'upgradable_total': upgradable_total,
                     'artists': artists,
                     'pagination': {
                         'page': page,
@@ -13310,214 +20239,152 @@ class MusicDatabase:
                 }
             }
 
-    def get_to_be_purchased_tracks(self, search: str = "", page: int = 1, limit: int = 50) -> Dict[str, Any]:
-        """Flat, cross-artist list of tracks still flagged to_be_purchased —
-        the "shopping list" view. Newest-flagged-first (most recently
-        downloaded is most likely to be top of mind). Pagination shape
-        mirrors get_library_artists()."""
+    def get_library_albums(self, search_query: str = "", letter: str = "", page: int = 1, limit: int = 75, profile_id: int = 1, source_filter: str = "", sort: str = "title") -> Dict[str, Any]:
+        """Albums for the library page's album view, with search, source filter
+        and pagination.
+
+        The mirror of get_library_artists: same active-server and owner-profile
+        scoping, same alphabet semantics, same pagination shape. The watchlist
+        filter is NOT accepted — it is a property of an ARTIST, and the page
+        hides it in this view rather than applying it sideways.
+
+        The track count is counted off the tracks table rather than read from
+        albums.track_count: the media-server import leaves that column NULL on
+        essentially every row, so reading it would put "0 tracks" on the card.
+
+        sort is one of 'title' (A-Z, the default), 'year_desc' (newest first),
+        'year_asc' (oldest first) or 'recent' (recently added first). Unknown
+        values fall back to 'title'. Year sorts put unknown years last —
+        an album with no year is not "older" than a 1969 record. A-Z title
+        sorting ignores leading punctuation/special characters, so '"Weird
+        Al"' files under W; digits still sort with the numbers.
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
-                where_conditions = ["t.to_be_purchased = 1"]
-                params: List[Any] = []
-                if search:
-                    where_conditions.append("(LOWER(t.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(al.title) LIKE LOWER(?))")
-                    like = f"%{search}%"
-                    params.extend([like, like, like])
-                where_clause = " AND ".join(where_conditions)
+                where_conditions = []
+                params = []
 
-                cursor.execute(
-                    f"""
-                    SELECT COUNT(*) as total_count
-                    FROM tracks t
-                    JOIN albums al ON t.album_id = al.id
-                    JOIN artists ar ON al.artist_id = ar.id
-                    WHERE {where_clause}
-                    """,
-                    params,
-                )
-                total_count = cursor.fetchone()['total_count']
+                if search_query:
+                    where_conditions.append("LOWER(al.title) LIKE LOWER(?)")
+                    params.append(f"%{search_query}%")
 
-                offset = (page - 1) * limit
-                cursor.execute(
-                    f"""
-                    SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
-                           al.id AS album_id, al.title AS album_title, al.thumb_url, al.year,
-                           ar.id AS artist_id, ar.name AS artist_name
-                    FROM tracks t
-                    JOIN albums al ON t.album_id = al.id
-                    JOIN artists ar ON al.artist_id = ar.id
-                    WHERE {where_clause}
-                    ORDER BY t.created_at DESC
-                    LIMIT ? OFFSET ?
-                    """,
-                    params + [limit, offset],
-                )
-                tracks = [dict(row) for row in cursor.fetchall()]
+                # The alphabet filter keys off the title with leading punctuation
+                # stripped, matching the sort order.
+                stripped_title = _library_stripped_sql("al.title")
+                if letter and letter != "all":
+                    if letter == "#":
+                        where_conditions.append(
+                            f"SUBSTR(UPPER({stripped_title}), 1, 1) NOT GLOB '[A-Z]'")
+                    else:
+                        where_conditions.append(
+                            f"UPPER(SUBSTR({stripped_title}, 1, 1)) = UPPER(?)")
+                        params.append(letter)
 
-                total_pages = (total_count + limit - 1) // limit if limit else 0
-                return {
-                    'tracks': tracks,
-                    'pagination': {
-                        'page': page,
-                        'limit': limit,
-                        'total_count': total_count,
-                        'total_pages': total_pages,
-                        'has_prev': page > 1,
-                        'has_next': page < total_pages,
+                # An album's provider ids live on its OWN columns, which are not
+                # the artist's: musicbrainz is a release id here, spotify and
+                # itunes are album ids, and jiosaavn and bandcamp exist only at
+                # album level. genius is artist-only and so has no entry — a
+                # filter carried over from the artists view is ignored, not
+                # applied as "no album has this", which would empty the grid.
+                if source_filter:
+                    _source_columns = {
+                        'spotify': 'al.spotify_album_id',
+                        'musicbrainz': 'al.musicbrainz_release_id',
+                        'deezer': 'al.deezer_id',
+                        'discogs': 'al.discogs_id',
+                        'audiodb': 'al.audiodb_id',
+                        'itunes': 'al.itunes_album_id',
+                        'lastfm': 'al.lastfm_url',
+                        'tidal': 'al.tidal_id',
+                        'qobuz': 'al.qobuz_id',
+                        'jiosaavn': 'al.jiosaavn_id',
+                        'bandcamp': 'al.bandcamp_url',
                     }
-                }
-        except Exception as e:
-            logger.error(f"Error getting to-be-purchased tracks: {e}")
-            return {
-                'tracks': [],
-                'pagination': {
-                    'page': 1, 'limit': limit, 'total_count': 0, 'total_pages': 0,
-                    'has_prev': False, 'has_next': False,
-                }
-            }
+                    col = _source_columns.get(source_filter.lstrip('!'))
+                    if col:
+                        if source_filter.startswith('!'):
+                            where_conditions.append(f"({col} IS NULL OR {col} = '')")
+                        else:
+                            where_conditions.append(f"({col} IS NOT NULL AND {col} != '')")
 
-    def mark_tracks_purchased(self, track_ids: List[str]) -> Dict[str, Any]:
-        """Mark one or more tracks purchased: clears the shopping-list flag
-        and stamps a durable purchased_at (server-side timestamp — never a
-        client-supplied value), read by get_purchased_albums for the
-        Purchased page. Works identically for a single track (track-level
-        "Mark Purchased") or every track in an album (album-level "Mark
-        Album Purchased") — the caller decides which ids to pass."""
-        if not track_ids:
-            return {'success': False, 'error': 'No tracks specified'}
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                placeholders = ','.join('?' * len(track_ids))
-                cursor.execute(
-                    f"UPDATE tracks SET to_be_purchased = 0, purchased_at = CURRENT_TIMESTAMP, "
-                    f"updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
-                    track_ids,
-                )
-                conn.commit()
-                return {'success': True, 'updated': cursor.rowcount}
-        except Exception as e:
-            logger.error(f"Error marking tracks purchased: {e}")
-            return {'success': False, 'error': str(e)}
+                from core.settings import config_manager
+                where_conditions.append("al.server_source = ?")
+                params.append(config_manager.get_active_media_server())
 
-    def unmark_tracks_purchased(self, track_ids: List[str]) -> Dict[str, Any]:
-        """Undo a purchase mark — clears purchased_at only. Deliberately does
-        NOT re-set to_be_purchased: this is a clean "undo the purchase
-        record", not "put it back on my shopping list"."""
-        if not track_ids:
-            return {'success': False, 'error': 'No tracks specified'}
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-                placeholders = ','.join('?' * len(track_ids))
-                cursor.execute(
-                    f"UPDATE tracks SET purchased_at = NULL, updated_at = CURRENT_TIMESTAMP "
-                    f"WHERE id IN ({placeholders})",
-                    track_ids,
-                )
-                conn.commit()
-                return {'success': True, 'updated': cursor.rowcount}
-        except Exception as e:
-            logger.error(f"Error unmarking tracks purchased: {e}")
-            return {'success': False, 'error': str(e)}
+                scope_sql, scope_params = self._current_scope_sql('al.owner_profile_id')
+                where_conditions.append(scope_sql)
+                params.extend(scope_params)
 
-    def get_purchased_albums(self, search: str = "", page: int = 1, limit: int = 25) -> Dict[str, Any]:
-        """Purchase history for the Purchased page, grouped by album (most
-        recently purchased first). Two-query page-then-hydrate shape,
-        mirroring get_library_artists(): count + a paginated distinct-album
-        query, then one query to fetch every purchased track for just that
-        page's albums, grouped in Python. An album with only SOME of its
-        tracks purchased still shows (purchased_count < total_track_count)."""
-        try:
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
-
-                where_conditions = ["t.purchased_at IS NOT NULL"]
-                params: List[Any] = []
-                if search:
-                    where_conditions.append("(LOWER(t.title) LIKE LOWER(?) OR LOWER(ar.name) LIKE LOWER(?) OR LOWER(al.title) LIKE LOWER(?))")
-                    like = f"%{search}%"
-                    params.extend([like, like, like])
                 where_clause = " AND ".join(where_conditions)
 
-                cursor.execute(
-                    f"""
-                    SELECT COUNT(DISTINCT al.id) as total_count
-                    FROM tracks t
-                    JOIN albums al ON t.album_id = al.id
-                    JOIN artists ar ON al.artist_id = ar.id
-                    WHERE {where_clause}
-                    """,
-                    params,
-                )
+                cursor.execute(f"SELECT COUNT(*) as total_count FROM albums al WHERE {where_clause}", params)
                 total_count = cursor.fetchone()['total_count']
 
+                # Whitelisted — never interpolated from the raw request value.
+                # Title/name sorts ignore leading punctuation/special chars.
+                order_by = {
+                    'year_desc': f"al.year IS NULL, al.year DESC, {_library_sort_key_sql('al.title')}",
+                    'year_asc': f"al.year IS NULL, al.year ASC, {_library_sort_key_sql('al.title')}",
+                    'recent': "al.created_at DESC, al.id DESC",
+                }.get(sort, f"{_library_sort_key_sql('al.title')}, al.title COLLATE NOCASE, {_library_sort_key_sql('a.name')}")
+
                 offset = (page - 1) * limit
-                cursor.execute(
-                    f"""
-                    SELECT al.id AS album_id, MAX(t.purchased_at) AS last_purchased_at
-                    FROM tracks t
-                    JOIN albums al ON t.album_id = al.id
-                    JOIN artists ar ON al.artist_id = ar.id
+                cursor.execute(f"""
+                    SELECT
+                        al.id,
+                        al.title,
+                        al.year,
+                        al.thumb_url,
+                        al.artist_id,
+                        a.name as artist_name,
+                        al.spotify_album_id,
+                        al.musicbrainz_release_id,
+                        al.deezer_id,
+                        al.audiodb_id,
+                        al.itunes_album_id,
+                        al.lastfm_url,
+                        al.tidal_id,
+                        al.qobuz_id,
+                        al.discogs_id,
+                        al.jiosaavn_id,
+                        al.bandcamp_url,
+                        al.amazon_id,
+                        al.soul_id,
+                        (SELECT COUNT(*) FROM tracks t WHERE t.album_id = al.id) as track_count
+                    FROM albums al
+                    LEFT JOIN artists a ON a.id = al.artist_id
                     WHERE {where_clause}
-                    GROUP BY al.id
-                    ORDER BY last_purchased_at DESC
+                    ORDER BY {order_by}
                     LIMIT ? OFFSET ?
-                    """,
-                    params + [limit, offset],
-                )
-                page_rows = cursor.fetchall()
-                page_album_ids = [row['album_id'] for row in page_rows]
-                last_purchased_map = {row['album_id']: row['last_purchased_at'] for row in page_rows}
+                """, params + [limit, offset])
 
-                albums: List[Dict[str, Any]] = []
-                if page_album_ids:
-                    id_placeholders = ','.join('?' * len(page_album_ids))
-                    cursor.execute(
-                        f"""
-                        SELECT al.id AS album_id, al.title AS album_title, al.thumb_url, al.year,
-                               ar.id AS artist_id, ar.name AS artist_name,
-                               (SELECT COUNT(*) FROM tracks t2 WHERE t2.album_id = al.id) AS total_track_count
-                        FROM albums al
-                        JOIN artists ar ON al.artist_id = ar.id
-                        WHERE al.id IN ({id_placeholders})
-                        """,
-                        page_album_ids,
-                    )
-                    summaries = {row['album_id']: dict(row) for row in cursor.fetchall()}
+                albums = [{
+                    'id': row['id'],
+                    'title': row['title'],
+                    'year': row['year'],
+                    'thumb_url': row['thumb_url'],
+                    'artist_id': row['artist_id'],
+                    'artist_name': row['artist_name'] or '',
+                    'track_count': row['track_count'],
+                    # One badge per populated id, in the card's own order
+                    'spotify_album_id': row['spotify_album_id'],
+                    'musicbrainz_release_id': row['musicbrainz_release_id'],
+                    'deezer_id': row['deezer_id'],
+                    'audiodb_id': row['audiodb_id'],
+                    'itunes_album_id': row['itunes_album_id'],
+                    'lastfm_url': row['lastfm_url'],
+                    'tidal_id': row['tidal_id'],
+                    'qobuz_id': row['qobuz_id'],
+                    'discogs_id': row['discogs_id'],
+                    'jiosaavn_id': row['jiosaavn_id'],
+                    'bandcamp_url': row['bandcamp_url'],
+                    'amazon_id': row['amazon_id'],
+                    'soul_id': row['soul_id'],
+                } for row in cursor.fetchall()]
 
-                    cursor.execute(
-                        f"""
-                        SELECT t.id, t.title, t.track_number, t.purchased_at, t.album_id
-                        FROM tracks t
-                        WHERE t.album_id IN ({id_placeholders}) AND t.purchased_at IS NOT NULL
-                        ORDER BY t.album_id, t.track_number
-                        """,
-                        page_album_ids,
-                    )
-                    tracks_by_album: Dict[Any, List[Dict[str, Any]]] = {}
-                    for row in cursor.fetchall():
-                        tracks_by_album.setdefault(row['album_id'], []).append({
-                            'id': row['id'], 'title': row['title'],
-                            'track_number': row['track_number'], 'purchased_at': row['purchased_at'],
-                        })
-
-                    # Preserve the newest-purchase-first order from the paginated query above.
-                    for album_id in page_album_ids:
-                        summary = summaries.get(album_id)
-                        if not summary:
-                            continue
-                        album_tracks = tracks_by_album.get(album_id, [])
-                        albums.append({
-                            **summary,
-                            'purchased_count': len(album_tracks),
-                            'last_purchased_at': last_purchased_map.get(album_id),
-                            'tracks': album_tracks,
-                        })
-
-                total_pages = (total_count + limit - 1) // limit if limit else 0
+                total_pages = (total_count + limit - 1) // limit
                 return {
                     'albums': albums,
                     'pagination': {
@@ -13526,18 +20393,65 @@ class MusicDatabase:
                         'total_count': total_count,
                         'total_pages': total_pages,
                         'has_prev': page > 1,
-                        'has_next': page < total_pages,
+                        'has_next': page < total_pages
                     }
                 }
+
         except Exception as e:
-            logger.error(f"Error getting purchased albums: {e}")
+            logger.error(f"Error getting library albums: {e}")
             return {
                 'albums': [],
                 'pagination': {
-                    'page': 1, 'limit': limit, 'total_count': 0, 'total_pages': 0,
-                    'has_prev': False, 'has_next': False,
+                    'page': 1,
+                    'limit': limit,
+                    'total_count': 0,
+                    'total_pages': 0,
+                    'has_prev': False,
+                    'has_next': False
                 }
             }
+
+    def get_unmatched_import_summary(self) -> Dict[str, Any]:
+        """How many library tracks are parked under 'Unknown Artist' (#1202).
+
+        a file that imports with unreadable tags and no acoustid hit falls all
+        the way back to filename-only identification, which files it under a
+        made-up 'Unknown Artist' as its own one-track album. nothing ever said
+        that happened, so the track just quietly landed in a bucket you had no
+        reason to open. re-identify has always been able to fix it, but you had
+        to already know to go looking on a fake artist's page.
+
+        returns the total, plus the artist row holding the most of them so the
+        banner can link straight there. the same name can exist more than once
+        (one row per server source), which is why this sums rather than taking
+        the first row it finds.
+
+        tracks hang off albums, not off the artist directly, so this walks
+        artist -> album -> track the same way get_library_artists does.
+        """
+        empty = {'count': 0, 'artist_id': None}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT ar.id AS artist_id, COUNT(DISTINCT t.id) AS track_count
+                    FROM artists ar
+                    LEFT JOIN albums al ON al.artist_id = ar.id
+                    LEFT JOIN tracks t ON t.album_id = al.id
+                    WHERE LOWER(TRIM(ar.name)) = 'unknown artist'
+                    GROUP BY ar.id
+                """)
+                rows = cursor.fetchall()
+
+            total = sum(int(r['track_count'] or 0) for r in rows)
+            if total <= 0:
+                # an empty Unknown Artist row is not worth telling anyone about
+                return empty
+            biggest = max(rows, key=lambda r: int(r['track_count'] or 0))
+            return {'count': total, 'artist_id': biggest['artist_id']}
+        except Exception as e:
+            logger.error(f"Error building unmatched-import summary: {e}")
+            return empty
 
     def get_artist_discography(self, artist_id) -> Dict[str, Any]:
         """
@@ -13554,8 +20468,9 @@ class MusicDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
+                scope_sql, scope_params = self._current_scope_sql()
                 # Get artist information
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT
                         id, name, thumb_url, genres, server_source,
                         musicbrainz_id, deezer_id, audiodb_id, discogs_id,
@@ -13563,8 +20478,8 @@ class MusicDatabase:
                         tidal_id, qobuz_id, soul_id, amazon_id,
                         lastfm_listeners, lastfm_playcount, lastfm_tags, lastfm_bio
                     FROM artists
-                    WHERE id = ?
-                """, (artist_id,))
+                    WHERE id = ? AND {scope_sql}
+                """, (artist_id, *scope_params))
 
                 artist_row = cursor.fetchone()
 
@@ -13598,7 +20513,7 @@ class MusicDatabase:
                 # Include albums from ALL artists with the same name (fixes duplicate artist issue)
                 # Group by artist_id+title+year to merge Navidrome split albums (same artist,
                 # same album split into multiple DB entries) WITHOUT merging across different artists
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT
                         MIN(a.id) as id,
                         a.title,
@@ -13617,11 +20532,11 @@ class MusicDatabase:
                     WHERE a.artist_id IN (
                         SELECT id FROM artists
                         WHERE name = (SELECT name FROM artists WHERE id = ?)
-                        AND server_source = (SELECT server_source FROM artists WHERE id = ?)
+                        AND server_source = (SELECT server_source FROM artists WHERE id = ?) AND {scope_sql}
                     )
                     GROUP BY a.artist_id, a.title, a.year
                     ORDER BY a.year DESC, a.title
-                """, (artist_id, artist_id))
+                """, (artist_id, artist_id, *scope_params))
 
                 album_rows = cursor.fetchall()
 
@@ -13631,23 +20546,23 @@ class MusicDatabase:
                 singles = []
 
                 # Get total stats for the artist (including all artists with same name)
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT
                         COUNT(*) as album_count,
                         (SELECT COUNT(*) FROM tracks WHERE album_id IN (
                             SELECT id FROM albums WHERE artist_id IN (
                                 SELECT id FROM artists
                                 WHERE name = (SELECT name FROM artists WHERE id = ?)
-                                AND server_source = (SELECT server_source FROM artists WHERE id = ?)
+                                AND server_source = (SELECT server_source FROM artists WHERE id = ?) AND {scope_sql}
                             )
                         )) as track_count
                     FROM albums
                     WHERE artist_id IN (
                         SELECT id FROM artists
                         WHERE name = (SELECT name FROM artists WHERE id = ?)
-                        AND server_source = (SELECT server_source FROM artists WHERE id = ?)
+                        AND server_source = (SELECT server_source FROM artists WHERE id = ?) AND {scope_sql}
                     )
-                """, (artist_id, artist_id, artist_id, artist_id))
+                """, (artist_id, artist_id, *scope_params, artist_id, artist_id, *scope_params))
 
                 stats_row = cursor.fetchone()
                 album_count = stats_row['album_count'] if stats_row else 0
@@ -13747,7 +20662,7 @@ class MusicDatabase:
     # Field whitelists for safe updates
     ARTIST_EDITABLE_FIELDS = {'name', 'genres', 'summary', 'style', 'mood', 'label'}
     ALBUM_EDITABLE_FIELDS = {'title', 'year', 'release_date', 'genres', 'style', 'mood', 'label', 'explicit', 'record_type', 'track_count'}
-    TRACK_EDITABLE_FIELDS = {'title', 'track_number', 'disc_number', 'bpm', 'explicit', 'style', 'mood', 'to_be_purchased'}
+    TRACK_EDITABLE_FIELDS = {'title', 'track_number', 'disc_number', 'bpm', 'explicit', 'style', 'mood'}
 
     def get_artist_full_detail(self, artist_id) -> Dict[str, Any]:
         """
@@ -13758,8 +20673,9 @@ class MusicDatabase:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
 
+                scope_sql, scope_params = self._current_scope_sql()
                 # Get artist with all columns
-                cursor.execute("SELECT * FROM artists WHERE id = ?", (artist_id,))
+                cursor.execute(f"SELECT * FROM artists WHERE id = ? AND {scope_sql}", (artist_id, *scope_params))
                 artist_row = cursor.fetchone()
                 if not artist_row:
                     # `artist_id` may be a *source* ID (e.g. a MusicBrainz MBID
@@ -13775,8 +20691,8 @@ class MusicDatabase:
                     id_columns = list(dict.fromkeys(SOURCE_ID_FIELD.values()))
                     where = ' OR '.join(f"{col} = ?" for col in id_columns)
                     cursor.execute(
-                        f"SELECT * FROM artists WHERE {where} LIMIT 1",
-                        tuple(str(artist_id) for _ in id_columns),
+                        f"SELECT * FROM artists WHERE ({where}) AND {scope_sql} LIMIT 1",
+                        (*[str(artist_id) for _ in id_columns], *scope_params),
                     )
                     artist_row = cursor.fetchone()
                 if not artist_row:
@@ -13798,10 +20714,10 @@ class MusicDatabase:
                     artist_data['genres'] = []
 
                 # Get all album IDs for this artist (including same-name artists on same server)
-                cursor.execute("""
+                cursor.execute(f"""
                     SELECT id FROM artists
-                    WHERE name = ? AND server_source = ?
-                """, (artist_name, server_source))
+                    WHERE name = ? AND server_source = ? AND {scope_sql}
+                """, (artist_name, server_source, *scope_params))
                 artist_ids = [row['id'] for row in cursor.fetchall()]
 
                 # Get all albums with all columns
@@ -13833,12 +20749,8 @@ class MusicDatabase:
                         ORDER BY track_number, title
                     """, (album_data['id'],))
                     track_rows = cursor.fetchall()
-                    # An Opus row stored 0/NULL because mutagen exposes no
-                    # bitrate for it — fill an average from size and duration
-                    # so the library shows something true rather than nothing.
                     from core.imports.file_ops import fill_missing_track_bitrate
-                    album_data['tracks'] = [fill_missing_track_bitrate(dict(tr))
-                                            for tr in track_rows]
+                    album_data['tracks'] = [fill_missing_track_bitrate(dict(tr)) for tr in track_rows]
 
                     # Determine record type from data if not set
                     if not album_data.get('record_type'):
@@ -13889,15 +20801,27 @@ class MusicDatabase:
             return {'success': False, 'error': str(e)}
 
     def set_album_thumb_url(self, album_id, thumb_url: str) -> bool:
-        """Set an album's cover-art URL (the user's art-picker choice). A non-empty value also PINS it:
-        every enrichment worker fills art only ``WHERE thumb_url IS NULL OR = ''``, so none will
-        overwrite a user pick. Returns True when a row was updated."""
+        """Set an album's cover-art URL (the user's art-picker choice) and LOCK it.
+
+        Two different protections, because there are two kinds of writer:
+
+        * enrichment workers fill art only ``WHERE thumb_url IS NULL OR = ''``,
+          so a non-empty value is enough to survive them;
+        * a library sync writes whatever the media server returned, and does not
+          care whether the value it is replacing was chosen by a human. That is
+          what wiped TheHomeGuy's covers — Navidrome always returns a cover URL
+          (its own placeholder counts), so the "non-empty" protection above
+          never applied. ``art_locked`` is the flag that says a person picked
+          this, and the sync upserts leave locked art alone.
+
+        Returns True when a row was updated."""
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE albums SET thumb_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE albums SET thumb_url = ?, art_locked = 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
                 (thumb_url, album_id))
             conn.commit()
             return cursor.rowcount > 0
@@ -13909,20 +20833,55 @@ class MusicDatabase:
                 conn.close()
 
     def set_artist_thumb_url(self, artist_id, thumb_url: str) -> bool:
-        """Set an artist's photo URL (the user's image-picker choice). A non-empty value also PINS
-        it: every enrichment worker fills artist thumbs only ``WHERE thumb_url IS NULL OR = ''``,
-        so none will overwrite a user pick. Returns True when a row was updated."""
+        """Set an artist's photo URL (the user's image-picker choice) and LOCK it.
+
+        See :meth:`set_album_thumb_url` for why the non-empty value alone was not
+        enough. The artist upsert was the worse of the two: it wrote the server's
+        photo with a plain ``SET thumb_url = ?``, with not even the empty-value
+        guard the album path had. Returns True when a row was updated."""
         conn = None
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "UPDATE artists SET thumb_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                "UPDATE artists SET thumb_url = ?, art_locked = 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
                 (thumb_url, artist_id))
             conn.commit()
             return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"set_artist_thumb_url failed for artist {artist_id}: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def clear_art_lock(self, kind: str, entity_id) -> bool:
+        """Release a hand-picked image so the media server owns the art again.
+
+        Without this the lock is a one-way door. The picker offers covers from
+        external sources only (Cover Art Archive, Deezer, iTunes, …) and can
+        legitimately return NOTHING — TheHomeGuy's own screenshot reads "No
+        alternative covers found for this album" — so a user who locked art they
+        no longer want would have no candidate to switch to and no way back.
+
+        The current image is deliberately left in place: it stays until the next
+        library sync refreshes it, so "unlock" never blanks the page. Returns
+        True when a row was updated."""
+        table = {'album': 'albums', 'artist': 'artists'}.get(kind)
+        if table is None:
+            raise ValueError(f"clear_art_lock: kind must be 'album' or 'artist', got {kind!r}")
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                f"UPDATE {table} SET art_locked = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (entity_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"clear_art_lock failed for {kind} {entity_id}: {e}")
             return False
         finally:
             if conn:
@@ -13995,6 +20954,42 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error batch updating tracks: {e}")
             return {'success': False, 'error': str(e)}
+
+    def clear_track_recording_mbid_if_matches(self, track_id, expected_mbid: str) -> bool:
+        """Null out ``tracks.musicbrainz_recording_id`` for ``track_id``, but ONLY when its
+        current value equals ``expected_mbid``.
+
+        Used by the mbid_mismatch repair fix (``RepairWorker._fix_mbid_mismatch``) right
+        after it strips that same bad MBID from the audio file's tag. The column is
+        populated verbatim from file tags at import (``core/imports/side_effects.py``),
+        and the export MBID waterfall's DB rung (``core/exports/export_sources.py``) reads
+        it directly — so clearing only the file tag would leave exports still resolving
+        the wrong recording out of the DB. The equality guard means a value something else
+        already corrected in the meantime (no longer the bad one) is left alone. Not part
+        of ``TRACK_EDITABLE_FIELDS``/``update_track_fields`` on purpose — this is a narrow,
+        repair-specific mutation, not a user-editable field.
+
+        Compares case-insensitively: ``side_effects.py`` lowercases the MBID before storing
+        it on import (``.strip().lower()``), but a repair finding's ``details['mbid']``
+        carries whatever case the file tag itself was written in — a plain ``=`` comparison
+        would silently match 0 rows for any tag that wasn't already lowercase.
+        """
+        if not expected_mbid or track_id is None:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE tracks SET musicbrainz_recording_id = NULL, "
+                    "updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND LOWER(musicbrainz_recording_id) = LOWER(?)",
+                    (track_id, expected_mbid),
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error clearing musicbrainz_recording_id for track {track_id}: {e}")
+            return False
 
     # ==================== Discovery Match Cache Methods ====================
 
@@ -14173,6 +21168,24 @@ class MusicDatabase:
             logger.error(f"Error saving sync match cache: {e}")
             return False
 
+    def delete_sync_match_cache(self, spotify_track_id: str, server_source: str) -> int:
+        """Delete ONE sync match cache row. Returns rows deleted.
+
+        Used when a cached pairing is proven stale under the current
+        matcher (#1721): the row must not survive to poison the next sync,
+        but the rest of the cache (other tracks, other servers) is fine."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM sync_match_cache WHERE spotify_track_id = ? AND server_source = ?",
+                (str(spotify_track_id), server_source))
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Error deleting sync match cache row: {e}")
+            return 0
+
     def invalidate_sync_match_cache(self, server_source: str = None) -> int:
         """Clear sync match cache entries. If server_source given, only clear that server's entries."""
         try:
@@ -14248,73 +21261,6 @@ class MusicDatabase:
             logger.error(f"Error removing from blacklist: {e}")
             return False
 
-    # ==================== Discovery Artist Blacklist Methods ====================
-
-    def add_to_discovery_blacklist(self, artist_name: str, spotify_id: str = None,
-                                   itunes_id: str = None, deezer_id: str = None) -> bool:
-        """Block an artist from appearing in discovery results."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT OR REPLACE INTO discovery_artist_blacklist
-                (artist_name, spotify_artist_id, itunes_artist_id, deezer_artist_id)
-                VALUES (?, ?, ?, ?)
-            """, (artist_name.strip(), spotify_id, itunes_id, deezer_id))
-            conn.commit()
-            return True
-        except Exception as e:
-            logger.error(f"Error adding to discovery blacklist: {e}")
-            return False
-
-    def remove_from_discovery_blacklist(self, blacklist_id: int) -> bool:
-        """Remove an artist from the discovery blacklist."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM discovery_artist_blacklist WHERE id = ?", (blacklist_id,))
-            conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            logger.error(f"Error removing from discovery blacklist: {e}")
-            return False
-
-    def get_discovery_blacklist(self) -> list:
-        """Get all blacklisted discovery artists."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, artist_name, spotify_artist_id, itunes_artist_id, deezer_artist_id, created_at
-                FROM discovery_artist_blacklist ORDER BY created_at DESC
-            """)
-            return [dict(r) for r in cursor.fetchall()]
-        except Exception as e:
-            logger.error(f"Error getting discovery blacklist: {e}")
-            return []
-
-    def get_discovery_blacklist_names(self) -> set:
-        """Set of blacklisted artist names (lowercased) for discovery filtering.
-
-        Unions the legacy discovery_artist_blacklist with the new unified
-        blocklist's artist entries (across all profiles), so a ban added via
-        either path filters discovery. The legacy table is migrated into the
-        blocklist on upgrade but kept as a rollback safety net."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT LOWER(artist_name) FROM discovery_artist_blacklist")
-            names = {r[0] for r in cursor.fetchall()}
-            try:
-                cursor.execute("SELECT LOWER(name) FROM blocklist WHERE entity_type = 'artist'")
-                names.update(r[0] for r in cursor.fetchall())
-            except Exception as _bl_err:  # noqa: BLE001 — old schema may predate blocklist
-                logger.debug("blocklist union skipped in discovery names: %s", _bl_err)
-            return names
-        except Exception as e:
-            logger.error(f"Error getting discovery blacklist names: {e}")
-            return set()
-
     # ==================== Blocklist (artist/album/track) ====================
 
     def _migrate_discovery_blacklist_into_blocklist(self, cursor):
@@ -14324,13 +21270,23 @@ class MusicDatabase:
         Replicated to EVERY existing profile so no existing discovery ban
         silently stops working under the new per-profile model. Idempotent
         (skips a (profile, name) already present). The old table is left in
-        place as a rollback safety net."""
+        place as a rollback safety net.
+
+        Runs once. It used to run on every start, so an artist a profile
+        unblocked came back on the next restart; the discover page's blocked
+        artists modal now writes the blocklist, so nothing new lands in the
+        old table after this."""
         try:
+            cursor.execute("SELECT 1 FROM metadata WHERE key = "
+                           "'discovery_blacklist_migrated_v1' LIMIT 1")
+            if cursor.fetchone():
+                return
             cursor.execute(
                 "SELECT artist_name, spotify_artist_id, itunes_artist_id, deezer_artist_id "
                 "FROM discovery_artist_blacklist")
             legacy = cursor.fetchall()
             if not legacy:
+                self._mark_discovery_blacklist_migrated(cursor)
                 return
             try:
                 cursor.execute("SELECT id FROM profiles")
@@ -14354,11 +21310,20 @@ class MusicDatabase:
                         "itunes_id, deezer_id, match_status) VALUES (?, 'artist', ?, ?, ?, ?, 'matched')",
                         (pid, name, row[1], row[2], row[3]))
                     migrated += 1
+            self._mark_discovery_blacklist_migrated(cursor)
             if migrated:
                 logger.info("Migrated %d discovery-blacklist artist entr(ies) into the "
                             "unified blocklist across %d profile(s)", migrated, len(profile_ids))
         except Exception as e:
             logger.debug("discovery→blocklist migration skipped: %s", e)
+
+    @staticmethod
+    def _mark_discovery_blacklist_migrated(cursor):
+        try:
+            cursor.execute("INSERT OR REPLACE INTO metadata (key, value) "
+                           "VALUES ('discovery_blacklist_migrated_v1', '1')")
+        except Exception as e:  # noqa: BLE001 - worst case it runs again
+            logger.debug("discovery blacklist migration flag not written: %s", e)
 
     def add_blocklist_entry(self, profile_id: int, entity_type: str, name: str,
                             spotify_id: str = None, itunes_id: str = None,
@@ -14411,6 +21376,78 @@ class MusicDatabase:
         except Exception as e:
             logger.error(f"Error removing blocklist entry: {e}")
             return False
+
+    # ==================== Discovery feedback ====================
+
+    def set_discovery_feedback(self, profile_id: int, entity_type: str, entity_key: str,
+                               name: str, kind: str, artist_name: str = None,
+                               ids_json: str = None, seed_context_json: str = None,
+                               expires_at: str = None) -> Optional[int]:
+        """Record one piece of feedback, replacing the same kind for the same
+        entity. ``more`` and ``less`` are opposites: setting one drops the
+        other. Returns the row id."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            opposite = {'more': 'less', 'less': 'more'}.get(kind)
+            if opposite:
+                cursor.execute(
+                    "DELETE FROM discovery_feedback WHERE profile_id = ? AND entity_type = ? "
+                    "AND entity_key = ? AND kind = ?", (profile_id, entity_type, entity_key, opposite))
+            cursor.execute(
+                "DELETE FROM discovery_feedback WHERE profile_id = ? AND entity_type = ? "
+                "AND entity_key = ? AND kind = ?", (profile_id, entity_type, entity_key, kind))
+            cursor.execute(
+                "INSERT INTO discovery_feedback (profile_id, entity_type, entity_key, name, "
+                "artist_name, ids_json, kind, seed_context_json, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (profile_id, entity_type, entity_key, name, artist_name, ids_json, kind,
+                 seed_context_json, expires_at))
+            conn.commit()
+            return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"Error recording discovery feedback: {e}")
+            return None
+
+    def get_discovery_feedback(self, profile_id: int) -> list:
+        """This profile's feedback still in force (an expired not-now is not)."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, entity_type, entity_key, name, artist_name, ids_json, kind, "
+                "seed_context_json, created_at, expires_at FROM discovery_feedback "
+                "WHERE profile_id = ? AND (expires_at IS NULL OR expires_at > datetime('now')) "
+                "ORDER BY created_at DESC, id DESC", (profile_id,))
+            return [dict(r) for r in cursor.fetchall()]
+        except Exception as e:
+            logger.debug(f"discovery feedback read failed: {e}")
+            return []
+
+    def remove_discovery_feedback(self, profile_id: int, feedback_id: int) -> bool:
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM discovery_feedback WHERE id = ? AND profile_id = ?",
+                           (int(feedback_id), profile_id))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error removing discovery feedback: {e}")
+            return False
+
+    def clear_discovery_feedback(self, profile_id: int) -> int:
+        """Reset taste: every more / less / not-now for the profile. Blocks
+        are in the blocklist and stay."""
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM discovery_feedback WHERE profile_id = ?", (profile_id,))
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            logger.error(f"Error clearing discovery feedback: {e}")
+            return 0
 
     def get_blocklist(self, profile_id: int, entity_type: str = None) -> list:
         """List blocklist entries for a profile, newest first."""
@@ -14960,9 +21997,12 @@ class MusicDatabase:
                                tidal_track_id: Optional[str] = None,
                                qobuz_track_id: Optional[str] = None,
                                musicbrainz_recording_id: Optional[str] = None,
+                               recording_disambiguation: Optional[str] = None,
                                audiodb_id: Optional[str] = None,
                                soul_id: Optional[str] = None,
-                               isrc: Optional[str] = None) -> Optional[int]:
+                               isrc: Optional[str] = None,
+                               acquired_quality_json: Optional[str] = None,
+                               retention_json: Optional[str] = None) -> Optional[int]:
         """Record a download with full source provenance. Returns the record ID.
 
         External-ID kwargs (spotify_track_id et al.) capture the metadata-
@@ -14998,13 +22038,17 @@ class MusicDatabase:
                  source_size, audio_quality, track_title, track_artist, track_album, status,
                  bit_depth, sample_rate, bitrate,
                  spotify_track_id, itunes_track_id, deezer_track_id, tidal_track_id,
-                 qobuz_track_id, musicbrainz_recording_id, audiodb_id, soul_id, isrc)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 qobuz_track_id, musicbrainz_recording_id, recording_disambiguation,
+                 audiodb_id, soul_id, isrc,
+                 acquired_quality_json, retention_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (track_id, file_path, source_service, source_username, source_filename,
                   source_size, audio_quality, track_title, track_artist, track_album, status,
                   bit_depth, sample_rate, bitrate,
                   spotify_track_id, itunes_track_id, deezer_track_id, tidal_track_id,
-                  qobuz_track_id, musicbrainz_recording_id, audiodb_id, soul_id, isrc))
+                  qobuz_track_id, musicbrainz_recording_id, recording_disambiguation,
+                  audiodb_id, soul_id, isrc,
+                  acquired_quality_json, retention_json))
             conn.commit()
             return cursor.lastrowid
         except Exception as e:
@@ -15058,7 +22102,8 @@ class MusicDatabase:
         number of columns updated. Called from
         ``insert_or_update_media_track`` immediately after the row is
         inserted/updated so freshly synced media-server rows pick up
-        whatever IDs Commissary already knew at download time.
+        whatever identity and retention provenance SoulSync already knew at
+        download time.
         """
         if not track_id or not file_path:
             return 0
@@ -15080,6 +22125,8 @@ class MusicDatabase:
             'audiodb_id': 'audiodb_id',
             'soul_id': 'soul_id',
             'isrc': 'isrc',
+            'acquired_quality_json': 'acquired_quality_json',
+            'retention_json': 'retention_json',
         }
 
         updates: Dict[str, str] = {}
@@ -15102,6 +22149,17 @@ class MusicDatabase:
             for track_col, val in updates.items():
                 set_clauses.append(f"{track_col} = COALESCE(NULLIF({track_col}, ''), ?)")
                 params.append(val)
+            disambiguation = prov.get('recording_disambiguation')
+            prov_mbid = prov.get('musicbrainz_recording_id')
+            if disambiguation and prov_mbid:
+                set_clauses.append(
+                    "recording_disambiguation = CASE "
+                    "WHEN musicbrainz_recording_id IS NULL OR musicbrainz_recording_id = '' "
+                    "OR LOWER(musicbrainz_recording_id) = LOWER(?) "
+                    "THEN COALESCE(NULLIF(recording_disambiguation, ''), ?) "
+                    "ELSE recording_disambiguation END"
+                )
+                params.extend((prov_mbid, disambiguation))
             params.append(track_id)
             cursor.execute(
                 f"UPDATE tracks SET {', '.join(set_clauses)} WHERE id = ?",
@@ -15188,8 +22246,56 @@ class MusicDatabase:
 
     # ==================== Discovery Pool Methods ====================
 
-    def get_discovery_pool_matched(self, limit: int = 500) -> list:
-        """Get all cached discovery matches, ordered by most recently used."""
+    def _get_playlist_discovery_keys(self, playlist_id: int, profile_id: int = None) -> set:
+        """Return the set of (normalized_title, normalized_artist) discovery keys for a playlist.
+
+        discovery_match_cache is a global cache keyed by Python-normalized
+        (clean_title, clean_artist) pairs (see _get_discovery_cache_key), so per-playlist
+        filtering re-keys the playlist's tracks with the same normalization and filters
+        the cached rows in memory. The cache has no playlist column by design.
+        """
+        keys = set()
+        try:
+            engine = _matching_engine
+            if engine is None:
+                # #1452: failing closed here would silently empty the Matched
+                # tab whenever a playlist filter is applied, so log loudly —
+                # a missing matching engine breaks the app broadly anyway.
+                logger.warning(
+                    "Discovery pool playlist filter: matching engine unavailable, "
+                    "returning no matched keys"
+                )
+                return keys
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            query = """
+                SELECT mpt.track_name, mpt.artist_name
+                FROM mirrored_playlist_tracks mpt
+                JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id
+                WHERE mpt.playlist_id = ?
+            """
+            params = [playlist_id]
+            if profile_id:
+                query += " AND mp.profile_id = ?"
+                params.append(profile_id)
+            cursor.execute(query, params)
+            for row in cursor.fetchall():
+                keys.add((engine.clean_title(row['track_name'] or ''),
+                          engine.clean_artist(row['artist_name'] or '')))
+            conn.close()
+        except Exception as e:
+            logger.error(f"Error getting playlist discovery keys: {e}")
+        return keys
+
+    def get_discovery_pool_matched(self, limit: int = 500, profile_id: int = None,
+                                   playlist_id: int = None) -> list:
+        """Get cached discovery matches, ordered by most recently used.
+
+        When ``playlist_id`` is given, only matches for tracks in that playlist are
+        returned. The cache is global and carries no playlist id, so the playlist's
+        tracks are re-keyed with the same normalization and the rows are filtered
+        in memory. Without ``playlist_id`` the result is identical to before.
+        """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -15200,8 +22306,16 @@ class MusicDatabase:
                 ORDER BY last_used_at DESC
                 LIMIT ?
             """, (limit,))
+            rows = cursor.fetchall()
+            conn.close()
+
+            if playlist_id:
+                keys = self._get_playlist_discovery_keys(playlist_id, profile_id)
+                rows = [row for row in rows
+                        if (row['normalized_title'], row['normalized_artist']) in keys]
+
             results = []
-            for row in cursor.fetchall():
+            for row in rows:
                 try:
                     matched_data = json.loads(row['matched_data_json'])
                 except (json.JSONDecodeError, TypeError):
@@ -15223,8 +22337,7 @@ class MusicDatabase:
             return []
 
     def get_discovery_pool_failed(self, profile_id: int = None, playlist_id: int = None) -> list:
-        """Get all tracks where discovery was attempted but failed, leaving out
-        the ones the user marked "Not available"."""
+        """Get all tracks where discovery was attempted but failed."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
@@ -15235,7 +22348,6 @@ class MusicDatabase:
                 JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id
                 WHERE mpt.extra_data LIKE '%"discovery_attempted": true%'
                   AND mpt.extra_data NOT LIKE '%"discovered": true%'
-                  AND mpt.extra_data NOT LIKE '%"unavailable": true%'
             """
             params = []
             if playlist_id:
@@ -15251,22 +22363,6 @@ class MusicDatabase:
             logger.error(f"Error getting discovery pool failed: {e}")
             return []
 
-    def get_discovery_cache_entry(self, entry_id: int) -> Optional[Dict]:
-        """One discovery cache entry's key -- normalized title and artist, provider --
-        and original names, by id; None when there is none."""
-        try:
-            conn = self._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id, normalized_title, normalized_artist, provider, original_title, original_artist
-                FROM discovery_match_cache WHERE id = ?
-            """, (entry_id,))
-            row = cursor.fetchone()
-            return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Error reading discovery cache entry: {e}")
-            return None
-
     def delete_discovery_cache_entry(self, entry_id: int) -> bool:
         """Delete a single entry from the discovery match cache."""
         try:
@@ -15279,27 +22375,72 @@ class MusicDatabase:
             logger.error(f"Error deleting discovery cache entry: {e}")
             return False
 
-    def get_discovery_pool_stats(self, profile_id: int = None) -> dict:
+    def clear_discovery_cache(self, playlist_id: int = None, profile_id: int = None) -> int:
+        """Delete cached discovery matches, optionally scoped to one playlist.
+
+        With playlist_id, only cache rows whose (normalized_title,
+        normalized_artist) key matches one of the playlist's tracks are
+        removed; without it the whole cache is emptied. Mirrored-playlist
+        track flags are untouched — the failed tab is per-track workflow
+        state, not cache. Returns the number of rows deleted. (#1452)
+        """
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            if playlist_id:
+                keys = self._get_playlist_discovery_keys(playlist_id, profile_id)
+                if not keys:
+                    return 0
+                # Note: the cache is global (no playlist column), so a row
+                # shared with other playlists is removed for them too. The
+                # only consequence is re-identification on next discovery.
+                placeholders = ",".join(["(?, ?)"] * len(keys))
+                flat = [v for pair in keys for v in pair]
+                cursor.execute(
+                    f"DELETE FROM discovery_match_cache WHERE (normalized_title, normalized_artist) IN ({placeholders})",
+                    flat,
+                )
+            else:
+                cursor.execute("DELETE FROM discovery_match_cache")
+            deleted = cursor.rowcount
+            conn.commit()
+            return deleted
+        except Exception as e:
+            logger.error(f"Error clearing discovery cache: {e}")
+            return 0
+
+    def get_discovery_pool_stats(self, profile_id: int = None, playlist_id: int = None) -> dict:
         """Get counts for matched and failed discovery tracks."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as cnt FROM discovery_match_cache")
-            matched = cursor.fetchone()['cnt']
+            if playlist_id:
+                # Scope the matched count the same way as the matched query: the cache
+                # is global, so re-key the playlist's tracks and count matching rows.
+                keys = self._get_playlist_discovery_keys(playlist_id, profile_id)
+                cursor.execute("SELECT normalized_title, normalized_artist FROM discovery_match_cache")
+                matched = sum(1 for row in cursor.fetchall()
+                              if (row['normalized_title'], row['normalized_artist']) in keys)
+            else:
+                cursor.execute("SELECT COUNT(*) as cnt FROM discovery_match_cache")
+                matched = cursor.fetchone()['cnt']
 
             query = """
                 SELECT COUNT(*) as cnt FROM mirrored_playlist_tracks mpt
                 JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id
                 WHERE mpt.extra_data LIKE '%"discovery_attempted": true%'
                   AND mpt.extra_data NOT LIKE '%"discovered": true%'
-                  AND mpt.extra_data NOT LIKE '%"unavailable": true%'
             """
             params = []
-            if profile_id:
+            if playlist_id:
+                query += " AND mpt.playlist_id = ?"
+                params.append(playlist_id)
+            elif profile_id:
                 query += " AND mp.profile_id = ?"
                 params.append(profile_id)
             cursor.execute(query, params)
             failed = cursor.fetchone()['cnt']
+            conn.close()
             return {'matched': matched, 'failed': failed}
         except Exception as e:
             logger.error(f"Error getting discovery pool stats: {e}")
@@ -15308,13 +22449,41 @@ class MusicDatabase:
     # Wing It Pool: two states on a mirrored track's extra_data. Both key off wing_it_fallback,
     # which is set by the wing-it stub and SURVIVES a manual fix (update_mirrored_track_extra_data
     # merges rather than replaces), so the only difference is the manual_match flag:
-    #   needs attention : wing_it_fallback=true AND NOT manual_match  (unverified guess)
+    #   needs attention : still a stub AND NOT manual_match  (unverified guess)
     #   resolved        : wing_it_fallback=true AND manual_match=true (user fixed it — incl. fixes
     #                     made before this feature existed, since the flag was never wiped)
-    _WING_IT_ATTENTION = ("mpt.extra_data LIKE '%\"wing_it_fallback\": true%' "
-                          "AND mpt.extra_data NOT LIKE '%\"manual_match\": true%'")
-    _WING_IT_RESOLVED = ("mpt.extra_data LIKE '%\"wing_it_fallback\": true%' "
-                         "AND mpt.extra_data LIKE '%\"manual_match\": true%'")
+    #
+    # That the flag survives is what makes "resolved" work, but it also means the
+    # flag alone cannot answer "is this STILL a guess?". Discovery re-runs every
+    # sync, and a track that wing-it'd once and matched at 0.99 on a later pass
+    # keeps the flag — the writer only ever sets it, and the merge preserves what
+    # it omits. So "needs attention" tests the thing that actually regenerates
+    # each pass: whether matched_data is still a stub. Stub ids carry the
+    # ``wing_it_`` prefix (see core.discovery.wing_it.stub_track_id); a real
+    # match overwrites matched_data wholesale, prefix and all.
+    #
+    # json_extract, not a raw substring LIKE. Scoping to $.matched_data.id —
+    # rather than matching `"id": "wing_it_..."` anywhere in the blob — is what
+    # rules out a same-shaped key elsewhere in the document ever being mistaken
+    # for the stub id. json_extract yields SQL NULL for a missing path/row,
+    # which the comparisons below treat as "not a match" rather than erroring —
+    # but for a MALFORMED value (not just an absent key) it raises instead,
+    # and SQLite evaluates that error for the whole statement, not just the
+    # offending row: one corrupt extra_data would blank the entire pool through
+    # the try/except below, where the LIKE version it replaced would have just
+    # silently not matched that row's garbage text. json_valid() as the first
+    # AND-clause is what keeps a single bad row's failure scoped to that row.
+    _WING_IT_ATTENTION = (
+        "json_valid(mpt.extra_data) "
+        "AND json_extract(mpt.extra_data, '$.wing_it_fallback') = 1 "
+        "AND json_extract(mpt.extra_data, '$.matched_data.id') LIKE 'wing\\_it\\_%' ESCAPE '\\' "
+        "AND IFNULL(json_extract(mpt.extra_data, '$.manual_match'), 0) != 1"
+    )
+    _WING_IT_RESOLVED = (
+        "json_valid(mpt.extra_data) "
+        "AND json_extract(mpt.extra_data, '$.wing_it_fallback') = 1 "
+        "AND json_extract(mpt.extra_data, '$.manual_match') = 1"
+    )
 
     def get_wing_it_pool(self, profile_id: int = None, playlist_id: int = None,
                          resolved: bool = False) -> list:
@@ -15350,7 +22519,7 @@ class MusicDatabase:
             logger.error(f"Error getting wing it pool: {e}")
             return []
 
-    def get_wing_it_pool_stats(self, profile_id: int = None) -> dict:
+    def get_wing_it_pool_stats(self, profile_id: int = None, playlist_id: int = None) -> dict:
         """Counts for both Wing It states: unverified (``wing_it``) + resolved (``matched``)."""
         try:
             conn = self._get_connection()
@@ -15360,7 +22529,10 @@ class MusicDatabase:
                 q = (f"SELECT COUNT(*) as cnt FROM mirrored_playlist_tracks mpt "
                      f"JOIN mirrored_playlists mp ON mpt.playlist_id = mp.id WHERE {where}")
                 params = []
-                if profile_id:
+                if playlist_id:
+                    q += " AND mpt.playlist_id = ?"
+                    params.append(playlist_id)
+                elif profile_id:
                     q += " AND mp.profile_id = ?"
                     params.append(profile_id)
                 cursor.execute(q, params)
@@ -15660,13 +22832,14 @@ class MusicDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
             placeholders = ",".join("?" * len(track_ids))
+            scope_sql, scope_params = self._current_scope_sql('t.owner_profile_id')
             cursor.execute(f"""
                 SELECT t.*, a.name as artist_name, al.title as album_title
                 FROM tracks t
                 LEFT JOIN artists a ON t.artist_id = a.id
                 LEFT JOIN albums al ON t.album_id = al.id
-                WHERE t.id IN ({placeholders})
-            """, track_ids)
+                WHERE t.id IN ({placeholders}) AND {scope_sql}
+            """, [*track_ids, *scope_params])
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"API: Error getting tracks by IDs: {e}")
@@ -15857,26 +23030,180 @@ class MusicDatabase:
             logger.error(f"Error getting watchlist scan run events for {run_id}: {e}")
             return []
 
+    @staticmethod
+    def _path_suffix_key(path, segments: int = 2):
+        """Normalised trailing path segments — see
+        ``core.library.expired_cleanup.path_suffix_key``. Imported lazily so
+        the pure module stays the single definition without this module
+        gaining an import-time dependency on it."""
+        from core.library.expired_cleanup import path_suffix_key
+        return path_suffix_key(path, segments)
+
+    # ── Curation signals (media-server favourites / ratings / playlists) ──
+
+    CURATION_SYNC_KEY = 'curation_signals_synced_at'
+    # The structured outcome of the last sweep. The bare timestamp above cannot
+    # express "half of it failed", and a fresh stamp over a half-written
+    # snapshot is indistinguishable from "nobody curated anything" — which is
+    # the state that deletes a library (L2-001).
+    CURATION_STATUS_KEY = 'curation_signals_sync_status'
+
+    def replace_curation_signals(self, server: str, user_key: str, signals) -> int:
+        """Replace one user's curation signals for one server, atomically.
+
+        Replace rather than merge: an unstarred track must actually lose its
+        protection, and a merge would keep it protected forever. The delete and
+        the insert share a transaction so a crash can never leave the user with
+        no signals — which would read as "nobody wants any of this".
+
+        ``signals`` items need ``track_key``; ``favorite``, ``rating``,
+        ``in_playlist`` and ``source_path`` are optional.
+
+        Raises on any storage failure. This is a safety API: swallowing the
+        error and returning 0 made a failed write indistinguishable from "this
+        user curated nothing", and the caller then stamped the sweep as a
+        success (L2-001). The caller decides what a failure means; it must never
+        have to guess whether one happened.
+        """
+        rows = [s for s in (signals or []) if isinstance(s, dict) and s.get('track_key')]
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "DELETE FROM curation_signals WHERE server = ? AND user_key = ?",
+                (str(server), str(user_key)))
+            cursor.executemany(
+                "INSERT OR REPLACE INTO curation_signals "
+                "(server, user_key, track_key, favorite, rating, in_playlist, "
+                " source_path, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,CURRENT_TIMESTAMP)",
+                [(str(server), str(user_key), s['track_key'],
+                  1 if s.get('favorite') else 0,
+                  s.get('rating'),
+                  1 if s.get('in_playlist') else 0,
+                  s.get('source_path'))
+                 for s in rows])
+            conn.commit()
+        return len(rows)
+
+    def get_curation_signals_by_track_key(self) -> Dict[str, List[Dict[str, Any]]]:
+        """Every stored signal, grouped by track_key, for the cleanup decision.
+
+        Raises on a read failure (L2-001). An empty dict has to mean "nobody
+        curated anything"; returning it for a schema or I/O error handed the
+        cleaner that exact conclusion and let it delete favourited files.
+        """
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT track_key, server, user_key, favorite, rating, in_playlist "
+            "FROM curation_signals")
+        for track_key, server, user_key, favorite, rating, in_playlist in cursor.fetchall():
+            grouped.setdefault(track_key, []).append({
+                'server': server,
+                'user': user_key,
+                'favorite': bool(favorite),
+                'rating': rating,
+                'in_playlist': bool(in_playlist),
+            })
+        return grouped
+
+    def mark_curation_sync(self, status: Optional[Dict[str, Any]] = None) -> None:
+        """Record the outcome of a curation sweep.
+
+        ``status`` is the structured record the cleaner reads; it must carry a
+        ``complete`` flag saying whether EVERY expected server and user was
+        stored. The plain timestamp is kept alongside it for older readers.
+        Raises on failure — a stamp that silently did not land is a stamp the
+        cleaner will read as older than it is, and eventually as absent.
+        """
+        now = datetime.now().isoformat()
+        if status is None:
+            # A caller that has nothing structured to say is asserting a plain
+            # successful sweep. Clear any older record rather than leaving one
+            # behind that would keep describing a sweep this one replaced.
+            self.set_preference(self.CURATION_STATUS_KEY, '')
+        else:
+            payload = dict(status)
+            payload.setdefault('complete', True)
+            payload['at'] = now
+            self.set_preference(self.CURATION_STATUS_KEY,
+                                json.dumps(payload, ensure_ascii=False))
+        self.set_preference(self.CURATION_SYNC_KEY, now)
+
+    def get_curation_sync_at(self):
+        """When the last curation sweep finished, or None. Raises on failure."""
+        return self.get_preference(self.CURATION_SYNC_KEY)
+
+    def get_curation_status(self) -> Optional[Dict[str, Any]]:
+        """The last sweep's structured outcome, or None if none was recorded.
+
+        Raises on a read failure, for the same reason as the signals above: the
+        caller must be able to tell "never swept" from "cannot tell".
+        """
+        raw = self.get_preference(self.CURATION_STATUS_KEY)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            # A corrupted record is not evidence of a good sweep.
+            return {'complete': False, 'at': None, 'corrupt': True}
+        return parsed if isinstance(parsed, dict) else {'complete': False, 'at': None}
+
     def get_origin_cleanup_candidates(self):
         """Origin-tracked downloads (watchlist/playlist) annotated with the
         matching library track's play_count, for the Expired Download Cleaner.
-        play_count is 0 when no library track matches the recorded path
-        (orphan history row → treated as not-listened)."""
+
+        ``play_count`` is None — meaning UNKNOWN, not zero — when no library
+        track can be matched to the download. The caller must treat that as
+        "cannot tell" and keep the file: this job deletes the user's data, and
+        an unmatched row is exactly the state a orphaned/renamed/not-yet-scanned
+        track is in.
+
+        Matching is exact-path first, then a trailing-segment fallback. The
+        exact join alone silently failed on every install where SoulSync's
+        paths differ from the media server's (Docker, NAS) — play_count read 0
+        for every candidate and the "you played it" protection never fired at
+        all. Where a suffix is ambiguous the HIGHEST play count wins, because
+        ambiguity must fail toward keeping the file.
+        """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT lh.id, lh.origin, lh.origin_context, lh.created_at,
                        lh.file_path, lh.title, lh.artist_name,
-                       COALESCE(t.play_count, 0) AS play_count
+                       t.play_count AS play_count, lh.source_track_id
                 FROM library_history lh
                 LEFT JOIN tracks t ON t.file_path = lh.file_path
                 WHERE lh.event_type = 'download'
                   AND lh.origin IN ('watchlist', 'playlist')
             """)
             cols = ['id', 'origin', 'origin_context', 'created_at',
-                    'file_path', 'title', 'artist_name', 'play_count']
-            return [dict(zip(cols, row, strict=True)) for row in cursor.fetchall()]
+                    'file_path', 'title', 'artist_name', 'play_count',
+                    'source_track_id']
+            rows = [dict(zip(cols, row, strict=True)) for row in cursor.fetchall()]
+
+            # Only pay for the fallback map when the exact join actually missed.
+            unmatched = [r for r in rows if r['play_count'] is None and r['file_path']]
+            if unmatched:
+                suffix_plays = {}
+                cursor.execute(
+                    "SELECT file_path, COALESCE(play_count, 0) FROM tracks "
+                    "WHERE file_path IS NOT NULL AND file_path != ''")
+                for track_path, plays in cursor.fetchall():
+                    key = self._path_suffix_key(track_path)
+                    if not key:
+                        continue
+                    previous = suffix_plays.get(key)
+                    if previous is None or plays > previous:
+                        suffix_plays[key] = plays
+                for row in unmatched:
+                    matched = suffix_plays.get(self._path_suffix_key(row['file_path']))
+                    if matched is not None:
+                        row['play_count'] = matched
+            return rows
         except Exception as e:
             logger.debug(f"Error getting origin cleanup candidates: {e}")
             return []
@@ -15938,203 +23265,6 @@ class MusicDatabase:
         except Exception as e:
             logger.debug(f"Error deleting history rows: {e}")
             return 0
-
-    # ── Music Libraries ────────────────────────────────────────────────────
-    # Where finished music is filed. See the music_root_folders CREATE TABLE
-    # for why this exists and what NULL means in each column.
-
-    @staticmethod
-    def _music_library_row(row) -> dict:
-        return {
-            'id': row['id'],
-            'path': row['path'],
-            'label': row['label'] or 'Music Library',
-            'sort_order': row['sort_order'],
-            'naming_template': row['naming_template'],
-            'quality_profile_id': row['quality_profile_id'],
-        }
-
-    def list_music_libraries(self) -> list:
-        """Every configured Music Library, default first.
-
-        Order is the contract, not a nicety: the lowest ``sort_order`` IS the
-        default destination, so callers resolving "where does this go with no
-        explicit choice?" take the first row.
-        """
-        conn = None
-        try:
-            conn = self._get_connection()
-            rows = conn.execute(
-                "SELECT id, path, label, sort_order, naming_template, quality_profile_id "
-                "FROM music_root_folders ORDER BY sort_order, id"
-            ).fetchall()
-            return [self._music_library_row(r) for r in rows]
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error listing music libraries: {e}")
-            return []
-        finally:
-            if conn:
-                conn.close()
-
-    def get_music_library(self, library_id) -> Optional[dict]:
-        """One library by id, or None. None is a normal answer — a wishlist row
-        can name a library the user has since deleted, and the caller falls
-        back to the default rather than failing the download."""
-        if library_id in (None, ''):
-            return None
-        try:
-            lid = int(library_id)
-        except (TypeError, ValueError):
-            return None
-        conn = None
-        try:
-            conn = self._get_connection()
-            row = conn.execute(
-                "SELECT id, path, label, sort_order, naming_template, quality_profile_id "
-                "FROM music_root_folders WHERE id=?", (lid,)
-            ).fetchone()
-            return self._music_library_row(row) if row else None
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error reading music library {library_id}: {e}")
-            return None
-        finally:
-            if conn:
-                conn.close()
-
-    def all_music_library_paths(self) -> list:
-        """Every library path, default first — the READ side.
-
-        Feeds ``core.library.path_resolver``, so a scanner or repair job can
-        resolve a file that lives in any library rather than only the one that
-        used to be the whole story.
-        """
-        return [lib['path'] for lib in self.list_music_libraries() if lib.get('path')]
-
-    def sync_default_music_library(self, path) -> bool:
-        """Point the DEFAULT Music Library at ``path`` (Settings → Music Library
-        Folder).
-
-        The folder field and the first library row are the same setting shown
-        in two places, and the import pipeline reads the LIBRARY. Editing the
-        field alone used to leave the row on the old path, so downloads kept
-        landing where the user had moved away from while the UI insisted
-        otherwise — a silent wrong-destination, which is worse than an error.
-
-        Creates the row when the table is empty (an install whose seed ran
-        before a transfer path was configured). Renaming a library the user
-        labelled is deliberately avoided — only the path moves.
-        """
-        p = str(path or '').strip()
-        if not p:
-            return False
-        conn = None
-        try:
-            conn = self._get_connection()
-            row = conn.execute(
-                "SELECT id, path FROM music_root_folders ORDER BY sort_order, id LIMIT 1"
-            ).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT OR IGNORE INTO music_root_folders (path, label, sort_order) "
-                    "VALUES (?, ?, 0)", (p, 'Music Library'))
-                conn.commit()
-                logger.info("Created the default Music Library from the configured folder: %s", p)
-                return True
-            if row['path'] == p:
-                return False
-            # A row already pointing here (a second library the user added) would
-            # break the UNIQUE(path); make this one the default instead of
-            # creating a duplicate.
-            dupe = conn.execute(
-                "SELECT id FROM music_root_folders WHERE path=? AND id<>?",
-                (p, row['id'])).fetchone()
-            if dupe:
-                conn.execute("UPDATE music_root_folders SET sort_order = sort_order + 1")
-                conn.execute("UPDATE music_root_folders SET sort_order = 0 WHERE id=?",
-                             (dupe['id'],))
-                conn.commit()
-                logger.info("Made the existing Music Library at %s the default", p)
-                return True
-            conn.execute("UPDATE music_root_folders SET path=? WHERE id=?", (p, row['id']))
-            conn.commit()
-            logger.info("Default Music Library moved to the configured folder: %s -> %s",
-                        row['path'], p)
-            return True
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error syncing the default music library: {e}")
-            if conn:
-                conn.rollback()
-            return False
-        finally:
-            if conn:
-                conn.close()
-
-    def save_music_libraries(self, entries) -> list:
-        """Replace the Music Library list with ``entries`` (each:
-        ``{id?, path, label?, naming_template?, quality_profile_id?}``).
-
-        List position becomes ``sort_order``, so index 0 is the default
-        destination — reordering in the UI reassigns the default, same as the
-        video Libraries page.
-
-        Rows whose id is absent from ``entries`` are deleted, and any wishlist
-        track pointing at a deleted library falls back to NULL (the default)
-        rather than keeping a dangling id that resolves to nothing.
-
-        ``entries is None`` is a no-op, NOT "delete everything" — that
-        distinction is what stops a caller who simply didn't manage libraries
-        from wiping them, and it mirrors ``video_database.save_libraries``.
-        """
-        if entries is None:
-            return self.list_music_libraries()
-        conn = None
-        try:
-            conn = self._get_connection()
-            keep_ids = set()
-            for i, e in enumerate(entries or []):
-                e = e or {}
-                path = str(e.get('path') or '').strip()
-                if not path:
-                    # A library with no path can't be a destination. Skipping
-                    # beats storing a row that silently files nothing.
-                    continue
-                label = str(e.get('label') or '').strip() or None
-                template = str(e.get('naming_template') or '').strip() or None
-                profile = e.get('quality_profile_id')
-                try:
-                    profile = int(profile) if profile not in (None, '') else None
-                except (TypeError, ValueError):
-                    profile = None
-                eid = e.get('id')
-                if eid:
-                    conn.execute(
-                        "UPDATE music_root_folders SET path=?, label=?, sort_order=?, "
-                        "naming_template=?, quality_profile_id=? WHERE id=?",
-                        (path, label, i, template, profile, int(eid)))
-                    keep_ids.add(int(eid))
-                else:
-                    cur = conn.execute(
-                        "INSERT INTO music_root_folders "
-                        "(path, label, sort_order, naming_template, quality_profile_id) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (path, label, i, template, profile))
-                    keep_ids.add(cur.lastrowid)
-            existing = {r[0] for r in conn.execute(
-                "SELECT id FROM music_root_folders").fetchall()}
-            for gone in existing - keep_ids:
-                conn.execute(
-                    "UPDATE wishlist_tracks SET root_folder_id=NULL WHERE root_folder_id=?",
-                    (gone,))
-                conn.execute("DELETE FROM music_root_folders WHERE id=?", (gone,))
-            conn.commit()
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Error saving music libraries: {e}")
-            if conn:
-                conn.rollback()
-        finally:
-            if conn:
-                conn.close()
-        return self.list_music_libraries()
 
     def record_torrent_seed_grab(self, torrent_hash: str,
                                  title: Optional[str] = None,
@@ -16200,6 +23330,312 @@ class MusicDatabase:
             if conn:
                 conn.close()
 
+    # ==================== Download Decisions ====================
+
+    DOWNLOAD_DECISIONS_KEPT = 5000
+
+    def record_download_decision(self, task_key: str, *, outcome: str, summary: dict,
+                                 track_title: str = '', track_artist: str = '',
+                                 quality_profile_id=None, provenance: Optional[dict] = None) -> Optional[int]:
+        """Store (or replace) the decision behind one download task.
+
+        ``summary`` is ``core.downloads.candidate_pool.summarize_pool`` output.
+        A task that retries replaces its row, so each task has one answer. The
+        table keeps the newest DOWNLOAD_DECISIONS_KEPT rows.
+
+        ``provenance`` is ``core.downloads.provenance.new_provenance`` output
+        (``search_mode``/``searched_at``/``policy_run_id``). When a retry record
+        omits it, the task's previous provenance is preserved instead of being
+        blanked.
+        """
+        if not task_key:
+            return None
+        conn = None
+        try:
+            chosen = summary.get('chosen')
+            rest = {k: v for k, v in summary.items() if k != 'chosen'}
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            provenance = provenance or {}
+            old = cursor.execute(
+                "SELECT search_mode, searched_at, policy_run_id FROM download_decisions"
+                " WHERE task_key = ? ORDER BY id DESC LIMIT 1",
+                (str(task_key),),
+            ).fetchone()
+            old_mode, old_at, old_run = (old or (None, None, None))
+            search_mode = provenance.get('search_mode') or old_mode or 'automatic'
+            searched_at = provenance.get('searched_at') or old_at
+            policy_run_id = provenance.get('policy_run_id') or old_run
+            cursor.execute("DELETE FROM download_decisions WHERE task_key = ?", (str(task_key),))
+            cursor.execute(
+                """INSERT INTO download_decisions
+                   (task_key, track_title, track_artist, quality_profile_id, outcome,
+                    chosen_json, alternatives_json, search_mode, searched_at, policy_run_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (str(task_key), track_title or '', track_artist or '', quality_profile_id,
+                 outcome, json.dumps(chosen) if chosen else None, json.dumps(rest),
+                 search_mode, searched_at, policy_run_id),
+            )
+            new_id = cursor.lastrowid
+            cursor.execute(
+                "DELETE FROM download_decisions WHERE id <= ?",
+                (new_id - self.DOWNLOAD_DECISIONS_KEPT,),
+            )
+            conn.commit()
+            return new_id
+        except Exception as e:
+            logger.debug("Error recording download decision for %s: %s", task_key, e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def get_download_decision(self, task_key: str) -> Optional[dict]:
+        if not task_key:
+            return None
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                """SELECT id, track_download_id, task_key, track_title, track_artist,
+                          quality_profile_id, outcome, chosen_json, alternatives_json,
+                          search_mode, searched_at, policy_run_id, created_at
+                   FROM download_decisions WHERE task_key = ? ORDER BY id DESC LIMIT 1""",
+                (str(task_key),),
+            ).fetchone()
+            return self._download_decision_row(row) if row else None
+        except Exception as e:
+            logger.debug("Error reading download decision for %s: %s", task_key, e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def get_download_decision_for_track_download(self, track_download_id) -> Optional[dict]:
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                """SELECT id, track_download_id, task_key, track_title, track_artist,
+                          quality_profile_id, outcome, chosen_json, alternatives_json,
+                          search_mode, searched_at, policy_run_id, created_at
+                   FROM download_decisions WHERE track_download_id = ? ORDER BY id DESC LIMIT 1""",
+                (int(track_download_id),),
+            ).fetchone()
+            return self._download_decision_row(row) if row else None
+        except Exception as e:
+            logger.debug("Error reading download decision for download %s: %s", track_download_id, e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def link_download_decision(self, task_key: str, track_download_id) -> bool:
+        """Tie a task's decision to the track_downloads row its file became."""
+        if not task_key or track_download_id is None:
+            return False
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "UPDATE download_decisions SET track_download_id = ? WHERE task_key = ?",
+                (int(track_download_id), str(task_key)),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.debug("Error linking download decision for %s: %s", task_key, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    # ---- failed-download blocklist -------------------------------------------
+    # core/downloads/failed_blocklist.py owns the fingerprinting and the
+    # fail-open policy; these methods are the SQL surface it calls.
+
+    def record_failed_download(self, fingerprint: str, service: str, artist: str,
+                               title: str, size_bytes: int, reason: str,
+                               expires_at: str, max_entries: int) -> bool:
+        """Block a fingerprint until expires_at. Re-recording refreshes the
+        expiry; oldest rows past max_entries are dropped."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO failed_download_blocklist "
+                "(fingerprint, service, artist, title, size_bytes, reason, expires_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(fingerprint) DO UPDATE SET "
+                "expires_at = excluded.expires_at, reason = excluded.reason, "
+                "created_at = CURRENT_TIMESTAMP",
+                (fingerprint, service, artist, title, size_bytes, reason, expires_at))
+            cursor.execute(
+                "DELETE FROM failed_download_blocklist WHERE id NOT IN "
+                "(SELECT id FROM failed_download_blocklist "
+                "ORDER BY created_at DESC, id DESC LIMIT ?)",
+                (max_entries,))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.debug("Error recording failed download blocklist entry: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def is_download_blocked(self, fingerprint: str, now: str) -> bool:
+        """Is this fingerprint currently blocked (unexpired)?"""
+        conn = None
+        try:
+            conn = self._get_connection()
+            row = conn.execute(
+                "SELECT 1 FROM failed_download_blocklist "
+                "WHERE fingerprint = ? AND expires_at > ?",
+                (fingerprint, now)).fetchone()
+            return row is not None
+        except Exception as e:
+            logger.debug("Error checking failed download blocklist: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def list_failed_downloads(self, limit: int = 200) -> list:
+        """Newest blocklist entries first, for the API."""
+        try:
+            limit = max(1, min(int(limit or 200), 1000))
+        except (TypeError, ValueError):
+            limit = 200
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT fingerprint, service, artist, title, size_bytes, "
+                "reason, created_at, expires_at FROM failed_download_blocklist "
+                "ORDER BY created_at DESC, id DESC LIMIT ?",
+                (limit,)).fetchall()
+            return [dict(r) for r in rows]
+        except Exception as e:
+            logger.debug("Error listing failed download blocklist: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def remove_failed_download(self, fingerprint: str) -> bool:
+        """Unblock one fingerprint. True when a row was actually removed."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "DELETE FROM failed_download_blocklist WHERE fingerprint = ?",
+                (str(fingerprint or ''),))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.debug("Error removing failed download blocklist entry: %s", e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def clear_expired_failed_downloads(self, now: str) -> int:
+        """Delete expired blocklist rows. Returns the number removed."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.execute(
+                "DELETE FROM failed_download_blocklist WHERE expires_at <= ?",
+                (now,))
+            conn.commit()
+            return cursor.rowcount
+        except Exception as e:
+            logger.debug("Error clearing expired failed download blocklist: %s", e)
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
+    # ---- discover page layout ------------------------------------------------
+    # core/discovery/layout.py owns section ids, zones and validation; these
+    # methods are the per-profile persistence behind GET/PUT /api/discover/layout.
+
+    def get_discovery_layout(self, profile_id) -> list:
+        """Saved layout rows for a profile. Empty when never customized —
+        the API merges over the defaults then."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            rows = conn.execute(
+                "SELECT section_id, zone, position, enabled FROM discovery_layout "
+                "WHERE profile_id = ? ORDER BY position, section_id",
+                (int(profile_id),)).fetchall()
+            return [{'section_id': r[0], 'zone': r[1], 'position': r[2],
+                     'enabled': bool(r[3])} for r in rows]
+        except Exception as e:
+            logger.debug("Error reading discovery layout for %s: %s", profile_id, e)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+    def save_discovery_layout(self, profile_id, entries) -> bool:
+        """Replace the profile's layout. ``entries`` are sanitized
+        ``{'id', 'zone', 'position', 'enabled'}`` dicts."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM discovery_layout WHERE profile_id = ?",
+                           (int(profile_id),))
+            for entry in entries or []:
+                cursor.execute(
+                    "INSERT INTO discovery_layout "
+                    "(profile_id, section_id, zone, position, enabled) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (int(profile_id), str(entry.get('id') or ''),
+                     str(entry.get('zone') or ''), int(entry.get('position') or 0),
+                     1 if entry.get('enabled') else 0))
+            conn.commit()
+            return True
+        except Exception as e:
+            logger.debug("Error saving discovery layout for %s: %s", profile_id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    @staticmethod
+    def _download_decision_row(row) -> dict:
+        def _load(text, fallback):
+            try:
+                return json.loads(text) if text else fallback
+            except (TypeError, ValueError):
+                return fallback
+
+        rest = _load(row['alternatives_json'], {})
+        return {
+            'id': row['id'],
+            'track_download_id': row['track_download_id'],
+            'task_key': row['task_key'],
+            'track_title': row['track_title'] or '',
+            'track_artist': row['track_artist'] or '',
+            'quality_profile_id': row['quality_profile_id'],
+            'outcome': row['outcome'],
+            'chosen': _load(row['chosen_json'], None),
+            'alternatives': rest.get('alternatives', []),
+            'accepted_total': rest.get('accepted_total', 0),
+            'rejected_total': rest.get('rejected_total', 0),
+            'rejected_counts': rest.get('rejected_counts', {}),
+            'policy': rest.get('policy'),
+            'search_mode': row['search_mode'] or 'automatic',
+            'searched_at': row['searched_at'] or '',
+            'policy_run_id': row['policy_run_id'] or '',
+            'created_at': row['created_at'],
+        }
+
     def clear_completed_download_history(self) -> int:
         """Delete the persisted completed-download history shown on the Downloads
         page (every event_type='download' row). This also clears the verification
@@ -16212,9 +23648,18 @@ class MusicDatabase:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM library_history WHERE event_type = 'download'")
+            cursor.execute("DELETE FROM library_history WHERE event_type IN ('download', 'podcast')")
+            removed = cursor.rowcount
             conn.commit()
-            return cursor.rowcount
+            # The "why this file" records belong to the same history. Best
+            # effort, after the commit: a missing table must never cost the
+            # clear the user asked for.
+            try:
+                cursor.execute("DELETE FROM download_decisions")
+                conn.commit()
+            except Exception as dec_err:
+                logger.debug("Could not clear download decisions: %s", dec_err)
+            return removed
         except Exception as e:
             logger.error("Error clearing completed download history: %s", e)
             return 0
@@ -16236,8 +23681,16 @@ class MusicDatabase:
             logger.debug(f"Error deleting track by path: {e}")
             return 0
 
-    def get_library_history(self, event_type=None, page=1, limit=50):
+    def get_library_history(self, event_type=None, page=1, limit=50,
+                            exclude_download_sources=()):
         """Query library history with optional type filter and pagination.
+
+        ``exclude_download_sources`` drops rows whose download_source matches -
+        the Downloads page tail passes ('acoustid_scan',) because the scanner's
+        synthetic review rows carry event_type='download' but are NOT downloads:
+        a first library scan wrote hundreds of pre-existing songs into the
+        Completed list and their newer timestamps pushed every real download
+        out of the capped tail.
 
         Returns (entries_list, total_count).
         """
@@ -16245,8 +23698,20 @@ class MusicDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
 
-            where = "WHERE event_type = ?" if event_type else ""
-            params = [event_type] if event_type else []
+            clauses = []
+            params = []
+            if event_type:
+                if isinstance(event_type, (list, tuple, set)):
+                    placeholders = ','.join('?' for _ in event_type)
+                    clauses.append(f"event_type IN ({placeholders})")
+                    params.extend(list(event_type))
+                else:
+                    clauses.append("event_type = ?")
+                    params.append(event_type)
+            for src in (exclude_download_sources or ()):
+                clauses.append("COALESCE(download_source, '') != ?")
+                params.append(src)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
             cursor.execute(f"SELECT COUNT(*) as cnt FROM library_history {where}", params)
             total = cursor.fetchone()['cnt']
@@ -16264,21 +23729,326 @@ class MusicDatabase:
             logger.error(f"Error querying library history: {e}")
             return [], 0
 
-    def get_library_history_unverified(self) -> list[dict]:
+    def get_recently_added_albums(self, limit: int = 20) -> list[dict]:
+        """The dashboard's Recently Added rail: newest N ALBUMS to land, folded
+        out of the per-track ``library_history`` rows.
+
+        Fold key is (artist, album) case-insensitively; a row with no album
+        falls back to its track title, so a landed single is its own card
+        rather than invisible. The newest row per key supplies the timestamp,
+        quality, source and the play target (title + file_path); every later
+        row only bumps the track count.
+
+        Art: most history rows carry no thumb_url (the importer records the
+        landing before art exists), so empty covers are backfilled from the
+        albums table — the album DID land in the library, which is where its
+        art eventually lives — then from the artist's thumb as a last resort.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT * FROM library_history ORDER BY created_at DESC LIMIT 200")
+                rows = [dict(r) for r in cursor.fetchall()]
+
+                cards: list[dict] = []
+                by_key: dict[str, dict] = {}
+                for row in rows:
+                    artist = (row.get('artist_name') or '').strip()
+                    album = (row.get('album_name') or '').strip() or (row.get('title') or '').strip()
+                    if not artist and not album:
+                        continue
+                    key = f"{artist.lower()}::{album.lower()}"
+                    existing = by_key.get(key)
+                    if existing is not None:
+                        existing['track_count'] += 1
+                        if not existing['thumb_url'] and row.get('thumb_url'):
+                            existing['thumb_url'] = row['thumb_url']
+                        continue
+                    if len(cards) >= limit:
+                        continue  # keep counting tracks for cards already kept
+                    card = {
+                        'artist_name': artist,
+                        'album_name': album,
+                        'thumb_url': row.get('thumb_url') or '',
+                        'added_at': row.get('created_at') or '',
+                        'track_count': 1,
+                        'quality': (row.get('quality') or '').upper(),
+                        'download_source': row.get('download_source') or '',
+                        'event_type': row.get('event_type') or '',
+                        'play_title': row.get('title') or '',
+                        'play_file_path': row.get('file_path') or '',
+                    }
+                    by_key[key] = card
+                    cards.append(card)
+
+                # #1453: a rebuild wipes tracks but keeps library_history
+                # (the Expired Download Cleaner grandfathers pre-rebuild
+                # downloads off surviving history rows + library_rebuilt_at),
+                # so the fold above can build cards whose play target no
+                # longer exists. Drop those here — never delete the history
+                # rows themselves.
+                # only a card whose file is gone from disk needs the library
+                # asked, and only about that card's path. this loaded every
+                # track's path on every dashboard load (18 s cold, 1.3 s warm).
+                from core.library.expired_cleanup import path_suffix_key
+                from core.library.live_paths import live_suffix_keys
+                gone_from_disk = [
+                    c for c in cards
+                    if c.get('play_file_path') and not os.path.exists(c['play_file_path'])
+                ]
+                if gone_from_disk:
+                    live_keys = live_suffix_keys(
+                        cursor, [c['play_file_path'] for c in gone_from_disk])
+                    dropped = {
+                        id(c) for c in gone_from_disk
+                        if path_suffix_key(c['play_file_path']) not in live_keys
+                    }
+                    cards = [c for c in cards if id(c) not in dropped]
+
+                # the normalized columns are indexed; the LOWER(TRIM()) form
+                # this replaced scanned every album per card (1.3 s of cpu per
+                # dashboard load on 70k albums). the norm also folds accents,
+                # which for an art lookup only finds more.
+                norm_ready = self._norm_ready(cursor)
+                for card in cards:
+                    if card['thumb_url']:
+                        continue
+                    try:
+                        if norm_ready:
+                            cursor.execute(
+                                """
+                                SELECT al.thumb_url, ar.thumb_url
+                                FROM albums al JOIN artists ar ON al.artist_id = ar.id
+                                WHERE ar.name_norm = ? AND al.title_norm = ?
+                                LIMIT 1
+                                """,
+                                (self._normalize_for_comparison(card['artist_name'] or ''),
+                                 self._normalize_for_comparison(card['album_name'] or '')))
+                        else:
+                            cursor.execute(
+                                """
+                                SELECT al.thumb_url, ar.thumb_url
+                                FROM albums al JOIN artists ar ON al.artist_id = ar.id
+                                WHERE LOWER(TRIM(ar.name)) = LOWER(TRIM(?))
+                                  AND LOWER(TRIM(al.title)) = LOWER(TRIM(?))
+                                LIMIT 1
+                                """,
+                                (card['artist_name'], card['album_name']))
+                        hit = cursor.fetchone()
+                        if hit:
+                            card['thumb_url'] = hit[0] or hit[1] or ''
+                    except Exception as e:
+                        logger.debug("recently-added art backfill failed: %s", e)
+
+                # Every card also carries the ARTIST's art: history thumb URLs
+                # can be stale or server-authed and die in the browser, so the
+                # frontend needs a second image to fall to before the
+                # placeholder — not just a second choice server-side.
+                def _artist_art(name):
+                    """Exact name first, then the primary artist: history rows"""
+                    # often carry 'A feat. B' / 'A, B' while the library row is
+                    # just 'A' — without the retry those cards stay artless.
+                    candidates = [name]
+                    lowered = name.lower()
+                    for sep in (' feat.', ' feat ', ' ft.', ' ft ', ' featuring ', ',', ';', ' & ', ' x '):
+                        idx = lowered.find(sep)
+                        if idx > 0:
+                            candidates.append(name[:idx])
+                    for candidate in candidates:
+                        if norm_ready:
+                            cursor.execute(
+                                "SELECT thumb_url FROM artists"
+                                " WHERE name_norm = ?"
+                                " AND thumb_url IS NOT NULL AND thumb_url != '' LIMIT 1",
+                                (self._normalize_for_comparison(candidate),))
+                        else:
+                            cursor.execute(
+                                "SELECT thumb_url FROM artists"
+                                " WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))"
+                                " AND thumb_url IS NOT NULL AND thumb_url != '' LIMIT 1",
+                                (candidate,))
+                        hit = cursor.fetchone()
+                        if hit and hit[0]:
+                            return hit[0]
+                    return ''
+
+                # the library album behind each card, so its play / queue /
+                # add-to-playlist buttons can act on the whole album. the
+                # newest track's path is the exact answer (indexed); a path
+                # that moved roots falls back to the names. None when the
+                # library has no such album, and the card stays single-track.
+                for card in cards:
+                    card['album_id'] = None
+                    card['artist_id'] = None
+                    try:
+                        hit = None
+                        if card['play_file_path']:
+                            cursor.execute(
+                                "SELECT album_id, artist_id FROM tracks"
+                                " WHERE file_path = ? AND album_id IS NOT NULL LIMIT 1",
+                                (card['play_file_path'],))
+                            hit = cursor.fetchone()
+                        if not hit and norm_ready:
+                            cursor.execute(
+                                """
+                                SELECT al.id, al.artist_id
+                                FROM albums al JOIN artists ar ON al.artist_id = ar.id
+                                WHERE ar.name_norm = ? AND al.title_norm = ?
+                                LIMIT 1
+                                """,
+                                (self._normalize_for_comparison(card['artist_name'] or ''),
+                                 self._normalize_for_comparison(card['album_name'] or '')))
+                            hit = cursor.fetchone()
+                        if hit:
+                            card['album_id'] = hit[0]
+                            card['artist_id'] = hit[1]
+                    except Exception as e:
+                        logger.debug("recently-added album id lookup failed: %s", e)
+
+                for card in cards:
+                    try:
+                        card['artist_thumb_url'] = _artist_art(card['artist_name'])
+                        if not card['thumb_url']:
+                            card['thumb_url'] = card['artist_thumb_url']
+                    except Exception as e:
+                        card['artist_thumb_url'] = ''
+                        logger.debug("recently-added artist art lookup failed: %s", e)
+
+                return cards
+        except Exception as e:
+            logger.error(f"Error getting recently added albums: {e}")
+            return []
+
+    # keep a lid on it. one row per bad upload, a heavy user might rack up a few
+    # thousand a year. 25k is far past that and still tiny, but unbounded growth
+    # in a table nothing ever prunes is how you get a surprise years later.
+    QUARANTINE_BLOCK_CAP = 25000
+
+    def add_quarantine_source_block(self, username: str, filename: str,
+                                    trigger: str = 'unknown',
+                                    expected_artist: str = '',
+                                    expected_track: str = '') -> bool:
+        """remember that this exact (uploader, file) failed verification.
+
+        called from move_to_quarantine. survives the quarantine folder being
+        cleared, which is the whole point, see the table comment.
+        """
+        if not username or not filename:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    INSERT OR IGNORE INTO quarantine_source_blocks
+                        (username, filename, trigger, expected_artist, expected_track)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (str(username), str(filename), str(trigger or 'unknown'),
+                      str(expected_artist or ''), str(expected_track or '')))
+                inserted = cursor.rowcount > 0
+                if inserted:
+                    cursor.execute("SELECT COUNT(*) FROM quarantine_source_blocks")
+                    total = cursor.fetchone()[0]
+                    if total > self.QUARANTINE_BLOCK_CAP:
+                        cursor.execute("""
+                            DELETE FROM quarantine_source_blocks
+                            WHERE id IN (
+                                SELECT id FROM quarantine_source_blocks
+                                ORDER BY created_at ASC, id ASC
+                                LIMIT ?
+                            )
+                        """, (total - self.QUARANTINE_BLOCK_CAP,))
+                conn.commit()
+                return inserted
+        except Exception as e:
+            logger.error("Error recording quarantine source block: %s", e)
+            return False
+
+    def get_quarantine_source_blocks(self) -> set:
+        """every blocked (username, filename). read on the search path so it
+        stays a single indexed query, no joins."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT username, filename FROM quarantine_source_blocks")
+                return {(str(r[0]), str(r[1])) for r in cursor.fetchall()}
+        except Exception as e:
+            logger.error("Error loading quarantine source blocks: %s", e)
+            return set()
+
+    def remove_quarantine_source_block(self, username: str, filename: str) -> bool:
+        """unblock one upload.
+
+        nothing in the review queue calls this, see the table comment. it's here
+        so a block CAN be lifted deliberately, not as part of tidying the list.
+        """
+        if not username or not filename:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM quarantine_source_blocks WHERE username = ? AND filename = ?",
+                    (str(username), str(filename)))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error removing quarantine source block: %s", e)
+            return False
+
+    @staticmethod
+    def _exclude_sources_clause(exclude_download_sources):
+        """``AND download_source NOT IN (...)`` for the sources given, tolerant
+        of a NULL download_source (a real download always has one; the
+        acoustid scanner's synthetic rows carry 'acoustid_scan')."""
+        sources = [str(x) for x in (exclude_download_sources or ()) if x]
+        if not sources:
+            return "", []
+        placeholders = ','.join('?' * len(sources))
+        return f" AND (download_source IS NULL OR download_source NOT IN ({placeholders}))", sources
+
+    def count_library_history_unverified(self, exclude_download_sources=()) -> int:
+        """just the count for the review badge. the full fetch pulls every row
+        with SELECT *, way too much work to render a number every few seconds.
+
+        ``exclude_download_sources`` drops the acoustid scanner's synthetic rows
+        for the Downloads page, the same way the history tail does: they are
+        pre-existing library files, not downloads (see get_library_history)."""
+        clause, params = self._exclude_sources_clause(exclude_download_sources)
+        try:
+            conn = self._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                SELECT COUNT(*) FROM library_history
+                WHERE verification_status IN ('unverified', 'force_imported'){clause}
+            """, params)
+            return int(cursor.fetchone()[0] or 0)
+        except Exception as e:
+            logger.error("Error counting unverified library history: %s", e)
+            return 0
+
+    def get_library_history_unverified(self, exclude_download_sources=()) -> list[dict]:
         """Return every library_history row that still needs human confirmation.
 
         Fetches all rows where verification_status is 'unverified' or
         'force_imported', ordered newest-first. No row limit — the full
         set must always be visible on the Downloads → Unverified tab.
+
+        ``exclude_download_sources`` drops the acoustid scanner's synthetic
+        rows for the Downloads page. storm: 735 pre-existing library files
+        sat in the list as "Completed", Clear Completed removed them and the
+        next daily scan put them all back. those files are reviewed from the
+        scanner's own findings, not as downloads.
         """
+        clause, params = self._exclude_sources_clause(exclude_download_sources)
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
+            cursor.execute(f"""
                 SELECT * FROM library_history
-                WHERE verification_status IN ('unverified', 'force_imported')
+                WHERE verification_status IN ('unverified', 'force_imported'){clause}
                 ORDER BY created_at DESC
-            """)
+            """, params)
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error("Error querying unverified library history: %s", e)
@@ -16391,19 +24161,21 @@ class MusicDatabase:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT event_type, COUNT(*) as cnt FROM library_history GROUP BY event_type")
-            stats = {'downloads': 0, 'imports': 0}
+            stats = {'downloads': 0, 'imports': 0, 'podcasts': 0}
             for row in cursor.fetchall():
                 if row['event_type'] == 'download':
                     stats['downloads'] = row['cnt']
                 elif row['event_type'] == 'import':
                     stats['imports'] = row['cnt']
+                elif row['event_type'] == 'podcast':
+                    stats['podcasts'] = row['cnt']
 
-            # Per-source breakdown for downloads
+            # Per-source breakdown for downloads and podcasts
             source_counts = {}
             try:
                 cursor.execute("""
                     SELECT download_source, COUNT(*) as cnt FROM library_history
-                    WHERE event_type = 'download' AND download_source IS NOT NULL AND download_source != ''
+                    WHERE event_type IN ('download', 'podcast') AND download_source IS NOT NULL AND download_source != ''
                     GROUP BY download_source ORDER BY cnt DESC
                 """)
                 for row in cursor.fetchall():
@@ -16415,26 +24187,36 @@ class MusicDatabase:
             return stats
         except Exception as e:
             logger.debug(f"Error getting library history stats: {e}")
-            return {'downloads': 0, 'imports': 0, 'source_counts': {}}
+            return {'downloads': 0, 'imports': 0, 'podcasts': 0, 'source_counts': {}}
 
     # ── Sync History ──────────────────────────────────────────────
 
     def add_sync_history_entry(self, batch_id, playlist_id, playlist_name, source, sync_type,
                                tracks_json, artist_context=None, album_context=None,
                                thumb_url=None, total_tracks=0, is_album_download=False,
-                               playlist_folder_mode=False, source_page=None):
-        """Record a new sync operation to sync_history."""
+                               playlist_folder_mode=False, source_page=None,
+                               profile_id=None, quality_profile_id=None):
+        """Record a new sync operation to sync_history.
+
+        ``profile_id``/``quality_profile_id`` capture WHO ran the sync and under
+        which Quality Profile, so a later re-add from the history reproduces the
+        original request instead of falling back to admin + global default
+        (P1-04).
+        """
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO sync_history (batch_id, playlist_id, playlist_name, source, sync_type,
                     tracks_json, artist_context, album_context, thumb_url, total_tracks,
-                    is_album_download, playlist_folder_mode, source_page)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_album_download, playlist_folder_mode, source_page,
+                    profile_id, quality_profile_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (batch_id, playlist_id, playlist_name, source, sync_type,
                   tracks_json, artist_context, album_context, thumb_url, total_tracks,
-                  int(is_album_download), int(playlist_folder_mode), source_page))
+                  int(is_album_download), int(playlist_folder_mode), source_page,
+                  int(profile_id) if profile_id is not None else None,
+                  int(quality_profile_id) if quality_profile_id is not None else None))
             conn.commit()
             # Cap at 100 entries
             cursor.execute("""
@@ -16449,12 +24231,19 @@ class MusicDatabase:
             return False
 
     def update_sync_history_completion(self, batch_id, tracks_found=0, tracks_downloaded=0, tracks_failed=0):
-        """Update a sync_history entry with completion stats."""
+        """Update a sync_history entry with completion stats.
+
+        ``tracks_found=None`` keeps the value already on the row. two writers
+        share this row: the sync (which knows how many tracks matched) and the
+        download batch that follows it (which knows what downloaded). a batch
+        with no analysis of its own used to write tracks_found = 0 over the
+        sync's count, so the dashboard read "0/240 in library" against a
+        details modal that listed 236 matched."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
             cursor.execute("""
-                UPDATE sync_history SET tracks_found = ?, tracks_downloaded = ?,
+                UPDATE sync_history SET tracks_found = COALESCE(?, tracks_found), tracks_downloaded = ?,
                     tracks_failed = ?, completed_at = CURRENT_TIMESTAMP
                 WHERE batch_id = ?
             """, (tracks_found, tracks_downloaded, tracks_failed, batch_id))
@@ -16495,13 +24284,51 @@ class MusicDatabase:
             logger.debug(f"Error refreshing sync history entry: {e}")
             return False
 
-    def get_sync_history(self, source=None, page=1, limit=20):
+    @staticmethod
+    def _sync_history_owner_conditions(profile_id):
+        """``(conditions, params)`` restricting sync_history to one owner.
+
+        Rows written before the P1-04 migration have ``profile_id IS NULL``.
+        Treating those as belonging to admin keeps an upgraded install's history
+        visible where it has always been, without exposing it to other profiles.
+        """
+        if profile_id is None:
+            return [], []
+        if int(profile_id) == 1:
+            return ["(profile_id = ? OR profile_id IS NULL)"], [1]
+        return ["profile_id = ?"], [int(profile_id)]
+
+    def get_sync_history(self, source=None, page=1, limit=20, profile_id=None,
+                         sync_type=None):
         """Return (entries, total) for sync_history, newest first. Full tracks_json excluded from list."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            where = "WHERE source = ?" if source else ""
-            params = [source] if source else []
+            conditions = []
+            params = []
+            if source:
+                conditions.append("source = ?")
+                params.append(source)
+            if sync_type:
+                # Filtered HERE, not by the caller after the fact. The dashboard
+                # band used to ask for 10 rows and then drop the album ones in
+                # javascript, so five album downloads left it five playlist runs
+                # to match eight schedules against, and three playlists reported
+                # "no runs yet" while their pipelines were completing fine
+                # (Boulder, Aug 2026). A filter after LIMIT is not a filter.
+                #
+                # NULL sync_type is legacy playlist history, so it rides along
+                # with 'playlist' exactly as the client-side filter did.
+                if sync_type == 'playlist':
+                    conditions.append("(sync_type = ? OR sync_type IS NULL OR sync_type = '')")
+                    params.append(sync_type)
+                else:
+                    conditions.append("sync_type = ?")
+                    params.append(sync_type)
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            conditions += owner_conditions
+            params += owner_params
+            where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
             cursor.execute(f"SELECT COUNT(*) as cnt FROM sync_history {where}", params)
             total = cursor.fetchone()['cnt']
@@ -16511,7 +24338,8 @@ class MusicDatabase:
                 SELECT id, batch_id, playlist_id, playlist_name, source, sync_type,
                        artist_context, album_context, thumb_url, total_tracks,
                        tracks_found, tracks_downloaded, tracks_failed,
-                       is_album_download, playlist_folder_mode, started_at, completed_at
+                       is_album_download, playlist_folder_mode, started_at, completed_at,
+                       profile_id, quality_profile_id
                 FROM sync_history {where}
                 ORDER BY started_at DESC
                 LIMIT ? OFFSET ?
@@ -16522,63 +24350,86 @@ class MusicDatabase:
             logger.error(f"Error querying sync history: {e}")
             return [], 0
 
-    def get_latest_sync_history_by_playlist(self, playlist_id):
+    def get_latest_sync_history_by_playlist(self, playlist_id, profile_id=None):
         """Return the most recent sync_history row for a given playlist_id."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            owner_sql = (" AND " + " AND ".join(owner_conditions)) if owner_conditions else ""
             cursor.execute("""
                 SELECT * FROM sync_history
                 WHERE playlist_id = ?
-                ORDER BY started_at DESC LIMIT 1
-            """, (playlist_id,))
+            """.rstrip() + owner_sql + " ORDER BY started_at DESC LIMIT 1",
+                [playlist_id, *owner_params])
             row = cursor.fetchone()
             return dict(row) if row else None
         except Exception as e:
             logger.debug(f"Error getting latest sync history by playlist: {e}")
             return None
 
-    def get_sync_history_entry(self, entry_id):
+    def get_sync_history_entry(self, entry_id, profile_id=None):
         """Return a single sync_history row with full tracks_json (for re-trigger)."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM sync_history WHERE id = ?", (entry_id,))
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            owner_sql = (" AND " + " AND ".join(owner_conditions)) if owner_conditions else ""
+            cursor.execute(
+                "SELECT * FROM sync_history WHERE id = ?" + owner_sql,
+                [entry_id, *owner_params],
+            )
             row = cursor.fetchone()
             return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error getting sync history entry: {e}")
             return None
 
-    def delete_sync_history_entry(self, entry_id):
+    def delete_sync_history_entry(self, entry_id, profile_id=None):
         """Delete a single sync_history entry."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM sync_history WHERE id = ?", (entry_id,))
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            owner_sql = (" AND " + " AND ".join(owner_conditions)) if owner_conditions else ""
+            cursor.execute(
+                "DELETE FROM sync_history WHERE id = ?" + owner_sql,
+                [entry_id, *owner_params],
+            )
             conn.commit()
             return cursor.rowcount > 0
         except Exception as e:
             logger.debug(f"Error deleting sync history entry: {e}")
             return False
 
-    def get_sync_history_playlist_names(self):
+    def get_sync_history_playlist_names(self, profile_id=None):
         """Return distinct playlist names ever synced (for server playlist filtering)."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT playlist_name FROM sync_history WHERE playlist_name != ''")
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            owner_sql = (" AND " + " AND ".join(owner_conditions)) if owner_conditions else ""
+            cursor.execute(
+                "SELECT DISTINCT playlist_name FROM sync_history WHERE playlist_name != ''"
+                + owner_sql,
+                owner_params,
+            )
             return [row[0] for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Error getting sync history playlist names: {e}")
             return []
 
-    def get_sync_history_stats(self):
+    def get_sync_history_stats(self, profile_id=None):
         """Return counts grouped by source."""
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("SELECT source, COUNT(*) as cnt FROM sync_history GROUP BY source")
+            owner_conditions, owner_params = self._sync_history_owner_conditions(profile_id)
+            owner_sql = ("WHERE " + " AND ".join(owner_conditions)) if owner_conditions else ""
+            cursor.execute(
+                f"SELECT source, COUNT(*) as cnt FROM sync_history {owner_sql} GROUP BY source",
+                owner_params,
+            )
             return {row['source']: row['cnt'] for row in cursor.fetchall()}
         except Exception as e:
             logger.debug(f"Error getting sync history stats: {e}")
@@ -16612,11 +24463,245 @@ class MusicDatabase:
         try:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute(f"SELECT * FROM {table} ORDER BY created_at DESC LIMIT ?", (limit,))
+            if table == "tracks":
+                # a bare track row has artist_id and album_id but no names, so
+                # every track came back as "Unknown artist" in sample studio
+                scope_sql, scope_params = self._current_scope_sql('t.owner_profile_id')
+                cursor.execute(f"""
+                    SELECT t.*, ar.name AS artist_name, al.title AS album_title
+                    FROM tracks t
+                    LEFT JOIN artists ar ON ar.id = t.artist_id
+                    LEFT JOIN albums al ON al.id = t.album_id
+                    WHERE {scope_sql}
+                    ORDER BY COALESCE(t.created_at, t.updated_at) DESC LIMIT ?
+                """, (*scope_params, limit))
+                return [dict(row) for row in cursor.fetchall()]
+            scope_sql, scope_params = self._current_scope_sql('owner_profile_id')
+            # COALESCE handles rows where created_at was never backfilled —
+            # updated_at is always set on write.
+            cursor.execute(f"SELECT * FROM {table} WHERE {scope_sql} ORDER BY COALESCE(created_at, updated_at) DESC LIMIT ?",
+                           (*scope_params, limit))
             return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"API: Error getting recently added {entity_type}: {e}")
             return []
+
+    def api_list_curated_playlists(self, profile_id: int = 1) -> List[Dict[str, Any]]:
+        """List discovery curated playlists for a profile with track counts."""
+        try:
+            import json
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT id, playlist_type, track_ids_json, curated_date
+                       FROM discovery_curated_playlists
+                       WHERE profile_id = ?
+                       ORDER BY curated_date DESC""",
+                    (profile_id,),
+                )
+                out = []
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    try:
+                        track_ids = json.loads(d.get("track_ids_json") or "[]")
+                    except Exception:
+                        track_ids = []
+                    out.append({
+                        "id": d.get("id"),
+                        "name": str(d.get("playlist_type") or "").replace("_", " ").title(),
+                        "playlist_type": d.get("playlist_type"),
+                        "track_count": len(track_ids),
+                        "curated_date": d.get("curated_date"),
+                    })
+                return out
+        except Exception as e:
+            logger.error(f"API: Error listing curated playlists: {e}")
+            return []
+
+    def api_get_curated_playlist_tracks(self, playlist_id: int, profile_id: int = 1) -> List[Dict[str, Any]]:
+        """Get track dicts for a curated playlist, in order.
+
+        Handles the different payload formats stored in track_ids_json:
+        - List of track IDs: [1, 2, 3]
+        - Dict with "tracks": {"tracks": [{"id": 1}, ...]} or {"tracks": [1, 2, 3]}
+        - Dict with "mixes" (Daily Mixes): {"mixes": [{"tracks": [...]}, ...]}
+
+        For entries without database IDs, falls back to title/artist matching.
+        """
+        try:
+            import json
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT track_ids_json FROM discovery_curated_playlists
+                       WHERE id = ? AND profile_id = ?""",
+                    (playlist_id, profile_id),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return []
+                try:
+                    payload = json.loads(row["track_ids_json"] or "[]")
+                except Exception:
+                    return []
+                # Debug: log payload structure.
+                if isinstance(payload, dict):
+                    logger.info(f"Playlist {playlist_id}: dict payload with keys {list(payload.keys())}")
+                    if "tracks" in payload and isinstance(payload["tracks"], list):
+                        logger.info(f"Playlist {playlist_id}: tracks list len={len(payload['tracks'])}, first={str(payload['tracks'][0])[:200] if payload['tracks'] else 'empty'}")
+                    if "mixes" in payload and isinstance(payload["mixes"], list):
+                        logger.info(f"Playlist {playlist_id}: mixes len={len(payload['mixes'])}")
+                elif isinstance(payload, list):
+                    logger.info(f"Playlist {playlist_id}: list payload len={len(payload)}, first={str(payload[0])[:200] if payload else 'empty'}")
+                entries = self._extract_curated_track_ids(payload)
+                logger.info(f"Playlist {playlist_id}: extracted {len(entries)} entries")
+                if not entries:
+                    return []
+                # Separate ID-based lookups from title/artist fallbacks.
+                id_entries = [(tid, t, a) for (tid, t, a) in entries if tid is not None]
+                name_entries = [(t, a) for (tid, t, a) in entries if tid is None and t]
+                by_id = {}
+                by_external = {}
+                if id_entries:
+                    tids = [tid for (tid, _, _) in id_entries]
+                    # Only bind int/str, never dicts.
+                    safe_tids = [tid for tid in tids if isinstance(tid, (int, str))]
+                    if safe_tids:
+                        placeholders = ",".join("?" for _ in safe_tids)
+                        # 1. Try database IDs.
+                        cursor.execute(
+                            f"SELECT * FROM tracks WHERE id IN ({placeholders})",
+                            tuple(safe_tids),
+                        )
+                        by_id = {str(r["id"]): dict(r) for r in cursor.fetchall()}
+                        # 2. Try Deezer IDs (numeric external IDs).
+                        # 3. Try Spotify IDs (string external IDs).
+                        remaining = [tid for tid in safe_tids if str(tid) not in by_id]
+                        if remaining:
+                            placeholders = ",".join("?" for _ in remaining)
+                            cursor.execute(
+                                f"SELECT * FROM tracks WHERE deezer_id IN ({placeholders})",
+                                tuple(remaining),
+                            )
+                            for r in cursor.fetchall():
+                                d = dict(r)
+                                if d.get("deezer_id"):
+                                    by_external[str(d["deezer_id"])] = d
+                            cursor.execute(
+                                f"SELECT * FROM tracks WHERE spotify_track_id IN ({placeholders})",
+                                tuple(remaining),
+                            )
+                            for r in cursor.fetchall():
+                                d = dict(r)
+                                if d.get("spotify_track_id"):
+                                    by_external[str(d["spotify_track_id"])] = d
+                # Title/artist fallback for entries without IDs.
+                # Tries exact match, then fuzzy (LIKE), then title-only.
+                name_matches = {}
+                for (title, artist) in name_entries:
+                    if not title:
+                        continue
+                    key = (title.lower(), (artist or "").lower())
+                    if key in name_matches:
+                        continue
+                    try:
+                        r = None
+                        if artist:
+                            # 1. Exact title + artist.
+                            cursor.execute(
+                                """SELECT t.* FROM tracks t
+                                   JOIN artists ar ON ar.id = t.artist_id
+                                   WHERE LOWER(t.title) = LOWER(?)
+                                   AND LOWER(ar.name) = LOWER(?)
+                                   LIMIT 1""",
+                                (title, artist),
+                            )
+                            r = cursor.fetchone()
+                            # 2. Fuzzy title + exact artist.
+                            if not r:
+                                cursor.execute(
+                                    """SELECT t.* FROM tracks t
+                                       JOIN artists ar ON ar.id = t.artist_id
+                                       WHERE LOWER(t.title) LIKE ?
+                                       AND LOWER(ar.name) = LOWER(?)
+                                       LIMIT 1""",
+                                    (f"%{title.lower()}%", artist),
+                                )
+                                r = cursor.fetchone()
+                        # 3. Title-only exact.
+                        if not r:
+                            cursor.execute(
+                                "SELECT * FROM tracks WHERE LOWER(title) = LOWER(?) LIMIT 1",
+                                (title,),
+                            )
+                            r = cursor.fetchone()
+                        # 4. Title-only fuzzy.
+                        if not r:
+                            cursor.execute(
+                                "SELECT * FROM tracks WHERE LOWER(title) LIKE ? LIMIT 1",
+                                (f"%{title.lower()}%",),
+                            )
+                            r = cursor.fetchone()
+                        if r:
+                            name_matches[key] = dict(r)
+                    except Exception as e:
+                        logger.warning(f"Playlist track fallback match failed for '{title}': {e}")
+                        continue
+                # Build result in playlist order.
+                out = []
+                for (tid, title, artist) in entries:
+                    if tid is not None and str(tid) in by_id:
+                        out.append(by_id[str(tid)])
+                    elif tid is not None and str(tid) in by_external:
+                        out.append(by_external[str(tid)])
+                    elif title:
+                        key = (title.lower(), (artist or "").lower())
+                        if key in name_matches:
+                            out.append(name_matches[key])
+                logger.info(f"Playlist {playlist_id}: matched {len(out)}/{len(entries)} entries ({len(by_id)} by ID, {len(by_external)} by external ID, {len(name_matches)} by name)")
+                if entries and not out:
+                    # Log a sample to diagnose matching failures.
+                    sample = entries[0]
+                    logger.info(f"Playlist {playlist_id}: sample entry title='{sample[1]}' artist='{sample[2]}'")
+                return out
+        except Exception as e:
+            logger.error(f"API: Error getting playlist tracks: {e}")
+            return []
+
+    def _extract_curated_track_ids(self, payload) -> List:
+        """Extract ordered track IDs from a curated playlist payload.
+
+        Returns a list of (id_or_none, title, artist) tuples. The ID may be
+        None if the payload only has display data (title/artist).
+        Handles both owned-track keys (title/artist) and discovery-pool
+        keys (track_name/artist_name).
+        """
+        def _title(d):
+            return d.get("title") or d.get("track_name") or d.get("name")
+        def _artist(d):
+            return d.get("artist") or d.get("artist_name")
+        if isinstance(payload, list):
+            out = []
+            for item in payload:
+                if isinstance(item, dict):
+                    tid = item.get("id") or item.get("track_id")
+                    if isinstance(tid, (int, str)):
+                        out.append((tid, _title(item), _artist(item)))
+                    elif _title(item):
+                        out.append((None, _title(item), _artist(item)))
+                elif isinstance(item, (int, str)):
+                    out.append((item, None, None))
+            return out
+        if isinstance(payload, dict):
+            if "tracks" in payload:
+                return self._extract_curated_track_ids(payload["tracks"])
+            if "mixes" in payload and isinstance(payload["mixes"], list):
+                out = []
+                for mix in payload["mixes"]:
+                    if isinstance(mix, dict) and "tracks" in mix:
+                        out.extend(self._extract_curated_track_ids(mix["tracks"]))
+                return out
+        return []
 
     def api_list_albums(self, search: str = "", artist_id: int = None,
                         year: int = None, page: int = 1, limit: int = 50) -> Dict[str, Any]:
@@ -16637,6 +24722,10 @@ class MusicDatabase:
             if year is not None:
                 where_parts.append("al.year = ?")
                 params.append(year)
+
+            scope_sql, scope_params = self._current_scope_sql('al.owner_profile_id')
+            where_parts.append(scope_sql)
+            params.extend(scope_params)
 
             where_clause = " AND ".join(where_parts) if where_parts else "1=1"
 
@@ -16662,13 +24751,179 @@ class MusicDatabase:
             logger.error(f"API: Error listing albums: {e}")
             return {"albums": [], "total": 0}
 
+    # ── MetaSync export ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_since(value: Any) -> str:
+        """One aware-UTC ``'YYYY-MM-DD HH:MM:SS'`` string for the export filter.
+
+        A naive input is read as UTC because that is what SQLite's
+        CURRENT_TIMESTAMP writes; anything with an offset is converted, so two
+        callers naming the same instant in different zones get the same slice.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return text
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            # `from None`: the caller sent a bad string, that's the whole story.
+            # chaining fromisoformat's internals onto a 400 just adds noise.
+            raise ValueError(
+                "since must be an ISO-8601 timestamp "
+                f"(e.g. 2026-08-19T00:00:00), got {value!r}") from None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def api_export_entities(self, entity: str, cursor: str = "",
+                            since: str = "", limit: int = 500) -> List[Dict[str, Any]]:
+        """Page through artists/albums/tracks for the MetaSync export.
+
+        Keyset pagination, NOT offset: these tables are large and the
+        enrichment workers shift rows under a walk, so OFFSET both skips and
+        duplicates rows mid-export. ``id`` is TEXT on all three tables, so the
+        ``>`` comparison and the ORDER BY share one lexicographic order — which
+        is all a complete walk needs (numeric-looking ids sort as text, and
+        that is fine because both halves agree).
+
+        Columns are named explicitly rather than ``SELECT *``: column ORDER
+        differs between a fresh install and an upgraded one. Every value is
+        read through ``_row_value`` so a database lagging the code by a
+        migration yields None instead of failing the whole export.
+
+        Rows with no usable ``soul_id`` are skipped, including the
+        ``soul_unnamed_*`` fallback (soulid_worker :263 / :580) which embeds
+        the library primary key — a Plex ratingKey or Jellyfin GUID. Those are
+        install-local and must never leave the box.
+
+        Read-only.
+        """
+        # The instant a row's EXPORTED payload last changed — its own timestamp
+        # or a parent's (L2-011). An album carries its artist's name and a track
+        # carries the artist name plus the album title and year, so renaming an
+        # artist rewrites what the export says about every one of its albums and
+        # tracks while touching none of their timestamps. A consumer that had
+        # already walked them would never be told.
+        # julianday() on every side, never a text MAX: the timestamps in these
+        # columns are a mix of 'YYYY-MM-DD HH:MM:SS' and ISO-with-a-'T', and
+        # 'T' > ' ' — a lexicographic MAX would pick the older one whenever the
+        # two rows were written in different formats. COALESCE to 0 so an
+        # unparseable or absent parent timestamp cannot NULL out the whole
+        # comparison and drop the row from every incremental export.
+        _day = "COALESCE(julianday({0}), 0)"
+        effective = {
+            'artist': _day.format("t.updated_at"),
+            'album': f"MAX({_day.format('t.updated_at')}, {_day.format('ar.updated_at')})",
+            'track': (f"MAX({_day.format('t.updated_at')}, "
+                      f"{_day.format('ar.updated_at')}, "
+                      f"{_day.format('al.updated_at')})"),
+        }
+        specs = {
+            'artist': (_EXPORT_ARTIST_COLUMNS, "FROM artists t", ""),
+            'album': (
+                _EXPORT_ALBUM_COLUMNS,
+                "FROM albums t LEFT JOIN artists ar ON ar.id = t.artist_id",
+                ", ar.name AS artist_name",
+            ),
+            # ar.name, never t.track_artist: soulid_worker._process_tracks
+            # computes the track soul_id from the JOINED artist name, so an
+            # importer normalizing any other string derives a different key
+            # than the one stored in the row.
+            'track': (
+                _EXPORT_TRACK_COLUMNS,
+                ("FROM tracks t JOIN artists ar ON ar.id = t.artist_id "
+                 "LEFT JOIN albums al ON al.id = t.album_id"),
+                ", ar.name AS artist_name, al.title AS album_title",
+            ),
+        }
+        if entity not in specs:
+            raise ValueError(f"unknown entity {entity!r} (expected artist, album or track)")
+
+        columns, from_clause, extra_select = specs[entity]
+        try:
+            limit = max(1, min(1000, int(limit)))
+        except (TypeError, ValueError):
+            limit = 500
+
+        # Select only columns this database actually has. _row_value covers a
+        # missing column when READING a row, but naming one in the SQL fails
+        # the whole query with "no such column" — so an install that lags a
+        # migration (or predates soul_id_path) would export nothing at all.
+        # The absent ones still appear in the payload, as None.
+        table = {'artist': 'artists', 'album': 'albums', 'track': 'tracks'}[entity]
+
+        # The soul_unnamed_ filter lives in SQL, not in the Python loop below,
+        # and that placement is load-bearing: dropping rows AFTER the LIMIT
+        # would return a short page, and the route reads `len(items) == limit`
+        # to decide whether to keep walking — so a batch containing unnamed
+        # rows would end the export early and silently lose everything after
+        # it. ESCAPE because `_` is LIKE's single-character wildcard.
+        where = [
+            "t.soul_id IS NOT NULL",
+            "t.soul_id != ''",
+            r"t.soul_id NOT LIKE 'soul\_unnamed\_%' ESCAPE '\'",
+        ]
+        params: list = []
+        if cursor:
+            where.append("t.id > ?")
+            params.append(str(cursor))
+        if since:
+            # Compared as INSTANTS, not as text (L2-010). SQLite writes
+            # CURRENT_TIMESTAMP as 'YYYY-MM-DD HH:MM:SS' while the API accepts
+            # ISO-8601 with a 'T' and an offset, and 'T' > ' ' in ASCII — so a
+            # caller asking for everything since midnight got nothing at all
+            # from that same day, and an offset was ranked by its own text
+            # rather than by the moment it denotes. julianday() parses both
+            # sides, and the input is normalised to UTC once, here.
+            where.append(f"{effective[entity]} >= julianday(?)")
+            params.append(self._normalize_since(since))
+
+        try:
+            conn = self._get_connection()
+            db_cursor = conn.cursor()
+            db_cursor.execute(f"PRAGMA table_info({table})")
+            present = {r[1] for r in db_cursor.fetchall()}
+            live_cols = [c for c in columns if c in present]
+
+            select_cols = ", ".join(f"t.{c}" for c in live_cols) + extra_select
+            sql = (f"SELECT {select_cols} {from_clause} "
+                   f"WHERE {' AND '.join(where)} ORDER BY t.id ASC LIMIT ?")
+            db_cursor.execute(sql, params + [limit])
+            rows = db_cursor.fetchall()
+        except Exception as e:
+            logger.error(f"API: Error exporting {entity}s: {e}")
+            raise
+
+        out: List[Dict[str, Any]] = []
+        joined = ('artist_name', 'album_title')
+        for row in rows:
+            soul_id = _row_value(row, 'soul_id')
+            if not soul_id or str(soul_id).startswith('soul_unnamed_'):
+                continue
+            item = {c: _row_value(row, c) for c in columns}
+            for extra in joined:
+                if extra in extra_select:
+                    item[extra] = _row_value(row, extra)
+            out.append(item)
+        return out
+
     # ── Mirrored Playlists ───────────────────────────────────────────────
 
     def mirror_playlist(self, source: str, source_playlist_id: str, name: str,
-                        tracks: List[Dict], profile_id: int = 1, **kwargs) -> Optional[int]:
-        """Upsert a mirrored playlist and replace all its tracks."""
+                        tracks: List[Dict], profile_id: int = 1,
+                        quality_profile_id: Optional[int] = None,
+                        **kwargs) -> Optional[int]:
+        """Upsert a mirrored playlist and replace all its tracks.
+
+        A new mirror inherits the current global Quality Profile. Refreshing
+        an existing mirror preserves its durable assignment unless the caller
+        explicitly supplies a new one.
+
+        ``source_skipped`` works the same way: pass it (a dict or None) and
+        it replaces the stored counts, leave it out and they stay.
+        """
         from core.playlists.source_refs import coalesce_mirror_track, stable_source_track_id
-        from core.text.isrc import normalize_isrc
 
         # #990: accept mirror-shaped AND Spotify-shaped tracks (the GET playlist
         # endpoints return the Spotify shape, which users feed straight back in).
@@ -16697,22 +24952,39 @@ class MusicDatabase:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                resolved_quality_profile_id = self._resolve_quality_profile_id(
+                    cursor, quality_profile_id
+                )
                 # Upsert the playlist row
                 cursor.execute("""
                     INSERT INTO mirrored_playlists
-                        (source, source_playlist_id, name, description, owner, image_url, track_count, profile_id, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                        (source, source_playlist_id, name, description, owner,
+                         image_url, track_count, profile_id, quality_profile_id,
+                         source_skipped, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     ON CONFLICT(source, source_playlist_id, profile_id) DO UPDATE SET
                         name = excluded.name,
                         description = COALESCE(NULLIF(excluded.description, ''), mirrored_playlists.description),
                         owner = excluded.owner,
-                        image_url = excluded.image_url,
+                        image_url = COALESCE(NULLIF(excluded.image_url, ''), mirrored_playlists.image_url),
                         track_count = excluded.track_count,
+                        quality_profile_id = CASE
+                            WHEN ? THEN excluded.quality_profile_id
+                            ELSE mirrored_playlists.quality_profile_id
+                        END,
+                        source_skipped = CASE
+                            WHEN ? THEN excluded.source_skipped
+                            ELSE mirrored_playlists.source_skipped
+                        END,
                         updated_at = CURRENT_TIMESTAMP
                 """, (
                     source, source_playlist_id, name,
                     kwargs.get('description'), kwargs.get('owner'),
-                    kwargs.get('image_url'), len(tracks), profile_id
+                    kwargs.get('image_url'), len(tracks), profile_id,
+                    resolved_quality_profile_id,
+                    self._source_skipped_json(kwargs.get('source_skipped')),
+                    1 if quality_profile_id is not None else 0,
+                    1 if 'source_skipped' in kwargs else 0,
                 ))
                 playlist_id = cursor.execute(
                     "SELECT id FROM mirrored_playlists WHERE source=? AND source_playlist_id=? AND profile_id=?",
@@ -16729,17 +25001,20 @@ class MusicDatabase:
                     old_extra_map = {row['source_track_id']: row['extra_data'] for row in cursor.fetchall()}
                 except Exception as e:
                     logger.debug("Failed to preserve mirrored playlist extra_data: %s", e)
-
-                # ...and each track's ISRC, for a re-mirror from a path that doesn't carry one
-                old_isrc_map = {}
+                # and when each track first joined, so a rewrite (an add, a
+                # remove, a reorder, a re-mirror) never resets its date added
+                old_added_map = {}
                 try:
                     cursor.execute("""
-                        SELECT source_track_id, isrc FROM mirrored_playlist_tracks
-                        WHERE playlist_id = ? AND source_track_id IS NOT NULL AND isrc IS NOT NULL AND isrc != ''
+                        SELECT source_track_id, added_at FROM mirrored_playlist_tracks
+                        WHERE playlist_id = ? AND source_track_id IS NOT NULL AND added_at IS NOT NULL
+                        ORDER BY position
                     """, (playlist_id,))
-                    old_isrc_map = {row['source_track_id']: row['isrc'] for row in cursor.fetchall()}
+                    for row in cursor.fetchall():
+                        old_added_map.setdefault(row['source_track_id'], row['added_at'])
                 except Exception as e:
-                    logger.debug("Failed to preserve mirrored playlist ISRCs: %s", e)
+                    logger.debug("Failed to preserve mirrored playlist added_at: %s", e)
+                now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
                 # Replace all tracks
                 from core.playlists.source_refs import stable_source_track_id
@@ -16756,16 +25031,16 @@ class MusicDatabase:
                     # Restore preserved discovery data if the incoming track doesn't have its own
                     if not extra and sid and sid in old_extra_map:
                         extra = old_extra_map[sid]
-                    isrc = normalize_isrc(t.get('isrc')) or old_isrc_map.get(sid) or None
+                    added_at = t.get('added_at') or (old_added_map.get(sid) if sid else None) or now_utc
                     cursor.execute("""
                         INSERT INTO mirrored_playlist_tracks
-                            (playlist_id, position, track_name, artist_name, album_name, duration_ms, image_url, source_track_id, extra_data, isrc)
+                            (playlist_id, position, track_name, artist_name, album_name, duration_ms, image_url, source_track_id, extra_data, added_at)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         playlist_id, i + 1,
                         t.get('track_name', ''), t.get('artist_name', ''),
                         t.get('album_name', ''), t.get('duration_ms', 0),
-                        t.get('image_url'), sid or None, extra, isrc
+                        t.get('image_url'), sid or None, extra, added_at
                     ))
                 conn.commit()
                 logger.info(f"Mirrored playlist '{name}' ({source}) with {len(tracks)} tracks")
@@ -16774,8 +25049,169 @@ class MusicDatabase:
             logger.error(f"Error mirroring playlist: {e}")
             return None
 
+    def link_mirrored_playlist_to_server(
+        self,
+        playlist_id: int,
+        server_playlist_id: str,
+        server_type: str,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Record which server playlist a mirror corresponds to.
+
+        Called when the relationship has actually been RESOLVED — the server tab
+        matched exactly one mirror by name, or the user picked one in the
+        disambiguation modal. Owner-scoped like every other request-facing
+        mirror write, so a foreign mirror is indistinguishable from a missing
+        one.
+
+        Nothing reads these columns yet. This is the write half landing on its
+        own so it can be checked against real data before anything depends on
+        it.
+        """
+        if not server_playlist_id or not server_type:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "UPDATE mirrored_playlists SET server_playlist_id = ?, server_type = ?, "
+                    "server_linked_at = CURRENT_TIMESTAMP WHERE id = ?" + owner_sql,
+                    [str(server_playlist_id), str(server_type), int(playlist_id), *owner_params],
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error linking mirrored playlist {playlist_id} to server: {e}")
+            return False
+
+    def set_mirrored_playlist_image_url(
+        self,
+        playlist_id: int,
+        image_url: Optional[str],
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Set (or clear, with None) a mirrored playlist's poster, owner-scoped.
+
+        For user playlists this is the cover the owner picked: the mirror
+        upsert preserves image_url on every track edit, so a cover set here
+        survives adds, removes and reorders. The list and detail views fall
+        back to track art when it is NULL.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "UPDATE mirrored_playlists SET image_url = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?" + owner_sql,
+                    [image_url, int(playlist_id), *owner_params],
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error setting image for mirrored playlist {playlist_id}: {e}")
+            return False
+
+    def set_mirrored_playlist_description(
+        self,
+        playlist_id: int,
+        description: Optional[str],
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Set (or clear, with None) a mirrored playlist's description, owner-scoped."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "UPDATE mirrored_playlists SET description = ?, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?" + owner_sql,
+                    [description, int(playlist_id), *owner_params],
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error setting description for mirrored playlist {playlist_id}: {e}")
+            return False
+
+    def backfill_missing_mirrored_covers(self, profile_id: int = 1) -> int:
+        """Give already-discovered playlists the covers they never got.
+
+        Collects up to four DISTINCT album covers from what discovery matched,
+        for the 2x2 collage. `image_url` is left alone throughout: it means the
+        poster the SOURCE supplied, which still wins when there is one.
+
+        The derivation above only fires when a track GAINS matched data, so
+        every playlist discovered before it existed stays bare — which is most
+        of them. This fills those in from the discovery results already sitting
+        in their tracks' extra_data.
+
+        Cheap by construction and self-limiting: it starts with a count of
+        playlists still missing a cover and returns immediately when that is
+        zero, which is the case on every run after the first. Only art-less
+        playlists are read, and each one is written at most once.
+        """
+        filled = 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM mirrored_playlists "
+                    "WHERE profile_id = ? AND cover_tiles IS NULL",
+                    (int(profile_id),)
+                )
+                bare = [row['id'] for row in cursor.fetchall()]
+                if not bare:
+                    return 0
+
+                for playlist_id in bare:
+                    cursor.execute(
+                        "SELECT extra_data FROM mirrored_playlist_tracks "
+                        "WHERE playlist_id = ? AND extra_data IS NOT NULL "
+                        "ORDER BY position",
+                        (playlist_id,)
+                    )
+                    # DISTINCT covers: a playlist of one album would otherwise
+                    # make a collage of the same tile four times, which reads as
+                    # a rendering bug rather than a design.
+                    tiles = []
+                    for row in cursor.fetchall():
+                        try:
+                            extra = json.loads(row['extra_data'])
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                        cover = mirrored_cover_from_match(extra)
+                        if cover and cover not in tiles:
+                            tiles.append(cover)
+                            if len(tiles) == 4:
+                                break
+                    # Always written, even empty: an undiscovered playlist has
+                    # no covers to find and must not be re-scanned on every
+                    # visit. `image_url` is NEVER touched — it means one thing,
+                    # the poster the source supplied, and a mosaic of album art
+                    # is not that.
+                    cursor.execute(
+                        "UPDATE mirrored_playlists SET cover_tiles = ? WHERE id = ?",
+                        (json.dumps(tiles), playlist_id)
+                    )
+                    if tiles:
+                        filled += 1
+                conn.commit()
+        except Exception as e:
+            # Best-effort decoration: a playlist without a cover still works,
+            # and this must never stop the library rendering.
+            logger.error(f"Error backfilling mirrored covers: {e}")
+        return filled
+
     def get_mirrored_playlists(self, profile_id: int = 1) -> List[Dict]:
         """Return all mirrored playlists for a profile, newest first."""
+        # Most sources supply no poster of their own, so a playlist borrows one
+        # from the first track discovery matched. Doing it here means the first
+        # visit after an upgrade fixes the whole library; every later visit
+        # short-circuits on the count and costs nothing.
+        self.backfill_missing_mirrored_covers(profile_id)
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
@@ -16793,14 +25229,35 @@ class MusicDatabase:
             logger.error(f"Error getting mirrored playlists: {e}")
             return []
 
-    def mark_mirrored_playlist_explored(self, playlist_id: int) -> bool:
+    @staticmethod
+    def _mirror_owner_clause(profile_id: Optional[int], column: str = "profile_id"):
+        """``(sql_fragment, params)`` restricting a mirror statement to one owner.
+
+        Passing ``profile_id=None`` keeps the historic unscoped behaviour for
+        trusted internal callers that already resolved the mirror (automation
+        handlers, pipeline steps). Every request-facing caller MUST pass the
+        active SoulSync profile so a foreign mirror is indistinguishable from a
+        missing one — see the P0-01 audit finding.
+        """
+        if profile_id is None:
+            return "", []
+        return f" AND {column}=?", [int(profile_id)]
+
+    def mark_mirrored_playlist_explored(
+        self,
+        playlist_id: int,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> bool:
         """Set explored_at to now for a mirrored playlist."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
                 cursor.execute(
-                    "UPDATE mirrored_playlists SET explored_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (playlist_id,)
+                    "UPDATE mirrored_playlists SET explored_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?" + owner_sql,
+                    [playlist_id, *owner_params],
                 )
                 conn.commit()
                 return cursor.rowcount > 0
@@ -16808,12 +25265,20 @@ class MusicDatabase:
             logger.error(f"Error marking playlist {playlist_id} as explored: {e}")
             return False
 
-    def get_mirrored_playlist(self, playlist_id: int) -> Optional[Dict]:
-        """Return a single mirrored playlist by id."""
+    def get_mirrored_playlist(
+        self,
+        playlist_id: int,
+        profile_id: Optional[int] = None,
+    ) -> Optional[Dict]:
+        """Return a single mirrored playlist by id, optionally owner-scoped."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM mirrored_playlists WHERE id = ?", (playlist_id,))
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "SELECT * FROM mirrored_playlists WHERE id = ?" + owner_sql,
+                    [playlist_id, *owner_params],
+                )
                 row = cursor.fetchone()
                 return self._normalize_mirrored_playlist_row(row)
         except Exception as e:
@@ -16826,7 +25291,38 @@ class MusicDatabase:
             return None
         pl = dict(row)
         pl['organize_by_playlist'] = bool(pl.get('organize_by_playlist', 0))
+        try:
+            pl['source_skipped'] = json.loads(pl['source_skipped']) if pl.get('source_skipped') else None
+        except (TypeError, ValueError):
+            pl['source_skipped'] = None
         return pl
+
+    def set_mirrored_playlist_source_skipped(
+        self,
+        source: str,
+        source_playlist_id: str,
+        skipped: Optional[Dict[str, int]],
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """store what the source skipped on an existing mirror, without touching its tracks.
+
+        for a fresh fetch that isn't a mirror write (identify re-pulls the
+        playlist). no mirror yet means nothing to update.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "UPDATE mirrored_playlists SET source_skipped = ? "
+                    "WHERE source = ? AND source_playlist_id = ?" + owner_sql,
+                    [self._source_skipped_json(skipped), source, str(source_playlist_id), *owner_params],
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"Error saving skipped counts for {source}:{source_playlist_id}: {e}")
+            return False
 
     def get_mirrored_playlist_by_source(
         self,
@@ -16880,25 +25376,112 @@ class MusicDatabase:
         from core.playlists.source_refs import extract_mirrored_pk
         pk = extract_mirrored_pk(ref)
         if pk is not None:
-            return self.get_mirrored_playlist(pk)
+            # Owner-scoped: a bare/synthetic PK from another profile must look
+            # like a missing mirror, not like someone else's playlist (P0-01).
+            return self.get_mirrored_playlist(pk, profile_id=profile_id)
+        return None
+
+    def resolve_mirrored_playlist_assignment(
+        self,
+        playlist_ref: Any,
+        playlist_name: Optional[str] = None,
+        profile_id: int = 1,
+        *,
+        source: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Resolve the durable mirror behind a provider-agnostic sync request.
+
+        Legacy sync endpoints do not consistently send the provider name.  A
+        source id is therefore matched across all providers first, followed by
+        an explicit synthetic mirror id and finally an unambiguous name.  This
+        lets Spotify, iTunes, Deezer, file imports and future providers share
+        the same persisted Quality Profile without Library v2 involvement.
+
+        ``source`` removes the remaining ambiguity (P2-01): two providers may
+        legitimately use the same upstream playlist id, and the heuristics below
+        cannot tell them apart.  Callers that know the provider should always
+        pass it; the heuristic path stays as the documented legacy fallback for
+        endpoints that never carried provider metadata.
+        """
+        ref = str(playlist_ref or '').strip()
+        provider = (str(source).strip() or None) if source else None
+        try:
+            with self._get_connection() as conn:
+                rows = []
+                if ref:
+                    rows = conn.execute(
+                        "SELECT * FROM mirrored_playlists "
+                        "WHERE source_playlist_id=? AND profile_id=? "
+                        "ORDER BY updated_at DESC",
+                        (ref, int(profile_id)),
+                    ).fetchall()
+                if provider and len(rows) > 1:
+                    # Exact provider match wins outright; a provider that matches
+                    # nothing falls through to the shared heuristics rather than
+                    # failing a legacy alias like 'spotify_public' vs 'spotify'.
+                    exact = [r for r in rows if str(r['source'] or '') == provider]
+                    if len(exact) == 1:
+                        return self._normalize_mirrored_playlist_row(exact[0])
+                    if len(exact) > 1:
+                        rows = exact
+                if len(rows) == 1:
+                    return self._normalize_mirrored_playlist_row(rows[0])
+                if len(rows) > 1 and playlist_name:
+                    wanted = str(playlist_name).strip().casefold()
+                    named = [
+                        row for row in rows
+                        if str(row['name'] or '').strip().casefold() == wanted
+                        or str(row['custom_name'] or '').strip().casefold() == wanted
+                    ]
+                    if len(named) == 1:
+                        return self._normalize_mirrored_playlist_row(named[0])
+
+                from core.playlists.source_refs import extract_mirrored_pk
+                pk = extract_mirrored_pk(ref)
+                if pk is not None and (
+                    ref.startswith(('auto_mirror_', 'youtube_mirrored_', 'mirrored_'))
+                    or not rows
+                ):
+                    row = conn.execute(
+                        "SELECT * FROM mirrored_playlists WHERE id=? AND profile_id=?",
+                        (pk, int(profile_id)),
+                    ).fetchone()
+                    if row:
+                        return self._normalize_mirrored_playlist_row(row)
+
+                if playlist_name:
+                    wanted = str(playlist_name).strip()
+                    named = conn.execute(
+                        "SELECT * FROM mirrored_playlists "
+                        "WHERE profile_id=? AND (name=? OR custom_name=?) "
+                        "ORDER BY updated_at DESC",
+                        (int(profile_id), wanted, wanted),
+                    ).fetchall()
+                    if len(named) == 1:
+                        return self._normalize_mirrored_playlist_row(named[0])
+        except Exception as e:
+            logger.debug("Could not resolve mirrored playlist assignment: %s", e)
         return None
 
     def set_mirrored_playlist_organize_by_playlist(
         self,
         playlist_id: int,
         enabled: bool,
+        *,
+        profile_id: Optional[int] = None,
     ) -> bool:
         """Persist whether downloads for this playlist use playlist-folder layout."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
                 cursor.execute(
                     """
                     UPDATE mirrored_playlists
                     SET organize_by_playlist = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                    """,
-                    (1 if enabled else 0, playlist_id),
+                    """.rstrip() + owner_sql,
+                    [1 if enabled else 0, playlist_id, *owner_params],
                 )
                 conn.commit()
                 return cursor.rowcount > 0
@@ -16906,7 +25489,110 @@ class MusicDatabase:
             logger.error(f"Error updating organize_by_playlist for playlist {playlist_id}: {e}")
             return False
 
-    def set_mirrored_playlist_custom_name(self, playlist_id: int, custom_name) -> bool:
+    def set_mirrored_playlist_quality_profile(
+        self,
+        playlist_id: int,
+        quality_profile_id: int,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Persist the Quality Profile shared by manual and automated syncs."""
+        try:
+            with self._get_connection() as conn:
+                if conn.execute(
+                    "SELECT 1 FROM quality_profiles WHERE id=?",
+                    (int(quality_profile_id),),
+                ).fetchone() is None:
+                    return False
+                sql = """UPDATE mirrored_playlists
+                            SET quality_profile_id=?, updated_at=CURRENT_TIMESTAMP
+                          WHERE id=?"""
+                params: List[Any] = [int(quality_profile_id), int(playlist_id)]
+                if profile_id is not None:
+                    sql += " AND profile_id=?"
+                    params.append(int(profile_id))
+                cursor = conn.execute(sql, params)
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(
+                "Error updating Quality Profile for mirrored playlist %s: %s",
+                playlist_id,
+                e,
+            )
+            return False
+
+    def update_mirrored_playlist_preferences(
+        self,
+        playlist_id: int,
+        *,
+        profile_id: Optional[int] = None,
+        organize_by_playlist: Optional[bool] = None,
+        quality_profile_id: Optional[int] = None,
+        sync_mode: Optional[str] = None,
+    ) -> str:
+        """Atomically update the per-playlist download preferences.
+
+        ``sync_mode`` None leaves it alone, '' clears it back to the global
+        mode, anything else is stored as given (the route validates it).
+
+        Returns ``'ok'``, ``'not_found'``, ``'unknown_quality_profile'`` or
+        ``'error'``.  Both fields are validated BEFORE anything is written and
+        applied in a single statement, so a rejected Quality Profile can no
+        longer leave a half-applied ``organize_by_playlist`` behind (P2-02).
+        """
+        assignments: List[str] = []
+        params: List[Any] = []
+        try:
+            with self._get_connection() as conn:
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                if conn.execute(
+                    "SELECT 1 FROM mirrored_playlists WHERE id=?" + owner_sql,
+                    [int(playlist_id), *owner_params],
+                ).fetchone() is None:
+                    return 'not_found'
+
+                if quality_profile_id is not None:
+                    if conn.execute(
+                        "SELECT 1 FROM quality_profiles WHERE id=?",
+                        (int(quality_profile_id),),
+                    ).fetchone() is None:
+                        return 'unknown_quality_profile'
+                    assignments.append("quality_profile_id=?")
+                    params.append(int(quality_profile_id))
+
+                if organize_by_playlist is not None:
+                    assignments.append("organize_by_playlist=?")
+                    params.append(1 if organize_by_playlist else 0)
+
+                if sync_mode is not None:
+                    assignments.append("sync_mode=?")
+                    params.append(sync_mode or None)
+
+                if not assignments:
+                    return 'ok'
+
+                conn.execute(
+                    "UPDATE mirrored_playlists SET "
+                    + ", ".join(assignments)
+                    + ", updated_at=CURRENT_TIMESTAMP WHERE id=?" + owner_sql,
+                    [*params, int(playlist_id), *owner_params],
+                )
+                conn.commit()
+                return 'ok'
+        except Exception as e:
+            logger.error(
+                "Error updating preferences for mirrored playlist %s: %s", playlist_id, e
+            )
+            return 'error'
+
+    def set_mirrored_playlist_custom_name(
+        self,
+        playlist_id: int,
+        custom_name,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> bool:
         """Set or clear a user alias for a mirrored playlist.
 
         A blank/None value CLEARS the alias (display + sync fall back to the
@@ -16918,13 +25604,14 @@ class MusicDatabase:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
                 cursor.execute(
                     """
                     UPDATE mirrored_playlists
                     SET custom_name = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
-                    """,
-                    (value, playlist_id),
+                    """.rstrip() + owner_sql,
+                    [value, playlist_id, *owner_params],
                 )
                 conn.commit()
                 return cursor.rowcount > 0
@@ -16968,26 +25655,108 @@ class MusicDatabase:
             logger.debug(f"set_playlist_export_target failed: {e}")
             return False
 
-    def get_mirrored_playlist_tracks(self, playlist_id: int) -> List[Dict]:
+    def get_mirrored_playlist_tracks(
+        self,
+        playlist_id: int,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> List[Dict]:
         """Return all tracks for a mirrored playlist ordered by position."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql = ""
+                owner_params: List[Any] = []
+                if profile_id is not None:
+                    owner_sql = (
+                        " AND playlist_id IN (SELECT id FROM mirrored_playlists WHERE profile_id=?)"
+                    )
+                    owner_params = [int(profile_id)]
                 cursor.execute("""
                     SELECT * FROM mirrored_playlist_tracks
                     WHERE playlist_id = ?
-                    ORDER BY position
-                """, (playlist_id,))
-                return [dict(row) for row in cursor.fetchall()]
+                """.rstrip() + owner_sql + " ORDER BY position",
+                    [playlist_id, *owner_params])
+                tracks = [dict(row) for row in cursor.fetchall()]
+
+                # Give each DISCOVERED track the album art its match carries.
+                #
+                # The mirror-track projections never sent an image_url, so the
+                # column is empty for essentially every source and the detail
+                # modal showed rows of blank squares. Discovery does know the
+                # artwork — it is inside the match it wrote to extra_data — so
+                # it is read back out here.
+                #
+                # Read-time decoration, not a write: this is per track and per
+                # open, where the playlist COVER is one value that earns being
+                # stored.
+                for track in tracks:
+                    if track.get('image_url'):
+                        continue
+                    raw = track.get('extra_data')
+                    if not raw:
+                        continue
+                    try:
+                        extra = json.loads(raw) if isinstance(raw, str) else raw
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    cover = mirrored_cover_from_match(extra)
+                    if cover:
+                        track['image_url'] = cover
+                return tracks
         except Exception as e:
             logger.error(f"Error getting mirrored playlist tracks: {e}")
             return []
+
+    def api_get_track_by_external_id(self, external_id: str) -> Optional[Dict[str, Any]]:
+        """Find a library track by Spotify/Deezer/etc external ID."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """SELECT t.*, a.name as artist_name
+                       FROM tracks t
+                       LEFT JOIN artists a ON t.artist_id = a.id
+                       WHERE t.spotify_track_id = ? OR t.deezer_id = ?
+                       LIMIT 1""",
+                    (external_id, external_id),
+                )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
+
+    def api_find_track_by_title_artist(self, title: str, artist: str = "") -> Optional[Dict[str, Any]]:
+        """Find a library track by title and artist name (fuzzy)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                if artist:
+                    cursor.execute(
+                        """SELECT t.*, ar.name as artist_name
+                           FROM tracks t
+                           JOIN artists ar ON ar.id = t.artist_id
+                           WHERE LOWER(t.title) LIKE ? AND LOWER(ar.name) = LOWER(?)
+                           LIMIT 1""",
+                        (f"%{title.lower()}%", artist),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT t.*, a.name as artist_name FROM tracks t LEFT JOIN artists a ON t.artist_id = a.id WHERE LOWER(t.title) LIKE ? LIMIT 1",
+                        (f"%{title.lower()}%",),
+                    )
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception:
+            return None
 
     def update_mirrored_playlist_source_ref(
         self,
         playlist_id: int,
         source_playlist_id: str,
         description: Optional[str] = None,
+        *,
+        profile_id: Optional[int] = None,
     ) -> bool:
         """Update a mirrored playlist's upstream source reference.
 
@@ -16998,22 +25767,51 @@ class MusicDatabase:
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
                 if description is None:
                     cursor.execute("""
                         UPDATE mirrored_playlists
                         SET source_playlist_id = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, (source_playlist_id, playlist_id))
+                    """.rstrip() + owner_sql, [source_playlist_id, playlist_id, *owner_params])
                 else:
                     cursor.execute("""
                         UPDATE mirrored_playlists
                         SET source_playlist_id = ?, description = ?, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, (source_playlist_id, description, playlist_id))
+                    """.rstrip() + owner_sql,
+                        [source_playlist_id, description, playlist_id, *owner_params])
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
             logger.error(f"Error updating mirrored playlist source reference: {e}")
+            return False
+
+    def adopt_discovered_artist(self, track_id: int, artist_name: str) -> bool:
+        """Promote a discovery match's artist onto the mirrored row itself —
+        ONLY when the stored artist is missing or the 'Unknown Artist'
+        placeholder. Discovery used to write matched_data alone, so an
+        explored playlist still displayed (and searched as) 'Unknown Artist'
+        forever, even with a confident match sitting in extra_data (found by
+        the PR #1136 author: their explored playlist stayed 75% unknown).
+        A real stored artist is never overwritten — a 0.7-confidence guess
+        must not replace source-provided truth."""
+        name = str(artist_name or '').strip()
+        if not name or name.lower() == 'unknown artist':
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE mirrored_playlist_tracks SET artist_name = ? "
+                    "WHERE id = ? AND (artist_name IS NULL OR TRIM(artist_name) = '' "
+                    "OR LOWER(TRIM(artist_name)) = 'unknown artist')",
+                    (name, track_id)
+                )
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error(f"adopt_discovered_artist failed for {track_id}: {e}")
             return False
 
     def update_mirrored_track_extra_data(self, track_id: int, extra_data_dict: dict) -> bool:
@@ -17039,6 +25837,16 @@ class MusicDatabase:
                     "UPDATE mirrored_playlist_tracks SET extra_data = ? WHERE id = ?",
                     (json.dumps(existing), track_id)
                 )
+                # A newly discovered track can change what the collage should
+                # be, so drop the cached tiles and let the next library read
+                # rebuild them. Cheaper than recomputing four distinct covers on
+                # every single track write, and it is the read that needs them.
+                if mirrored_cover_from_match(existing):
+                    cursor.execute(
+                        "UPDATE mirrored_playlists SET cover_tiles = NULL "
+                        "WHERE id = (SELECT playlist_id FROM mirrored_playlist_tracks WHERE id = ?)",
+                        (track_id,)
+                    )
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
@@ -17060,17 +25868,42 @@ class MusicDatabase:
             logger.error(f"Error getting extra_data map: {e}")
             return {}
 
-    def clear_mirrored_playlist_discovery(self, playlist_id: int) -> int:
-        """Clear extra_data for all tracks in a mirrored playlist (resets discovery)."""
+    def clear_mirrored_playlist_discovery(
+        self,
+        playlist_id: int,
+        *,
+        profile_id: Optional[int] = None,
+        preserve_manual_matches: bool = True,
+    ) -> int:
+        """Clear extra_data for tracks in a mirrored playlist (resets discovery)."""
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
+                owner_sql = ""
+                owner_params: List[Any] = []
+                if profile_id is not None:
+                    owner_sql = (
+                        " AND playlist_id IN (SELECT id FROM mirrored_playlists WHERE profile_id=?)"
+                    )
+                    owner_params = [int(profile_id)]
+                manual_sql = ""
+                if preserve_manual_matches:
+                    manual_sql = (
+                        " AND (extra_data IS NULL OR "
+                        "IFNULL(json_extract(extra_data, '$.manual_match'), 0) != 1)"
+                    )
                 cursor.execute(
-                    "UPDATE mirrored_playlist_tracks SET extra_data = NULL WHERE playlist_id = ?",
+                    "UPDATE mirrored_playlist_tracks SET extra_data = NULL "
+                    "WHERE playlist_id = ?" + owner_sql + manual_sql,
+                    [playlist_id, *owner_params],
+                )
+                cleared_count = cursor.rowcount
+                cursor.execute(
+                    "UPDATE mirrored_playlists SET cover_tiles = NULL WHERE id = ?",
                     (playlist_id,)
                 )
                 conn.commit()
-                return cursor.rowcount
+                return cleared_count
         except Exception as e:
             logger.error(f"Error clearing mirrored playlist discovery: {e}")
             return 0
@@ -17110,13 +25943,78 @@ class MusicDatabase:
                     WHERE mp.profile_id = ?
                 """, (profile_id,))
                 for row in cursor.fetchall():
-                    result[row['playlist_id']] = {'total': 0, 'discovered': 0, 'wishlisted': 0, 'in_library': 0}
+                    result[row['playlist_id']] = {
+                        'total': 0, 'discovered': 0, 'wishlisted': 0,
+                        'in_library': 0, 'library_checked': 0, 'needs_match': 0,
+                    }
 
                 # Core counts: total + discovered, grouped per playlist
                 cursor.execute("""
                     SELECT mpt.playlist_id,
                            COUNT(*) as total,
-                           SUM(CASE WHEN mpt.extra_data LIKE '%"discovered": true%' THEN 1 ELSE 0 END) as discovered
+                           SUM(CASE WHEN mpt.extra_data LIKE '%"discovered": true%' THEN 1 ELSE 0 END) as discovered,
+                           -- Written by the SYNC MATCHER, not derived here. A join
+                           -- cannot answer this: it fails on collaborations and
+                           -- casing, and normalising at query time is a full scan
+                           -- of `tracks` per row. Free to read — same scan, one
+                           -- more CASE.
+                           -- THE FLAG FIRST, THE JOIN ONLY AS FALLBACK.
+                           --
+                           -- The flag is what the sync matcher decided, and it is
+                           -- right about the cases a join cannot reach:
+                           -- collaborations and casing. But it only exists for
+                           -- playlists synced since it was added, so dropping the
+                           -- join outright regressed the id-first fix that landed
+                           -- for the 45/50 Hot Hits undercount.
+                           --
+                           -- So: trust the flag where there is one, including when
+                           -- it says NOT owned, and fall back to the old join only
+                           -- for tracks nobody has checked. The expensive branch
+                           -- therefore stops running for a playlist the moment it
+                           -- syncs once.
+                           SUM(CASE
+                               WHEN mpt.extra_data LIKE '%"in_library": true%' THEN 1
+                               WHEN mpt.extra_data LIKE '%"library_checked_at"%' THEN 0
+                               WHEN (
+                                   (mpt.source_track_id IS NOT NULL AND mpt.source_track_id != ''
+                                    -- Separate probes avoid a multi-column OR scan.
+                                    -- IS NOT NULL skips NULL entries even on SQLite 3.45,
+                                    -- which can otherwise scan an all-NULL index after ANALYZE.
+                                    AND (
+                                        EXISTS (SELECT 1 FROM tracks ti
+                                                WHERE ti.spotify_track_id IS NOT NULL
+                                                  AND ti.spotify_track_id = mpt.source_track_id)
+                                        OR EXISTS (SELECT 1 FROM tracks ti
+                                                   WHERE ti.deezer_id IS NOT NULL
+                                                     AND ti.deezer_id = mpt.source_track_id)
+                                        OR EXISTS (SELECT 1 FROM tracks ti
+                                                   WHERE ti.tidal_id IS NOT NULL
+                                                     AND ti.tidal_id = mpt.source_track_id)
+                                        OR EXISTS (SELECT 1 FROM tracks ti
+                                                   WHERE ti.qobuz_id IS NOT NULL
+                                                     AND ti.qobuz_id = mpt.source_track_id)
+                                        OR EXISTS (SELECT 1 FROM tracks ti
+                                                   WHERE ti.itunes_track_id IS NOT NULL
+                                                     AND ti.itunes_track_id = mpt.source_track_id)
+                                    ))
+                                   -- The name join stays exact (case-sensitive):
+                                   -- COLLATE NOCASE would defeat idx_artists_name /
+                                   -- idx_tracks_title (~18s vs ~6ms on a 300k-track
+                                   -- library). The track_artist OR covers
+                                   -- compilations filed under Various Artists.
+                                   -- File-import tracks (file:{digest} ids) never
+                                   -- id-match; the name join is their path.
+                                   OR EXISTS (SELECT 1 FROM artists a
+                                              JOIN tracks t ON t.artist_id = a.id
+                                              WHERE (a.name = mpt.artist_name
+                                                     OR t.track_artist = mpt.artist_name)
+                                                AND t.title = mpt.track_name)
+                               ) THEN 1
+                               ELSE 0 END) as in_library,
+                           -- How many rows have EVER been checked. Without this a
+                           -- never-synced playlist reads as "you own none of it"
+                           -- rather than "nobody has looked".
+                           SUM(CASE WHEN mpt.extra_data LIKE '%"library_checked_at"%' THEN 1 ELSE 0 END) as library_checked
                     FROM mirrored_playlist_tracks mpt
                     JOIN mirrored_playlists mp ON mp.id = mpt.playlist_id
                     WHERE mp.profile_id = ?
@@ -17125,9 +26023,14 @@ class MusicDatabase:
                 for row in cursor.fetchall():
                     pid = row['playlist_id']
                     if pid not in result:
-                        result[pid] = {'total': 0, 'discovered': 0, 'wishlisted': 0, 'in_library': 0}
+                        result[pid] = {
+                            'total': 0, 'discovered': 0, 'wishlisted': 0,
+                            'in_library': 0, 'library_checked': 0, 'needs_match': 0,
+                        }
                     result[pid]['total'] = row['total'] or 0
                     result[pid]['discovered'] = row['discovered'] or 0
+                    result[pid]['in_library'] = row['in_library'] or 0
+                    result[pid]['library_checked'] = row['library_checked'] or 0
 
                 # Wishlist counts in one shot
                 try:
@@ -17136,11 +26039,9 @@ class MusicDatabase:
                         FROM mirrored_playlist_tracks mpt
                         JOIN mirrored_playlists mp ON mp.id = mpt.playlist_id
                         WHERE mp.profile_id = ?
-                          AND mpt.source_track_id IS NOT NULL AND mpt.source_track_id != ''
-                          AND EXISTS (SELECT 1 FROM wishlist_tracks wt
-                                      WHERE wt.spotify_track_id = mpt.source_track_id)
+                          AND {_WISHLISTED}
                         GROUP BY mpt.playlist_id
-                    """, (profile_id,))
+                    """.replace("{_WISHLISTED}", self._MIRROR_TRACK_WISHLISTED), (profile_id,))
                     for row in cursor.fetchall():
                         pid = row['playlist_id']
                         if pid in result:
@@ -17148,28 +26049,89 @@ class MusicDatabase:
                 except Exception as e:
                     logger.debug(f"Batch wishlist counts failed: {e}")
 
-                # In-library counts in one shot. Case-sensitive join so
-                # idx_artists_name + idx_tracks_title kick in.
+                # wing it guesses nobody fixed: what the card's "need a match"
+                # link opens, so it counts exactly what the pool lists (#1721)
                 try:
-                    cursor.execute("""
-                        SELECT mpt.playlist_id, COUNT(DISTINCT mpt.id) as in_library
+                    cursor.execute(f"""
+                        SELECT mpt.playlist_id, COUNT(*) as needs_match
                         FROM mirrored_playlist_tracks mpt
                         JOIN mirrored_playlists mp ON mp.id = mpt.playlist_id
-                        JOIN artists a ON a.name = mpt.artist_name
-                        JOIN tracks t ON t.artist_id = a.id
-                                     AND t.title = mpt.track_name
-                        WHERE mp.profile_id = ?
+                        WHERE mp.profile_id = ? AND {self._WING_IT_ATTENTION}
                         GROUP BY mpt.playlist_id
                     """, (profile_id,))
                     for row in cursor.fetchall():
                         pid = row['playlist_id']
                         if pid in result:
-                            result[pid]['in_library'] = row['in_library'] or 0
+                            result[pid]['needs_match'] = row['needs_match'] or 0
                 except Exception as e:
-                    logger.debug(f"Batch library counts failed: {e}")
+                    logger.debug(f"Batch needs-match counts failed: {e}")
+
+                # NOTE: in_library is no longer derived here. It used to be a
+                # join with two paths and both were wrong. The ID path compared
+                # `tracks.spotify_track_id` to the mirrored row's source id,
+                # which is only a Spotify id by coincidence — a ListenBrainz
+                # playlist stores 'file:...' references, so it matched NOTHING.
+                # That left an exact case-sensitive artist+title join, which
+                # fails on ordinary things: "Taylor Swift feat. HAIM" against a
+                # library holding "Taylor Swift", "Empire of the Sun" against
+                # "Empire Of The Sun".
+                #
+                # Measured on a real 50-track ListenBrainz playlist: 47 owned by
+                # the media server's own reckoning, 18 reported here. The error
+                # was also differential — near enough for Spotify, badly wrong
+                # elsewhere — which is worse than uniform error, because it looks
+                # right wherever you happen to check it.
+                #
+                # It comes from the SYNC MATCHER now, which already resolves all
+                # of the above, and is read as a stored flag in the query above.
+                # Normalising names at query time was measured and is not
+                # affordable: LOWER() on either side drops the index and scans
+                # the whole `tracks` table per row.
+
         except Exception as e:
             logger.error(f"Error getting batch mirrored playlist status counts: {e}")
         return result
+
+    # a mirrored track is wishlisted under the id sync filed it under: the
+    # matched id once discovery found one (often deezer's), the playlist's own
+    # id before that. asking only for the source id read 0 for every
+    # deezer-identified spotify playlist (#1721).
+    _MIRROR_TRACK_WISHLISTED = (
+        "((mpt.source_track_id IS NOT NULL AND mpt.source_track_id != '' "
+        "AND EXISTS (SELECT 1 FROM wishlist_tracks wt "
+        "WHERE wt.spotify_track_id = mpt.source_track_id)) "
+        "OR (json_valid(mpt.extra_data) "
+        "AND json_extract(mpt.extra_data, '$.matched_data.id') IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM wishlist_tracks wt "
+        "WHERE wt.spotify_track_id = json_extract(mpt.extra_data, '$.matched_data.id'))))"
+    )
+
+    def get_wishlisted_ids(self, ids, profile_id: Optional[int] = None) -> set:
+        """which of ``ids`` have a wishlist row, for this profile when given."""
+        wanted = sorted({str(i) for i in ids or [] if i})
+        found: set = set()
+        if not wanted:
+            return found
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA table_info(wishlist_tracks)")
+                scoped = profile_id is not None and any(
+                    r[1] == 'profile_id' for r in cursor.fetchall())
+                # sqlite caps bound parameters, so ask in chunks
+                for start in range(0, len(wanted), 500):
+                    chunk = wanted[start:start + 500]
+                    sql = ("SELECT spotify_track_id FROM wishlist_tracks WHERE spotify_track_id IN ("
+                           + ",".join("?" * len(chunk)) + ")")
+                    params = list(chunk)
+                    if scoped:
+                        sql += " AND profile_id = ?"
+                        params.append(int(profile_id))
+                    cursor.execute(sql, params)
+                    found.update(str(r[0]) for r in cursor.fetchall())
+        except Exception as e:
+            logger.debug(f"wishlisted id lookup failed: {e}")
+        return found
 
     def get_mirrored_playlist_status_counts(self, playlist_id: int) -> dict:
         """Return discovery, wishlisted, and downloaded counts for a mirrored playlist.
@@ -17199,28 +26161,51 @@ class MusicDatabase:
                         SELECT COUNT(*) as wishlisted
                         FROM mirrored_playlist_tracks mpt
                         WHERE mpt.playlist_id = ?
-                          AND mpt.source_track_id IS NOT NULL AND mpt.source_track_id != ''
-                          AND EXISTS (SELECT 1 FROM wishlist_tracks wt
-                                      WHERE wt.spotify_track_id = mpt.source_track_id)
-                    """, (playlist_id,))
+                          AND {_WISHLISTED}
+                    """.replace("{_WISHLISTED}", self._MIRROR_TRACK_WISHLISTED), (playlist_id,))
                     result['wishlisted'] = cursor.fetchone()['wishlisted'] or 0
                 except Exception as extra_err:
                     logger.debug(f"Wishlist count failed for playlist {playlist_id}: {extra_err}")
 
-                # In-library: case-sensitive equality so SQLite can use
-                # `idx_artists_name` and `idx_tracks_title`. COLLATE NOCASE on
-                # the join columns prevents index usage and takes ~18s per
-                # playlist on a 300k-track library; the case-sensitive variant
-                # is ~6ms. Misses purely-case-different matches (rare — Spotify
-                # canonicalizes artist/track names that match library imports).
+                # In-library, id-first like the batched variant: source id
+                # against the provider id columns (spotify/deezer/tidal/qobuz/
+                # itunes), OR the case-sensitive name join (COLLATE NOCASE would
+                # defeat idx_artists_name / idx_tracks_title — ~18s vs ~6ms on a
+                # 300k-track library). The track_artist OR covers compilations
+                # filed under Various Artists. File-import tracks (file:{digest}
+                # ids) never id-match; the name join is their path.
                 try:
                     cursor.execute("""
                         SELECT COUNT(DISTINCT mpt.id) as in_library
                         FROM mirrored_playlist_tracks mpt
-                        JOIN artists a ON a.name = mpt.artist_name
-                        JOIN tracks t ON t.artist_id = a.id
-                                     AND t.title = mpt.track_name
                         WHERE mpt.playlist_id = ?
+                          AND (
+                            (mpt.source_track_id IS NOT NULL AND mpt.source_track_id != ''
+                             -- Use the same separate, non-NULL provider probes as
+                             -- the batched counts, including on SQLite 3.45.
+                             AND (
+                                 EXISTS (SELECT 1 FROM tracks ti
+                                         WHERE ti.spotify_track_id IS NOT NULL
+                                           AND ti.spotify_track_id = mpt.source_track_id)
+                                 OR EXISTS (SELECT 1 FROM tracks ti
+                                            WHERE ti.deezer_id IS NOT NULL
+                                              AND ti.deezer_id = mpt.source_track_id)
+                                 OR EXISTS (SELECT 1 FROM tracks ti
+                                            WHERE ti.tidal_id IS NOT NULL
+                                              AND ti.tidal_id = mpt.source_track_id)
+                                 OR EXISTS (SELECT 1 FROM tracks ti
+                                            WHERE ti.qobuz_id IS NOT NULL
+                                              AND ti.qobuz_id = mpt.source_track_id)
+                                 OR EXISTS (SELECT 1 FROM tracks ti
+                                            WHERE ti.itunes_track_id IS NOT NULL
+                                              AND ti.itunes_track_id = mpt.source_track_id)
+                             ))
+                            OR EXISTS (SELECT 1 FROM artists a
+                                       JOIN tracks t ON t.artist_id = a.id
+                                       WHERE (a.name = mpt.artist_name
+                                              OR t.track_artist = mpt.artist_name)
+                                         AND t.title = mpt.track_name)
+                          )
                     """, (playlist_id,))
                     result['in_library'] = cursor.fetchone()['in_library'] or 0
                 except Exception as extra_err:
@@ -17230,17 +26215,91 @@ class MusicDatabase:
             logger.error(f"Error getting mirrored playlist status counts: {e}")
         return result
 
-    def delete_mirrored_playlist(self, playlist_id: int) -> bool:
-        """Delete a mirrored playlist and its tracks (CASCADE)."""
+    def delete_mirrored_playlist(
+        self,
+        playlist_id: int,
+        *,
+        profile_id: Optional[int] = None,
+    ) -> bool:
+        """Delete a mirrored playlist and its tracks (CASCADE).
+
+        Also removes Auto-Sync board-owned pipeline automations (owned_by='auto_sync')
+        scoped to this playlist so the dashboard Sync band stops rendering ghost
+        schedule rows for the deleted mirror (#1455). User-created automations are
+        never touched, and 'all' schedules (covering every playlist) survive.
+        """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM mirrored_playlists WHERE id = ?", (playlist_id,))
+                owner_sql, owner_params = self._mirror_owner_clause(profile_id)
+                cursor.execute(
+                    "DELETE FROM mirrored_playlists WHERE id = ?" + owner_sql,
+                    [playlist_id, *owner_params],
+                )
+                deleted = cursor.rowcount > 0
+                if deleted:
+                    self._delete_auto_sync_automations_for_playlist(
+                        cursor, int(playlist_id), profile_id=profile_id
+                    )
                 conn.commit()
-                return cursor.rowcount > 0
+                return deleted
         except Exception as e:
             logger.error(f"Error deleting mirrored playlist: {e}")
             return False
+
+    @staticmethod
+    def _delete_auto_sync_automations_for_playlist(
+        cursor, playlist_id: int, profile_id: Optional[int] = None
+    ):
+        """Delete board-owned Auto-Sync automations scoped to one mirrored playlist.
+
+        Only rows the Auto-Sync board owns (owned_by='auto_sync') whose
+        action_config targets exactly this playlist_id are removed. The board
+        stores playlist_id as a JSON string; 'all' schedules (true/'true') apply
+        to every playlist and are left alone (#1455).
+
+        Static: needs only a cursor, so non-MusicDatabase owners of mirror
+        deletes (e.g. ListenBrainzManager) can reuse it.
+        """
+        try:
+            if profile_id is None:
+                cursor.execute(
+                    "SELECT id, action_config FROM automations WHERE owned_by = 'auto_sync'"
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, action_config FROM automations WHERE owned_by = 'auto_sync' AND profile_id = ?",
+                    (int(profile_id),),
+                )
+            to_delete = []
+            for row in cursor.fetchall():
+                try:
+                    cfg = json.loads(row["action_config"] or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(cfg, dict):
+                    continue
+                if cfg.get("all") is True or str(cfg.get("all")).lower() == "true":
+                    continue  # applies to every playlist — not scoped to this one
+                raw = cfg.get("playlist_id")
+                if raw in (None, ""):
+                    continue
+                try:
+                    scoped_id = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if scoped_id == int(playlist_id):
+                    to_delete.append(row["id"])
+            if to_delete:
+                cursor.execute(
+                    f"DELETE FROM automations WHERE id IN ({','.join('?' * len(to_delete))})",
+                    to_delete,
+                )
+                logger.info(
+                    f"Deleted {cursor.rowcount} auto-sync automation(s) scoped to deleted playlist {playlist_id}"
+                )
+        except Exception as e:
+            logger.error(f"Error deleting auto-sync automations for playlist {playlist_id}: {e}")
 
     # ===========================
     # AUTOMATIONS CRUD
@@ -17250,21 +26309,26 @@ class MusicDatabase:
                           action_type: str, action_config: str, profile_id: int = 1,
                           notify_type: str = None, notify_config: str = '{}',
                           then_actions: str = '[]', group_name: str = None,
-                          owned_by: str = None):
+                          owned_by: str = None, is_system: bool = False,
+                          enabled: bool = True):
         """Create a new automation. Returns the new automation ID or None.
 
         ``owned_by`` tags an automation as managed by a feature surface
         (e.g. ``'auto_sync'`` for entries the Playlist Auto-Sync board
         creates) so that surface can recognize its own rows without
         scraping the display name.
+
+        ``is_system`` marks first-party system rows (e.g. repair-job
+        schedules from #1289): they render in the System section and
+        cannot be deleted via the API.
         """
         try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    INSERT INTO automations (name, trigger_type, trigger_config, action_type, action_config, profile_id, notify_type, notify_config, then_actions, group_name, owned_by)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (name, trigger_type, trigger_config, action_type, action_config, profile_id, notify_type, notify_config, then_actions, group_name, owned_by))
+                    INSERT INTO automations (name, trigger_type, trigger_config, action_type, action_config, profile_id, notify_type, notify_config, then_actions, group_name, owned_by, is_system, enabled)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (name, trigger_type, trigger_config, action_type, action_config, profile_id, notify_type, notify_config, then_actions, group_name, owned_by, 1 if is_system else 0, 1 if enabled else 0))
                 conn.commit()
                 return cursor.lastrowid
         except Exception as e:
@@ -17283,6 +26347,27 @@ class MusicDatabase:
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error getting automations: {e}")
+            return []
+
+    def get_all_automations(self):
+        """Get every automation in the table, regardless of owning profile.
+
+        Engine/internal view — the automation engine (start(), event cache,
+        signal-cycle detection) must see all enabled automations, not just
+        profile 1's, or non-admin automations silently stop after a restart
+        (timers are in-memory; issue #1428). The profile-filtered
+        ``get_automations()`` keeps serving the UI, which must stay scoped.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT * FROM automations ORDER BY is_system DESC, created_at DESC
+                """)
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"Error getting all automations: {e}")
             return []
 
     def get_system_automation_by_action(self, action_type: str):
@@ -17727,7 +26812,122 @@ class MusicDatabase:
             logger.error(f"Error getting radio tracks for track {track_id}: {e}")
             return {'success': False, 'error': str(e)}
 
+    def resolve_library_tracks(self, pairs) -> Dict[tuple, Dict[str, Any]]:
+        """Batch (title, artist) -> library track resolution in ONE pass.
+
+        The per-track resolver runs LOWER(title) = ? per call — an unindexed
+        full scan of the tracks table EACH time, which turned a 50-track
+        playlist into minutes on a 300k-track library. This collects every
+        wanted title into one IN() query (one scan total) and matches the
+        artist in Python. Returns {(title_lower, artist_lower): row}; pairs
+        whose track isn't on disk are simply absent."""
+        wants = set()
+        for t, a in pairs or []:
+            t2 = str(t or '').strip().lower()
+            a2 = str(a or '').strip().lower()
+            if t2:
+                wants.add((t2, a2))
+        if not wants:
+            return {}
+        titles = sorted({k[0] for k in wants})
+        out: Dict[tuple, Dict[str, Any]] = {}
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                _CHUNK = 400   # stay far under SQLite's placeholder limit
+                for i in range(0, len(titles), _CHUNK):
+                    chunk = titles[i:i + _CHUNK]
+                    ph = ','.join('?' * len(chunk))
+                    cursor.execute(f"""
+                        SELECT t.id, t.title, t.file_path, t.bitrate, t.duration,
+                               ar.name AS artist_name, al.title AS album_title,
+                               al.thumb_url, t.artist_id, t.album_id
+                        FROM tracks t
+                        JOIN artists ar ON ar.id = t.artist_id
+                        LEFT JOIN albums al ON al.id = t.album_id
+                        WHERE LOWER(t.title) IN ({ph})
+                          AND t.file_path IS NOT NULL AND t.file_path != ''
+                    """, chunk)
+                    for row in cursor.fetchall():
+                        r = dict(row)
+                        key = (str(r['title'] or '').lower(),
+                               str(r['artist_name'] or '').lower())
+                        if key in wants and key not in out:
+                            out[key] = r
+            return out
+        except Exception as e:
+            logger.error("Error batch-resolving library tracks: %s", e)
+            return {}
+
+    def get_library_radio_tracks(self, limit=50, exclude_ids=None) -> Dict[str, Any]:
+        """Seedless radio across the WHOLE library (Library Radio).
+
+        Same machinery as get_radio_tracks' last tier: pull a generous random
+        pool of playable tracks, then let core.radio.selection rank it
+        (play_count + lastfm popularity, recency penalty, stable jitter) so the
+        mix leans familiar-but-fresh instead of pure noise. Once tracks are
+        playing, refills go through the normal seeded get_radio_tracks path —
+        this only starts the station.
+        """
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                from core.radio.selection import RadioCollector
+
+                collector = RadioCollector(limit, exclude_ids=exclude_ids)
+
+                # Same defensive probe as get_radio_tracks: ranking columns are
+                # migration-added, omit them from the SELECT when absent.
+                cursor.execute("PRAGMA table_info(tracks)")
+                _track_cols = {row[1] for row in cursor.fetchall()}
+                _rank_cols = "".join(
+                    f"t.{c}, " for c in ("play_count", "lastfm_playcount")
+                    if c in _track_cols
+                )
+
+                # No seed track means the exclude set can be EMPTY — and
+                # "NOT IN ()" is a syntax error — so the clause is conditional.
+                _exclude_sql = ""
+                if collector.exclude_values():
+                    _exclude_sql = f"AND t.id NOT IN ({collector.exclude_placeholders()})"
+
+                cursor.execute(f"""
+                    SELECT t.id, t.title, t.track_number, t.duration,
+                           t.file_path, t.bitrate,
+                           t.album_id, t.artist_id,
+                           {_rank_cols}
+                           al.title   AS album,
+                           COALESCE(al.thumb_url, ar.thumb_url) AS image_url,
+                           ar.name    AS artist
+                    FROM tracks t
+                    JOIN albums al ON al.id = t.album_id
+                    JOIN artists ar ON ar.id = t.artist_id
+                    WHERE t.file_path IS NOT NULL AND t.file_path != ''
+                      {_exclude_sql}
+                    ORDER BY RANDOM()
+                    LIMIT ?
+                """, collector.exclude_values() + [max(limit * 4, limit + 10)])
+                collector.collect(cursor.fetchall(), rank=True)
+
+                return {'success': True, 'tracks': collector.tracks}
+
+        except Exception as e:
+            logger.error(f"Error getting library radio tracks: {e}")
+            return {'success': False, 'error': str(e)}
+
     # ── Library Issues CRUD ──
+
+    @property
+    def issue_threads(self):
+        """comments, followers and the reporter's unread flag (core/issues)."""
+        store = getattr(self, '_issue_threads', None)
+        if store is None:
+            from core.issues.thread_store import IssueThreadStore
+            store = IssueThreadStore(self._get_connection, 'library_issues',
+                                     'library_issue_comments', 'library_issue_followers')
+            self._issue_threads = store
+        return store
 
     def create_issue(self, profile_id: int, entity_type: str, entity_id: str,
                      category: str, title: str, description: str = '',
@@ -17755,14 +26955,25 @@ class MusicDatabase:
                    is_admin: bool = False) -> Dict[str, Any]:
         """Get issues with optional filters. Non-admin only sees own issues."""
         try:
+            self.issue_threads._run(lambda _c: None)   # reporter_label exists
+        except Exception as e:  # noqa: BLE001
+            logger.debug("issue thread schema check failed: %s", e)
+        try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 conditions = []
                 params = []
 
                 if not is_admin and profile_id:
-                    conditions.append("i.profile_id = ?")
-                    params.append(profile_id)
+                    # their own reports, and the ones they said they hit too
+                    followed = self.issue_threads.followed_issue_ids(profile_id)
+                    if followed:
+                        conditions.append("(i.profile_id = ? OR i.id IN (%s))" % ','.join('?' * len(followed)))
+                        params.append(profile_id)
+                        params.extend(followed)
+                    else:
+                        conditions.append("i.profile_id = ?")
+                        params.append(profile_id)
                 if status:
                     conditions.append("i.status = ?")
                     params.append(status)
@@ -17781,7 +26992,8 @@ class MusicDatabase:
 
                 # Fetch issues with reporter profile info
                 cursor.execute(f"""
-                    SELECT i.*, p.name as reporter_name, p.avatar_color as reporter_color,
+                    SELECT i.*, COALESCE(i.reporter_label, p.name) as reporter_name,
+                           p.avatar_color as reporter_color,
                            p.avatar_url as reporter_avatar
                     FROM library_issues i
                     LEFT JOIN profiles p ON i.profile_id = p.id
@@ -17810,10 +27022,15 @@ class MusicDatabase:
     def get_issue(self, issue_id: int) -> Optional[Dict[str, Any]]:
         """Get a single issue by ID with reporter info."""
         try:
+            self.issue_threads._run(lambda _c: None)   # reporter_label exists
+        except Exception as e:  # noqa: BLE001
+            logger.debug("issue thread schema check failed: %s", e)
+        try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("""
-                    SELECT i.*, p.name as reporter_name, p.avatar_color as reporter_color,
+                    SELECT i.*, COALESCE(i.reporter_label, p.name) as reporter_name,
+                           p.avatar_color as reporter_color,
                            p.avatar_url as reporter_avatar
                     FROM library_issues i
                     LEFT JOIN profiles p ON i.profile_id = p.id
@@ -17859,6 +27076,10 @@ class MusicDatabase:
     def delete_issue(self, issue_id: int) -> Dict[str, Any]:
         """Delete an issue (admin only)."""
         try:
+            self.issue_threads.delete_thread(issue_id)
+        except Exception as e:  # noqa: BLE001 - the issue row is the thing asked for
+            logger.debug("issue thread cleanup failed: %s", e)
+        try:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute("DELETE FROM library_issues WHERE id = ?", (issue_id,))
@@ -17895,6 +27116,236 @@ class MusicDatabase:
             logger.error(f"Error getting issue counts: {e}")
             return {'open': 0, 'in_progress': 0, 'resolved': 0, 'dismissed': 0, 'total': 0}
 
+    # ===================== Music requests =====================
+    # a profile without download rights keeps a wishlist the scheduled run
+    # won't download. each row is a request until an admin approves it
+    # (request_status = 'approved', downloaded like any other row) or declines
+    # it (row removed). music_requests is the history both leave behind, and
+    # how an approved request learns it arrived. see core/requests/music.py.
+
+    def _ensure_music_request_schema(self, cursor) -> None:
+        """idempotent, cheap: two columns and a table. run defensively before
+        use because the old wishlist rebuild migration recreates the table
+        from a fixed column list."""
+        cursor.execute("PRAGMA table_info(wishlist_tracks)")
+        cols = {c[1] for c in cursor.fetchall()}
+        if cols and 'request_status' not in cols:
+            cursor.execute("ALTER TABLE wishlist_tracks ADD COLUMN request_status TEXT DEFAULT NULL")
+        if cols and 'request_resolved_at' not in cols:
+            cursor.execute("ALTER TABLE wishlist_tracks ADD COLUMN request_resolved_at TIMESTAMP DEFAULT NULL")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS music_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                requester_name TEXT,
+                group_key TEXT NOT NULL,
+                kind TEXT NOT NULL,                 -- album | track
+                title TEXT NOT NULL,
+                artist TEXT,
+                image_url TEXT,
+                tracks TEXT NOT NULL DEFAULT '[]',  -- [{id, title, artist}]
+                status TEXT NOT NULL,               -- approved | available | declined | removed
+                admin_response TEXT,
+                resolved_by INTEGER,
+                resolved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                available_at TIMESTAMP,
+                seen_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_music_requests_profile ON music_requests (profile_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_music_requests_status ON music_requests (status)")
+
+    def music_request_asks_since(self, cursor, profile_id: int, days: int) -> set:
+        """the asks (album or single-track group keys) a profile made in the
+        last ``days`` days: what's on its wishlist from that window plus what
+        was approved/declined in it."""
+        from core.requests.music import group_key
+        self._ensure_music_request_schema(cursor)
+        window = f"-{int(days)} days"
+        keys = set()
+        cursor.execute("SELECT spotify_track_id, spotify_data, source_type FROM wishlist_tracks "
+                       "WHERE profile_id = ? AND date_added >= datetime('now', ?)", (int(profile_id), window))
+        for row in cursor.fetchall():
+            try:
+                data = json.loads(row['spotify_data'])
+            except (ValueError, TypeError):
+                data = {}
+            keys.add(group_key({'spotify_track_id': row['spotify_track_id'], 'spotify_data': data,
+                                'source_type': row['source_type']}))
+        cursor.execute("SELECT group_key FROM music_requests WHERE profile_id = ? "
+                       "AND created_at >= datetime('now', ?)", (int(profile_id), window))
+        keys.update(r[0] for r in cursor.fetchall())
+        return keys
+
+    def _music_request_quota_blocks(self, cursor, profile_id, track_data, source_type, track_id) -> bool:
+        from core.permissions import profile_can_download
+        from core.requests.music import group_key
+        from core.requests.quota import quota_for
+        profile = self.get_profile(profile_id)
+        quota = quota_for(profile)
+        if not quota or profile_can_download(profile):
+            return False
+        cursor.execute("SELECT 1 FROM wishlist_tracks WHERE profile_id = ? AND spotify_track_id = ? LIMIT 1",
+                       (int(profile_id), str(track_id)))
+        if cursor.fetchone():
+            return False      # a refresh of a row already asked for
+        key = group_key({'spotify_track_id': track_id, 'spotify_data': track_data, 'source_type': source_type})
+        asks = self.music_request_asks_since(cursor, profile_id, quota['days'])
+        if key in asks:
+            return False
+        return len(asks) >= quota['limit']
+
+    def get_pending_request_rows(self, profile_id: int) -> List[Dict[str, Any]]:
+        """the not-yet-approved wishlist rows of one profile."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute(
+                    "SELECT spotify_track_id, spotify_data, source_type, date_added "
+                    "FROM wishlist_tracks WHERE profile_id = ? AND request_status IS NULL "
+                    "ORDER BY date_added DESC", (int(profile_id),))
+                out = []
+                for row in cursor.fetchall():
+                    try:
+                        data = json.loads(row['spotify_data'])
+                    except (ValueError, TypeError):
+                        data = {}
+                    out.append({'spotify_track_id': row['spotify_track_id'], 'spotify_data': data,
+                                'source_type': row['source_type'], 'date_added': row['date_added']})
+                return out
+        except Exception as e:
+            logger.error("Error reading pending music requests: %s", e)
+            return []
+
+    def approve_request_rows(self, profile_id: int, track_ids: List[str]) -> int:
+        """flip pending rows to approved; the scheduled run picks them up.
+        only rows still pending change, so a second approve is a no-op."""
+        ids = [str(t) for t in track_ids or [] if t]
+        if not ids:
+            return 0
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                ph = ','.join('?' * len(ids))
+                cursor.execute(
+                    f"UPDATE wishlist_tracks SET request_status = 'approved', "
+                    f"request_resolved_at = CURRENT_TIMESTAMP "
+                    f"WHERE profile_id = ? AND request_status IS NULL AND spotify_track_id IN ({ph})",
+                    [int(profile_id)] + ids)
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.error("Error approving music request rows: %s", e)
+            return 0
+
+    def wishlist_has_track(self, profile_id: int, track_id: str) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM wishlist_tracks WHERE profile_id = ? AND spotify_track_id = ? LIMIT 1",
+                               (int(profile_id), str(track_id)))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.debug("wishlist_has_track failed: %s", e)
+            return True   # unknown reads as still on its way, never a false "arrived"
+
+    def add_music_request(self, *, profile_id: int, requester_name: str, group_key: str, kind: str,
+                          title: str, artist: str, image_url: str, tracks: List[Dict[str, Any]],
+                          status: str, resolved_by: int, admin_response: Optional[str] = None) -> Optional[int]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute(
+                    "INSERT INTO music_requests (profile_id, requester_name, group_key, kind, title, artist, "
+                    "image_url, tracks, status, admin_response, resolved_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (int(profile_id), requester_name, group_key, kind, title, artist, image_url,
+                     json.dumps(tracks or []), status, admin_response, int(resolved_by)))
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error("Error recording music request: %s", e)
+            return None
+
+    def list_music_requests(self, profile_id: Optional[int] = None, status: Optional[str] = None,
+                            limit: int = 200) -> List[Dict[str, Any]]:
+        """request history, newest first. profile_id None = everyone's."""
+        where, args = [], []
+        if profile_id is not None:
+            where.append("profile_id = ?")
+            args.append(int(profile_id))
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        sql = ("SELECT * FROM music_requests" + (" WHERE " + " AND ".join(where) if where else "") +
+               " ORDER BY resolved_at DESC, id DESC LIMIT ?")
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute(sql, args + [max(1, int(limit))])
+                rows = []
+                for row in cursor.fetchall():
+                    d = dict(row)
+                    try:
+                        d['tracks'] = json.loads(d.get('tracks') or '[]')
+                    except (ValueError, TypeError):
+                        d['tracks'] = []
+                    rows.append(d)
+                return rows
+        except Exception as e:
+            logger.error("Error listing music requests: %s", e)
+            return []
+
+    def set_music_request_status(self, request_id: int, status: str) -> bool:
+        """approved -> available | removed, stamping available_at and clearing
+        seen_at so the requester's badge lights up."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute(
+                    "UPDATE music_requests SET status = ?, seen_at = NULL, "
+                    "available_at = CASE WHEN ? = 'available' THEN CURRENT_TIMESTAMP ELSE available_at END "
+                    "WHERE id = ? AND status = 'approved'", (status, status, int(request_id)))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error updating music request %s: %s", request_id, e)
+            return False
+
+    def mark_music_requests_seen(self, profile_id: int) -> int:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute("UPDATE music_requests SET seen_at = CURRENT_TIMESTAMP "
+                               "WHERE profile_id = ? AND seen_at IS NULL", (int(profile_id),))
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.debug("mark_music_requests_seen failed: %s", e)
+            return 0
+
+    def delete_music_request(self, request_id: int, profile_id: Optional[int] = None) -> bool:
+        where, args = "id = ?", [int(request_id)]
+        if profile_id is not None:
+            where += " AND profile_id = ?"
+            args.append(int(profile_id))
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_request_schema(cursor)
+                cursor.execute(f"DELETE FROM music_requests WHERE {where}", args)
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error deleting music request %s: %s", request_id, e)
+            return False
+
     # ===================== HiFi Instances =====================
 
     def _ensure_hifi_instances_table(self, cursor) -> None:
@@ -17926,6 +27377,179 @@ class MusicDatabase:
         self._ensure_hifi_instances_table(cursor)
         cursor.execute("SELECT url, priority, enabled FROM hifi_instances WHERE enabled = 1 ORDER BY priority ASC, id ASC")
         return [dict(row) for row in cursor.fetchall()]
+
+
+    def _ensure_music_video_request_schema(self, cursor) -> None:
+        """idempotent: create music_video_requests table if not exists."""
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS music_video_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                requester_name TEXT,
+                video_id TEXT NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL,
+                channel TEXT,
+                artist TEXT,
+                thumbnail_url TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                admin_response TEXT,
+                resolved_by INTEGER,
+                resolved_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                seen_at TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mvr_profile ON music_video_requests(profile_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mvr_status ON music_video_requests(status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_mvr_video ON music_video_requests(video_id)")
+
+    def add_music_video_request(self, *, profile_id: int, requester_name: str,
+                                video_id: str, url: str, title: str,
+                                channel: Optional[str] = None,
+                                artist: Optional[str] = None,
+                                thumbnail_url: Optional[str] = None) -> Optional[int]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute(
+                    "INSERT INTO music_video_requests (profile_id, requester_name, video_id, url, "
+                    "title, channel, artist, thumbnail_url, status) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (int(profile_id), requester_name, video_id, url, title,
+                     channel, artist, thumbnail_url, "pending"))
+                conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error("Error recording music video request: %s", e)
+            return None
+
+    def list_music_video_requests(self, profile_id: Optional[int] = None,
+                                  status: Optional[str] = None,
+                                  limit: int = 200) -> List[Dict[str, Any]]:
+        """video request history, newest first. profile_id None = everyone's."""
+        where, args = [], []
+        if profile_id is not None:
+            where.append("profile_id = ?")
+            args.append(int(profile_id))
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        sql = ("SELECT * FROM music_video_requests" + (" WHERE " + " AND ".join(where) if where else "") +
+               " ORDER BY created_at DESC, id DESC LIMIT ?")
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute(sql, args + [max(1, int(limit))])
+                return [dict(row) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error("Error listing music video requests: %s", e)
+            return []
+
+    def get_music_video_request(self, request_id: int) -> Optional[Dict[str, Any]]:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute("SELECT * FROM music_video_requests WHERE id = ?", (int(request_id),))
+                row = cursor.fetchone()
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error("Error getting music video request: %s", e)
+            return None
+
+    def delete_music_video_request(self, request_id: int) -> bool:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute("DELETE FROM music_video_requests WHERE id = ?", (int(request_id),))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error deleting music video request: %s", e)
+            return False
+
+    def music_video_downloaded(self, video_id: str) -> bool:
+        """True if this video_id has landed in the library history."""
+        if not video_id:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT 1 FROM library_history WHERE source_track_id = ? LIMIT 1",
+                    (str(video_id),))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            logger.debug("Error checking music video downloaded: %s", e)
+            return False
+
+    def set_music_video_request_status(self, request_id: int, status: str,
+                                       resolved_by: Optional[int] = None,
+                                       admin_response: Optional[str] = None) -> bool:
+        """Set status; only succeeds if currently pending (prevents races)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute(
+                    "UPDATE music_video_requests SET status = ?, resolved_by = ?, "
+                    "admin_response = ?, resolved_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ? AND status = 'pending'",
+                    (status, resolved_by, admin_response, int(request_id)))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error setting music video request status: %s", e)
+            return False
+
+    def mark_music_video_request_available(self, request_id: int) -> bool:
+        """approved -> available, clearing seen_at so the requester's badge
+        lights up. mirrors set_music_request_status for track requests."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute(
+                    "UPDATE music_video_requests SET status = 'available', seen_at = NULL "
+                    "WHERE id = ? AND status = 'approved'",
+                    (int(request_id),))
+                conn.commit()
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error marking music video request available %s: %s", request_id, e)
+            return False
+
+    def mark_music_video_requests_seen(self, profile_id: int) -> int:
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute("UPDATE music_video_requests SET seen_at = CURRENT_TIMESTAMP "
+                               "WHERE profile_id = ? AND seen_at IS NULL", (int(profile_id),))
+                conn.commit()
+                return cursor.rowcount
+        except Exception as e:
+            logger.debug("mark_music_video_requests_seen failed: %s", e)
+            return 0
+
+    def count_music_video_requests_since(self, profile_id: int, days: int) -> int:
+        """Count video requests filed by a profile in the last N days (for quota)."""
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                self._ensure_music_video_request_schema(cursor)
+                cursor.execute(
+                    "SELECT COUNT(*) FROM music_video_requests "
+                    "WHERE profile_id = ? AND created_at >= datetime('now', ?)",
+                    (int(profile_id), f"-{int(days)} days"))
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+        except Exception as e:
+            logger.error("Error counting music video requests: %s", e)
+            return 0
 
     def get_all_hifi_instances(self) -> List[Dict[str, Any]]:
         """Get all HiFi instances (including disabled) ordered by priority."""
@@ -18004,8 +27628,14 @@ class MusicDatabase:
             conn.commit()
             logger.info(f"Seeded {len(default_urls)} default HiFi instances")
 
-# Thread-safe singleton pattern for database access
-_database_instances: Dict[int, MusicDatabase] = {}  # Thread ID -> Database instance
+# Thread-safe singleton pattern for database access.
+# Keyed by (thread ID, resolved database path): the same thread may legitimately
+# need different database files over its lifetime (tests set DATABASE_PATH per
+# module; workers pass explicit paths). Keying by thread alone silently returned
+# the WRONG database when a second path was requested after the first — e.g. a
+# test module's DATABASE_PATH was ignored because an earlier module had already
+# cached an instance for this thread, so queries ran against the wrong file.
+_database_instances: Dict[Tuple[int, str], MusicDatabase] = {}
 _database_lock = threading.Lock()
 
 def get_database(database_path: str = None) -> MusicDatabase:
@@ -18020,12 +27650,16 @@ def get_database(database_path: str = None) -> MusicDatabase:
     if database_path is None or database_path == "database/music_library.db":
         database_path = os.environ.get('DATABASE_PATH', 'database/music_library.db')
 
-    thread_id = threading.get_ident()
+    # The cache key includes the resolved path: two different paths requested
+    # from the same thread must yield two different instances. (Previously the
+    # key was the thread ID alone, so the second path silently got the first
+    # path's database.)
+    key = (threading.get_ident(), database_path)
 
     with _database_lock:
-        if thread_id not in _database_instances:
-            _database_instances[thread_id] = MusicDatabase(database_path)
-        return _database_instances[thread_id]
+        if key not in _database_instances:
+            _database_instances[key] = MusicDatabase(database_path)
+        return _database_instances[key]
 
 def close_database():
     """Close database instances (safe to call from any thread)"""

@@ -131,6 +131,7 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
             from core.metadata.track_number_format import (
                 format_track_number_tag,
                 format_track_number_tuple,
+                format_vorbis_track_fields,
             )
             track_num_str = format_track_number_tag(
                 metadata.get('track_number'), metadata.get('total_tracks')
@@ -144,7 +145,14 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
             _disc_num = normalize_disc_number(metadata.get('disc_number'))
             disc_num_str = str(_disc_num)
             write_multi = cfg.get("metadata_enhancement.tags.write_multi_artist", False)
+            from core.metadata.multi_value import genre_values
+            from core.audiobook_routing import routed_root_for_context
+            # Streaming services tag a children's audio play "Rock"; a routed
+            # album is an audiobook, whatever the source says.
+            genre = "Audiobook" if routed_root_for_context(context) else metadata.get("genre")
+            genres_out = genre_values(genre, bool(write_multi))
             artists_list = metadata.get("_artists_list", [])
+            album_artists_list = metadata.get("_album_artists_list", [])
 
             if isinstance(audio_file.tags, symbols.ID3):
                 if metadata.get("title"):
@@ -167,12 +175,18 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                         )
                 if metadata.get("album_artist"):
                     audio_file.tags.add(symbols.TPE2(encoding=3, text=[metadata["album_artist"]]))
+                    # same idea for albums: TPE2 stays the display string, the
+                    # list goes where navidrome looks (txxx:album artists)
+                    if write_multi and len(album_artists_list) > 1:
+                        audio_file.tags.add(
+                            symbols.TXXX(encoding=3, desc='Album Artists', text=list(album_artists_list))
+                        )
                 if metadata.get("album"):
                     audio_file.tags.add(symbols.TALB(encoding=3, text=[metadata["album"]]))
                 if metadata.get("date"):
                     audio_file.tags.add(symbols.TDRC(encoding=3, text=[metadata["date"]]))
-                if metadata.get("genre"):
-                    audio_file.tags.add(symbols.TCON(encoding=3, text=[metadata["genre"]]))
+                if genres_out:
+                    audio_file.tags.add(symbols.TCON(encoding=3, text=genres_out))
                 audio_file.tags.add(symbols.TRCK(encoding=3, text=[track_num_str]))
                 audio_file.tags.add(symbols.TPOS(encoding=3, text=[disc_num_str]))
             elif is_vorbis_like(audio_file, symbols):
@@ -184,13 +198,23 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                         audio_file["artists"] = artists_list
                 if metadata.get("album_artist"):
                     audio_file["albumartist"] = [metadata["album_artist"]]
+                    if write_multi and len(album_artists_list) > 1:
+                        audio_file["albumartists"] = list(album_artists_list)
                 if metadata.get("album"):
                     audio_file["album"] = [metadata["album"]]
                 if metadata.get("date"):
                     audio_file["date"] = [metadata["date"]]
-                if metadata.get("genre"):
-                    audio_file["genre"] = [metadata["genre"]]
-                audio_file["tracknumber"] = [track_num_str]
+                if genres_out:
+                    audio_file["genre"] = genres_out
+                # Vorbis has no ID3-style "N/M" convention — TRACKNUMBER is the
+                # bare number, the total goes in its own field. "1/1" here is what
+                # displayed literally as the track number (Discord, mrderekibmusic).
+                _vorbis_num, _vorbis_total = format_vorbis_track_fields(
+                    metadata.get('track_number'), metadata.get('total_tracks'))
+                audio_file["tracknumber"] = [_vorbis_num]
+                if _vorbis_total is not None:
+                    audio_file["tracktotal"] = [_vorbis_total]
+                    audio_file["totaltracks"] = [_vorbis_total]   # legacy readers
                 audio_file["discnumber"] = [disc_num_str]
             elif isinstance(audio_file, symbols.MP4):
                 if metadata.get("title"):
@@ -203,14 +227,23 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                     audio_file["\xa9alb"] = [metadata["album"]]
                 if metadata.get("date"):
                     audio_file["\xa9day"] = [metadata["date"]]
-                if metadata.get("genre"):
-                    audio_file["\xa9gen"] = [metadata["genre"]]
+                if genres_out:
+                    audio_file["\xa9gen"] = genres_out
                 audio_file["trkn"] = [format_track_number_tuple(
                     metadata.get("track_number"), metadata.get("total_tracks")
                 )]
                 audio_file["disk"] = [(_disc_num, 0)]
 
-            embed_source_ids(audio_file, metadata, context, runtime=runtime)
+            from core.metadata.manual import is_manual_context, manual_cover_path, write_manual_marker
+            if is_manual_context(context):
+                # the user typed this release in. no name-based id lookups:
+                # they'd embed a studio release's ids and replace the user's
+                # date with a musicbrainz one
+                metadata['_manual'] = True
+                metadata['_manual_cover_path'] = manual_cover_path(context)
+                write_manual_marker(audio_file, symbols)
+            else:
+                embed_source_ids(audio_file, metadata, context, runtime=runtime)
 
             if album_info is not None and metadata.get("musicbrainz_release_id"):
                 album_info["musicbrainz_release_id"] = metadata["musicbrainz_release_id"]
@@ -272,4 +305,8 @@ def enhance_file_metadata(file_path: str, context: dict, artist: dict, album_inf
                     logger.info("Persisted core tags (and restored art) after enrichment error.")
             except Exception as restore_exc:
                 logger.debug("Tag/art persist after error failed: %s", restore_exc)
+            # a crash before any tag was built persists an empty file, which the
+            # media server files under Unknown Album. put the basics back.
+            from core.metadata.core_tag_guard import ensure_core_tags
+            ensure_core_tags(file_path, context, artist, album_info)
             return False

@@ -1,5 +1,5 @@
 /*
- * Commissary — Video "get" button + detail/download modal (shared).
+ * SoulSync — Video "get" button + detail/download modal (shared).
  *
  * The terminal-content counterpart to the watchlist eye: movies and ENDED shows
  * can't be "watched for new episodes," so instead of an eye they get a download
@@ -49,7 +49,7 @@
         return '<button type="button" class="vget-btn"' +
             ' data-vget-kind="' + kind + '" data-vget-source="' + esc(opts.source || 'library') + '"' +
             ' data-vget-id="' + esc(opts.openId) + '" data-vget-title="' + esc(opts.title || '') + '"' +
-            ' title="Download this ' + kind + '" aria-label="Download this ' + kind + '">' + dlSvg() + '</button>';
+            ' title="Get this ' + kind + '" aria-label="Get this ' + kind + '">' + dlSvg() + '</button>';
     }
 
     // ── modal ─────────────────────────────────────────────────────────────────
@@ -88,15 +88,13 @@
             // Shows get a wider modal + a season/episode picker (not the movie layout).
             VideoDownload.render(content, { kind: 'show', id: o.id, source: o.source || 'library',
                 detail: (modalState && modalState._detail) || null, tvId: (modalState && modalState._tvId) || null,
-                poster: (modalState && modalState.poster) || null,
-                rootFolderId: (modalState && modalState._detail && modalState._detail.root_folder_id) || null });
+                poster: (modalState && modalState.poster) || null });
             ov.classList.add('vgm-mode-dl-show');
         } else {
             var file = (modalState && modalState.kind === 'movie' && modalState.owned) ? (modalState.file || null) : null;
             VideoDownload.render(content, { kind: o.kind, id: o.id, source: o.source || 'library', isYt: false, file: file,
                 title: (modalState && modalState.title) || o.title || '', year: (modalState && modalState.year) || null,
-                poster: (modalState && modalState.poster) || null,
-                rootFolderId: (modalState && modalState.rootFolderId) || null });
+                poster: (modalState && modalState.poster) || null });
         }
         setDownloadMode(ov, true);
         dl.hidden = false;
@@ -111,11 +109,8 @@
 
     // ── wishlist / watchlist writes ───────────────────────────────────────────
     function postJSON(url, body) {
-        // Parse the body even on a non-2xx status — the backend's {ok:false, error:'…'}
-        // detail lives there too; discarding it on !r.ok left every failure toast
-        // showing the generic fallback text instead of the real reason.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.json().catch(function () { return null; }); });
+            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; });
     }
     // Build the wishlist payload from the modal's selection and POST it; for a
     // show, optionally also follow it (the "Add to watchlist" tick).
@@ -205,6 +200,7 @@
                 '<div class="vgm-body">' +
                     '<div class="vgm-ratings" data-vgm-ratings hidden></div>' +
                     '<p class="vgm-overview" data-vgm-overview>Loading details…</p>' +
+                    '<div class="vgm-plan" data-vgm-plan hidden></div>' +
                     '<div class="vgm-owned" data-vgm-owned hidden></div>' +
                     '<div class="vgm-next" data-vgm-next hidden></div>' +
                     '<div class="vgm-eps" data-vgm-eps hidden></div>' +
@@ -216,9 +212,9 @@
                 '</div>' +
                 '<div class="vgm-actions">' +
                     '<span class="vgm-sel-count" data-vgm-count></span>' +
-                    '<button class="discog-cancel-btn" type="button" data-vgm-open>Full page &rarr;</button>' +
+                    '<button class="discog-cancel-btn" type="button" data-vgm-open>Details &rarr;</button>' +
                     '<button class="discog-cancel-btn vgm-download-btn" type="button" data-vgm-download>' +
-                        '<span class="vgm-download-ic">⤓</span> Download</button>' +
+                        '<span class="vgm-download-ic">⤓</span> Choose release</button>' +
                     '<button class="discog-submit-btn" type="button" data-vgm-wishlist>' +
                         '<span class="discog-submit-icon">⬇</span>' +
                         '<span class="discog-submit-text" data-vgm-add-label>+ Add to Wishlist</span>' +
@@ -324,7 +320,9 @@
 
     function updateFooter() {
         if (!modalEl) return;
-        var n = modalState ? modalState.sel.size : 0;
+        var n = (modalState && modalState.sel) ? modalState.sel.size : 0;
+        var planSel = modalEl.querySelector('[data-vgm-plan-selected]');
+        if (planSel) planSel.textContent = n;
         var cnt = modalEl.querySelector('[data-vgm-count]');
         var add = modalEl.querySelector('[data-vgm-wishlist]');
         var addLbl = modalEl.querySelector('[data-vgm-add-label]');   // set label only (keep the icon)
@@ -597,6 +595,7 @@
         }
 
         renderRatings(d);   // IMDb / Rotten Tomatoes / Metacritic chips (both kinds)
+        renderPlan(d, o);
         var libId = (o.source === 'library') ? parseInt(o.id, 10) : (d.library_id || null);
         if (o.kind === 'show') {
             modalState = modalState || { kind: 'show', sel: new Set(), epMeta: {} };
@@ -610,7 +609,6 @@
         } else {
             modalState = { kind: 'movie', owned: !!d.owned, tmdbId: d.tmdb_id, title: d.title,
                 year: d.year || null, poster: pUrl || null, libraryId: libId,
-                rootFolderId: d.root_folder_id || null,   // preselects the Library picker
                 file: d.file || null };   // owned → re-download; file feeds the download verdict
             renderOwned(d);
         }
@@ -634,12 +632,55 @@
                     }
                 }).catch(function () { /* the state chip is a nicety */ });
         }
-        // "Download Missing" (show detail page) asks to land straight in the download
+        // "Get Missing" (show detail page) asks to land straight in the download
         // view — the season/episode grab tree — rather than the details step.
         // Only meaningful for shows; the detail (_detail) it needs is set above.
         if (o && o.startDownload && o.kind === 'show') enterDownload(modalEl, o);
     }
 
+    function renderPlan(d, o) {
+        var box = modalEl && modalEl.querySelector('[data-vgm-plan]'); if (!box) return;
+        function metric(label, value, cls) {
+            return '<span class="vgm-plan-metric ' + (cls || '') + '">' +
+                '<span class="vgm-plan-num">' + value + '</span>' +
+                '<span class="vgm-plan-label">' + esc(label) + '</span></span>';
+        }
+        if (o.kind === 'movie') {
+            var owned = !!d.owned;
+            var f = d.file || {};
+            var bits = [resLabel(f.resolution), f.quality].filter(Boolean).join(' · ');
+            box.innerHTML = '<div class="vgm-plan-copy">' +
+                '<span class="vgm-plan-k">' + (owned ? 'Library copy' : 'Ready to get') + '</span>' +
+                '<span class="vgm-plan-v">' + (owned ? ('Re-download or search for an upgrade' + (bits ? ' · ' + esc(bits) : '')) : 'Add it to the wishlist or open the download picker') + '</span>' +
+                '</div>' + metric(owned ? 'owned' : 'wanted', owned ? '✓' : '+', owned ? 'vgm-plan-ok' : 'vgm-plan-want');
+            box.hidden = false;
+            return;
+        }
+        if (o.kind !== 'show' || !d.seasons || !d.seasons.length) { box.hidden = true; return; }
+        var today = isoToday(), missing = 0, ownedCount = 0, upcoming = 0, lazy = 0;
+        (d.seasons || []).forEach(function (s) {
+            var eps = s.episodes || [];
+            if (!eps.length && (s.episode_total || 0) > 0) { lazy += s.episode_total; return; }
+            eps.forEach(function (e) {
+                var st = epState(e, today);
+                if (st === 'owned') ownedCount++;
+                else if (st === 'upcoming') upcoming++;
+                else missing++;
+            });
+        });
+        var selected = modalState && modalState.sel ? modalState.sel.size : missing;
+        var copy = lazy ? 'Expand seasons to load exact episodes' : (missing ? 'Missing aired episodes are preselected' : 'You already have the aired catalog');
+        box.innerHTML = '<div class="vgm-plan-copy">' +
+            '<span class="vgm-plan-k">Acquisition plan</span>' +
+            '<span class="vgm-plan-v">' + esc(copy) + '</span>' +
+            '</div><div class="vgm-plan-metrics">' +
+            metric('selected', '<span data-vgm-plan-selected>' + selected + '</span>', 'vgm-plan-want') +
+            metric('missing', missing + (lazy ? '+' : ''), 'vgm-plan-missing') +
+            metric('owned', ownedCount, 'vgm-plan-ok') +
+            (upcoming ? metric('upcoming', upcoming, 'vgm-plan-soon') : '') +
+            '</div>';
+        box.hidden = false;
+    }
     // Ratings strip: branded chips for whichever scores the payload carries.
     function renderRatings(d) {
         var box = modalEl && modalEl.querySelector('[data-vgm-ratings]'); if (!box) return;
@@ -736,6 +777,12 @@
     // Returns a positioned wrapper holding 0–2 buttons.
     function cardButton(o) {
         if (!o || !o.kind) return '';
+        // a profile without download rights asks instead: the get modal and the
+        // watchlist are gated for it. owned titles have nothing left to ask for.
+        if ((o.kind === 'movie' || o.kind === 'show') && typeof canDownload === 'function' && !canDownload()) {
+            var ask = (o.source !== 'library' && window.VideoRequests) ? VideoRequests.cardButton(o) : '';
+            return ask ? '<span class="vcard-ctrls">' + ask + '</span>' : '';
+        }
         var parts = [];
         if (o.kind === 'person') {
             if (window.VideoWatchlist) parts.push(VideoWatchlist.btn({ kind: 'person', tmdbId: o.tmdbId, title: o.title, poster: o.poster }));

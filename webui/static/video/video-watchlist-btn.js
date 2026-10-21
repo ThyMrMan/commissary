@@ -1,5 +1,5 @@
 /*
- * Commissary — Video watchlist button (shared).
+ * SoulSync — Video watchlist button (shared).
  *
  * One source of truth so every TV-show poster and person card gets the SAME
  * "add to watchlist" control + behaviour — the video mirror of the music
@@ -47,10 +47,15 @@
 
     function paint(b, on) {
         b.classList.toggle('active', on);
+        b.classList.toggle('watching', on);          // detail-page text buttons use this visual state
         b.title = on ? 'On watchlist' : 'Add to watchlist';
         b.setAttribute('aria-label', b.title);
         var svg = b.querySelector('svg');
         if (svg) svg.setAttribute('fill', on ? 'currentColor' : 'none');
+        var ic = b.querySelector('.watchlist-icon');
+        if (ic) ic.textContent = on ? '✓' : '＋';
+        var tx = b.querySelector('.watchlist-text');
+        if (tx) tx.textContent = on ? 'In Watchlist' : 'Watchlist';
     }
 
     // Reflect a (kind, id) across EVERY matching button in the DOM — the same
@@ -184,6 +189,8 @@
         // it's the one hook that reaches ALL cards — hydrate wishlist ribbons
         // in the same pass (separate module; one batched POST of its own).
         if (window.VideoWishState) VideoWishState.hydrate(root);
+        // and the Requested / Available ribbons for profiles that ask instead
+        if (window.VideoRequests) VideoRequests.hydrate(root);
         ['show', 'person', 'studio'].forEach(function (kind) {
             var nodes = root.querySelectorAll('.vwl-btn[data-vwl-kind="' + kind + '"]');
             if (!nodes.length) return;

@@ -5,7 +5,7 @@ passed as the FIRST positional param of every call as the string
 ``token:<secret>``. The RPC endpoint is ``<host>:6800/jsonrpc``.
 
 A few aria2 quirks the adapter smooths over:
-- the secret maps onto Commissary's ``password`` field (aria2 has no username),
+- the secret maps onto SoulSync's ``password`` field (aria2 has no username),
 - ``addUri`` returns a GID — that's our torrent id,
 - aria2 does NOT delete files on remove; for ``delete_files`` we read the file
   paths first and unlink them ourselves,
@@ -17,15 +17,14 @@ Reference: https://aria2.github.io/manual/en/html/aria2c.html#rpc-interface
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import os
 from typing import List, Optional
 
 import requests as http_requests
 
-from config.settings import config_manager
-from core.torrent_clients import infohash
+from core.settings import config_manager
+from core.async_utils import run_control
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
@@ -59,7 +58,7 @@ class Aria2Adapter:
     DEFAULT_TIMEOUT = 15
     _STATUS_KEYS = ['gid', 'status', 'totalLength', 'completedLength', 'downloadSpeed',
                     'uploadSpeed', 'connections', 'numSeeders', 'dir', 'files',
-                    'errorMessage', 'bittorrent']
+                    'errorMessage', 'bittorrent', 'infoHash']
 
     def __init__(self) -> None:
         self._load_config()
@@ -72,7 +71,9 @@ class Aria2Adapter:
         self._url = url
         # aria2 has no username; the RPC secret maps onto the password field.
         self._secret = config_manager.get('torrent_client.password', '') or ''
-        self._category = config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        self._category = str(
+            config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        ).strip() or 'soulsync'
         self._save_path = config_manager.get('torrent_client.save_path', '') or ''
 
     def reload_settings(self) -> None:
@@ -107,14 +108,12 @@ class Aria2Adapter:
     async def check_connection(self) -> bool:
         if not self.is_configured():
             return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._rpc('aria2.getVersion') is not None)
+        return await run_control(lambda: self._rpc('aria2.getVersion') is not None)
 
     # ── add ──
-    async def add_torrent(self, url_or_magnet: str, category: Optional[str] = None,
+    async def add_torrent(self, url_or_magnet: str, category: str = "soulsync",
                           save_path: Optional[str] = None) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._add_uri_sync, url_or_magnet, save_path)
+        return await run_control(self._add_uri_sync, url_or_magnet, save_path)
 
     def _opts(self, save_path: Optional[str]) -> dict:
         opts: dict = {}
@@ -124,81 +123,35 @@ class Aria2Adapter:
 
     def _add_uri_sync(self, uri: str, save_path: Optional[str]) -> Optional[str]:
         result = self._rpc('aria2.addUri', [uri], self._opts(save_path))
-        return str(result) if result else self._existing_ref(uri)   # GID
+        if not result:
+            # Commissary: aria2 errors on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import aria2_held
+            return aria2_held(self, uri)
+        return str(result)   # GID
 
-    async def add_torrent_file(self, file_bytes: bytes, category: Optional[str] = None,
+    async def add_torrent_file(self, file_bytes: bytes, category: str = "soulsync",
                                save_path: Optional[str] = None) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._add_file_sync, file_bytes, save_path)
+        return await run_control(self._add_file_sync, file_bytes, save_path)
 
     def _add_file_sync(self, file_bytes: bytes, save_path: Optional[str]) -> Optional[str]:
         b64 = base64.b64encode(file_bytes).decode('ascii')
         result = self._rpc('aria2.addTorrent', b64, [], self._opts(save_path))
-        return str(result) if result else self._existing_ref(file_bytes)
-
-    # Just enough to match an existing download to what we tried to add. The
-    # full _STATUS_KEYS payload would be wasted here — this runs once, on a
-    # refusal, and only needs to map info-hash back to GID.
-    _REF_KEYS = ['gid', 'infoHash']
-
-    def _existing_ref(self, payload) -> Optional[str]:
-        """The GID of a torrent aria2 ALREADY holds, when the add was refused.
-
-        aria2 errors on a duplicate ("Duplicate torrent") and ``_rpc`` maps that
-        to None, which the stack above reads as "the client didn't accept the
-        release" — no download row, nothing polling the torrent already sitting
-        there, and an hourly re-grab that can never succeed.
-
-        aria2 is the one adapter whose identifier is NOT the info-hash: it hands
-        out a GID. So unlike Deluge, knowing the expected hash is not the answer
-        by itself — it has to be looked up across the three queues to recover the
-        GID that ``get_status`` will actually answer to. Stopped is included on
-        purpose: a torrent that finished and is no longer active is exactly the
-        one whose duplicate add needs adopting."""
-        expected = infohash.expected_hash(payload)
-        if not expected:
-            return None
-        for rows in (self._rpc('aria2.tellActive', self._REF_KEYS),
-                     self._rpc('aria2.tellWaiting', 0, 1000, self._REF_KEYS),
-                     self._rpc('aria2.tellStopped', 0, 1000, self._REF_KEYS)):
-            for item in (rows or []):
-                if not isinstance(item, dict):
-                    continue
-                if str(item.get('infoHash') or '').lower() != expected:
-                    continue
-                gid = str(item.get('gid') or '')
-                if gid:
-                    logger.info("aria2 already had %s as gid %s — the add was a "
-                                "duplicate, not a refusal; adopting it", expected, gid)
-                    return gid
-        return None
+        if not result:
+            # Commissary: aria2 errors on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import aria2_held
+            return aria2_held(self, file_bytes)
+        return str(result)
 
     # ── status ──
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_status_sync, torrent_id)
+        return await run_control(self._get_status_sync, torrent_id)
 
     def _get_status_sync(self, gid: str) -> Optional[TorrentStatus]:
         result = self._rpc('aria2.tellStatus', gid, self._STATUS_KEYS)
         return self._parse_status(result) if result else None
 
-    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
-
-    def _list_files_sync(self, gid: str) -> Optional[List[str]]:
-        """aria2 gives ABSOLUTE paths; the classifier reads basenames, so that
-        costs nothing. A torrent still fetching metadata reports one placeholder
-        file named after the .torrent itself, which classifies as unknown."""
-        result = self._rpc('aria2.tellStatus', gid, ['files'])
-        if not isinstance(result, dict):
-            return None
-        return [str(f.get('path')) for f in (result.get('files') or [])
-                if isinstance(f, dict) and f.get('path')]
-
     async def get_all(self) -> List[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_all_sync)
+        return await run_control(self._get_all_sync)
 
     def _get_all_sync(self) -> List[TorrentStatus]:
         active = self._rpc('aria2.tellActive', self._STATUS_KEYS) or []
@@ -234,12 +187,13 @@ class Aria2Adapter:
             save_path=item.get('dir'),
             files=file_paths,
             error=item.get('errorMessage') or None,
+            # aria2's id is a gid, so the hash rides separately
+            info_hash=str(item.get('infoHash') or '').lower() or None,
         )
 
     # ── remove / pause / resume ──
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._remove_sync, torrent_id, delete_files)
+        return await run_control(self._remove_sync, torrent_id, delete_files)
 
     def _remove_sync(self, gid: str, delete_files: bool) -> bool:
         st = self._rpc('aria2.tellStatus', gid, ['status', 'files']) or {}
@@ -262,9 +216,7 @@ class Aria2Adapter:
         return ok
 
     async def pause(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._rpc('aria2.pause', torrent_id) is not None)
+        return await run_control(lambda: self._rpc('aria2.pause', torrent_id) is not None)
 
     async def resume(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self._rpc('aria2.unpause', torrent_id) is not None)
+        return await run_control(lambda: self._rpc('aria2.unpause', torrent_id) is not None)

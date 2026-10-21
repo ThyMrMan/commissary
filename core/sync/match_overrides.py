@@ -29,6 +29,21 @@ from utils.logging_config import get_logger
 logger = get_logger("sync.match_overrides")
 
 
+def match_lookup_ids(track: Any) -> List[str]:
+    """ids a user's saved match can be filed under, in lookup order.
+
+    a sync track's ``id`` is whatever discovery matched (a catalogue id, or a
+    ``wing_it_`` stub), but Find & Add files its match under the playlist's own
+    ``source_track_id``. checking only ``id`` missed every match on a wing-it
+    track or a track discovered on another provider (#1289)."""
+    ids: List[str] = []
+    for value in (getattr(track, 'id', None), getattr(track, 'source_track_id', None)):
+        text = str(value or '').strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
+
+
 def resolve_match_overrides(
     source_tracks: List[Dict[str, Any]],
     server_tracks: List[Dict[str, Any]],
@@ -127,6 +142,263 @@ def record_manual_match(
         return False
 
 
+def _cache_row_is_user_confirmed(cached: Dict[str, Any]) -> bool:
+    """Is this ``sync_match_cache`` row a USER-CONFIRMED pairing, or one the
+    sync's auto-matcher wrote for its own reuse?
+
+    The table holds both. ``record_manual_match`` writes confidence=1.0; the
+    sync fast-path stores every auto-match it makes at its real score (>=0.7,
+    ``services/sync_service.py``) so the next run can skip re-matching. The
+    compare view's pass 0 documented itself as applying "user-confirmed match
+    overrides ... persisted at confidence=1.0" but never actually checked, so a
+    0.75 auto-match was pinned as if the user had confirmed it (#1159,
+    AfonsoG6): the bad pairing came back on every load, and — because a cache
+    hit that points into the playlist short-circuits the durable path — the
+    user's SAVED manual match was never even consulted. His words: "almost as
+    if the 'saved matches list' is not being consulted."
+
+    A row with no readable confidence is trusted: only a numeric score below
+    1.0 proves the row came from the auto-matcher, and the sync always writes
+    one. (Stub DBs in tests return rows without the key.)"""
+    raw = cached.get("confidence")
+    if raw is None:
+        return True
+    try:
+        return float(raw) >= 1.0
+    except (TypeError, ValueError):
+        return True
+
+
+# An auto-match only ever gets cached after the matcher scored the cached
+# track's TITLE against the source title — the sync writes the row itself,
+# from a match it just made. The writers scored titles the way
+# ``_score_title_similarity`` does: max(raw similarity, cleaned similarity),
+# where the cleaned form strips feat./ft./(with …) tails — the one broken
+# writer (the pre-#1715 album fallback) cached on exactly that score at
+# >= the sync threshold. A cached track whose title is not even roughly
+# similar under EITHER form therefore cannot be an auto-match at all: the
+# row must be a user-confirmed pick, which can point at a file tagged with
+# a completely different title ('Track 09', #1289) and is honored as stored.
+_AUTO_MATCH_TITLE_FLOOR = 0.65
+
+# Names that carry no artist evidence either way — the same placeholder set
+# the #1715 album-fallback gate uses, compared squashed after normalization.
+_PLACEHOLDER_SQUASHED = frozenset({
+    "unknown", "unknownartist", "unknownartists", "artistunknown",
+    "noartist", "unknownalbum", "unknownalbumartist", "untitled",
+})
+
+_CREDIT_SPLIT_RE = r"\s*(?:[;,&]|\bfeat\.?\b|\bft\.?\b|\bfeaturing\b|\bvs\.?\b|\bx\b)\s*"
+
+
+# VA spellings, squashed the same way: 'Various Artists', '[Various
+# Artists]', 'Various-Artists' and 'Various Artists.' are all the same
+# non-evidence. The compilation helper's VA set is exact-match, so these
+# punctuated forms need the squash comparison too (round-2 review: with
+# only the exact set, a no-credit VA row under a bracketed spelling was
+# treated as carrying a specific, conflicting artist and dropped).
+_VA_SQUASHED = frozenset({"va", "various", "variousartist", "variousartists"})
+
+
+def _squash_name(db: Any, name: Any) -> str:
+    """A name reduced to its alphanumeric bones for placeholder tests."""
+    import re as _re
+    n = "" if name is None else str(name)
+    normalize = getattr(db, "_normalize_for_comparison", None)
+    if normalize is not None:
+        try:
+            n = str(normalize(n))
+        except Exception as e:  # noqa: BLE001 - fall back to the raw name
+            logger.debug("name normalize failed for placeholder test: %s", e)
+    return _re.sub(r"[^a-z0-9]", "", n.casefold())
+
+
+def _is_placeholder_artist(db: Any, name: Any) -> bool:
+    """VA / placeholder names carry no artist evidence (mirrors the
+    #1715 fallback's test, extended to punctuated VA spellings)."""
+    n = "" if name is None else str(name).strip()
+    if not n:
+        return True
+    try:
+        from core.imports.compilation import is_various_artists_name
+        if is_various_artists_name(n):
+            return True
+    except Exception as e:  # noqa: BLE001 - helper unavailable == not VA-evidenced
+        logger.debug("VA-name check unavailable for %r: %s", n, e)
+    squashed = _squash_name(db, n)
+    return squashed in _PLACEHOLDER_SQUASHED or squashed in _VA_SQUASHED
+
+
+def _artist_key(db: Any, name: str) -> str:
+    try:
+        from core.text.normalize import normalize_key
+        return normalize_key(name)
+    except Exception:
+        normalize = getattr(db, "_normalize_for_comparison", None)
+        try:
+            return str(normalize(name)) if normalize is not None else str(name).casefold()
+        except Exception:  # noqa: BLE001 - an unkeyable name keys to nothing
+            return ""
+
+
+def _evidence_keys(db: Any, row: Any) -> set:
+    """Keyed artist names a library row evidences: the album artist and the
+    per-track credit, each whole and split on credit delimiters — the
+    #1715 fallback's evidence semantics. Placeholder/VA names are skipped:
+    they are the ABSENCE of evidence, not evidence against anyone."""
+    import re as _re
+    keys = set()
+    for raw in (getattr(row, "artist_name", None), getattr(row, "track_artist", None)):
+        if not isinstance(raw, str):
+            continue  # a non-string artist field is corruption, not evidence
+        name = raw
+        if not name.strip() or _is_placeholder_artist(db, name):
+            continue
+        # A name that keys to nothing ('!!!') is no evidence either —
+        # an empty key must never convict a row (round-2 review).
+        whole = _artist_key(db, name)
+        if whole:
+            keys.add(whole)
+        normalize = getattr(db, "_normalize_for_comparison", None)
+        split_base = str(normalize(name)) if normalize is not None else name
+        for piece in _re.split(_CREDIT_SPLIT_RE, split_base, flags=_re.IGNORECASE):
+            if piece.strip():
+                piece_key = _artist_key(db, piece)
+                if piece_key:
+                    keys.add(piece_key)
+    return keys
+
+
+def _source_artist_keys(db: Any, artists: List[str]) -> set:
+    """Keyed names for the source's artists: every known variation, keyed
+    the way the #1715 evidence gate keys them."""
+    keys = set()
+    variations = getattr(db, "_get_artist_variations", None)
+    for artist in artists:
+        names = [artist]
+        if variations is not None:
+            try:
+                names.extend(variations(artist) or [])
+            except Exception as e:  # noqa: BLE001 - variations are best-effort
+                logger.debug("artist variations failed for %r: %s", artist, e)
+        for name in names:
+            if str(name or "").strip():
+                key = _artist_key(db, str(name))
+                if key:
+                    keys.add(key)
+    return keys
+
+
+def cached_match_is_stale(
+    db: Any,
+    *,
+    title: str,
+    artists: List[str],
+    album: Optional[str],
+    server_source: str,
+    cached_track_id: Any,
+    cached_track_row: Any,
+    threshold: float,
+) -> bool:
+    """Is this ``sync_match_cache`` row an AUTO-match the CURRENT matcher
+    would no longer make — the #1715 poison shape? (#1721)
+
+    The cache fast-path in the sync matchers used to return a cached
+    pairing unchecked, forever: a row written by a matcher bug (the #1715
+    album fallback matched a same-titled track by a different artist at
+    confidence 1.0) survived the fix that gated the matcher itself, so
+    every re-sync put the wrong song back on the playlist. The row is only
+    ever invalidated by hand (database admin), so nothing self-healed.
+
+    Returns True only on conclusive evidence — ALL three:
+      * title-shaped like an auto-match: max(raw, cleaned) title
+        similarity clears the floor (a dissimilar title means a
+        user-confirmed pick, never stale);
+      * the cached row carries real artist evidence (a specific album
+        artist or per-track credit) and NONE of it agrees with any source
+        artist under the #1715 exact-key evidence semantics. A row with
+        NO evidence (Various Artists / placeholder filing, no credit) is
+        unverifiable, not wrong — the #1715 gate itself still matches
+        that shape on title+album, so the cache row is kept;
+      * ``check_track_exists`` under today's rules, given the cached
+        track as its only candidate plus the album-aware fallback, does
+        not pick the cached track for ANY of the source's artists.
+
+    Anything inconclusive (missing row or helpers, scoring errors, a stub
+    db whose "track" has no real id) returns False: the cached pairing is
+    honored exactly as before. A user-confirmed pairing additionally
+    survives via the durable manual match the sync checks right after the
+    cache, so dropping a stale auto row can never unpick a Find & Add the
+    durable table knows about."""
+    if cached_track_row is None or cached_track_id is None:
+        return False
+    names = [str(a).strip() for a in (artists or []) if str(a or "").strip()]
+    if not names or not (title or "").strip():
+        return False
+    normalize = getattr(db, "_normalize_for_comparison", None)
+    similarity = getattr(db, "_string_similarity", None)
+    check = getattr(db, "check_track_exists", None)
+    if normalize is None or similarity is None or check is None:
+        return False
+    # Gate 1 — title shape, scored the way the writers scored it.
+    cached_title = getattr(cached_track_row, "title", "") or ""
+    try:
+        title_sim = similarity(normalize(title), normalize(cached_title))
+        clean = getattr(db, "_clean_track_title_for_comparison", None)
+        if clean is not None:
+            title_sim = max(title_sim, similarity(clean(title), clean(cached_title)))
+    except Exception:
+        return False
+    if not isinstance(title_sim, (int, float)) or isinstance(title_sim, bool):
+        return False
+    if title_sim < _AUTO_MATCH_TITLE_FLOOR:
+        return False
+    # Gate 2 — positive conflicting artist evidence on the cached row.
+    # Wrapped: a malformed row (non-string artist fields, a db whose
+    # helpers misbehave) is inconclusive, never a crash (round-2 review).
+    try:
+        evidence = _evidence_keys(db, cached_track_row)
+        source_keys = _source_artist_keys(db, names)
+    except Exception as e:  # noqa: BLE001 - inconclusive == not stale
+        logger.debug("cached-match evidence check failed: %s", e)
+        return False
+    if not evidence:
+        return False
+    if evidence & source_keys:
+        return False
+    # Gate 3 — today's matcher, given every chance, does not re-pick it.
+    for artist in names:
+        try:
+            track, _conf = check(
+                title, artist,
+                confidence_threshold=threshold,
+                server_source=server_source,
+                album=album or None,
+                candidate_tracks=[cached_track_row],
+            )
+        except Exception:
+            return False
+        if track is None:
+            continue
+        track_id = getattr(track, "id", None)
+        if not isinstance(track_id, (str, int)) or isinstance(track_id, bool):
+            return False  # a stub "track" proves nothing either way
+        if str(track_id) == str(cached_track_id):
+            return False
+    return True
+
+
+def drop_stale_cached_match(db: Any, source_track_id: Any, server_source: str) -> None:
+    """Best-effort delete of one proven-stale cache row. Never raises."""
+    deleter = getattr(db, "delete_sync_match_cache", None)
+    if deleter is None:
+        return
+    try:
+        deleter(str(source_track_id), server_source)
+    except Exception as e:  # noqa: BLE001 - bookkeeping must not fail a sync
+        logger.debug("stale sync match cache delete failed: %s", e)
+
+
 def resolve_override_server_id(
     db: Any,
     profile_id: int,
@@ -142,7 +414,7 @@ def resolve_override_server_id(
     PLAYLIST (``valid_server_ids``).
 
     Why (wolf39us / Plex): a cache hit was previously returned unconditionally, so a
-    STALE entry — Plex reassigned the library ratingKey without a Commissary rescan to
+    STALE entry — Plex reassigned the library ratingKey without a SoulSync rescan to
     wipe the cache — short-circuited the durable path and the manual match silently
     never applied (resolve_match_overrides drops a server id that isn't in the
     playlist). Falling through to the durable match lets it self-heal the stale id
@@ -153,6 +425,10 @@ def resolve_override_server_id(
     except Exception:
         cached = {}
     cached_id = cached.get("server_track_id")
+    if cached_id is not None and not _cache_row_is_user_confirmed(cached):
+        # An auto-match the sync cached for its own reuse — not a user
+        # confirmation, so it must not pin the pairing here (#1159).
+        cached_id = None
     if cached_id is not None:
         if str(cached_id) in valid_server_ids:
             return cached_id
@@ -182,13 +458,21 @@ def build_bulk_override_lookup(
     a cache hit is only trusted while it points into THIS playlist, else the
     durable manual match applies, with the per-row file-path self-heal kept
     for the (rare) stale rows. Falls back to the per-row resolver when the DB
-    doesn't offer the bulk readers (stub DBs)."""
+    doesn't offer the bulk readers (stub DBs).
+
+    The returned callable carries ``dead_match_source_ids``: source ids that
+    HAVE a saved manual match which could not be applied by any route (#1138).
+    Callers must not present those rows as "already matched" — the saved match
+    points at something that no longer exists, and claiming otherwise costs the
+    user the Find & Add and download affordances, so the track is silently
+    neither synced nor wishlisted."""
     if not (hasattr(db, "read_sync_match_cache_bulk")
             and hasattr(db, "find_manual_library_matches_bulk")):
         def _per_row(src_id):
             return resolve_override_server_id(
                 db, profile_id, src_id, server_source, valid_server_ids,
                 getattr(db, "read_sync_match_cache", lambda *_a: None))
+        _per_row.dead_match_source_ids = set()
         return _per_row
 
     ids = [str(s.get("source_track_id")) for s in (source_tracks or [])
@@ -202,10 +486,16 @@ def build_bulk_override_lookup(
     except Exception:
         durable_map = {}
 
+    dead_ids: set = set()
+
     def _lookup(source_track_id):
         sid = str(source_track_id)
         cached = cache_map.get(sid) or {}
         cached_id = cached.get("server_track_id")
+        if cached_id is not None and not _cache_row_is_user_confirmed(cached):
+            # Auto-match reuse row, not a user confirmation (#1159) — fall
+            # through to the durable manual match / normal matching.
+            cached_id = None
         if cached_id is not None:
             if str(cached_id) in valid_server_ids:
                 return cached_id
@@ -234,15 +524,23 @@ def build_bulk_override_lookup(
         # Every path exhausted — the user's confirmed match CANNOT apply. Say
         # exactly why, or this renders as a bare "missing" row and looks like
         # the match was never saved (the wolf39us report shape).
+        # Every path exhausted: this saved match is DEAD (its file was deleted,
+        # or the library row went away). Remember it so the caller stops
+        # advertising the row as "already matched" — see #1138, where a match
+        # to a since-deleted file left the track with no Find & Add and no
+        # download, so reprocessing the playlist silently skipped it forever.
+        dead_ids.add(sid)
         logger.warning(
             "Manual match for source %s (%s) cannot apply: library track %s is not "
-            "in this playlist and the file-path fallback %s. The track likely needs "
-            "re-adding to the playlist (Find & Add), or the library row was re-keyed.",
+            "in this playlist and the file-path fallback %s. Treating the saved match "
+            "as stale so the track can be re-matched or wishlisted; remove it from "
+            "Tools → Manual Library Match to stop this warning.",
             sid, server_source, lib_id,
             ("resolved nothing for %r" % (file_path,)) if file_path else "is empty (no stored path)",
         )
         return None
 
+    _lookup.dead_match_source_ids = dead_ids
     return _lookup
 
 

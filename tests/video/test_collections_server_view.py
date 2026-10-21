@@ -1,4 +1,4 @@
-"""Server-cleanup view: list every collection ON the media server (Commissary-
+"""Server-cleanup view: list every collection ON the media server (SoulSync-
 managed marked via the sync ledger, foreign — e.g. old Kometa — unmarked) and
 bulk-delete by server id."""
 

@@ -33,21 +33,16 @@ _ALLOWED_GET = frozenset({
     '/api/setup/status',      # #842: first-run check runs before the PIN screen;
                               # blocking it made the frontend think setup wasn't
                               # done and re-launch the wizard on every visit.
-    '/api/auth/plex/status',  # Sign in with Plex: poll for PIN authorization
 })
 
 # POST endpoints that drive selection + unlock. Selecting a profile only sets
 # session['profile_id'] (+ any per-profile PIN check); it does NOT set
-# launch_pin_verified, so it can't bypass the launch lock. Sign in with Plex
-# (/api/auth/plex/*) follows the exact same rule — its success path sets
-# session['profile_id'] the same way profile-select does, never
-# launch_pin_verified, so completing it still leaves the shared PIN required.
+# launch_pin_verified, so it can't bypass the launch lock.
 _ALLOWED_POST = frozenset({
     '/api/profiles/select',
     '/api/profiles/verify-launch-pin',
     '/api/profiles/reset-pin-via-credential',
     '/api/profiles/logout',
-    '/api/auth/plex/start',
 })
 
 
@@ -89,6 +84,9 @@ def request_is_locked(path: str, method: str, *,
     if method == 'GET' and path in _ALLOWED_GET:
         return False
     if method == 'POST' and path in _ALLOWED_POST:
+        return False
+    from core.security.session_profile import is_open_profile_path
+    if is_open_profile_path(path, method):
         return False
 
     return True

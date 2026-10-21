@@ -27,6 +27,8 @@ entirely.
 """
 
 import errno
+import hashlib
+import json
 import os
 import re
 import shutil
@@ -61,6 +63,7 @@ _HUNG_WORKER_THRESHOLD_SECONDS = 300  # 5 min — generous; real worst-case
                                        # is ffmpeg downsampling a long
                                        # hi-res FLAC, ~30-60s typically.
 
+from core.library.release_identity import read_release_identity
 from core.metadata_service import (
     get_album_for_source,
     get_album_tracks_for_source,
@@ -68,9 +71,51 @@ from core.metadata_service import (
     get_primary_source,
     get_source_priority,
 )
+from core.source_ids import id_column
 from utils.logging_config import get_logger
 
 logger = get_logger("library_reorganize")
+
+
+def resolve_album_profile_id(db, album_id, tracks=None, resolve_file_path_fn=None) -> Optional[int]:
+    """the owning profile for a reorganize operation (#1504).
+
+    File location wins over the DB: resolve the first track's on-disk path
+    and match it against own-library roots. Falls back to the album row's
+    ``owner_profile_id``. Returns None for the shared library (unchanged
+    behavior)."""
+    from core.imports.paths import profile_id_for_path
+    # 1. file location wins — where the files actually sit right now
+    try:
+        track_list = tracks
+        if track_list is None:
+            _, track_list = load_album_and_tracks(db, album_id)
+        for t in track_list or []:
+            db_path = t.get('file_path') if isinstance(t, dict) else None
+            if not db_path:
+                continue
+            resolved = resolve_file_path_fn(db_path) if resolve_file_path_fn else db_path
+            if resolved:
+                pid = profile_id_for_path(resolved)
+                if pid:
+                    return pid
+                break  # resolved but shared — don't keep looking
+    except Exception as e:
+        logger.debug("[Reorganize] profile resolution from path failed: %s", e)
+    # 2. DB fallback: who the album row says owns it
+    try:
+        conn = db._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT owner_profile_id FROM albums WHERE id = ?", (str(album_id),)
+            ).fetchone()
+            if row and row[0]:
+                return int(row[0])
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("[Reorganize] profile resolution from album row failed: %s", e)
+    return None
 
 
 def _safe_filename(name: str) -> str:
@@ -126,7 +171,7 @@ def available_sources_for_album(album_data: dict) -> List[dict]:
     """Return the list of metadata sources the user can pick for this
     album's reorganize. Every entry has both (a) a stored album ID on
     the local row AND (b) an authenticated / configured client on this
-    Commissary instance.
+    SoulSync instance.
 
     Returns entries in source-priority order (preferred source first).
     Each entry is ``{'source': str, 'label': str}``. No API calls —
@@ -155,7 +200,7 @@ def available_sources_for_album(album_data: dict) -> List[dict]:
 
 def authed_sources() -> List[dict]:
     """Return all metadata sources the user has authed/configured on
-    this Commissary instance. Doesn't require any album-specific stored
+    this SoulSync instance. Doesn't require any album-specific stored
     ID — used by the bulk "Reorganize All" picker where each album
     has its own ID coverage and we just want to know which sources
     are reachable. Returned in priority order."""
@@ -184,6 +229,25 @@ def _is_unknown_artist(artist_name: Optional[str]) -> bool:
     if not artist_name:
         return True
     return str(artist_name).strip().lower() in _UNKNOWN_ARTIST_NAMES
+
+
+def _source_album_artist(api_album) -> str:
+    """the album artist the metadata source gives the album, '' when it gives
+    none. every source shape: a spotify-style artists list, a bare artist or
+    artist_name, or a tag-mode album_artist."""
+    if not isinstance(api_album, dict):
+        return ''
+    artists = api_album.get('artists')
+    if isinstance(artists, list) and artists:
+        first = artists[0]
+        name = first.get('name') if isinstance(first, dict) else first
+    else:
+        name = (api_album.get('album_artist') or api_album.get('artist')
+                or api_album.get('artist_name'))
+        if isinstance(name, dict):
+            name = name.get('name')
+    name = str(name or '').strip()
+    return '' if _is_unknown_artist(name) else name
 
 
 def _looks_like_album_id_title(album_title: Optional[str]) -> bool:
@@ -244,15 +308,16 @@ def _resolve_better_edition(album_data, source_ids, file_tracks, primary_source)
     from core.metadata.canonical_resolver import (
         default_fetch_alternates,
         default_fetch_tracklist,
+        provider_artist_id,
         resolve_canonical_for_album,
     )
-    art_id = str(album_data.get('artist_id') or '')
     art_name = album_data.get('artist_name') or ''
     title = album_data.get('title') or ''
 
     def _alts(source, aid):
         return default_fetch_alternates(
-            source, aid, artist_id=art_id, artist_name=art_name, album_title=title,
+            source, aid, artist_id=provider_artist_id(album_data, source),
+            artist_name=art_name, album_title=title,
         )
 
     try:
@@ -288,6 +353,7 @@ def _resolve_better_edition(album_data, source_ids, file_tracks, primary_source)
 def _resolve_source(
     album_data: dict, primary_source: str, strict_source: bool = False,
     *, file_tracks: Optional[List[dict]] = None, on_better_edition=None,
+    resolved: Optional[dict] = None,
 ):
     """Walk the configured source priority looking for the first source
     we have an ID for AND that returns a usable tracklist.
@@ -303,9 +369,23 @@ def _resolve_source(
     alternate-edition search (#767-2). ``on_better_edition(source, album_id,
     score)`` is invoked to persist the pin when a better edition is chosen.
 
+    ``resolved``, when given, is filled with ``{'source', 'album_id'}`` of the
+    release that answered, or ``{'unavailable': True}`` when the release the
+    album was placed with (#1701) didn't answer this time.
+
     Returns ``(source_name, album_meta, tracks_list)`` or ``(None, None, None)``.
     """
+    if resolved is None:
+        resolved = {}
     source_ids = _extract_source_ids(album_data)
+
+    def _fetch(source, album_id):
+        api_album = get_album_for_source(source, album_id)
+        items = _normalize_album_tracks(get_album_tracks_for_source(source, album_id))
+        if items and api_album:
+            resolved.update(source=source, album_id=str(album_id))
+            return source, api_album, items
+        return None
 
     # #765: if a canonical release was pinned for this album (best-fit to the
     # user's actual files), prefer it — so reorganize agrees with Track Number
@@ -313,18 +393,35 @@ def _resolve_source(
     # on the album row carrying a canonical, and skipped when the user explicitly
     # picked a source in the modal (strict_source) — their choice wins. Falls
     # through to the priority walk if the canonical fetch fails.
+    #
+    # #1701: once reorganize has placed the album, the release it used wins over
+    # an AUTO pin set later, and a failed lookup of it skips the album instead
+    # of walking on to another source. otherwise a pin written after the move,
+    # or one rate-limited scan, renames the whole album again. a LOCKED pin is
+    # the user picking a version, so it still comes first.
     if not strict_source:
         c_source = album_data.get('canonical_source')
         c_id = album_data.get('canonical_album_id')
-        if c_source and c_id:
+        c_locked = bool(album_data.get('canonical_locked'))
+        p_source = album_data.get('reorganize_source')
+        p_id = album_data.get('reorganize_album_id')
+        attempts = []
+        if c_source and c_id and c_locked:
+            attempts.append(('canonical', c_source, c_id))
+        if p_source and p_id:
+            attempts.append(('placed', p_source, p_id))
+        if c_source and c_id and not c_locked:
+            attempts.append(('canonical', c_source, c_id))
+        for kind, a_source, a_id in attempts:
             try:
-                api_album = get_album_for_source(c_source, c_id)
-                api_tracks = get_album_tracks_for_source(c_source, c_id)
-                items = _normalize_album_tracks(api_tracks)
-                if items and api_album:
-                    return c_source, api_album, items
+                hit = _fetch(a_source, a_id)
+                if hit:
+                    return hit
             except Exception as e:
-                logger.warning(f"[Reorganize] canonical {c_source} lookup raised: {e}")
+                logger.warning(f"[Reorganize] {kind} {a_source} lookup raised: {e}")
+            if kind == 'placed':
+                resolved['unavailable'] = True
+                return None, None, None
 
     if strict_source:
         sources_to_try = [primary_source] if primary_source else []
@@ -346,6 +443,7 @@ def _resolve_source(
         if not items or not api_album:
             continue
         walk_source, walk_album, walk_items = source, api_album, items
+        resolved.update(source=source, album_id=str(sid))
         break
 
     # #767-2: the walk takes the first source we have an ID for, but that ID can
@@ -361,6 +459,7 @@ def _resolve_source(
             )
             if better is not None:
                 b_source, b_id, b_album, b_items, b_score = better
+                resolved.update(source=b_source, album_id=str(b_id))
                 if on_better_edition:
                     try:
                         on_better_edition(b_source, b_id, b_score)
@@ -432,10 +531,42 @@ def _feat_in_title_enabled() -> bool:
     switch the download path does. Isolated in a helper so tests can
     monkeypatch it without a full config manager."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         return bool(config_manager.get("metadata_enhancement.tags.feat_in_title", False))
     except Exception:
         return False
+
+
+# A folder the organizer itself writes for one disc of a multi-disc release:
+# "Disc 1" / "CD 1" (the `file_organization.disc_label` setting) and "CD01"
+# (the `$cdnum` template variable). Anchored and numeric so a real album called
+# "Discovery" or an artist called "CD" is never mistaken for one.
+_DISC_FOLDER_RE = re.compile(r'^(disc|disk|cd|volume|vol)\s*\.?\s*\d+$', re.IGNORECASE)
+
+
+def _already_organized_by_disc(tracks) -> bool:
+    """Do the user's files already sit in per-disc folders?
+
+    The single-disc cap below reads the user's layout from their track NUMBERS,
+    which cannot distinguish "a single-disc edition mis-matched against a deluxe"
+    (#1080) from "a multi-disc album that is still downloading". A part-downloaded
+    box set has only disc 1 on disk, uniquely numbered and inside disc 1 — exactly
+    what the cap keys on — so Reorganize proposed moving the album straight back
+    out of the disc folders the download pipeline had just created, and flipped it
+    back again once disc 2 arrived.
+
+    The files settle it. SoulSync only writes a disc folder when the release IS
+    multi-disc, so an album already living in one is organized, not mis-matched,
+    and the setting gating this cap is "preserve my organization".
+    """
+    for track in tracks or []:
+        path = str(track.get('file_path') or '').replace('\\', '/')
+        if not path:
+            continue                      # a missing file carries no evidence
+        parent = os.path.basename(os.path.dirname(path))
+        if parent and _DISC_FOLDER_RE.match(parent):
+            return True
+    return False
 
 
 def _preserve_casing_enabled() -> bool:
@@ -444,7 +575,7 @@ def _preserve_casing_enabled() -> bool:
     already-organized files were flagged for cosmetic re-casing). Default on.
     Isolated so tests can monkeypatch without a config manager."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         return bool(config_manager.get("library.reorganize_preserve_casing", True))
     except Exception:
         return True
@@ -616,7 +747,7 @@ def _score_candidate(
     Components:
 
     - **Exact normalized-title match** is the strongest signal — usually
-      enough on its own, especially because local titles Commissary wrote
+      enough on its own, especially because local titles SoulSync wrote
       should already match the source's text after normalization.
     - **Substring containment** with a length-ratio guard handles
       annotation drift like ``"The Recipe - Bonus Track"`` (local)
@@ -759,7 +890,8 @@ def load_album_and_tracks(db, album_id):
         cursor = conn.cursor()
         cursor.execute(
             """
-            SELECT al.*, ar.name as artist_name
+            SELECT al.*, ar.name as artist_name,
+                   ar.id as _artist_columns_start, ar.*
             FROM albums al
             JOIN artists ar ON al.artist_id = ar.id
             WHERE al.id = ?
@@ -769,7 +901,25 @@ def load_album_and_tracks(db, album_id):
         album_row = cursor.fetchone()
         if not album_row:
             return None, []
-        album_data = dict(album_row)
+        # Older and partial schemas may lack some enrichment columns. Read the
+        # artist side by position because album and artist rows share names
+        # like id and deezer_id; a combined sqlite3.Row resolves those names
+        # to the album value.
+        columns = [column[0] for column in cursor.description]
+        if '_artist_columns_start' in columns:
+            artist_start = columns.index('_artist_columns_start')
+            album_data = {
+                name: album_row[i] for i, name in enumerate(columns)
+                if i < artist_start
+            }
+            artist_columns = {
+                name: album_row[i] for i, name in enumerate(columns)
+                if i > artist_start
+            }
+            for source in ('spotify', 'itunes', 'deezer', 'discogs', 'musicbrainz'):
+                album_data[f'artist_{source}_id'] = artist_columns.get(id_column(source, 'artist'))
+        else:
+            album_data = dict(album_row)  # Legacy dict-backed database adapters.
 
         cursor.execute(
             """
@@ -789,6 +939,71 @@ def load_album_and_tracks(db, album_id):
                 conn.close()
             except Exception:  # noqa: S110 — finally-block cleanup, logger may be torn down
                 pass
+
+
+def _detect_compilation_enabled() -> bool:
+    try:
+        from core.settings import config_manager
+        return bool(config_manager.get("file_organization.detect_multi_artist_compilations", True))
+    except Exception:
+        return True
+
+
+def is_multi_artist_compilation(
+    album_artist: Optional[str],
+    tracks: Optional[List[dict]] = None,
+    api_tracks: Optional[List[dict]] = None,
+    threshold: int = 3,
+) -> bool:
+    """Detect if an album release is a compilation based on artist signals.
+
+    A release is identified as a compilation if:
+    1. The album artist name is explicitly 'Various Artists', 'Various', 'VA', 'V.A.', etc.
+    2. Or there are multiple tracks (>= threshold, default 3) with distinct primary
+       artists, where neither any single track artist nor the album artist accounts
+       for more than 50% of the total tracks.
+    """
+    clean_aa = str(album_artist or '').strip().lower()
+    if clean_aa in ('various artists', 'various', 'va', 'v.a.', 'soundtrack'):
+        return True
+
+    track_artists: List[str] = []
+    if api_tracks:
+        for t in api_tracks:
+            a_list = t.get('artists')
+            if isinstance(a_list, list) and a_list:
+                first = a_list[0]
+                name = first.get('name') if isinstance(first, dict) else str(first)
+                if name and str(name).strip():
+                    track_artists.append(str(name).strip().lower())
+            elif t.get('artist') or t.get('artist_name'):
+                name = t.get('artist') or t.get('artist_name')
+                if name and str(name).strip():
+                    track_artists.append(str(name).strip().lower())
+    elif tracks:
+        for t in tracks:
+            name = t.get('track_artist') or t.get('artist_name') or t.get('artist')
+            if name and str(name).strip():
+                track_artists.append(str(name).strip().lower())
+
+    if len(track_artists) < threshold:
+        return False
+
+    unique_artists = set(track_artists)
+    if len(unique_artists) < threshold:
+        return False
+
+    total = len(track_artists)
+    from collections import Counter
+    counts = Counter(track_artists)
+    max_count = max(counts.values())
+    if (max_count / total) > 0.50:
+        return False
+
+    if clean_aa and (counts.get(clean_aa, 0) / total) > 0.50:
+        return False
+
+    return True
 
 
 def _plan_from_tags(
@@ -889,12 +1104,35 @@ def _plan_from_tags(
             'items': items,
         }
 
+    raw_db_type = str(album_data.get('record_type') or '').strip().lower()
+    tag_album_type = str((first_album_meta or {}).get('album_type') or '').strip().lower()
+    tag_api_tracks = [it['api_track'] for it in items if it.get('api_track')]
+    is_multi = False
+    if _detect_compilation_enabled():
+        is_multi = is_multi_artist_compilation(
+            album_artist=album_data.get('artist_name'),
+            tracks=tracks,
+            api_tracks=tag_api_tracks,
+        )
+    if (raw_db_type in ('compilation', 'compile', 'compilations')
+            or tag_album_type in ('compilation', 'compile', 'compilations')
+            or is_multi):
+        resolved_record_type = 'compilation'
+    elif raw_db_type in ('single', 'ep'):
+        resolved_record_type = raw_db_type
+    elif tag_album_type in ('single', 'ep'):
+        resolved_record_type = tag_album_type
+    else:
+        resolved_record_type = raw_db_type or tag_album_type or 'album'
+
     return {
         'status': 'planned',
         'source': 'tags',
         'api_album': first_album_meta or {},
         'total_discs': max_disc,
         'items': items,
+        'record_type': resolved_record_type,
+        'is_compilation': (resolved_record_type == 'compilation'),
     }
 
 
@@ -947,7 +1185,9 @@ def plan_album_reorganize(
         }
 
     if metadata_source == 'tags':
-        return _plan_from_tags(album_data, tracks, resolve_file_path_fn)
+        return _with_release_disambiguation(
+            _plan_from_tags(album_data, tracks, resolve_file_path_fn),
+            tracks, resolve_file_path_fn)
 
     if primary_source is None:
         try:
@@ -960,10 +1200,24 @@ def plan_album_reorganize(
         {'duration_ms': t.get('duration') or 0, 'title': t.get('title') or ''}
         for t in tracks
     ]
+    resolved: dict = {}
     source, api_album, api_tracks = _resolve_source(
         album_data, primary_source, strict_source=strict_source,
         file_tracks=file_tracks, on_better_edition=on_better_edition,
+        resolved=resolved,
     )
+    if not source and resolved.get('unavailable'):
+        reason = (
+            f"{album_data.get('reorganize_source')} didn't answer for the release this "
+            "album was placed with, skipped so it isn't renamed from another source"
+        )
+        return {
+            'status': 'source_unavailable', 'source': None, 'api_album': None,
+            'total_discs': 1,
+            'items': [{
+                'track': t, 'api_track': None, 'matched': False, 'reason': reason,
+            } for t in tracks],
+        }
     if not source:
         reason = _unresolvable_reason(album_data, primary_source, strict_source)
         return {
@@ -1007,7 +1261,8 @@ def plan_album_reorganize(
     #   * every user track fits within the source's disc 1  → a continuously-
     #     numbered 2-disc set (1..25) spills past disc 1 → left multi-disc.
     # Gated on the same preserve-my-organization setting as casing/year.
-    if total_discs > 1 and _preserve_casing_enabled():
+    if (total_discs > 1 and _preserve_casing_enabled()
+            and not _already_organized_by_disc(tracks)):
         try:
             user_nums = [int(t.get('track_number')) for t in tracks
                          if str(t.get('track_number') or '').strip().isdigit()]
@@ -1024,13 +1279,78 @@ def plan_album_reorganize(
             # odd data just fall back to the source's disc structure
             logger.debug("single-disc cap skipped (unexpected track data)", exc_info=True)
 
-    return {
+    raw_db_type = str(album_data.get('record_type') or '').strip().lower()
+    api_album_type = str((api_album or {}).get('album_type') or (api_album or {}).get('record_type') or '').strip().lower()
+    is_multi = False
+    if _detect_compilation_enabled():
+        is_multi = is_multi_artist_compilation(
+            album_artist=album_data.get('artist_name'),
+            tracks=tracks,
+            api_tracks=api_tracks,
+        )
+    if (raw_db_type in ('compilation', 'compile', 'compilations')
+            or api_album_type in ('compilation', 'compile', 'compilations')
+            or is_multi):
+        resolved_record_type = 'compilation'
+    elif raw_db_type in ('single', 'ep'):
+        resolved_record_type = raw_db_type
+    elif api_album_type in ('single', 'ep'):
+        resolved_record_type = api_album_type
+    else:
+        resolved_record_type = raw_db_type or api_album_type or 'album'
+
+    return _with_release_disambiguation({
         'status': 'planned',
         'source': source,
+        'source_album_id': resolved.get('album_id'),
         'api_album': api_album,
         'total_discs': total_discs,
         'items': items,
-    }
+        'record_type': resolved_record_type,
+        'is_compilation': (resolved_record_type == 'compilation'),
+    }, tracks, resolve_file_path_fn)
+
+
+def _files_disambiguation(tracks, resolve_file_path_fn, read_identity) -> str:
+    """The release comment off the album's own files, "" when none carry one."""
+    if not resolve_file_path_fn:
+        return ''
+    for track in tracks:
+        try:
+            path = resolve_file_path_fn(track.get('file_path'))
+        except Exception:
+            path = None
+        if not path:
+            continue
+        _release_id, comment = read_identity(path)
+        if comment:
+            return comment
+    return ''
+
+
+def _with_release_disambiguation(plan: dict, tracks, resolve_file_path_fn,
+                                 read_identity=None) -> dict:
+    """Carry the release's disambiguation onto the plan's album dicts.
+
+    the import puts it on the album folder (#1299), so reorganize has to know it
+    too or it folds "album (baby punk version)" back into "album", on top of the
+    other release. musicbrainz says it directly when it's the source; otherwise
+    the files' album comment tag does, which picard and beets write as well.
+    """
+    if plan.get('status') != 'planned':
+        return plan
+    api_album = plan.get('api_album') or {}
+    if plan.get('source') == 'musicbrainz' and 'disambiguation' in api_album:
+        disambiguation = api_album.get('disambiguation')
+    else:
+        disambiguation = _files_disambiguation(
+            tracks, resolve_file_path_fn, read_identity or read_release_identity)
+    disambiguation = str(disambiguation or '').strip()
+    plan['api_album'] = {**api_album, 'disambiguation': disambiguation}
+    for item in plan.get('items') or []:
+        if isinstance(item.get('api_album'), dict):
+            item['api_album'] = {**item['api_album'], 'disambiguation': disambiguation}
+    return plan
 
 
 def _build_post_process_context(
@@ -1041,6 +1361,10 @@ def _build_post_process_context(
     total_discs: int,
     local_title: Optional[str] = None,
     local_year: Optional[str] = None,
+    record_type: Optional[str] = None,
+    type_source: Optional[str] = None,
+    album_artist: Optional[str] = None,
+    profile_id: Optional[int] = None,
 ) -> dict:
     """Build the same shape `import_album_process` builds so post-process
     treats this exactly like a fresh download with full Spotify-style
@@ -1048,13 +1372,51 @@ def _build_post_process_context(
 
     ``local_title`` is the user's own current track title — used only to
     carry a featured-artist credit forward when feat_in_title is on and the
-    API doesn't supply one (#1078)."""
+    API doesn't supply one (#1078).
+
+    ``profile_id`` (#1504): the owning profile for own-library files. Stamped
+    into the context so ``transfer_root_for_context()`` routes the destination
+    to the profile's own library instead of the shared folder. None = shared
+    (unchanged behavior)."""
     track_number = int(api_track.get('track_number') or 1)
     disc_number = int(api_track.get('disc_number') or 1)
-    track_artists = api_track.get('artists') or [artist_name]
+    track_artists = api_track.get('artists')
+    if not track_artists:
+        if api_track.get('artist'):
+            track_artists = [api_track['artist']]
+        elif api_track.get('artist_name'):
+            track_artists = [api_track['artist_name']]
+        else:
+            track_artists = [artist_name]
     normalized_artists = [
         ({'name': a} if isinstance(a, str) else a) for a in track_artists
     ]
+    # album artist comes from the source, like every other tag reorganize
+    # writes. it used to be the name soulsync already had, which on navidrome
+    # IS the file's old album artist tag, so a wrong variation got written
+    # straight back every run (LettuceSnob). the library name is only the
+    # fallback, and a case-only difference keeps the user's casing.
+    library_album_artist = album_artist or artist_name
+    source_album_artist = _source_album_artist(api_album)
+    album_artist_name = (
+        _keep_user_casing(source_album_artist, library_album_artist)
+        if source_album_artist else library_album_artist
+    )
+    primary_track_artist = ''
+    if normalized_artists:
+        first_a = normalized_artists[0]
+        if isinstance(first_a, dict) and first_a.get('name'):
+            primary_track_artist = first_a['name']
+
+    eff_type = (
+        record_type
+        or api_album.get('record_type')
+        or api_album.get('album_type')
+        or ''
+    ).strip().lower()
+    if eff_type in ('compile', 'compilations'):
+        eff_type = 'compilation'
+    is_comp = (eff_type == 'compilation') or bool(api_album.get('is_compilation'))
 
     api_album_id = api_album.get('id') or api_album.get('album_id') or ''
     api_album_name = api_album.get('name') or api_album.get('title') or album_title
@@ -1098,9 +1460,29 @@ def _build_post_process_context(
     # filename and the title tag are built from this string, so they agree.
     track_name = _keep_user_casing(track_name, local_title or '')
 
+    effective_artist_name = primary_track_artist if (is_comp and primary_track_artist) else album_artist_name
+
+    # which source the release type came from, for $albumtype only (a source
+    # with its own EP label is taken at its word). tag mode has none: its
+    # record_type is the library's, so it keeps the track-count split and a
+    # reorganize files a release where the download did
+    _type_source = type_source if type_source and type_source != 'tags' else ''
+    # the source's own album lookup is reliable for a source that labels EPs
+    # itself (deezer's catch-all 'album' only comes from its TRACK lookups).
+    # when the release type agrees with it, lock it, so a reorganize files a
+    # short album where the artist page shows it: Flow State Sampler, a
+    # three-track deezer album, would otherwise go back to Single/ by count.
+    # spotify and tag mode keep the count split, same as their downloads
+    from core.imports.paths import _source_labels_eps
+    _api_type = str(api_album.get('record_type') or api_album.get('album_type') or '').strip().lower()
+    _type_locked = bool(
+        _type_source and _source_labels_eps(_type_source)
+        and _api_type and _api_type == (eff_type or 'album')
+    )
     return {
+        '_album_type_source': _type_source,
         'spotify_artist': {
-            'name': artist_name,
+            'name': effective_artist_name,
             'id': '',
             'genres': [],
         },
@@ -1110,7 +1492,25 @@ def _build_post_process_context(
             'release_date': api_album_release,
             'total_tracks': api_album_total_tracks,
             'total_discs': total_discs,
+            # Reorganize is the caller that really knows: it counted the discs
+            # off the source tracklist it just resolved, so the path builder must
+            # not go and ask a provider again (that lookup's success or failure
+            # would decide the destination).
+            'total_discs_declared': True,
             'image_url': api_album_image,
+            # #1299: keeps a same-named release in its own folder
+            'disambiguation': str(api_album.get('disambiguation') or '').strip(),
+            'album_type': eff_type or 'album',
+            'record_type': eff_type or 'album',
+            'album_type_locked': _type_locked,
+            # $atypes labels a folder with every qualifier the release carries,
+            # and Live/Soundtrack/Remix exist only as secondary types. Without
+            # them here a reorganize renders $atypes empty and RENAMES
+            # "[2017][EP][Live] Audiotree Live" to "[2017] Audiotree Live",
+            # stripping the labels the variable exists to preserve.
+            'secondary_types': list(api_album.get('secondary_types') or []),
+            'is_compilation': is_comp,
+            'artists': [{'name': album_artist_name}],
         },
         'track_info': {
             'name': track_name,
@@ -1120,10 +1520,11 @@ def _build_post_process_context(
             'duration_ms': api_track.get('duration_ms', 0),
             'artists': normalized_artists,
             'uri': api_track.get('uri', ''),
+            '_explicit_artist_context': {'name': album_artist_name},
         },
         'original_search_result': {
             'title': track_name,
-            'artist': artist_name,
+            'artist': effective_artist_name,
             'album': api_album_name,
             'track_number': track_number,
             'disc_number': disc_number,
@@ -1131,6 +1532,9 @@ def _build_post_process_context(
             'spotify_clean_album': api_album_name,
             'artists': normalized_artists,
         },
+        'album_type': eff_type or 'album',
+        'record_type': eff_type or 'album',
+        'is_compilation': is_comp,
         'is_album_download': True,
         'has_clean_spotify_data': True,
         'has_full_spotify_metadata': True,
@@ -1142,6 +1546,19 @@ def _build_post_process_context(
         # that stayed happily in the library (TheHomeGuy: 'Through Glass'
         # 283s vs Discogs' 241s). Size + parse corruption legs still run.
         'is_local_import': True,
+        # ...and for the same reason, the AcoustID identity leg does not get to
+        # quarantine this file. A reorganize stages a COPY of a track the user
+        # ALREADY OWNS and runs it through the download post-process; when the
+        # fingerprint disagreed, that leg moved the copy into ss_quarantine and
+        # the whole run reported `failed`, so a rename that should have been a
+        # no-op only worked on a second attempt with "Rename only" ticked. The
+        # disagreement is routinely legitimate — a different master, a regional
+        # release, or an artist credited in another script (Sawano Hiroyuki
+        # fingerprints as 澤野弘之). Identity of files already in the library is
+        # the AcoustID Scanner's job, and that one raises a finding instead of
+        # moving anyone's audio. The size and parse-corruption legs still run:
+        # skipping identity is not skipping safety.
+        '_skip_quarantine_check': 'acoustid',
         # Reorganize destinations must come from the CURRENT template alone.
         # The #829 existing-folder reuse would resolve to the folder the album
         # already lives in — the very folder reorganize is trying to move it
@@ -1149,6 +1566,10 @@ def _build_post_process_context(
         # album and both the Tools job and Reorganize All silently no-opped
         # after a template change.
         '_no_album_folder_reuse': True,
+        # #1504: own-library routing. stamped at the operation entry point;
+        # transfer_root_for_context() reads it to pick the profile's own
+        # library root instead of the shared folder. None = shared.
+        'profile_id': profile_id,
     }
 
 
@@ -1162,6 +1583,7 @@ def preview_album_reorganize(
     primary_source: Optional[str] = None,
     strict_source: bool = False,
     metadata_source: str = 'api',
+    profile_id: Optional[int] = None,
 ) -> dict:
     """Compute the planned destination paths for a reorganize WITHOUT
     moving any files. The preview UI uses this to show users what the
@@ -1228,7 +1650,11 @@ def preview_album_reorganize(
         'artist': artist_name,
         'transfer_dir': transfer_dir,
         'source': plan['source'],
+        'source_album_id': plan.get('source_album_id'),
     }
+
+    if plan['status'] == 'source_unavailable':
+        return {'success': False, 'status': 'source_unavailable', **common, 'tracks': []}
 
     if plan['status'] == 'no_source_id':
         return {
@@ -1305,18 +1731,16 @@ def preview_album_reorganize(
             per_item_album, api_track, artist_name, album_title, total_discs,
             local_title=title,
             local_year=(str(album_data.get('year')) if album_data.get('year') else None),
+            record_type=plan.get('record_type') or album_data.get('record_type'),
+            album_artist=artist_name,
+            type_source=plan.get('source'),
+            profile_id=profile_id,
         )
         # `_build_final_path_for_track` switches between ALBUM and SINGLE
         # modes based on `album_info.get('is_album')` — must be passed,
         # not None, otherwise multi-disc deluxes degrade to single-track
         # folders (the exact bug winecountrygames hit).
         album_info = _build_album_info(context)
-        # Reorganize renames files WITHIN the library they're already in. Tell
-        # the destination resolver where this one lives, or a file in a
-        # non-default Music Library would be planned into the default one and
-        # the "rename" would quietly move it between libraries.
-        if resolved:
-            context['_current_file_path'] = resolved
         try:
             spotify_artist = context['spotify_artist']
             # Dry run: compute the destination path WITHOUT creating the folder.
@@ -1326,11 +1750,7 @@ def preview_album_reorganize(
                 context, spotify_artist, album_info, file_ext, create_dirs=False
             )
             item['new_path_abs'] = new_full or ''
-            item['new_path'] = (
-                os.path.relpath(new_full, transfer_dir)
-                if transfer_dir and new_full and new_full.startswith(transfer_dir)
-                else new_full or ''
-            )
+            item['new_path'] = _display_relative_to_root(new_full, transfer_dir)
             if resolved and new_full and os.path.normpath(resolved) == os.path.normpath(new_full):
                 item['unchanged'] = True
         except Exception as e:
@@ -1353,6 +1773,8 @@ def preview_album_reorganize(
 
     return {
         'success': True, 'status': 'planned',
+        'record_type': plan.get('record_type') or album_data.get('record_type'),
+        'is_compilation': plan.get('is_compilation', False),
         **common,
         'tracks': preview_tracks,
     }
@@ -1360,18 +1782,19 @@ def preview_album_reorganize(
 
 def _is_in_deleted_quarantine(resolved_path, transfer_dir) -> bool:
     """True when ``resolved_path`` lives inside the duplicate-cleaner
-    quarantine folder (``<transfer_dir>/deleted/...``).
+    quarantine folder (``<transfer_dir>/.deleted/...``, or the legacy bare
+    ``deleted`` spelling older installs still carry).
 
     The Duplicate Cleaner (``core/library/duplicate_cleaner.py``) moves
-    de-duplicated files into ``<transfer_dir>/deleted/``. If the user's
+    de-duplicated files into the quarantine. If the user's
     media server scans the transfer folder (e.g. a ``/music`` root that
     contains both the library and the transfer dir), those quarantined
-    files get real rows in Commissary's DB — and Reorganize, being purely
+    files get real rows in SoulSync's DB — and Reorganize, being purely
     DB-driven, would otherwise dutifully move them back OUT of /deleted
     to the template location. This guard makes Reorganize skip them so
     the quarantine stays quarantined (#746).
 
-    Anchored to ``<transfer_dir>/deleted`` specifically so a legitimately
+    Anchored to the transfer dir specifically so a legitimately
     named artist/album like "Deleted" elsewhere in the library is NOT
     skipped. When ``transfer_dir`` is unavailable we fall back to an exact
     ``deleted`` path-SEGMENT match (mirrors the cleaner's own
@@ -1389,16 +1812,43 @@ def _is_in_deleted_quarantine(resolved_path, transfer_dir) -> bool:
 
     norm = _norm(resolved_path)
     if transfer_dir:
-        quarantine = _norm(os.path.join(transfer_dir, 'deleted'))
-        return norm == quarantine or norm.startswith(quarantine + '/')
-    return 'deleted' in norm.split('/')
+        for name in ('.deleted', 'deleted'):     # hidden spelling + legacy installs
+            quarantine = _norm(os.path.join(transfer_dir, name))
+            if norm == quarantine or norm.startswith(quarantine + '/'):
+                return True
+        return False
+    return any(seg in ('.deleted', 'deleted') for seg in norm.split('/'))
+
+
+def _display_relative_to_root(path, root):
+    """``path`` shown relative to ``root`` when it lives inside it, else whole.
+
+    A raw ``startswith`` was wrong twice over. It matched a SIBLING root
+    (``/music/Transfer2`` starts with ``/music/Transfer``), and it compared two
+    strings that different code paths had spelled differently — the proposed
+    path came from the path builder rooted at the config value, the current
+    path from the resolver (absolute, symlinks resolved). With a relative root
+    configured the two never shared a prefix, so the preview trimmed one column
+    and printed the raw stored value in the other, for the very same file.
+    """
+    if not path or not root:
+        return path or ''
+    p = os.path.normpath(str(path))
+    r = os.path.normpath(str(root))
+    if p == r:
+        return ''
+    if p.startswith(r + os.sep) or (os.altsep and p.startswith(r + os.altsep)):
+        return p[len(r):].lstrip(os.sep).lstrip('/')
+    return path
 
 
 def _trim_to_transfer(db_path, resolved, transfer_dir):
     """Compose the user-facing 'current path' string — relative to the
     transfer dir if the file lives there, else the raw DB value."""
-    if resolved and transfer_dir and resolved.startswith(transfer_dir):
-        return resolved[len(transfer_dir):].lstrip(os.sep).lstrip('/')
+    if resolved and transfer_dir:
+        trimmed = _display_relative_to_root(resolved, transfer_dir)
+        if trimmed != resolved:
+            return trimmed
     return db_path or 'No file'
 
 
@@ -1420,6 +1870,9 @@ def _build_album_info(context: dict) -> dict:
         'disc_number': track_info.get('disc_number') or 1,
         'album_image_url': spotify_album.get('image_url') or '',
         'spotify_album_id': spotify_album.get('id') or '',
+        'album_type': spotify_album.get('album_type') or context.get('album_type') or '',
+        'record_type': spotify_album.get('record_type') or context.get('record_type') or '',
+        'is_compilation': spotify_album.get('is_compilation') or context.get('is_compilation') or False,
     }
 
 
@@ -1479,6 +1932,9 @@ class _RunContext:
     on_progress: Optional[Callable[[dict], None]] = None
     stop_check: Optional[Callable[[], bool]] = None
     transfer_dir: Optional[str] = None      # anchors the #746 /deleted-quarantine skip
+    record_type: Optional[str] = None
+    source: Optional[str] = None            # the metadata source the plan resolved
+    profile_id: Optional[int] = None        # #1504: owning profile for own-library files
 
     def emit(self, **updates) -> None:
         """Fire the progress callback. Caller is responsible for
@@ -1527,8 +1983,8 @@ def _stage_track(ctx: _RunContext, track_id, title, resolved_src) -> Optional[st
     With per-track subdirs:
 
     - Worker A's cleanup walks: per-track subdir (empty after move →
-      removed) → ``staging_album_dir`` (still has other workers'
-      subdirs → not empty → walk stops). ✓
+       removed) → ``staging_album_dir`` (still has other workers'
+       subdirs → not empty → walk stops). ✓
     - Worker B's stage-in: makedirs its OWN subdir, copies into
       it. No interference from worker A. ✓
     """
@@ -1564,6 +2020,10 @@ def _run_post_process_for_track(ctx: _RunContext, track_id, title, api_track, st
     context = _build_post_process_context(
         api_album, api_track, ctx.artist_name, ctx.album_title, ctx.total_discs,
         local_title=title, local_year=ctx.local_year,
+        record_type=ctx.record_type,
+        album_artist=ctx.artist_name,
+        type_source=ctx.source,
+        profile_id=ctx.profile_id,
     )
     context_key = f"reorganize_{ctx.album_id}_{track_id}_{uuid.uuid4().hex[:8]}"
     try:
@@ -1595,6 +2055,36 @@ def _finalize_track(ctx: _RunContext, track_id, resolved_src, new_path) -> bool:
     purposes — the file is at both locations, the DB still points to
     the old path, and counting it as "moved" overstates how many
     tracks the user can actually find via the UI."""
+    # #1504: cross-library move guard. a reorganize may rename within a
+    # library but must NEVER move a file across a library boundary
+    # (own->shared, shared->own, own->other-own). this is the backstop
+    # that would have prevented the ~600-file incident: with profile_id
+    # stamped correctly the destination is always in the right library,
+    # so this should never fire. if it does, something is very wrong —
+    # leave the original alone, remove the stray new file, and fail loud.
+    from core.imports.paths import library_containing
+    try:
+        if library_containing(resolved_src) != library_containing(new_path):
+            logger.error(
+                "[Reorganize] REFUSING cross-library move: %s -> %s "
+                "(source library %s, destination library %s). leaving original "
+                "in place.",
+                resolved_src, new_path,
+                library_containing(resolved_src), library_containing(new_path),
+            )
+            try:
+                if os.path.exists(new_path) and os.path.normpath(resolved_src) != os.path.normpath(new_path):
+                    os.remove(new_path)
+            except OSError:
+                pass
+            ctx.record_error(
+                track_id, f"track {track_id}",
+                f"refusing cross-library move {resolved_src} -> {new_path}",
+                kind='failed',
+            )
+            return False
+    except Exception as guard_err:
+        logger.warning("[Reorganize] move-guard check failed: %s", guard_err)
     if ctx.update_track_path_fn:
         try:
             ctx.update_track_path_fn(track_id, new_path)
@@ -1701,6 +2191,24 @@ def _process_one_track(ctx: _RunContext, plan_item: dict) -> None:
         )
 
 
+def _persist_compilation_record_type(db, album_id: str) -> None:
+    """Persist compilation record_type to the database for the given album."""
+    if not db or not album_id:
+        return
+    try:
+        if hasattr(db, 'update_album_fields'):
+            db.update_album_fields(album_id, {'record_type': 'compilation'})
+        elif hasattr(db, '_get_connection'):
+            conn = db._get_connection()
+            try:
+                conn.execute("UPDATE albums SET record_type = 'compilation' WHERE id = ?", (str(album_id),))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as e:
+        logger.warning("[Reorganize] Failed to persist compilation record_type for album %s: %s", album_id, e)
+
+
 def reorganize_album(
     *,
     album_id: str,
@@ -1716,6 +2224,7 @@ def reorganize_album(
     strict_source: bool = False,
     stop_check: Optional[Callable[[], bool]] = None,
     metadata_source: str = 'api',
+    profile_id: Optional[int] = None,
 ) -> dict:
     """Run a single album through the post-processing pipeline.
 
@@ -1807,6 +2316,10 @@ def reorganize_album(
         resolve_file_path_fn=resolve_file_path_fn,
         on_better_edition=_persist_canonical,
     )
+    if plan['status'] == 'source_unavailable':
+        summary['status'] = 'source_unavailable'
+        summary['errors'].append({'error': plan['items'][0]['reason']})
+        return summary
     if plan['status'] == 'no_source_id':
         summary['status'] = 'no_source_id'
         summary['source'] = plan.get('source')  # 'tags' or None
@@ -1878,6 +2391,9 @@ def reorganize_album(
         on_progress=on_progress,
         stop_check=stop_check,
         transfer_dir=transfer_dir,
+        record_type=plan.get('record_type') or album_data.get('record_type'),
+        source=plan.get('source'),
+        profile_id=profile_id,
     )
 
     try:
@@ -1992,6 +2508,11 @@ def reorganize_album(
             for artist_dir in artist_dirs:
                 _prune_empty_album_dirs(artist_dir)
 
+        if plan.get('record_type') == 'compilation' and str(album_data.get('record_type') or '').strip().lower() != 'compilation':
+            _persist_compilation_record_type(db, album_id)
+
+    if metadata_source == 'api' and _run_placed_everything(summary, stop_check):
+        mark_album_placed(db, album_id, source, plan.get('source_album_id'))
     return summary
 
 
@@ -2042,6 +2563,7 @@ def reorganize_album_rename_only(
     metadata_source: str = 'api',
     stop_check: Optional[Callable[[], bool]] = None,
     preview_fn: Optional[Callable] = None,
+    profile_id: Optional[int] = None,
 ) -> dict:
     """RENAME-ONLY reorganize (#875): move each track's file to the path the current
     naming scheme dictates, and nothing else — no copy-to-staging, no re-tag, no
@@ -2075,6 +2597,7 @@ def reorganize_album_rename_only(
         build_final_path_fn=build_final_path_fn,
         primary_source=primary_source, strict_source=strict_source,
         metadata_source=metadata_source,
+        profile_id=profile_id,
     )
     summary['source'] = preview.get('source')
     if not preview.get('success'):
@@ -2093,14 +2616,37 @@ def reorganize_album_rename_only(
 
         # Skip anything that isn't a real, changing move. `unchanged` is the key one —
         # it's why a rename no longer rewrites files whose name didn't change.
+        # `current_path_abs` is the other one: the preview leaves it empty when the
+        # stored path resolves to nothing on disk (`file_exists` False). Passing that
+        # to the mover fails on os.rename — but only AFTER os.makedirs has built the
+        # destination tree, so an unresolvable track used to litter the library with
+        # empty folders, which is exactly what the preview avoids with create_dirs=False.
         if (not t.get('matched') or t.get('unchanged')
-                or t.get('collision') or not t.get('new_path_abs')):
+                or t.get('collision') or not t.get('new_path_abs')
+                or not t.get('current_path_abs')):
             summary['skipped'] += 1
             _emit(skipped=summary['skipped'])
             continue
 
         current_abs = t.get('current_path_abs')
         new_abs = t.get('new_path_abs')
+        # #1504: cross-library move guard (same as _finalize_track).
+        try:
+            from core.imports.paths import library_containing
+            if library_containing(current_abs) != library_containing(new_abs):
+                logger.error(
+                    "[Reorganize/rename] REFUSING cross-library move: %s -> %s",
+                    current_abs, new_abs,
+                )
+                summary['failed'] += 1
+                summary['errors'].append({
+                    'track_id': t.get('track_id'), 'title': title,
+                    'error': f'refusing cross-library move {current_abs} -> {new_abs}',
+                })
+                _emit(failed=summary['failed'], errors=list(summary['errors']))
+                continue
+        except Exception as guard_err:
+            logger.warning("[Reorganize/rename] move-guard check failed: %s", guard_err)
         ok, err = _rename_track_in_place(current_abs, new_abs)
         if not ok:
             summary['failed'] += 1
@@ -2112,17 +2658,41 @@ def reorganize_album_rename_only(
             continue
 
         # File is at its new home — update the DB directly (authoritative; no need to
-        # round-trip through a server scan to learn what we just did). On DB failure the
-        # file still moved; a library scan reconciles it, so we don't fail the track.
+        # round-trip through a server scan to learn what we just did).
+        #
+        # A rename MOVES the only copy, so a failed catalogue update is NOT
+        # recoverable by "a scan will reconcile": the file sits at a path nothing
+        # points at, the track reads as MISSING, and the wishlist re-downloads
+        # something the user already owns. Reported against a fresh library — songs
+        # downloaded, Reorganize run while the import still held the write lock.
+        # Put the file back and fail the track loudly instead.
         if update_track_path_fn:
             try:
                 update_track_path_fn(t.get('track_id'), new_abs)
             except Exception as db_err:
-                logger.warning(
-                    "[Reorganize/rename] DB path update failed for %s: %s "
-                    "(file moved to %s; a scan will reconcile)",
-                    t.get('track_id'), db_err, new_abs,
-                )
+                undone, undo_err = _rename_track_in_place(new_abs, current_abs)
+                if undone:
+                    detail = f'{db_err} (move undone)'
+                    logger.warning(
+                        "[Reorganize/rename] catalogue update failed for %s: %s "
+                        "— moved %s back to %s",
+                        t.get('track_id'), db_err, new_abs, current_abs,
+                    )
+                else:
+                    detail = (f'{db_err} — and the file could not be moved back '
+                              f'to {current_abs}: {undo_err}')
+                    logger.error(
+                        "[Reorganize/rename] catalogue update failed for %s (%s) AND "
+                        "the rollback failed (%s): the file is at %s while the "
+                        "catalogue still names %s",
+                        t.get('track_id'), db_err, undo_err, new_abs, current_abs,
+                    )
+                summary['failed'] += 1
+                summary['errors'].append({
+                    'track_id': t.get('track_id'), 'title': title, 'error': detail,
+                })
+                _emit(failed=summary['failed'], errors=list(summary['errors']))
+                continue
         if current_abs:
             src_dirs_touched.add(os.path.dirname(current_abs))
         summary['moved'] += 1
@@ -2140,7 +2710,95 @@ def reorganize_album_rename_only(
         except Exception as e:
             logger.debug("[Reorganize/rename] source prune of %s failed: %s", src_dir, e)
 
+    if summary.get('moved', 0) > 0 and preview.get('record_type') == 'compilation':
+        _persist_compilation_record_type(db, album_id)
+
+    if (metadata_source == 'api' and _run_placed_everything(summary, stop_check)
+            and not any(t.get('collision') for t in tracks)):
+        mark_album_placed(db, album_id, preview.get('source'), preview.get('source_album_id'))
     return summary
+
+
+def naming_fingerprint() -> str:
+    """Short hash of every setting that decides where reorganize puts a file.
+
+    stored with the placement (#1701) so a scan can tell "the user changed their
+    naming" (re-check the album) from "soulsync's naming code changed" (leave the
+    placed album alone)."""
+    try:
+        from core.settings import config_manager
+        get = config_manager.get
+    except Exception:
+        def get(_key, default=None):
+            return default
+    keys = (
+        'file_organization', 'soulseek.transfer_path', 'library.music_paths',
+        'library.reorganize_preserve_casing',
+        'metadata_enhancement.tags.feat_in_title',
+    )
+    blob = json.dumps({k: get(k, None) for k in keys}, sort_keys=True, default=str)
+    return hashlib.sha1(blob.encode('utf-8')).hexdigest()[:16]
+
+
+def _run_placed_everything(summary: dict, stop_check) -> bool:
+    """True when an apply run finished without a failure or a stop, so the album
+    sits where its plan says."""
+    if summary.get('status') != 'completed' or summary.get('failed'):
+        return False
+    try:
+        return not (stop_check and stop_check())
+    except Exception:
+        return False
+
+
+def mark_album_placed(db, album_id, source, source_album_id, fingerprint=None) -> bool:
+    """Remember the release + naming the album now sits under (#1701), and close
+    the album's pending "would move" findings, which describe a move that's done.
+
+    the next scan resolves this same release and skips the album until the naming
+    settings change, so findings stop coming back after every pin or upgrade."""
+    if not source or not source_album_id or source == 'tags':
+        return False
+    fingerprint = fingerprint or naming_fingerprint()
+    conn = None
+    try:
+        conn = db._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE albums SET reorganize_source = ?, reorganize_album_id = ?, "
+            "reorganize_fp = ? WHERE id = ?",
+            (source, str(source_album_id), fingerprint, str(album_id)),
+        )
+        placed = cursor.rowcount > 0
+        cursor.execute(
+            "UPDATE repair_findings SET status = 'resolved', user_action = 'obsolete', "
+            "resolved_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+            "WHERE job_id = 'library_reorganize' AND finding_type = 'path_mismatch' "
+            "AND status = 'pending' AND entity_type = 'track' "
+            "AND entity_id IN (SELECT CAST(id AS TEXT) FROM tracks WHERE album_id = ?)",
+            (str(album_id),),
+        )
+        conn.commit()
+        return placed
+    except Exception as e:
+        logger.warning("[Reorganize] couldn't record placement of album %s: %s", album_id, e)
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+
+def album_placement_settled(album_row: dict, fingerprint: str) -> bool:
+    """True when the album was placed under the current naming settings and the
+    user hasn't locked it to a different release since (#1701)."""
+    p_source = album_row.get('reorganize_source')
+    p_id = album_row.get('reorganize_album_id')
+    if not p_source or not p_id or album_row.get('reorganize_fp') != fingerprint:
+        return False
+    if album_row.get('canonical_locked'):
+        if (album_row.get('canonical_source'), str(album_row.get('canonical_album_id') or '')) != (p_source, str(p_id)):
+            return False
+    return True
 
 
 def _find_artist_dir(dest_path: str, transfer_dir: str) -> Optional[str]:
@@ -2391,10 +3049,13 @@ def _has_remaining_audio(directory: str) -> bool:
     """Return True if `directory` contains any audio files. Used as the
     safety check before stripping album-level sidecars: if a track
     failed to move, leave its cover art and friends in place."""
+    from core.library.residual_files import is_appledouble
     if not os.path.isdir(directory):
         return False
     try:
         for name in os.listdir(directory):
+            if is_appledouble(name):
+                continue   # a macOS `._track.flac` splits to '.flac' but isn't audio
             full = os.path.join(directory, name)
             if not os.path.isfile(full):
                 continue

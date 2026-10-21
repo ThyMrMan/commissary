@@ -14,6 +14,42 @@ from utils.logging_config import get_logger
 
 logger = get_logger("personalized_playlists")
 
+
+def _blocklist_profile() -> int:
+    """Whose blocks apply: the request's profile, or the background override.
+    Blocks are per profile, so one profile's block never thins another's mix."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return get_current_profile_id() or 1
+    except Exception:  # noqa: BLE001 - no flask, no profile context
+        return 1
+
+
+def rank_library_genres(rows) -> List[Tuple[str, int]]:
+    """(genres_value, weight) rows -> [(genre, total_weight)], biggest first.
+
+    genres_value is a json array or a comma list. names count case-blind so
+    "House" and "house" are one genre, the first spelling seen is the label.
+    """
+    totals: Counter = Counter()
+    labels: Dict[str, str] = {}
+    for raw, weight in rows:
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+            names = parsed if isinstance(parsed, list) else [parsed]
+        except (ValueError, TypeError):
+            names = str(raw).split(',')
+        for name in names:
+            label = str(name or '').strip()
+            if not label:
+                continue
+            key = label.lower()
+            labels.setdefault(key, label)
+            totals[key] += int(weight or 1)
+    return [(labels[key], count) for key, count in totals.most_common()]
+
 class PersonalizedPlaylistsService:
     """Service for generating personalized playlists from library and discovery pool"""
 
@@ -168,7 +204,7 @@ class PersonalizedPlaylistsService:
             source = ?
             AND (spotify_track_id IS NOT NULL OR itunes_track_id IS NOT NULL OR deezer_track_id IS NOT NULL)
             AND LOWER(artist_name) NOT IN
-                (SELECT LOWER(artist_name) FROM discovery_artist_blacklist)
+                (this profile's blocked artists, by name)
 
         When `exclude_owned=True` (default) the WHERE additionally excludes
         any discovery_pool row whose IDs already match a row in the local
@@ -214,13 +250,27 @@ class PersonalizedPlaylistsService:
             if exclude_owned:
                 # Note column-name asymmetry: discovery_pool.deezer_track_id
                 # but tracks.deezer_id. Don't refactor without checking.
+                #
+                # Split into three single-column NOT EXISTS checks (one per
+                # ID space) instead of one OR'd clause: SQLite cannot use an
+                # index for the OR'd correlated subquery and falls back to a
+                # full scan of `tracks` for every discovery_pool row, which
+                # pins the CPU for minutes on large pools (issue #1350).
+                # Each subquery is guarded by an IS NULL test on the pool
+                # side — a NULL ID can never match the original clause
+                # either (equality against NULL is never true), so this
+                # changes nothing semantically and skips the index probe
+                # entirely for rows without that ID.
                 owned_clause = """
-                  AND NOT EXISTS (
+                  AND (discovery_pool.spotify_track_id IS NULL OR NOT EXISTS (
                       SELECT 1 FROM tracks t
-                      WHERE (t.spotify_track_id IS NOT NULL AND t.spotify_track_id = discovery_pool.spotify_track_id)
-                         OR (t.itunes_track_id IS NOT NULL AND t.itunes_track_id = discovery_pool.itunes_track_id)
-                         OR (t.deezer_id IS NOT NULL AND t.deezer_id = discovery_pool.deezer_track_id)
-                  )"""
+                      WHERE t.spotify_track_id = discovery_pool.spotify_track_id))
+                  AND (discovery_pool.itunes_track_id IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM tracks t
+                      WHERE t.itunes_track_id = discovery_pool.itunes_track_id))
+                  AND (discovery_pool.deezer_track_id IS NULL OR NOT EXISTS (
+                      SELECT 1 FROM tracks t
+                      WHERE t.deezer_id = discovery_pool.deezer_track_id))"""
 
             query = f"""
                 SELECT
@@ -228,14 +278,14 @@ class PersonalizedPlaylistsService:
                 FROM discovery_pool
                 WHERE source = ?
                   AND (spotify_track_id IS NOT NULL OR itunes_track_id IS NOT NULL OR deezer_track_id IS NOT NULL)
-                  AND LOWER(artist_name) NOT IN (SELECT LOWER(artist_name) FROM discovery_artist_blacklist UNION SELECT LOWER(name) FROM blocklist WHERE entity_type='artist')
+                  AND LOWER(artist_name) NOT IN (SELECT LOWER(name) FROM blocklist WHERE entity_type='artist' AND profile_id = ?)
                   {owned_clause}
                   {extra_where}
                 ORDER BY {order_by}
                 LIMIT ?
             """
 
-            params = (source,) + tuple(extra_params) + (fetch_limit,)
+            params = (source, _blocklist_profile()) + tuple(extra_params) + (fetch_limit,)
 
             with self.database._get_connection() as conn:
                 cursor = conn.cursor()
@@ -601,13 +651,19 @@ class PersonalizedPlaylistsService:
         logger.info(f"Popular Picks ({active_source}): selected {len(diverse_tracks)} tracks with diversity")
         return diverse_tracks
 
-    def get_hidden_gems(self, limit: int = 50) -> List[Dict]:
+    def get_hidden_gems(self, limit: int = 50, taste_profile: Optional[Dict[str, float]] = None) -> List[Dict]:
         """Get low-popularity (underground/indie) tracks from discovery pool with diversity.
 
         Mirrors Popular Picks' diversity caps (2 per album, 3 per artist)
         since both are curated-feel sections. Popularity threshold is
         source-aware — iTunes/Hydrabase fall back to RANDOM + diversity
         only.
+
+        With a ``taste_profile`` ({genre: 0..1}), candidates are re-ranked by
+        genre affinity BEFORE the diversity cut — "best obscure", not "random
+        obscure". The base fetch stays RANDOM(), so equal-affinity tracks
+        still rotate between visits (the stable sort keeps their random
+        order within each affinity band).
         """
         active_source = self._get_active_source()
         _, hidden_max = self._get_popularity_thresholds(active_source)
@@ -626,7 +682,24 @@ class PersonalizedPlaylistsService:
             extra_params=extra_params,
             order_by="RANDOM()",
             fetch_limit=limit * 3,
+            extra_columns=('artist_genres',),
         )
+
+        if taste_profile:
+            def _affinity(track: Dict) -> float:
+                # _build_track_dict surfaces the extra column as
+                # _artist_genres_raw (raw JSON string), not artist_genres
+                genres = track.get('_artist_genres_raw')
+                if isinstance(genres, str):
+                    try:
+                        genres = json.loads(genres)
+                    except ValueError:
+                        genres = []
+                if not isinstance(genres, list):
+                    genres = []
+                return max((float(taste_profile.get(str(g).lower(), 0.0))
+                            for g in genres), default=0.0)
+            all_tracks.sort(key=_affinity, reverse=True)
 
         diverse_tracks = self._apply_diversity_filter(
             all_tracks,
@@ -687,43 +760,48 @@ class PersonalizedPlaylistsService:
                 if 'genres' in columns:
                     # Get genres directly from tracks
                     cursor.execute("""
-                        SELECT genres FROM tracks WHERE genres IS NOT NULL
+                        SELECT genres, 1 AS weight FROM tracks WHERE genres IS NOT NULL
                     """)
-                    rows = cursor.fetchall()
+                    ranked = rank_library_genres(
+                        (row['genres'], row['weight']) for row in cursor.fetchall())
+                    if ranked:
+                        return ranked[:limit]
 
-                    # Parse genres (assuming JSON array or comma-separated)
-                    all_genres = []
-                    for row in rows:
-                        genres_str = row['genres']
-                        if genres_str:
-                            # Try JSON parse first
-                            try:
-                                import json
-                                genres = json.loads(genres_str)
-                                all_genres.extend(genres)
-                            except:
-                                # Fallback to comma-separated
-                                genres = [g.strip() for g in genres_str.split(',')]
-                                all_genres.extend(genres)
-
-                    # Count genres
-                    genre_counts = Counter(all_genres)
-                    return genre_counts.most_common(limit)
-                else:
-                    # Fallback: use artist names as "genres"
-                    logger.warning("No genres column - using top artists as categories")
+                # tracks has no genres column on real installs, the genres live
+                # on artists. weight each artist's genres by how many of your
+                # tracks they have. before this it jumped straight to artist
+                # names, and get_genre_playlist then searched the discovery
+                # pool for a *genre* called "Louis Armstrong": every Daily Mix
+                # came back empty.
+                cursor.execute("PRAGMA table_info(artists)")
+                artist_columns = [row['name'] for row in cursor.fetchall()]
+                if 'genres' in artist_columns:
                     cursor.execute("""
-                        SELECT ar.name, COUNT(*) as count
+                        SELECT ar.genres AS genres, COUNT(t.id) AS weight
                         FROM tracks t
-                        LEFT JOIN artists ar ON t.artist_id = ar.id
-                        WHERE ar.name IS NOT NULL
-                        GROUP BY ar.name
-                        ORDER BY count DESC
-                        LIMIT ?
-                    """, (limit,))
+                        JOIN artists ar ON t.artist_id = ar.id
+                        WHERE ar.genres IS NOT NULL AND ar.genres NOT IN ('', '[]')
+                        GROUP BY ar.id
+                    """)
+                    ranked = rank_library_genres(
+                        (row['genres'], row['weight']) for row in cursor.fetchall())
+                    if ranked:
+                        return ranked[:limit]
 
-                    rows = cursor.fetchall()
-                    return [(row['name'], row['count']) for row in rows]
+                # last resort, no genre data anywhere: artist names as categories
+                logger.warning("No genre data in library - using top artists as categories")
+                cursor.execute("""
+                    SELECT ar.name, COUNT(*) as count
+                    FROM tracks t
+                    LEFT JOIN artists ar ON t.artist_id = ar.id
+                    WHERE ar.name IS NOT NULL
+                    GROUP BY ar.name
+                    ORDER BY count DESC
+                    LIMIT ?
+                """, (limit,))
+
+                rows = cursor.fetchall()
+                return [(row['name'], row['count']) for row in rows]
 
         except Exception as e:
             logger.error(f"Error getting top genres: {e}")
@@ -821,10 +899,10 @@ class PersonalizedPlaylistsService:
                         source
                     FROM discovery_pool
                     WHERE (artist_name LIKE ? OR track_name LIKE ?) AND source = ?
-                      AND LOWER(artist_name) NOT IN (SELECT LOWER(artist_name) FROM discovery_artist_blacklist UNION SELECT LOWER(name) FROM blocklist WHERE entity_type='artist')
+                      AND LOWER(artist_name) NOT IN (SELECT LOWER(name) FROM blocklist WHERE entity_type='artist' AND profile_id = ?)
                     ORDER BY RANDOM()
                     LIMIT ?
-                """, (f'%{category}%', f'%{category}%', active_source, limit))
+                """, (f'%{category}%', f'%{category}%', active_source, _blocklist_profile(), limit))
 
                 rows = cursor.fetchall()
                 return [self._build_track_dict(row, active_source) for row in rows]
@@ -1038,6 +1116,14 @@ class PersonalizedPlaylistsService:
             else:
                 from core.metadata_service import get_primary_client
                 itunes = get_primary_client()
+                # S8: these track ids come from the active (non-Spotify)
+                # source — label them with the provider-correct key instead
+                # of mislabeling them as spotify_track_id. The generic 'id'
+                # is preserved for consumers that don't care about the source.
+                track_id_key = {
+                    'itunes': 'itunes_track_id',
+                    'deezer': 'deezer_track_id',
+                }.get(active_source, 'spotify_track_id')
                 for album in selected_albums:
                     try:
                         album_data = itunes.get_album(album.id, include_tracks=True)
@@ -1053,7 +1139,7 @@ class PersonalizedPlaylistsService:
                                     track_artists = track.get('artists', [])
                                     artist_names = [a['name'] for a in track_artists] if isinstance(track_artists, list) and track_artists and isinstance(track_artists[0], dict) else (track_artists if isinstance(track_artists, list) else [])
                                     all_tracks.append({
-                                        'spotify_track_id': track_id,
+                                        track_id_key: track_id,
                                         'track_name': track.get('name', ''),
                                         'artist_name': ', '.join(artist_names) if artist_names else 'Unknown',
                                         'album_name': album_name,

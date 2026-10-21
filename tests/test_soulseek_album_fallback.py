@@ -42,8 +42,16 @@ class _Stub:
     def download(self, username, filename, size):
         return f"dl-{filename}"          # truthy id; run_async patched to identity
 
-    def _poll_album_bundle_downloads(self, transfer_keys, emit):
-        return self._poll_result
+    _enqueue_album_tracks = SoulseekClient._enqueue_album_tracks
+
+    def _poll_album_bundle_downloads(self, transfer_keys, emit, *, deadline=None,
+                                     switch_on_crawl=False, initial_completed=None):
+        completed = {
+            key: path for key, path in zip(transfer_keys, self._poll_result)
+        }
+        completed.update(initial_completed or {})
+        return {'completed': completed, 'pending': [], 'reason': 'complete',
+                'speed_bps': None, 'sample_seconds': 0}
 
 
 def _track(name):
@@ -98,3 +106,31 @@ def test_healthy_folder_does_not_fall_back():
     assert result['fallback'] is False
     assert result['partial'] is False
     assert result['files'] == completed
+
+
+def test_album_folder_filter_uses_the_batch_quality_profile():
+    class _ProfileStub(_Stub):
+        def __init__(self):
+            super().__init__([])
+            self.profile_ids = []
+
+        def filter_results_by_quality_preference(self, tracks, profile_id=None):
+            self.profile_ids.append(profile_id)
+            return tracks
+
+    stub = _ProfileStub()
+    with patch("core.soulseek_client.run_async", lambda value: value):
+        SoulseekClient.download_album_to_staging(
+            stub,
+            album_name="All Hope Is Gone",
+            artist_name="Slipknot",
+            staging_dir="/tmp/staging-does-not-matter",
+            preferred_source={
+                "username": "deadpeer",
+                "folder_path": "music/Slipknot/All Hope Is Gone",
+            },
+            preferred_tracks=[_track("01.flac")],
+            quality_profile_id=73,
+        )
+
+    assert stub.profile_ids == [73]

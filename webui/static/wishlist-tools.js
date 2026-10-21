@@ -16,43 +16,31 @@ let discoveryFixEnterHandler = null;
 // instead of fuzzy search so Enter does the obvious right thing per field.
 let discoveryFixMbidEnterHandler = null;
 
-// What the Fix dialog lists: candidates kept for the track (its suggestions, an
-// MBID lookup) and each metadata source's answer to the current search
-// (searchDiscoveryFix). `token` drops answers to a search since replaced.
-let discoveryFixResults = { token: 0, pinned: [], sources: [], settled: true, chosenKey: null, order: null };
-// How the results are shown. Hiding versions carries over from track to track.
-let discoveryFixView = { source: 'all', hideVersions: false };
-// The review in progress (startDiscoveryReview), or null.
-let discoveryReview = null;
-
-/**
- * The discovery modal state a Fix acts on. ListenBrainz keeps its own states;
- * every other source's modal lives in youtubePlaylistStates under the modal's
- * identifier. Opening Fix and saving the pick both look the state up here, so
- * a source can't be known to one and missing from the other: Qobuz playlists
- * opened from the Qobuz tab, and iTunes links, were missing from opening.
- */
-function getDiscoveryFixState(platform, identifier) {
-    if (platform === 'listenbrainz') {
-        return listenbrainzPlaylistStates[identifier];
-    }
-    if (platform === 'youtube') {
-        // ListenBrainz also uses the YouTube modal infrastructure
-        return listenbrainzPlaylistStates[identifier] || youtubePlaylistStates[identifier];
-    }
-    const youtubeStatePlatforms = ['tidal', 'qobuz', 'deezer', 'beatport', 'mirrored', 'spotify_public', 'itunes_link'];
-    return youtubeStatePlatforms.includes(platform) ? youtubePlaylistStates[identifier] : undefined;
-}
-
 /**
  * Open discovery fix modal for a specific track
  */
-function openDiscoveryFixModal(platform, identifier, trackIndex, { review = false } = {}) {
+function openDiscoveryFixModal(platform, identifier, trackIndex) {
     console.log(`🔧 Opening fix modal: ${platform} - ${identifier} - track ${trackIndex}`);
 
     // Get the discovery state
-    const state = getDiscoveryFixState(platform, identifier);
-    let result;
+    // Note: Beatport, Tidal, and ListenBrainz have their own states, but reuse YouTube modal infrastructure
+    let state, result;
+    if (platform === 'youtube') {
+        // Check both states - ListenBrainz also uses YouTube modal infrastructure
+        state = listenbrainzPlaylistStates[identifier] || youtubePlaylistStates[identifier];
+    } else if (platform === 'tidal') {
+        state = youtubePlaylistStates[identifier]; // Tidal uses YouTube state infrastructure
+    } else if (platform === 'beatport') {
+        state = youtubePlaylistStates[identifier]; // Beatport uses YouTube state infrastructure
+    } else if (platform === 'listenbrainz') {
+        state = listenbrainzPlaylistStates[identifier]; // ListenBrainz has its own state
+    } else if (platform === 'deezer') {
+        state = youtubePlaylistStates[identifier]; // Deezer uses YouTube state infrastructure
+    } else if (platform === 'mirrored') {
+        state = youtubePlaylistStates[identifier]; // Mirrored playlists use YouTube state infrastructure
+    } else if (platform === 'spotify_public') {
+        state = youtubePlaylistStates[identifier]; // Spotify public playlists use YouTube state infrastructure
+    }
 
     // Support both camelCase and snake_case for discovery results
     const results = state?.discoveryResults || state?.discovery_results;
@@ -77,16 +65,14 @@ function openDiscoveryFixModal(platform, identifier, trackIndex, { review = fals
         identifier,
         trackIndex,
         sourceTrack: result.lb_track || result.yt_track || result.tidal_track?.name || result.beatport_track?.title || result.track_name || 'Unknown Track',
-        sourceArtist: result.lb_artist || result.yt_artist || result.tidal_track?.artist || result.beatport_track?.artist || result.artist_name || 'Unknown Artist',
-        // How long the playlist's track runs, to show how far each result's length is off.
-        sourceDurationMs: discoverySourceDurationMs(state, result, trackIndex)
+        sourceArtist: result.lb_artist || result.yt_artist || result.tidal_track?.artist || result.beatport_track?.artist || result.artist_name || 'Unknown Artist'
     };
 
     // Find the fix modal within the active discovery modal
     const discoveryModal = document.getElementById(`youtube-discovery-modal-${identifier}`);
     if (!discoveryModal) {
         console.error('❌ Discovery modal not found:', identifier);
-        showToast('Discovery modal not found', 'error');
+        showToast('Identification modal not found', 'error');
         return;
     }
 
@@ -159,41 +145,18 @@ function openDiscoveryFixModal(platform, identifier, trackIndex, { review = fals
         mbidInput.addEventListener('keypress', discoveryFixMbidEnterHandler);
     }
 
-    // A fresh list for this track. Hiding versions carries over; the source filter doesn't.
-    discoveryFixResults = { token: discoveryFixResults.token + 1, pinned: [], sources: [], settled: true, chosenKey: null, order: null };
-    discoveryFixView = { ...discoveryFixView, source: 'all' };
-    drawDiscoveryFixResults(fixModalOverlay);
-    setDiscoveryFixReviewChrome(fixModalOverlay);
-
     // Show modal BEFORE auto-search so elements are visible
     fixModalOverlay.classList.remove('hidden');
-    if (review) {
-        // Keys drive a review, so no search box may keep the focus from the last track.
-        document.activeElement?.blur?.();
-    }
-
-    // A track discovery couldn't match may carry its best near misses: list them
-    // straight away, and search every source for more below them.
-    if (Array.isArray(result.suggestions) && result.suggestions.length > 0) {
-        console.log('✅ Fix modal opened on its suggestions');
-        renderDiscoveryFixResults([...result.suggestions], fixModalOverlay);
-    }
     console.log('✅ Fix modal opened, starting auto-search...');
 
-    // Auto-search with initial values. Outside a review the delay lets the modal
-    // layout settle and prevents accidental clicks; a review guards its own clicks.
-    setTimeout(() => searchDiscoveryFix(), review ? 0 : 500);
+    // Auto-search with initial values (delay allows modal layout to settle and prevents accidental clicks)
+    setTimeout(() => searchDiscoveryFix(), 500);
 }
 
 /**
  * Close discovery fix modal
  */
 function closeDiscoveryFixModal() {
-    // During a review the dialog closes by ending the review, which closes it here.
-    if (discoveryReview) {
-        closeDiscoveryReview();
-        return;
-    }
     if (!currentDiscoveryFix.identifier) {
         console.warn('No active fix modal to close');
         return;
@@ -208,14 +171,10 @@ function closeDiscoveryFixModal() {
     }
 
     currentDiscoveryFix = { platform: null, identifier: null, trackIndex: null, sourceTrack: null, sourceArtist: null };
-    // Answers still on their way belong to no one now.
-    discoveryFixResults = { ...discoveryFixResults, token: discoveryFixResults.token + 1 };
 }
 
 /**
- * Search every metadata source for the track at once and list each answer as it
- * arrives (drawDiscoveryFixResults). It used to search the active source and try
- * the next only when one found nothing.
+ * Search for tracks in the configured metadata source
  */
 async function searchDiscoveryFix() {
     if (!currentDiscoveryFix.identifier) {
@@ -243,56 +202,67 @@ async function searchDiscoveryFix() {
         return;
     }
 
+    const resultsContainer = fixModalOverlay.querySelector('#fix-modal-results');
+
+    // Build search params
     const params = new URLSearchParams();
     if (trackInput) params.set('track', trackInput);
     if (artistInput) params.set('artist', artistInput);
-    params.set('limit', '20');
+    if (!trackInput && !artistInput) {
+        resultsContainer.innerHTML = '<div class="no-results">Enter a track name or artist.</div>';
+        return;
+    }
+    params.set('limit', '50');
 
-    // One request per source (discoveryFixSourceList), so a slow one -- MusicBrainz
-    // allows a request a second -- only delays its own answer. Each search fills its
-    // own source entries, so answers to a search since replaced land nowhere shown;
-    // `token` keeps a replaced search from marking its successor settled.
-    const token = discoveryFixResults.token + 1;
-    discoveryFixResults = {
-        ...discoveryFixResults,
-        token,
-        settled: false,
-        chosenKey: null,
-        order: null,
-        sources: discoveryFixSourceList().map(source => ({ ...source, status: 'searching', tracks: [], error: '' })),
-    };
-    drawDiscoveryFixResults(fixModalOverlay);
+    // Use the user's active metadata source first, then fall back to others.
+    // MusicBrainz is included so users on MB-as-primary get MB queried first,
+    // and so MB is available as a fallback for fuzzy / niche / non-mainstream
+    // recordings that Spotify / Deezer / iTunes miss (different catalogues,
+    // different cover coverage). MB sits last by default because it's
+    // rate-limited to 1 req/sec — when it's the active primary the activeIdx
+    // reorder below moves it to the front. Discogs is intentionally absent —
+    // Discogs has no track-level search API (releases only).
+    const activeSource = (currentMusicSourceName || 'Spotify').toLowerCase();
+    const allSources = [
+        { key: 'spotify', endpoint: '/api/spotify/search_tracks', label: 'Spotify' },
+        { key: 'deezer', endpoint: '/api/deezer/search_tracks', label: 'Deezer' },
+        { key: 'itunes', endpoint: '/api/itunes/search_tracks', label: 'iTunes' },
+        { key: 'musicbrainz', endpoint: '/api/musicbrainz/search_tracks', label: 'MusicBrainz' },
+    ];
+    // Put the active source first, keep others as fallbacks
+    const activeIdx = allSources.findIndex(s => activeSource.includes(s.key));
+    const searchSources = activeIdx > 0
+        ? [allSources[activeIdx], ...allSources.filter((_, i) => i !== activeIdx)]
+        : allSources;
 
-    await Promise.all(discoveryFixResults.sources.map(async entry => {
-        let timer = null;
-        try {
-            const response = await Promise.race([
-                fetch(`/api/discovery/fix-search?source=${entry.key}&${params.toString()}`),
-                new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timed out')), 15000); }),
-            ]);
-            const data = await response.json().catch(() => ({}));
-            if (data.status === 'not_connected') {
-                entry.status = 'not_connected';
-            } else if (!response.ok || data.status === 'error') {
-                entry.status = 'error';
-                entry.error = data.error || `request failed (${response.status})`;
-            } else {
-                entry.status = 'done';
-                entry.tracks = (data.tracks || []).map(track => ({ ...track, source: track.source || entry.key }));
+    resultsContainer.innerHTML = `<div class="loading">🔍 Searching ${searchSources[0].label}...</div>`;
+
+    try {
+        for (let i = 0; i < searchSources.length; i++) {
+            const source = searchSources[i];
+            try {
+                const response = await fetch(`${source.endpoint}?${params.toString()}`);
+                const data = await response.json();
+
+                if (data.tracks && data.tracks.length > 0) {
+                    renderDiscoveryFixResults(data.tracks, fixModalOverlay);
+                    return;
+                }
+                // No results from this source — show next source status if there is one
+                if (i < searchSources.length - 1) {
+                    resultsContainer.innerHTML = `<div class="loading">🔍 Trying ${searchSources[i + 1].label}...</div>`;
+                }
+            } catch (e) {
+                console.warn(`Discovery fix search failed on ${source.label}: ${e.message}`);
             }
-        } catch (error) {
-            console.warn(`Discovery fix search failed on ${entry.label}: ${error.message}`);
-            entry.status = 'error';
-            entry.error = error.message;
-        } finally {
-            clearTimeout(timer);
         }
-        drawDiscoveryFixResults(fixModalOverlay);
-    }));
+        // All sources exhausted
+        resultsContainer.innerHTML = '<div class="no-results">No matches found on any source. Try different search terms.</div>';
 
-    if (discoveryFixResults.token !== token) return;
-    discoveryFixResults.settled = true;
-    drawDiscoveryFixResults(fixModalOverlay);
+    } catch (error) {
+        console.error('Search error:', error);
+        resultsContainer.innerHTML = '<div class="error-message">❌ Search failed. Try again.</div>';
+    }
 }
 
 /**
@@ -328,7 +298,7 @@ async function lookupDiscoveryFixByMbid() {
     }
 
     if (resultsContainer) {
-        resultsContainer.innerHTML = '<div class="loading">🔗 Looking up MusicBrainz recording…</div>';
+        resultsContainer.innerHTML = '<div class="loading">🔗 Looking up MusicBrainz recording...</div>';
     }
 
     try {
@@ -350,9 +320,8 @@ async function lookupDiscoveryFixByMbid() {
             return;
         }
         // Render as a single-result list — user still clicks to confirm,
-        // matching the existing search-result flow exactly. The lookup doesn't say
-        // the recording came from MusicBrainz.
-        renderDiscoveryFixResults([{ ...track, source: track.source || 'musicbrainz' }], fixModalOverlay);
+        // matching the existing search-result flow exactly.
+        renderDiscoveryFixResults([track], fixModalOverlay);
     } catch (error) {
         console.error('MBID lookup error:', error);
         if (resultsContainer) {
@@ -362,274 +331,39 @@ async function lookupDiscoveryFixByMbid() {
 }
 
 /**
- * List these candidates for the track -- its suggestions, an MBID lookup -- in place
- * of any earlier results. A search started afterwards adds every source's answers.
+ * Render search results as clickable cards
  */
 function renderDiscoveryFixResults(tracks, fixModalOverlay) {
-    discoveryFixResults = {
-        token: discoveryFixResults.token + 1,
-        pinned: [...(tracks || [])],
-        sources: [],
-        settled: true,
-        chosenKey: null,
-        order: null,
-    };
-    drawDiscoveryFixResults(fixModalOverlay);
-}
+    const resultsContainer = fixModalOverlay.querySelector('#fix-modal-results');
+    resultsContainer.innerHTML = '';
 
-/** The metadata sources the Fix dialog searches, the active one first. Discogs has no track search. */
-function discoveryFixSourceList() {
-    const sources = [
-        { key: 'spotify', label: 'Spotify' },
-        { key: 'deezer', label: 'Deezer' },
-        { key: 'itunes', label: 'iTunes' },
-        { key: 'musicbrainz', label: 'MusicBrainz' },
-    ];
-    const active = String(currentMusicSourceName || '').toLowerCase();
-    const first = sources.findIndex(source => active.includes(source.key));
-    return first > 0 ? [sources[first], ...sources.filter((_, i) => i !== first)] : sources;
-}
+    // Sort: standard album versions first, live/remix/cover/soundtrack last
+    const _variantPattern = /\b(live|remix|remaster|refix|cover|acoustic|demo|instrumental|radio edit|single version|deluxe|edition|soundtrack|from .* film|from .* movie|bonus track)\b|\b\w+ mix\b/i;
+    const _albumVariantPattern = /\b(live|greatest hits|best of|collection|compilation|soundtrack|from .* film|from .* movie|remaster|deluxe|redux|expanded|anniversary)\b/i;
+    tracks.sort((a, b) => {
+        const aVariant = _variantPattern.test(a.name || '') || _albumVariantPattern.test(a.album || '');
+        const bVariant = _variantPattern.test(b.name || '') || _albumVariantPattern.test(b.album || '');
+        if (aVariant !== bVariant) return aVariant ? 1 : -1;
+        return 0; // preserve original order within same category
+    });
 
-/** How long the playlist's own track runs, in ms, or 0 when nothing says. */
-function discoverySourceDurationMs(state, result, trackIndex) {
-    const playlistTrack = state?.playlist?.tracks?.[trackIndex];
-    const ownTrack = result?.tidal_track || result?.qobuz_track || result?.deezer_track || result?.itunes_link_track;
-    const ms = Number(playlistTrack?.duration_ms) || Number(ownTrack?.duration_ms) || 0;
-    if (ms > 0) return ms;
-    // A ListenBrainz row carries the playlist track's length as text.
-    const text = result?.lb_track ? String(result.duration || '').match(/^(\d+):(\d{2})$/) : null;
-    return text ? (Number(text[1]) * 60 + Number(text[2])) * 1000 : 0;
-}
+    tracks.forEach(track => {
+        const card = document.createElement('div');
+        card.className = 'fix-result-card';
+        card.onclick = () => selectDiscoveryFixTrack(track);
 
-/**
- * The kind of version a result is when it's one a playlist rarely means --
- * 'karaoke', 'cover', 'live' or 'remix' -- or ''. A title counts only in its
- * bracketed or dashed-off part ("Song (Live)", "Song - Remix"), so "Live Forever"
- * is no live cut and Beatport's "(Original Mix)" no remix; an album or artist counts
- * for karaoke and tribute releases and live albums.
- */
-function discoveryVersionTag(track) {
-    const kinds = [
-        ['karaoke', /karaoke|backing track|instrumental|originally performed|in the style of|made famous|as performed by/i],
-        ['cover', /\bcover(?:ed)?\b|tribute|re-?recorded|lullaby|8[- ]?bit/i],
-        ['live', /\blive\b|unplugged|in concert/i],
-        ['remix', /remix|(?<!original )\bmix\b|\brework\b|\bbootleg\b|sped up|slowed|nightcore|\bvip\b/i],
-    ];
-    const title = String(track?.name || '');
-    const parts = [...title.matchAll(/[([]([^)\]]*)[)\]]/g)].map(match => match[1]);
-    const dashed = title.match(/\s[-–—]\s(.+)$/);
-    if (dashed) parts.push(dashed[1]);
-    const decoration = parts.join(' | ');
-    for (const [kind, pattern] of kinds) {
-        if (pattern.test(decoration)) return kind;
-    }
-    const artists = (Array.isArray(track?.artists) ? track.artists : [track?.artists])
-        .map(artist => (typeof artist === 'string' ? artist : artist?.name || '')).join(' ');
-    const album = typeof track?.album === 'string' ? track.album : (track?.album?.name || '');
-    if (kinds[0][1].test(`${album} ${artists}`)) return 'karaoke';
-    if (/tribute|lullaby|8[- ]?bit/i.test(`${album} ${artists}`)) return 'cover';
-    if (/^live\b|\blive (?:at|in|from)\b|[([]live[)\]]|unplugged/i.test(album)) return 'live';
-    return '';
-}
-
-/** A result's length minus the playlist track's, in ms, or null when either is unknown. */
-function discoveryLengthDelta(track, sourceMs) {
-    const ms = Number(track?.duration_ms) || 0;
-    return ms > 0 && sourceMs > 0 ? ms - sourceMs : null;
-}
-
-/** A small version of a cover, where the source's image URL can ask for one. */
-function discoveryThumbUrl(url) {
-    return String(url || '')
-        .replace(/\/(\d{3,4})x\1bb\.(jpg|png|webp)$/, '/100x100bb.$2')
-        .replace(/\/(\d{3,4})x\1-000000-80-0-0\.jpg$/, '/250x250-000000-80-0-0.jpg')
-        .replace(/ab67616d0000b273|ab67616d000082c1/, 'ab67616d00001e02');
-}
-
-/** Which result this is, across every source: its source and its id there. */
-function discoveryFixCandidateKey(track) {
-    return `${track?.source || ''}:${track?.id ?? ''}`;
-}
-
-/**
- * Everything the Fix dialog has for the track, best first: the candidates kept for
- * it (suggestions, an MBID lookup) in their own order, then every source's results
- * by relevance, a length close to the playlist track's counting for more. Versions
- * (discoveryVersionTag) sink below the rest unless the playlist track is that kind
- * of version itself. Once a result is chosen the order holds, and a later answer
- * joins at the end rather than moving the list under the user.
- */
-function discoveryFixRanked() {
-    const results = discoveryFixResults;
-    const sourceKind = discoveryVersionTag({ name: currentDiscoveryFix.sourceTrack || '' });
-    const sourceMs = currentDiscoveryFix.sourceDurationMs || 0;
-    const priority = new Map(discoveryFixSourceList().map((source, i) => [source.key, i]));
-    const seen = new Set();
-    const candidates = [];
-    const add = (track, pinned, rank) => {
-        if (!track) return;
-        const key = discoveryFixCandidateKey(track);
-        if (seen.has(key)) return;
-        seen.add(key);
-        const kind = discoveryVersionTag(track);
-        candidates.push({ track, key, pinned, rank, kind, sunk: Boolean(kind) && kind !== sourceKind });
-    };
-    results.pinned.forEach((track, i) => add(track, true, i));
-    results.sources.forEach(entry => (entry.tracks || []).forEach((track, i) => add(track, false, i)));
-
-    const score = candidate => {
-        const delta = discoveryLengthDelta(candidate.track, sourceMs);
-        const closeness = delta === null ? 0 : Math.abs(delta) <= 3000 ? 0.3 : Math.abs(delta) <= 10000 ? 0.15 : 0;
-        return (Number(candidate.track.relevance) || 0) + closeness;
-    };
-    candidates.sort((a, b) => (Number(a.sunk) - Number(b.sunk))
-        || (Number(b.pinned) - Number(a.pinned))
-        || (a.pinned ? a.rank - b.rank : score(b) - score(a))
-        || ((priority.get(a.track.source) ?? 99) - (priority.get(b.track.source) ?? 99))
-        || (a.rank - b.rank));
-
-    if (results.order) {
-        const held = new Map(results.order.map((key, i) => [key, i]));
-        const after = results.order.length;
-        candidates.sort((a, b) => (held.has(a.key) ? held.get(a.key) : after) - (held.has(b.key) ? held.get(b.key) : after));
-    }
-    return candidates;
-}
-
-/** The candidates the source chip and the versions chip let through. */
-function discoveryFixVisible(ranked) {
-    return ranked.filter(candidate => (discoveryFixView.source === 'all' || candidate.track.source === discoveryFixView.source)
-        && !(discoveryFixView.hideVersions && candidate.sunk));
-}
-
-/**
- * The result Enter accepts in a review: the one chosen with a number key or, failing
- * that, the top one -- once every source has answered, or when it is a kept candidate
- * no later answer can rank above.
- */
-function discoveryFixChosen(visible) {
-    const chosenKey = discoveryFixResults.chosenKey;
-    const chosen = chosenKey ? visible.find(candidate => candidate.key === chosenKey) : null;
-    if (chosen) return chosen;
-    const top = visible[0];
-    if (!top) return null;
-    return discoveryFixResults.settled || discoveryFixResults.order || (top.pinned && !top.sunk) ? top : null;
-}
-
-/** The Fix dialog of the discovery modal it is open in. */
-function discoveryFixOverlay() {
-    const discoveryModal = document.getElementById(`youtube-discovery-modal-${currentDiscoveryFix.identifier}`);
-    return discoveryModal ? discoveryModal.querySelector('.discovery-fix-modal-overlay') : null;
-}
-
-/** Draw the Fix dialog's source chips and result cards from what it has now. */
-function drawDiscoveryFixResults(fixModalOverlay) {
-    const container = fixModalOverlay?.querySelector('#fix-modal-results');
-    if (!container) return;
-    const results = discoveryFixResults;
-    const view = discoveryFixView;
-    const ranked = discoveryFixRanked();
-    const visible = discoveryFixVisible(ranked);
-    const reviewing = Boolean(discoveryReview);
-    const chosen = reviewing ? discoveryFixChosen(visible) : null;
-    const sourceMs = currentDiscoveryFix.sourceDurationMs || 0;
-    const labels = Object.fromEntries(discoveryFixSourceList().map(source => [source.key, source.label]));
-    const waiting = results.sources.filter(entry => entry.status === 'searching').map(entry => entry.label);
-
-    const chips = fixModalOverlay.querySelector('#fix-modal-source-chips');
-    if (chips) {
-        const shown = ranked.filter(candidate => !(view.hideVersions && candidate.sunk));
-        const count = key => shown.filter(candidate => key === 'all' || candidate.track.source === key).length;
-        const chip = (key, label, status, error) => {
-            const note = status === 'searching' ? '…' : status === 'error' ? '!' : status === 'not_connected' ? '–' : count(key);
-            const title = status === 'error' ? `${label}: ${error || 'search failed'}`
-                : status === 'not_connected' ? `${label} isn't connected` : '';
-            return `<button type="button" class="discovery-filter-chip fix-source-chip${view.source === key ? ' is-active' : ''}" data-fix-source="${key}"${status === 'not_connected' ? ' disabled' : ''}${title ? ` title="${escapeHtml(title)}"` : ''} onclick="setDiscoveryFixSource('${key}')">${escapeHtml(label)} <span class="discovery-filter-count">${note}</span></button>`;
-        };
-        const versions = ranked.filter(candidate => candidate.sunk).length;
-        const versionsChip = versions || view.hideVersions
-            ? `<button type="button" class="discovery-filter-chip fix-versions-chip${view.hideVersions ? ' is-active' : ''}" title="Karaoke, cover, live and remix versions" onclick="toggleDiscoveryFixVersions()">Hide versions <span class="discovery-filter-count">${versions}</span></button>`
-            : '';
-        chips.innerHTML = results.sources.length
-            ? [chip('all', 'All', waiting.length ? 'searching' : 'done'),
-                ...results.sources.map(entry => chip(entry.key, entry.label, entry.status, entry.error))].join('') + versionsChip
-            : versionsChip;
-    }
-
-    if (!visible.length) {
-        if (waiting.length) {
-            container.innerHTML = `<div class="loading">🔍 Searching ${escapeHtml(waiting.join(', '))}…</div>`;
-        } else if (!results.sources.length && !results.pinned.length) {
-            container.innerHTML = '';
-        } else {
-            container.innerHTML = `<div class="no-results">${ranked.length
-                ? 'No results with these filters.'
-                : 'No matches found on any source. Try different search terms.'}</div>`;
-        }
-        return;
-    }
-
-    const kindLabels = { karaoke: 'Karaoke', cover: 'Cover', live: 'Live', remix: 'Remix' };
-    container.innerHTML = visible.map((candidate, position) => {
-        const track = candidate.track;
-        const artists = (Array.isArray(track.artists) ? track.artists : [track.artists])
-            .map(artist => (typeof artist === 'string' ? artist : artist?.name || '')).filter(Boolean).join(', ');
-        const album = typeof track.album === 'string' ? track.album : (track.album?.name || '');
-        const thumb = discoveryThumbUrl(track.image_url);
-        const delta = discoveryLengthDelta(track, sourceMs);
-        let deltaHtml = '';
-        if (delta !== null) {
-            const off = Math.abs(delta);
-            deltaHtml = off <= 2000
-                ? '<span class="fix-result-delta is-close" title="The same length as the playlist track">same length</span>'
-                : `<span class="fix-result-delta ${off <= 10000 ? 'is-near' : 'is-far'}" title="Compared with the playlist track">${delta > 0 ? '+' : '−'}${off < 60000 ? `${Math.round(off / 1000)}s` : formatDuration(off)}</span>`;
-        }
-        const suggested = candidate.pinned && track.confidence != null
-            ? `<span class="fix-result-suggested" title="Discovery's score for this near miss">${Math.round((Number(track.confidence) || 0) * 100)}%</span>`
-            : '';
-        const keyArg = escapeHtml(candidate.key.replace(/\\/g, '\\\\').replace(/'/g, "\\'"));
-        const classes = `fix-result-card${candidate.sunk ? ' is-version' : ''}${chosen && chosen.key === candidate.key ? ' is-chosen' : ''}`;
-        return `<div class="${classes}" data-key="${escapeHtml(candidate.key)}" onclick="pickDiscoveryFixResult('${keyArg}')">
-            ${reviewing && position < 9 ? `<span class="fix-result-number">${position + 1}</span>` : ''}
-            <div class="fix-result-art">${thumb ? `<img src="${escapeHtml(thumb)}" alt="" loading="lazy">` : '<span class="fix-result-art-empty">♪</span>'}</div>
+        card.innerHTML = `
             <div class="fix-result-card-content">
-                <div class="fix-result-title">${escapeHtml(track.name || 'Unknown Track')}${candidate.kind ? ` <span class="fix-result-version">${kindLabels[candidate.kind]}</span>` : ''}</div>
-                <div class="fix-result-artist">${escapeHtml(artists || 'Unknown Artist')}</div>
-                <div class="fix-result-album">${escapeHtml(album || 'Unknown Album')}</div>
+                <div class="fix-result-title">${escapeHtml(track.name || 'Unknown Track')}</div>
+                ${track.disambiguation ? `<div class="fix-result-disambiguation">Recording note: ${escapeHtml(track.disambiguation)}</div>` : ''}
+                <div class="fix-result-artist">${escapeHtml((track.artists || ['Unknown Artist']).join(', '))}</div>
+                <div class="fix-result-album">${escapeHtml(track.album || 'Unknown Album')}</div>
+                <div class="fix-result-duration">${formatDuration(track.duration_ms || 0)}</div>
             </div>
-            <div class="fix-result-meta">
-                <span class="fix-result-source">${escapeHtml(labels[track.source] || track.source || '')}</span>
-                ${suggested}
-                <span class="fix-result-duration">${formatDuration(track.duration_ms || 0)}</span>
-                ${deltaHtml}
-            </div>
-        </div>`;
-    }).join('') + (waiting.length
-        ? `<div class="fix-results-pending">Still searching ${escapeHtml(waiting.join(', '))}…</div>`
-        : '');
-}
+        `;
 
-/** A result card was clicked: a review saves it at once, the Fix dialog asks first. */
-function pickDiscoveryFixResult(key) {
-    const candidate = discoveryFixRanked().find(entry => entry.key === key);
-    if (!candidate) return;
-    if (discoveryReview) {
-        acceptDiscoveryReviewCandidate(candidate.track);
-    } else {
-        selectDiscoveryFixTrack(candidate.track);
-    }
-}
-
-/** Show one source's results, or every source's ('all'). */
-function setDiscoveryFixSource(key) {
-    discoveryFixView = { ...discoveryFixView, source: key };
-    drawDiscoveryFixResults(discoveryFixOverlay());
-}
-
-/** Hide karaoke, cover, live and remix versions, or show them again. */
-function toggleDiscoveryFixVersions() {
-    discoveryFixView = { ...discoveryFixView, hideVersions: !discoveryFixView.hideVersions };
-    drawDiscoveryFixResults(discoveryFixOverlay());
+        resultsContainer.appendChild(card);
+    });
 }
 
 /**
@@ -642,26 +376,34 @@ async function selectDiscoveryFixTrack(track) {
     const artists = (track.artists || ['Unknown Artist']).join(', ');
     if (!await showConfirmDialog({ title: 'Confirm Match', message: `Match to "${track.name}" by ${artists}?`, confirmText: 'Confirm' })) return;
 
-    const { platform, identifier, trackIndex, sourceTrack, sourceArtist } = currentDiscoveryFix;
-    if (await applyDiscoveryMatch(platform, identifier, trackIndex, track, { sourceTrack, sourceArtist })) {
-        closeDiscoveryFixModal();
-    }
-}
+    const { platform, identifier, trackIndex } = currentDiscoveryFix;
 
-/**
- * Save ``track`` as the match for one discovery row: send it to the source's
- * update route, then update the modal's state, the row and the playlist card.
- * Picking a result in the Fix dialog and accepting a suggestion both land here.
- * ``quiet`` leaves the messages to a caller accepting many at once. Returns true
- * once the match is saved.
- */
-async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { sourceTrack = '', sourceArtist = '', quiet = false } = {}) {
     console.log('📡 Updating backend match:', { platform, identifier, trackIndex, track });
 
     // Update backend
     try {
-        // The id the platform's routes know the playlist by
-        const backendIdentifier = discoveryBackendIdentifier(platform, identifier);
+        // Get the correct backend identifier based on platform
+        let backendIdentifier = identifier;
+
+        if (platform === 'tidal') {
+            // For Tidal, backend expects the actual playlist_id, not url_hash
+            const state = youtubePlaylistStates[identifier];
+            backendIdentifier = state?.tidal_playlist_id || identifier;
+        } else if (platform === 'deezer') {
+            // For Deezer, backend expects the actual playlist_id, not url_hash
+            const state = youtubePlaylistStates[identifier];
+            backendIdentifier = state?.deezer_playlist_id || identifier;
+        } else if (platform === 'spotify_public') {
+            // For Spotify Public, backend expects the url_hash
+            const state = youtubePlaylistStates[identifier];
+            backendIdentifier = state?.spotify_public_playlist_id || identifier;
+        } else if (platform === 'itunes_link') {
+            const state = youtubePlaylistStates[identifier];
+            backendIdentifier = state?.itunes_link_playlist_id || identifier;
+        } else if (platform === 'beatport') {
+            // For Beatport, backend expects url_hash (same as identifier)
+            backendIdentifier = identifier;
+        }
 
         // Mirrored playlists route through the YouTube endpoint (which already handles mirrored_ prefixes)
         const apiPlatform = platform === 'mirrored' ? 'youtube' : (platform === 'spotify_public' ? 'spotify-public' : (platform === 'itunes_link' ? 'itunes-link' : platform));
@@ -672,8 +414,8 @@ async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { so
             // #843: send the original (source) track so the backend can still save
             // the match to the discovery cache when its in-memory discovery state
             // is gone (server restart / imported playlist not discovered this run).
-            original_name: sourceTrack || '',
-            original_artist: sourceArtist || '',
+            original_name: currentDiscoveryFix.sourceTrack || '',
+            original_artist: currentDiscoveryFix.sourceArtist || '',
             spotify_track: {
                 id: track.id,
                 name: track.name,
@@ -681,17 +423,8 @@ async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { so
                 album: track.album,
                 duration_ms: track.duration_ms,
                 image_url: track.image_url || null,
-                // A suggestion names the metadata source it came from; a search
-                // result may not, and undefined is left out of the request.
                 source: track.source,
-                // What a result knows of its place on its album; the server completes
-                // the rest from the same source (core/discovery/fix_pick.py).
-                track_number: track.track_number || undefined,
-                disc_number: track.disc_number || undefined,
-                release_date: track.release_date || undefined,
-                total_tracks: track.total_tracks || undefined,
-                album_type: track.album_type || undefined,
-                album_id: track.album_id || undefined
+                disambiguation: track.disambiguation || ''
             }
         };
 
@@ -711,24 +444,41 @@ async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { so
         console.log('📡 Response data:', data);
 
         if (data.error) {
-            if (!quiet) showToast(`Failed to update: ${data.error}`, 'error');
+            showToast(`Failed to update: ${data.error}`, 'error');
             console.error('❌ Backend update failed:', data.error);
-            return false;
+            return;
         }
 
-        if (!quiet) showToast('Match updated successfully!', 'success');
+        showToast('Match updated successfully!', 'success');
         console.log('✅ Backend update successful');
 
         // Update frontend state
-        const state = getDiscoveryFixState(platform, identifier);
+        // Note: Beatport and Tidal reuse youtubePlaylistStates for discovery results
+        // ListenBrainz uses its own state but may also be accessed via YouTube
+        let state;
+        if (platform === 'youtube') {
+            state = listenbrainzPlaylistStates[identifier] || youtubePlaylistStates[identifier];
+        } else if (platform === 'tidal') {
+            state = youtubePlaylistStates[identifier];
+        } else if (platform === 'deezer') {
+            state = youtubePlaylistStates[identifier];
+        } else if (platform === 'beatport') {
+            state = youtubePlaylistStates[identifier];
+        } else if (platform === 'listenbrainz') {
+            state = listenbrainzPlaylistStates[identifier];
+        } else if (platform === 'mirrored') {
+            state = youtubePlaylistStates[identifier];
+        } else if (platform === 'spotify_public') {
+            state = youtubePlaylistStates[identifier];
+        } else if (platform === 'itunes_link') {
+            state = youtubePlaylistStates[identifier];
+        }
 
         // Support both camelCase and snake_case
         const results = state?.discoveryResults || state?.discovery_results;
         if (state && results && results[trackIndex]) {
             const result = results[trackIndex];
-            // Not a match before? A Wing It guess was one on some platforms (discoveryGuessesCount).
-            const wasNotFound = result.status !== 'found' && result.status_class !== 'found'
-                && !((result.wing_it_fallback || result.status_class === 'wing-it') && discoveryGuessesCount(state));
+            const wasNotFound = result.status !== 'found' && result.status_class !== 'found';
 
             // Update result
             result.status = '✅ Found';
@@ -746,9 +496,6 @@ async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { so
             result.manual_match = true;
             // User picked a real metadata match — no longer a wing-it track
             result.wing_it_fallback = false;
-            result.suggestions = [];
-            // A match puts a track marked "Not available" back in play.
-            result.unavailable = false;
 
             // IMPORTANT: Also set spotify_data for download/sync compatibility.
             // Build album as a dict (not a bare string) so the download
@@ -767,434 +514,90 @@ async function applyDiscoveryMatch(platform, identifier, trackIndex, track, { so
                     _fixAlbumObj.images = [{ url: _fixImageUrl }];
                 }
             }
-            // The server's copy carries what it completed the pick with.
-            result.spotify_data = data.result?.spotify_data || {
+            result.spotify_data = {
                 id: track.id,
                 name: track.name,
                 artists: track.artists,
                 album: _fixAlbumObj,
                 duration_ms: track.duration_ms,
-                image_url: _fixImageUrl,
-                source: track.source
+                image_url: _fixImageUrl
             };
 
             // Increment match count if this was previously not_found or error
             if (wasNotFound) {
                 state.spotifyMatches = (state.spotifyMatches || 0) + 1;
-                if (state.spotify_matches !== undefined) state.spotify_matches = state.spotifyMatches;
-                showDiscoveryMatchProgress(identifier, state);
-                showDiscoveryCardMatches(platform, identifier, state);
+
+                // Update progress bar and text
+                const spotify_total = state.spotify_total || state.playlist?.tracks?.length || 0;
+                const progress = spotify_total > 0 ? Math.round((state.spotifyMatches / spotify_total) * 100) : 0;
+
+                const progressBar = document.getElementById(`youtube-discovery-progress-${identifier}`);
+                const progressText = document.getElementById(`youtube-discovery-progress-text-${identifier}`);
+
+                if (progressBar) {
+                    progressBar.style.width = `${progress}%`;
+                }
+                if (progressText) {
+                    progressText.textContent = `${state.spotifyMatches} / ${spotify_total} tracks matched (${progress}%)`;
+                }
+
+                console.log(`✅ Updated progress: ${state.spotifyMatches}/${spotify_total} (${progress}%)`);
+
+                // Also update the Deezer playlist card if this is a Deezer fix
+                if (platform === 'deezer' && state.deezer_playlist_id) {
+                    const deezerState = deezerPlaylistStates[state.deezer_playlist_id];
+                    if (deezerState) {
+                        deezerState.spotifyMatches = state.spotifyMatches;
+                        updateDeezerCardProgress(state.deezer_playlist_id, {
+                            spotify_matches: state.spotifyMatches,
+                            spotify_total: spotify_total
+                        });
+                    }
+                }
+
+                // Also update the Tidal playlist card if this is a Tidal fix
+                if (platform === 'tidal' && state.tidal_playlist_id) {
+                    const tidalState = tidalPlaylistStates?.[state.tidal_playlist_id];
+                    if (tidalState) {
+                        tidalState.spotifyMatches = state.spotifyMatches;
+                    }
+                }
+
+                // Also update the Spotify Public playlist card if this is a Spotify Public fix
+                if (platform === 'spotify_public' && state.spotify_public_playlist_id) {
+                    const spState = spotifyPublicPlaylistStates?.[state.spotify_public_playlist_id];
+                    if (spState) {
+                        spState.spotifyMatches = state.spotifyMatches;
+                        updateSpotifyPublicCardProgress(state.spotify_public_playlist_id, {
+                            spotify_matches: state.spotifyMatches,
+                            spotify_total: spotify_total
+                        });
+                    }
+                }
+
+                if (platform === 'itunes_link' && state.itunes_link_playlist_id) {
+                    const itunesState = itunesLinkPlaylistStates?.[state.itunes_link_playlist_id];
+                    if (itunesState) {
+                        itunesState.spotifyMatches = state.spotifyMatches;
+                        updateITunesLinkCardProgress(state.itunes_link_playlist_id, {
+                            spotify_matches: state.spotifyMatches,
+                            spotify_total: spotify_total
+                        });
+                    }
+                }
             }
 
             // Update UI - refresh the table row
             updateDiscoveryModalSingleRow(platform, identifier, trackIndex);
         }
-        return true;
+
+        // Close modal
+        closeDiscoveryFixModal();
 
     } catch (error) {
         console.error('Error updating match:', error);
-        if (!quiet) showToast('Failed to update match', 'error');
-        return false;
+        showToast('Failed to update match', 'error');
     }
-}
-
-function _discoverySourceNames(result) {
-    return {
-        sourceTrack: result.yt_track || result.lb_track || result.track_name || '',
-        sourceArtist: result.yt_artist || result.lb_artist || result.artist_name || '',
-    };
-}
-
-/**
- * Accept the top suggestion discovery kept for a track it couldn't match. The
- * suggestion is the pick, so there is nothing to confirm.
- */
-async function acceptDiscoverySuggestion(platform, identifier, trackIndex) {
-    const state = getDiscoveryFixState(platform, identifier);
-    const results = state?.discoveryResults || state?.discovery_results;
-    const result = results?.[trackIndex];
-    const suggestion = result?.suggestions?.[0];
-    if (!suggestion) {
-        showToast('That suggestion is no longer available', 'error');
-        return false;
-    }
-    const saved = await applyDiscoveryMatch(platform, identifier, trackIndex, suggestion, _discoverySourceNames(result));
-    if (saved && typeof setDiscoveryModalFooterActions === 'function') {
-        setDiscoveryModalFooterActions(identifier, state.phase, state);
-    }
-    return saved;
-}
-
-/**
- * Accept every top suggestion at or above the modal's "Accept suggestions ≥"
- * percentage: one confirmation, then one track at a time.
- */
-async function acceptAllDiscoverySuggestions(platform, identifier) {
-    const state = getDiscoveryFixState(platform, identifier);
-    const results = state?.discoveryResults || state?.discovery_results || [];
-    const input = document.getElementById(`accept-suggestions-min-${identifier}`);
-    const minPercent = Math.max(1, Math.min(99, parseInt(input?.value, 10) || 80));
-    const picks = results.filter(r => r.status_class !== 'found' && r.suggestions?.[0]
-        && Math.round((Number(r.suggestions[0].confidence) || 0) * 100) >= minPercent);
-    if (!picks.length) {
-        showToast(`No suggestions at ${minPercent}% or above`, 'info');
-        return;
-    }
-    if (!await showConfirmDialog({
-        title: 'Accept suggestions',
-        message: `Accept the suggested match for ${picks.length} track${picks.length === 1 ? '' : 's'} at ${minPercent}% or above?`,
-        confirmText: 'Accept all',
-    })) return;
-
-    let accepted = 0;
-    for (const result of picks) {
-        const saved = await applyDiscoveryMatch(platform, identifier, result.index, result.suggestions[0],
-            { ..._discoverySourceNames(result), quiet: true });
-        if (saved) accepted++;
-    }
-    showToast(`Accepted ${accepted} of ${picks.length} suggestions`, accepted === picks.length ? 'success' : 'warning');
-    if (typeof setDiscoveryModalFooterActions === 'function') {
-        setDiscoveryModalFooterActions(identifier, state.phase, state);
-    }
-}
-
-/** The id a platform's discovery routes know the modal's playlist by. */
-function discoveryBackendIdentifier(platform, identifier) {
-    // Tidal, Deezer and Qobuz keep their discovery states under the playlist's own
-    // id, and the link playlists under theirs; every other modal's id is the one.
-    const state = youtubePlaylistStates[identifier];
-    if (platform === 'tidal') return state?.tidal_playlist_id || identifier;
-    if (platform === 'deezer') return state?.deezer_playlist_id || identifier;
-    if (platform === 'qobuz') return state?.qobuz_playlist_id || identifier;
-    if (platform === 'spotify_public') return state?.spotify_public_playlist_id || identifier;
-    if (platform === 'itunes_link') return state?.itunes_link_playlist_id || identifier;
-    return identifier;
-}
-
-/** Redraw a discovery modal's match count and progress bar. */
-function showDiscoveryMatchProgress(identifier, state) {
-    const total = state.spotify_total || state.playlist?.tracks?.length || 0;
-    const matches = state.spotifyMatches || 0;
-    const progress = total > 0 ? Math.round((matches / total) * 100) : 0;
-    const bar = document.getElementById(`youtube-discovery-progress-${identifier}`);
-    const text = document.getElementById(`youtube-discovery-progress-text-${identifier}`);
-    if (bar) bar.style.width = `${progress}%`;
-    if (text) text.textContent = `${matches} / ${total} tracks matched (${progress}%)`;
-}
-
-/**
- * Whether a discovery modal counts Wing It guesses as matches: Tidal, Deezer, Qobuz,
- * Spotify-link, Apple Music-link and Beatport discovery do; YouTube, mirrored and
- * ListenBrainz discovery don't.
- */
-function discoveryGuessesCount(state) {
-    return Boolean(state && (state.is_tidal_playlist || state.is_deezer_playlist || state.is_qobuz_playlist
-        || state.is_spotify_public_playlist || state.is_itunes_link_playlist || state.is_beatport_playlist));
-}
-
-/**
- * Show a discovery modal's match count on its playlist's card. A card redraws from its
- * own state's `spotify_matches`, so the count is kept there as well as drawn now; a Fix
- * used to set `spotifyMatches`, which no card reads, and left Tidal and Beatport cards
- * alone.
- */
-function showDiscoveryCardMatches(platform, identifier, state) {
-    const progress = {
-        spotify_matches: state.spotifyMatches || 0,
-        spotify_total: state.spotify_total || state.playlist?.tracks?.length || 0,
-    };
-    const cards = {
-        tidal: () => [tidalPlaylistStates, state.tidal_playlist_id, id => updateTidalCardProgress(id, progress)],
-        qobuz: () => [qobuzPlaylistStates, state.qobuz_playlist_id, id => updateQobuzCardProgress(id, progress)],
-        deezer: () => [deezerPlaylistStates, state.deezer_playlist_id, id => updateDeezerCardProgress(id, progress)],
-        spotify_public: () => [spotifyPublicPlaylistStates, state.spotify_public_playlist_id,
-            id => updateSpotifyPublicCardProgress(id, progress)],
-        itunes_link: () => [itunesLinkPlaylistStates, state.itunes_link_playlist_id,
-            id => updateITunesLinkCardProgress(id, progress)],
-        beatport: () => [beatportChartStates, state.beatport_chart_hash || identifier,
-            id => updateBeatportCardProgress(id, { ...progress, failed: progress.spotify_total - progress.spotify_matches })],
-    };
-    if (!cards[platform]) return;
-    const [cardStates, cardId, redraw] = cards[platform]();
-    const cardState = cardId ? cardStates?.[cardId] : null;
-    if (!cardState) return;
-    cardState.spotify_matches = progress.spotify_matches;
-    redraw(cardId);
-}
-
-/** Take a row that is losing its match, or a guess its platform counted, out of the counts. */
-function uncountDiscoveryMatch(platform, identifier, state, result) {
-    const wasGuess = Boolean(result.wing_it_fallback) || result.status_class === 'wing-it';
-    if (result.status_class !== 'found' && !(wasGuess && discoveryGuessesCount(state))) return;
-    state.spotifyMatches = Math.max(0, (state.spotifyMatches ?? state.spotify_matches ?? 0) - 1);
-    if (state.spotify_matches !== undefined) state.spotify_matches = state.spotifyMatches;
-    showDiscoveryMatchProgress(identifier, state);
-    showDiscoveryCardMatches(platform, identifier, state);
-}
-
-/** Redraw a discovery modal's footer buttons after its tracks changed. Its filter chips
- * follow each row's redraw (updateDiscoveryModalSingleRow). */
-function refreshDiscoveryModalChrome(identifier, state) {
-    if (!state) return;
-    setDiscoveryModalFooterActions(identifier, state.phase, state);
-}
-
-/**
- * Mark a discovery track "Not available" -- no source has it, so it stops coming
- * back -- or, with unavailable=false, put it back in line. The server clears its
- * match and keeps discovery away from it (/api/discovery/unavailable); the row, the
- * match count and the footer follow here. Returns true once saved.
- */
-async function setDiscoveryTrackUnavailable(platform, identifier, trackIndex, unavailable = true, { quiet = false } = {}) {
-    try {
-        const response = await fetch('/api/discovery/unavailable', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                identifier: discoveryBackendIdentifier(platform, identifier),
-                track_index: trackIndex,
-                unavailable,
-            }),
-        });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.success) {
-            if (!quiet) showToast(`Failed to update: ${data.error || response.status}`, 'error');
-            return false;
-        }
-    } catch (error) {
-        console.error('Error marking discovery track:', error);
-        if (!quiet) showToast('Failed to update the track', 'error');
-        return false;
-    }
-
-    const state = getDiscoveryFixState(platform, identifier);
-    const results = state?.discoveryResults || state?.discovery_results;
-    const result = results?.[trackIndex];
-    if (result) {
-        if (unavailable) {
-            uncountDiscoveryMatch(platform, identifier, state, result);
-            Object.assign(result, {
-                status: 'Not available',
-                status_class: 'unavailable',
-                unavailable: true,
-                spotify_track: '',
-                spotify_artist: '',
-                spotify_album: '',
-                spotify_id: '',
-                spotify_data: null,
-                matched_data: null,
-                match_data: null,
-                confidence: 0,
-                wing_it_fallback: false,
-                manual_match: false,
-                isrc_match: false,
-                suggestions: [],
-            });
-        } else if (result.status_class === 'unavailable') {
-            Object.assign(result, { status: 'Not Found', status_class: 'not-found', unavailable: false });
-        }
-        updateDiscoveryModalSingleRow(platform, identifier, trackIndex);
-    }
-    // A review redraws the footer once, when it ends.
-    if (!discoveryReview) refreshDiscoveryModalChrome(identifier, state);
-    if (!quiet) showToast(unavailable ? 'Marked as not available' : 'Back in line for discovery', 'success');
-    return true;
-}
-
-// ── Review ──────────────────────────────────────────────────────────────────
-// One dialog steps through every track still waiting for a decision -- unmatched
-// tracks, Wing It guesses, errors and low-confidence matches. A pick is saved at
-// once and the next track loads: 1–9 choose a result, Enter accepts it, S skips,
-// Esc closes, and "Not available" keeps a track from coming back.
-
-/** Whether a discovery row still waits for a decision. */
-function discoveryReviewWanted(result) {
-    return Boolean(result) && result.status_class !== 'unavailable' && discoveryBucketFor(result) !== 'perfect';
-}
-
-/** The rows a review steps through, in playlist order. */
-function discoveryReviewQueue(state) {
-    const results = state?.discoveryResults || state?.discovery_results || [];
-    return results
-        .map((result, position) => (discoveryReviewWanted(result) ? (result.index ?? position) : null))
-        .filter(index => index !== null);
-}
-
-/** Start reviewing the modal's tracks that still wait for a decision. */
-function startDiscoveryReview(platform, identifier) {
-    const state = getDiscoveryFixState(platform, identifier);
-    const queue = discoveryReviewQueue(state);
-    if (!queue.length) {
-        showToast('Nothing left to review', 'info');
-        return;
-    }
-    if (discoveryReview) closeDiscoveryReview();
-    discoveryReview = { platform, identifier, queue, position: 0, matched: 0, unavailable: 0, skipped: 0, armedAt: 0, busy: false };
-    document.addEventListener('keydown', discoveryReviewKeydown, true);
-    openDiscoveryReviewTrack();
-}
-
-/** Open the review's current track, passing over any settled since the review began. */
-function openDiscoveryReviewTrack() {
-    const review = discoveryReview;
-    if (!review) return;
-    const state = getDiscoveryFixState(review.platform, review.identifier);
-    const results = state?.discoveryResults || state?.discovery_results || [];
-    while (review.position < review.queue.length && !discoveryReviewWanted(results[review.queue[review.position]])) {
-        review.position++;
-    }
-    if (review.position >= review.queue.length) {
-        closeDiscoveryReview({ finished: true });
-        return;
-    }
-    if (!document.getElementById(`youtube-discovery-modal-${review.identifier}`)) {
-        closeDiscoveryReview();
-        return;
-    }
-    // A click meant for the last track's results mustn't land on this one's.
-    review.armedAt = Date.now() + 350;
-    openDiscoveryFixModal(review.platform, review.identifier, review.queue[review.position], { review: true });
-}
-
-/** Dress the Fix dialog for a review, or back for a single fix. */
-function setDiscoveryFixReviewChrome(fixModalOverlay) {
-    const review = discoveryReview;
-    const title = fixModalOverlay.querySelector('.discovery-fix-modal-header h2');
-    if (title) title.textContent = review ? 'Review Matches' : 'Fix Track Match';
-    const progress = fixModalOverlay.querySelector('.fix-review-progress');
-    if (progress) {
-        progress.textContent = review ? `Track ${review.position + 1} of ${review.queue.length}` : '';
-        progress.hidden = !review;
-    }
-    for (const selector of ['.fix-review-keys', '.fix-review-skip', '.fix-review-unavailable']) {
-        const element = fixModalOverlay.querySelector(selector);
-        if (element) element.hidden = !review;
-    }
-    const cancel = fixModalOverlay.querySelector('.fix-modal-cancel');
-    if (cancel) cancel.textContent = review ? 'Close' : 'Cancel';
-}
-
-/** A review's keys: 1–9 choose a result, Enter accepts it, S skips, Esc ends the review. */
-function discoveryReviewKeydown(event) {
-    if (!discoveryReview) return;
-    if (event.key === 'Escape') {
-        event.preventDefault();
-        event.stopPropagation();
-        closeDiscoveryReview();
-        return;
-    }
-    const target = event.target || {};
-    const typing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable;
-    if (typing || event.ctrlKey || event.metaKey || event.altKey) return;
-    const isChoice = /^[1-9]$/.test(event.key);
-    const isSkip = event.key === 's' || event.key === 'S';
-    if (!isChoice && !isSkip && event.key !== 'Enter') return;
-    event.preventDefault();
-    event.stopPropagation();
-    // A held key would run through tracks faster than anyone can read them.
-    if (event.repeat) return;
-    if (isChoice) {
-        chooseDiscoveryFixResult(Number(event.key));
-    } else if (isSkip) {
-        skipDiscoveryReviewTrack();
-    } else {
-        acceptDiscoveryReviewChoice();
-    }
-}
-
-/** Choose the numbered result for Enter to accept. The list holds still from here. */
-function chooseDiscoveryFixResult(number) {
-    const ranked = discoveryFixRanked();
-    const candidate = discoveryFixVisible(ranked)[number - 1];
-    if (!candidate) return false;
-    discoveryFixResults.chosenKey = candidate.key;
-    discoveryFixResults.order = ranked.map(entry => entry.key);
-    drawDiscoveryFixResults(discoveryFixOverlay());
-    return true;
-}
-
-/** Enter in a review: save the chosen result (discoveryFixChosen). */
-function acceptDiscoveryReviewChoice() {
-    const candidate = discoveryFixChosen(discoveryFixVisible(discoveryFixRanked()));
-    if (!candidate) {
-        showToast(discoveryFixResults.settled
-            ? 'No result to accept: search again, skip the track or mark it not available'
-            : 'Still searching: press 1–9 to choose a result', 'info');
-        return Promise.resolve(false);
-    }
-    return acceptDiscoveryReviewCandidate(candidate.track);
-}
-
-/** Save this result as the review's current track's match and move on. */
-async function acceptDiscoveryReviewCandidate(track) {
-    const review = discoveryReview;
-    if (!review || review.busy || Date.now() < review.armedAt) return false;
-    review.busy = true;
-    const { platform, identifier, trackIndex, sourceTrack, sourceArtist } = currentDiscoveryFix;
-    let saved = false;
-    try {
-        saved = await applyDiscoveryMatch(platform, identifier, trackIndex, track, { sourceTrack, sourceArtist, quiet: true });
-    } finally {
-        review.busy = false;
-    }
-    if (discoveryReview !== review) return saved;
-    if (!saved) {
-        showToast('That match was not saved: try again, or skip the track', 'error');
-        return false;
-    }
-    // The track has its match now, so the review passes over it (openDiscoveryReviewTrack).
-    review.matched++;
-    openDiscoveryReviewTrack();
-    return true;
-}
-
-/** Leave the review's current track as it is and move on. */
-function skipDiscoveryReviewTrack() {
-    const review = discoveryReview;
-    if (!review || review.busy) return;
-    review.skipped++;
-    review.position++;
-    openDiscoveryReviewTrack();
-}
-
-/** Mark the review's current track "Not available" and move on. */
-async function markDiscoveryReviewUnavailable() {
-    const review = discoveryReview;
-    if (!review || review.busy || Date.now() < review.armedAt) return false;
-    review.busy = true;
-    const { platform, identifier, trackIndex } = currentDiscoveryFix;
-    let marked = false;
-    try {
-        marked = await setDiscoveryTrackUnavailable(platform, identifier, trackIndex, true, { quiet: true });
-    } finally {
-        review.busy = false;
-    }
-    if (discoveryReview !== review) return marked;
-    if (!marked) {
-        showToast('That track was not marked: try again, or skip it', 'error');
-        return false;
-    }
-    // A marked track waits for no decision, so the review passes over it.
-    review.unavailable++;
-    openDiscoveryReviewTrack();
-    return true;
-}
-
-/** End the review: close the dialog, say what was done and redraw the modal's footer. */
-function closeDiscoveryReview({ finished = false } = {}) {
-    const review = discoveryReview;
-    if (!review) return;
-    discoveryReview = null;
-    document.removeEventListener('keydown', discoveryReviewKeydown, true);
-    closeDiscoveryFixModal();
-    const done = [];
-    if (review.matched) done.push(`${review.matched} matched`);
-    if (review.unavailable) done.push(`${review.unavailable} not available`);
-    if (review.skipped) done.push(`${review.skipped} skipped`);
-    if (finished || done.length) {
-        showToast(`${finished ? 'Review finished' : 'Review closed'}${done.length ? `: ${done.join(', ')}` : ''}`, 'success');
-    }
-    refreshDiscoveryModalChrome(review.identifier, getDiscoveryFixState(review.platform, review.identifier));
 }
 
 /**
@@ -1240,63 +643,71 @@ function updateDiscoveryModalSingleRow(platform, identifier, trackIndex) {
         actionsCell.innerHTML = generateDiscoveryActionButton(result, identifier, platform);
     }
 
-    // The row may belong to another filter group now: the chips' counts follow.
-    refreshDiscoveryFilterBar(identifier, state);
-
     console.log(`✅ Updated row ${trackIndex} in discovery modal`);
 }
 
 async function unmatchDiscoveryTrack(platform, identifier, trackIndex) {
-    platform = String(platform).replace(/-/g, '_');
-    // Each platform's modal unmatches through its own route -- a mirrored playlist's
-    // through YouTube's. Qobuz had no case here and went to YouTube's.
-    const apiBase = {
-        tidal: '/api/tidal', deezer: '/api/deezer', qobuz: '/api/qobuz', spotify_public: '/api/spotify-public',
-        itunes_link: '/api/itunes-link', beatport: '/api/beatport', listenbrainz: '/api/listenbrainz',
-    }[platform] || '/api/youtube';
+    const uiState = (typeof youtubePlaylistStates !== 'undefined' ? youtubePlaylistStates[identifier] : null)
+        || (typeof listenbrainzPlaylistStates !== 'undefined' ? listenbrainzPlaylistStates[identifier] : null);
+    const backendIdentifier = platform === 'spotify_public'
+        ? (uiState?.spotify_public_playlist_id || identifier)
+        : platform === 'itunes_link'
+            ? (uiState?.itunes_link_playlist_id || identifier)
+            : identifier;
+
+    // Determine the correct API base for this platform
+    const apiBase = platform === 'tidal' ? '/api/tidal'
+        : platform === 'deezer' ? '/api/deezer'
+        : (platform === 'spotify-public' || platform === 'spotify_public') ? '/api/spotify-public'
+        : (platform === 'itunes-link' || platform === 'itunes_link') ? '/api/itunes-link'
+        : platform === 'beatport' ? '/api/beatport'
+        : platform === 'listenbrainz' ? '/api/listenbrainz'
+        : '/api/youtube';
 
     try {
         const response = await fetch(`${apiBase}/discovery/unmatch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            // A tab playlist is known to its routes by the playlist's own id.
-            body: JSON.stringify({ identifier: discoveryBackendIdentifier(platform, identifier), track_index: trackIndex })
+            body: JSON.stringify({ identifier: backendIdentifier, track_index: trackIndex })
         });
-        const data = await response.json().catch(() => ({}));
-        if (!response.ok || !data.success) {
+        const data = await response.json();
+        if (data.success) {
+            // Update the row in the discovery modal table
+            const state = youtubePlaylistStates[identifier]
+                || (window.tidalDiscoveryStates && window.tidalDiscoveryStates[identifier])
+                || {};
+            if (state.discovery_results && state.discovery_results[trackIndex]) {
+                const r = state.discovery_results[trackIndex];
+                r.status = '❌ Not Found';
+                r.status_class = 'not-found';
+                r.spotify_track = '-';
+                r.spotify_artist = '-';
+                r.spotify_album = '-';
+                r.spotify_data = null;
+                r.matched_data = null;
+                r.confidence = 0;
+                r.wing_it_fallback = false;
+                r.manual_match = false;
+            }
+            // Re-render the row — discovery rows use id="discovery-row-{urlHash}-{index}"
+            const row = document.getElementById(`discovery-row-${identifier}-${trackIndex}`);
+            if (row) {
+                const statusCell = row.querySelector('.discovery-status');
+                if (statusCell) { statusCell.textContent = '❌ Not Found'; statusCell.className = 'discovery-status not-found'; }
+                const matchedCells = row.querySelectorAll('.spotify-track, .spotify-artist, .spotify-album');
+                matchedCells.forEach(c => c.textContent = '-');
+                const actionsCell = row.querySelector('.discovery-actions');
+                if (actionsCell) {
+                    actionsCell.innerHTML = `<button class="fix-match-btn" onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${trackIndex})" title="Manually search for this track">🔧 Fix</button>`;
+                }
+            }
+            showToast('Match removed', 'success');
+        } else {
             showToast(data.error || 'Failed to remove match', 'error');
-            return false;
         }
-
-        const state = getDiscoveryFixState(platform, identifier);
-        const results = state?.discoveryResults || state?.discovery_results;
-        const result = results?.[trackIndex];
-        if (result) {
-            uncountDiscoveryMatch(platform, identifier, state, result);
-            Object.assign(result, {
-                status: 'Not Found',
-                status_class: 'not-found',
-                spotify_track: '',
-                spotify_artist: '',
-                spotify_album: '',
-                spotify_id: '',
-                spotify_data: null,
-                matched_data: null,
-                match_data: null,
-                confidence: 0,
-                wing_it_fallback: false,
-                manual_match: false,
-                isrc_match: false,
-            });
-            updateDiscoveryModalSingleRow(platform, identifier, trackIndex);
-        }
-        refreshDiscoveryModalChrome(identifier, state);
-        showToast('Match removed', 'success');
-        return true;
     } catch (e) {
         console.error('Unmatch error:', e);
         showToast('Failed to remove match', 'error');
-        return false;
     }
 }
 
@@ -1305,10 +716,6 @@ window.openDiscoveryFixModal = openDiscoveryFixModal;
 window.closeDiscoveryFixModal = closeDiscoveryFixModal;
 window.searchDiscoveryFix = searchDiscoveryFix;
 window.unmatchDiscoveryTrack = unmatchDiscoveryTrack;
-window.openMatchingModal = openMatchingModal;
-window.closeMatchingModal = closeMatchingModal;
-window.selectArtist = selectArtist;
-window.selectAlbum = selectAlbum;
 
 /**
  * Handle post-download cleanup: clear finished downloads from slskd.
@@ -1383,9 +790,24 @@ let wishlistModalVersion = 0;
  * @param {Array} tracks - Array of track objects
  * @param {string} albumType - Type of release (album, EP, single)
  */
-async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwnership) {
+const WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID = 'wishlist-modal-quality-profile';
+
+/** The Quality Profile chosen in the shared wishlist modal, or null for "server decides". */
+function currentWishlistModalQualityProfileId() {
+    return getAcquisitionQualityProfileId(WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID);
+}
+
+/**
+ * @param {object} [playlistContext] `{ playlistRef, playlistSource }` when this
+ *   modal was opened from a playlist surface, so the Quality Profile selector
+ *   can preselect that mirror's persisted assignment. The library/artist
+ *   surfaces that call this today have no playlist, and omitting it simply
+ *   preselects the global default — the context has to be passed in, it was
+ *   never derivable from the album/artist arguments (R2-10).
+ */
+async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwnership, playlistContext = null) {
     wishlistModalVersion++;
-    showLoadingOverlay('Preparing wishlist…');
+    showLoadingOverlay('Preparing wishlist...');
     console.log(`🎵 Opening Add to Wishlist modal for: ${artist.name} - ${album.name}`);
 
     try {
@@ -1394,7 +816,9 @@ async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwn
             album,
             artist,
             tracks,
-            albumType
+            albumType,
+            playlistRef: playlistContext?.playlistRef || null,
+            playlistSource: playlistContext?.playlistSource || null
         };
 
         const modal = document.getElementById('add-to-wishlist-modal');
@@ -1423,7 +847,16 @@ async function openAddToWishlistModal(album, artist, tracks, albumType, trackOwn
         const addToWishlistBtn = document.getElementById('confirm-add-to-wishlist-btn');
         if (addToWishlistBtn) {
             addToWishlistBtn.onclick = () => handleAddToWishlist();
+            addToWishlistBtn.textContent = wishlistAddLabel();
         }
+
+        // Quality Profile for this acquisition (P1-01). Preselects the mirror's
+        // persisted assignment when the caller passed a playlist context, the
+        // default profile otherwise. Both footer buttons read the same control.
+        await hydrateAcquisitionQualityProfileSelect(WISHLIST_MODAL_QUALITY_PROFILE_SELECT_ID, {
+            playlistRef: currentWishlistModalData.playlistRef,
+            source: currentWishlistModalData.playlistSource,
+        });
 
         // Show the modal
         overlay.classList.remove('hidden');
@@ -1526,6 +959,11 @@ function generateWishlistTrackList(tracks, trackOwnership) {
     }).join('');
 }
 
+// a profile without download rights sends a request, so the button says so
+function wishlistAddLabel() {
+    return (typeof canDownload === 'function' && !canDownload()) ? 'Request' : 'Add to Wishlist';
+}
+
 /**
  * Handle the "Add to Wishlist" button click
  */
@@ -1537,12 +975,18 @@ async function handleAddToWishlist() {
 
     const { album, artist, tracks, albumType } = currentWishlistModalData;
     const addToWishlistBtn = document.getElementById('confirm-add-to-wishlist-btn');
+    // Read once, before the modal can be re-rendered mid-loop, so every track in
+    // this batch gets the SAME profile (P1-01).
+    const qualityProfileId = currentWishlistModalQualityProfileId();
+
+    // request limit used up: say so instead of an add the server drops
+    if (typeof checkMusicRequestQuota === 'function' && !(await checkMusicRequestQuota())) return;
 
     try {
         // Show loading state
         if (addToWishlistBtn) {
             addToWishlistBtn.classList.add('loading');
-            addToWishlistBtn.textContent = 'Adding…';
+            addToWishlistBtn.textContent = 'Adding...';
             addToWishlistBtn.disabled = true;
         }
 
@@ -1614,6 +1058,9 @@ async function handleAddToWishlist() {
                         artist: artist,
                         album: trackAlbum,
                         source_type: 'album',
+                        // Explicit user choice for this action (P1-01); null lets
+                        // the server keep its own resolution order.
+                        quality_profile_id: qualityProfileId,
                         source_context: {
                             album_name: trackAlbum.name,
                             artist_name: artist.name,
@@ -1649,7 +1096,10 @@ async function handleAddToWishlist() {
             let message = `Added ${successCount} track${successCount !== 1 ? 's' : ''} to wishlist`;
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
-            showToast(message, errorCount > 0 ? 'warning' : 'success');
+            // a profile that asks first hears who it went to instead
+            if (errorCount > 0 || typeof announceWishlistRequest !== 'function' || !announceWishlistRequest()) {
+                showToast(message, errorCount > 0 ? 'warning' : 'success');
+            }
         } else {
             showToast('Failed to add any tracks to wishlist', 'error');
         }
@@ -1666,7 +1116,7 @@ async function handleAddToWishlist() {
         // Reset button state
         if (addToWishlistBtn) {
             addToWishlistBtn.classList.remove('loading');
-            addToWishlistBtn.textContent = 'Add to Wishlist';
+            addToWishlistBtn.textContent = wishlistAddLabel();
             addToWishlistBtn.disabled = false;
         }
     }
@@ -1891,6 +1341,9 @@ async function handleWishlistDownloadNow() {
 
     // Capture data before closeAddToWishlistModal clears it
     const { album, artist, tracks, albumType } = currentWishlistModalData;
+    // Carry the user's choice into the download dialog, so "Download Now" and
+    // "Add to Wishlist" in the SAME dialog can never disagree (P1-01).
+    const qualityProfileId = currentWishlistModalQualityProfileId();
 
     // Close the wishlist modal
     closeAddToWishlistModal();
@@ -1909,10 +1362,18 @@ async function handleWishlistDownloadNow() {
     }
 
     // Open download missing modal (reuses existing function)
-    showLoadingOverlay('Loading album…');
+    showLoadingOverlay('Loading album...');
     await openDownloadMissingModalForArtistAlbum(
         virtualPlaylistId, playlistName, tracks, album, artist, false
     );
+    if (qualityProfileId != null) {
+        // Awaited: the modal's own hydration is still in flight and would
+        // otherwise land after this one and overwrite the user's choice. The
+        // generation guard inside the helper makes the later call win either
+        // way; awaiting also keeps the loading overlay up until the selector
+        // really shows the chosen profile (R2-05).
+        await setDownloadModalQualityProfile(virtualPlaylistId, qualityProfileId);
+    }
     hideLoadingOverlay();
 
     // Register download bubble (reuses existing artist bubble system)
@@ -1923,145 +1384,14 @@ async function handleWishlistDownloadNow() {
  * Add all tracks from any download modal to the wishlist
  * Universal handler for all modal types (artist albums, playlists, YouTube, Tidal, etc.)
  */
-// Which tracks the download-missing modal's footer buttons act on: the ticked
-// ones, or all of them when the table has no checkboxes. Shared by "Add to
-// Wishlist" and "Manual Search" so the two buttons can never disagree about
-// what the user selected.
-function selectedModalTracks(playlistId, process) {
-    const tracks = (process && process.tracks) || [];
-    const tbody = document.getElementById(`download-tracks-tbody-${playlistId}`);
-    if (!tbody) return tracks;
-    const allCbs = tbody.querySelectorAll('.track-select-cb');
-    if (allCbs.length === 0) return tracks;
-    const checked = tbody.querySelectorAll('.track-select-cb:checked');
-    const selected = new Set([...checked].map(cb => parseInt(cb.dataset.trackIndex)));
-    return tracks.filter((_, i) => selected.has(i));
+/** a track's album with the modal album's locked release type applied, when
+ * the modal album was opened from the artist page (album_type_locked) */
+function _withLockedAlbumType(trackAlbum, modalAlbum) {
+    if (!modalAlbum || !modalAlbum.album_type_locked || !trackAlbum || typeof trackAlbum !== 'object') {
+        return trackAlbum;
+    }
+    return { ...trackAlbum, album_type: modalAlbum.album_type, album_type_locked: true };
 }
-window.selectedModalTracks = selectedModalTracks;
-
-
-// Manual search from the modal footer, beside "Add to Wishlist".
-//
-// Deliberately one track at a time: the picker is a per-track choice — you look
-// at candidates for ONE song and pick the right file — so there is no coherent
-// meaning for "manually search these nine". Rather than silently searching the
-// first of a multi-selection, say what it needs.
-async function openManualSearchForModalSelection(playlistId) {
-    const process = activeDownloadProcesses[playlistId];
-    if (!process || !process.tracks || process.tracks.length === 0) {
-        showToast('No tracks to search for', 'error');
-        return;
-    }
-
-    const tracks = selectedModalTracks(playlistId, process);
-    // Where the whole-album picker exists, say so — otherwise the only way to
-    // discover it is to notice a second button you were not looking for.
-    const _albumHint = (typeof window.isAlbumContextPlaylistId === 'function'
-                        && window.isAlbumContextPlaylistId(playlistId))
-        ? ' To choose a release of the whole album instead, use 💿 Choose Release.'
-        : '';
-    if (tracks.length === 0) {
-        showToast(`Tick the track you want to search for.${_albumHint}`, 'error');
-        return;
-    }
-    if (tracks.length > 1) {
-        showToast(
-            `Manual search handles one track at a time — ${tracks.length} are ticked. ` +
-            `Leave just the one you want.${_albumHint}`,
-            'info',
-        );
-        return;
-    }
-
-    const track = tracks[0];
-    // process.artist is only set for album downloads; a playlist carries the
-    // artist per track, so resolve in that order rather than defaulting.
-    let artist = '';
-    if (Array.isArray(track.artists) && track.artists.length) {
-        artist = typeof track.artists[0] === 'string'
-            ? track.artists[0]
-            : (track.artists[0] && track.artists[0].name) || '';
-    } else if (typeof track.artists === 'string') {
-        artist = track.artists;
-    }
-    if (!artist) artist = (process.artist && process.artist.name) || '';
-
-    const albumName = (track.album && (track.album.name || track.album))
-        || (process.album && process.album.name) || '';
-
-    if (typeof window.openManualSearchFor !== 'function') {
-        showToast('The manual search picker is unavailable on this page', 'error');
-        return;
-    }
-    await window.openManualSearchFor({
-        id: track.id || '',
-        name: track.name || '',
-        artist: artist,
-        album: typeof albumName === 'string' ? albumName : '',
-    }, document.getElementById(`manual-search-btn-${playlistId}`));
-}
-window.openManualSearchForModalSelection = openManualSearchForModalSelection;
-
-
-// The whole-album sibling of the button above.
-//
-// The per-track picker deliberately refuses a multi-selection, because "manually
-// search these nine" has no coherent meaning — its candidates are individual
-// FILES. That reasoning is sound and stays; what was missing is that an album
-// has its own kind of candidate. A release is a real thing you can look at and
-// choose: this format, this many tracks, this size, these seeders. So albums get
-// the release picker rather than an overloaded track one, and the two buttons
-// say plainly which is which.
-//
-// The pick rides the SAME path the search page already uses — stash it against
-// the playlist id, then run the normal flow — so nothing here forks a second
-// download route. startMissingTracksProcess consumes the pin exactly once.
-async function openAlbumReleasePickerForModal(playlistId) {
-    const process = activeDownloadProcesses[playlistId];
-    if (!process) {
-        showToast('No album data available', 'error');
-        return;
-    }
-    // Choosing a release starts the download, and startMissingTracksProcess has
-    // no re-entrancy guard of its own — it is simply what Begin Analysis calls.
-    // Pressing this after that button would start a second batch for the same
-    // album, so refuse rather than quietly doubling up.
-    if (process.status === 'running') {
-        showToast('This album is already downloading — close and reopen the modal '
-                  + 'to choose a different release', 'info');
-        return;
-    }
-    const albumName = (process.album && process.album.name) || '';
-    const artistName = (process.artist && process.artist.name) || '';
-    if (!albumName) {
-        // A playlist-context modal has tracks from many albums; there is no one
-        // release to choose. The button isn't rendered there, so this only fires
-        // if the two ever disagree — say so rather than searching for ''.
-        showToast('This download has no single album to choose a release for', 'error');
-        return;
-    }
-    if (typeof window.openAlbumSourcePicker !== 'function'
-            || typeof window.setPendingAlbumPin !== 'function') {
-        showToast('The release picker is unavailable on this page', 'error');
-        return;
-    }
-    await window.openAlbumSourcePicker(albumName, artistName, (pin, opts) => {
-        // `opts.replace` is the answer to the picker's "you already own this"
-        // prompt; it has to reach the pin store or the confirmation grabs nothing.
-        window.setPendingAlbumPin(playlistId, pin, opts);
-        // Choosing a release IS the instruction to download it — leaving the user
-        // to press Begin Analysis afterwards would make the pick look like it did
-        // nothing. "Let Commissary choose" lands here with a null pin and starts
-        // the ordinary run, which is exactly what Begin Analysis would have done.
-        const _replacing = !!(opts && opts.replace);
-        showToast(pin
-            ? `${_replacing ? 'Replacing' : 'Downloading'} that release of “${albumName}”`
-            : `Choosing a release automatically for “${albumName}”`, 'info');
-        startMissingTracksProcess(playlistId);
-    });
-}
-window.openAlbumReleasePickerForModal = openAlbumReleasePickerForModal;
-
 
 async function addModalTracksToWishlist(playlistId) {
     const process = activeDownloadProcesses[playlistId];
@@ -2078,13 +1408,31 @@ async function addModalTracksToWishlist(playlistId) {
         return;
     }
 
-    const tracks = selectedModalTracks(playlistId, process);
+    // Filter tracks based on checkbox selection (if checkboxes exist in this modal)
+    const wishlistTbody = document.getElementById(`download-tracks-tbody-${playlistId}`);
+    let tracks = process.tracks;
+    if (wishlistTbody) {
+        const allCbs = wishlistTbody.querySelectorAll('.track-select-cb');
+        if (allCbs.length > 0) {
+            const checkedCbs = wishlistTbody.querySelectorAll('.track-select-cb:checked');
+            const selectedIndices = new Set([...checkedCbs].map(cb => parseInt(cb.dataset.trackIndex)));
+            tracks = process.tracks.filter((_, i) => selectedIndices.has(i));
+        }
+    }
 
     // Get album context if available (for artist album downloads)
     // Artist is resolved per-track below — process.artist is only set for album downloads,
     // not for playlists, so we must NOT use it as a blanket default.
     const processArtist = process.artist || null;
     const album = process.album || process.playlist || { name: 'Playlist', id: playlistId };
+
+    // a profile that asks first and has used its request limit: say so here,
+    // the server would drop the add without a word
+    if (typeof checkMusicRequestQuota === 'function' && !(await checkMusicRequestQuota())) return;
+
+    // Same control the modal's "Begin Analysis" reads, so both buttons in this
+    // dialog agree on the Quality Profile (P1-01).
+    const qualityProfileId = getDownloadModalQualityProfileId(playlistId);
 
     console.log(`🔄 Adding ${tracks.length} tracks from "${album.name}" to wishlist (process artist: ${processArtist?.name || 'per-track'})`);
 
@@ -2093,7 +1441,7 @@ async function addModalTracksToWishlist(playlistId) {
     if (wishlistBtn) {
         wishlistBtn.disabled = true;
         wishlistBtn.classList.add('loading');
-        wishlistBtn.textContent = 'Adding…';
+        wishlistBtn.textContent = 'Adding...';
     }
 
     try {
@@ -2168,6 +1516,12 @@ async function addModalTracksToWishlist(playlistId) {
                     trackAlbumType = 'album';
                 }
 
+                // an artist-page album is locked to the section it showed under;
+                // tracks queued from its modal keep that, or the wishlist files
+                // them by a track-count guess instead
+                trackAlbum = _withLockedAlbumType(trackAlbum, process.album);
+                trackAlbumType = trackAlbum.album_type || trackAlbumType;
+
                 // Resolve artist: for album downloads, use the album-level artist to keep
                 // all tracks grouped under one artist in the wishlist. Per-track artists
                 // (like individual vocalists on a soundtrack) should NOT split the album.
@@ -2192,6 +1546,7 @@ async function addModalTracksToWishlist(playlistId) {
                         artist: trackArtist,
                         album: trackAlbum,
                         source_type: 'album',
+                        quality_profile_id: qualityProfileId,
                         source_context: {
                             album_name: trackAlbum.name,
                             artist_name: trackArtist.name,
@@ -2223,7 +1578,9 @@ async function addModalTracksToWishlist(playlistId) {
             if (skippedCount > 0) message += ` (${skippedCount} already owned)`;
             if (errorCount > 0) message += ` — ${errorCount} failed`;
             if (wingItSkipped > 0) message += ` (${wingItSkipped} wing-it skipped)`;
-            showToast(message, 'success');
+            if (errorCount > 0 || typeof announceWishlistRequest !== 'function' || !announceWishlistRequest()) {
+                showToast(message, 'success');
+            }
 
             // Close the modal on success
             await closeDownloadMissingModal(playlistId);
@@ -2239,25 +1596,15 @@ async function addModalTracksToWishlist(playlistId) {
         if (wishlistBtn) {
             wishlistBtn.disabled = false;
             wishlistBtn.classList.remove('loading');
-            wishlistBtn.textContent = 'Add to Wishlist';
+            wishlistBtn.textContent = wishlistAddLabel();
         }
     }
 }
 
-/**
- * Format duration from milliseconds to MM:SS format
- */
-function formatDuration(durationMs) {
-    if (!durationMs || durationMs <= 0) {
-        return '--:--';
-    }
-
-    const totalSeconds = Math.floor(durationMs / 1000);
-    const minutes = Math.floor(totalSeconds / 60);
-    const seconds = totalSeconds % 60;
-
-    return `${minutes}:${seconds.toString().padStart(2, '0')}`;
-}
+// formatDuration lived here too, returning '--:--' for an unknown duration.
+// It was DEAD: sync-services.js declared the same name and loaded later, so its
+// '0:00' version won for every caller in this file. The one definition now
+// lives in shared-helpers.js — see the note there.
 
 // Note: Functions from other modules (downloads.js, sync-spotify.js, sync-services.js, artists.js)
 // are already global via their function declarations and do not need window.X = X assignments.
@@ -2270,1087 +1617,14 @@ window.handleWishlistDownloadNow = handleWishlistDownloadNow;
 window.addModalTracksToWishlist = addModalTracksToWishlist;
 
 
-// APPEND THIS JAVASCRIPT SNIPPET (B)
-
-function initializeFilters() {
-    const toggleBtn = document.getElementById('filter-toggle-btn');
-    const container = document.getElementById('filters-container');
-    const content = document.getElementById('filter-content');
-
-    if (toggleBtn && container && content) {
-        // Using .onclick ensures we only ever have one click handler
-        toggleBtn.onclick = () => {
-            const isExpanded = container.classList.contains('expanded');
-
-            if (isExpanded) {
-                // Collapse the container
-                container.classList.remove('expanded');
-                toggleBtn.textContent = '⏷ Filters';
-            } else {
-                // Expand the container
-                content.classList.remove('hidden'); // Make sure content is visible for animation
-                container.classList.add('expanded');
-                toggleBtn.textContent = '⏶ Filters';
-            }
-        };
-    }
-
-    // This part is correct and doesn't need to change
-    document.querySelectorAll('.filter-btn').forEach(button => {
-        button.addEventListener('click', handleFilterClick);
-    });
-}
-
-function handleFilterClick(event) {
-    const button = event.target;
-    const filterType = button.dataset.filterType;
-    const value = button.dataset.value;
-
-    if (filterType === 'type') currentFilterType = value;
-    if (filterType === 'format') currentFilterFormat = value;
-    if (filterType === 'sort') currentSortBy = value;
-
-    if (button.id === 'sort-order-btn') {
-        isSortReversed = !isSortReversed;
-        button.textContent = isSortReversed ? '↑' : '↓';
-    }
-
-    document.querySelectorAll(`.filter-btn[data-filter-type="${filterType}"]`).forEach(btn => {
-        btn.classList.remove('active');
-    });
-    if (filterType) { // Don't try to activate the sort order button
-        button.classList.add('active');
-    }
-
-    applyFiltersAndSort();
-}
-
-function resetFilters() {
-    currentFilterType = 'all';
-    currentFilterFormat = 'all';
-    currentSortBy = 'quality_score';
-    isSortReversed = false;
-
-    document.querySelectorAll('.filter-btn').forEach(btn => btn.classList.remove('active'));
-    document.querySelector('.filter-btn[data-filter-type="type"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="format"][data-value="all"]').classList.add('active');
-    document.querySelector('.filter-btn[data-filter-type="sort"][data-value="quality_score"]').classList.add('active');
-    document.getElementById('sort-order-btn').textContent = '↓';
-}
-
-function applyFiltersAndSort() {
-    let processedResults = [...allSearchResults];
-    const query = document.getElementById('downloads-search-input').value.trim().toLowerCase();
-
-    // 1. Filter by Type
-    if (currentFilterType !== 'all') {
-        processedResults = processedResults.filter(r => r.result_type === currentFilterType);
-    }
-
-    // 2. Filter by Format
-    if (currentFilterFormat !== 'all') {
-        processedResults = processedResults.filter(r => {
-            const quality = (r.dominant_quality || r.quality || '').toLowerCase();
-            return quality === currentFilterFormat;
-        });
-    }
-
-    // 3. Sort Results
-    processedResults.sort((a, b) => {
-        let valA, valB;
-
-        // Special handling for relevance sort
-        if (currentSortBy === 'relevance') {
-            valA = calculateRelevanceScore(a, query);
-            valB = calculateRelevanceScore(b, query);
-            return valB - valA; // Higher score is better
-        }
-
-        // Special handling for availability
-        if (currentSortBy === 'availability') {
-            valA = (a.free_upload_slots || 0) - (a.queue_length || 0) * 0.1;
-            valB = (b.free_upload_slots || 0) - (b.queue_length || 0) * 0.1;
-            return valB - valA;
-        }
-
-        valA = a[currentSortBy] || 0;
-        valB = b[currentSortBy] || 0;
-
-        if (typeof valA === 'string') {
-            // For name/title sort, use the correct property
-            const titleA = (a.album_title || a.title || '').toLowerCase();
-            const titleB = (b.album_title || b.title || '').toLowerCase();
-            return titleA.localeCompare(titleB);
-        }
-
-        // Default numeric sort (descending)
-        return valB - valA;
-    });
-
-    // Handle sort direction toggle
-    const sortDefaults = {
-        relevance: 'desc', quality_score: 'desc', size: 'desc', bitrate: 'desc',
-        upload_speed: 'desc', duration: 'desc', availability: 'desc',
-        title: 'asc', username: 'asc'
-    };
-
-    const defaultOrder = sortDefaults[currentSortBy] || 'desc';
-    if ((defaultOrder === 'asc' && isSortReversed) || (defaultOrder === 'desc' && !isSortReversed)) {
-        processedResults.reverse();
-    }
-
-    displayDownloadsResults(processedResults);
-}
-
-function calculateRelevanceScore(result, query) {
-    let score = 0.0;
-    const queryTerms = query.split(' ').filter(t => t.length > 1);
-
-    // 1. Search Term Matching (40%)
-    let searchableText = `${result.title || ''} ${result.artist || ''} ${result.album || ''} ${result.album_title || ''}`.toLowerCase();
-    let termMatches = 0;
-    for (const term of queryTerms) {
-        if (searchableText.includes(term)) {
-            termMatches++;
-        }
-    }
-    score += (termMatches / queryTerms.length) * 0.40;
-
-    // 2. Quality Score (25%)
-    score += (result.quality_score || 0) * 0.25;
-
-    // 3. User Reliability (Availability & Speed) (20%)
-    const reliability = ((result.free_upload_slots || 0) > 0 ? 0.5 : 0) + Math.min(1, (result.upload_speed || 0) / 500) * 0.5;
-    score += reliability * 0.20;
-
-    // 4. File Completeness (Bitrate & Duration) (15%)
-    const completeness = (Math.min(1, (result.bitrate || 0) / 320) * 0.5) + (result.duration > 0 ? 0.5 : 0);
-    score += completeness * 0.15;
-
-    return score;
-}
-// Add to global scope for onclick
-window.handleFilterClick = handleFilterClick;
-
-// ===============================
-// MATCHED DOWNLOADS MODAL
-// ===============================
-
-// Global state for matching modal
-let currentMatchingData = {
-    searchResult: null,
-    isAlbumDownload: false,
-    albumResult: null,
-    selectedArtist: null,
-    selectedAlbum: null,
-    currentStage: 'artist' // 'artist' or 'album'
-};
-
-let searchTimers = {
-    artist: null,
-    album: null
-};
-
-function openMatchingModal(searchResult, isAlbumDownload = false, albumResult = null) {
-    console.log('🎯 Opening matching modal for:', searchResult);
-
-    // Store the current matching data
-    currentMatchingData = {
-        searchResult: searchResult,
-        isAlbumDownload: isAlbumDownload,
-        albumResult: albumResult,
-        selectedArtist: null,
-        selectedAlbum: null,
-        currentStage: 'artist'
-    };
-
-    // Show modal
-    const overlay = document.getElementById('matching-modal-overlay');
-    overlay.classList.remove('hidden');
-
-    // Reset modal state
-    resetModalState();
-
-    // Set appropriate title and stage
-    const modalTitle = document.getElementById('matching-modal-title');
-    const artistStageTitle = document.getElementById('artist-stage-title');
-
-    if (isAlbumDownload) {
-        modalTitle.textContent = 'Match album download to release';
-        artistStageTitle.textContent = 'Step 1: Select the correct Artist';
-        document.getElementById('album-selection-stage').style.display = 'block';
-    } else {
-        modalTitle.textContent = 'Match track download to release';
-        artistStageTitle.textContent = 'Select the correct Artist for this Single';
-        document.getElementById('album-selection-stage').style.display = 'none';
-    }
-
-    // Generate initial artist suggestions
-    fetchArtistSuggestions();
-
-    // Setup event listeners
-    setupModalEventListeners();
-}
-
-function closeMatchingModal() {
-    const overlay = document.getElementById('matching-modal-overlay');
-    overlay.classList.add('hidden');
-
-    // Clear timers
-    Object.values(searchTimers).forEach(timer => {
-        if (timer) clearTimeout(timer);
-    });
-
-    // Reset state
-    currentMatchingData = {
-        searchResult: null,
-        isAlbumDownload: false,
-        albumResult: null,
-        selectedArtist: null,
-        selectedAlbum: null,
-        currentStage: 'artist'
-    };
-}
-
-function resetModalState() {
-    // Show artist stage, hide album stage
-    document.getElementById('artist-selection-stage').classList.remove('hidden');
-    document.getElementById('album-selection-stage').classList.add('hidden');
-
-    // Clear all suggestion containers
-    document.getElementById('artist-suggestions').innerHTML = '';
-    document.getElementById('artist-manual-results').innerHTML = '';
-    document.getElementById('album-suggestions').innerHTML = '';
-    document.getElementById('album-manual-results').innerHTML = '';
-
-    // Clear search inputs
-    document.getElementById('artist-search-input').value = '';
-    document.getElementById('album-search-input').value = '';
-
-    // Reset button states
-    document.getElementById('confirm-match-btn').disabled = true;
-
-    // Reset selections
-    currentMatchingData.selectedArtist = null;
-    currentMatchingData.selectedAlbum = null;
-    currentMatchingData.currentStage = 'artist';
-}
-
-function setupModalEventListeners() {
-    // Search input listeners
-    const artistInput = document.getElementById('artist-search-input');
-    const albumInput = document.getElementById('album-search-input');
-
-    artistInput.removeEventListener('input', handleArtistSearch);
-    artistInput.addEventListener('input', handleArtistSearch);
-
-    albumInput.removeEventListener('input', handleAlbumSearch);
-    albumInput.addEventListener('input', handleAlbumSearch);
-
-    // Button listeners
-    const skipBtn = document.getElementById('skip-matching-btn');
-    const cancelBtn = document.getElementById('cancel-match-btn');
-    const confirmBtn = document.getElementById('confirm-match-btn');
-
-    skipBtn.onclick = skipMatching;
-    cancelBtn.onclick = closeMatchingModal;
-    confirmBtn.onclick = confirmMatch;
-}
-
-async function fetchArtistSuggestions() {
-    try {
-        showLoadingCards('artist-suggestions', 'Finding artist…');
-
-        const response = await fetch('/api/match/suggestions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                search_result: currentMatchingData.searchResult,
-                context: 'artist',
-                is_album: currentMatchingData.isAlbumDownload,
-                album_result: currentMatchingData.albumResult
-            })
-        });
-
-        const data = await response.json();
-        if (data.suggestions) {
-            renderArtistSuggestions(data.suggestions);
-        } else {
-            showNoResultsMessage('artist-suggestions', 'No artist suggestions found');
-        }
-    } catch (error) {
-        console.error('Error fetching artist suggestions:', error);
-        showNoResultsMessage('artist-suggestions', 'Error loading suggestions');
-    }
-}
-
-async function fetchAlbumSuggestions() {
-    if (!currentMatchingData.selectedArtist) return;
-
-    try {
-        showLoadingCards('album-suggestions', 'Finding album…');
-
-        const response = await fetch('/api/match/suggestions', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                search_result: currentMatchingData.searchResult,
-                context: 'album',
-                selected_artist: currentMatchingData.selectedArtist
-            })
-        });
-
-        const data = await response.json();
-        if (data.suggestions) {
-            renderAlbumSuggestions(data.suggestions);
-        } else {
-            showNoResultsMessage('album-suggestions', 'No album suggestions found');
-        }
-    } catch (error) {
-        console.error('Error fetching album suggestions:', error);
-        showNoResultsMessage('album-suggestions', 'Error loading suggestions');
-    }
-}
-
-function renderArtistSuggestions(suggestions) {
-    const container = document.getElementById('artist-suggestions');
-    container.innerHTML = '';
-
-    if (!suggestions.length) {
-        showNoResultsMessage('artist-suggestions', 'No artist matches found');
-        return;
-    }
-
-    suggestions.forEach(suggestion => {
-        const card = createArtistCard(suggestion.artist, suggestion.confidence);
-        container.appendChild(card);
-    });
-}
-
-function renderAlbumSuggestions(suggestions) {
-    const container = document.getElementById('album-suggestions');
-    container.innerHTML = '';
-
-    if (!suggestions.length) {
-        showNoResultsMessage('album-suggestions', 'No album matches found');
-        return;
-    }
-
-    suggestions.forEach(suggestion => {
-        const card = createAlbumCard(suggestion.album, suggestion.confidence);
-        container.appendChild(card);
-    });
-}
-
-function createArtistCard(artist, confidence) {
-    const card = document.createElement('div');
-    card.className = 'suggestion-card';
-    card.onclick = () => selectArtist(artist);
-
-    const imageUrl = artist.image_url || '';
-    const confidencePercent = Math.round(confidence * 100);
-
-    // Add data attribute for lazy loading
-    card.dataset.artistId = artist.id;
-    card.dataset.needsImage = imageUrl ? 'false' : 'true';
-
-    card.innerHTML = `
-        <div class="suggestion-card-overlay"></div>
-        <div class="suggestion-card-content">
-            <div class="suggestion-card-name" title="${escapeHtml(artist.name)}">${escapeHtml(artist.name)}</div>
-            <div class="suggestion-card-details">
-                ${artist.genres && artist.genres.length ? escapeHtml(artist.genres.slice(0, 2).join(', ')) : 'Artist'}
-            </div>
-            <div class="suggestion-card-confidence">${confidencePercent}% match</div>
-        </div>
-    `;
-
-    // Set background image if available
-    if (imageUrl) {
-        card.style.backgroundImage = `url(${imageUrl})`;
-        card.style.backgroundSize = 'cover';
-        card.style.backgroundPosition = 'center';
-    }
-
-    return card;
-}
-
-function createAlbumCard(album, confidence) {
-    const card = document.createElement('div');
-    card.className = 'suggestion-card';
-    card.onclick = () => selectAlbum(album);
-
-    const imageUrl = album.image_url || '';
-    const confidencePercent = Math.round(confidence * 100);
-    const year = album.release_date ? album.release_date.split('-')[0] : '';
-
-    card.innerHTML = `
-        <div class="suggestion-card-overlay"></div>
-        <div class="suggestion-card-content">
-            <div class="suggestion-card-name" title="${escapeHtml(album.name)}">${escapeHtml(album.name)}</div>
-            <div class="suggestion-card-details">
-                ${album.album_type ? escapeHtml(album.album_type.charAt(0).toUpperCase() + album.album_type.slice(1)) : 'Album'}${year ? ` • ${year}` : ''}
-            </div>
-            <div class="suggestion-card-confidence">${confidencePercent}% match</div>
-        </div>
-    `;
-
-    // Set background image if available
-    if (imageUrl) {
-        card.style.backgroundImage = `url(${imageUrl})`;
-        card.style.backgroundSize = 'cover';
-        card.style.backgroundPosition = 'center';
-    }
-
-    return card;
-}
-
-function selectArtist(artist) {
-    // Clear previous selections
-    document.querySelectorAll('#artist-suggestions .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-    document.querySelectorAll('#artist-manual-results .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-
-    // Mark new selection
-    event.currentTarget.classList.add('selected');
-
-    // Store selection
-    currentMatchingData.selectedArtist = artist;
-
-    console.log('🎯 Selected artist:', artist.name);
-
-    if (currentMatchingData.isAlbumDownload) {
-        // Transition to album selection stage
-        transitionToAlbumStage();
-    } else {
-        // Enable confirm button for single downloads
-        document.getElementById('confirm-match-btn').disabled = false;
-    }
-}
-
-function selectAlbum(album) {
-    // Clear previous selections
-    document.querySelectorAll('#album-suggestions .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-    document.querySelectorAll('#album-manual-results .suggestion-card').forEach(card => {
-        card.classList.remove('selected');
-    });
-
-    // Mark new selection
-    event.currentTarget.classList.add('selected');
-
-    // Store selection
-    currentMatchingData.selectedAlbum = album;
-
-    console.log('🎯 Selected album:', album.name);
-
-    // Enable confirm button
-    document.getElementById('confirm-match-btn').disabled = false;
-}
-
-function transitionToAlbumStage() {
-    // Hide artist stage
-    document.getElementById('artist-selection-stage').classList.add('hidden');
-
-    // Show album stage
-    const albumStage = document.getElementById('album-selection-stage');
-    albumStage.classList.remove('hidden');
-
-    // Update selected artist name
-    document.getElementById('selected-artist-name').textContent = currentMatchingData.selectedArtist.name;
-
-    // Update current stage
-    currentMatchingData.currentStage = 'album';
-
-    // Fetch album suggestions
-    fetchAlbumSuggestions();
-}
-
-function handleArtistSearch(event) {
-    const query = event.target.value.trim();
-
-    // Clear previous timer
-    if (searchTimers.artist) {
-        clearTimeout(searchTimers.artist);
-    }
-
-    if (query.length < 2) {
-        document.getElementById('artist-manual-results').innerHTML = '';
-        return;
-    }
-
-    // Debounce search
-    searchTimers.artist = setTimeout(() => {
-        performArtistSearch(query);
-    }, 400);
-}
-
-function handleAlbumSearch(event) {
-    const query = event.target.value.trim();
-
-    // Clear previous timer
-    if (searchTimers.album) {
-        clearTimeout(searchTimers.album);
-    }
-
-    if (query.length < 2) {
-        document.getElementById('album-manual-results').innerHTML = '';
-        return;
-    }
-
-    // Debounce search
-    searchTimers.album = setTimeout(() => {
-        performAlbumSearch(query);
-    }, 400);
-}
-
-async function performArtistSearch(query) {
-    try {
-        showLoadingCards('artist-manual-results', 'Searching artists…');
-
-        const requestBody = {
-            query: query,
-            context: 'artist'
-        };
-        console.log('Manual search request:', requestBody);
-
-        const response = await fetch('/api/match/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(requestBody)
-        });
-
-        const data = await response.json();
-        console.log('Manual search response:', data);
-        if (data.provider) currentMatchingData.provider = data.provider;
-        if (data.results) {
-            console.log('Results array:', data.results);
-            renderArtistSearchResults(data.results);
-        } else {
-            showNoResultsMessage('artist-manual-results', 'No artists found');
-        }
-    } catch (error) {
-        console.error('Error searching artists:', error);
-        showNoResultsMessage('artist-manual-results', 'Error searching artists');
-    }
-}
-
-async function performAlbumSearch(query) {
-    if (!currentMatchingData.selectedArtist) return;
-
-    try {
-        showLoadingCards('album-manual-results', 'Searching albums…');
-
-        const response = await fetch('/api/match/search', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                query: query,
-                context: 'album',
-                artist_id: currentMatchingData.selectedArtist.id
-            })
-        });
-
-        const data = await response.json();
-        if (data.results) {
-            renderAlbumSearchResults(data.results);
-        } else {
-            showNoResultsMessage('album-manual-results', 'No albums found');
-        }
-    } catch (error) {
-        console.error('Error searching albums:', error);
-        showNoResultsMessage('album-manual-results', 'Error searching albums');
-    }
-}
-
-function renderArtistSearchResults(results) {
-    const container = document.getElementById('artist-manual-results');
-    container.innerHTML = '';
-
-    results.forEach((result, index) => {
-        console.log(`Manual search result ${index}:`, result);
-        console.log(`  result.artist:`, result.artist);
-        console.log(`  result.confidence:`, result.confidence);
-        try {
-            const card = createArtistCard(result.artist, result.confidence);
-            console.log(`createArtistCard returned:`, card, typeof card, card instanceof Element);
-            if (card && card instanceof Element) {
-                container.appendChild(card);
-            } else {
-                console.error(`Invalid card returned for result ${index}:`, card);
-            }
-        } catch (error) {
-            console.error(`Error calling createArtistCard for result ${index}:`, error);
-        }
-    });
-
-    // Lazy load missing artist images
-    console.log('🖼️ Starting lazy load for artist images in matching modal...');
-    if (typeof lazyLoadArtistImages === 'function') {
-        lazyLoadArtistImages(container);
-    } else if (typeof window.lazyLoadArtistImages === 'function') {
-        window.lazyLoadArtistImages(container);
-    } else {
-        console.error('❌ lazyLoadArtistImages function not found!');
-    }
-}
-
-function renderAlbumSearchResults(results) {
-    const container = document.getElementById('album-manual-results');
-    container.innerHTML = '';
-
-    results.forEach(result => {
-        const card = createAlbumCard(result.album, result.confidence);
-        container.appendChild(card);
-    });
-}
-
-function showLoadingCards(containerId, message) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="loading-card">${message}</div>`;
-}
-
-function showNoResultsMessage(containerId, message) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="loading-card" style="color: rgba(255,255,255,0.5)">${message}</div>`;
-}
-
-function skipMatching() {
-    console.log('🎯 Skipping matching, proceeding with normal download');
-
-    // Close modal
-    closeMatchingModal();
-
-    // Start normal download
-    if (currentMatchingData.isAlbumDownload) {
-        // For albums, we need to download each track
-        showToast('⬇️ Starting album download (unmatched)', 'info');
-        // This would need to be implemented to download all album tracks
-    } else {
-        // Single track download
-        startDownload(window.currentSearchResults.indexOf(currentMatchingData.searchResult));
-    }
-}
-
-function matchSlskdTracksToSpotify(slskdTracks, spotifyTracks) {
-    /**
-     * Matches Soulseek tracks to Spotify tracks based on filename analysis.
-     * Returns enhanced tracks with full Spotify metadata.
-     */
-    console.log(`🎯 Starting track matching: ${slskdTracks.length} Soulseek tracks vs ${spotifyTracks.length} Spotify tracks`);
-
-    const matched = [];
-    const unmatched = [];
-
-    for (const slskdTrack of slskdTracks) {
-        const filename = slskdTrack.filename || slskdTrack.title || '';
-        const parsedMeta = parseTrackFilename(filename);
-
-        console.log(`🔍 Matching: "${filename}" -> parsed as: "${parsedMeta.title}" (track #${parsedMeta.trackNumber})`);
-
-        // Find best matching Spotify track
-        let bestMatch = null;
-        let bestScore = 0;
-
-        for (const spotifyTrack of spotifyTracks) {
-            let score = 0;
-
-            // Match by track number (highest priority if available)
-            if (parsedMeta.trackNumber && spotifyTrack.track_number === parsedMeta.trackNumber) {
-                score += 50;
-                console.log(`   ✓ Track number match: ${parsedMeta.trackNumber} == ${spotifyTrack.track_number} (+50)`);
-            }
-
-            // Match by title similarity
-            const titleScore = calculateStringSimilarity(
-                parsedMeta.title.toLowerCase(),
-                spotifyTrack.name.toLowerCase()
-            );
-            score += titleScore * 50; // Max 50 points for perfect title match
-
-            console.log(`   Spotify track "${spotifyTrack.name}" (${spotifyTrack.track_number}): score ${score.toFixed(2)}`);
-
-            if (score > bestScore) {
-                bestScore = score;
-                bestMatch = spotifyTrack;
-            }
-        }
-
-        // Accept match if score is above threshold (70/100)
-        if (bestMatch && bestScore >= 70) {
-            console.log(`✅ MATCHED: "${filename}" -> "${bestMatch.name}" (score: ${bestScore.toFixed(2)})`);
-            matched.push({
-                slskd_track: slskdTrack,
-                spotify_track: bestMatch,
-                confidence: bestScore / 100
-            });
-        } else {
-            console.log(`❌ NO MATCH: "${filename}" (best score: ${bestScore.toFixed(2)})`);
-            unmatched.push(slskdTrack);
-        }
-    }
-
-    console.log(`🎯 Matching complete: ${matched.length} matched, ${unmatched.length} unmatched`);
-
-    return {
-        matched: matched,
-        unmatched: unmatched,
-        total: slskdTracks.length
-    };
-}
-
-function parseTrackFilename(filename) {
-    /**
-     * Parse track metadata from filename.
-     * Handles common patterns like:
-     * - "01 - Title.flac"
-     * - "01. Title.flac"
-     * - "Artist - Title.flac"
-     * - "Title.flac"
-     * - YouTube: "video_id||title" (extract title part)
-     */
-    // YouTube special handling: Extract title from encoded format
-    if (filename && filename.includes('||')) {
-        const parts = filename.split('||');
-        const youtubeTitle = parts[1] || parts[0];  // Use title part, fallback to video_id
-        // Remove common YouTube suffixes
-        const cleanTitle = youtubeTitle
-            .replace(/\s*\[.*?\]\s*/g, '')  // Remove [Official Video], [Lyrics], etc.
-            .replace(/\s*\(.*?\)\s*/g, '')  // Remove (Official), (Audio), etc.
-            .trim();
-        return { title: cleanTitle, trackNumber: null };
-    }
-
-    // Remove file extension and path
-    let basename = filename.split('/').pop().split('\\').pop();
-    basename = basename.replace(/\.(flac|mp3|m4a|ogg|wav)$/i, '');
-
-    let trackNumber = null;
-    let title = basename;
-
-    // Pattern 1: "01 - Title" or "01. Title"
-    const pattern1 = /^(\d{1,2})\s*[-\.]\s*(.+)$/;
-    const match1 = basename.match(pattern1);
-    if (match1) {
-        trackNumber = parseInt(match1[1]);
-        title = match1[2].trim();
-        return { title, trackNumber };
-    }
-
-    // Pattern 2: "Artist - Title" (extract title only)
-    const pattern2 = /^.+?\s*[-–]\s*(.+)$/;
-    const match2 = basename.match(pattern2);
-    if (match2) {
-        title = match2[1].trim();
-        return { title, trackNumber };
-    }
-
-    // Fallback: use whole basename as title
-    return { title: basename.trim(), trackNumber };
-}
-
-function calculateStringSimilarity(str1, str2) {
-    /**
-     * Calculate similarity between two strings (0-1 range).
-     * Uses Levenshtein distance for fuzzy matching.
-     */
-    // Normalize strings
-    str1 = str1.trim().toLowerCase();
-    str2 = str2.trim().toLowerCase();
-
-    if (str1 === str2) return 1.0;
-
-    // Simple contains check
-    if (str1.includes(str2) || str2.includes(str1)) {
-        return 0.9;
-    }
-
-    // Levenshtein distance calculation
-    const matrix = [];
-    const len1 = str1.length;
-    const len2 = str2.length;
-
-    for (let i = 0; i <= len1; i++) {
-        matrix[i] = [i];
-    }
-
-    for (let j = 0; j <= len2; j++) {
-        matrix[0][j] = j;
-    }
-
-    for (let i = 1; i <= len1; i++) {
-        for (let j = 1; j <= len2; j++) {
-            const cost = str1[i - 1] === str2[j - 1] ? 0 : 1;
-            matrix[i][j] = Math.min(
-                matrix[i - 1][j] + 1,      // deletion
-                matrix[i][j - 1] + 1,      // insertion
-                matrix[i - 1][j - 1] + cost // substitution
-            );
-        }
-    }
-
-    const maxLen = Math.max(len1, len2);
-    const distance = matrix[len1][len2];
-    const similarity = 1 - (distance / maxLen);
-
-    return Math.max(0, similarity);
-}
-
-async function confirmMatch() {
-    if (!currentMatchingData.selectedArtist) {
-        showToast('⚠️ Please select an artist first', 'error');
-        return;
-    }
-
-    if (currentMatchingData.isAlbumDownload && !currentMatchingData.selectedAlbum) {
-        showToast('⚠️ Please select an album first', 'error');
-        return;
-    }
-
-    const confirmBtn = document.getElementById('confirm-match-btn');
-    const originalText = confirmBtn.textContent;
-
-    try {
-        console.log('🎯 Confirming match with:', {
-            artist: currentMatchingData.selectedArtist.name,
-            album: currentMatchingData.selectedAlbum?.name
-        });
-
-        confirmBtn.disabled = true;
-        confirmBtn.textContent = 'Starting…';
-
-        // Determine the correct data to send
-        const downloadPayload = currentMatchingData.isAlbumDownload
-            ? currentMatchingData.albumResult
-            : currentMatchingData.searchResult;
-
-        // --- NEW: For album downloads, fetch Spotify tracklist and match tracks ---
-        if (currentMatchingData.isAlbumDownload && currentMatchingData.selectedAlbum) {
-            confirmBtn.textContent = 'Matching tracks…';
-            console.log('🎵 Fetching Spotify tracklist for album:', currentMatchingData.selectedAlbum.name);
-
-            try {
-                // Fetch album tracks (pass name/artist for Hydrabase support)
-                const artistId = currentMatchingData.selectedArtist.id;
-                const albumId = currentMatchingData.selectedAlbum.id;
-                const _aat3 = new URLSearchParams({ name: currentMatchingData.selectedAlbum.name || '', artist: currentMatchingData.selectedArtist.name || '' });
-                const albumSource = currentMatchingData.selectedAlbum?.source || currentMatchingData.selectedArtist?.source || null;
-                if (albumSource) {
-                    _aat3.set('source', albumSource);
-                }
-                const tracksResponse = await fetch(`/api/album/${albumId}/tracks?${_aat3}`);
-
-                if (!tracksResponse.ok) {
-                    throw new Error(`Failed to fetch Spotify tracks: ${tracksResponse.status}`);
-                }
-
-                const tracksData = await tracksResponse.json();
-                const spotifyTracks = tracksData.tracks || [];
-
-                console.log(`✅ Fetched ${spotifyTracks.length} Spotify tracks for matching`);
-
-                // Match each Soulseek track to a Spotify track
-                const enhancedTracks = matchSlskdTracksToSpotify(
-                    downloadPayload.tracks || [],
-                    spotifyTracks
-                );
-
-                console.log(`🎯 Matched ${enhancedTracks.matched.length}/${enhancedTracks.total} tracks to Spotify`);
-
-                // Send enhanced data with full Spotify track objects
-                confirmBtn.textContent = 'Downloading…';
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum,
-                        enhanced_tracks: enhancedTracks.matched, // Send matched tracks with full Spotify data
-                        unmatched_tracks: enhancedTracks.unmatched // Send unmatched tracks for basic processing
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched ${enhancedTracks.matched.length} tracks to Spotify`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-
-            } catch (trackMatchError) {
-                console.error('❌ Track matching failed, falling back to simple matching:', trackMatchError);
-                showToast('⚠️ Track matching failed, using basic matching', 'warning');
-
-                // Fallback to simple matching (current behavior)
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum || null
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched download started for "${currentMatchingData.selectedArtist.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-            }
-        } else {
-            // Single track download - fetch release data for full details
-            confirmBtn.textContent = 'Searching release data…';
-
-            try {
-                // Parse track name from Soulseek filename
-                const filename = downloadPayload.filename || downloadPayload.title || '';
-                const parsedMeta = parseTrackFilename(filename);
-
-                console.log(`🔍 Searching release data for: "${parsedMeta.title}" by ${currentMatchingData.selectedArtist.name}`);
-
-                // Search the configured provider for this track
-                const searchQuery = `track:${parsedMeta.title} artist:${currentMatchingData.selectedArtist.name}`;
-                const searchResponse = await fetch(`/api/spotify/search?q=${encodeURIComponent(searchQuery)}&type=track&limit=5`);
-
-                if (!searchResponse.ok) {
-                    throw new Error('Failed to search Spotify for track');
-                }
-
-                const searchData = await searchResponse.json();
-                const spotifyTracks = searchData.tracks?.items || [];
-
-                if (spotifyTracks.length === 0) {
-                    throw new Error('No Spotify tracks found for this search');
-                }
-
-                // Find best match (prefer exact artist match)
-                let bestMatch = spotifyTracks.find(track =>
-                    track.artists.some(artist => artist.id === currentMatchingData.selectedArtist.id)
-                ) || spotifyTracks[0];
-
-                console.log(`✅ Found Spotify track: "${bestMatch.name}" (${bestMatch.id})`);
-
-                // Get full track details with album info
-                const trackResponse = await fetch(`/api/spotify/track/${bestMatch.id}`);
-                if (!trackResponse.ok) {
-                    throw new Error('Failed to fetch Spotify track details');
-                }
-
-                const fullTrack = await trackResponse.json();
-
-                // Send with full Spotify metadata (single track enhanced)
-                confirmBtn.textContent = 'Downloading…';
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: null,  // Singles don't have album context
-                        spotify_track: fullTrack,  // Full Spotify track object
-                        is_single_track: true  // Flag for single track processing
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched single: "${fullTrack.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-
-            } catch (singleMatchError) {
-                console.error('❌ Release matching failed, falling back to basic:', singleMatchError);
-                showToast('⚠️ Release matching failed, using basic track data', 'warning');
-
-                // Fallback to basic matching (current behavior)
-                const response = await fetch('/api/download/matched', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        search_result: downloadPayload,
-                        spotify_artist: currentMatchingData.selectedArtist,
-                        spotify_album: currentMatchingData.selectedAlbum || null
-                    })
-                });
-
-                const data = await response.json();
-
-                if (data.success) {
-                    showToast(`🎯 Matched download started for "${currentMatchingData.selectedArtist.name}"`, 'success');
-                    closeMatchingModal();
-                } else {
-                    throw new Error(data.error || 'Failed to start matched download');
-                }
-            }
-        }
-
-    } catch (error) {
-        console.error('Error starting matched download:', error);
-        showToast(`❌ Error starting matched download: ${error.message}`, 'error');
-
-        // Re-enable confirm button on failure
-        confirmBtn.disabled = false;
-        confirmBtn.textContent = originalText;
-    }
-}
-
-
-
-
-function matchedDownloadTrack(trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[trackIndex]) {
-        console.error('Could not find track for matched download:', trackIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const trackData = results[trackIndex];
-    // It's a single track, so isAlbumDownload is false and there's no album context.
-    openMatchingModal(trackData, false, null);
-}
-
-function matchedDownloadAlbum(albumIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex]) {
-        console.error('Could not find album for matched download:', albumIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const albumData = results[albumIndex];
-    // The first track is used as a reference for the initial artist search.
-    const firstTrack = albumData.tracks ? albumData.tracks[0] : albumData;
-    openMatchingModal(firstTrack, true, albumData);
-}
-
-function matchedDownloadAlbumTrack(albumIndex, trackIndex) {
-    const results = window.currentSearchResults;
-    if (!results || !results[albumIndex] || !results[albumIndex].tracks || !results[albumIndex].tracks[trackIndex]) {
-        console.error('Could not find album track for matched download:', albumIndex, trackIndex);
-        showToast('Error preparing matched download.', 'error');
-        return;
-    }
-    const albumData = results[albumIndex];
-    const trackData = albumData.tracks[trackIndex];
-
-    // This is the definitive fix.
-    // The second argument MUST be 'false' to treat this as a single track download,
-    // which prevents the modal from asking for an album selection.
-    openMatchingModal(trackData, false, albumData);
-}
+// The basic-search filter/sort controls lived here: initializeFilters,
+// handleFilterClick, resetFilters, applyFiltersAndSort and
+// calculateRelevanceScore. They are React's now
+// (webui/src/routes/search/-basic.helpers.ts), where four defects in them were
+// fixed rather than carried over — see that file's header.
+
+// the matched-download modal that lived here is gone: basic search's
+// enriched download is a React modal now (webui/src/routes/search/-ui/enriched-modal.tsx)
 
 // ===========================================
 // == DASHBOARD DATABASE UPDATER FUNCTIONALITY ==
@@ -3387,16 +1661,18 @@ async function handleReconcileIdsButtonClick() {
     if (!button) return;
     if (button.textContent.trim() !== 'Scan Library') return; // already running
 
-    const ok = confirm(
-        'Scan every library file for embedded provider IDs and fill any that are ' +
-        'missing in the database?\n\nEach file is read once. Existing matches are ' +
-        'never overwritten. This can take a while on large libraries.'
-    );
+    const ok = await showConfirmDialog({
+        title: 'Import IDs from File Tags',
+        message: 'Scan every library file for embedded provider IDs and fill any that are ' +
+            'missing in the database?\n\nEach file is read once. Existing matches are ' +
+            'never overwritten. This can take a while on large libraries.',
+        confirmText: 'Scan Library'
+    });
     if (!ok) return;
 
     try {
         button.disabled = true;
-        button.textContent = 'Starting…';
+        button.textContent = 'Starting...';
         const response = await fetch('/api/library/reconcile-embedded-ids', { method: 'POST' });
         if (response.ok) {
             showToast('Tag import started!', 'success');
@@ -3499,7 +1775,7 @@ async function handleDuplicateCleanButtonClick() {
     if (currentAction === 'Clean Duplicates') {
         try {
             button.disabled = true;
-            button.textContent = 'Starting…';
+            button.textContent = 'Starting...';
             const response = await fetch('/api/duplicate-cleaner/start', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' }
@@ -3597,7 +1873,7 @@ function updateDuplicateCleanProgressUI(state) {
         button.textContent = 'Stop Cleaning';
         button.disabled = false;
 
-        phaseLabel.textContent = state.phase || 'Scanning…';
+        phaseLabel.textContent = state.phase || 'Scanning...';
         progressLabel.textContent = `${state.files_scanned} / ${state.total_files} files scanned (${state.progress.toFixed(1)}%)`;
         progressBar.style.width = `${state.progress}%`;
     } else { // idle, finished, or error
@@ -3700,7 +1976,7 @@ async function handleBackupNowClick() {
     if (!button) return;
     const origText = button.textContent;
     button.disabled = true;
-    button.textContent = 'Backing up…';
+    button.textContent = 'Backing up...';
     try {
         const res = await fetch('/api/database/backup', { method: 'POST' });
         const data = await res.json();
@@ -3747,7 +2023,7 @@ async function restoreBackup(filename, force = false) {
             // Version mismatch — ask user to confirm
             const confirmed = await showConfirmDialog({
                 title: 'Version Mismatch',
-                message: `This backup was created on Commissary v${data.backup_version}, but you're running v${data.current_version}.\n\nRestoring an older backup may cause issues if the database schema has changed. A safety backup will be created first.\n\nProceed anyway?`,
+                message: `This backup was created on SoulSync v${data.backup_version}, but you're running v${data.current_version}.\n\nRestoring an older backup may cause issues if the database schema has changed. A safety backup will be created first.\n\nProceed anyway?`,
                 confirmText: 'Restore Anyway',
                 destructive: true
             });
@@ -3820,7 +2096,7 @@ function openLibraryHistoryModal() {
 
 // Bucket entries that are alternatives for the SAME intended target
 // (same backend group_key — derived from expected_artist/expected_track, the
-// track Commissary was trying to fetch, not the bad file's own tags). Entries
+// track SoulSync was trying to fetch, not the bad file's own tags). Entries
 // with a null group_key (legacy/orphan, ungroupable) each stand alone.
 // Preserves the newest-first order the backend already sorted by.
 function _groupQuarantineEntries(entries) {
@@ -3855,7 +2131,7 @@ async function loadLibraryHistory() {
     const list = document.getElementById('library-history-list');
     const pagination = document.getElementById('library-history-pagination');
     if (!list) return;
-    list.innerHTML = '<div class="library-history-loading">Loading…</div>';
+    list.innerHTML = '<div class="library-history-loading">Loading...</div>';
     if (pagination) pagination.innerHTML = '';
 
     try {
@@ -3865,8 +2141,10 @@ async function loadLibraryHistory() {
         // Update tab counts
         const dlCount = document.getElementById('history-download-count');
         const imCount = document.getElementById('history-import-count');
+        const pcCount = document.getElementById('history-podcast-count');
         if (dlCount) dlCount.textContent = data.stats?.downloads || 0;
         if (imCount) imCount.textContent = data.stats?.imports || 0;
+        if (pcCount) pcCount.textContent = data.stats?.podcasts || 0;
 
         // Source breakdown bar (downloads tab only)
         const sourceBar = document.getElementById('history-source-bar');
@@ -3874,7 +2152,7 @@ async function loadLibraryHistory() {
             const sc = data.stats?.source_counts || {};
             const srcEntries = Object.entries(sc).sort((a, b) => b[1] - a[1]);
             if (srcEntries.length > 0 && tab === 'download') {
-                const _srcColors = { Soulseek: '#4caf50', Tidal: '#000', YouTube: '#ff0000', Qobuz: '#4285f4', HiFi: '#00bcd4', Deezer: '#a238ff', Lidarr: '#5dade2', Amazon: '#ff9900', SoundCloud: '#ff7700', Torrent: '#5dade2', Usenet: '#a78bfa', Staging: '#888', 'Auto-Import': '#888' };
+                const _srcColors = { Soulseek: '#4caf50', Tidal: '#000', YouTube: '#ff0000', Qobuz: '#4285f4', HiFi: '#00bcd4', Deezer: '#a238ff', Lidarr: '#5dade2', Amazon: '#ff9900', SoundCloud: '#ff7700', Torrent: '#5dade2', Usenet: '#a78bfa', Staging: '#888', 'Auto-Import': '#888', Podcast: '#c084fc' };
                 sourceBar.innerHTML = srcEntries.map(([src, cnt]) =>
                     `<span class="history-source-chip" style="border-color:${_srcColors[src] || '#888'};color:${_srcColors[src] || '#888'}">${src}: ${cnt}</span>`
                 ).join('');
@@ -3885,10 +2163,12 @@ async function loadLibraryHistory() {
         }
 
         if (!data.entries || data.entries.length === 0) {
-            const emptyIcon = tab === 'download' ? '📥' : '📚';
+            const emptyIcon = tab === 'download' ? '📥' : (tab === 'podcast' ? '🎙️' : '📚');
             const emptyText = tab === 'download'
                 ? 'No downloads recorded yet. Completed downloads will appear here.'
-                : 'No server imports recorded yet. New tracks from library scans will appear here.';
+                : (tab === 'podcast'
+                    ? 'No podcast downloads recorded yet. Downloaded episodes will appear here.'
+                    : 'No server imports recorded yet. New tracks from library scans will appear here.');
             list.innerHTML = `<div class="library-history-empty">${emptyIcon}<br><br>${emptyText}</div>`;
             return;
         }
@@ -3907,10 +2187,11 @@ async function loadLibraryHistory() {
 
 function renderHistoryEntry(entry) {
     // Server import thumb_urls are relative paths (e.g. /library/metadata/...) — use placeholder
+    const placeholderIcon = entry.event_type === 'download' ? '📥' : (entry.event_type === 'podcast' ? '🎙️' : '📚');
     const hasValidThumb = entry.thumb_url && (entry.thumb_url.startsWith('http://') || entry.thumb_url.startsWith('https://'));
     const thumb = hasValidThumb
-        ? `<img src="${escapeHtml(entry.thumb_url)}" class="library-history-thumb" loading="lazy" onerror="this.outerHTML='<div class=\\'library-history-thumb-placeholder\\'>${entry.event_type === 'download' ? '📥' : '📚'}</div>'">`
-        : `<div class="library-history-thumb-placeholder">${entry.event_type === 'download' ? '📥' : '📚'}</div>`;
+        ? `<img src="${escapeHtml(entry.thumb_url)}" class="library-history-thumb" loading="lazy" onerror="this.outerHTML='<div class=\\'library-history-thumb-placeholder\\'>${placeholderIcon}</div>'">`
+        : `<div class="library-history-thumb-placeholder">${placeholderIcon}</div>`;
 
     let badge = '';
     if (entry.event_type === 'download') {
@@ -3921,6 +2202,11 @@ function renderHistoryEntry(entry) {
             const cls = String(p || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
             return `<span class="library-history-badge download source-${escapeHtml(cls)}">${escapeHtml(p)}</span>`;
         }).join('');
+    } else if (entry.event_type === 'podcast') {
+        badge = `<span class="library-history-badge podcast">Podcast</span>`;
+        if (entry.quality) {
+            badge += ` <span class="library-history-badge download">${escapeHtml(entry.quality)}</span>`;
+        }
     } else if (entry.event_type === 'import' && entry.server_source) {
         const sourceName = { plex: 'Plex', jellyfin: 'Jellyfin', navidrome: 'Navidrome' }[entry.server_source] || entry.server_source;
         badge = `<span class="library-history-badge import">${escapeHtml(sourceName)}</span>`;
@@ -3961,6 +2247,20 @@ function renderHistoryEntry(entry) {
             if (entry.source_filename) fileParts.push(`<span class="lh-prov-label">File:</span> ${escapeHtml(entry.source_filename)}`);
             if (entry.source_track_id) fileParts.push(`<span class="lh-prov-label">${entry.source_filename ? '' : 'Source '}ID:</span> ${escapeHtml(entry.source_track_id)}`);
             lines.push(fileParts.join(` <span class="lh-prov-dim">·</span> `));
+        }
+        if (lines.length > 0) {
+            sourceDetail = `<div class="library-history-entry-source">${lines.join('<br>')}</div>`;
+        }
+    } else if (entry.event_type === 'podcast') {
+        const lines = [];
+        if (entry.title) {
+            lines.push(`<span class="lh-prov-label">Episode:</span> ${escapeHtml(entry.title)}`);
+        }
+        if (entry.artist_name || entry.album_name) {
+            lines.push(`<span class="lh-prov-label">Podcast:</span> ${escapeHtml(entry.artist_name || entry.album_name)}`);
+        }
+        if (entry.source_filename || entry.file_path) {
+            lines.push(`<span class="lh-prov-label">File:</span> ${escapeHtml(entry.source_filename || entry.file_path)}`);
         }
         if (lines.length > 0) {
             sourceDetail = `<div class="library-history-entry-source">${lines.join('<br>')}</div>`;
@@ -4500,7 +2800,7 @@ function buildDownloadAuditExplanation(entry) {
     const quality = entry.quality ? ` at ${entry.quality}` : '';
     const trackPart = entry.title ? `"${entry.title}"` : 'this track';
     const artistPart = entry.artist_name ? ` by ${entry.artist_name}` : '';
-    return `Commissary downloaded ${trackPart}${artistPart} from ${source}${quality}. Detailed source-by-source decisions, candidate scoring, and post-processing steps are not captured yet — older entries show a summary built from the recorded history fields.`;
+    return `SoulSync downloaded ${trackPart}${artistPart} from ${source}${quality}. Detailed source-by-source decisions, candidate scoring, and post-processing steps are not captured yet — older entries show a summary built from the recorded history fields.`;
 }
 
 function buildDownloadAuditSteps(entry) {
@@ -4762,7 +3062,7 @@ async function loadSyncHistory() {
     const list = document.getElementById('sync-history-list');
     const tabsContainer = document.getElementById('sync-history-tabs');
     if (!list) return;
-    list.innerHTML = '<div class="sync-history-loading">Loading…</div>';
+    list.innerHTML = '<div class="sync-history-loading">Loading...</div>';
 
     try {
         const params = new URLSearchParams({ page, limit });
@@ -4847,7 +3147,7 @@ function renderSyncHistoryEntry(entry) {
                 <div class="sync-history-progress-bar-fill" id="sync-history-bar-${entry.id}"></div>
             </div>
             <div class="sync-history-progress-text">
-                <span class="sync-history-progress-step" id="sync-history-step-${entry.id}">Starting sync…</span>
+                <span class="sync-history-progress-step" id="sync-history-step-${entry.id}">Starting sync...</span>
                 <div class="sync-history-progress-stats">
                     <span class="matched" id="sync-history-matched-${entry.id}">0 matched</span>
                     <span class="failed" id="sync-history-failed-${entry.id}">0 failed</span>
@@ -4941,7 +3241,7 @@ async function retriggerSync(entryId) {
 async function _startSyncHistoryResync(entryId, entry) {
     // Disable the re-sync button
     const btn = document.getElementById(`resync-btn-${entryId}`);
-    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Syncing...'; }
 
     // Show the progress area
     const wrapper = document.getElementById(`sync-history-wrapper-${entryId}`);
@@ -4987,7 +3287,15 @@ async function _startSyncHistoryResync(entryId, entry) {
         }
 
         // Store active re-sync state
-        _activeSyncHistoryResyncs[entryId] = { syncPlaylistId, entryId };
+        _activeSyncHistoryResyncs[entryId] = { syncPlaylistId, entryId, playlistName: entry.playlist_name };
+        if (typeof updateMusicSyncTask === 'function') {
+            updateMusicSyncTask({
+                playlist_id: syncPlaylistId,
+                playlist_name: entry.playlist_name,
+                status: 'starting',
+                progress: { progress: 0, total_tracks: tracks.length, playlist_name: entry.playlist_name },
+            });
+        }
 
         // Start polling for progress
         _pollSyncHistoryProgress(entryId, syncPlaylistId);
@@ -5002,6 +3310,7 @@ async function _startSyncHistoryResync(entryId, entry) {
 function _pollSyncHistoryProgress(entryId, syncPlaylistId) {
     const pollInterval = setInterval(async () => {
         try {
+            const active = _activeSyncHistoryResyncs[entryId];
             const resp = await fetch(`/api/sync/status/${syncPlaylistId}`);
             if (!resp.ok) {
                 clearInterval(pollInterval);
@@ -5009,6 +3318,9 @@ function _pollSyncHistoryProgress(entryId, syncPlaylistId) {
                 return;
             }
             const state = await resp.json();
+            const syncFrame = { playlist_id: syncPlaylistId, playlist_name: active?.playlistName || '', ...state };
+            window.dispatchEvent(new CustomEvent('ss:sync-progress', { detail: syncFrame }));
+            if (typeof updateMusicSyncTask === 'function') updateMusicSyncTask(syncFrame);
 
             if (state.status === 'syncing' || state.status === 'starting') {
                 const progress = state.progress || {};
@@ -5092,7 +3404,7 @@ async function cancelSyncHistoryResync(entryId) {
         });
 
         const stepEl = document.getElementById(`sync-history-step-${entryId}`);
-        if (stepEl) stepEl.textContent = 'Cancelling…';
+        if (stepEl) stepEl.textContent = 'Cancelling...';
 
     } catch (err) {
         console.error('Error cancelling sync:', err);
@@ -5153,7 +3465,7 @@ async function syncPlaylistToServer(playlistId) {
 
     // Disable the sync button
     const btn = document.getElementById(`sync-server-btn-${playlistId}`);
-    if (btn) { btn.disabled = true; btn.textContent = 'Syncing…'; }
+    if (btn) { btn.disabled = true; btn.textContent = 'Syncing...'; }
 
     // Show progress area
     const progressArea = document.getElementById(`modal-sync-progress-${playlistId}`);
@@ -5284,7 +3596,7 @@ async function cancelModalSync(playlistId) {
             body: JSON.stringify({ playlist_id: active.syncPlaylistId })
         });
         const stepEl = document.getElementById(`modal-sync-step-${playlistId}`);
-        if (stepEl) stepEl.textContent = 'Cancelling…';
+        if (stepEl) stepEl.textContent = 'Cancelling...';
     } catch (err) {
         console.error('Error cancelling modal sync:', err);
     }
@@ -5340,7 +3652,7 @@ async function openBlacklistModal() {
                 <button class="redownload-close" onclick="document.getElementById('blacklist-modal-overlay')?.remove()">&times;</button>
             </div>
             <div class="blacklist-modal-body" id="blacklist-modal-body">
-                <div class="redownload-loading"><div class="server-search-spinner"></div>Loading…</div>
+                <div class="redownload-loading"><div class="server-search-spinner"></div>Loading...</div>
             </div>
         </div>
     `;
@@ -5471,7 +3783,7 @@ async function loadMetadataCacheBrowse() {
     const search = document.getElementById('mcache-search')?.value || '';
     const sort = document.getElementById('mcache-sort-filter')?.value || 'last_accessed_at';
 
-    grid.innerHTML = '<div class="mcache-empty"><div class="mcache-empty-icon">…</div><div class="mcache-empty-sub">Loading…</div></div>';
+    grid.innerHTML = '<div class="mcache-empty"><div class="mcache-empty-icon">...</div><div class="mcache-empty-sub">Loading...</div></div>';
 
     try {
         let data;
@@ -5506,7 +3818,7 @@ async function loadMetadataCacheBrowse() {
                 <div class="mcache-empty">
                     <div class="mcache-empty-icon">📦</div>
                     <div class="mcache-empty-title">No cached ${_mcacheCurrentTab}s yet</div>
-                    <div class="mcache-empty-sub">As you search and browse music in Commissary, API responses will be cached here automatically.</div>
+                    <div class="mcache-empty-sub">As you search and browse music in SoulSync, API responses will be cached here automatically.</div>
                 </div>`;
             renderMetadataCachePagination(0, 0);
             return;
@@ -5607,7 +3919,7 @@ function renderMetadataCachePagination(total, offset) {
 
     if (start > 0) {
         html += `<button class="mcache-page-btn" onclick="_mcachePage=0;loadMetadataCacheBrowse()">1</button>`;
-        if (start > 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">…</span>`;
+        if (start > 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">...</span>`;
     }
 
     for (let i = start; i < end; i++) {
@@ -5615,7 +3927,7 @@ function renderMetadataCachePagination(total, offset) {
     }
 
     if (end < totalPages) {
-        if (end < totalPages - 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">…</span>`;
+        if (end < totalPages - 1) html += `<span style="color:rgba(255,255,255,0.2);padding:0 4px">...</span>`;
         html += `<button class="mcache-page-btn" onclick="_mcachePage=${totalPages - 1};loadMetadataCacheBrowse()">${totalPages}</button>`;
     }
 
@@ -5632,8 +3944,8 @@ async function openMetadataCacheDetail(source, entityType, entityId) {
     if (!modal || !body) return;
 
     modal.style.display = 'flex';
-    body.innerHTML = '<div style="text-align:center;padding:40px;color:rgba(255,255,255,0.4)">Loading…</div>';
-    if (title) title.textContent = 'Loading…';
+    body.innerHTML = '<div style="text-align:center;padding:40px;color:rgba(255,255,255,0.4)">Loading...</div>';
+    if (title) title.textContent = 'Loading...';
 
     try {
         const response = await fetch(`/api/metadata-cache/entity/${source}/${entityType}/${entityId}`);
@@ -5684,7 +3996,7 @@ async function openMetadataCacheDetail(source, entityType, entityId) {
             addRow('Disc Number', data.disc_number);
             addRow('Explicit', data.explicit ? 'Yes' : 'No');
             addRow('ISRC', data.isrc);
-            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent,#6d5dfc)">Listen</a>`);
+            if (data.preview_url) addRow('Preview', `<a href="${data.preview_url}" target="_blank" style="color:var(--accent)">Listen</a>`);
         }
 
         fieldsHtml += '</table>';
@@ -5753,7 +4065,12 @@ function toggleMcacheClearDropdown(event) {
 }
 
 async function clearMetadataCache() {
-    if (!confirm('Clear ALL cached metadata? This removes all cached API responses.')) return;
+    if (!await showConfirmDialog({
+        title: 'Clear Metadata Cache',
+        message: 'Clear ALL cached metadata? This removes every cached API response — lookups will have to be made again.',
+        confirmText: 'Clear All',
+        destructive: true
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5773,7 +4090,12 @@ async function clearMetadataCache() {
 }
 
 async function clearMetadataCacheBySource(source) {
-    if (!confirm(`Clear all ${source} cached metadata?`)) return;
+    if (!await showConfirmDialog({
+        title: 'Clear Cache by Source',
+        message: `Clear all ${source} cached metadata?`,
+        confirmText: 'Clear',
+        destructive: true
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5794,7 +4116,12 @@ async function clearMetadataCacheBySource(source) {
 
 async function clearMusicBrainzCache(failedOnly = false) {
     const label = failedOnly ? 'failed MusicBrainz lookups' : 'ALL MusicBrainz cache entries';
-    if (!confirm(`Clear ${label}?`)) return;
+    if (!await showConfirmDialog({
+        title: 'Clear MusicBrainz Cache',
+        message: `Clear ${label}?`,
+        confirmText: 'Clear',
+        destructive: !failedOnly
+    })) return;
     document.getElementById('mcache-clear-dropdown-menu').style.display = 'none';
 
     try {
@@ -5846,7 +4173,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Database Updater',
         content: `
             <h4>What does this tool do?</h4>
-            <p>The Database Updater syncs your media server library (Plex, Jellyfin, or Navidrome) with Commissary's internal database.</p>
+            <p>The Database Updater syncs your media server library (Plex, Jellyfin, or Navidrome) with SoulSync's internal database.</p>
 
             <h4>Update Modes</h4>
             <ul>
@@ -5891,6 +4218,34 @@ const TOOL_HELP_CONTENT = {
             <p>Available for <strong>Plex</strong> and <strong>Jellyfin</strong> media servers. Each enrichment worker only runs if its service is authenticated.</p>
         `
     },
+    'reconcile-ids': {
+        title: 'Import IDs from File Tags',
+        content: `
+            <h4>What does this tool do?</h4>
+            <p>Reads provider IDs that are already embedded in your audio files — Spotify, MusicBrainz, iTunes, Deezer and friends — and fills them into the database where they're missing.</p>
+
+            <h4>Why it's worth running</h4>
+            <p>Every ID it recovers is one the enrichment workers no longer have to go looking for. On a large library that's a lot of API calls skipped, and matches that were already correct in your tags get used instead of being re-guessed.</p>
+
+            <h4>How safe is it?</h4>
+            <ul>
+                <li><strong>Only fills blanks.</strong> An existing match is never overwritten.</li>
+                <li><strong>Read-only on your files.</strong> Each file is opened once to read tags; nothing is written back to disk.</li>
+                <li><strong>Conflicts are skipped, not applied.</strong> If a tag disagrees with a stored ID, the row is counted under Conflicts and left alone.</li>
+            </ul>
+
+            <h4>The counters</h4>
+            <ul>
+                <li><strong>IDs Filled:</strong> individual provider IDs written</li>
+                <li><strong>Rows Updated:</strong> database rows touched (a row can gain several IDs)</li>
+                <li><strong>Conflicts:</strong> tag disagreed with an existing match — skipped</li>
+                <li><strong>Unreadable:</strong> files whose tags could not be parsed</li>
+            </ul>
+
+            <h4>Note</h4>
+            <p>Reads every file in the library, so it can take a while on large collections. Safe to re-run — a second pass only picks up what's still blank.</p>
+        `
+    },
     'duplicate-cleaner': {
         title: 'Duplicate Cleaner',
         content: `
@@ -5914,7 +4269,7 @@ const TOOL_HELP_CONTENT = {
             </ol>
 
             <h4>Where do deleted files go?</h4>
-            <p>Removed files are moved to <code>Transfer/deleted/</code> folder (not permanently deleted). You can review and recover them if needed.</p>
+            <p>Removed files are moved to <code>Transfer/.deleted/</code> folder (not permanently deleted). You can review and recover them if needed.</p>
 
             <h4>Safety Features</h4>
             <ul>
@@ -5949,8 +4304,8 @@ const TOOL_HELP_CONTENT = {
             <h4>What happens when you scan?</h4>
             <ol>
                 <li><strong>Plex library scan:</strong> Plex scans your music folder for new/changed files</li>
-                <li><strong>Automatic database update:</strong> After the scan completes, Commissary automatically updates its internal database with new tracks</li>
-                <li><strong>Library refreshed:</strong> New music appears in Plex and Commissary within moments</li>
+                <li><strong>Automatic database update:</strong> After the scan completes, SoulSync automatically updates its internal database with new tracks</li>
+                <li><strong>Library refreshed:</strong> New music appears in Plex and SoulSync within moments</li>
             </ol>
 
             <h4>Plex only?</h4>
@@ -6089,7 +4444,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>🗺️ How MusicMap Integration Works</h4>
-            <p>Commissary uses <strong>MusicMap</strong> (music-map.com) instead of Spotify's recommendation API to find similar artists:</p>
+            <p>SoulSync uses <strong>MusicMap</strong> (music-map.com) instead of Spotify's recommendation API to find similar artists:</p>
             <ul>
                 <li>During watchlist scans, each watchlist artist is looked up on MusicMap</li>
                 <li>MusicMap's artist similarity graph is scraped to find related artists</li>
@@ -6149,7 +4504,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>When does it first run?</h4>
-            <p>The timer starts when Commissary boots. If the automation was previously scheduled, it resumes from where it left off.</p>
+            <p>The timer starts when SoulSync boots. If the automation was previously scheduled, it resumes from where it left off.</p>
 
             <h4>Good for</h4>
             <ul>
@@ -6202,17 +4557,17 @@ const TOOL_HELP_CONTENT = {
         title: 'App Started',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires once when Commissary starts up. Useful for tasks you want to run on every boot.</p>
+            <p>Fires once when SoulSync starts up. Useful for tasks you want to run on every boot.</p>
 
             <h4>Good for</h4>
             <ul>
                 <li>Refreshing mirrored playlists on startup</li>
                 <li>Running a quick database sync</li>
-                <li>Sending a "Commissary is online" notification</li>
+                <li>Sending a "SoulSync is online" notification</li>
             </ul>
 
             <h4>Note</h4>
-            <p>This trigger fires only once per startup — it will not fire again until Commissary is restarted.</p>
+            <p>This trigger fires only once per startup — it will not fire again until SoulSync is restarted.</p>
         `
     },
     'auto-track_downloaded': {
@@ -6311,17 +4666,17 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Good for</h4>
             <ul>
-                <li>Auto-discovering new tracks after a playlist updates</li>
+                <li>Auto-identifying new tracks after a playlist updates</li>
                 <li>Auto-syncing the playlist to your media server</li>
                 <li>Getting notified when your followed playlists change</li>
             </ul>
         `
     },
     'auto-discovery_completed': {
-        title: 'Discovery Complete',
+        title: 'Identification Complete',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires when Spotify/iTunes metadata discovery finishes for a mirrored playlist. Discovery is the process of matching playlist tracks to official Spotify or iTunes metadata.</p>
+            <p>Fires when Spotify/iTunes metadata identification finishes for a mirrored playlist. Identification is the process of matching playlist tracks to official Spotify or iTunes metadata.</p>
 
             <h4>Conditions</h4>
             <ul>
@@ -6333,8 +4688,8 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Good for</h4>
             <ul>
-                <li>Auto-syncing a playlist after discovery completes</li>
-                <li>Getting notified about discovery results (how many matched vs failed)</li>
+                <li>Auto-syncing a playlist after identification completes</li>
+                <li>Getting notified about identification results (how many matched vs failed)</li>
             </ul>
         `
     },
@@ -6362,7 +4717,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Database Updated',
         content: `
             <h4>What is this trigger?</h4>
-            <p>Fires when the library database refresh finishes — either incremental or full. This means Commissary's internal database has been synced with your media server.</p>
+            <p>Fires when the library database refresh finishes — either incremental or full. This means SoulSync's internal database has been synced with your media server.</p>
 
             <h4>Available variables for notifications</h4>
             <p><code>{total_artists}</code>, <code>{total_albums}</code>, <code>{total_tracks}</code></p>
@@ -6521,7 +4876,7 @@ const TOOL_HELP_CONTENT = {
             <p>Fires when a media server library scan is considered complete. This only happens after a <strong>Scan Library</strong> action was triggered — it cannot fire on its own.</p>
 
             <h4>How does it know the scan is done?</h4>
-            <p>Your media server (Plex, Jellyfin, Navidrome) doesn't send a "scan finished" signal back to Commissary. So after telling the server to scan, Commissary waits <strong>approximately 5 minutes</strong> and then assumes the scan has finished. This is a generous estimate that works for most libraries.</p>
+            <p>Your media server (Plex, Jellyfin, Navidrome) doesn't send a "scan finished" signal back to SoulSync. So after telling the server to scan, SoulSync waits <strong>approximately 5 minutes</strong> and then assumes the scan has finished. This is a generous estimate that works for most libraries.</p>
 
             <h4>Timing</h4>
             <p>From the moment a download finishes to when this trigger fires, expect roughly <strong>6-7 minutes</strong>:</p>
@@ -6533,7 +4888,7 @@ const TOOL_HELP_CONTENT = {
             </ol>
 
             <h4>Default use</h4>
-            <p>The system automation <strong>Auto-Update Database After Scan</strong> listens for this trigger to start an incremental database update, keeping your Commissary library in sync with your media server.</p>
+            <p>The system automation <strong>Auto-Update Database After Scan</strong> listens for this trigger to start an incremental database update, keeping your SoulSync library in sync with your media server.</p>
 
             <h4>Available variables</h4>
             <p><code>{server_type}</code> — which media server was scanned (plex, jellyfin, navidrome)</p>
@@ -6587,7 +4942,7 @@ const TOOL_HELP_CONTENT = {
             <ol>
                 <li>A <strong>60 second debounce</strong> groups rapid requests — if multiple downloads finish close together, only one scan is triggered</li>
                 <li>After the debounce, your media server is told to scan</li>
-                <li>Commissary waits <strong>~5 minutes</strong> (your media server doesn't report when it's finished, so this is an assumed completion time)</li>
+                <li>SoulSync waits <strong>~5 minutes</strong> (your media server doesn't report when it's finished, so this is an assumed completion time)</li>
                 <li>The <strong>Library Scan Done</strong> event fires, which can trigger follow-up actions like a database update</li>
             </ol>
 
@@ -6632,22 +4987,22 @@ const TOOL_HELP_CONTENT = {
         `
     },
     'auto-discover_playlist': {
-        title: 'Discover Playlist',
+        title: 'Identify Playlist Tracks',
         content: `
             <h4>What does this action do?</h4>
             <p>Finds official Spotify or iTunes metadata for tracks in a mirrored playlist. This is required before syncing — it matches each track to a known release so it can be found in your library.</p>
 
             <h4>Configuration</h4>
             <ul>
-                <li><strong>Playlist:</strong> Select a specific playlist, or check "Discover all" to process all mirrored playlists</li>
+                <li><strong>Playlist:</strong> Select a specific playlist, or check "Identify all" to process all mirrored playlists</li>
             </ul>
 
             <h4>How it works</h4>
             <ol>
                 <li>Takes each track name and artist from the mirror</li>
                 <li>Searches Spotify (or iTunes as fallback) for a match</li>
-                <li>Stores the best match with confidence score in the discovery cache</li>
-                <li>Already-discovered tracks are skipped for efficiency</li>
+                <li>Stores the best match with confidence score in the identification cache</li>
+                <li>Already-identified tracks are skipped for efficiency</li>
             </ol>
         `
     },
@@ -6658,7 +5013,7 @@ const TOOL_HELP_CONTENT = {
             <p>Runs the full playlist lifecycle in one automation — no signal wiring needed. Executes four phases sequentially:</p>
             <ol>
                 <li><strong>Refresh</strong> — Re-fetches playlist tracks from the source platform (Spotify, Tidal, YouTube, Deezer)</li>
-                <li><strong>Discover</strong> — Matches each track to official metadata (Spotify/iTunes/Deezer IDs)</li>
+                <li><strong>Identify</strong> — Matches each track to official metadata (Spotify/iTunes/Deezer IDs)</li>
                 <li><strong>Sync</strong> — Pushes the playlist to your media server (Plex, Jellyfin, Navidrome)</li>
                 <li><strong>Download Missing</strong> — Queues unmatched tracks to the wishlist for automatic download</li>
             </ol>
@@ -6673,7 +5028,7 @@ const TOOL_HELP_CONTENT = {
             <p>Set this on a schedule (e.g., every 6 hours). Between runs, the wishlist processor downloads missing tracks in the background. On the next pipeline run, those newly downloaded tracks will match during the sync phase — so your server playlist gets more complete with each cycle until fully synced.</p>
 
             <h4>Replaces</h4>
-            <p>This single automation replaces the 4-automation signal chain pattern (Refresh → signal → Discover → signal → Sync → signal → Download). No signals, no chaining, no room for misconfiguration.</p>
+            <p>This single automation replaces the 4-automation signal chain pattern (Refresh → signal → Identify → signal → Sync → signal → Download). No signals, no chaining, no room for misconfiguration.</p>
         `
     },
     'auto-notify_only': {
@@ -6685,7 +5040,7 @@ const TOOL_HELP_CONTENT = {
             <h4>Good for</h4>
             <ul>
                 <li>Getting notified about events without taking any automated action</li>
-                <li>Monitoring what's happening in Commissary (downloads, failures, changes)</li>
+                <li>Monitoring what's happening in SoulSync (downloads, failures, changes)</li>
                 <li>Pair with any event trigger + Discord/Telegram/Pushbullet notification</li>
             </ul>
         `
@@ -6694,7 +5049,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Update Database',
         content: `
             <h4>What does this action do?</h4>
-            <p>Refreshes Commissary's internal library database by syncing with your media server (Plex, Jellyfin, or Navidrome).</p>
+            <p>Refreshes SoulSync's internal library database by syncing with your media server (Plex, Jellyfin, or Navidrome).</p>
 
             <h4>Configuration</h4>
             <ul>
@@ -6709,7 +5064,7 @@ const TOOL_HELP_CONTENT = {
             <p>Scans your output folder for duplicate audio files (same filename, different format) and removes the lower-quality version. For example, if you have both <code>Song.flac</code> and <code>Song.mp3</code>, the MP3 is removed.</p>
 
             <h4>Safety</h4>
-            <p>Removed files are moved to a <code>deleted/</code> subfolder, not permanently deleted. You can recover them if needed.</p>
+            <p>Removed files are moved to a hidden <code>.deleted/</code> subfolder your media server ignores, not permanently deleted. You can recover them if needed.</p>
         `
     },
     'auto-clear_quarantine': {
@@ -6720,6 +5075,19 @@ const TOOL_HELP_CONTENT = {
 
             <h4>Warning</h4>
             <p>This permanently deletes files. Make sure you've reviewed quarantined files before setting up an automation for this.</p>
+        `
+    },
+    'auto-library_cleanup': {
+        title: 'Clear Quarantine + Empty Recycle Bin',
+        content: `
+            <h4>What does this action do?</h4>
+            <p>Two bins in one sweep. First it deletes everything in the download quarantine (downloads that failed verification). Then it empties the recycle bin, where the duplicate cleaner and repair tools put files they removed. Either half can be switched off in the action's settings.</p>
+
+            <h4>The recycle bin keep window</h4>
+            <p>The Recycle Bin tab on the Downloads page has a keep window. When one is set, this action only deletes files older than it. When it is on "keep forever", switching this automation on means you want the bin emptied, so it deletes everything in it.</p>
+
+            <h4>Warning</h4>
+            <p>This permanently deletes files. The seeded "Weekly Cleanup" automation runs it and ships switched off for that reason.</p>
         `
     },
     'auto-cleanup_wishlist': {
@@ -6752,7 +5120,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Backup Database',
         content: `
             <h4>What does this action do?</h4>
-            <p>Creates a timestamped backup of Commissary's SQLite database. Uses the SQLite backup API for a safe hot-copy while the app is running.</p>
+            <p>Creates a timestamped backup of SoulSync's SQLite database. Uses the SQLite backup API for a safe hot-copy while the app is running.</p>
 
             <h4>Retention</h4>
             <p>Keeps the last 5 backups automatically. Older backups are cleaned up to save disk space.</p>
@@ -6836,7 +5204,7 @@ const TOOL_HELP_CONTENT = {
         title: 'Deep Scan Library',
         content: `
             <h4>What does this action do?</h4>
-            <p>Walks your entire media server library and compares it against Commissary's database. Adds any new tracks found and removes stale entries that no longer exist on the server.</p>
+            <p>Walks your entire media server library and compares it against SoulSync's database. Adds any new tracks found and removes stale entries that no longer exist on the server.</p>
 
             <h4>How is this different from Database Update?</h4>
             <ul>
@@ -6939,7 +5307,7 @@ const TOOL_HELP_CONTENT = {
 
             <h4>JSON payload</h4>
             <p>The POST body always includes all event variables as JSON fields:</p>
-            <pre style="background:rgba(255,255,255,0.05);padding:8px;border-radius:6px;font-size:11px;">{"time": "2026-04-02 …", "name": "My Automation", "status": "success", ...}</pre>
+            <pre style="background:rgba(255,255,255,0.05);padding:8px;border-radius:6px;font-size:11px;">{"time": "2026-04-02 ...", "name": "My Automation", "status": "success", ...}</pre>
 
             <h4>Available variables</h4>
             <p>Use these in your message or header values:</p>
@@ -7020,7 +5388,7 @@ const TOOL_HELP_CONTENT = {
             </ul>
 
             <h4>Auto-Backups</h4>
-            <p>Commissary automatically creates a backup every 3 days via the automation engine. Up to 5 rolling backups are kept (oldest are removed when the limit is exceeded).</p>
+            <p>SoulSync automatically creates a backup every 3 days via the automation engine. Up to 5 rolling backups are kept (oldest are removed when the limit is exceeded).</p>
 
             <h4>Restore Safety</h4>
             <p>When you restore from a backup, a <strong>safety backup</strong> of your current database is created first. This means you can always undo a restore if something goes wrong.</p>
@@ -7038,10 +5406,10 @@ const TOOL_HELP_CONTENT = {
         title: 'Metadata Cache',
         content: `
             <h4>What is this?</h4>
-            <p>The Metadata Cache stores every API response from Spotify and iTunes so Commissary can reuse them instead of making duplicate API calls. This reduces rate limit pressure and speeds up lookups.</p>
+            <p>The Metadata Cache stores every API response from Spotify and iTunes so SoulSync can reuse them instead of making duplicate API calls. This reduces rate limit pressure and speeds up lookups.</p>
 
             <h4>How it works</h4>
-            <p>When Commissary fetches artist, album, or track data from Spotify or iTunes, the response is cached locally. The next time the same data is needed, it's served from cache instantly — no API call required. Cached data is even served during Spotify rate limit bans.</p>
+            <p>When SoulSync fetches artist, album, or track data from Spotify or iTunes, the response is cached locally. The next time the same data is needed, it's served from cache instantly — no API call required. Cached data is even served during Spotify rate limit bans.</p>
 
             <h4>Browsing the Cache</h4>
             <p>Click <strong>Browse Cache</strong> to explore all cached metadata. You can filter by entity type (artists, albums, tracks), search by name, filter by source (Spotify/iTunes), and sort by different fields. Click any card to see full details including the raw API response.</p>
@@ -7098,22 +5466,30 @@ const TOOL_HELP_CONTENT = {
     }
 };
 
+// Called from initializeToolsPage() on EVERY visit to the Tools page, so every
+// binding here has to be idempotent. It used to add a fresh listener per call —
+// including a document-level keydown — so N visits left N keydown handlers and N
+// click handlers per help button. Guarded the same way the tool buttons in
+// initializeToolsPage are (`_toolsWired`).
 function initializeToolHelpButtons() {
-    const helpButtons = document.querySelectorAll('.tool-help-button');
-    const modal = document.getElementById('tool-help-modal');
-    const closeButton = modal.querySelector('.tool-help-modal-close');
-
-    // Attach click handlers to all help buttons
-    helpButtons.forEach(button => {
+    document.querySelectorAll('.tool-help-button').forEach(button => {
+        if (button._toolsWired) return;
         button.addEventListener('click', (e) => {
             e.stopPropagation();
-            const toolId = button.getAttribute('data-tool');
-            openToolHelpModal(toolId);
+            openToolHelpModal(button.getAttribute('data-tool'));
         });
+        button._toolsWired = true;
     });
 
-    // Close modal when clicking close button
-    closeButton.addEventListener('click', closeToolHelpModal);
+    // The modal itself lives outside #tools-page (index.html), so it survives
+    // navigation — bind it once and never again. Also guard the lookup: a throw
+    // here used to abort initializeToolsPage before the DB/cache/pool stats and
+    // switchRepairTab('jobs') ever ran.
+    const modal = document.getElementById('tool-help-modal');
+    if (!modal || modal._toolsWired) return;
+
+    const closeButton = modal.querySelector('.tool-help-modal-close');
+    if (closeButton) closeButton.addEventListener('click', closeToolHelpModal);
 
     // Close modal when clicking outside content
     modal.addEventListener('click', (e) => {
@@ -7122,12 +5498,7 @@ function initializeToolHelpButtons() {
         }
     });
 
-    // Close modal on Escape key
-    document.addEventListener('keydown', (e) => {
-        if (e.key === 'Escape' && modal.classList.contains('active')) {
-            closeToolHelpModal();
-        }
-    });
+    modal._toolsWired = true;
 }
 
 function openToolHelpModal(toolId) {
@@ -7198,7 +5569,7 @@ async function openRetagModal() {
     if (clearBtn) { clearBtn.textContent = 'Clear All'; clearBtn.dataset.confirming = ''; clearBtn.style.background = ''; }
 
     const body = document.getElementById('retag-modal-body');
-    body.innerHTML = '<div class="retag-loading">Loading downloads…</div>';
+    body.innerHTML = '<div class="retag-loading">Loading downloads...</div>';
 
     try {
         const response = await fetch('/api/retag/groups');
@@ -7262,7 +5633,7 @@ function renderRetagGroups(groups, container) {
                     </div>
                 </div>
                 <div class="retag-group-tracks" id="retag-tracks-${group.id}" style="display:none;">
-                    <div class="retag-tracks-loading">Loading tracks…</div>
+                    <div class="retag-tracks-loading">Loading tracks...</div>
                 </div>
             </div>`;
         });
@@ -7437,7 +5808,7 @@ async function searchRetagAlbums(query) {
     if (!query || !query.trim()) return;
     const resultsDiv = document.getElementById('retag-search-results');
     if (!resultsDiv) return;
-    resultsDiv.innerHTML = '<div class="retag-search-loading">Searching…</div>';
+    resultsDiv.innerHTML = '<div class="retag-search-loading">Searching...</div>';
 
     try {
         const response = await fetch(`/api/retag/search?q=${encodeURIComponent(query.trim())}`);
@@ -7735,8 +6106,6 @@ function stopWishlistCountPolling() {
     }
 }
 
-
-
 function resetWishlistModalToIdleState() {
     // Reset wishlist modal to idle state after background processing completes
     const playlistId = 'wishlist';
@@ -7870,59 +6239,14 @@ async function initializeToolsPage() {
     await checkAndUpdateDbProgress();
     await checkAndUpdateDuplicateCleanProgress();
 
-    // Initialize library maintenance section
+    // Initialize library maintenance section. switchRepairTab('jobs') was here
+    // and its renderer is gone: 'tools' is a React route, this whole function
+    // has had no callers since that flip, and the vanilla repair-tab renderers
+    // it was the sole path to were deleted with it. updateRepairStatus stays —
+    // it is still reached from openRepairModal.
     updateRepairStatus();
-    switchRepairTab('jobs');
 
     toolsPageState.isInitialized = true;
-}
-
-let dashboardIntervals = [];
-
-function stopDashboardPolling() {
-    dashboardIntervals.forEach(clearInterval);
-    dashboardIntervals = [];
-}
-
-async function loadDashboardData() {
-    // Start periodic refreshers up front (independent of the initial loads).
-    stopWishlistCountPolling(); // Ensure no duplicates
-    stopDashboardPolling();     // ...same for the rest: this runs on every
-                                // navigation back to the dashboard, and the
-                                // timers used to accumulate one set per visit.
-    wishlistCountInterval = setInterval(updateWishlistCount, 10000);
-
-    // Cards hidden from this profile never poll. For a member with System
-    // Stats and Recent Activity hidden that's ~2,000 requests an hour saved,
-    // all of which would have rendered into a display:none card.
-    // NOTE: service status is deliberately absent — fetchAndUpdateServiceStatus
-    // also drives the SIDEBAR indicators every user sees, and is polled
-    // globally from initApp(). Hiding that card is presentation-only.
-    if (isWidgetVisible('music.stats')) {
-        dashboardIntervals.push(setInterval(fetchAndUpdateSystemStats, 10000));
-    }
-    if (isWidgetVisible('music.activity')) {
-        dashboardIntervals.push(setInterval(fetchAndUpdateActivityFeed, 2000));
-    }
-    dashboardIntervals.push(setInterval(checkForActivityToasts, 3000));
-
-    // Fire all independent initial loads in parallel instead of sequentially.
-    // Sequential awaits meant 6 back-to-back round-trips, each triggering its own
-    // reflow — the layout kept shifting for ~1-2s, which made the page feel
-    // unscrollable. Concurrent loads collapse that into a single settle.
-    await Promise.all([
-        updateWishlistCount(),
-        fetchAndUpdateServiceStatus(),
-        isWidgetVisible('music.stats') ? fetchAndUpdateSystemStats() : null,
-        isWidgetVisible('music.library') ? fetchAndUpdateDbStats() : null,
-        isWidgetVisible('music.activity') ? fetchAndUpdateActivityFeed() : null,
-        checkForActiveProcesses(),
-    ]);
-
-    // Render existing downloads once active processes are known.
-    updateDashboardDownloads();
-
-    // Automatic wishlist processing now runs server-side
 }
 
 // --- Data Fetching and UI Updates ---
@@ -7935,340 +6259,26 @@ async function fetchAndUpdateDbStats() {
 
         const stats = await response.json();
 
-        // This function updates the stat cards in the top grid
-        updateDashboardStatCards(stats);
-
-        // This function updates the info within the DB Updater tool card
-        updateDbUpdaterCardInfo(stats);
+        // Re-broadcast on the socket handler's channel (the poller-twin rule,
+        // same as fetchAndUpdateServiceStatus): the React dashboard Library
+        // card consumes ss:dashboard-db-stats, and the vanilla DOM halves this
+        // used to call (updateDashboardStatCards / updateDbUpdaterCardInfo)
+        // wrote what is React DOM now. Exactly one of the two dispatchers runs
+        // at a time — this one early-returns while the socket is connected.
+        window.dispatchEvent(new CustomEvent('ss:dashboard-db-stats', { detail: stats }));
 
     } catch (error) {
         console.warn('Could not fetch DB stats:', error);
     }
 }
 
-function updateDashboardStatCards(stats) {
-    // Update the Library Status card on the dashboard
-    updateLibraryStatusCard(stats);
-}
-
-/**
- * Smart Library Status card on the Dashboard.
- * Shows different states: no server, empty library, healthy library, scanning.
- */
-function updateLibraryStatusCard(dbStats) {
-    const card = document.getElementById('library-status-card');
-    if (!card) return;
-
-    const title = document.getElementById('library-status-title');
-    const subtitle = document.getElementById('library-status-subtitle');
-    const statsRow = document.getElementById('library-status-stats');
-    const scanBtn = document.getElementById('library-status-scan-btn');
-    const scanLabel = document.getElementById('library-status-scan-label');
-    const deepBtn = document.getElementById('library-status-deep-btn');
-    const progressDiv = document.getElementById('library-status-progress');
-    const messageDiv = document.getElementById('library-status-message');
-
-    const artists = dbStats ? (dbStats.artists || 0) : 0;
-    const albums = dbStats ? (dbStats.albums || 0) : 0;
-    const tracks = dbStats ? (dbStats.tracks || 0) : 0;
-    const sizeMb = dbStats ? (dbStats.database_size_mb || 0) : 0;
-    const lastUpdate = dbStats ? dbStats.last_update : null;
-    const serverSource = dbStats ? dbStats.server_source : null;
-
-    // Check if a scan is in progress
-    const isScanning = window._libraryStatusScanning || false;
-
-    // Determine state
-    const serverConnected = _lastStatusPayload && _lastStatusPayload.media_server && _lastStatusPayload.media_server.connected;
-    const serverType = _lastStatusPayload && _lastStatusPayload.active_media_server;
-    const hasData = tracks > 0;
-    const hasServer = !!serverType && serverType !== 'none';
-
-    // Reset classes
-    card.className = 'library-status-card';
-
-    if (isScanning) {
-        // State: Scanning
-        card.classList.add('scanning');
-        if (title) title.textContent = 'Library Scan';
-        if (subtitle) subtitle.textContent = 'Updating library database…';
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.add('scanning');
-            scanLabel.textContent = 'Stop';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = hasData ? '' : 'none';
-        if (progressDiv) progressDiv.style.display = '';
-        if (messageDiv) messageDiv.style.display = 'none';
-
-    } else if (!hasServer) {
-        // State: No server configured
-        card.classList.add('needs-setup');
-        if (title) title.textContent = 'No Media Server';
-        if (subtitle) subtitle.textContent = 'Connect a server to get started';
-        if (scanBtn) scanBtn.style.display = 'none';
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = 'Commissary needs a media server to manage your library. '
-                + 'Go to <span class="link" onclick="navigateToPage(\'settings\')">Settings</span> '
-                + 'to connect Plex, Jellyfin, or Navidrome.';
-        }
-
-    } else if (!serverConnected) {
-        // State: Server configured but not connected
-        card.classList.add('needs-setup');
-        const serverName = _capitalize(serverType);
-        if (title) title.textContent = `${serverName} — Disconnected`;
-        if (subtitle) subtitle.textContent = 'Cannot reach your media server';
-        if (scanBtn) scanBtn.style.display = 'none';
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = `Your ${serverName} server is configured but not responding. `
-                + 'Check that it\'s running and the connection details are correct in '
-                + '<span class="link" onclick="navigateToPage(\'settings\')">Settings</span>.';
-        }
-
-    } else if (!hasData) {
-        // State: Server connected but library is empty
-        card.classList.add('empty-library');
-        const serverName = _capitalize(serverType);
-        if (title) title.textContent = `${serverName} Connected`;
-        if (subtitle) subtitle.textContent = 'Library database is empty';
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.remove('scanning');
-            scanLabel.textContent = 'Scan Now';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = 'none';
-        if (statsRow) statsRow.style.display = 'none';
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) {
-            messageDiv.style.display = '';
-            messageDiv.innerHTML = 'Your server is connected but Commissary hasn\'t imported your library yet. '
-                + 'Click <strong>Scan Now</strong> to pull your artists, albums, and tracks into Commissary.';
-        }
-
-    } else {
-        // State: Healthy library with data
-        card.classList.add('has-data');
-        const serverName = _capitalize(serverType);
-        let lastRefreshText = 'Never';
-        if (lastUpdate) {
-            const d = new Date(lastUpdate);
-            if (!isNaN(d.getTime())) {
-                lastRefreshText = typeof _formatTimeAgo === 'function' ? _formatTimeAgo(d) : d.toLocaleDateString();
-            }
-        }
-        if (title) title.textContent = `${serverName} Library`;
-        if (subtitle) subtitle.textContent = `Last refreshed ${lastRefreshText}`;
-        if (scanBtn) {
-            scanBtn.style.display = '';
-            scanBtn.classList.remove('scanning');
-            scanLabel.textContent = 'Refresh';
-            scanBtn.disabled = false;
-        }
-        if (deepBtn) deepBtn.style.display = '';
-        if (statsRow) {
-            statsRow.style.display = '';
-            document.getElementById('library-status-artists').textContent = artists.toLocaleString();
-            document.getElementById('library-status-albums').textContent = albums.toLocaleString();
-            document.getElementById('library-status-tracks').textContent = tracks.toLocaleString();
-            document.getElementById('library-status-size').textContent = sizeMb < 1 ? `${Math.round(sizeMb * 1024)} KB` : `${sizeMb.toFixed(1)} MB`;
-        }
-        if (progressDiv) progressDiv.style.display = 'none';
-        if (messageDiv) messageDiv.style.display = 'none';
-    }
-}
-
 // _lastStatusPayload and _isSoulsyncStandalone are declared in core.js
-const _origFetchServiceStatus = typeof fetchAndUpdateServiceStatus === 'function' ? fetchAndUpdateServiceStatus : null;
-
-function _capitalize(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
-
-/**
- * Dashboard library scan button handler — triggers incremental DB update.
- */
-async function dashboardLibraryScan(fullRefresh = false) {
-    const scanBtn = document.getElementById('library-status-scan-btn');
-    const scanLabel = document.getElementById('library-status-scan-label');
-
-    // If already scanning, stop it
-    if (window._libraryStatusScanning) {
-        try {
-            await fetch('/api/database/update/stop', { method: 'POST' });
-            window._libraryStatusScanning = false;
-            showToast('Library scan stopped', 'info');
-            // Refresh the card
-            try {
-                const r = await fetch('/api/database/stats');
-                if (r.ok) updateLibraryStatusCard(await r.json());
-            } catch (e) {}
-        } catch (e) {
-            showToast('Failed to stop scan', 'error');
-        }
-        return;
-    }
-
-    // Start scan
-    try {
-        window._libraryStatusScanning = true;
-        updateLibraryStatusCard(null); // Update to scanning state
-
-        const response = await fetch('/api/database/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ full_refresh: fullRefresh })
-        });
-        const data = await response.json();
-        if (!data.success) {
-            window._libraryStatusScanning = false;
-            showToast(data.error || 'Failed to start scan', 'error');
-            return;
-        }
-
-        showToast('Library scan started', 'success');
-
-        // Poll for progress
-        const pollInterval = setInterval(async () => {
-            try {
-                const statusResp = await fetch('/api/database/update/status');
-                if (!statusResp.ok) return;
-                const status = await statusResp.json();
-
-                const phase = document.getElementById('library-status-phase');
-                const barFill = document.getElementById('library-status-bar-fill');
-                const detail = document.getElementById('library-status-progress-detail');
-
-                if (phase) phase.textContent = status.phase || 'Scanning…';
-                if (barFill) barFill.style.width = `${status.progress || 0}%`;
-                if (detail && status.processed !== undefined) {
-                    detail.textContent = `${status.processed} / ${status.total || '?'}`;
-                }
-
-                if (status.status === 'completed' || status.status === 'finished' || status.status === 'error' || status.status === 'idle') {
-                    clearInterval(pollInterval);
-                    window._libraryStatusScanning = false;
-
-                    if (status.status === 'completed' || status.status === 'finished') {
-                        showToast('Library scan complete', 'success');
-                    } else if (status.status === 'error') {
-                        showToast(`Scan error: ${status.error_message || 'Unknown'}`, 'error');
-                    }
-
-                    // Refresh stats
-                    try {
-                        const r = await fetch('/api/database/stats');
-                        if (r.ok) updateLibraryStatusCard(await r.json());
-                    } catch (e) {}
-                }
-            } catch (e) {
-                clearInterval(pollInterval);
-                window._libraryStatusScanning = false;
-            }
-        }, 2000);
-
-    } catch (e) {
-        window._libraryStatusScanning = false;
-        showToast(`Scan failed: ${e.message}`, 'error');
-    }
-}
-
-/**
- * Dashboard deep scan — finds new tracks, removes stale ones, preserves enrichment data.
- */
-async function dashboardLibraryDeepScan() {
-    if (window._libraryStatusScanning) {
-        showToast('A scan is already running', 'warning');
-        return;
-    }
-
-    if (!await showConfirmDialog({
-        title: 'Deep Scan Library',
-        message: 'A deep scan re-checks every track in your media server library.\n\n' +
-                 '• Adds any new tracks that were missed\n' +
-                 '• Removes tracks no longer on your server\n' +
-                 '• Preserves all existing metadata and enrichment data\n\n' +
-                 'This may take a while for large libraries. Continue?',
-    })) return;
-
-    // Use the same scan flow as dashboardLibraryScan but with deep_scan flag
-    try {
-        window._libraryStatusScanning = true;
-        updateLibraryStatusCard(null);
-
-        const response = await fetch('/api/database/update', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ deep_scan: true })
-        });
-        const data = await response.json();
-        if (!data.success) {
-            window._libraryStatusScanning = false;
-            showToast(data.error || 'Failed to start deep scan', 'error');
-            try { const r = await fetch('/api/database/stats'); if (r.ok) updateLibraryStatusCard(await r.json()); } catch (e) {}
-            return;
-        }
-
-        showToast('Deep scan started — this may take a while', 'success');
-
-        const pollInterval = setInterval(async () => {
-            try {
-                const statusResp = await fetch('/api/database/update/status');
-                if (!statusResp.ok) return;
-                const status = await statusResp.json();
-
-                const phase = document.getElementById('library-status-phase');
-                const barFill = document.getElementById('library-status-bar-fill');
-                const detail = document.getElementById('library-status-progress-detail');
-
-                if (phase) phase.textContent = status.phase || 'Deep scanning…';
-                if (barFill) barFill.style.width = `${status.progress || 0}%`;
-                if (detail && status.processed !== undefined) {
-                    detail.textContent = `${status.processed} / ${status.total || '?'}`;
-                }
-
-                if (status.status === 'completed' || status.status === 'finished' || status.status === 'error' || status.status === 'idle') {
-                    clearInterval(pollInterval);
-                    window._libraryStatusScanning = false;
-
-                    if (status.status === 'completed' || status.status === 'finished') {
-                        showToast('Deep scan complete', 'success');
-                    } else if (status.status === 'error') {
-                        showToast(`Deep scan error: ${status.error_message || 'Unknown'}`, 'error');
-                    }
-
-                    try { const r = await fetch('/api/database/stats'); if (r.ok) updateLibraryStatusCard(await r.json()); } catch (e) {}
-                }
-            } catch (e) {
-                clearInterval(pollInterval);
-                window._libraryStatusScanning = false;
-            }
-        }, 2000);
-
-    } catch (e) {
-        window._libraryStatusScanning = false;
-        showToast(`Deep scan failed: ${e.message}`, 'error');
-    }
-}
 
 /**
  * Update the Active Downloads section on the dashboard.
  * Called from artist, search, and discover update points (event-driven, no polling).
  */
 function updateDashboardDownloads() {
-    // Hidden for this profile — bail before the reveal below would undo
-    // applyWidgetPolicy()'s display:none the moment a download starts.
-    if (!isWidgetVisible('music.active-downloads')) return;
-
     const section = document.getElementById('dashboard-active-downloads-section');
     const container = document.getElementById('dashboard-downloads-container');
     if (!section || !container) return;
@@ -8411,40 +6421,6 @@ function createDashboardDiscoverBubble(playlistId) {
     `;
 }
 
-
-
-function updateDbUpdaterCardInfo(stats) {
-    // Update the detailed stats within the DB Updater tool card
-    const lastRefreshEl = document.getElementById('db-last-refresh');
-    const artistsStatEl = document.getElementById('db-stat-artists');
-    const albumsStatEl = document.getElementById('db-stat-albums');
-    const tracksStatEl = document.getElementById('db-stat-tracks');
-    const sizeStatEl = document.getElementById('db-stat-size');
-
-    if (lastRefreshEl) {
-        if (stats.last_full_refresh) {
-            const date = new Date(stats.last_full_refresh);
-            lastRefreshEl.textContent = date.toLocaleString();
-        } else {
-            lastRefreshEl.textContent = 'Never';
-        }
-    }
-
-    if (artistsStatEl) artistsStatEl.textContent = stats.artists.toLocaleString() || '0';
-    if (albumsStatEl) albumsStatEl.textContent = stats.albums.toLocaleString() || '0';
-    if (tracksStatEl) tracksStatEl.textContent = stats.tracks.toLocaleString() || '0';
-    if (sizeStatEl) sizeStatEl.textContent = `${stats.database_size_mb.toFixed(2)} MB`;
-
-    // Update the title of the tool card to show which server is active
-    const toolCardTitle = document.querySelector('#db-updater-card .tool-card-title');
-    if (toolCardTitle && stats.server_source) {
-        const serverName = stats.server_source.charAt(0).toUpperCase() + stats.server_source.slice(1);
-        // Keep the card emoji the static markup sets — this line owns the whole
-        // title, so without it the tool cards lose their icon the moment stats land.
-        toolCardTitle.textContent = `🗄️ ${serverName} Database Updater`;
-    }
-}
-
 // --- Wishlist Count Functions ---
 
 async function updateWishlistCount() {
@@ -8456,22 +6432,14 @@ async function updateWishlistCount() {
         const data = await response.json();
         const count = data.count || 0;
 
-        _updateHeroBtnCount('wishlist-button', 'wishlist-badge', count);
-        // Update sidebar nav badge
+        // Only the SIDEBAR badge survives the dashboard flip — the hero
+        // button, its badge and the active/inactive classes are React-rendered
+        // (dashboard-header.tsx fetches this same endpoint on mount and
+        // consumes the socket dispatch afterwards).
         const wlNavBadge = document.getElementById('wishlist-nav-badge');
         if (wlNavBadge) {
             wlNavBadge.textContent = count;
             wlNavBadge.classList.toggle('hidden', count === 0);
-        }
-        const wishlistButton = document.getElementById('wishlist-button');
-        if (wishlistButton) {
-            if (count === 0) {
-                wishlistButton.classList.remove('wishlist-active');
-                wishlistButton.classList.add('wishlist-inactive');
-            } else {
-                wishlistButton.classList.remove('wishlist-inactive');
-                wishlistButton.classList.add('wishlist-active');
-            }
         }
 
         // Check for auto-initiated wishlist processes that user should see immediately
@@ -8579,7 +6547,7 @@ function armDbUpdateSafetyPoll() {
             }
         } catch (e) { /* transient — keep the safety net armed */ }
     };
-    tick();  // immediate: flip off "Starting…" as soon as the server confirms state
+    tick();  // immediate: flip off "Starting..." as soon as the server confirms state
     _dbUpdateSafetyPoll = setInterval(tick, 5000);
 }
 
@@ -8597,7 +6565,7 @@ function updateDbProgressUI(state) {
         button.disabled = false;
         refreshSelect.disabled = true;
 
-        phaseLabel.textContent = state.phase || 'Processing…';
+        phaseLabel.textContent = state.phase || 'Processing...';
         progressLabel.textContent = `${state.processed} / ${state.total} artists (${state.progress.toFixed(1)}%)`;
         progressBar.style.width = `${state.progress}%`;
     } else { // idle, finished, or error

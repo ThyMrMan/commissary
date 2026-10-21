@@ -103,9 +103,20 @@ def select_playlist_video_gaps(
 
 
 # ── production seams ──────────────────────────────────────────────────────────
+def _profile() -> int:
+    """The automation owner's profile: the scan reads/writes its owner's
+    watchlist/wishlist (the engine sets the background profile to the owner
+    before the run)."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
+
+
 def _default_fetch_playlists() -> List[Dict[str, Any]]:
     from api.video import get_video_db
-    return get_video_db().list_watchlist_playlists()
+    return get_video_db().list_watchlist_playlists(profile_id=_profile())
 
 
 def _default_fetch_videos(playlist_id: Any) -> List[Dict[str, Any]]:
@@ -127,7 +138,7 @@ def _default_fetch_videos(playlist_id: Any) -> List[Dict[str, Any]]:
 def _default_wishlisted_ids(playlist_id: Any) -> List[Any]:
     # parent_source_id holds the playlist id for playlist-sourced wishlist videos.
     from api.video import get_video_db
-    return get_video_db().wishlisted_video_ids_for_channel(playlist_id)
+    return get_video_db().wishlisted_video_ids_for_channel(playlist_id, profile_id=_profile())
 
 
 def _default_downloaded_ids(playlist_id: Any) -> List[Any]:
@@ -146,6 +157,32 @@ def _default_seen_ids(playlist_id: Any) -> List[Any]:
     return get_video_db().get_playlist_seen(playlist_id)
 
 
+def _default_playlist_settings(playlist_id: Any) -> Dict[str, Any]:
+    from api.video import get_video_db
+    return get_video_db().get_playlist_settings(playlist_id)
+
+
+def _archive_recheck_hours(settings: Dict[str, Any], default_hours: int = 24) -> int:
+    try:
+        days = int((settings or {}).get("archive_recheck_days") or 0)
+    except (TypeError, ValueError):
+        days = 0
+    if days <= 0:
+        return max(1, int(default_hours or 24))
+    return max(1, min(days, 365)) * 24
+
+
+def _default_checked_recently(playlist_id: Any, within_hours: int) -> bool:
+    from api.video import get_video_db
+    return get_video_db().youtube_source_checked_recently(playlist_id, kind="playlist",
+                                                          within_hours=within_hours)
+
+
+def _default_mark_checked(playlist_id: Any) -> None:
+    from api.video import get_video_db
+    get_video_db().mark_youtube_source_checked(playlist_id, kind="playlist")
+
+
 def _default_mark_seen(playlist_id: Any, video_ids: Iterable) -> None:
     from api.video import get_video_db
     get_video_db().add_playlist_seen(playlist_id, list(video_ids or []))
@@ -155,7 +192,8 @@ def _default_add_videos(playlist: Dict[str, Any], videos: List[Dict[str, Any]]) 
     """Wishlist under the PLAYLIST as the show (title = playlist name → playlist-as-show)."""
     from api.video import get_video_db
     from core.video.sources import resolve_video_server
-    return get_video_db().add_videos_to_wishlist(playlist, videos, server_source=resolve_video_server())
+    return get_video_db().add_videos_to_wishlist(
+        playlist, videos, server_source=resolve_video_server(), profile_id=_profile())
 
 
 def auto_video_scan_watchlist_playlists(
@@ -171,6 +209,9 @@ def auto_video_scan_watchlist_playlists(
     today_fn: Optional[Callable[[], str]] = None,
     seen_ids: Optional[Callable[[Any], Iterable]] = None,
     mark_seen: Optional[Callable[[Any, Iterable], None]] = None,
+    source_settings: Optional[Callable[[Any], Dict[str, Any]]] = None,
+    checked_recently: Optional[Callable[[Any, int], bool]] = None,
+    mark_checked: Optional[Callable[[Any], None]] = None,
     backfill_fn: Optional[Callable[[], int]] = None,
 ) -> Dict[str, Any]:
     """Scan every followed YouTube playlist — the SAME 'cap + new' rule as channels.
@@ -185,6 +226,9 @@ def auto_video_scan_watchlist_playlists(
     today_fn = today_fn or (lambda: date.today().isoformat())
     seen_ids = seen_ids or _default_seen_ids
     mark_seen = mark_seen or _default_mark_seen
+    source_settings = source_settings or _default_playlist_settings
+    checked_recently = checked_recently or _default_checked_recently
+    mark_checked = mark_checked or _default_mark_checked
     automation_id = config.get('_automation_id')
     min_seconds = max(0, int(config.get('min_seconds', 60) or 0))
     backfill = max(0, int((backfill_fn or _default_backfill_count)()))
@@ -210,6 +254,11 @@ def auto_video_scan_watchlist_playlists(
                                  log_line="Checking '%s' for new videos" % ptitle, log_type='info')
             if not pid:
                 continue
+            settings = source_settings(pid) or {}
+            if not config.get("force") and checked_recently(pid, _archive_recheck_hours(settings)):
+                deps.update_progress(automation_id, log_line="Skipping '%s' until its recheck window expires" % ptitle,
+                                     log_type='info')
+                continue
             try:
                 videos = fetch_videos(pid) or []
             except Exception:   # noqa: BLE001 - one flaky playlist shouldn't abort the scan
@@ -234,6 +283,10 @@ def auto_video_scan_watchlist_playlists(
                     mark_seen(pid, baseline)          # remember membership so later scans see only additions
                 except Exception:   # noqa: BLE001 - baseline is best-effort; a miss just re-checks next scan
                     logger.debug("playlist seen-baseline write failed for %s", pid, exc_info=True)
+            try:
+                mark_checked(pid)
+            except Exception:   # noqa: BLE001 - cadence assists scans; never fail the run
+                logger.debug("playlist checked marker write failed for %s", pid, exc_info=True)
 
         done = ('Wishlisted %d new video(s) across %d playlist(s)' % (added, total)) if added \
             else ('Playlists are up to date — nothing new across %d playlist(s)' % total)

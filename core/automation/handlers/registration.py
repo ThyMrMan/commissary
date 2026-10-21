@@ -10,19 +10,27 @@ from __future__ import annotations
 from core.automation.deps import AutomationDeps
 from core.automation.handlers.process_wishlist import auto_process_wishlist
 from core.automation.handlers.scan_watchlist import auto_scan_watchlist
+from core.automation.handlers.audiobook_process_wishlist import auto_process_audiobook_wishlist
+from core.automation.handlers.audiobook_scan_watchlist import auto_scan_audiobook_watchlist
+from core.automation.handlers.audiobook_scan_library import auto_scan_audiobook_library
+from core.automation.handlers.audiobook_purge_recycle import auto_purge_audiobook_recycle
+from core.automation.handlers.scan_watchlist_podcasts import auto_scan_watchlist_podcasts
 from core.automation.handlers.scan_library import auto_scan_library
 from core.automation.handlers.refresh_mirrored import auto_refresh_mirrored
 from core.automation.handlers.sync_playlist import auto_sync_playlist
 from core.automation.handlers.discover_playlist import auto_discover_playlist
-from core.automation.handlers.resync_playlists import auto_resync_incomplete_playlists
 from core.automation.handlers.playlist_pipeline import auto_playlist_pipeline
 from core.automation.handlers.personalized_pipeline import auto_personalized_pipeline
 from core.automation.handlers.lastfm_import import auto_import_lastfm_listening
+from core.automation.handlers.listenbrainz_import import auto_import_listenbrainz_listening
+from core.automation.handlers.library_cleanup import auto_library_cleanup
 from core.automation.handlers.database_update import (
     auto_start_database_update, auto_deep_scan_library,
 )
 from core.automation.handlers.duplicate_cleaner import auto_run_duplicate_cleaner
 from core.automation.handlers.quality_scanner import auto_start_quality_scan
+from core.automation.handlers.run_repair import auto_run_repair_job
+from core.automation.handlers.apply_quality_upgrades import auto_apply_quality_upgrades
 from core.automation.handlers.maintenance import (
     auto_clear_quarantine,
     auto_cleanup_wishlist,
@@ -38,10 +46,13 @@ from core.automation.handlers.download_cleanup import (
 )
 from core.automation.handlers.run_script import auto_run_script
 from core.automation.handlers.search_and_download import auto_search_and_download
-from core.automation.handlers.video_auto_wishlist_airing import auto_video_add_airing_episodes
-from core.automation.handlers.video_refresh_airing_schedules import auto_video_refresh_airing_schedules
-from core.automation.handlers.video_reenrich_stale import auto_video_reenrich_stale
+from core.automation.handlers.complete_incomplete_albums import auto_complete_incomplete_albums
+from core.automation.handlers.video_auto_wishlist_airing import auto_video_add_airing_episodes_all_profiles, is_airing_already_running
+from core.automation.handlers.video_refresh_airing_schedules import auto_video_refresh_airing_schedules, is_refresh_already_running
+from core.automation.handlers.video_reenrich_stale import auto_video_reenrich_stale, is_reenrich_already_running
 from core.automation.handlers.video_clean_youtube import auto_video_clean_youtube_episodes
+from core.automation.handlers.video_purge_recycle import auto_video_purge_recycle_bin
+from core.automation.handlers.video_profile_fanout import run_per_profile
 from core.automation.handlers.video_scan_watchlist_people import auto_video_scan_watchlist_people
 from core.automation.handlers.video_scan_watchlist_studios import auto_video_scan_watchlist_studios
 from core.automation.handlers.video_scan_watchlist_channels import auto_video_scan_watchlist_channels
@@ -49,6 +60,7 @@ from core.automation.handlers.video_process_youtube_wishlist import auto_video_p
 from core.automation.handlers.video_scan_watchlist_playlists import auto_video_scan_watchlist_playlists
 from core.automation.handlers.video_process_wishlist import auto_video_process_wishlist, is_running
 from core.automation.handlers.video_rss_sync import auto_video_rss_sync
+from core.automation.handlers.video_extto_fresh import auto_video_extto_fresh_refresh
 from core.automation.handlers.video_import_lists import auto_video_import_lists
 from core.automation.handlers.video_seeding_sweep import auto_video_seeding_sweep
 from core.automation.handlers.seeding_sweep import auto_seeding_sweep
@@ -78,6 +90,13 @@ def register_all(deps: AutomationDeps) -> None:
     """
     engine = deps.engine
 
+    # Opt-in album completion. The handler independently requires a
+    # successful Album Completeness scan event before queueing anything.
+    engine.register_action_handler(
+        'complete_incomplete_albums',
+        lambda config: auto_complete_incomplete_albums(config, deps),
+    )
+
     # Self-guards prevent duplicate runs of the SAME operation, but
     # different operations can run concurrently — wishlist downloads
     # use bandwidth, watchlist scans use API calls, library scans use
@@ -91,6 +110,26 @@ def register_all(deps: AutomationDeps) -> None:
         'scan_watchlist',
         lambda config: auto_scan_watchlist(config, deps),
         guard_fn=deps.is_watchlist_actually_scanning,
+    )
+    engine.register_action_handler(
+        'scan_watchlist_podcasts',
+        lambda config: auto_scan_watchlist_podcasts(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_process_wishlist',
+        lambda config: auto_process_audiobook_wishlist(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_scan_watchlist',
+        lambda config: auto_scan_audiobook_watchlist(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_scan_library',
+        lambda config: auto_scan_audiobook_library(config, deps),
+    )
+    engine.register_action_handler(
+        'audiobook_purge_recycle',
+        lambda config: auto_purge_audiobook_recycle(config, deps),
     )
     # NOTE: labels are NOT a separate automation kind — the 'scan_watchlist'
     # action (and the manual scan) run a label phase after the artist scan via
@@ -118,15 +157,6 @@ def register_all(deps: AutomationDeps) -> None:
         'discover_playlist',
         lambda config: auto_discover_playlist(config, deps),
     )
-    # The tail of the post-download chain: once the database update has read the
-    # freshly imported tracks in, re-sync the playlists that were short. Shares
-    # the pipeline flag both ways — the guard refuses it mid-pipeline, and it
-    # holds the flag itself so a pipeline can't start under it.
-    engine.register_action_handler(
-        'resync_incomplete_playlists',
-        lambda config: auto_resync_incomplete_playlists(config, deps),
-        deps.state.is_pipeline_running,
-    )
     engine.register_action_handler(
         'playlist_pipeline',
         lambda config: auto_playlist_pipeline(config, deps),
@@ -140,13 +170,15 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_personalized_pipeline(config, deps),
         deps.state.is_pipeline_running,
     )
-    # The importer is single-flight on its own lock, so the guard asks IT
-    # rather than sharing a pipeline flag: a listening-history crawl has no
-    # reason to block, or be blocked by, a playlist sync.
     engine.register_action_handler(
         'import_lastfm_listening',
         lambda config: auto_import_lastfm_listening(config, deps),
         lambda: bool(deps.lastfm_import_worker and deps.lastfm_import_worker.is_running()),
+    )
+    engine.register_action_handler(
+        'import_listenbrainz_listening',
+        lambda config: auto_import_listenbrainz_listening(config, deps),
+        lambda: bool(deps.listenbrainz_import_worker and deps.listenbrainz_import_worker.is_running()),
     )
 
     # Database update + deep scan share the db_update_state guard —
@@ -161,6 +193,21 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_deep_scan_library(config, deps),
         lambda: deps.get_db_update_state().get('status') == 'running',
     )
+    # The same incremental server-read on an hourly SCHEDULE rather than only after a
+    # SoulSync download, so manually-added music appears within the hour instead of
+    # waiting for the weekly deep scan. A distinct action_type because the system
+    # seeder looks rows up BY action_type — reusing 'start_database_update' would
+    # collide with the event-driven 'Auto-Update Database After Scan' row.
+    #
+    # full_refresh is pinned FIRST so a schedule can never full-refresh hourly by
+    # accident; an explicit config still wins for a hand-built automation. Shares
+    # the db_update_state guard, so an hourly tick during a long deep scan is
+    # skipped rather than queued.
+    engine.register_action_handler(
+        'start_database_update_hourly',
+        lambda config: auto_start_database_update({'full_refresh': False, **config}, deps),
+        lambda: deps.get_db_update_state().get('status') == 'running',
+    )
     engine.register_action_handler(
         'run_duplicate_cleaner',
         lambda config: auto_run_duplicate_cleaner(config, deps),
@@ -169,6 +216,10 @@ def register_all(deps: AutomationDeps) -> None:
     engine.register_action_handler(
         'clear_quarantine',
         lambda config: auto_clear_quarantine(config, deps),
+    )
+    engine.register_action_handler(
+        'library_cleanup',
+        lambda config: auto_library_cleanup(config, deps),
     )
     engine.register_action_handler(
         'cleanup_wishlist',
@@ -182,6 +233,17 @@ def register_all(deps: AutomationDeps) -> None:
         'start_quality_scan',
         lambda config: auto_start_quality_scan(config, deps),
         lambda: False,  # repair worker dedupes Run-Now requests itself
+    )
+    # Any music Library Maintenance job, on the repair worker's force-run
+    # queue (one job at a time; dedupes repeat requests itself).
+    engine.register_action_handler(
+        'run_repair_job',
+        lambda config: auto_run_repair_job(config, deps),
+        lambda: False,
+    )
+    engine.register_action_handler(
+        'apply_quality_upgrades',
+        lambda config: auto_apply_quality_upgrades(config, deps),
     )
     engine.register_action_handler(
         'backup_database',
@@ -262,7 +324,7 @@ def register_all(deps: AutomationDeps) -> None:
         'video_update_database',
         lambda config: auto_video_update_database(config, deps),
     )
-    # Same incremental update, but on an hourly SCHEDULE (not just after a Commissary scan) —
+    # Same incremental update, but on an hourly SCHEDULE (not just after a SoulSync scan) —
     # so manual library additions (which Plex auto-scans) show up within the hour instead of
     # waiting for the weekly deep scan. A distinct action_type because the seeder keys on it.
     engine.register_action_handler(
@@ -272,19 +334,22 @@ def register_all(deps: AutomationDeps) -> None:
     # Sonarr-style: wishlist every episode airing today (for followed shows).
     engine.register_action_handler(
         'video_add_airing_episodes',
-        lambda config: auto_video_add_airing_episodes(config, deps),
+        lambda config: auto_video_add_airing_episodes_all_profiles(config, deps),
+        guard_fn=is_airing_already_running,
     )
     # Keep the calendar honest: re-pull TMDB episode schedules for still-airing watchlist
     # shows (the airing automation above reads the LOCAL calendar, so it needs this fresh).
     engine.register_action_handler(
         'video_refresh_airing_schedules',
         lambda config: auto_video_refresh_airing_schedules(config, deps),
+        guard_fn=is_refresh_already_running,
     )
     # Freshness: rolling re-enrichment of the stalest matched library items (oldest-refreshed
     # first, skipping anything already fresh) so ratings/overviews/art never go out of date.
     engine.register_action_handler(
         'video_reenrich_stale',
         lambda config: auto_video_reenrich_stale(config, deps),
+        guard_fn=is_reenrich_already_running,
     )
     # YouTube retention: delete channel episodes outside each channel's keep window (opt-in
     # per channel; default keeps everything). The history row stays so it's not re-downloaded.
@@ -292,27 +357,37 @@ def register_all(deps: AutomationDeps) -> None:
         'video_clean_youtube_episodes',
         lambda config: auto_video_clean_youtube_episodes(config, deps),
     )
+    # recycle bin retention. used to only run as a side effect of the next
+    # delete, so keep-days did nothing on a quiet library.
+    engine.register_action_handler(
+        'video_purge_recycle_bin',
+        lambda config: auto_video_purge_recycle_bin(config, deps),
+    )
     # ── Watchlist → Wishlist pipeline ─────────────────────────────────────────
     # Stage 1 — SCANS that fill the wishlist from what you follow.
     # People: wishlist every un-owned movie followed actors/directors made (catalog + upcoming).
     engine.register_action_handler(
         'video_scan_watchlist_people',
-        lambda config: auto_video_scan_watchlist_people(config, deps),
+        lambda config: run_per_profile(
+            lambda d, _pid, _own: auto_video_scan_watchlist_people(config, d), deps, ['person']),
     )
     # Studios: wishlist every un-owned movie a followed studio produced (catalog + upcoming).
     engine.register_action_handler(
         'video_scan_watchlist_studios',
-        lambda config: auto_video_scan_watchlist_studios(config, deps),
+        lambda config: run_per_profile(
+            lambda d, _pid, _own: auto_video_scan_watchlist_studios(config, d), deps, ['studio']),
     )
     # Channels: new long-form uploads from followed YouTube channels (forward + last-N net).
     engine.register_action_handler(
         'video_scan_watchlist_channels',
-        lambda config: auto_video_scan_watchlist_channels(config, deps),
+        lambda config: run_per_profile(
+            lambda d, _pid, _own: auto_video_scan_watchlist_channels(config, d), deps, ['channel']),
     )
     # Playlists: mirror followed YouTube playlists (whole list + new additions; playlist-as-show).
     engine.register_action_handler(
         'video_scan_watchlist_playlists',
-        lambda config: auto_video_scan_watchlist_playlists(config, deps),
+        lambda config: run_per_profile(
+            lambda d, _pid, _own: auto_video_scan_watchlist_playlists(config, d), deps, ['playlist']),
     )
     # Stage 2 — PROCESSORS that drain the wishlist by downloading. Movie/episode go through
     # slskd (search → pick best → grab); the guard skips an hourly tick while a drain is still
@@ -337,6 +412,14 @@ def register_all(deps: AutomationDeps) -> None:
         'video_rss_sync',
         lambda config: auto_video_rss_sync(config, deps),
         lambda: __import__('core.video.rss_sync', fromlist=['is_running']).is_running(),
+    )
+    # Fresh Releases: pull the EXT.to board + match each release against its
+    # detail page, cached by release so an hourly run mostly costs nothing. The
+    # tab's Refresh button runs the identical code.
+    engine.register_action_handler(
+        'video_extto_fresh_refresh',
+        lambda config: auto_video_extto_fresh_refresh(config, deps),
+        lambda: __import__('core.video.extto_board', fromlist=['is_running']).is_running(),
     )
     # Seeding lifecycle: release completed torrent grabs once ratio/time goals
     # are met (off until goals are set on Settings → Downloads).
@@ -373,7 +456,7 @@ def register_all(deps: AutomationDeps) -> None:
         lambda config: auto_video_clean_plex_images(config, deps),
         lambda: __import__('core.video.overlays.cleanup', fromlist=['status']).status().get('running'),
     )
-    # Daily: sync Commissary-managed collections to the server (add/remove members,
+    # Daily: sync SoulSync-managed collections to the server (add/remove members,
     # art/sort/pin), skipping unchanged; list collections feed missing to wishlist.
     engine.register_action_handler(
         'video_sync_collections',

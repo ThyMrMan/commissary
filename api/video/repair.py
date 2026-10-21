@@ -24,139 +24,6 @@ def _worker():
 
 
 def register_routes(bp):
-    @bp.route("/repair/duplicate-episodes", methods=["GET"])
-    def video_duplicate_episodes():
-        """Preview: episodes listed twice because the media server and TMDB
-        number the show's seasons differently (Plex files Bleach's newer run as
-        S2, TMDB calls it S17 — different rows under
-        UNIQUE(show_id, season_number, episode_number)).
-
-        Read-only, and deliberately its own step: the clean-up deletes rows, so
-        it must be possible to look before agreeing. ``?show_id=`` scopes it to
-        one show."""
-        from . import get_video_db
-        show_id = request.args.get("show_id", type=int)
-        rows = get_video_db().duplicate_episode_rows(show_id)
-        return jsonify({"ok": True, "count": len(rows), "items": rows})
-
-    @bp.route("/repair/duplicate-episodes", methods=["POST"])
-    def video_remove_duplicate_episodes():
-        """Delete the phantom rows. Body: {ids: [...]} or {show_id: N}.
-
-        Only ever removes a row that is server-less, has no file and no media
-        files, and whose air date matches exactly one OWNED episode under a
-        different season — re-checked at delete time, so a preview that has gone
-        stale cannot destroy something that became real in between.
-
-        Nothing on disk is touched: these rows are placeholders for episodes you
-        do not have, listed under the wrong season number."""
-        from . import get_video_db
-        db = get_video_db()
-        body = request.get_json(silent=True) or {}
-        ids = body.get("ids")
-        if ids is None:
-            show_id = body.get("show_id")
-            if show_id is None:
-                return jsonify({"ok": False,
-                                "error": "Pass ids, or show_id to clear one show."}), 400
-            ids = [r["id"] for r in db.duplicate_episode_rows(show_id)]
-        removed = db.delete_episode_rows(ids)
-        return jsonify({"ok": True, "removed": removed,
-                        "requested": len(ids or [])})
-
-    def _authoritative_episode_numbers(db, show_id):
-        """{season_number: {episode numbers}} from whichever provider owns this
-        show's NUMBERING, plus the source name.
-
-        Must be the resolved provider, not always TMDB: for a show where TMDB's
-        structure disagrees with the media server (Bleach — TMDB has 3 seasons
-        where Plex and TVDB have 17), checking against TMDB would call the
-        library's correct rows out of place and the invented ones legitimate,
-        which is precisely backwards.
-
-        Returns ({}, source, reason) when it can't be established. The caller
-        must NOT read that as 'no episodes' — every missing episode would become
-        a deletion candidate."""
-        info = db.show_match_info(show_id)
-        if not info:
-            return {}, None, "That show isn't in the library."
-        from core.video.enrichment.engine import get_video_enrichment_engine
-        eng = get_video_enrichment_engine()
-        tw = eng.workers.get("tmdb")
-        if not tw or not tw.enabled:
-            return {}, None, "TMDB isn't configured, so there's nothing to check against."
-        res = tw.client.match("show", info.get("title"), info.get("year"),
-                              known_id=info.get("tmdb_id"))
-        if not res or not res.get("id"):
-            return {}, None, "This show has no TMDB match to check against."
-        tmdb_nums = [s.get("season_number") for s in ((res.get("metadata") or {}).get("seasons") or [])
-                     if s.get("season_number") is not None]
-        source = eng._episode_source(show_id, info, tmdb_nums)
-        out = {}
-        if source == "tvdb":
-            vw = eng.workers.get("tvdb")
-            if not vw or not vw.enabled:
-                return {}, source, "TVDB owns this show's numbering but isn't configured."
-            for sn in (eng._tvdb_season_numbers(info.get("tvdb_id")) or []):
-                nums = {e["episode_number"] for e in (vw.client.season_episodes(info["tvdb_id"], sn) or [])
-                        if e.get("episode_number") is not None}
-                if nums:
-                    out[sn] = nums
-        else:
-            for sn in tmdb_nums:
-                data = tw.client.season_episodes(res["id"], sn) or {}
-                nums = {e["episode_number"] for e in (data.get("episodes") or [])
-                        if e.get("episode_number") is not None}
-                if nums:                 # a season that answered empty proves nothing
-                    out[sn] = nums
-        if not out:
-            return {}, source, "Couldn't read this show's episode list just now."
-        return out, source, None
-
-    @bp.route("/repair/unlisted-episodes", methods=["GET", "POST"])
-    def video_unlisted_episodes():
-        """Episodes a SECONDARY metadata provider invented, which TMDB doesn't
-        list for the season they were filed under.
-
-        The Bleach case: TMDB's season 2 is the 2005 arc, TVDB's season 2 is
-        Thousand-Year Blood War. The TVDB gap-fill was handed TMDB's season
-        numbers and allowed to insert, so seventeen TYBW episodes (25, 26,
-        39-53) landed inside the 21-episode 2005 season. A wished episode under
-        a season number no release uses can never be matched, which is why the
-        missing episodes were never found. ``update_only`` on the TVDB cascade
-        stops new ones; this clears what was already written.
-
-        GET previews, POST removes — deleting rows, so looking first is a
-        separate step. Only ever removes a row with no server_id, no file and no
-        media_files, whose episode number TMDB does not list for that season,
-        re-derived at delete time. Nothing on disk is touched."""
-        from . import get_video_db
-        db = get_video_db()
-        body = request.get_json(silent=True) or {}
-        show_id = request.args.get("show_id", type=int) or body.get("show_id")
-        if not show_id:
-            return jsonify({"ok": False, "error": "show_id is required"}), 400
-        try:
-            listed, source, err = _authoritative_episode_numbers(db, int(show_id))
-        except Exception:
-            logger.exception("unlisted-episodes: provider read failed for show %s", show_id)
-            return jsonify({"ok": False,
-                            "error": "Couldn't reach the metadata provider — see app.log"}), 502
-        if err:
-            return jsonify({"ok": False, "error": err}), 400
-        # A season the authority doesn't have at all is NOT evidence its rows are
-        # junk — it's the case where the two providers disagree about structure,
-        # which is what put them there. Only seasons the authority knows are judged.
-        if request.method == "GET":
-            items = []
-            for sn, keep in sorted(listed.items()):
-                items += db.unlisted_episode_rows(int(show_id), sn, keep)
-            return jsonify({"ok": True, "count": len(items), "items": items,
-                            "source": source})
-        removed = sum(db.delete_unlisted_episode_rows(int(show_id), sn, keep)
-                      for sn, keep in listed.items())
-        return jsonify({"ok": True, "removed": removed, "source": source})
-
     @bp.route("/repair/status", methods=["GET"])
     def video_repair_status():
         return jsonify(_worker().get_stats())
@@ -167,6 +34,14 @@ def register_routes(bp):
         body = request.get_json(silent=True) or {}
         enabled = bool(body.get("enabled", not w.master_enabled()))
         w.set_master(enabled)
+        # #1289 item 12: bridge to the automation engine's metadata so
+        # scheduled video jobs honor the master toggle.
+        try:
+            from web_server import get_database
+            get_database().set_metadata('automation_master_video_enabled',
+                                        '1' if enabled else '0')
+        except Exception:
+            pass
         return jsonify({"enabled": enabled})
 
     @bp.route("/repair/pause", methods=["POST"])
@@ -192,6 +67,16 @@ def register_routes(bp):
         body = request.get_json(silent=True) or {}
         enabled = bool(body.get("enabled", not cfg["enabled"]))
         w.set_job_config(job_id, enabled=enabled)
+        # #1289 item 12: bridge to the system automation row so the engine's
+        # scheduler honors the toggle. Without this a disabled video job keeps
+        # running on its schedule.
+        try:
+            import web_server
+            from core.automation.migrate_repair_jobs import set_system_job_enabled
+            set_system_job_enabled(web_server.get_database(), web_server.automation_engine,
+                                   job_id, enabled, "video_run_repair_job")
+        except Exception:
+            logger.debug("Could not bridge video job toggle for %s", job_id, exc_info=True)
         return jsonify({"job_id": job_id, "enabled": enabled})
 
     @bp.route("/repair/jobs/<job_id>/settings", methods=["PUT"])

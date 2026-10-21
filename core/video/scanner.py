@@ -1,4 +1,4 @@
-"""Commissary — video library scanner.
+"""SoulSync — video library scanner.
 
 The media SERVER (Plex/Jellyfin) is the source of truth, exactly like the music
 side: we ask the server what it has and mirror it into video.db. This module is
@@ -26,6 +26,9 @@ import time
 from datetime import datetime
 
 from utils.logging_config import get_logger
+
+# Commissary: records which video Library each scanned movie/show is in.
+from core.commissary.video_libraries import ScanTracker as _VlibTracker
 
 logger = get_logger("video_scanner")
 
@@ -160,10 +163,12 @@ class VideoLibraryScanner:
                           error="No connected Plex/Jellyfin video server")
                 return
             server = source.server_name
-            # {server_title: root_folder_id} per kind — resolved ONCE per scan
-            # (not per item) so stamping every movie/show doesn't cost a query each.
-            movie_roots = self.db.root_folder_ids_for(server, "movie")
-            show_roots = self.db.root_folder_ids_for(server, "show")
+            problem = getattr(source, "scan_problem", None)
+            problem = problem(media_type) if problem else None
+            if problem:
+                logger.warning("Video scan (%s) can't run: %s", mode, problem)
+                self._set(state="error", phase="no library", error=problem)
+                return
             incremental = mode == "incremental"
             do_prune = mode == "deep"
             # Movies and TV are independent libraries — scan only the requested
@@ -219,11 +224,11 @@ class VideoLibraryScanner:
             if do_movies:
                 self._set(phase="scanning movies", total=total, percent=pct())
                 consec = 0
-                for item in source.iter_movies(incremental=incremental, since=since):
+                _vlib_movies = _VlibTracker()  # Commissary: record each item's library
+                for item in _vlib_movies.track(source.iter_movies(incremental=incremental, since=since)):
                     if self._cancel:
                         return self._finish_cancelled(movies, 0, 0)
                     sid = str(item["server_id"])
-                    item["root_folder_id"] = movie_roots.get(item.pop("_server_title", None))
                     # Known already: re-upsert it anyway (don't skip) so a metadata
                     # change on an existing movie — e.g. a Plex re-match that fixed a bad
                     # title — actually propagates. In DELTA mode the source already
@@ -252,6 +257,7 @@ class VideoLibraryScanner:
                     if movies % 10 == 0:
                         self._set(movies=movies, percent=pct())
                 self._set(movies=movies, percent=pct())
+                _vlib_movies.stamp(self.db, server, "movie")  # Commissary
                 # Prune ONLY on a deep scan, and only when we actually saw items —
                 # so a transient empty response can never wipe the library. The prune
                 # runs AFTER the bar fills, and a big cleanup (many orphaned rows +
@@ -270,11 +276,11 @@ class VideoLibraryScanner:
             if do_shows:
                 self._set(phase="scanning shows")
                 consec = 0
-                for show in source.iter_shows(incremental=incremental, since=since):
+                _vlib_shows = _VlibTracker()  # Commissary: record each item's library
+                for show in _vlib_shows.track(source.iter_shows(incremental=incremental, since=since)):
                     if self._cancel:
                         return self._finish_cancelled(movies, shows, episodes)
                     sid = str(show["server_id"])
-                    show["root_folder_id"] = show_roots.get(show.pop("_server_title", None))
                     # In DELTA mode the source only returned shows that changed since the
                     # last scan, so re-upsert every one (apply the change). Only the
                     # recent-window fallback uses the 'skip fully-present + early-stop'
@@ -301,6 +307,7 @@ class VideoLibraryScanner:
                     episodes += sum(len(s.get("episodes", [])) for s in show.get("seasons", []))
                     processed += 1
                     self._set(shows=shows, episodes=episodes, percent=pct())
+                _vlib_shows.stamp(self.db, server, "show")  # Commissary
                 # Final prune (the one that delays "done" on a deep scan) — show it.
                 if do_prune and seen_shows:
                     self._set(phase="cleaning up removed shows", percent=100)

@@ -25,7 +25,7 @@ _CSS_PATH = _ROOT / "webui" / "static" / "video" / "video-side.css"
 EXPECTED_VIDEO_PAGES = {
     "video-dashboard", "video-search", "video-discover", "video-library",
     "video-watchlist", "video-wishlist", "video-downloads", "video-requests",
-    "video-calendar", "video-automations", "video-tools", "video-import",
+    "video-calendar", "video-automations", "video-chat", "video-tools", "video-import",
     "video-settings", "video-issues", "video-help",
 }
 
@@ -35,11 +35,14 @@ EXPECTED_VIDEO_PAGES = {
 # rather than banning the substring outright (which wrongly flags window.confirm,
 # window.VideoGet, window.addEventListener, …).
 _ALLOWED_WINDOW = {
+    # Shared deployment URL utility; independent of music UI state.
+    "window.SoulSyncURL",
     # sibling video-side module namespaces (each published by its own IIFE)
     "window.VideoGet", "window.VideoWatchlist", "window.VideoYoutube", "window.VideoDownload",
     "window.VideoGrab", "window.VideoManage", "window.VideoPoster", "window.VideoIssues",
-    "window.VideoRename",
+    "window.VideoRequestSheet", "window.VideoRequests",
     "window.VideoCalendar", "window.VideoOverlayEditor", "window.VideoCollectionEditor",
+    "window.VideoSubtitles",
     "window.videoWorkerOrbs", "window._videoWorkerOrbsEnabled",
     "window._buildAutomationSection", "window._buildAutomationHub",
     "window._reloadVideoAutomations", "window._vdpgAnyActive", "window._reduceEffectsActive",
@@ -53,6 +56,32 @@ def _window_isolated(src: str) -> bool:
     """True when every ``window.*`` reference is a sibling-video handle or a DOM API
     (no music global leaked in)."""
     return set(re.findall(r"window\.\w+", src)) <= _ALLOWED_WINDOW
+
+
+def _section_block(html: str, open_tag_re: str) -> str:
+    """The FULL <section>...</section> for a match, nested sections included.
+
+    ``_block`` stops at the first close tag, which is right for a flat block and
+    wrong the moment one nests. The video dashboard grew an inner <section> for
+    the continue-watching rail, so every assertion about markup after that point
+    started reading a truncated string and failing on cards that are still
+    there. Count depth instead of taking the first close.
+    """
+    match = re.search(open_tag_re, html)
+    assert match, f"could not find {open_tag_re!r}"
+    depth, cursor = 0, match.start()
+    while True:
+        nxt_open = html.find('<section', cursor + 1)
+        nxt_close = html.find('</section>', cursor + 1)
+        assert nxt_close != -1, f"unclosed section for {open_tag_re!r}"
+        if nxt_open != -1 and nxt_open < nxt_close:
+            depth += 1
+            cursor = nxt_open
+            continue
+        if depth == 0:
+            return html[match.start():nxt_close + len('</section>')]
+        depth -= 1
+        cursor = nxt_close
 
 
 def _block(html: str, open_tag_re: str, close_tag: str) -> str:
@@ -110,8 +139,8 @@ def test_music_sidebar_nav_still_intact():
 # --- the video dashboard (first built page) -------------------------------
 
 def test_video_dashboard_subpage_present_with_expected_cards():
-    block = _block(
-        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"', "</section>")
+    block = _section_block(
+        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"')
     # The video landing page's own card set (redesigned Jul 2026: recently-added
     # hero, stats, library, upcoming, tools + the two admin studio cards).
     for card in ("recent", "stats", "library", "upcoming", "tools", "studios"):
@@ -126,8 +155,8 @@ def test_video_dashboard_subpage_present_with_expected_cards():
 
 
 def test_video_dashboard_header_matches_music_shape():
-    block = _block(
-        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"', "</section>")
+    block = _section_block(
+        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"')
     header = _block(block, r'<div class="dashboard-header">', "<div class=\"dash-grid\">")
     # Same shell as music: sweep band + icon title + subtitle.
     assert "dashboard-header-sweep" in header
@@ -175,9 +204,7 @@ def test_video_library_subpage_present():
     assert "alphabet-selector" in block             # A–Z selector
     assert "library-artists-grid" in block          # the music card grid
     assert "data-video-lib-grid" in block
-    # One tab per configured Library, rendered dynamically (video-library.js
-    # buildTabs) from Settings → Connections → Libraries — not hardcoded here.
-    assert "data-video-lib-tabs" in block
+    assert 'data-video-lib-tab="movies"' in block and 'data-video-lib-tab="shows"' in block
     assert "data-video-scan-mode" in block          # the Scan button
     # Server-side paging + sort/filter controls (music parity).
     assert "data-video-lib-pagination" in block and "data-video-lib-next" in block
@@ -191,10 +218,8 @@ def test_video_library_module_referenced_and_isolated():
     assert stripped.startswith("/*") or stripped.startswith("(function")
     assert "(function" in _LIB_JS and "})();" in _LIB_JS
     assert "soulsync:video-page-shown" in _LIB_JS  # decoupled via the event
-    # Cards/poster URLs use the SINGULAR kind (movie/show); the API kind param
-    # is plural — activeLib() carries both per the active (per-Library) tab.
-    assert "cardKind" in _LIB_JS and "kindSingular" in _LIB_JS
-    assert "buildTabs" in _LIB_JS                   # dynamic per-Library tab bar
+    # Cards/poster URLs use the SINGULAR kind (movie/show); the API uses plural.
+    assert "cardKind" in _LIB_JS and "apiKind" in _LIB_JS
     assert "addEventListener" in _LIB_JS
     assert _window_isolated(_LIB_JS)        # only sibling-video handles + DOM APIs
 
@@ -216,8 +241,8 @@ def test_video_tools_page_has_three_scan_modes():
 
 
 def test_dashboard_library_card_has_refresh_and_deep_buttons():
-    block = _block(
-        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"', "</section>")
+    block = _section_block(
+        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"')
     assert 'data-video-scan-mode="full"' in block   # Refresh
     assert 'data-video-scan-mode="deep"' in block    # Deep Scan
     assert "library-status-actions" in block
@@ -250,10 +275,10 @@ def test_video_settings_reuses_real_music_settings_page():
 
 
 def test_video_library_mapping_ui_present_and_video_only():
-    # The Libraries editor (multi-library, P.4) lives next to the music library
-    # selector, marked data-video-only so it shows only on the video side.
-    assert 'data-video-lib-group="movies"' in _INDEX
-    assert 'data-video-lib-group="tv"' in _INDEX
+    # Movies/TV selectors live next to the music library selector, marked
+    # data-video-only so they show only on the video side.
+    assert 'data-video-lib-select="movies"' in _INDEX
+    assert 'data-video-lib-select="tv"' in _INDEX
     assert "data-video-only" in _INDEX
     css = _CSS_PATH.read_text(encoding="utf-8")
     assert 'body[data-side="music"] [data-video-only]' in css  # video bits hidden on music side
@@ -277,8 +302,8 @@ def test_video_side_hides_music_api_config_and_shows_placeholders():
 
 
 def test_dashboard_enrichment_buttons_present():
-    block = _block(
-        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"', "</section>")
+    block = _section_block(
+        _INDEX, r'<section class="video-subpage" data-video-subpage="video-dashboard"')
     assert 'data-video-enrich="tmdb"' in block and 'data-video-enrich="tvdb"' in block
     assert 'data-video-enrich="omdb"' in block       # OMDb is a full worker too
     assert "data-video-manage-workers" in block
@@ -340,7 +365,7 @@ def test_video_settings_module_referenced_and_isolated():
     stripped = _VSETTINGS_JS.strip()
     assert stripped.startswith("/*") or stripped.startswith("(function")
     assert "(function" in _VSETTINGS_JS and "})();" in _VSETTINGS_JS
-    assert "window." not in _VSETTINGS_JS
+    assert set(re.findall(r"window\.\w+", _VSETTINGS_JS)) <= {"window.refreshLibrarySummaries"}
     assert "addEventListener" in _VSETTINGS_JS
     assert "/api/video/libraries" in _VSETTINGS_JS
     assert "soulsync:video-page-shown" in _VSETTINGS_JS
@@ -439,8 +464,11 @@ def test_video_detail_module_referenced_and_isolated():
 def test_search_subpage_and_module():
     assert 'data-video-subpage="video-search"' in _INDEX
     assert "data-video-search-input" in _INDEX and "data-video-search-results" in _INDEX
+    assert 'data-vsr-tab="enhanced"' in _INDEX and 'data-vsr-tab="basic"' in _INDEX and 'data-vsr-tab="fresh"' in _INDEX
+    assert "data-vsr-basic-form" in _INDEX and "data-vsr-basic-sources" in _INDEX and "Sourced from EXT.to" in _INDEX
     assert "video/video-search.js" in _INDEX
     src = (_ROOT / "webui" / "static" / "video" / "video-search.js").read_text(encoding="utf-8")
+    assert "data-vsr-basic-source" in src
     assert "(function" in src and "})();" in src
     assert _window_isolated(src)                         # no music globals leaked in
     assert "/api/video/search" in src

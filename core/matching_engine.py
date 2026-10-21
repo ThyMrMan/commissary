@@ -2,9 +2,10 @@ from typing import List, Optional, Dict, Any, Tuple
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from unidecode import unidecode
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 
 from core.spotify_client import Track as SpotifyTrack
 from core.media_server.types import TrackInfo
@@ -12,7 +13,10 @@ from core.media_server.types import TrackInfo
 # neutral download_plugins package (download PR's Gap 1 lift). Import
 # from the new location.
 from core.download_plugins.types import TrackResult, AlbumResult
-from core.text.language_version import LANGUAGE_VERSION_LABELS, language_version
+# Pure text helpers, no cycle back here (core.text imports only core.text).
+from core.text.source_title import strip_artist_prefix
+from core.text.title_match import is_trailing_version_qualifier
+from core.text.track_prefix import strip_track_prefix
 
 
 logger = get_logger("matching_engine")
@@ -33,6 +37,40 @@ class MatchResult:
     @property
     def is_match(self) -> bool:
         return self.plex_track is not None and self.confidence >= self.match_threshold
+
+_DIFFERENT_VERSION_KEYWORDS = [
+    'remix', 'mix', 'rmx',  # Remixes (different song)
+    'live', 'live at', 'live from',  # Live versions (different recording)
+    'acoustic', 'unplugged',  # Acoustic versions (different arrangement)
+    'slowed', 'reverb', 'sped up', 'speed up',  # TikTok edits (different)
+    'radio edit', 'radio version',  # Radio edits (different cut)
+    'single edit',  # Single edits (different cut)
+    'album edit',  # Album edits (different cut)
+    'instrumental', 'karaoke',  # Instrumental (different)
+    'extended', 'extended version',  # Extended (different length)
+    'demo', 'rough cut',  # Demos (different recording)
+]
+# (keyword, compiled word-bounded pattern), in list order — order matters for
+# the strip step, which is why this is a list and not a dict
+_VERSION_KEYWORD_PATTERNS = [
+    (kw, re.compile(r'\b' + re.escape(kw) + r'\b')) for kw in _DIFFERENT_VERSION_KEYWORDS
+]
+
+
+@lru_cache(maxsize=262144)
+def _similarity_score_cached_pair(str1: str, str2: str) -> float:
+    return _SIMILARITY_ENGINE._similarity_score_uncached(str1, str2)
+
+
+def _similarity_score_cached(engine, str1: str, str2: str) -> float:
+    global _SIMILARITY_ENGINE
+    if _SIMILARITY_ENGINE is None:
+        _SIMILARITY_ENGINE = engine
+    return _similarity_score_cached_pair(str1, str2)
+
+
+_SIMILARITY_ENGINE = None
+
 
 class MusicMatchingEngine:
     def __init__(self):
@@ -61,6 +99,25 @@ class MusicMatchingEngine:
             # REMOVED: r',.*' - This can break legitimate artist names with commas
         ]
     
+        self.derivative_artist_keywords = [
+            'tribute', 'tribute band', 'cover', 'covers', 'cover band',
+            'karaoke', 'orchestra', 'orchestral', 'salute', 'parody',
+            'soundalike', 'instrumental', 'backing track', 'backing band'
+        ]
+    
+    def has_derivative_artist_mismatch(self, src_artist: str, cand_artist: str) -> bool:
+        """Detect if candidate artist contains derivative indicators (tribute, cover, etc.)
+        that are not present in the source artist."""
+        if not cand_artist:
+            return False
+        src_lower = src_artist.lower() if src_artist else ""
+        cand_lower = cand_artist.lower()
+        for kw in self.derivative_artist_keywords:
+            if re.search(r'\b' + re.escape(kw) + r'\b', cand_lower):
+                if not re.search(r'\b' + re.escape(kw) + r'\b', src_lower):
+                    return True
+        return False
+
     def normalize_string(self, text: str) -> str:
         """
         Normalizes string by handling common stylizations, converting to ASCII,
@@ -206,6 +263,12 @@ class MusicMatchingEngine:
         return self.normalize_string(cleaned)
     
     def similarity_score(self, str1: str, str2: str) -> float:
+        """cached front for _similarity_score_uncached: pure on its inputs, and
+        the pool matcher asks for the same pairs over and over (the search
+        title's raw and cleaned forms are often the same string)."""
+        return _similarity_score_cached(self, str1, str2)
+
+    def _similarity_score_uncached(self, str1: str, str2: str) -> float:
         """
         Calculates similarity score between two strings with STRICT version handling.
 
@@ -219,12 +282,12 @@ class MusicMatchingEngine:
         if str1 == str2:
             return 1.0
 
-        # A language version is a different recording: "idol" and "idol english
-        # version" share a backing track, a length and most of a title, and
-        # nothing below knows it. Capped, never raised -- an unrelated pair keeps
-        # its own lower ratio.
-        if language_version(str1) != language_version(str2):
-            return min(SequenceMatcher(None, str1, str2).ratio(), 0.30)
+        # Commissary: a language version is a different recording - capped,
+        # never raised (core/commissary/language_versions.py)
+        from core.commissary.language_versions import capped_similarity
+        _language_capped = capped_similarity(str1, str2)
+        if _language_capped is not None:
+            return _language_capped
 
         # Standard similarity
         standard_ratio = SequenceMatcher(None, str1, str2).ratio()
@@ -232,18 +295,7 @@ class MusicMatchingEngine:
         # Version vocabulary, shared by the prefix check and the divergent
         # check below.
         remaster_keywords = ['remaster', 'remastered']
-        different_version_keywords = [
-            'remix', 'mix', 'rmx',  # Remixes (different song)
-            'live', 'live at', 'live from',  # Live versions (different recording)
-            'acoustic', 'unplugged',  # Acoustic versions (different arrangement)
-            'slowed', 'reverb', 'sped up', 'speed up',  # TikTok edits (different)
-            'radio edit', 'radio version',  # Radio edits (different cut)
-            'single edit',  # Single edits (different cut)
-            'album edit',  # Album edits (different cut)
-            'instrumental', 'karaoke',  # Instrumental (different)
-            'extended', 'extended version',  # Extended (different length)
-            'demo', 'rough cut',  # Demos (different recording)
-        ]
+        different_version_keywords = _DIFFERENT_VERSION_KEYWORDS
 
         # STRICT VERSION CHECKING: Different versions should score LOW
         # This prevents "Song Title" from matching "Song Title (Remix)" during sync
@@ -287,18 +339,24 @@ class MusicMatchingEngine:
         # pair that survives to here with high base overlap is a genuinely
         # different cut. (Remasters are intentionally excluded — the prefix
         # branch gives them the lenient 0.75 so re-mastered cuts still match.)
+        # the per-keyword patterns are compiled once at import: building and
+        # escaping ~20 of them per comparison was most of the scorer's time in
+        # a pool match (PERF_REVIEW item 3). same keywords, same word-bounded
+        # search, same set semantics.
         def _versions_in(s: str) -> frozenset:
-            return frozenset(
-                kw for kw in different_version_keywords
-                if re.search(r'\b' + re.escape(kw) + r'\b', s))
+            return frozenset(kw for kw, rx in _VERSION_KEYWORD_PATTERNS if rx.search(s))
 
-        v1, v2 = _versions_in(str1), _versions_in(str2)
+        # nothing below applies under 0.5, so don't scan for versions unless it can matter
+        if standard_ratio >= 0.5:
+            v1, v2 = _versions_in(str1), _versions_in(str2)
+        else:
+            v1 = v2 = frozenset()
         if v1 and v2 and standard_ratio >= 0.5:
             # Strip the version words; what remains is base + distinguishing
             # descriptor (remixer / performance / year).
             def _strip_versions(s: str) -> str:
-                for kw in different_version_keywords:
-                    s = re.sub(r'\b' + re.escape(kw) + r'\b', ' ', s)
+                for _kw, rx in _VERSION_KEYWORD_PATTERNS:
+                    s = rx.sub(' ', s)
                 # A "(live)" vs "- live" difference is the SAME version formatted
                 # differently — the source often uses a dash where the metadata
                 # uses parentheses (lilbob5769). Normalise the wrapping punctuation
@@ -348,16 +406,25 @@ class MusicMatchingEngine:
             for raw_cand_artist in candidate_artists:
                 if not raw_cand_artist:
                     continue
+
+                # Check for derivative artist mismatch (e.g., "Queen Tribute" vs "Queen")
+                if self.has_derivative_artist_mismatch(src_artist, raw_cand_artist):
+                    score = 0.20
+                    if score > best_artist_score:
+                        best_artist_score = score
+                    continue
+
                 cand_artist_normalized = self.normalize_string(raw_cand_artist)
                 cand_artist_cleaned = self.clean_artist(raw_cand_artist)
-                # Check containment (e.g., "drake" in "drake 21 savage")
-                # Skip for very short names (≤2 chars) — "b" matches everything
-                if src_artist and len(src_artist) > 2 and src_artist in cand_artist_normalized:
+
+                # Exact match against whole candidate artist string
+                if src_artist and (src_artist == cand_artist_cleaned or src_artist == cand_artist_normalized):
                     best_artist_score = 1.0
                     break
-                elif src_artist and src_artist == cand_artist_normalized:
-                    best_artist_score = 1.0
-                    break
+
+                # Commas, slashes, ampersands and 'and' can belong to a band name.
+                # Separate credits arrive as artist list entries; clean_artist handles feat.
+                # Fuzzy similarity against full candidate artist
                 score = self.similarity_score(src_artist, cand_artist_cleaned)
                 if score > best_artist_score:
                     best_artist_score = score
@@ -365,11 +432,19 @@ class MusicMatchingEngine:
                 break
         artist_score = best_artist_score
 
+        # Check for duration mismatch if both durations are known (> 0)
+        has_durations = source_duration_ms > 0 and candidate_duration_ms > 0
+        diff_ms = abs(source_duration_ms - candidate_duration_ms) if has_durations else 0
+        max_duration = max(source_duration_ms, candidate_duration_ms) if has_durations else 1
+        diff_ratio = diff_ms / max_duration if has_durations else 0.0
+        significant_duration_mismatch = has_durations and diff_ms > 15000 and diff_ratio > 0.15
+
         # --- Priority 1: Core Title Match ---
         source_core_title = self.get_core_string(source_title)
         candidate_core_title = self.get_core_string(candidate_title)
 
-        if source_core_title and source_core_title == candidate_core_title:
+        # Core title fast path requires compatible duration (cannot be a preview clip or mismatched cut)
+        if source_core_title and source_core_title == candidate_core_title and not significant_duration_mismatch:
             if artist_score >= 0.75:
                 confidence = 0.90 + (artist_score * 0.09)
                 return confidence, "core_title_match"
@@ -382,6 +457,12 @@ class MusicMatchingEngine:
         duration_score = self.duration_similarity(source_duration_ms, candidate_duration_ms)
 
         confidence = (title_score * 0.60) + (artist_score * 0.30) + (duration_score * 0.10)
+
+        # Apply duration penalty when there is a significant duration mismatch (>15s and >15%)
+        if significant_duration_mismatch:
+            duration_penalty = min(0.35, max(0.15, diff_ratio * 0.35))
+            confidence = max(0.0, confidence - duration_penalty)
+
         return confidence, "standard_match"
 
     def calculate_match_confidence(self, spotify_track: SpotifyTrack, plex_track: TrackInfo) -> Tuple[float, str]:
@@ -492,7 +573,13 @@ class MusicMatchingEngine:
             # - Is reasonable length (4-30 chars)
             # - Doesn't look like a feature/remix indicator
             exclude_patterns = [
-                r'\b(remix|mix|edit|version|live|acoustic|instrumental|demo|feat|ft|featuring)\b'
+                r'\b(remix|mix|edit|version|live|acoustic|instrumental|demo|feat|ft|featuring)\b',
+                # Edition/master decoration ("Song - Deluxe", "Song - Mono")
+                # is not an album name either — without this, this heuristic
+                # strips it here before generate_download_queries' Priority 5
+                # last-resort ever gets a chance to, so the faithful
+                # "artist song deluxe" query is never tried at all.
+                r'\b(' + '|'.join(re.escape(tok) for tok in self._VERSION_TOKENS) + r')\b',
             ]
             
             is_likely_album = True
@@ -508,6 +595,143 @@ class MusicMatchingEngine:
         
         return track_title, False
 
+    # A title-only query (no artist) is a BROADCAST to the whole Soulseek
+    # network, and every peer holding a match opens a connection back. "alex"
+    # or "SISTERS" matches on thousands of peers at once, which exhausts the
+    # NAT connection-tracking table on a consumer router and takes the user's
+    # entire internet connection down — not just SoulSync's (#1102, and the
+    # same root cause as slskd#1598).
+    #
+    # A short title is also where the query is worth least: it returns noise
+    # the matcher discards anyway, so we pay the whole connection cost for
+    # almost no match value. A distinctive title ("Californication",
+    # "Bohemian Rhapsody") still earns its broadcast, which is what the
+    # title-only fallback was added for.
+    # Length, not word count. Word count looks like a distinctiveness signal
+    # and isn't: "Kid A" is two words and five characters, and matches about as
+    # much of the network as "alex" does. Total length is what predicts how
+    # many peers answer.
+    _TITLE_ONLY_MIN_CHARS = 12
+
+    @classmethod
+    def _title_is_distinctive_enough_to_broadcast(cls, title: str) -> bool:
+        """May ``title`` be searched on its own, without an artist to narrow it?"""
+        cleaned = " ".join(str(title or "").split())
+        return len(cleaned) >= cls._TITLE_ONLY_MIN_CHARS
+
+    # EDITION decoration only: markers that distinguish two masters/releases of
+    # THE SAME RECORDING. Stripping these can only change which pressing you get.
+    #
+    # Performance markers — live, remix, acoustic, instrumental, radio/club/
+    # extended edits, demos, slowed/sped-up edits — are deliberately NOT here.
+    # They name a different take, and the version gate in
+    # calculate_slskd_match_confidence only rejects on the CANDIDATE's version:
+    # a plain studio file classifies as 'original' and is never rejected, so a
+    # query stripped down to "Song" would happily return the studio cut for a
+    # source that asked for "Song (Live)" — silently substituting a different
+    # performance. An edition strip has no such failure mode.
+    _VERSION_TOKENS = (
+        'remaster', 'remastered', 'mono', 'stereo', 'anniversary',
+        'deluxe', 'expanded', 'reissue', 'tv size', 'tv-size', 'edition',
+    )
+    # Performance markers that keep a decoration from being edition-only even
+    # when an edition token also appears in it — "(Live at the Deluxe
+    # Anniversary Tour)" contains "deluxe" and "anniversary", but it also
+    # names a different TAKE, and stripping the whole bracket would lose that
+    # along with the edition note. See the safety note below _VERSION_TOKENS'
+    # own docstring: this is the same failure mode, reached through a mixed
+    # label instead of a bare performance one.
+    _PERFORMANCE_TOKENS = (
+        'live', 'remix', 'mix', 'edit', 'acoustic', 'instrumental', 'radio',
+        'extended', 'club', 'demo', 'slowed', 'sped up', 'spedup', 'mashup',
+        'bootleg', 'version', 'ver',
+    )
+    # Connector words/numbers allowed alongside an edition token without
+    # disqualifying the decoration — "30th Anniversary Remaster" is still
+    # edition-only even though "30th" isn't itself a token.
+    _EDITION_STOPWORDS = frozenset({'the', 'a', 'an', 'of', 'and'})
+    _EDITION_NUMBER = re.compile(r"\d{1,4}(st|nd|rd|th)?")
+    _BRACKETED_GROUP = re.compile(r'\s*[\(\[]([^)\]]*)[)\]]')
+    _DASH_CHAR = re.compile(r'[-–—]')
+
+    def _is_edition_only_text(self, text: str) -> bool:
+        """Is `text` composed ENTIRELY of edition decoration (tokens, numbers/
+        ordinals, light connector words) with no performance marker and no
+        unrelated content? Used to decide whether a bracket/dash-tail is safe
+        to drop outright."""
+        low = text.lower()
+        if not any(tok in low for tok in self._VERSION_TOKENS):
+            return False
+        if any(re.search(r'\b' + re.escape(tok) + r'\b', low)
+               for tok in self._PERFORMANCE_TOKENS):
+            return False
+        # Whole-content check: every remaining word must be a number/ordinal,
+        # a stopword, or part of a recognized edition token — otherwise the
+        # text carries unrelated content ("Stereo Hearts" is a real title,
+        # not a mono/stereo mix note) and stripping it would drop more than
+        # the edition note.
+        residual = low
+        # Longest first: 'remaster' is a prefix of 'remastered', so removing
+        # it first would leave a stray "ed" that isn't a stopword/number and
+        # wrongly fail this check.
+        for tok in sorted(self._VERSION_TOKENS, key=len, reverse=True):
+            residual = residual.replace(tok, ' ')
+        for word in re.findall(r"[a-z0-9']+", residual):
+            if word in self._EDITION_STOPWORDS:
+                continue
+            if self._EDITION_NUMBER.fullmatch(word):
+                continue
+            return False
+        return True
+
+    def _dash_tail_edition_split(self, title: str) -> Optional[str]:
+        """`title` with a trailing "-<edition>" segment removed, or None if
+        none qualifies.
+
+        Tries every -/–/— position, RIGHT TO LEFT, and takes the first whose
+        trailing segment is edition-only. Whitespace around the separator is
+        optional (`"Nevermind–30th Anniversary Remaster"` must strip same as
+        the spaced form), which makes a naive "split on any dash" ambiguous
+        for a tail with its own internal hyphen — "the WORLD - TV-Size" has a
+        candidate split inside "TV-Size" itself. Right-to-left resolves it for
+        free: that inner candidate's tail is just "Size", which isn't
+        edition-only, so it's rejected and the search continues left to the
+        real separator, whose tail "TV-Size" IS a recognized token.
+        """
+        positions = [m.start() for m in self._DASH_CHAR.finditer(title)]
+        for pos in reversed(positions):
+            prefix = title[:pos].rstrip(' -–—')
+            tail = title[pos + 1:].strip()
+            if not prefix or not tail:
+                continue
+            if self._is_edition_only_text(tail):
+                return prefix
+        return None
+
+    def _strip_version_decoration(self, title: str) -> str:
+        """`title` with version-bearing decoration removed.
+
+        Drops bracketed groups and a trailing "-<edition>" segment ONLY when
+        their COMPLETE content is edition-only, so "Africa" is untouched, "Old
+        Town Road (feat. Billy Ray Cyrus)" keeps its credit (no edition
+        token), "Sweet Dreams (Are Made of This) [2005 Remaster]" loses just
+        the remaster note, and "(Live at the Deluxe Anniversary Tour)" is left
+        alone entirely — an edition token sharing a bracket with a performance
+        marker does not make it safe to drop the performance marker too.
+        Returns '' if stripping would leave nothing.
+        """
+        if not title:
+            return ''
+
+        stripped = self._BRACKETED_GROUP.sub(
+            lambda m: '' if self._is_edition_only_text(m.group(1)) else m.group(0), title)
+
+        dash_stripped = self._dash_tail_edition_split(stripped)
+        if dash_stripped is not None:
+            stripped = dash_stripped
+
+        return ' '.join(stripped.split()).strip(' -–—')
+
     def generate_download_queries(self, spotify_track: SpotifyTrack) -> List[str]:
         """
         Generate multiple search query variations for better matching.
@@ -518,6 +742,15 @@ class MusicMatchingEngine:
         if not spotify_track.artists:
             # No artist info - just use track name variations
             queries.append(self.clean_title(spotify_track.name))
+            # Deliberately NOT extended with a Priority 5 stripped-title query:
+            # calculate_slskd_match_confidence's minimum artist gate rejects
+            # any non-YouTube candidate with artist_score < 0.25, and with no
+            # source artist at all the loop that computes artist_score never
+            # runs, so it is unconditionally 0.0 — every candidate a search
+            # here could return is mathematically rejected before scoring
+            # finishes. Firing an extra broadcast-guarded query for a result
+            # that can never be accepted is pure network cost for zero
+            # possible benefit — worse than doing nothing.
             return queries
 
         # If artist or title contains non-ASCII (e.g. Japanese, Chinese, Korean),
@@ -573,10 +806,10 @@ class MusicMatchingEngine:
             # Define version keywords that should be preserved
             preserve_keywords = [
                 'slowed', 'reverb', 'sped up', 'speed up', 'spedup', 'slowdown',
-                'remix', 'mix', 'edit', 'version', 'remaster', 'acoustic', 
+                'remix', 'mix', 'edit', 'version', 'remaster', 'acoustic',
                 'live', 'demo', 'instrumental', 'radio', 'extended', 'club',
                 'original', 'clean', 'explicit', 'mashup', 'bootleg'
-            ]
+            ] + list(self._VERSION_TOKENS)
             
             # Check if the dash content contains version keywords
             should_preserve = any(keyword in dash_content for keyword in preserve_keywords)
@@ -632,8 +865,55 @@ class MusicMatchingEngine:
 
         # PRIORITY 4: Clean title without artist (broadens results when artist name limits matches)
         if original_track_clean and original_track_clean not in [q.lower() for q in queries]:
-            queries.append(original_track_clean)
-            logger.debug(f"PRIORITY 4: Title-only query: '{original_track_clean}'")
+            if self._title_is_distinctive_enough_to_broadcast(original_track_clean):
+                queries.append(original_track_clean)
+                logger.debug(f"PRIORITY 4: Title-only query: '{original_track_clean}'")
+            else:
+                # Every artist-qualified query above still runs; only the
+                # unqualified broadcast is withheld (#1102).
+                logger.debug(
+                    f"PRIORITY 4: skipping title-only query for short title "
+                    f"'{original_track_clean}' — too broad to search without an artist")
+
+        # PRIORITY 5: LAST RESORT — drop EDITION decoration ("[2005 Remaster]",
+        # "(Deluxe)", "(Mono)").
+        #
+        # Priorities 1-2 deliberately PRESERVE version info so a search for a
+        # specific cut doesn't return a different one. That is right, but it is
+        # also absolute: every rung of the ladder above carries the suffix, so
+        # when no peer happens to share that exact pressing the track never
+        # resolves at all. On a live library that is what a wishlist entry stuck
+        # at retry 6 looks like — "Sweet Dreams (Are Made of This) [2005
+        # Remaster]", "KAZENO LONELY WAY (2022 Remaster)" — tracks that are
+        # trivially available in some other edition of the same recording.
+        #
+        # Two things keep this safe. _VERSION_TOKENS covers editions only, never
+        # a different take (see its comment). And ordering: this query runs only
+        # after every version-faithful one has come up empty, so a wrong-edition
+        # result can never displace a right-edition one.
+        version_stripped = self._strip_version_decoration(original_title)
+        if version_stripped and version_stripped.lower() != original_title.strip().lower():
+            stripped_clean = self.clean_title(version_stripped)
+            if stripped_clean:
+                candidates = []
+                # A punctuation-only source artist ("...", "- - -") cleans to
+                # '', and f"{artist} {x}".strip() would then silently BECOME
+                # the unqualified broadcast form — skipping the distinctiveness
+                # gate below entirely. Only add the artist-qualified candidate
+                # when there is actually an artist to qualify it with.
+                if artist:
+                    candidates.append(f"{artist} {stripped_clean}".strip())
+                # The unqualified variant is still a broadcast, and stripping
+                # decoration only makes the title SHORTER — "Kid A (2009
+                # Remaster)" strips to "kid a". So it has to clear the same
+                # distinctiveness bar as PRIORITY 4 (#1102); the artist-qualified
+                # query above is unaffected either way.
+                if self._title_is_distinctive_enough_to_broadcast(stripped_clean):
+                    candidates.append(stripped_clean)
+                for candidate in candidates:
+                    if candidate.lower() not in [q.lower() for q in queries]:
+                        queries.append(candidate)
+                        logger.debug(f"PRIORITY 5: Version-stripped last resort: '{candidate}'")
 
         # Remove duplicates while preserving order
         unique_queries = []
@@ -904,7 +1184,25 @@ class MusicMatchingEngine:
         filename_lower = filename.lower()
         
         # Define version patterns and their penalties (higher penalty = lower priority)
+        # radio sits first on purpose. 'edit' is one of the remix patterns below
+        # and this loop stops at the first hit, so "radio edit" and "clean edit"
+        # used to come back as remixes. remix is reject-on-sight, so a radio edit
+        # got thrown away even when that's exactly what was asked for.
         version_patterns = {
+            'radio': {
+                'patterns': [r'\bradio\s*edit\b', r'\bradio\s*version\b', r'\bclean\s*edit\b'],
+                'penalty': 0.08  # -8% penalty for radio edits (minor difference)
+            },
+            # tempo edits ahead of remix: "Slowed Edit" holds the remix word
+            # 'edit', but its audio is the slowed cut, not a remix
+            'slowed': {
+                'patterns': [r'\bslowed\b', r'\bdaycore\b'],
+                'penalty': 0.20
+            },
+            'sped_up': {
+                'patterns': [r'\bsped\s*up\b', r'\bspeed\s*up\b', r'\bnightcore\b'],
+                'penalty': 0.20
+            },
             'remix': {
                 'patterns': [r'\bremix\b', r'\brmx\b', r'\brework\b', r'\bedit\b(?!ion)'],
                 'penalty': 0.15  # -15% penalty for remixes
@@ -920,10 +1218,6 @@ class MusicMatchingEngine:
             'instrumental': {
                 'patterns': [r'\binstrumental\b', r'\bkaraoke\b', r'\bminus one\b'],
                 'penalty': 0.25  # -25% penalty for instrumentals (most different from original)
-            },
-            'radio': {
-                'patterns': [r'\bradio\s*edit\b', r'\bradio\s*version\b', r'\bclean\s*edit\b'],
-                'penalty': 0.08  # -8% penalty for radio edits (minor difference)
             },
             'clean': {
                 # #923: bare clean/censored markers used to be invisible (only
@@ -957,13 +1251,12 @@ class MusicMatchingEngine:
                 if re.search(pattern, filename_lower):
                     return version_type, config['penalty']
         
-        # A language version ("(English Version)", "-Japanese ver.-", "英語版") is
-        # its own recording. No penalty of its own: the Soulseek scorer rejects a
-        # language the request didn't name, and AcoustID verification fails a file
-        # whose recording is in another language.
-        language = language_version(filename_lower)
-        if language:
-            return LANGUAGE_VERSION_LABELS[language], 0.0
+        # Commissary: a language version is its own recording, no penalty of its
+        # own - staging and AcoustID verification compare these labels
+        from core.commissary.language_versions import version_label
+        _language_label = version_label(filename_lower)
+        if _language_label:
+            return _language_label, 0.0
 
         # No version indicators found - assume original
         return 'original', 0.0
@@ -985,20 +1278,80 @@ class MusicMatchingEngine:
         # Detect version type in Soulseek result
         version_type, penalty = self.detect_version_type(slskd_track.filename)
 
-        # A language version is a different recording, both ways round: the
-        # request for "Idol" must not take "Idol (English Version)", nor the
-        # request for the English version the unmarked original. The whole path
-        # counts -- "UNDEAD (English Version)/01 UNDEAD.flac" is the English one.
-        wanted_language = (language_version(spotify_track.name)
-                           or language_version(getattr(spotify_track, 'album', '') or ''))
-        if wanted_language != language_version(slskd_track.filename):
+        # Commissary: another language version than the request, both ways round
+        from core.commissary.language_versions import soulseek_mismatch
+        if soulseek_mismatch(spotify_track, slskd_track.filename):
             return 0.0, 'rejected_version_mismatch'
+
+        # --- Base-title veto (#1626) ---
+        # A shared version qualifier inflates whole-path similarity enough to
+        # pass the title gate: wanted "Crystalline (Orchestral Version)" vs a
+        # DIFFERENT song's "Damnation Flame (Orchestral Version)" in the right
+        # artist folder scored 0.69 and cleared the accept threshold — the
+        # "(Orchestral Version)" overlap pushed the title score past the 0.30
+        # gate while the artist folder contributed 0.40. Compare the BARE song
+        # titles instead: if both reduce to non-empty base titles that are
+        # nowhere near each other, this is the wrong song no matter what the
+        # folders say. Fail open — all three must hold or nothing happens:
+        #   (a) the artist component matched cleanly (word-boundary hit: the
+        #       similarity fallback is capped at 0.70, so >= 0.99 is exact);
+        #   (b) both base titles are non-empty;
+        #   (c) base-title similarity under a FLOOR, not exact inequality, so
+        #       a typo'd filename never gets vetoed.
+        # Same song, different version ("X" vs "X (Remastered)") reduces to
+        # equal base titles and never vetoes — that call stays with the strict
+        # version matching below. Skipped when the base scorer already
+        # rejected (0.0), so its early-return paths are untouched.
+        if base_confidence > 0.0:
+            _artist_evidence = getattr(slskd_track, 'artist_score', None) or 0.0
+            if _artist_evidence >= 0.99:
+                # Pass the wanted artist on both sides (MAJOR-1, #1626): for
+                # flat "Artist - Title" filenames — an explicitly supported
+                # shape — the last segment is the whole "Artist - Title"
+                # string, and without the artist the name dilutes the
+                # candidate base title ("up" vs "pink floyd up"), vetoing
+                # correct short-titled tracks by long-named artists.
+                # strip_artist_prefix only strips on exact folded equality
+                # and never returns empty, so this is fail-safe.
+                _wanted_artist = (getattr(spotify_track, 'artists', None)
+                                  or [''])[0]
+                _wanted_base = self.base_title_of(spotify_track.name,
+                                                  _wanted_artist)
+                _cand_base = self.base_title_of(slskd_track.filename,
+                                                _wanted_artist,
+                                                from_filename=True)
+                if _wanted_base and _cand_base:
+                    _base_sim = SequenceMatcher(
+                        None, _wanted_base, _cand_base).ratio()
+                    if _base_sim < 0.30:
+                        logger.debug(
+                            f"Base-title veto: '{spotify_track.name}' vs "
+                            f"'{slskd_track.filename[:60]}' (base "
+                            f"'{_wanted_base}' vs '{_cand_base}', "
+                            f"sim={_base_sim:.2f})"
+                        )
+                        return 0.0, 'rejected_base_title_mismatch'
 
         # Check if Spotify track title contains version indicators
         spotify_title_lower = spotify_track.name.lower()
 
+        # The user can ask for one of these versions on purpose. When they have,
+        # don't reject it for going unnamed in the source title — the source is
+        # Spotify saying "radio edit" because that's the only cut it carries,
+        # which is the exact case the setting exists for.
+        _preferred = self._preferred_version()
+        _wanted_on_purpose = bool(_preferred) and version_type == _preferred
+
+        # A slowed / sped-up cut is its own audio in BOTH directions. The checks
+        # below only reject a versioned candidate, so the plain studio file
+        # scored 0.73 for "Devil Eyes - Slowed" and got imported as it.
+        _wanted_version = self.detect_version_type(spotify_track.name)[0]
+        if ((version_type in self.TEMPO_EDITS or _wanted_version in self.TEMPO_EDITS)
+                and version_type != _wanted_version):
+            return 0.0, 'rejected_version_mismatch'
+
         # STRICT VERSION MATCHING: Reject mismatched versions
-        if version_type == 'live':
+        if version_type == 'live' and not _wanted_on_purpose:
             # Only accept live versions if Spotify title has live as a VERSION INDICATOR
             # Patterns: (Live), - Live, [Live], Live at, Live from, Live in, Live Version
             # NOT: words ending with 'live' like "Let Me Live" or starting like "Lively"
@@ -1018,7 +1371,7 @@ class MusicMatchingEngine:
                 # Reject: Soulseek has live version but Spotify doesn't want it
                 return 0.0, 'rejected_version_mismatch'
 
-        elif version_type == 'remix':
+        elif version_type == 'remix' and not _wanted_on_purpose:
             # Only accept remixes if Spotify title has remix as a VERSION INDICATOR
             # Patterns: (Remix), - Remix, [Remix], Remix, Mix
             remix_patterns = [
@@ -1033,7 +1386,7 @@ class MusicMatchingEngine:
                 # Reject: Soulseek has remix but Spotify wants original
                 return 0.0, 'rejected_version_mismatch'
 
-        elif version_type == 'acoustic':
+        elif version_type == 'acoustic' and not _wanted_on_purpose:
             # Only accept acoustic if Spotify title has acoustic as a VERSION INDICATOR
             acoustic_patterns = [
                 r'\(.*?acoustic.*?\)',         # (Acoustic)
@@ -1047,7 +1400,7 @@ class MusicMatchingEngine:
                 # Reject: Soulseek has acoustic but Spotify wants original
                 return 0.0, 'rejected_version_mismatch'
 
-        elif version_type == 'instrumental':
+        elif version_type == 'instrumental' and not _wanted_on_purpose:
             # Only accept instrumental if Spotify title has instrumental as a VERSION INDICATOR
             instrumental_patterns = [
                 r'\(.*?instrumental.*?\)',     # (Instrumental)
@@ -1076,6 +1429,11 @@ class MusicMatchingEngine:
                     effective_penalty = -0.05
                 elif version_type in ('clean', 'radio'):
                     effective_penalty += 0.10
+            if _wanted_on_purpose:
+                # they went and asked for this version, so it isn't a demerit.
+                # a floor rather than a flat 0 so the explicit boost above still
+                # stands when explicit is also the preferred one.
+                effective_penalty = min(effective_penalty, 0.0)
             adjusted_confidence = max(0.0, min(1.0, base_confidence - effective_penalty))
             # Store version info on the track object for UI display
             slskd_track.version_type = version_type
@@ -1086,6 +1444,113 @@ class MusicMatchingEngine:
             slskd_track.version_penalty = 0.0
 
         return adjusted_confidence, version_type
+
+    # the versions a user is allowed to ask for. same labels detect_version_type
+    # hands back, so a preference can only ever name something the detector
+    # actually produces — a typo in config turns the feature off instead of
+    # silently matching nothing.
+    PREFERABLE_VERSIONS = ('extended', 'radio', 'remix', 'live', 'acoustic',
+                           'instrumental', 'demo', 'clean', 'explicit')
+    # tempo edits: never a stand-in for the original, nor the original for them
+    TEMPO_EDITS = ('slowed', 'sped_up')
+
+    _BRACKET_GROUP = re.compile(r'[\(\[][^\)\]]*[\)\]]')
+
+    @staticmethod
+    def _preferred_version() -> str:
+        """The version the user asked us to favour, or '' for off.
+
+        Off is the default and everything hangs off this being empty: with no
+        preference every candidate gets the same preference term, so the sort
+        tuple compares exactly like it did before and nothing moves. Never
+        raises (config trouble = feature off)."""
+        try:
+            value = config_manager.get('soulseek.preferred_version', '') or ''
+        except Exception:
+            return ''
+        value = str(value).strip().lower()
+        return value if value in MusicMatchingEngine.PREFERABLE_VERSIONS else ''
+
+    def base_title_of(self, text: str, artist: str = '',
+                      *, from_filename: bool = False) -> str:
+        """The bare song title, with everything wrapped around it removed.
+
+        Soulseek filenames carry a lot that isn't the title — a track number, a
+        vinyl side, the artist again, the release year, the format, and the
+        version qualifier itself. Strip all of it and what's left is the song,
+        which is the only thing worth comparing.
+
+        ``from_filename`` gates the strips that ONLY make sense on a filename:
+        the extension and the leading track number. A source title must never
+        get those, because plenty of songs genuinely start with a number —
+        "99 Problems" would reduce to "problems" while the candidate
+        "03 - 99 Problems.flac" reduces to "99 problems", and the two sides
+        would never meet. Same trap as stripping "99 Luftballons" in the
+        library path resolver.
+        """
+        stem = str(text or '')
+        if from_filename:
+            if '/' in stem or '\\' in stem:
+                stem = re.split(r'[\\/]', stem)[-1]
+            stem = re.sub(r'\.[A-Za-z0-9]{2,5}$', '', stem)      # file extension
+        stem = self._BRACKET_GROUP.sub(' ', stem)                # (Extended Mix), [2004], [FLAC]
+        stem = re.sub(r'\s+', ' ', stem).strip(' -_.')
+        if from_filename:
+            stem = strip_track_prefix(stem).strip()
+        if artist:
+            stem = strip_artist_prefix(stem, artist).strip(' -_.')
+        if ' - ' in stem:
+            head, tail = stem.rsplit(' - ', 1)
+            if is_trailing_version_qualifier(tail):
+                stem = head
+        return re.sub(r'[^a-z0-9 ]', '', stem.lower()).strip()
+
+    def preferred_match_ids(self, spotify_track, results, preferred: str) -> set:
+        """ids of the candidates that really are the asked-for version OF THIS TRACK.
+
+        Carrying the label is not enough. "Song Two (Extended Mix)" is an
+        extended mix, just not of the song we're after, and with the preference
+        ranked above confidence it would beat the correct track outright.
+
+        Confidence cannot tell those apart — it scores the whole file PATH with
+        fuzzy string similarity, and real Soulseek paths are mostly noise
+        ("@@dl/", "[FLAC]", "VA/Compilation Vol 3/"). Measured against 'Song'
+        the right file scored 0.751 and an impostor 0.743, eight thousandths
+        apart, while genuine matches in messy folders scored no better than
+        wrong ones. Every threshold over those numbers either fired on the
+        wrong song or never fired at all.
+
+        So compare the TITLE instead of the path: reduce both sides to the bare
+        song name and require them to be equal. "01 - Song (Extended Mix)",
+        "A1 Song (Extended Mix)" and "VA/.../12 - Artist - Song (Extended Mix)"
+        all reduce to "song"; "Song Two", "The Song" and "Another Song" don't.
+        Exact equality, so there is no threshold to get wrong.
+        """
+        if not preferred or not results:
+            return set()
+        artist = ''
+        try:
+            artists = getattr(spotify_track, 'artists', None) or []
+            artist = str(artists[0]) if artists else ''
+        except Exception:
+            artist = ''
+        try:
+            wanted = self.base_title_of(getattr(spotify_track, 'name', ''), artist)
+        except Exception:
+            return set()
+        if not wanted:
+            return set()
+        matches = set()
+        for r in results:
+            if getattr(r, 'version_type', 'original') != preferred:
+                continue
+            try:
+                if self.base_title_of(getattr(r, 'filename', ''), artist,
+                                      from_filename=True) == wanted:
+                    matches.add(id(r))
+            except Exception:
+                continue
+        return matches
 
     @staticmethod
     def _prefer_explicit_enabled() -> bool:
@@ -1128,15 +1593,32 @@ class MusicMatchingEngine:
             slskd_track.version_type = getattr(slskd_track, 'version_type', 'original')
             scored_results.append(slskd_track)
 
-        # Sort by confidence, version preference, peer quality, then file size
+        # Sort by requested version, confidence, version preference, peer quality, size
+        _preferred = self._preferred_version()
+        # Which candidates are genuinely the asked-for version OF THIS TRACK.
+        # Empty set when the feature is off, so nothing below can fire.
+        _preferred_ids = self.preferred_match_ids(spotify_track, scored_results, _preferred)
+        # Stamped on the file, not kept in a local set. Sorting here is not the
+        # last word: the download walk re-sorts this exact list later
+        # (core.downloads.candidates.order_candidates) and would otherwise drop
+        # the preference on the floor and take the plain version anyway. The
+        # attribute is the one place both sorts read the answer from.
+        for _r in scored_results:
+            _r.preferred_version_hit = id(_r) in _preferred_ids
+
         def sort_key(r):
+            # Zeroth: the version the user actually asked for wins outright.
+            # With no preference set this is 0 for every candidate, so the
+            # tuple compares exactly as it did before and nothing reorders —
+            # that's what makes the setting safe to ship off by default.
+            preferred_hit = 1 if getattr(r, 'preferred_version_hit', False) else 0
             # Primary: confidence score
             # Secondary: prefer originals (original=0, others=penalty value for tie-breaking)
             version_priority = 0.0 if r.version_type == 'original' else getattr(r, 'version_penalty', 0.1)
             # Tertiary: peer quality (upload speed, queue, free slots)
             peer_quality = r.quality_score
             # Quaternary: file size
-            return (r.confidence, -version_priority, peer_quality, r.size)
+            return (preferred_hit, r.confidence, -version_priority, peer_quality, r.size)
 
         sorted_results = sorted(scored_results, key=sort_key, reverse=True)
 

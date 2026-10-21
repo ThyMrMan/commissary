@@ -28,8 +28,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests as http_requests
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.amazon_client import AmazonClient, AmazonClientError
+from core.async_utils import run_blocking
 from core.download_plugins.base import DownloadSourcePlugin
 from core.download_plugins.types import AlbumResult, DownloadStatus, TrackResult
 from core.quality.model import AudioQuality
@@ -89,7 +90,7 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         self._client = AmazonClient(preferred_codec=self._quality)
         self.session = http_requests.Session()
         self.session.headers.update({
-            "User-Agent": "Commissary/1.0",
+            "User-Agent": "SoulSync/1.0",
             "Accept": "*/*",
         })
 
@@ -113,8 +114,11 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         return True
 
     async def check_connection(self) -> bool:
+        # the t2tunes calls are blocking http with retries (up to ~90s), and
+        # these coroutines run on the app's one shared loop. off the loop, or
+        # a slow proxy freezes search, downloads and status for everyone
         try:
-            return self._client.is_authenticated()
+            return await run_blocking(self._client.is_authenticated)
         except Exception:
             return False
 
@@ -129,7 +133,7 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         progress_callback: Any = None,
     ) -> Tuple[List[TrackResult], List[AlbumResult]]:
         try:
-            items = self._client.search_raw(query, types="track,album")
+            items = await run_blocking(self._client.search_raw, query, types="track,album")
         except AmazonClientError as exc:
             logger.warning(f"Amazon search failed for {query!r}: {exc}")
             return [], []
@@ -137,13 +141,18 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         track_results: List[TrackResult] = []
         album_map: Dict[str, AlbumResult] = {}
         album_order: List[str] = []
-        preferred = self._client.preferred_codec
+        preferred = quality_tier_for_source(
+            'amazon', default=self._quality,
+        )
         # Search results only carry the codec (real sample_rate arrives at
         # stream time). Claim the format honestly — FLAC for the lossless
         # codec, lossy otherwise — so audio_quality derives a real format
         # instead of the display label ("Lossless"), and the post-download
         # probe pins the actual sample_rate/bit_depth.
-        amazon_q = AudioQuality(format='flac' if _codec_key(preferred) == 'flac' else 'aac')
+        preferred_codec = _codec_key(preferred)
+        amazon_q = AudioQuality(
+            format='flac' if preferred_codec == 'flac' else preferred_codec
+        )
 
         for item in items:
             quality = _quality_label(preferred)
@@ -237,7 +246,22 @@ class AmazonDownloadClient(DownloadSourcePlugin):
         display_name: str,
     ) -> Optional[str]:
         asin = str(target_id)
-        codecs = CODEC_PREFERENCE if self._allow_fallback else [self._quality]
+        requested_codec = quality_tier_for_source(
+            'amazon', default=self._quality,
+        )
+        if self._allow_fallback:
+            codecs = list(CODEC_PREFERENCE)
+            try:
+                preferred_index = codecs.index(requested_codec)
+                # Fallback means progressively lower tiers. Wrapping to FLAC
+                # after an Opus/EAC3 request violates the item's quality
+                # ceiling and can make the later import guard reject a grab we
+                # should never have started.
+                codecs = codecs[preferred_index:]
+            except ValueError:
+                pass
+        else:
+            codecs = [requested_codec]
         for codec in codecs:
             try:
                 streams = self._client.media_from_asin(asin, codec=codec)
@@ -286,7 +310,7 @@ class AmazonDownloadClient(DownloadSourcePlugin):
             if stream.decryption_key:
                 if self._engine is not None:
                     self._engine.update_record(
-                        "amazon", download_id, {"state": "decrypting", "progress": 1.0}
+                        "amazon", download_id, {"state": "decrypting", "progress": 100.0}
                     )
                 try:
                     self._decrypt_with_ffmpeg(enc_path, out_path, stream.decryption_key)
@@ -382,7 +406,14 @@ class AmazonDownloadClient(DownloadSourcePlugin):
                         {
                             "transferred": downloaded,
                             "size": total,
-                            "progress": downloaded / total if total else 0.0,
+                            # PERCENT, like every other download client. this
+                            # alone reported a 0-1 fraction, which forced the
+                            # shared status normaliser to guess the unit — and
+                            # that guess turned the first 1% of every OTHER
+                            # engine's download into 50-100% on the page
+                            # (0.5 -> 50, 1.0 -> 100). one outlier, four
+                            # victims; fix the outlier.
+                            "progress": (downloaded / total * 100) if total else 0.0,
                         },
                     )
                     last_report = now
@@ -463,4 +494,5 @@ class AmazonDownloadClient(DownloadSourcePlugin):
             speed=int(rec.get('speed', 0)),
             time_remaining=rec.get('time_remaining'),
             file_path=rec.get('file_path'),
+            error=rec.get('error'),
         )

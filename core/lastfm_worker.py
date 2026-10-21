@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from utils.logging_config import get_logger
 from database.music_database import MusicDatabase
 from core.lastfm_client import LastFMClient
-from config.settings import config_manager
+from core.settings import config_manager
 from core.worker_utils import interruptible_sleep
 
 logger = get_logger("lastfm_worker")
@@ -231,7 +231,7 @@ class LastFMWorker:
             cursor.execute("""
                 SELECT id, name
                 FROM artists
-                WHERE lastfm_match_status = 'not_found' AND lastfm_last_attempted < ?
+                WHERE lastfm_match_status IN ('not_found', 'error') AND lastfm_last_attempted < ?
                 ORDER BY lastfm_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -245,7 +245,7 @@ class LastFMWorker:
                 SELECT a.id, a.title, ar.name AS artist_name
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.lastfm_match_status = 'not_found' AND a.lastfm_last_attempted < ?
+                WHERE a.lastfm_match_status IN ('not_found', 'error') AND a.lastfm_last_attempted < ?
                 ORDER BY a.lastfm_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -258,7 +258,7 @@ class LastFMWorker:
                 SELECT t.id, t.title, ar.name AS artist_name
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.lastfm_match_status = 'not_found' AND t.lastfm_last_attempted < ?
+                WHERE t.lastfm_match_status IN ('not_found', 'error') AND t.lastfm_last_attempted < ?
                 ORDER BY t.lastfm_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -278,8 +278,8 @@ class LastFMWorker:
     def _normalize_name(self, name: str) -> str:
         """Normalize name for comparison"""
         name = name.lower().strip()
-        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'\s*\(.*?\)\s*', ' ', name)
+        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'[^\w\s]', '', name)
         name = re.sub(r'\s+', ' ', name).strip()
         return name
@@ -288,6 +288,13 @@ class LastFMWorker:
         """Check if result name matches our query with fuzzy matching"""
         norm_query = self._normalize_name(query_name)
         norm_result = self._normalize_name(result_name)
+        if not norm_query or not norm_result:
+            # Titles that normalize to NOTHING ("(Intro)", "[Skit]", "!!!",
+            # "...") would compare at SequenceMatcher ratio 1.0 against any
+            # other such title — fall back to exact raw comparison instead.
+            raw_q = (query_name or '').strip().lower()
+            raw_r = (result_name or '').strip().lower()
+            return bool(raw_q) and raw_q == raw_r
         similarity = SequenceMatcher(None, norm_query, norm_result).ratio()
         logger.debug(f"Name similarity: '{query_name}' vs '{result_name}' = {similarity:.2f}")
         return similarity >= self.name_similarity_threshold

@@ -3,10 +3,6 @@
 #   OLD: - soulsync_database:/app/database
 #   NEW: - soulsync_database:/app/data
 # Your data will be preserved - it's the same volume, just mounted at a different path.
-#
-# The service, volume and network below keep their original `soulsync` names on
-# purpose. Commissary is a rename of the app, not of your deployment: renaming
-# the named volume here would point a running install at an EMPTY database.
 
 services:
   soulsync:
@@ -19,13 +15,18 @@ services:
       - UMASK=022
       # Web server configuration
       - PYTHONPATH=/app
+      # Optional: ONLY when your reverse proxy hosts SoulSync under a subpath,
+      # e.g. https://media.example.com/soulsync/. Leave commented for normal setups.
+      # Configure the proxy for the same path; see docs/REVERSE_PROXY_SUBPATH.md.
+      # After changing this setting, recreate the container to apply it.
+      # - SOULSYNC_URL_BASE=/soulsync
       # Optional: Configure through environment variables
       - SOULSYNC_CONFIG_PATH=/app/config/config.json
       # Set timezone (change to your timezone)
       - TZ=America/New_York
       # OAuth callback ports. If 8888/8889 conflict with another container (e.g. Gluetun),
       # change the port numbers below AND update the matching port mappings in the ports section.
-      # Then update the redirect URI in Commissary → Settings → Connections AND in your Spotify/Tidal developer dashboard to match.
+      # Then update the redirect URI in SoulSync → Settings → Connections AND in your Spotify/Tidal developer dashboard to match.
       - SOULSYNC_SPOTIFY_CALLBACK_PORT=8888
       - SOULSYNC_TIDAL_CALLBACK_PORT=8889
     ports:
@@ -50,17 +51,66 @@ services:
 
       # - ./Transfer:/app/Transfer
 
+      # ─── Per-profile libraries (OUTPUT) — optional ──────────────────────────
+      # A profile the admin switches to "Own library" (Manage Profiles) downloads
+      # into its own folder and syncs against its own Plex/Jellyfin library. Each
+      # such folder needs a mount under /app/libraries/<name>; that is the path to
+      # enter on the profile card, and the path to point the second Plex/Jellyfin
+      # music library at (on the host side, left of the colon).
+      # - ./libraries/thomas:/app/libraries/thomas
+
+      # ─── Podcast library (OUTPUT) — optional: uncomment + set your path ───
+      # Downloaded podcast episodes are saved here. UNCOMMENT the line below, point
+      # the host side (left of the colon) at your podcasts folder, then set
+      # Settings → Library → Podcasts Folder to /app/podcasts:
+      # - ./podcasts:/app/podcasts
+      # ─── Audiobook library (OUTPUT) — optional: uncomment + set your path ───
+      # Finished audiobooks are filed here as Author/Series/Book folders. UNCOMMENT
+      # the line below, point the host side (left of the colon) at your audiobook
+      # folder, then set Settings → Library → Audiobooks Folder to /app/audiobooks.
+      # Keep this OUT of your music library: a book is a folder of chapter files,
+      # and a music scanner will happily index it as an album of 300 tracks.
+      # - ./audiobooks:/app/audiobooks
+      # ─── Sample Studio folders (OUTPUT) — optional: uncomment + set your path ───
+      # Saved Sample Studio chops are rendered here, organized as Artist/Track
+      # folders by the sample path template. UNCOMMENT the line below, point the
+      # host side (left of the colon) at your samples folder, then set
+      # Settings → Library → Folders → Sample Studio Folders to /app/samples.
+      # Keep this OUT of your music library: a music scanner will happily index
+      # your chops as albums. Add more folders in-app for per-project
+      # destinations — the first folder in the list is the default.
+      # - ./samples:/app/samples
+
       - ./Staging:/app/Staging
       - ./MusicVideos:/app/MusicVideos
       - ./scripts:/app/scripts
       # ─── Video libraries (OUTPUT) — one per content type ─────────────────
       # The video Downloads tab sorts finished files into these by type. Point each
       # at where Plex/Jellyfin reads from, then set the matching path on
-      # Settings → Downloads (the in-app placeholders match the in-container paths):
+      # Settings → Library → Folders → Videos (container paths):
       #   Movies → /media/movies   ·   TV → /media/tv   ·   YouTube → /media/youtube
       - ./Movies:/media/movies
       - ./TV:/media/tv
       - ./YouTube:/media/youtube
+      # Multiple movie / TV drives: give EVERY mount a UNIQUE container path.
+      # Mounts do not merge: do NOT bind several drives to /media/movies or /media/tv.
+      # Replace the host paths below with your real folders, then uncomment:
+      # - /mnt/drive2/Movies:/media/movies2:rw
+      # - /mnt/drive3/Movies:/media/movies3:rw
+      # - /mnt/drive4/Movies:/media/movies4:rw
+      # - /mnt/drive2/TV:/media/tv2:rw
+      # - /mnt/drive3/TV:/media/tv3:rw
+      # - /mnt/drive4/TV:/media/tv4:rw
+      # Recreate the container after adding mounts. In Settings → Library →
+      # Folders → Videos, add /media/movies2, /media/movies3, /media/movies4 under
+      # Additional Movie Libraries, and the /media/tv2 etc. paths under Additional
+      # TV Libraries. Enter CONTAINER paths (right side), not /mnt/drive2 paths.
+      # Keep /media/movies and /media/tv as primary destinations for new downloads.
+      # Extra paths let SoulSync locate existing files for playback, upgrades,
+      # renaming and recycling; :rw permits those file operations.
+      # Plex/Jellyfin must also have these folders mounted and included in the
+      # libraries selected for SoulSync's video scan. Adding paths here does not
+      # create media-server libraries or directly crawl unindexed video folders.
       # Use named volume for database persistence (separate from host database)
       # NOTE: Changed from /app/database to /app/data to avoid overwriting Python package
       # Holds BOTH databases (music_library.db + video_library.db) plus the video
@@ -78,14 +128,14 @@ services:
       # - /path/to/your/music:/music:ro
       #
       # ─── Torrent / Usenet download sources (Prowlarr integration) ────────
-      # If you use the Torrent Only or Usenet Only download sources, Commissary
+      # If you use the Torrent Only or Usenet Only download sources, SoulSync
       # needs to read the files your torrent / usenet client downloads.
       #
       # EASIEST SETUP: point qBittorrent, SABnzbd / NZBGet, AND slskd at the
       # SAME download folder. The ./downloads mount above is reused; nothing
       # new to add here. Just configure each client's download path to
       # /downloads (inside its own container) — files land in the same place
-      # Commissary already reads from.
+      # SoulSync already reads from.
       #
       # SEPARATE FOLDERS (if you prefer): uncomment + edit these to point at
       # the client's download folder. The in-container path must MATCH the
@@ -117,9 +167,9 @@ services:
           memory: 512M
 
   ## ─── Optional: slskd (Soulseek client) ───────────────────────────────
-  ## Uncomment below to run slskd alongside Commissary.
-  ## Downloads land in ./downloads which Commissary already reads from.
-  ## After starting, set your Commissary slskd URL to http://slskd:5030
+  ## Uncomment below to run slskd alongside SoulSync.
+  ## Downloads land in ./downloads which SoulSync already reads from.
+  ## After starting, set your SoulSync slskd URL to http://slskd:5030
   ## and the API key to whatever you set in SLSKD_API_KEY below.
   #
   # slskd:

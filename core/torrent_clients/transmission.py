@@ -10,14 +10,14 @@ Reference: https://github.com/transmission/transmission/blob/main/docs/rpc-spec.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import threading
 from typing import List, Optional
 
 import requests as http_requests
 
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_control
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
@@ -37,6 +37,16 @@ _TRANSMISSION_STATUS = {
 }
 
 
+def _first_label(labels) -> Optional[str]:
+    """transmission has labels, not one category. the first one is the
+    category soulsync itself sets when it adds a torrent."""
+    if isinstance(labels, list):
+        for label in labels:
+            if str(label or '').strip():
+                return str(label).strip()
+    return None
+
+
 def _map_state(status_code: int, percent_done: float) -> str:
     base = _TRANSMISSION_STATUS.get(status_code, "error")
     # Transmission reports 'paused' (0) for both never-started and
@@ -44,6 +54,42 @@ def _map_state(status_code: int, percent_done: float) -> str:
     if status_code == 0 and percent_done >= 1.0:
         return "completed"
     return base
+
+
+def normalize_transmission_url(raw: str) -> str:
+    """Normalize a user-entered Transmission URL to its RPC endpoint.
+
+    Transmission's RPC endpoint is always ``<base>/rpc`` (standard default:
+    ``http://host:9091/transmission/rpc``). Users frequently enter:
+      - Bare host/port: ``http://transmission:9091`` or ``transmission:9091``
+      - Web UI URL copied from browser: ``http://transmission:9091/transmission/web/``
+      - Base path: ``http://transmission:9091/transmission`` or ``.../transmission/``
+      - Trailing slash on RPC: ``http://transmission:9091/transmission/rpc/``
+    All of these normalize to the RPC endpoint ``.../transmission/rpc``.
+    """
+    url = normalize_client_url(raw)
+    if not url:
+        return ''
+    url = url.rstrip('/')
+
+    if url.endswith('/transmission/rpc') or url.endswith('/rpc'):
+        return url
+
+    # Web UI URL copied from browser (/transmission/web or /web)
+    if url.endswith('/transmission/web'):
+        return url[:-4] + '/rpc'
+    if url.endswith('/web'):
+        return url[:-4] + '/rpc'
+
+    # Base path ending with /transmission
+    if url.endswith('/transmission'):
+        return f"{url}/rpc"
+
+    # Bare host with no /transmission in path
+    if '/transmission' not in url:
+        return f"{url}/transmission/rpc"
+
+    return f"{url}/rpc"
 
 
 class TransmissionAdapter:
@@ -57,17 +103,12 @@ class TransmissionAdapter:
         self._load_config()
 
     def _load_config(self) -> None:
-        url = normalize_client_url(config_manager.get('torrent_client.url', ''))
-        # Transmission's RPC endpoint is always /transmission/rpc — if the
-        # user pasted a bare host URL, append it. If they pasted the full
-        # /transmission/rpc URL, leave it.
-        if url and not url.endswith('/transmission/rpc'):
-            if '/transmission' not in url:
-                url = f"{url}/transmission/rpc"
-        self._url = url
+        self._url = normalize_transmission_url(config_manager.get('torrent_client.url', ''))
         self._username = config_manager.get('torrent_client.username', '') or ''
         self._password = config_manager.get('torrent_client.password', '') or ''
-        self._category = config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        self._category = str(
+            config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        ).strip() or 'soulsync'
         self._save_path = config_manager.get('torrent_client.save_path', '') or ''
         with self._session_id_lock:
             self._session_id = None
@@ -81,8 +122,7 @@ class TransmissionAdapter:
     async def check_connection(self) -> bool:
         if not self.is_configured():
             return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._check_connection_sync)
+        return await run_control(self._check_connection_sync)
 
     def _check_connection_sync(self) -> bool:
         resp = self._rpc('session-get', {})
@@ -121,7 +161,18 @@ class TransmissionAdapter:
                 if not resp.ok:
                     logger.warning("Transmission RPC %s returned HTTP %s", method, resp.status_code)
                     return None
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception:
+                    body_excerpt = resp.text[:200] if resp.text else '(empty)'
+                    logger.error(
+                        "Transmission RPC %s returned non-JSON response from %s (HTTP %s, Content-Type: %s): %r. "
+                        "Check that the Transmission URL points to the RPC endpoint (/transmission/rpc)",
+                        method, self._url, resp.status_code,
+                        resp.headers.get('Content-Type', 'unknown'),
+                        body_excerpt,
+                    )
+                    return None
                 if data.get('result') != 'success':
                     logger.warning("Transmission RPC %s result=%s", method, data.get('result'))
                     return None
@@ -134,13 +185,11 @@ class TransmissionAdapter:
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_sync, url_or_magnet, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_sync, url_or_magnet, category, save_path)
 
     def _add_torrent_sync(
         self,
@@ -156,13 +205,11 @@ class TransmissionAdapter:
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_file_sync, file_bytes, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_file_sync, file_bytes, category, save_path)
 
     def _add_torrent_file_sync(
         self,
@@ -190,8 +237,7 @@ class TransmissionAdapter:
         return str(torrent.get('hashString') or '') or None
 
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_status_sync, torrent_id)
+        return await run_control(self._get_status_sync, torrent_id)
 
     def _get_status_sync(self, torrent_id: str) -> Optional[TorrentStatus]:
         data = self._rpc('torrent-get', {
@@ -202,24 +248,8 @@ class TransmissionAdapter:
             return None
         return self._parse_status(data['torrents'][0])
 
-    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
-
-    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
-        """'files' is asked for on its own rather than added to _STATUS_FIELDS:
-        that field list drives the every-few-seconds poll for every torrent, and
-        this is wanted once per download."""
-        data = self._rpc('torrent-get', {'ids': [torrent_id], 'fields': ['files']})
-        rows = (data or {}).get('torrents') or []
-        if not rows:
-            return None
-        return [str(f.get('name')) for f in (rows[0].get('files') or [])
-                if isinstance(f, dict) and f.get('name')]
-
     async def get_all(self) -> List[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_all_sync)
+        return await run_control(self._get_all_sync)
 
     def _get_all_sync(self) -> List[TorrentStatus]:
         data = self._rpc('torrent-get', {'fields': self._STATUS_FIELDS})
@@ -230,7 +260,7 @@ class TransmissionAdapter:
     _STATUS_FIELDS = [
         'hashString', 'name', 'status', 'percentDone', 'totalSize',
         'downloadedEver', 'rateDownload', 'rateUpload', 'peersSendingToUs',
-        'peersGettingFromUs', 'eta', 'downloadDir', 'errorString',
+        'peersGettingFromUs', 'eta', 'downloadDir', 'errorString', 'labels',
     ]
 
     def _parse_status(self, item: dict) -> TorrentStatus:
@@ -253,11 +283,11 @@ class TransmissionAdapter:
             eta=eta,
             save_path=item.get('downloadDir'),
             error=item.get('errorString') or None,
+            category=_first_label(item.get('labels')),
         )
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._remove_sync, torrent_id, delete_files)
+        return await run_control(self._remove_sync, torrent_id, delete_files)
 
     def _remove_sync(self, torrent_id: str, delete_files: bool) -> bool:
         data = self._rpc('torrent-remove', {
@@ -267,15 +297,13 @@ class TransmissionAdapter:
         return data is not None
 
     async def pause(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._pause_sync, torrent_id)
+        return await run_control(self._pause_sync, torrent_id)
 
     def _pause_sync(self, torrent_id: str) -> bool:
         return self._rpc('torrent-stop', {'ids': [torrent_id]}) is not None
 
     async def resume(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._resume_sync, torrent_id)
+        return await run_control(self._resume_sync, torrent_id)
 
     def _resume_sync(self, torrent_id: str) -> bool:
         return self._rpc('torrent-start', {'ids': [torrent_id]}) is not None

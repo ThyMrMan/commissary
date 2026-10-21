@@ -7,7 +7,7 @@ browser). Falls back to 404 so the frontend shows its placeholder.
 
 from __future__ import annotations
 
-from flask import Response, abort, request
+from flask import Response, abort, request, send_file
 from werkzeug.exceptions import HTTPException
 
 from utils.logging_config import get_logger
@@ -27,37 +27,21 @@ def _req_width():
     return max(48, min(1600, w))
 
 
-def _serve_cached(url, params=None):
-    """Serve an upstream image through the on-disk image cache, or None to let
-    the caller fall back to streaming it live.
+def _cached_file(url):
+    """The shared artwork cache's copy of ``url``, or None to stream it live.
 
-    Every artwork request used to make a fresh blocking call to Plex/TMDB. With
-    gunicorn on one worker and eight threads, a grid of posters on a cold browser
-    cache could occupy the whole pool and stall unrelated API requests behind it.
-    ``core.image_cache`` (already used by the music side) stores the bytes on
-    disk, dedupes concurrent requests for the same key with a per-key lock, and
-    serves a stale copy if the refresh fails — so a Plex restart mid-scroll shows
-    art instead of holes.
-
-    Returns None rather than raising on any cache problem: artwork must never be
-    the reason a page errors."""
+    Deliberately best-effort and silent: this is a page full of posters, and a
+    cache problem should cost a cache miss, never a broken image. Honours the
+    same `image_cache.enabled` switch as the music side, so one toggle governs
+    both."""
     try:
-        from urllib.parse import urlencode
-
-        from flask import send_file
-
+        from core.settings import config_manager
+        if config_manager.get("image_cache.enabled", True) is False:
+            return None
         from core.image_cache import get_image_cache
-        full = url + (("&" if "?" in url else "?") + urlencode(params) if params else "")
-        cached = get_image_cache().get_url(full)
-        resp = send_file(str(cached.path), mimetype=cached.mime_type, conditional=True)
-        # A real validator, so a repeat view is a 304 instead of a re-download.
-        # The old code sent max-age alone, which meant every image was refetched
-        # in full the moment the browser's copy aged out.
-        resp.headers["Cache-Control"] = "public, max-age=604800"
-        resp.headers["ETag"] = '"vimg-%s"' % cached.key[:32]
-        return resp
-    except Exception as e:      # noqa: BLE001 - fall back to the live stream
-        logger.debug("image cache miss-through for %s: %s", url, e)
+        return get_image_cache().get_url(url)
+    except Exception as exc:
+        logger.debug("video art cache miss for %s: %s", url, exc)
         return None
 
 
@@ -86,9 +70,19 @@ def register_routes(bp):
             if path.startswith("http://") or path.startswith("https://"):
                 if w and "image.tmdb.org" in path:
                     path = _tmdb_resize(path, w, backdrop)
-                hit = _serve_cached(path)
-                if hit is not None:
-                    return hit
+                # Serve through the shared disk cache. Without this the video
+                # side re-fetched every poster from TMDB on EVERY request and
+                # leaned entirely on the browser cache — so a hard refresh, a
+                # second device, or a cleared browser cache paid for the whole
+                # grid again. The music side has cached art for a while; this
+                # is the same cache, so both sides share one size limit, one
+                # TTL and one Clear button.
+                cached = _cached_file(path)
+                if cached is not None:
+                    resp = send_file(cached.path, mimetype=cached.mime_type, conditional=True)
+                    resp.headers["Cache-Control"] = "public, max-age=86400"
+                    resp.headers["X-SoulSync-Image-Cache"] = cached.status
+                    return resp
                 upstream = requests.get(path, timeout=15, stream=True)
                 if upstream.status_code != 200:
                     abort(404)
@@ -132,11 +126,33 @@ def register_routes(bp):
             else:
                 abort(404)
 
-            hit = _serve_cached(url, params)
-            if hit is None and fallback:
-                hit = _serve_cached(fallback, params)
-            if hit is not None:
-                return hit
+            # Media-server art gets the SAME disk cache the TMDB branch above has
+            # had. Without it every poster in a grid re-fetches from Plex/Jellyfin
+            # on EVERY page view, and only the browser cache stood between the
+            # server and that cost - so a hard refresh, a second device or a
+            # cleared cache paid for the whole grid again.
+            #
+            # That cost is not theoretical: a Plex poster transcode measures ~97ms
+            # on a LAN server, a grid page renders 60 of them, and the app runs one
+            # gunicorn worker with eight threads. Sixty blocking proxy fetches
+            # therefore occupy every thread for the better part of a second while
+            # the page's own API calls queue behind them. Caching turns the repeat
+            # visit into a local file read and a 304.
+            #
+            # An authenticated URL is what gets cached (the token is a query param)
+            # - the same thing the music side does for Navidrome covers, and the
+            # cache explicitly supports LAN hosts for exactly this reason.
+            full_url = url
+            if params:
+                from urllib.parse import urlencode
+                full_url += ("&" if "?" in full_url else "?") + urlencode(params)
+            cached = _cached_file(full_url)
+            if cached is not None:
+                resp = send_file(cached.path, mimetype=cached.mime_type, conditional=True)
+                resp.headers["Cache-Control"] = "public, max-age=86400"
+                resp.headers["X-SoulSync-Image-Cache"] = cached.status
+                return resp
+
             upstream = requests.get(url, params=params, timeout=15, stream=True)
             if upstream.status_code != 200 and fallback:
                 upstream = requests.get(fallback, params=params, timeout=15, stream=True)
@@ -161,8 +177,15 @@ def register_routes(bp):
     @bp.route("/img", methods=["GET"])
     def video_img_proxy():
         """Same-origin image proxy (SSRF-safe allowlist). TMDB for accent-sampling,
-        and YouTube CDN (avatars/banners/thumbnails) so channel art loads reliably
-        regardless of hotlink/CORS policy."""
+        YouTube CDN (avatars/banners/thumbnails) so channel art loads reliably
+        regardless of hotlink/CORS policy, and EXT.to release posters for the Fresh
+        Releases board.
+
+        EXT.to is not optional here: it serves its poster art with a
+        Cross-Origin-Resource-Policy header, so the browser refuses to render it in
+        an <img> on our origin at all - 'ERR_BLOCKED_BY_RESPONSE.NotSameOrigin',
+        with a URL that is perfectly correct. Same-origin is the only way those
+        posters can load."""
         from flask import request
         from urllib.parse import urlparse
         url = request.args.get("u", "")
@@ -171,36 +194,62 @@ def register_routes(bp):
         host = (urlparse(url).hostname or "").lower()
         # image.tmdb.org + any YouTube image host (yt3/yt4.ggpht, googleusercontent, *.ytimg)
         ok = host == "image.tmdb.org" or any(
-            host == s or host.endswith("." + s) for s in ("ytimg.com", "ggpht.com", "googleusercontent.com"))
+            host == s or host.endswith("." + s)
+            # exact-or-subdomain, never a bare endswith: that would let
+            # 'ext.to.evil.com' through the allowlist
+            for s in ("ytimg.com", "ggpht.com", "googleusercontent.com", "ext.to", "extto.com"))
         if not ok:
             abort(404)
+        cached = _cached_file(url)
+        if cached is not None:
+            resp = send_file(cached.path, mimetype=cached.mime_type, conditional=True)
+            resp.headers["Cache-Control"] = "public, max-age=604800"
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["X-SoulSync-Image-Cache"] = cached.status
+            return resp
         try:
             import requests
-            # TMDB art goes through the on-disk cache like library posters do — a
-            # watchlist page is a grid of these, and every one was a fresh blocking
-            # TMDB fetch. Not the Google hosts: those need the UA below to answer.
-            if host == "image.tmdb.org":
-                hit = _serve_cached(url)
-                if hit is not None:
-                    hit.headers["Access-Control-Allow-Origin"] = "*"
-                    return hit
             # A browser UA — Google's image CDN (yt3/googleusercontent) 403s some
             # avatars when fetched with no User-Agent, which blanked search results.
-            upstream = requests.get(url, timeout=15, stream=True, headers={
+            headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
                 "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
-            })
+            }
+            cookies = None
+            if host == "ext.to" or host.endswith(".ext.to") or host.endswith("extto.com"):
+                # ext.to's art sits behind the same Cloudflare challenge as its
+                # pages: a plain GET is answered 403. Reuse the clearance
+                # FlareSolverr already solved — and its UA, which the cookie is
+                # bound to, so a mismatched agent invalidates it.
+                from core.video.extto_search import clearance
+                cookies, ua = clearance()
+                if ua:
+                    headers["User-Agent"] = ua
+                headers["Referer"] = "https://ext.to/"
+            upstream = requests.get(url, timeout=15, stream=True, headers=headers,
+                                    cookies=cookies or None)
             if upstream.status_code != 200:
                 # An expected miss (e.g. a video with no maxresdefault.jpg — the UI
                 # falls back) — a quiet 404, never an ERROR traceback in the log.
                 logger.debug("img proxy upstream %s for %s", upstream.status_code, url)
                 abort(404)
-            resp = Response(upstream.iter_content(8192),
-                            content_type=upstream.headers.get("Content-Type", "image/jpeg"))
-            resp.headers["Cache-Control"] = "public, max-age=604800"
-            resp.headers["Access-Control-Allow-Origin"] = "*"
-            return resp
+            ctype = upstream.headers.get("Content-Type", "image/jpeg")
+            raw_data = upstream.content
+            try:
+                from core.image_cache import get_image_cache
+                saved = get_image_cache().store_bytes(url, raw_data, ctype)
+                resp = send_file(saved.path, mimetype=saved.mime_type, conditional=True)
+                resp.headers["Cache-Control"] = "public, max-age=604800"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                resp.headers["X-SoulSync-Image-Cache"] = "miss"
+                return resp
+            except Exception as store_err:
+                logger.debug("image_cache store_bytes failed for %s: %s", url, store_err)
+                resp = Response(raw_data, content_type=ctype)
+                resp.headers["Cache-Control"] = "public, max-age=604800"
+                resp.headers["Access-Control-Allow-Origin"] = "*"
+                return resp
         except HTTPException:
             raise   # our own abort(404) above — already handled, don't re-log it
         except Exception:

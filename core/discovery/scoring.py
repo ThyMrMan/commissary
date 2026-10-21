@@ -1,13 +1,13 @@
 """Discovery scoring + tidal-track search — lifted from web_server.py.
 
-Both function bodies were lifted byte-identical; the scorer has since been
-split so the candidates it ranks can also be kept as suggestions. The
+Both function bodies are byte-identical to the originals. The
 ``spotify_client`` proxy and ``_get_metadata_fallback_source`` shim
 let the bodies resolve their original names without modification.
 ``matching_engine`` is injected via init() because it is constructed
 in web_server.py and referenced by name throughout the bodies.
 """
 import logging
+import re
 
 from core.metadata.cache import get_metadata_cache
 from core.metadata.registry import get_primary_source, get_spotify_client
@@ -47,7 +47,7 @@ def init(matching_engine_obj):
     matching_engine = matching_engine_obj
 
 
-def _discovery_rank_candidates(source_title, source_artist, source_duration_ms, search_results):
+def _discovery_score_candidates(source_title, source_artist, source_duration_ms, search_results):
     """Score search results against a source track using the matching engine.
 
     Both artist AND title must independently pass minimum similarity floors.
@@ -62,10 +62,11 @@ def _discovery_rank_candidates(source_title, source_artist, source_duration_ms, 
         search_results: List of Track objects (Spotify or iTunes) from search
 
     Returns:
-        ``[(confidence, index, candidate), ...]`` for every candidate that passes
-        both floors, best first; equal confidences keep search order.
+        (best_match, best_confidence, best_index) or (None, 0.0, -1) if no results
     """
-    ranked = []
+    best_match = None
+    best_confidence = 0.0
+    best_index = -1
     min_artist_similarity = 0.5
     min_title_similarity = 0.5
 
@@ -79,16 +80,36 @@ def _discovery_rank_candidates(source_title, source_artist, source_duration_ms, 
             result_name = result.name if hasattr(result, 'name') else ''
             result_duration = result.duration_ms if hasattr(result, 'duration_ms') else 0
 
+            # Duration floor — reject extreme duration discrepancies (>15s and >40% difference)
+            if source_duration_ms > 0 and result_duration > 0:
+                diff_ms = abs(source_duration_ms - result_duration)
+                diff_ratio = diff_ms / max(source_duration_ms, result_duration)
+                if diff_ms > 15000 and diff_ratio > 0.40:
+                    continue
+
             # Artist floor — both must match, not just the weighted score
             best_artist_sim = 0.0
             for cand_artist in result_artists:
                 if not cand_artist:
                     continue
+
+                # Check for derivative artist mismatch (e.g., "Queen Tribute" vs "Queen")
+                if hasattr(matching_engine, "has_derivative_artist_mismatch") and matching_engine.has_derivative_artist_mismatch(source_artist, cand_artist):
+                    sim = 0.20
+                    if sim > best_artist_sim:
+                        best_artist_sim = sim
+                    continue
+
                 cand_cleaned = matching_engine.clean_artist(cand_artist)
                 cand_normalized = matching_engine.normalize_string(cand_artist)
-                if source_artist_cleaned and source_artist_cleaned in cand_normalized:
+
+                # Exact match against whole candidate artist string
+                if source_artist_cleaned and (source_artist_cleaned == cand_cleaned or source_artist_cleaned == cand_normalized):
                     best_artist_sim = 1.0
                     break
+
+                # Commas, slashes, ampersands and 'and' can belong to a band name.
+                # Separate credits arrive as artist list entries; clean_artist handles feat.
                 sim = matching_engine.similarity_score(source_artist_cleaned, cand_cleaned)
                 if sim > best_artist_sim:
                     best_artist_sim = sim
@@ -122,29 +143,16 @@ def _discovery_rank_candidates(source_title, source_artist, source_duration_ms, 
                 candidate_duration_ms=result_duration
             )
 
-            ranked.append((confidence, idx, result))
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_match = result
+                best_index = idx
 
         except Exception as e:
             logger.error(f"Error scoring candidate {idx}: {e}")
             continue
 
-    # The sort is stable, so equal confidences keep search order -- the first
-    # of them is the one the scorer has always picked.
-    ranked.sort(key=lambda entry: entry[0], reverse=True)
-    return ranked
-
-
-def _discovery_score_candidates(source_title, source_artist, source_duration_ms, search_results):
-    """The best candidate ``_discovery_rank_candidates`` finds.
-
-    Returns:
-        (best_match, best_confidence, best_index) or (None, 0.0, -1) if no results
-    """
-    ranked = _discovery_rank_candidates(source_title, source_artist, source_duration_ms, search_results)
-    if not ranked:
-        return None, 0.0, -1
-    confidence, index, match = ranked[0]
-    return match, confidence, index
+    return best_match, best_confidence, best_index
 
 
 def _search_spotify_for_tidal_track(tidal_track, use_spotify=True, itunes_client=None):
@@ -209,6 +217,10 @@ def _search_spotify_for_tidal_track(tidal_track, use_spotify=True, itunes_client
         best_confidence = 0.0
         min_confidence = 0.9
 
+        # deezer's free text can leave the original out entirely (#1565)
+        from core.metadata.song_search import with_song_first_pass
+        _source = with_song_first_pass(itunes_client, track_name, artist_name)
+
         for query_idx, search_query in enumerate(search_queries):
             try:
                 logger.debug(f"Tidal query {query_idx + 1}/{len(search_queries)}: {search_query} ({source_name})")
@@ -218,7 +230,7 @@ def _search_spotify_for_tidal_track(tidal_track, use_spotify=True, itunes_client
                     if not results:
                         continue
                 else:
-                    results = itunes_client.search_tracks(search_query, limit=10)
+                    results = _source.search_tracks(search_query, limit=10)
                     if not results:
                         continue
 

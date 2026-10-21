@@ -33,6 +33,8 @@ from core.playlists.sources.spotify import SpotifyPlaylistSource
 from core.playlists.sources.spotify_public import SpotifyPublicPlaylistSource
 from core.playlists.sources.tidal import TidalPlaylistSource
 from core.playlists.sources.youtube import YouTubePlaylistSource
+import core.playlists.sources.ytmusic as _ytmusic_module
+from core.playlists.sources.ytmusic import YTMusicPlaylistSource
 
 
 # ─── Spotify ────────────────────────────────────────────────────────────
@@ -325,6 +327,97 @@ def test_youtube_adapter_failed_parse():
     assert src.get_playlist("https://bad") is None
 
 
+def test_ytmusic_adapter_unauthenticated_short_circuits():
+    src = YTMusicPlaylistSource(lambda: None)
+    assert src.is_authenticated() is False
+    assert src.list_playlists() == []
+    assert src.get_playlist("PL123") is None
+
+
+def test_ytmusic_adapter_auth_getter_raising_is_treated_as_unauthenticated():
+    def boom():
+        raise RuntimeError("cookie parse blew up")
+
+    src = YTMusicPlaylistSource(boom)
+    assert src.is_authenticated() is False
+    assert src.list_playlists() == []
+
+
+def test_ytmusic_adapter_lists_library_plus_liked_music(monkeypatch):
+    monkeypatch.setattr(_ytmusic_module, "fetch_library_playlists", lambda auth: ["raw-row"])
+    monkeypatch.setattr(
+        _ytmusic_module, "library_playlists_to_rows",
+        lambda raw: [{
+            "id": "pl1", "name": "Road Trip", "track_count": 10,
+            "image_url": "thumb1", "description": None, "owner": None,
+        }],
+    )
+    monkeypatch.setattr(
+        _ytmusic_module, "fetch_liked_music_row",
+        lambda auth: {
+            "id": "LM", "name": "Liked Music", "track_count": 5,
+            "image_url": "thumb2", "description": None, "owner": "You",
+        },
+    )
+
+    src = YTMusicPlaylistSource(lambda: {"Cookie": "x"})
+    assert src.is_authenticated() is True
+    metas = src.list_playlists()
+    # Liked Music is pinned FIRST — matches YouTube Music's own UI, unlike
+    # the Spotify "Liked Songs" / Tidal "Favorite Tracks" virtual-playlist
+    # convention elsewhere in this app, which appends at the end.
+    assert [m.source_playlist_id for m in metas] == ["LM", "pl1"]
+    assert metas[0].name == "Liked Music"
+    assert metas[0].owner == "You"
+    assert metas[1].source == "ytmusic"
+    assert metas[1].name == "Road Trip"
+    assert metas[1].track_count == 10
+
+
+def test_ytmusic_adapter_omits_liked_music_when_none_liked(monkeypatch):
+    monkeypatch.setattr(_ytmusic_module, "fetch_library_playlists", lambda auth: [])
+    monkeypatch.setattr(_ytmusic_module, "library_playlists_to_rows", lambda raw: [])
+    monkeypatch.setattr(_ytmusic_module, "fetch_liked_music_row", lambda auth: None)
+
+    src = YTMusicPlaylistSource(lambda: {"Cookie": "x"})
+    assert src.list_playlists() == []
+
+
+def test_ytmusic_adapter_get_playlist_projection(monkeypatch):
+    def fake_fetch(url, auth):
+        assert url == "https://music.youtube.com/playlist?list=pl1"
+        assert auth == {"Cookie": "x"}
+        return {
+            "id": "pl1", "name": "Road Trip", "track_count": 1,
+            "url": url, "image_url": "thumb",
+            "tracks": [{
+                "id": "vid1", "name": "Track", "artists": ["Artist"],
+                "album": "Album", "duration_ms": 200_000,
+                "url": "https://youtu.be/vid1",
+            }],
+        }
+
+    monkeypatch.setattr(_ytmusic_module, "fetch_ytmusic_playlist", fake_fetch)
+
+    src = YTMusicPlaylistSource(lambda: {"Cookie": "x"})
+    detail = src.get_playlist("pl1")
+    assert detail is not None
+    assert detail.meta.source == "ytmusic"
+    assert detail.meta.source_playlist_id == "pl1"
+    assert detail.meta.name == "Road Trip"
+    assert detail.tracks[0].source_track_id == "vid1"
+    assert detail.tracks[0].album_name == "Album"
+
+    # refresh_playlist is the identical call — the point of being ID-backed.
+    assert src.refresh_playlist("pl1") is not None
+
+
+def test_ytmusic_adapter_get_playlist_failed_fetch(monkeypatch):
+    monkeypatch.setattr(_ytmusic_module, "fetch_ytmusic_playlist", lambda url, auth: None)
+    src = YTMusicPlaylistSource(lambda: {"Cookie": "x"})
+    assert src.get_playlist("pl1") is None
+
+
 # ─── iTunes Link ────────────────────────────────────────────────────────
 
 
@@ -416,6 +509,15 @@ class _FakeLBManager:
         if self.refresh_raises is not None:
             raise self.refresh_raises
         return {"success": True, "result": "skipped", "playlist_mbid": mbid}
+
+    def sync_created_for_index(self):
+        self.sync_calls = getattr(self, "sync_calls", 0) + 1
+        if getattr(self, "sync_raises", None) is not None:
+            raise self.sync_raises
+        hook = getattr(self, "on_sync", None)
+        if hook:
+            hook()
+        return {"success": True, "new": 0}
 
 
 def test_listenbrainz_adapter_marks_needs_discovery():
@@ -511,6 +613,99 @@ def test_listenbrainz_adapter_refresh_resolves_synthetic_series_id():
     assert manager.refresh_playlist_calls == ["weekly-mbid"]
 
 
+def test_listenbrainz_series_resolves_to_the_newest_week_not_the_newest_write():
+    """cremonies #1407: the weekly exploration mirror kept pulling an old
+    week. newest was picked by last_updated, which ties when the first cache
+    fill writes every week in one second, and jumps to an old week whenever
+    that week's track count changes. the week lives in the title."""
+    import sqlite3
+    manager = _FakeLBManager()
+    conn = sqlite3.connect(":memory:")
+    cur = conn.cursor()
+    cur.execute(
+        "CREATE TABLE listenbrainz_playlists "
+        "(playlist_mbid TEXT, title TEXT, profile_id INTEGER, last_updated TEXT)"
+    )
+    cur.executemany(
+        "INSERT INTO listenbrainz_playlists VALUES (?, ?, 1, ?)",
+        [
+            # an old week re-written most recently (its count changed)
+            ('old-mbid', 'Weekly Exploration for nezreka, week of 2026-06-01 Mon', '2026-09-30 10:00:05'),
+            ('new-mbid', 'Weekly Exploration for nezreka, week of 2026-09-28 Mon', '2026-09-30 10:00:00'),
+            ('mid-mbid', 'Weekly Exploration for nezreka, week of 2026-09-21 Mon', '2026-09-30 10:00:00'),
+            # another user's newer week never leaks in
+            ('other-mbid', 'Weekly Exploration for someone, week of 2026-10-05 Mon', '2026-09-30 10:00:09'),
+        ],
+    )
+    conn.commit()
+    manager.profile_id = 1
+    manager._get_db_connection = lambda: conn
+
+    src = ListenBrainzPlaylistSource(lambda: manager)
+    assert src._resolve_series_to_latest_mbid(manager, "lb_weekly_exploration_nezreka") == "new-mbid"
+
+
+
+def _series_cache(manager, rows):
+    """In-memory LB cache the series resolver can query."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute(
+        "CREATE TABLE listenbrainz_playlists "
+        "(playlist_mbid TEXT, title TEXT, profile_id INTEGER, last_updated TEXT)"
+    )
+    conn.executemany("INSERT INTO listenbrainz_playlists VALUES (?, ?, 1, ?)", rows)
+    conn.commit()
+    manager.profile_id = 1
+    manager._get_db_connection = lambda: conn
+    return conn
+
+
+def test_listenbrainz_series_refresh_picks_up_a_week_published_since_last_cache_fill():
+    """New weekly periods used to enter the cache only via
+    ``update_all_playlists`` (watchlist auto-scan, which bails on an empty
+    watchlist), so the rolling mirror re-synced the last cached week
+    forever. The series refresh now syncs the created-for index first."""
+    manager = _FakeLBManager()
+    conn = _series_cache(manager, [
+        ("old-mbid", "Weekly Exploration for nezreka, week of 2026-08-24 Mon", "2026-08-24"),
+    ])
+
+    def lb_published_a_new_week():
+        conn.execute(
+            "INSERT INTO listenbrainz_playlists VALUES (?, ?, 1, ?)",
+            ("new-mbid", "Weekly Exploration for nezreka, week of 2026-09-14 Mon", "2026-10-06"),
+        )
+    manager.on_sync = lb_published_a_new_week
+
+    src = ListenBrainzPlaylistSource(lambda: manager)
+    src.refresh_playlist("lb_weekly_exploration_nezreka")
+
+    assert getattr(manager, "sync_calls", 0) == 1
+    assert manager.refresh_playlist_calls == ["new-mbid"]
+
+
+def test_listenbrainz_series_refresh_falls_back_to_cache_when_index_sync_fails():
+    manager = _FakeLBManager()
+    _series_cache(manager, [
+        ("cached-mbid", "Weekly Jams for nezreka, week of 2026-08-24 Mon", "2026-08-24"),
+    ])
+    manager.sync_raises = RuntimeError("LB API timed out")
+
+    src = ListenBrainzPlaylistSource(lambda: manager)
+    src.refresh_playlist("lb_weekly_jams_nezreka")
+
+    assert manager.refresh_playlist_calls == ["cached-mbid"]
+
+
+def test_listenbrainz_plain_mbid_refresh_does_not_sync_created_for_index():
+    manager = _FakeLBManager()
+    src = ListenBrainzPlaylistSource(lambda: manager)
+    src.refresh_playlist("lb-1")
+
+    assert getattr(manager, "sync_calls", 0) == 0
+    assert manager.refresh_playlist_calls == ["lb-1"]
+
 # ─── Last.fm ────────────────────────────────────────────────────────────
 
 
@@ -560,7 +755,7 @@ def test_lastfm_adapter_projects_radio_rows():
     assert detail.tracks[0].source_track_id == "lfm-rec-1"
 
 
-# ─── Commissary Discovery ─────────────────────────────────────────────────
+# ─── SoulSync Discovery ─────────────────────────────────────────────────
 
 
 class _FakeDiscoveryManager:
@@ -629,6 +824,232 @@ def test_soulsync_discovery_adapter_refresh_invokes_manager():
     src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
     src.refresh_playlist("42")
     assert manager.refresh_calls == [("hidden_gems", "", 1)]
+
+
+# ─── #1724: mirrors created by "Refresh & Mirror" carry ssd_ IDs ──────────
+# The frontend mirrors personalized playlists with
+# source_playlist_id="ssd_<kind>[_<variant>]" (its UPSERT-stable key), NOT
+# the personalized row id. The adapter used to int()-parse the ID, fail,
+# and return None — so a scheduled Auto-Sync of such a mirror refreshed
+# nothing and re-synced the stale stored tracks forever.
+
+
+def test_soulsync_discovery_adapter_get_by_synthetic_id():
+    manager = _FakeDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.get_playlist("ssd_hidden_gems")
+    assert detail is not None
+    assert detail.tracks[0].source_track_id == "sp-gem"
+
+
+def test_soulsync_discovery_adapter_refresh_by_synthetic_id():
+    manager = _FakeDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_hidden_gems")
+    assert manager.refresh_calls == [("hidden_gems", "", 1)]
+    assert detail is not None
+    assert detail.tracks[0].source_track_id == "sp-gem"
+
+
+def test_soulsync_discovery_adapter_refresh_by_synthetic_variant_id():
+    manager = _FakeDiscoveryManager()
+    manager._records = [_discovery_record(7, "time_machine", 1, "Time Machine", variant="1990s")]
+    manager.get_playlist_tracks = lambda playlist_id: manager._tracks if playlist_id == 7 else []
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_time_machine_1990s")
+    assert manager.refresh_calls == [("time_machine", "1990s", 1)]
+    assert detail is not None
+
+
+def test_soulsync_discovery_adapter_unknown_synthetic_id_returns_none():
+    manager = _FakeDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.get_playlist("ssd_no_such_kind") is None
+    assert src.refresh_playlist("ssd_no_such_kind") is None
+    assert manager.refresh_calls == []
+
+
+class _GeneratingDiscoveryManager(_FakeDiscoveryManager):
+    """Fake whose refresh creates the personalized row (like the real
+    manager's ensure_playlist inside refresh_playlist)."""
+
+    def __init__(self):
+        super().__init__()
+        self._records = []
+        self.registry = SimpleNamespace(all=lambda: [
+            SimpleNamespace(kind="discovery_shuffle", requires_variant=False),
+            SimpleNamespace(kind="time_machine", requires_variant=True,
+                            variant_resolver=lambda deps: ["1990s", "2000s"]),
+        ])
+
+    def refresh_playlist(self, kind: str, variant: str = "", profile_id: int = 1, config_overrides=None):
+        self.refresh_calls.append((kind, variant, profile_id))
+        name = "Discovery Shuffle" if kind == "discovery_shuffle" else f"Time Machine {variant}"
+        self._records = [_discovery_record(99, kind, 1, name, variant=variant)]
+        return self._records[0]
+
+    def get_playlist_tracks(self, playlist_id: int):
+        return self._tracks if playlist_id == 99 else []
+
+
+def test_soulsync_discovery_adapter_refresh_synthetic_without_record():
+    # Mirror exists but the personalized row is gone: refresh must still
+    # regenerate by parsing the ssd_ ID against the kind registry.
+    manager = _GeneratingDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_discovery_shuffle")
+    assert manager.refresh_calls == [("discovery_shuffle", "", 1)]
+    assert detail is not None
+    assert detail.tracks[0].source_track_id == "sp-gem"
+
+
+def test_soulsync_discovery_adapter_refresh_synthetic_variant_without_record():
+    manager = _GeneratingDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_time_machine_2000s")
+    assert manager.refresh_calls == [("time_machine", "2000s", 1)]
+    assert detail is not None
+
+
+def test_soulsync_discovery_adapter_refresh_unregistered_synthetic_returns_none():
+    manager = _GeneratingDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.refresh_playlist("ssd_reverted_kind_1") is None
+    assert manager.refresh_calls == []
+
+
+def test_soulsync_discovery_adapter_fallback_unproducible_variant_returns_none():
+    # Parsing deliberately doesn't validate variants (free-form genre
+    # variants aren't enumerated by their resolver — see the free-form
+    # test below). A variant that produces nothing is stopped by the
+    # empty-generation guard instead: the refresh was attempted, the
+    # result is None, and no 0-track detail reaches the caller.
+    manager = _EmptyGeneratingManager()
+    manager.registry = SimpleNamespace(all=lambda: [
+        SimpleNamespace(kind="time_machine", requires_variant=True),
+    ])
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.refresh_playlist("ssd_time_machine_99") is None
+    assert manager.refresh_calls == [("time_machine", "99", 1)]
+
+
+def test_soulsync_discovery_adapter_fallback_freeform_genre_variant_refreshes():
+    # genre_playlist's resolver enumerates only parent genres, but the
+    # kind supports free-form variants created on demand. The parse
+    # fallback must accept one the resolver doesn't list.
+    manager = _GeneratingDiscoveryManager()
+    manager.registry = SimpleNamespace(all=lambda: [
+        SimpleNamespace(kind="genre_playlist", requires_variant=True,
+                        variant_resolver=lambda deps: ["rock", "pop"]),
+    ])
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_genre_playlist_electronic_dance")
+    assert manager.refresh_calls == [("genre_playlist", "electronic_dance", 1)]
+    assert detail is not None
+    assert detail.tracks[0].source_track_id == "sp-gem"
+
+
+def test_soulsync_discovery_adapter_parse_longest_prefix_wins():
+    # With prefix-related kinds registered, the longest kind must claim
+    # the ID (frontend fixture pins the same for time vs time_machine).
+    manager = _GeneratingDiscoveryManager()
+    manager.registry = SimpleNamespace(all=lambda: [
+        SimpleNamespace(kind="time", requires_variant=True),
+        SimpleNamespace(kind="time_machine", requires_variant=True),
+    ])
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("ssd_time_machine_1990s")
+    assert manager.refresh_calls == [("time_machine", "1990s", 1)]
+    assert detail is not None
+
+
+def test_soulsync_discovery_adapter_synthetic_underscore_variant_exact_match():
+    # Variants containing underscores resolve by exact synthetic match,
+    # never by splitting, on both the get and refresh paths.
+    manager = _FakeDiscoveryManager()
+    manager._records = [_discovery_record(33, "genre_playlist", 1, "Genre — electronic_dance",
+                                          variant="electronic_dance")]
+    manager.get_playlist_tracks = lambda playlist_id: manager._tracks if playlist_id == 33 else []
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.get_playlist("ssd_genre_playlist_electronic_dance")
+    assert detail is not None
+    assert detail.tracks[0].source_track_id == "sp-gem"
+    detail = src.refresh_playlist("ssd_genre_playlist_electronic_dance")
+    assert manager.refresh_calls == [("genre_playlist", "electronic_dance", 1)]
+    assert detail is not None
+
+
+def test_soulsync_discovery_adapter_refresh_bare_variant_kind_returns_none():
+    # ssd_<kind> with no variant names a singleton only; a variant kind
+    # without its variant is an orphan ID (the frontend drops those rows).
+    # It must not reach the manager as (kind, '').
+    manager = _GeneratingDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.refresh_playlist("ssd_time_machine") is None
+    assert manager.refresh_calls == []
+
+
+class _EmptyGeneratingManager(_GeneratingDiscoveryManager):
+    """Refresh creates the row but the generator produced no tracks
+    (failure stamped on the row, or a variant with no data)."""
+
+    def refresh_playlist(self, kind: str, variant: str = "", profile_id: int = 1, config_overrides=None):
+        self.refresh_calls.append((kind, variant, profile_id))
+        self._records = [_discovery_record(98, kind, 0, "Empty", variant=variant)]
+        return self._records[0]
+
+    def get_playlist_tracks(self, playlist_id: int):
+        return []
+
+
+def test_soulsync_discovery_adapter_fallback_empty_generation_returns_none():
+    # A first generation via the parse fallback that yields 0 tracks must
+    # read as a FAILED refresh (None): the caller replaces the mirror with
+    # whatever detail it gets, so a 0-track detail would wipe the mirror.
+    manager = _EmptyGeneratingManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.refresh_playlist("ssd_discovery_shuffle") is None
+    assert manager.refresh_calls == [("discovery_shuffle", "", 1)]
+
+
+class _EmptySnapshotManager(_FakeDiscoveryManager):
+    """Existing record whose current snapshot has no tracks."""
+
+    def __init__(self):
+        super().__init__()
+        self._records = [_discovery_record(42, "hidden_gems", 0, "Hidden Gems")]
+
+    def get_playlist_tracks(self, playlist_id: int):
+        return []
+
+
+def test_soulsync_discovery_adapter_record_path_empty_snapshot_unchanged():
+    # The guard is fallback-only: with an existing record, the manager's
+    # snapshot semantics surface as before (here: an empty snapshot).
+    manager = _EmptySnapshotManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    detail = src.refresh_playlist("42")
+    assert detail is not None
+    assert detail.tracks == []
+
+
+class _CountingDiscoveryManager(_FakeDiscoveryManager):
+    def __init__(self):
+        super().__init__()
+        self.list_calls = 0
+
+    def list_playlists(self, profile_id: int = 1):
+        self.list_calls += 1
+        return super().list_playlists(profile_id=profile_id)
+
+
+def test_soulsync_discovery_adapter_garbage_id_does_not_query():
+    # An ID that is neither an integer row ID nor an ssd_ mirror ID
+    # resolves to None without a list_playlists call (pre-ssd_ behavior).
+    manager = _CountingDiscoveryManager()
+    src = SoulSyncDiscoveryPlaylistSource(lambda: manager, profile_id_getter=lambda: 1)
+    assert src.get_playlist("not-a-playlist") is None
+    assert manager.list_calls == 0
 
 
 def _discovery_record(id, kind, track_count, name="X", variant=""):
@@ -796,7 +1217,7 @@ def test_mirror_dict_spotify_authed_emits_matched_data():
 def test_default_discover_tracks_is_no_op():
     """Adapters whose tracks already carry provider IDs (Spotify,
     Tidal, Qobuz, YouTube, Deezer, Spotify-public, iTunes-link,
-    Commissary-Discovery) inherit the ABC default — return tracks
+    SoulSync-Discovery) inherit the ABC default — return tracks
     unchanged."""
     track = NormalizedTrack(
         position=0,

@@ -12,11 +12,15 @@ to the engine in one place. ``web_server.py`` calls
 
 from core.automation.handlers.process_wishlist import auto_process_wishlist
 from core.automation.handlers.scan_watchlist import auto_scan_watchlist
+from core.automation.handlers.audiobook_process_wishlist import auto_process_audiobook_wishlist
+from core.automation.handlers.audiobook_scan_watchlist import auto_scan_audiobook_watchlist
+from core.automation.handlers.audiobook_scan_library import auto_scan_audiobook_library
+from core.automation.handlers.audiobook_purge_recycle import auto_purge_audiobook_recycle
+from core.automation.handlers.scan_watchlist_podcasts import auto_scan_watchlist_podcasts
 from core.automation.handlers.scan_library import auto_scan_library
 from core.automation.handlers.refresh_mirrored import auto_refresh_mirrored
 from core.automation.handlers.sync_playlist import auto_sync_playlist
 from core.automation.handlers.discover_playlist import auto_discover_playlist
-from core.automation.handlers.resync_playlists import auto_resync_incomplete_playlists
 from core.automation.handlers.playlist_pipeline import auto_playlist_pipeline
 from core.automation.handlers.personalized_pipeline import auto_personalized_pipeline
 from core.automation.handlers.database_update import auto_start_database_update, auto_deep_scan_library
@@ -29,6 +33,7 @@ from core.automation.handlers.maintenance import (
     auto_backup_database,
     auto_refresh_beatport_cache,
 )
+from core.automation.handlers.library_cleanup import auto_library_cleanup
 from core.automation.handlers.download_cleanup import (
     auto_clean_search_history,
     auto_clean_completed_downloads,
@@ -41,11 +46,15 @@ from core.automation.handlers.registration import register_all
 __all__ = [
     'auto_process_wishlist',
     'auto_scan_watchlist',
+    'auto_process_audiobook_wishlist',
+    'auto_scan_audiobook_watchlist',
+    'auto_scan_audiobook_library',
+    'auto_purge_audiobook_recycle',
+    'auto_scan_watchlist_podcasts',
     'auto_scan_library',
     'auto_refresh_mirrored',
     'auto_sync_playlist',
     'auto_discover_playlist',
-    'auto_resync_incomplete_playlists',
     'auto_playlist_pipeline',
     'auto_personalized_pipeline',
     'auto_start_database_update',
@@ -53,6 +62,7 @@ __all__ = [
     'auto_run_duplicate_cleaner',
     'auto_start_quality_scan',
     'auto_clear_quarantine',
+    'auto_library_cleanup',
     'auto_cleanup_wishlist',
     'auto_update_discovery_pool',
     'auto_backup_database',

@@ -183,7 +183,9 @@ def test_extract_source_metadata_keeps_neutral_fields_and_skips_itunes_fallback_
     assert metadata["source"] == "spotify"
     assert metadata["title"] == "Song One"
     assert metadata["artist"] == "Artist One"
-    assert metadata["album_artist"] == "Artist One & Artist Two"
+    # first listed: the combined name starts with the track's one listed
+    # artist, so that's the album artist, no itunes lookup needed
+    assert metadata["album_artist"] == "Artist One"
     assert metadata["album"] == "Album One"
     assert metadata["track_number"] == 3
     assert metadata["total_tracks"] == 12
@@ -356,7 +358,7 @@ def test_embed_source_ids_writes_musicbrainz_release_year_and_updates_album_year
         def __init__(self):
             self.mb_client = _FakeMBClient()
 
-        def match_recording(self, title, artist):
+        def match_recording(self, title, artist, **kwargs):
             return {"mbid": "rec-mbid"}
 
         def match_artist(self, artist):
@@ -431,7 +433,7 @@ def test_musicbrainz_release_lookup_failure_does_not_poison_cache(monkeypatch):
             self.release_calls = 0
             self.mb_client = _FakeMBClient()
 
-        def match_recording(self, title, artist):
+        def match_recording(self, title, artist, **kwargs):
             return None
 
         def match_artist(self, artist):
@@ -446,6 +448,10 @@ def test_musicbrainz_release_lookup_failure_does_not_poison_cache(monkeypatch):
     monkeypatch.setattr(ms, "get_config_manager", lambda: _Config({"musicbrainz.embed_tags": True}))
     monkeypatch.setattr(ms, "mb_release_cache", {})
     monkeypatch.setattr(ms, "mb_release_detail_cache", {})
+    # L4 caches: reset per test like the release caches above, or artist
+    # lookups leak between tests (module-level, keyed by name/MBID).
+    monkeypatch.setattr(ms, "mb_artist_cache", {})
+    monkeypatch.setattr(ms, "mb_artist_detail_cache", {})
 
     service = _FakeMBService()
     runtime = types.SimpleNamespace(mb_worker=types.SimpleNamespace(mb_service=service))
@@ -688,7 +694,7 @@ def _build_mb_genre_test(monkeypatch, *, recording_genres, release_genres, artis
         def __init__(self):
             self.mb_client = _FakeMBClient()
 
-        def match_recording(self, t, a):
+        def match_recording(self, t, a, **kwargs):
             return {"mbid": "rec-mbid"}
 
         def match_artist(self, a):
@@ -701,6 +707,10 @@ def _build_mb_genre_test(monkeypatch, *, recording_genres, release_genres, artis
     monkeypatch.setattr(ms, "get_config_manager", lambda: _Config({"musicbrainz.embed_tags": True}))
     monkeypatch.setattr(ms, "mb_release_cache", {})
     monkeypatch.setattr(ms, "mb_release_detail_cache", {})
+    # L4 caches: reset per test like the release caches above, or artist
+    # lookups leak between tests (module-level, keyed by name/MBID).
+    monkeypatch.setattr(ms, "mb_artist_cache", {})
+    monkeypatch.setattr(ms, "mb_artist_detail_cache", {})
 
     runtime = types.SimpleNamespace(mb_worker=types.SimpleNamespace(mb_service=service))
     pp = {

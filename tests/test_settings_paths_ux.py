@@ -15,7 +15,10 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _INDEX = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
-_DOCS = (_ROOT / "webui" / "static" / "docs.js").read_text(encoding="utf-8")
+_DOCS = " ".join(
+    p.read_text(encoding="utf-8")
+    for p in sorted((_ROOT / "webui" / "static" / "docs-content").glob("*.js"))
+)
 _WIZ = (_ROOT / "webui" / "static" / "setup-wizard.js").read_text(encoding="utf-8")
 
 
@@ -42,29 +45,25 @@ def test_labels_dropped_the_ambiguous_transfer_language():
 
 
 def test_extra_libraries_section_stops_being_a_red_herring():
-    """The read-only extras must not read like the output folder. Once
-    "Music Libraries" came to mean DESTINATIONS, calling the read-only list
-    "Additional Music Libraries" recreated exactly the ambiguity this test
-    exists to prevent — so it's now named for what it is."""
-    assert "<h3>Additional Read-Only Paths</h3>" in _INDEX
+    assert "<h3>Additional Music Libraries</h3>" in _INDEX
     assert "<h3>Music Library Paths</h3>" not in _INDEX
-    assert "<h3>Additional Music Libraries</h3>" not in _INDEX
-    assert "you don't need to repeat them here" in _INDEX
-    # ...and it says plainly that nothing is filed INTO them.
-    assert "never file downloads into" in _INDEX
-
-
-def test_music_libraries_are_the_destinations():
-    """The section that DOES decide where downloads land, and the two things
-    about it that are easy to get wrong: which one is the default, and that
-    Docker paths are container-side."""
-    assert "<h3>Music Libraries</h3>" in _INDEX
-    assert "first" in _INDEX and "default destination" in _INDEX
-    section = _INDEX.split("<h3>Music Libraries</h3>", 1)[1][:1600]
-    assert "Docker" in section, "the page that takes arbitrary paths must say they're container-side"
+    assert "you don't need to repeat it here" in _INDEX
 
 
 def test_docs_and_wizard_tell_the_same_story():
-    assert "Music Libraries" in _DOCS
-    assert "Additional Read-Only Paths" in _DOCS
+    assert "Additional Music Libraries" in _DOCS
     assert "Music Library Folder" in _WIZ and "Download Folder" in _WIZ
+
+
+def test_podcasts_folder_field_present():
+    assert "Podcasts Folder (output):" in _INDEX
+    assert 'id="podcasts-path"' in _INDEX
+    assert "togglePathLock('podcasts', this)" in _INDEX
+
+
+def test_podcast_path_template_field_present():
+    assert "Podcast Path Template:" in _INDEX
+    assert 'id="template-podcast-path"' in _INDEX
+    assert 'placeholder="$show/Season $season/$title"' in _INDEX
+
+

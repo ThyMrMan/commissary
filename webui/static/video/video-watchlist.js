@@ -1,13 +1,11 @@
 /*
- * Commissary — Video Watchlist page (isolated).
+ * SoulSync — Video Watchlist page (isolated).
  *
  * The shows + people you follow, split by a Shows / People tab switcher.
  * Server-paged + searchable like the library (only a page of cards/posters
  * renders at once). Reads /api/video/watchlist?kind=&search=&page=&limit=.
  * Cards reuse the shared VideoWatchlist eye-button (reads as "watched" here;
- * un-follows on click, with a confirm). A followed show you don't own yet also
- * gets a Library cog — the only place that choice can be made before the first
- * download makes it permanent.
+ * un-follows on click, with a confirm).
  */
 (function () {
     'use strict';
@@ -54,7 +52,7 @@
     // back-catalog cog + the shared follow eye; opens the studio detail page.
     function studioCard(it) {
         var logo = it.poster_url
-            ? '<img class="vwlp-studio-logo" src="' + esc(it.poster_url) + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
+            ? '<img class="vwlp-studio-logo" src="' + esc(sized(it.poster_url, 500)) + '" alt="" loading="lazy" onerror="this.style.display=\'none\'">'
             : '<span class="vwlp-studio-ph">&#127902;</span>';
         var eye = wlBtn({ kind: 'studio', tmdbId: it.tmdb_id, title: it.title, poster: it.poster_url });
         var cog = '<button type="button" data-vwlp-ssettings="' + esc(it.tmdb_id) + '" data-title="' + esc(it.title) + '" ' +
@@ -85,205 +83,27 @@
         return '<span class="vwlp-pill">' + esc(status) + '</span>';
     }
 
-    function isAdmin() {
-        return !(typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin);
-    }
-
-    // A follow filed by a profile without download rights sits approved=0: it's on
-    // the list so the requester can see it, but nothing acquires it until an admin
-    // approves. Admins get the Approve/Decline pair inline on the card.
-    function pendingChrome(it, kind) {
-        if (it.approved !== false) return { badge: '', actions: '' };
-        var who = it.requested_by_name ? ' · asked by ' + esc(it.requested_by_name) : '';
-        var badge = '<span class="vwlp-pending-badge" title="Waiting for an admin to approve' +
-            (it.requested_by_name ? ' — requested by ' + esc(it.requested_by_name) : '') + '">' +
-            '⏳ Awaiting approval' + (isAdmin() ? who : '') + '</span>';
-        if (!isAdmin()) return { badge: badge, actions: '' };
-        var d = 'data-vwlp-kind="' + esc(kind) + '" data-vwlp-tmdb="' + esc(it.tmdb_id) + '"';
-        return { badge: badge, actions:
-            '<div class="vwlp-pending-actions">' +
-            '<button type="button" class="vwlp-approve" ' + d + '>Approve</button>' +
-            '<button type="button" class="vwlp-deny" ' + d + '>Decline</button></div>' };
-    }
-
-    // ── "which Library does this show land in?" — shows only ─────────────────
-    // The FIRST download of a show decides where it lives forever: it imports
-    // into whichever server section the grab was filed under, and the next
-    // library scan stamps that Library onto the show row. After that the show's
-    // own detail page can reassign it; BEFORE it, the follow is the only place
-    // the intent can be recorded — and until now nothing could record it, so
-    // every new show's first grab went to the primary Library by default.
+    // Ask for a THUMBNAIL, not the original.
     //
-    // The registry loads asynchronously and can land either side of the first
-    // render, so cards emit an empty SLOT and paintLibCogs() fills every one;
-    // it's called from BOTH ends of that race. (Same shape as the wishlist's
-    // per-card picker, which had the same problem.)
-    var LIB_ICON =
-        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
-        'stroke-width="2" stroke-linecap="round" aria-hidden="true">' +
-        '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M8.5 4v16M13.5 4v16"/></svg>';
-    var _showLibs = [];        // configured show Libraries: [{id, label, server_title, category}]
-    var _libsLoaded = false;
-
-    function mayGrab() { return (typeof canDownload !== 'function') || canDownload(); }
-
-    // Who can actually save one. The route checks can_download — but the
-    // blueprint's gate runs first and treats ANY write whose path ends in
-    // '/library' as a library mutation, which this endpoint's path does. So it
-    // is admin-only in practice, and the route's own 403 branch is unreachable
-    // for a non-admin. Both conditions here, so this is never a button that
-    // 403s on every press (the shape the Manage panel was fixed for).
-    function mayChooseLibrary() { return isAdmin() && mayGrab(); }
-
-    function loadShowLibraries() {
-        if (_libsLoaded) return;
-        _libsLoaded = true;
-        fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                // configured = the Library REGISTRY every profile can read, and the
-                // only half that carries the ids root_folder_id points at; d.tv is
-                // live server-section discovery, which is admin-only and has none.
-                _showLibs = ((d && d.configured) || {}).tv || [];
-                paintLibCogs();   // cards drawn before the registry arrived
-            })
-            .catch(function () { /* no registry → no picker; cards render unchanged */ });
-    }
-
-    function libLabel(l) { return (l && (l.label || l.server_title)) || ('Library ' + (l && l.id)); }
-    function libById(id) {
-        for (var i = 0; i < _showLibs.length; i++)
-            if (String(_showLibs[i].id) === String(id)) return _showLibs[i];
-        return null;
-    }
-
-    // ``cur`` = '' for "no choice recorded", which means the backend's primary
-    // fallback. An id that is no longer configured reads the same way — the
-    // Library it named is gone, so the fallback is what will actually happen.
-    function libCogHTML(cur) {
-        // One Library (or none) is not a decision to make — an empty slot
-        // collapses, so the card looks exactly as it did before.
-        if (_showLibs.length < 2) return '';
-        var l = cur ? libById(cur) : null;
-        return '<button type="button" data-vwlp-lib aria-label="Choose Library" title="' +
-            esc(l ? ('Lands in ' + libLabel(l) + ' — click to change')
-                  : 'Choose which Library this show lands in') + '" ' +
-            'style="position:absolute;bottom:8px;left:8px;z-index:4;width:28px;height:28px;border-radius:9px;' +
-            'cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);' +
-            'color:#fff;border:1px solid ' + (l ? 'rgba(var(--accent-rgb),.9)' : 'rgba(255,255,255,.14)') +
-            ';background:' + (l ? 'rgba(var(--accent-rgb),.55)' : 'rgba(0,0,0,.55)') + ';">' + LIB_ICON + '</button>';
-    }
-
-    // Only shows, and only ones with no library row yet: an owned show's Library
-    // is already settled, and its detail page reassigns it for REAL (moving the
-    // show row and anything queued, not just recording an intent) — two controls
-    // for one decision would be worse than one. Hidden from profiles the server
-    // would refuse — see mayChooseLibrary.
-    function libSlot(it, kind) {
-        if (kind !== 'show' || !it.tmdb_id || it.library_id || !mayChooseLibrary()) return '';
-        return '<span data-vwlp-lib-slot data-tmdb="' + esc(it.tmdb_id) +
-            '" data-title="' + esc(it.title) + '" data-current="' +
-            esc(it.root_folder_id == null ? '' : it.root_folder_id) + '"></span>';
-    }
-
-    function paintLibCogs(root) {
-        var slots = (root || document).querySelectorAll('[data-vwlp-lib-slot]');
-        for (var i = 0; i < slots.length; i++)
-            slots[i].innerHTML = libCogHTML(slots[i].getAttribute('data-current') || '');
-    }
-
-    function libPickerHTML(title, cur) {
-        function opt(id, label, hint) {
-            var on = String(id) === String(cur);
-            return '<button type="button" data-vlib-v="' + esc(id) + '" style="display:block;width:100%;' +
-                'text-align:left;padding:11px 13px;border-radius:10px;cursor:pointer;font-size:13px;' +
-                'font-weight:700;color:#fff;border:1px solid ' +
-                (on ? 'rgb(var(--accent-rgb))' : 'rgba(255,255,255,.12)') + ';background:' +
-                (on ? 'rgba(var(--accent-rgb),.18)' : 'rgba(255,255,255,.03)') + ';">' + esc(label) +
-                (hint ? '<span style="display:block;margin-top:2px;font-size:11.5px;font-weight:600;' +
-                        'color:rgba(255,255,255,.45);">' + esc(hint) + '</span>' : '') + '</button>';
+    // The cards are 158px wide (128 on small screens) and were being handed the
+    // full-size art: Plex returns a ~2000x3000 poster when no width is asked for,
+    // which the browser then decodes to ~24MB of bitmap PER CARD and scales down.
+    // Sixty of those is over a gigabyte of texture behind a grid of thumbnails,
+    // and it shows up as the compositor taking most of a second to repaint a
+    // hover. 342 covers a 158px cell at 2x DPR.
+    //
+    // Same helper the wishlist page has used for a while - the proxy takes ?w=,
+    // and a TMDB url gets its size segment rewritten instead.
+    function sized(url, w) {
+        if (!url) return url;
+        if (url.indexOf('/api/video/poster/') !== -1 || url.indexOf('/api/video/backdrop/') !== -1) {
+            return url + (url.indexOf('?') === -1 ? '?' : '&') + 'w=' + w;
         }
-        return '<div style="width:min(410px,100%);background:#15161c;border:1px solid rgba(255,255,255,.1);' +
-                'border-radius:16px;padding:22px;box-shadow:0 24px 60px rgba(0,0,0,.5);">' +
-            '<div style="font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;' +
-                'color:rgba(255,255,255,.45);">Library</div>' +
-            '<h3 style="margin:4px 0 2px;font-size:19px;color:#fff;">' + esc(title || 'This show') + '</h3>' +
-            '<p style="margin:0 0 16px;font-size:12.5px;line-height:1.55;color:rgba(255,255,255,.55);">' +
-                'Where this show lands when an episode is first grabbed. Nothing moves on disk — ' +
-                'it has no files yet, and that first import is what decides its shelf for good.</p>' +
-            '<div data-vlib-opts style="display:grid;gap:8px;">' +
-                opt('', 'Default (primary)', 'The first show Library — what happens with no choice') +
-                _showLibs.map(function (l) {
-                    // The category is a useful subtitle ('Anime' under 'Shelf 2')
-                    // — but a Library NAMED after its category would just print
-                    // itself twice.
-                    var c = String(l.category || '');
-                    return opt(l.id, libLabel(l),
-                               c.toLowerCase() === String(libLabel(l)).toLowerCase() ? '' : c);
-                }).join('') +
-            '</div>' +
-            '<div style="display:flex;justify-content:flex-end;gap:8px;margin-top:20px;">' +
-                '<button type="button" data-vlib-cancel style="padding:9px 16px;border-radius:10px;border:1px solid rgba(255,255,255,.14);background:transparent;color:rgba(255,255,255,.8);font-weight:700;cursor:pointer;">Cancel</button>' +
-                '<button type="button" data-vlib-save style="padding:9px 18px;border-radius:10px;border:none;background:rgb(var(--accent-rgb));color:#fff;font-weight:800;cursor:pointer;">Save</button>' +
-            '</div></div>';
-    }
-
-    // POST, not the wishlist picker's PUT — a different endpoint on a different
-    // table. '' (Default) is sent as an explicit null, which is how the choice is
-    // CLEARED; omitting the field would leave the old one in place.
-    function saveWatchlistLibrary(tmdbId, val) {
-        return fetch('/api/video/watchlist/library', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ tmdb_id: parseInt(tmdbId, 10),
-                                   root_folder_id: (val === '' || val == null) ? null : parseInt(val, 10) }),
-        }).then(function (r) { return r.ok ? r.json() : null; });
-    }
-
-    function openLibraryPicker(slot) {
-        // Hiding the cog is not the check — same defence-in-depth as the Manage
-        // panel and the poster modal, which guard open() as well as their
-        // launchers. A picker whose every save comes back 403 should not open at
-        // all, however it was reached.
-        if (!mayChooseLibrary()) return;
-        var title = slot.getAttribute('data-title') || '';
-        var sel = slot.getAttribute('data-current') || '';
-        var ov = document.createElement('div');
-        ov.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.6);display:flex;' +
-            'align-items:center;justify-content:center;padding:20px;';
-        ov.innerHTML = libPickerHTML(title, sel);
-        document.body.appendChild(ov);
-        function close() { if (ov.parentNode) ov.parentNode.removeChild(ov); document.removeEventListener('keydown', onKey); }
-        function onKey(e) { if (e.key === 'Escape') close(); }
-        document.addEventListener('keydown', onKey);
-        ov.addEventListener('click', function (e) {
-            if (e.target === ov || e.target.closest('[data-vlib-cancel]')) { close(); return; }
-            var opt = e.target.closest('[data-vlib-v]');
-            if (opt) { sel = opt.getAttribute('data-vlib-v'); ov.innerHTML = libPickerHTML(title, sel); return; }
-            var save = e.target.closest('[data-vlib-save]');
-            if (!save) return;
-            save.disabled = true;
-            saveWatchlistLibrary(slot.getAttribute('data-tmdb'), sel)
-                .then(function (d) {
-                    if (!d || !d.success) {
-                        save.disabled = false;
-                        if (typeof showToast === 'function') showToast((d && d.error) || 'Could not change the Library', 'error');
-                        return;
-                    }
-                    // Repaint from the slot rather than reloading the page: the card
-                    // is otherwise unchanged, and a reload would lose the scroll.
-                    slot.setAttribute('data-current', sel);
-                    paintLibCogs(slot.parentNode || undefined);
-                    if (typeof showToast === 'function') {
-                        var l = sel ? libById(sel) : null;
-                        showToast(l ? ('Will download into ' + libLabel(l)) : 'Using the default Library', 'success');
-                    }
-                    close();
-                })
-                .catch(function () {
-                    save.disabled = false;
-                    if (typeof showToast === 'function') showToast('Could not change the Library', 'error');
-                });
-        });
+        if (url.indexOf('image.tmdb.org') !== -1) {
+            var b = w <= 185 ? 185 : (w <= 342 ? 342 : (w <= 500 ? 500 : 780));
+            return url.replace(/\/t\/p\/[^/]+\//, '/t/p/w' + b + '/');
+        }
+        return url;
     }
 
     function cardHTML(it, kind) {
@@ -293,13 +113,9 @@
         var openId = source === 'library' ? it.library_id : it.tmdb_id;
         var href = '/video-detail/' + source + '/' + kind + '/' + openId;
         var ph = kind === 'person' ? '👤' : '📺';   // 👤 / 📺
-        // A failed poster must fall BACK to the placeholder, not just hide itself —
-        // display:none left a blank tile that looked like a broken card rather than
-        // a title with no art. Same idiom the search/discover cards already use.
         var art = it.poster_url
-            ? '<img class="vwlp-card-img" src="' + esc(it.poster_url) + '" alt="" loading="lazy" ' +
-              'onload="this.classList.add(\'vwlp-loaded\')" ' +
-              'onerror="this.outerHTML=\'<div class=&quot;vwlp-card-ph&quot;>' + ph + '</div>\'">'
+            ? '<img class="vwlp-card-img" src="' + esc(sized(it.poster_url, 342)) + '" alt="" loading="lazy" ' +
+              'onload="this.classList.add(\'vwlp-loaded\')" onerror="this.style.display=\'none\'">'
             : '<div class="vwlp-card-ph">' + ph + '</div>';
         var btn = window.VideoGet
             ? VideoGet.cardButton({ kind: kind, tmdbId: it.tmdb_id, libraryId: it.library_id,
@@ -317,14 +133,11 @@
               'background:rgba(0,0,0,.55);color:#fff;font-size:15px;line-height:1;cursor:pointer;display:flex;' +
               'align-items:center;justify-content:center;backdrop-filter:blur(4px);">&#9881;</button>'
             : '';
-        var pend = pendingChrome(it, kind);
-        return '<a class="vwlp-card' + (kind === 'person' ? ' vwlp-card--person' : '') +
-            (it.approved === false ? ' vwlp-card--pending' : '') + '" href="' + href + '" ' +
+        return '<a class="vwlp-card' + (kind === 'person' ? ' vwlp-card--person' : '') + '" href="' + href + '" ' +
             'data-vwlp-open="' + kind + '" data-vwlp-source="' + source + '" data-vwlp-openid="' + esc(openId) + '">' +
-            '<div class="vwlp-card-art">' + art + '<div class="vwlp-card-scrim"></div>' + pill + cog + btn +
-            libSlot(it, kind) + '</div>' +
+            '<div class="vwlp-card-art">' + art + '<div class="vwlp-card-scrim"></div>' + pill + cog + btn + '</div>' +
             '<div class="vwlp-card-info"><span class="vwlp-card-title" title="' + esc(it.title) + '">' +
-            esc(it.title) + '</span>' + meta + pend.badge + pend.actions + '</div></a>';
+            esc(it.title) + '</span>' + meta + '</div></a>';
     }
 
     function updateNavBadge(counts) {
@@ -390,7 +203,6 @@
             var renderer = state.tab === 'studio'
                 ? studioCard : function (it) { return cardHTML(it, state.tab); };
             grid.innerHTML = items.map(renderer).join('');
-            paintLibCogs(grid);   // this end of the race: registry already in hand
             if (window.VideoWatchlist) VideoWatchlist.hydrate(grid);
         }
     }
@@ -704,50 +516,10 @@
     // FULL page reload). The eye button's capture-phase handler already stops its
     // own clicks from reaching here. Mirrors video-library.js.
     function onGridClick(e) {
-        // Approve / Decline a pending follow. These sit inside the card's <a>,
-        // so both handlers must stop the navigation before doing anything.
-        var appr = e.target.closest('.vwlp-approve, .vwlp-deny');
-        if (appr) {
-            e.preventDefault(); e.stopPropagation();
-            if (appr.disabled) return;
-            var deny = appr.classList.contains('vwlp-deny');
-            appr.disabled = true;
-            appr.textContent = deny ? 'Declining…' : 'Approving…';
-            fetch('/api/video/watchlist/' + (deny ? 'deny' : 'approve'), {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ kind: appr.getAttribute('data-vwlp-kind'),
-                                       tmdb_id: parseInt(appr.getAttribute('data-vwlp-tmdb'), 10) })
-            }).then(function (r) { return r.json().catch(function () { return null; }); })
-              .then(function (d) {
-                  if (d && d.success) {
-                      if (typeof toast === 'function') {
-                          toast(deny ? 'Request declined'
-                                     : 'Approved' + (d.wished ? ' — wishlisted ' + d.wished + ' episode'
-                                                                + (d.wished === 1 ? '' : 's') : ''),
-                                'success');
-                      }
-                      load();
-                  } else {
-                      appr.disabled = false;
-                      appr.textContent = deny ? 'Decline' : 'Approve';
-                      if (typeof toast === 'function') toast((d && d.error) || 'Failed', 'error');
-                  }
-              });
-            return;
-        }
         var pcog = e.target.closest('[data-vwlp-psettings]');
         if (pcog) {
             e.preventDefault(); e.stopPropagation();
             openLookbackSettings('person', pcog.getAttribute('data-vwlp-psettings'), pcog.getAttribute('data-title'));
-            return;
-        }
-        // The cog sits inside the card's <a>, so a bare click would navigate to
-        // the detail page instead of opening the picker.
-        var lcog = e.target.closest('[data-vwlp-lib]');
-        if (lcog) {
-            e.preventDefault(); e.stopPropagation();
-            var lslot = lcog.closest('[data-vwlp-lib-slot]');
-            if (lslot) openLibraryPicker(lslot);
             return;
         }
         var scog = e.target.closest('[data-vwlp-ssettings]');
@@ -817,7 +589,6 @@
         document.addEventListener('soulsync:video-page-shown', onShown);
         refreshBadge();   // seed the nav badge on boot
         refreshChannelCount();
-        loadShowLibraries();   // the per-card Library picker needs the registry
     }
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

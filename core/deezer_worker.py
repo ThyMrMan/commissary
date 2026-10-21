@@ -19,7 +19,13 @@ from core.worker_utils import (
     release_titles,
     set_album_api_track_count,
 )
-from core.enrichment.manual_match_honoring import honor_stored_match
+from core.enrichment.manual_match_honoring import MATCHED, honor_stored_match
+from core.library.artist_credits import (
+    AlbumCreditsBackfill,
+    CreditsBackfill,
+    try_save_album_credits,
+    try_save_track_credits,
+)
 
 logger = get_logger("deezer_worker")
 
@@ -54,6 +60,10 @@ class DeezerWorker:
 
         # Retry configuration
         self.retry_days = 30
+        # tracks matched before the worker kept artist credits. one /track call
+        # each, so small batches, about the pace of a normal match
+        self._credits_backfill = CreditsBackfill('deezer', batch_size=3)
+        self._album_credits_backfill = AlbumCreditsBackfill('deezer', batch_size=3)
 
         # Name matching threshold
         self.name_similarity_threshold = 0.80
@@ -226,12 +236,25 @@ class DeezerWorker:
             if row:
                 return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2], 'artist_deezer_id': row[3]}
 
+            # Priority 3b: artist credits. rematched albums and tracks, then
+            # the one-time sweeps of ones matched before we kept them. albums
+            # first, there are far fewer and they're what collab pages need
+            album_backfill = self._album_credits_backfill.next_batch(cursor)
+            if album_backfill:
+                return {'type': 'album_credits_backfill', 'id': album_backfill[0][0],
+                        'albums': album_backfill,
+                        'name': f"Artist credits for {len(album_backfill)} albums"}
+            backfill = self._credits_backfill.next_batch(cursor)
+            if backfill:
+                return {'type': 'credits_backfill', 'id': backfill[0][0], 'tracks': backfill,
+                        'name': f"Artist credits for {len(backfill)} tracks"}
+
             # Priority 4: Retry 'not_found' artists after retry_days
             not_found_cutoff = datetime.now() - timedelta(days=self.retry_days)
             cursor.execute("""
                 SELECT id, name
                 FROM artists
-                WHERE deezer_match_status = 'not_found' AND deezer_last_attempted < ?
+                WHERE deezer_match_status IN ('not_found', 'error') AND deezer_last_attempted < ?
                 ORDER BY deezer_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -245,7 +268,7 @@ class DeezerWorker:
                 SELECT a.id, a.title, ar.name AS artist_name, ar.deezer_id AS artist_deezer_id
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.deezer_match_status = 'not_found' AND a.deezer_last_attempted < ?
+                WHERE a.deezer_match_status IN ('not_found', 'error') AND a.deezer_last_attempted < ?
                 ORDER BY a.deezer_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -258,7 +281,7 @@ class DeezerWorker:
                 SELECT t.id, t.title, ar.name AS artist_name, ar.deezer_id AS artist_deezer_id
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.deezer_match_status = 'not_found' AND t.deezer_last_attempted < ?
+                WHERE t.deezer_match_status IN ('not_found', 'error') AND t.deezer_last_attempted < ?
                 ORDER BY t.deezer_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -278,8 +301,8 @@ class DeezerWorker:
     def _normalize_name(self, name: str) -> str:
         """Normalize name for comparison"""
         name = name.lower().strip()
-        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'\s*\(.*?\)\s*', ' ', name)
+        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'[^\w\s]', '', name)
         name = re.sub(r'\s+', ' ', name).strip()
         return name
@@ -288,6 +311,13 @@ class DeezerWorker:
         """Check if Deezer result name matches our query with fuzzy matching"""
         norm_query = self._normalize_name(query_name)
         norm_result = self._normalize_name(result_name)
+        if not norm_query or not norm_result:
+            # Titles that normalize to NOTHING ("(Intro)", "[Skit]", "!!!",
+            # "...") would compare at SequenceMatcher ratio 1.0 against any
+            # other such title — fall back to exact raw comparison instead.
+            raw_q = (query_name or '').strip().lower()
+            raw_r = (result_name or '').strip().lower()
+            return bool(raw_q) and raw_q == raw_r
 
         similarity = SequenceMatcher(None, norm_query, norm_result).ratio()
         logger.debug(f"Name similarity: '{query_name}' vs '{result_name}' = {similarity:.2f}")
@@ -388,6 +418,16 @@ class DeezerWorker:
 
     def _process_item(self, item: Dict[str, Any]):
         """Process a single item (artist, album, or track)"""
+        if item.get('type') in ('credits_backfill', 'album_credits_backfill'):
+            # not a match, so nothing to mark as error if it fails
+            try:
+                if item['type'] == 'album_credits_backfill':
+                    self._process_album_credits_backfill(item)
+                else:
+                    self._process_credits_backfill(item)
+            except Exception as e:
+                logger.error(f"Error backfilling Deezer artist credits: {e}")
+            return
         try:
             item_type = item['type']
             item_id = item['id']
@@ -433,6 +473,11 @@ class DeezerWorker:
         """Process an artist: search Deezer, verify, store metadata"""
         existing_id = self._get_existing_id('artist', artist_id)
         if existing_id:
+            # Has an id but status may still be NULL (e.g. an id-only manual
+            # match) and _get_next_item selects NULL rows every loop — stamp
+            # 'matched' so this artist stops re-selecting and blocking the
+            # queue (#964, the JioSaavn fix applied here too).
+            self._mark_status('artist', artist_id, 'matched')
             logger.debug(f"Preserving existing Deezer ID for artist '{artist_name}': {existing_id}")
             return
 
@@ -488,14 +533,22 @@ class DeezerWorker:
         # never refreshed metadata). Now it goes through the full
         # refresh path via the stored ID, picking up label / genres /
         # explicit updates without ever overwriting the manual match.
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='albums', entity_id=album_id,
             id_column='deezer_id',
             client_fetch_fn=self.client.get_album_raw,
             on_match_fn=self._refresh_album_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='deezer_match_status',
             log_prefix='Deezer',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
             return
 
         result = self.client.search_album(artist_name, album_name)
@@ -537,20 +590,60 @@ class DeezerWorker:
             self.stats['not_found'] += 1
             logger.debug(f"No match for album '{album_name}'")
 
+    def _track_from_matched_album(self, track_id: int, track_name: str) -> Optional[Dict[str, Any]]:
+        """The track's entry in its album's Deezer tracklist, or None when the
+        album has no Deezer match or the title isn't on it."""
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT al.deezer_id, t.track_number FROM tracks t "
+                "JOIN albums al ON t.album_id = al.id WHERE t.id = ?", (track_id,))
+            row = cursor.fetchone()
+        except Exception as e:
+            logger.debug("album lookup for track %s failed: %s", track_id, e)
+            return None
+        finally:
+            if conn:
+                conn.close()
+        if not row or not row[0]:
+            return None
+        try:
+            tracks = self.client.get_album_tracks_raw(row[0])
+            return self.client.pick_track_from_list(tracks, track_name, row[1])
+        except Exception as e:
+            logger.debug("album tracklist match for '%s' failed: %s", track_name, e)
+            return None
+
     def _process_track(self, track_id: int, track_name: str, artist_name: str, item: Dict[str, Any]):
         """Process a track: search Deezer, verify, fetch full details for BPM, store metadata"""
         # Issue #501: honor manual matches (see _process_album).
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='tracks', entity_id=track_id,
             id_column='deezer_id',
             client_fetch_fn=self.client.get_track_raw,
             on_match_fn=self._refresh_track_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='deezer_match_status',
             log_prefix='Deezer',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
             return
 
-        result = self.client.search_track(artist_name, track_name)
+        # the album is matched before its tracks (artists, albums, then tracks),
+        # so look the song up in that album's own tracklist first. an artist
+        # search fails when the library credits the album to "Various Artists"
+        # or a label, and Deezer's search index leaves some songs out entirely.
+        result = self._track_from_matched_album(track_id, track_name)
+        if result is None:
+            result = self.client.search_track(artist_name, track_name)
         if result:
             result_name = result.get('title', '')
             if self._name_matches(track_name, result_name):
@@ -651,6 +744,11 @@ class DeezerWorker:
                 album_id
             ))
 
+            # every album artist. the full /album record has contributors,
+            # the search hit only the primary
+            if full_data:
+                try_save_album_credits(cursor, album_id, 'deezer', full_data.get('contributors'))
+
             # Update label if available
             if label:
                 cursor.execute("""
@@ -687,7 +785,7 @@ class DeezerWorker:
                     genre_names = [g.get('name') for g in genres_data if g.get('name')]
                     if genre_names:
                         from core.genre_filter import filter_genres
-                        from config.settings import config_manager as _cfg
+                        from core.settings import config_manager as _cfg
                         genre_names = filter_genres(genre_names, _cfg)
                     if genre_names:
                         cursor.execute("""
@@ -738,6 +836,11 @@ class DeezerWorker:
                 track_id
             ))
 
+            # every artist on the track. only the full /track record has
+            # contributors, the search result just has the primary artist
+            if full_data:
+                try_save_track_credits(cursor, track_id, 'deezer', full_data.get('contributors'))
+
             # Update BPM if available and non-zero
             if bpm and bpm > 0:
                 cursor.execute("""
@@ -760,6 +863,45 @@ class DeezerWorker:
         finally:
             if conn:
                 conn.close()
+
+    def _process_album_credits_backfill(self, item: Dict[str, Any]):
+        """album artists for albums matched before we kept them, off the full
+        /album record."""
+        for album_id, deezer_album_id, _ in item['albums']:
+            if self.should_stop:
+                break
+            full = self.client.get_album_raw(deezer_album_id)
+            if not full:
+                continue
+            conn = None
+            try:
+                conn = self.db._get_connection()
+                try_save_album_credits(conn.cursor(), album_id, 'deezer', full.get('contributors'))
+                conn.commit()
+            finally:
+                if conn:
+                    conn.close()
+
+    def _process_credits_backfill(self, item: Dict[str, Any]):
+        """credits for tracks matched before we kept them, off the full /track
+        record (cached when the match fetched it recently)."""
+        saved = 0
+        for track_id, deezer_track_id, _album_id in item['tracks']:
+            if self.should_stop:
+                break
+            full = self.client.get_track_raw(deezer_track_id)
+            if not full:
+                continue
+            conn = None
+            try:
+                conn = self.db._get_connection()
+                if try_save_track_credits(conn.cursor(), track_id, 'deezer', full.get('contributors')):
+                    saved += 1
+                conn.commit()
+            finally:
+                if conn:
+                    conn.close()
+        logger.debug("Deezer credits backfill: %d/%d tracks", saved, len(item['tracks']))
 
     def _mark_status(self, entity_type: str, entity_id: int, status: str):
         """Mark an entity (artist, album, or track) with a match status"""

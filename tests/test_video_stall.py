@@ -1,177 +1,253 @@
-"""A stall clock a restart could reset — so the longer something was stuck, the
-less likely it was ever caught.
+"""A stall clock that survives a restart, and notices "finished but unfindable".
 
-Ported from upstream SoulSync 3.2.1. Six torrents on a live install sat at the
-same percentage for 199 minutes against a 30-minute timeout and were never
-failed. They all flipped to 'searching' about 30 minutes after a restart: the
-clock was a module dict keyed off ``time.monotonic()``, so every restart wiped
-it and handed each stuck download a fresh half hour. The perverse consequence is
-that the more restarts a dead download survived, the safer it was.
+Both defects were read off the live install.
 
-The clock now lives on the row (``progress_at``) in wall-clock time. It survives
-restarts, and it is the same measure a person uses looking at the Downloads
-page: "this hasn't moved since 4pm".
+**The clock was wiped by every restart.** Six torrents sat at the same percentage
+for 199 minutes against a 30-minute timeout and were never failed — SoulSync had
+restarted inside the window, and the clock, being a module dict keyed off
+``time.monotonic()``, restarted with it. The perverse consequence: the longer a
+download had been stuck, the more restarts it had survived, and the *less* likely
+it was to ever be caught. Storing the clock on the row fixes it, and wall-clock is
+also the measure a person uses looking at the page — "this hasn't moved since 4pm".
 
-Two more things fall out of the same read:
-
-  · "Finished, but the file never appeared" was not tracked AT ALL. That patch
-    carries progress and NO status, and the old branch matched only
-    queued/downloading, so the row fell through every guard and spun at 100%
-    forever. On a library spread across many mount roots that is exactly what an
-    unresolvable save path looks like, so it gets its own message.
-
-  · A BACKWARDS percentage is no longer read as movement. A torrent re-checking
-    or resuming briefly reports less, and counting that as progress renewed the
-    grace period every time it happened.
+**Finishing with no findable file was not tracked at all.** When a torrent reports
+complete and the importer can't locate its file, the patch carries progress and NO
+status. The old branch matched only ``queued``/``downloading``, so that row fell
+through every guard and spun at 100% forever. On a library spread over eleven mount
+roots, an unresolvable save path is exactly how that happens — so it gets its own
+message, because telling someone "no progress" when the bytes are already on disk
+sends them hunting seeders that were never the problem.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from core.video.stall import (
+    DEFAULT_TIMEOUT_SECONDS,
+    MOVED,
+    SEEDED,
+    STALLED,
+    WAITING,
+    classify,
+    is_terminal,
+    reason,
+    tracks_stall,
+)
 
-import pytest
-
-from core.video import stall
-
-
-def _stamp(seconds_ago: float) -> str:
-    """A stored ``progress_at`` that many seconds in the past.
-
-    Built the way the PRODUCTION WRITER builds it — ``download_monitor._now()``
-    is ``time.strftime(...)``, i.e. local wall-clock with no offset. This helper
-    used to build a UTC-naive string instead, which matched the reader's
-    (wrong) assumption rather than the writer, and is why the whole file passed
-    while every real download on a non-UTC host was killed four seconds after
-    its last progress reading. A fixture that models the reader instead of the
-    writer cannot catch a reader/writer disagreement."""
-    return (datetime.now() - timedelta(seconds=seconds_ago)).strftime(
-        "%Y-%m-%d %H:%M:%S")
+_T = 1800          # the monitor's 30 minutes
+_NOON = 1_775_000_000.0
 
 
-def _now() -> float:
-    return datetime.now(timezone.utc).timestamp()
+def _at(seconds_ago):
+    """A stored timestamp N seconds before _NOON, in SQLite's format."""
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(_NOON - seconds_ago, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-class TestTheClockSurvivesARestart:
-    def test_a_download_stuck_past_the_timeout_is_stalled(self):
-        """THE regression. The stored stamp is wall-clock, so process uptime is
-        irrelevant — this is the case the old module dict could never see after
-        a restart."""
-        verdict, idle = stall.classify(50.0, 50.0, _stamp(3600), _now(),
-                                       timeout_seconds=1800)
-        assert verdict == stall.STALLED
-        assert idle == pytest.approx(3600, abs=5)
+# ── movement ─────────────────────────────────────────────────────────────────
 
-    def test_inside_the_grace_period_it_just_waits(self):
-        verdict, idle = stall.classify(50.0, 50.0, _stamp(600), _now(),
-                                       timeout_seconds=1800)
-        assert verdict == stall.WAITING and idle == pytest.approx(600, abs=5)
-
-    def test_progress_resets_the_clock(self):
-        verdict, idle = stall.classify(50.0, 51.0, _stamp(3600), _now(),
-                                       timeout_seconds=1800)
-        assert verdict == stall.MOVED and idle == 0.0
-
-    def test_a_row_with_no_clock_yet_starts_one(self):
-        """A new row, or one migrated before the column existed. It must not read
-        as infinitely stalled — that would mass-fail an existing queue on the
-        first poll after an upgrade."""
-        assert stall.classify(0, 0, None, _now())[0] == stall.SEEDED
-        assert stall.classify(0, 0, "", _now())[0] == stall.SEEDED
-
-    def test_an_unparseable_stamp_is_treated_as_no_clock(self):
-        """Never as infinitely stalled — a bad timestamp must not fail a queue."""
-        assert stall.classify(0, 0, "not-a-date", _now())[0] == stall.SEEDED
+def test_forward_progress_resets_the_clock():
+    assert classify(10.0, 12.5, _at(9999), _NOON, timeout_seconds=_T)[0] == MOVED
 
 
-class TestBackwardsIsNotProgress:
-    def test_a_recheck_reporting_less_does_not_renew_the_grace(self):
-        """A torrent re-verifying briefly reports a lower percentage. Counting
-        that as movement handed a dead download a fresh half hour every time it
-        happened."""
-        verdict, _ = stall.classify(80.0, 40.0, _stamp(3600), _now(),
-                                    timeout_seconds=1800)
-        assert verdict == stall.STALLED
-
-    def test_identical_progress_is_not_movement_either(self):
-        assert stall.classify(80.0, 80.0, _stamp(3600), _now(),
-                              timeout_seconds=1800)[0] == stall.STALLED
-
-    @pytest.mark.parametrize("prev,new", [(None, 1.0), (0, 0.5), ("", 2)])
-    def test_going_forwards_from_nothing_still_counts(self, prev, new):
-        assert stall.classify(prev, new, _stamp(3600), _now())[0] == stall.MOVED
-
-    @pytest.mark.parametrize("prev,new", [("junk", "junk"), (None, None)])
-    def test_junk_percentages_do_not_raise(self, prev, new):
-        assert stall.classify(prev, new, _stamp(10), _now())[0] in (
-            stall.WAITING, stall.STALLED)
+def test_a_backwards_percentage_is_not_movement():
+    """A recheck or a resumed torrent re-verifying briefly reports LESS. Reading
+    that as progress hands a dead download a fresh half hour, every time it
+    happens — which is how something stays queued forever while looking busy."""
+    assert classify(50.0, 12.0, _at(_T + 60), _NOON, timeout_seconds=_T)[0] == STALLED
 
 
-class TestWhichStatesAreWatched:
-    @pytest.mark.parametrize("status", ["queued", "downloading", "", None])
-    def test_a_live_download_is_watched(self, status):
-        assert stall.tracks_stall(status) is True
-
-    @pytest.mark.parametrize("status", ["completed", "failed", "cancelled",
-                                        "import_failed"])
-    def test_a_finished_one_is_not(self, status):
-        assert stall.tracks_stall(status) is False
-        assert stall.is_terminal(status) is True
-
-    @pytest.mark.parametrize("status", ["importing", "searching"])
-    def test_busy_elsewhere_is_not_watched(self, status):
-        """An import sits at 100% for as long as the copy takes, and a multi-GB
-        file over SMB can exceed the timeout easily — failing it for "no
-        progress" would destroy a download that was working perfectly.
-        'searching' belongs to the requery thread, which owns its own lifetime."""
-        assert stall.tracks_stall(status) is False
-        assert stall.is_terminal(status) is False
-
-    def test_a_statusless_patch_IS_watched(self):
-        """The "finished but unplaceable" shape: progress and no status. The old
-        branch matched only queued/downloading, so this fell through every guard
-        and spun at 100% forever."""
-        assert stall.tracks_stall(None) is True
+def test_standing_still_inside_the_window_just_waits():
+    v, idle = classify(50.0, 50.0, _at(600), _NOON, timeout_seconds=_T)
+    assert v == WAITING and 590 <= idle <= 610
 
 
-class TestTheMessage:
-    def test_an_ordinary_stall_says_how_long(self):
-        assert stall.reason(stall.STALLED, 3600) == "Stalled — no progress for 60 min"
-
-    def test_a_completed_but_unplaceable_download_says_something_else(self):
-        """Telling someone "no progress" when the bytes are already on disk
-        sends them hunting seeders that were never the problem."""
-        msg = stall.reason(stall.STALLED, 1860, at_completion=True)
-        assert "never appeared" in msg
-        assert "save path" in msg
-        assert "no progress" not in msg
-
-    @pytest.mark.parametrize("bad", [None, "", "junk", object()])
-    def test_junk_input_never_raises(self, bad):
-        """A message is not worth raising over — this one was a real bug caught
-        upstream by the junk-input test."""
-        assert isinstance(stall.reason(stall.STALLED, bad), str)
+def test_standing_still_past_the_window_is_stalled():
+    v, idle = classify(50.0, 50.0, _at(_T + 120), _NOON, timeout_seconds=_T)
+    assert v == STALLED and idle > _T
 
 
-def test_the_monitor_no_longer_keeps_the_clock_in_memory():
-    """Source guard. The module dict is the defect; a revert would restore it."""
+def test_the_boundary_is_not_off_by_one():
+    assert classify(1, 1, _at(_T - 1), _NOON, timeout_seconds=_T)[0] == WAITING
+    assert classify(1, 1, _at(_T + 1), _NOON, timeout_seconds=_T)[0] == STALLED
+
+
+# ── the restart that started all this ────────────────────────────────────────
+
+def test_the_clock_is_wall_clock_so_a_restart_cannot_reset_it():
+    """The exact live case: stuck 199 minutes, timeout 30, and the process only
+    came up 29 minutes ago. Under the old uptime-based clock this was invisible.
+    Nothing here reads process uptime, so a fresh start changes nothing."""
+    v, idle = classify(47.8, 47.8, _at(199 * 60), _NOON, timeout_seconds=_T)
+    assert v == STALLED
+    assert idle > 199 * 60 - 5
+
+
+def test_a_row_with_no_clock_yet_starts_one_rather_than_failing():
+    """Every existing row is like this the first time the new code sees it. Reading
+    a missing timestamp as 'infinitely stalled' would fail the entire queue on the
+    first tick after an upgrade."""
+    for empty in (None, "", "   "):
+        assert classify(0, 0, empty, _NOON, timeout_seconds=_T)[0] == SEEDED
+
+
+def test_an_unreadable_timestamp_is_treated_as_no_clock_not_as_forever():
+    for bad in ("not a date", "13/08/2026", "yesterday", object()):
+        assert classify(0, 0, bad, _NOON, timeout_seconds=_T)[0] == SEEDED, bad
+
+
+def test_an_epoch_number_is_accepted_too():
+    assert classify(1, 1, _NOON - (_T + 60), _NOON, timeout_seconds=_T)[0] == STALLED
+
+
+def test_junk_progress_never_raises():
+    for bad in (None, "", "abc", object()):
+        assert classify(bad, bad, _at(10), _NOON, timeout_seconds=_T)[0] in (
+            MOVED, WAITING, STALLED, SEEDED)
+
+
+def test_a_zero_or_silly_timeout_cannot_fail_everything_instantly():
+    assert classify(1, 1, _at(0), _NOON, timeout_seconds=0)[0] == WAITING
+
+
+def test_the_default_timeout_matches_the_monitor():
+    assert DEFAULT_TIMEOUT_SECONDS == 1800
+
+
+# ── what the row is told ─────────────────────────────────────────────────────
+
+def test_an_ordinary_stall_reports_the_minutes():
+    assert reason(STALLED, 199 * 60) == "Stalled — no progress for 199 min"
+
+
+def test_finishing_with_no_findable_file_says_that_instead():
+    """These are different problems. One is nobody seeding; the other is a file
+    that IS on disk somewhere SoulSync can't reach — a path question. Saying 'no
+    progress' for the second sends people hunting seeders."""
+    msg = reason(STALLED, 40 * 60, at_completion=True)
+    assert "never appeared" in msg and "save path" in msg
+    assert "no progress" not in msg.lower()
+
+
+def test_the_reason_survives_junk_input():
+    for bad in (None, "", -5, "x"):
+        assert isinstance(reason(STALLED, bad), str)
+
+
+def test_terminal_states_are_recognised():
+    for s in ("completed", "failed", "cancelled", "import_failed"):
+        assert is_terminal(s) is True
+    for s in ("downloading", "queued", "importing", "searching", None, ""):
+        assert is_terminal(s) is False
+
+
+def test_an_import_in_flight_is_never_stall_killed():
+    """An import sits at 100% for as long as the copy takes, and a multi-GB file
+    over SMB can pass the 30-minute timeout easily. Failing it for 'no progress'
+    would destroy a download that was working perfectly — the exact regression
+    that widening the branch beyond queued/downloading could have introduced."""
+    assert tracks_stall("importing") is False
+
+
+def test_a_searching_row_is_left_to_its_own_thread():
+    assert tracks_stall("searching") is False
+
+
+def test_the_states_that_are_watched():
+    for s in ("downloading", "queued", None, ""):
+        assert tracks_stall(s) is True, s
+    for s in ("completed", "failed", "cancelled", "import_failed"):
+        assert tracks_stall(s) is False, s
+
+
+def test_the_no_status_patch_is_watched():
+    """The completed-but-unplaceable case carries progress and no status at all."""
+    assert tracks_stall(None) is True
+
+
+# ── the monitor actually uses it ─────────────────────────────────────────────
+
+def _monitor_src() -> str:
+    import inspect
     from pathlib import Path
-    src = (Path(__file__).resolve().parent.parent / "core" / "video"
-           / "download_monitor.py").read_text(encoding="utf-8")
-    # NB: match the assignment, not the bare name — 'tracks_stall' contains
-    # '_stall' as a substring, which is the trap upstream's own test hit.
-    assert "_stall: dict" not in src
-    assert "_stall.pop(" not in src
-    assert "stall.tracks_stall(" in src
-    assert 'upd["progress_at"]' in src
+    from core.video import download_monitor
+    return Path(inspect.getfile(download_monitor)).read_text(encoding="utf-8")
 
 
-def test_the_row_can_store_the_clock(tmp_path):
-    import database.video_database as mod
-    if hasattr(mod, "_initialized_paths"):
-        mod._initialized_paths.clear()
-    db = mod.VideoDatabase(str(tmp_path / "v.db"))
-    conn = db._get_connection()
-    cols = [r["name"] for r in conn.execute("PRAGMA table_info(video_downloads)")]
-    conn.close()
-    assert "progress_at" in cols
+def test_the_in_memory_clock_is_gone_for_good():
+    """Leaving it in place alongside the row-stored one would quietly restore the
+    restart bug for whichever path still read it."""
+    src = _monitor_src()
+    # Name the DICT operations, not the bare substring — 'tracks_stall' contains
+    # '_stall' and a loose match would pass or fail for the wrong reason.
+    for dead in ("_stall[", "_stall.get(", "_stall.pop(", "_stall: dict", "_stall ="):
+        assert dead not in src, dead
+    # monotonic is fine elsewhere in this file (a search deadline); what must not
+    # come back is a stall decision measured against process uptime.
+    tick = src[src.index("def _tick("):]
+    assert "monotonic" not in tick, "uptime is what made the stall clock unreliable"
+
+
+def test_the_monitor_stores_the_clock_on_the_row():
+    assert 'upd["progress_at"] = _now()' in _monitor_src()
+
+
+def test_the_completion_case_is_no_longer_skipped():
+    """The old branch matched only queued/downloading; a completed-but-unplaceable
+    patch has NO status and fell through everything."""
+    src = _monitor_src()
+    assert "stall.tracks_stall" in src
+    assert "at_completion" in src
+
+
+def test_the_column_rides_the_migration_list():
+    """Live installs upgrade in place — a column added only to CREATE TABLE would
+    be missing on every existing database."""
+    from pathlib import Path
+    db = Path("database/video_database.py").read_text(encoding="utf-8")
+    start = db.index("_COLUMN_MIGRATIONS = [")
+    end = db.index("]", db.index('("shows", "tvdb_match_status"'))
+    assert '("video_downloads", "progress_at", "TEXT")' in db[start:end]
+
+
+# ── retrying the right things ────────────────────────────────────────────────
+
+def test_the_unfindable_file_case_does_not_go_back_out_to_search():
+    """Observed on the live install: a stalled download requeries, and the requery
+    path CLEARS the error on its way through — so the six torrents ended up saying
+    "No working release found after retries", which points at the indexer when the
+    swarm was the problem.
+
+    For a download that already finished, that is worse than unhelpful: the bytes
+    are on disk, re-downloading changes nothing, and the message naming the real
+    cause (the path mapping) would be overwritten by a generic one. So the
+    completion case skips the retry ladder and keeps its diagnosis."""
+    src = _monitor_src()
+    assert "allow_retry=not _at_completion" in src
+    fn = src[src.index("def _fail_or_retry("):src.index("def _search_for_retry(")]
+    assert "allow_retry: bool = True" in fn, "ordinary failures must still retry"
+    assert 'if allow_retry else {"action": "fail"}' in fn
+
+
+def test_an_ordinary_stall_still_gets_its_retries():
+    """The change must not disarm the retry ladder for the case it exists for — a
+    dead swarm genuinely does deserve another release."""
+    src = _monitor_src()
+    tick = src[src.index("def _tick("):]
+    assert "allow_retry=not _at_completion" in tick
+    assert "allow_retry=False" not in tick, "never unconditionally off"
+
+
+def test_monitor_clock_is_utc_even_when_server_local_time_is_seven_hours_behind(monkeypatch):
+    """A fresh Pacific-time grab used to become 420 minutes old on its next poll."""
+    import time
+    from core.video import download_monitor as monitor
+    epoch = 1788624000.0
+    utc = time.gmtime(epoch)
+    local = time.gmtime(epoch - 7 * 3600)
+    real_strftime = time.strftime
+    monkeypatch.setattr(monitor.time, "gmtime", lambda: utc)
+    monkeypatch.setattr(monitor.time, "strftime",
+                        lambda fmt, value=None: real_strftime(fmt, local if value is None else value))
+    stored = monitor._now()
+    assert classify(0, 0, stored, epoch + 5) == (WAITING, 5.0)
+    assert classify(0, 0, stored, epoch + 1801)[0] == STALLED

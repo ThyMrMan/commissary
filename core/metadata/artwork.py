@@ -5,10 +5,12 @@ from __future__ import annotations
 import errno
 import os
 import re
+import threading
 import time
 import urllib.request
+from collections import OrderedDict
 from ipaddress import ip_address
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from core.imports.context import get_import_context_album, get_import_context_artist
 from core.metadata.common import (
@@ -201,6 +203,13 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
                     return _browser_safe_image_url(fixed_url)
 
             elif active_server == 'navidrome':
+                parsed_cover = urlparse(thumb_url)
+                cover_id = parse_qs(parsed_cover.query).get('id', [''])[0]
+                if parsed_cover.path.rstrip('/').endswith('/getCoverArt') and cover_id:
+                    # Keep the cover identity, not a newly salted auth URL. The
+                    # existing proxy authenticates and caches when the image is
+                    # requested, outside library JSON serialization.
+                    return '/api/navidrome/cover/' + quote(cover_id, safe='')
                 navidrome_config = cfg.get_navidrome_config()
                 navidrome_base_url = navidrome_config.get('base_url', '')
                 navidrome_username = navidrome_config.get('username', '')
@@ -222,12 +231,9 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
                     salt = secrets.token_hex(6)
                     token = hashlib.md5((navidrome_password + salt).encode()).hexdigest()
 
-                    # Add authentication parameters to the URL. `c` is the Subsonic
-                    # client name and is deliberately still "SoulSync" — see
-                    # core/navidrome_client.SUBSONIC_CLIENT_NAME for why.
-                    from core.navidrome_client import SUBSONIC_CLIENT_NAME
+                    # Add authentication parameters to the URL
                     separator = '&' if '?' in path else '?'
-                    auth_params = f"u={navidrome_username}&t={token}&s={salt}&v=1.16.1&c={SUBSONIC_CLIENT_NAME}&f=json"
+                    auth_params = f"u={navidrome_username}&t={token}&s={salt}&v=1.16.1&c=SoulSync&f=json"
 
                     # Construct proper Navidrome Subsonic URL
                     fixed_url = f"{navidrome_base_url.rstrip('/')}{path}{separator}{auth_params}"
@@ -244,14 +250,46 @@ def normalize_image_url(thumb_url: str | None) -> str | None:
         return _browser_safe_image_url(thumb_url)
 
 
+# deezer's "this artist has no picture": the picture hash is empty, or it is
+# d41d8cd9..., the md5 of an empty string. the url is well formed and starts
+# with https, so every "is there an image" check that looks for http let it
+# through, and breakbot and billie eilish sat on the watchlist with a mic icon
+# while their library rows had perfectly good plex thumbs.
+_DEEZER_EMPTY_HASH = 'd41d8cd98f00b204e9800998ecf8427e'
+
+
+def is_placeholder_image_url(url: str | None) -> bool:
+    """True for a url that is a real url but will never show a picture."""
+    if not url:
+        return False
+    value = str(url).strip().lower()
+    if not value or value == 'none':
+        return False
+    if 'dzcdn.net' in value or 'deezer.com' in value:
+        if '/images/artist//' in value or '/images/cover//' in value or '/images/playlist//' in value:
+            return True
+        if _DEEZER_EMPTY_HASH in value:
+            return True
+    return False
+
+
+def usable_image_url(url: str | None) -> bool:
+    """a non-empty url that is not a known placeholder."""
+    if not url:
+        return False
+    value = str(url).strip()
+    return bool(value) and value.lower() != 'none' and not is_placeholder_image_url(value)
+
+
 def is_image_proxy_url(url: str) -> bool:
-    """Return True for Commissary image proxy/cache URLs, absolute or relative."""
+    """Return True for SoulSync image proxy/cache URLs, absolute or relative."""
     if not url:
         return False
 
     try:
         parsed = urlparse(url)
-        return parsed.path == '/api/image-proxy' or parsed.path.startswith('/api/image-cache/')
+        return (parsed.path == '/api/image-proxy' or parsed.path.startswith('/api/image-cache/')
+                or parsed.path.startswith('/api/navidrome/cover/'))
     except Exception:
         return False
 
@@ -281,7 +319,7 @@ def is_internal_image_host(url: str) -> bool:
 
 
 def _browser_safe_image_url(url: str) -> str:
-    """Return a browser-safe image URL, proxying internal hosts through Commissary."""
+    """Return a browser-safe image URL, proxying internal hosts through SoulSync."""
     if not url:
         return url
 
@@ -363,6 +401,47 @@ _caa_original_down_until = 0.0
 _CAA_ORIGINAL_COOLDOWN_S = 600
 
 
+# L3: bounded album-scoped artwork byte cache. Enhancement embeds art per
+# track, so without this a 12-track album fetched the identical cover 12
+# times. Entries are keyed by (album identity, URL): bounded (FIFO eviction
+# at _ART_FETCH_CACHE_MAX) so memory stays small; failures are NEVER cached
+# so a transient 404/timeout doesn't poison the rest of the batch; and one
+# album's bytes are never served to another album.
+_art_fetch_cache: "OrderedDict[tuple, tuple[bytes, str]]" = OrderedDict()
+_ART_FETCH_CACHE_MAX = 64
+_art_fetch_cache_lock = threading.Lock()
+
+
+def _art_cache_key_for(metadata: dict) -> tuple:
+    """Stable album identity for the L3 art cache, from the fields that are
+    constant across an album's tracks."""
+    md = metadata if isinstance(metadata, dict) else {}
+    artist = str(md.get("album_artist") or md.get("artist") or "").strip().lower()
+    album = str(md.get("album") or "").strip().lower()
+    release = str(md.get("musicbrainz_release_id") or "").strip().lower()
+    art_url = str(md.get("album_art_url") or "").strip().lower()
+    return (artist, album, release, art_url)
+
+
+def _cached_fetch_art_bytes(art_url: str, album_key: tuple):
+    """URL->bytes fetch scoped to one album's batch (see _art_fetch_cache).
+    Cache hits skip the network; misses delegate to _fetch_art_bytes and
+    only successes are stored."""
+    key = (album_key, art_url)
+    with _art_fetch_cache_lock:
+        if key in _art_fetch_cache:
+            _art_fetch_cache.move_to_end(key)
+            return _art_fetch_cache[key]
+    # Call the module global by name so tests can stub _fetch_art_bytes.
+    data, mime = _fetch_art_bytes(art_url)
+    if data:
+        with _art_fetch_cache_lock:
+            _art_fetch_cache[key] = (data, mime)
+            while len(_art_fetch_cache) > _ART_FETCH_CACHE_MAX:
+                _art_fetch_cache.popitem(last=False)
+    return data, mime
+
+
 def _fetch_art_bytes(art_url: str):
     """Fetch artwork bytes at the highest resolution the source serves.
 
@@ -411,7 +490,7 @@ def _fetch_art_bytes(art_url: str):
     return None, None
 
 
-def _min_size_art_validator(min_px):
+def _min_size_art_validator(min_px, fetch_fn=None):
     """Build a ``(validate, cache)`` pair for the preferred-art resolver.
 
     ``validate(source, url)`` fetches the candidate cover, caches its bytes (so
@@ -421,11 +500,15 @@ def _min_size_art_validator(min_px):
     next source instead of letting it win on priority alone. Images whose
     dimensions can't be read are accepted (don't over-reject; the fallback is
     still today's art). ``min_px <= 0`` disables the size gate entirely.
+
+    ``fetch_fn`` defaults to :func:`_fetch_art_bytes`; pass the L3
+    album-scoped cached fetch so validation hits don't re-download per track.
     """
     cache = {}
+    _fetch = fetch_fn or _fetch_art_bytes
 
     def validate(_source, url):
-        res = _fetch_art_bytes(url)
+        res = _fetch(url)
         cache[url] = res
         data = res[0] if res else None
         if not data:
@@ -450,6 +533,16 @@ def embed_album_art_metadata(audio_file, metadata: dict):
         image_data = None
         mime_type = None
 
+        if metadata.get("_manual"):
+            return _embed_manual_art(audio_file, metadata, symbols)
+
+        # L3: album-scoped URL->bytes fetch shared across this album's
+        # per-track calls, so the same cover isn't re-downloaded per track.
+        _album_key = _art_cache_key_for(metadata)
+
+        def _album_fetch(url):
+            return _cached_fetch_art_bytes(url, _album_key)
+
         # User-preferred cover-art source. When album_art_order is a non-empty
         # list it is the SOLE authority for preferred art (put 'caa' in it to use
         # Cover Art Archive), and the legacy prefer_caa_art toggle below is
@@ -459,7 +552,8 @@ def embed_album_art_metadata(audio_file, metadata: dict):
         try:
             from core.metadata.art_lookup import select_preferred_art_url
             _validate, _art_cache = _min_size_art_validator(
-                cfg.get("metadata_enhancement.min_art_size", 1000))
+                cfg.get("metadata_enhancement.min_art_size", 1000),
+                fetch_fn=_album_fetch)
             preferred_url = select_preferred_art_url(
                 metadata.get("album_artist") or metadata.get("artist"),
                 metadata.get("album"),
@@ -469,7 +563,7 @@ def embed_album_art_metadata(audio_file, metadata: dict):
             )
             if preferred_url:
                 cached = _art_cache.get(preferred_url)
-                image_data, mime_type = cached if (cached and cached[0]) else _fetch_art_bytes(preferred_url)
+                image_data, mime_type = cached if (cached and cached[0]) else _album_fetch(preferred_url)
         except Exception as exc:
             logger.debug("Preferred art-source selection failed: %s", exc)
 
@@ -495,7 +589,7 @@ def embed_album_art_metadata(audio_file, metadata: dict):
             # with cover.jpg (same preference + fetch).
             from core.metadata.caa_art import fetch_release_preferred_art
             image_data, mime_type, used_url = fetch_release_preferred_art(
-                release_mbid, art_url, fetch_fn=_fetch_art_bytes)
+                release_mbid, art_url, fetch_fn=_album_fetch)
             if not image_data:
                 if not art_url and not release_mbid:
                     logger.warning("No album art URL available for embedding.")
@@ -507,49 +601,66 @@ def embed_album_art_metadata(audio_file, metadata: dict):
             logger.error("Failed to download album art data.")
             return False
 
-        # A FLAC metadata block carries a 24-bit length, so nothing over
-        # 16,777,215 bytes can ever be written. mutagen only finds out at SAVE
-        # time and raises "block is too long to write", which fails the whole
-        # tag write — the track ends up with no art AND no tags, and the log
-        # says "Album art successfully embedded" right before it.
-        #
-        # Some CDNs serve genuinely huge originals (the downloader prefers the
-        # original over a 1200px thumbnail), so this is reachable on ordinary
-        # downloads rather than being exotic. Ported from upstream 3.3.1.
-        if isinstance(audio_file, symbols.FLAC) and len(image_data) > FLAC_MAX_PICTURE_BYTES:
-            shrunk = _shrink_for_flac(image_data, mime_type)
-            if shrunk is None:
-                logger.warning(
-                    "Album art is %.1f MB, over the %.1f MB a FLAC picture block can hold, "
-                    "and it could not be resized — writing tags without art rather than "
-                    "failing the whole save.",
-                    len(image_data) / 1048576, FLAC_MAX_PICTURE_BYTES / 1048576)
-                return False
-            logger.info("Album art resized to fit a FLAC picture block (%.1f MB -> %.1f MB).",
-                        len(image_data) / 1048576, len(shrunk) / 1048576)
-            image_data, mime_type = shrunk, "image/jpeg"
-
-        if isinstance(audio_file.tags, symbols.ID3):
-            audio_file.tags.add(symbols.APIC(encoding=3, mime=mime_type, type=3, desc="Cover", data=image_data))
-        elif isinstance(audio_file, symbols.FLAC):
-            picture = symbols.Picture()
-            picture.data = image_data
-            picture.type = 3
-            picture.mime = mime_type
-            width, height = get_image_dimensions(image_data)
-            picture.width = width or 640
-            picture.height = height or 640
-            picture.depth = 24
-            audio_file.add_picture(picture)
-        elif isinstance(audio_file, symbols.MP4):
-            fmt = symbols.MP4Cover.FORMAT_JPEG if "jpeg" in mime_type else symbols.MP4Cover.FORMAT_PNG
-            audio_file["covr"] = [symbols.MP4Cover(image_data, imageformat=fmt)]
-
-        logger.info("Album art successfully embedded.")
-        return True
+        return _write_embedded_art(audio_file, image_data, mime_type, symbols)
     except Exception as exc:
         logger.error("Error embedding album art: %s", exc)
         return False
+
+
+def _write_embedded_art(audio_file, image_data: bytes, mime_type: str, symbols) -> bool:
+    """put the cover into the file's tags, fitted to what the container allows"""
+    # A FLAC metadata block carries a 24-bit length, so nothing over
+    # 16,777,215 bytes can ever be written. mutagen only finds out at SAVE
+    # time and raises "block is too long to write", which fails the whole
+    # tag write — the track ends up with no art AND no tags, and the log
+    # says "Album art successfully embedded" right before it (Boulder,
+    # Aug 2026, a 1-09 capaz.flac from LA CIUDAD).
+    #
+    # Some CDNs serve genuinely huge originals (#806 deliberately prefers
+    # the original over the 1200px thumbnail), so this is reachable on
+    # ordinary downloads.
+    if isinstance(audio_file, symbols.FLAC) and len(image_data) > FLAC_MAX_PICTURE_BYTES:
+        shrunk = _shrink_for_flac(image_data, mime_type)
+        if shrunk is None:
+            logger.warning(
+                "Album art is %.1f MB, over the %.1f MB a FLAC picture block can hold, "
+                "and it could not be resized — writing tags without art rather than "
+                "failing the whole save.",
+                len(image_data) / 1048576, FLAC_MAX_PICTURE_BYTES / 1048576)
+            return False
+        logger.info("Album art resized to fit a FLAC picture block (%.1f MB -> %.1f MB).",
+                    len(image_data) / 1048576, len(shrunk) / 1048576)
+        image_data, mime_type = shrunk, "image/jpeg"
+
+    if isinstance(audio_file.tags, symbols.ID3):
+        audio_file.tags.add(symbols.APIC(encoding=3, mime=mime_type, type=3, desc="Cover", data=image_data))
+    elif isinstance(audio_file, symbols.FLAC):
+        picture = symbols.Picture()
+        picture.data = image_data
+        picture.type = 3
+        picture.mime = mime_type
+        width, height = get_image_dimensions(image_data)
+        picture.width = width or 640
+        picture.height = height or 640
+        picture.depth = 24
+        audio_file.add_picture(picture)
+    elif isinstance(audio_file, symbols.MP4):
+        fmt = symbols.MP4Cover.FORMAT_JPEG if "jpeg" in mime_type else symbols.MP4Cover.FORMAT_PNG
+        audio_file["covr"] = [symbols.MP4Cover(image_data, imageformat=fmt)]
+
+    logger.info("Album art successfully embedded.")
+    return True
+
+
+def _embed_manual_art(audio_file, metadata: dict, symbols) -> bool:
+    """embed the user's own cover on a hand-tagged file, never a looked-up one"""
+    from core.metadata.manual import read_manual_cover
+    image_data, mime_type = read_manual_cover(metadata.get("_manual_cover_path"))
+    if not image_data and metadata.get("album_art_url"):
+        image_data, mime_type = _fetch_art_bytes(metadata.get("album_art_url"))
+    if not image_data:
+        return False
+    return _write_embedded_art(audio_file, image_data, mime_type or "image/jpeg", symbols)
 
 
 def download_cover_art(album_info: dict, target_dir: str, context: dict = None, force: bool = False):
@@ -591,6 +702,22 @@ def download_cover_art(album_info: dict, target_dir: str, context: dict = None, 
             is_upgrade = False
 
         image_data = None
+
+        from core.metadata.manual import is_manual_context, manual_cover_path, read_manual_cover
+        if is_manual_context(context):
+            # a hand-tagged release: the user's cover or nothing. the lookups
+            # below match by artist + album name and would find the studio cover
+            image_data, _ = read_manual_cover(manual_cover_path(context))
+            if not image_data:
+                album_ctx = get_import_context_album(context) or {}
+                art_url = album_info.get("album_image_url") or album_ctx.get("image_url")
+                image_data = _fetch_art_bytes(art_url)[0] if art_url else None
+            if not image_data:
+                return
+            with open(cover_path, "wb") as handle:
+                handle.write(image_data)
+            logger.info("Cover art saved (hand-tagged): %s", cover_path)
+            return
 
         # User-preferred cover-art source (no-op unless album_art_order is set).
         # cover.jpg only supports the artist+album sources here (no MBID in

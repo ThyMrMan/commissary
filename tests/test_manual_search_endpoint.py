@@ -136,16 +136,11 @@ def manual_search_client(monkeypatch):
                     'soundcloud': _make_plugin(),
                 }
 
-                # Sources that index whole releases rather than tracks — the
-                # real registry marks these via PluginSpec.release_level.
-                RELEASE_LEVEL = {'torrent', 'usenet'}
-
                 class _FakeSpec:
                     def __init__(self, name):
                         self.name = name
                         self.display_name = name.title()
                         self.aliases = ()
-                        self.release_level = name in RELEASE_LEVEL
 
                 class _FakeRegistry:
                     def __init__(self, plugins_dict):
@@ -163,30 +158,9 @@ def manual_search_client(monkeypatch):
                     def all_plugins(self):
                         return list(self._plugins.items())
 
-                    def configured_plugins(self):
-                        return [(n, p) for n, p in self._plugins.items()
-                                if p.is_configured()]
-
-                    def searchable_plugins(self):
-                        return self.configured_plugins()
-
-                    def is_release_level(self, name):
-                        spec = self.get_spec(name)
-                        return bool(spec and spec.release_level)
-
                 fake_orch = MagicMock()
                 fake_orch.registry = _FakeRegistry(plugins)
                 fake_orch.client = MagicMock(side_effect=lambda name: plugins.get(name))
-                # The endpoint asks for the auto-cascade chain only to ANNOTATE
-                # which sources the unattended fallback would use; it no longer
-                # restricts the search to them. A MagicMock's return value isn't
-                # iterable, so give it the real config-backed order.
-                fake_orch._resolve_source_chain = MagicMock(
-                    side_effect=lambda: [
-                        n for n in config_manager.get('download_source.hybrid_order', []) or []
-                        if n in plugins
-                    ]
-                )
 
                 monkeypatch.setattr(web_server, 'download_orchestrator', fake_orch)
 
@@ -220,7 +194,7 @@ def manual_search_client(monkeypatch):
 
                 # Default config: hybrid mode with all six in hybrid_order.
                 # Individual tests override this.
-                from config.settings import config_manager
+                from core.settings import config_manager
                 original_get = config_manager.get
 
                 def _fake_config_get(key, default=None):
@@ -253,7 +227,7 @@ def test_manual_search_soundcloud_link_forces_soundcloud_source(manual_search_cl
     — it must NOT be turned into a text query or fan out to other sources."""
     client, ctx = manual_search_client
     # Hybrid order = soundcloud only, so SoundCloud is the lone available source.
-    from config.settings import config_manager
+    from core.settings import config_manager
     original = config_manager.get
 
     def _cfg(key, default=None):
@@ -279,15 +253,105 @@ def test_manual_search_soundcloud_link_errors_when_not_connected(manual_search_c
     """A SoundCloud link with SoundCloud not configured → clear 400, not a
     useless text search of the raw URL."""
     client, ctx = manual_search_client
-    # Actually disconnect it. This used to lean on soundcloud being absent
-    # from hybrid_order, but a source's absence from the fallback CHAIN no
-    # longer makes it unavailable to search — only is_configured() does.
-    ctx['plugins']['soundcloud'].is_configured = MagicMock(return_value=False)
+    # Default hybrid_order has no soundcloud → it's not an available source.
+    # Commissary: every configured source is searchable now, so "not connected"
+    # has to mean unconfigured (core/commissary/search_sources.py)
+    ctx['plugins']['soundcloud'].is_configured.return_value = False
     resp = client.post('/api/downloads/task/task-abc/manual-search',
                        json={'query': 'https://soundcloud.com/artist/track', 'source': 'all'})
     assert resp.status_code == 400
     assert 'soundcloud' in resp.get_data(as_text=True).lower()
     ctx['plugins']['soundcloud'].search.assert_not_called()
+
+
+def _wire_deezer_link_plugin(ctx, *, track=None, album=None):
+    """Give the mocked Deezer plugin real get_track / get_album so a pasted
+    link resolves instead of MagicMock-faking a payload."""
+    plugin = ctx['plugins']['deezer']
+    plugin.get_track = MagicMock(return_value=track)
+    plugin.get_album = MagicMock(return_value=album)
+    plugin.get_track_result = MagicMock(return_value=None)
+    return plugin
+
+
+def test_manual_search_deezer_track_link_forces_deezer_source(manual_search_client):
+    """A pasted Deezer track URL resolves to artist+title and searches Deezer
+    only — not a text search of the raw URL across every source."""
+    client, ctx = manual_search_client
+    plugin = _wire_deezer_link_plugin(ctx, track={
+        'id': 2914419581,
+        'title': 'Raccoons (Gaudi & Don Letts Remix)',
+        'artist': {'name': 'Caravan Palace'},
+    })
+
+    url = 'https://www.deezer.com/us/track/2914419581'
+    resp = client.post('/api/downloads/task/task-abc/manual-search',
+                       json={'query': url, 'source': 'all'})
+    assert resp.status_code == 200
+    msgs = _consume_ndjson(resp)
+    header = next(m for m in msgs if m.get('type') == 'header')
+    assert header['sources_queried'] == ['deezer']
+    assert header['query'] == 'Caravan Palace Raccoons (Gaudi & Don Letts Remix)'
+    plugin.search.assert_called()
+    ctx['plugins']['soulseek'].search.assert_not_called()
+
+
+def test_manual_search_deezer_album_link_resolves_to_track(manual_search_client):
+    """Deezer remix singles are album pages. Pasting the album URL must
+    resolve to the album's track and search Deezer for that title."""
+    client, ctx = manual_search_client
+    plugin = _wire_deezer_link_plugin(
+        ctx,
+        album={
+            'id': 620787111,
+            'title': 'Raccoons (Gaudi & Don Letts Remix)',
+            'artist': {'name': 'Caravan Palace'},
+            'tracks': {'data': [
+                {'id': 2914419581, 'title': 'Raccoons (Gaudi & Don Letts Remix)'},
+            ]},
+        },
+        track={
+            'id': 2914419581,
+            'title': 'Raccoons (Gaudi & Don Letts Remix)',
+            'artist': {'name': 'Caravan Palace'},
+        },
+    )
+
+    url = 'https://www.deezer.com/us/album/620787111'
+    resp = client.post('/api/downloads/task/task-abc/manual-search',
+                       json={'query': url, 'source': 'all'})
+    assert resp.status_code == 200
+    msgs = _consume_ndjson(resp)
+    header = next(m for m in msgs if m.get('type') == 'header')
+    assert header['sources_queried'] == ['deezer']
+    assert header['query'] == 'Caravan Palace Raccoons (Gaudi & Don Letts Remix)'
+    plugin.get_album.assert_called_once_with('620787111')
+    plugin.get_track.assert_called_once_with('2914419581')
+    plugin.search.assert_called()
+
+
+def test_manual_search_deezer_link_errors_when_not_connected(manual_search_client):
+    """A Deezer link with Deezer not in the available sources → clear 400,
+    not a useless text search of the raw URL."""
+    client, ctx = manual_search_client
+    from core.settings import config_manager
+    original = config_manager.get
+
+    def _cfg(key, default=None):
+        if key == 'download_source.mode':
+            return 'hybrid'
+        if key == 'download_source.hybrid_order':
+            return ['soulseek', 'youtube']
+        return original(key, default)
+    ctx['config_get_setter'](_cfg)
+
+    resp = client.post(
+        '/api/downloads/task/task-abc/manual-search',
+        json={'query': 'https://www.deezer.com/us/album/620787111', 'source': 'all'},
+    )
+    assert resp.status_code == 400
+    assert 'deezer' in resp.get_data(as_text=True).lower()
+    ctx['plugins']['soulseek'].search.assert_not_called()
 
 
 def test_manual_search_validates_query_length(manual_search_client):
@@ -399,7 +463,8 @@ def test_manual_search_streams_one_event_per_source(manual_search_client):
     plugins = ctx['plugins']
 
     import web_server
-    for src_name in ('soulseek', 'youtube', 'qobuz', 'hifi', 'deezer'):
+    # Commissary: soundcloud is configured, so it is searched too
+    for src_name in ('soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'):
         new_plugin = _make_plugin(
             search_results=[_fake_track_result(f'{src_name}_song.mp3', src_name)]
         )
@@ -414,13 +479,11 @@ def test_manual_search_streams_one_event_per_source(manual_search_client):
     msgs = _consume_ndjson(resp)
     source_events = [m for m in msgs if m.get('type') == 'source_results']
     seen_sources = {m['source'] for m in source_events}
-    # soundcloud is configured but outside hybrid_order — it's searched now
-    # too, which is the point of the un-gating. tidal stays out (unconfigured).
     assert seen_sources == {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'}
     # One header + one per source + one done terminator
     assert msgs[0]['type'] == 'header'
     assert msgs[-1]['type'] == 'done'
-    assert msgs[-1]['total'] == 5
+    assert msgs[-1]['total'] == 6
 
 
 def test_manual_search_skips_unconfigured_sources(manual_search_client):
@@ -502,22 +565,18 @@ def test_manual_search_header_carries_track_and_source_metadata(manual_search_cl
             assert field in candidate, f"missing {field}"
 
 
-def test_manual_search_single_source_mode_still_offers_every_configured_source(
-        monkeypatch, manual_search_client):
-    """``download_source.mode`` is a DISPATCH preference — which source the
-    unattended cascade downloads from — not a statement that the others are
-    unusable. It used to gate manual search too, so a user in single-source
-    mode could only ever search that one source even with five others
-    connected and working. Now every configured source is offered; the mode
-    only decides which one leads."""
+def test_manual_search_single_source_mode_only_offers_one_source(monkeypatch, manual_search_client):
+    """When download_source.mode is a single source, available_sources
+    contains just that one entry. Frontend swaps the dropdown for a static
+    label in this case."""
     client, _ctx = manual_search_client
 
-    from config.settings import config_manager
+    from core.settings import config_manager
     monkeypatch.setattr(
         config_manager, 'get',
         lambda key, default=None: (
             'soulseek' if key == 'download_source.mode'
-            else (['soulseek'] if key == 'download_source.hybrid_order' else default)
+            else (['soulseek', 'youtube'] if key == 'download_source.hybrid_order' else default)
         ),
     )
 
@@ -531,62 +590,10 @@ def test_manual_search_single_source_mode_still_offers_every_configured_source(
     header = msgs[0]
     assert header['download_mode'] == 'soulseek'
     available_ids = [s['id'] for s in header['available_sources']]
-    # Every configured source, not just the mode. Tidal stays out — it's
-    # is_configured() == False, which is a real reason to hide it.
-    assert {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'} == set(available_ids)
-    assert 'tidal' not in available_ids
-    # The mode's own source leads, so the UI's default still matches the
-    # user's stated preference.
+    # Commissary: the mode's source leads, every other configured source follows
+    # (core/commissary/search_sources.py)
     assert available_ids[0] == 'soulseek'
-
-
-def test_manual_search_offers_a_source_missing_from_the_hybrid_order(manual_search_client):
-    """The regression this un-gating exists for: 'soundcloud' is configured
-    and downloadable but deliberately absent from ``hybrid_order``. It used
-    to be invisible to manual search — the user had to re-order their
-    fallback chain just to look at it."""
-    client, _ctx = manual_search_client
-
-    resp = client.post(
-        '/api/downloads/task/task-abc/manual-search',
-        json={'query': 'something', 'source': 'all'},
-    )
-
-    assert resp.status_code == 200
-    header = _consume_ndjson(resp)[0]
-    by_id = {s['id']: s for s in header['available_sources']}
-    assert 'soundcloud' in by_id, "a configured source outside hybrid_order is still hidden"
-    # ...and it's marked as outside the cascade, so the UI can say so.
-    assert by_id['soundcloud']['in_chain'] is False
-    assert by_id['soulseek']['in_chain'] is True
-
-
-def test_manual_search_sources_carry_chain_order_and_release_level(manual_search_client):
-    """Each source entry annotates whether the auto-cascade uses it (and
-    where), and whether it searches releases rather than tracks. The modal
-    needs both: the first to show the user's ordering without enforcing it,
-    the second to group whole-album results separately."""
-    client, _ctx = manual_search_client
-
-    resp = client.post(
-        '/api/downloads/task/task-abc/manual-search',
-        json={'query': 'something', 'source': 'all'},
-    )
-
-    header = _consume_ndjson(resp)[0]
-    sources = header['available_sources']
-    for s in sources:
-        assert set(('id', 'label', 'in_chain', 'chain_position', 'release_level')) <= set(s)
-
-    # Chain members lead, in cascade order; the rest follow.
-    in_chain = [s for s in sources if s['in_chain']]
-    assert [s['chain_position'] for s in in_chain] == sorted(s['chain_position'] for s in in_chain)
-    assert sources.index(in_chain[-1]) < min(
-        i for i, s in enumerate(sources) if not s['in_chain']
-    )
-
-    # None of these fixture sources is release-level (no torrent/usenet).
-    assert all(s['release_level'] is False for s in sources)
+    assert set(available_ids) == {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'}
 
 
 def test_manual_search_handles_plugin_exception_gracefully(manual_search_client):

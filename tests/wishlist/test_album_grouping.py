@@ -54,6 +54,28 @@ def test_single_album_groups_all_tracks_together():
     assert len(g.tracks) == 3
 
 
+def test_compilation_uses_album_artist_not_first_track_artist():
+    tracks = [
+        _wt('Star Fighter', 'Wice', 'comp1', 'Magnatron 2.0', album_type='compilation'),
+        _wt('Omricon', 'Woob', 'comp1', 'Magnatron 2.0', album_type='compilation'),
+    ]
+    for ordered in (tracks, list(reversed(tracks))):
+        group = group_wishlist_tracks_by_album(ordered).album_groups[0]
+        assert group.artist_context['name'] == 'Various Artists'
+        assert group.tracks == ordered
+
+
+def test_compilation_prefers_declared_album_artist():
+    tracks = [
+        _wt('A', 'Singer A', 'comp1', 'Shared Album', album_type='compilation',
+            artists=[{'name': 'Album Curator'}]),
+        _wt('B', 'Singer B', 'comp1', 'Shared Album', album_type='compilation',
+            artists=[{'name': 'Album Curator'}]),
+    ]
+    group = group_wishlist_tracks_by_album(tracks).album_groups[0]
+    assert group.artist_context['name'] == 'Album Curator'
+
+
 def test_multiple_albums_emit_separate_groups():
     """Two tracks in alb1 promotes that album to a group at the default
     threshold of 2; alb2's one solo track falls to residual."""
@@ -190,3 +212,114 @@ def test_nested_track_data_payloads_normalized():
     res = group_wishlist_tracks_by_album(tracks, min_tracks_per_album=1)
     assert len(res.album_groups) == 1
     assert res.album_groups[0].album_key == 'a'
+
+
+def test_poisoned_row_album_artist_corrected_by_unanimous_tracks():
+    """#1316: a wishlist row whose stored album.artists[0] is wrong must not
+    stamp the whole batch — when every track names the same (different)
+    artist, the group context follows the tracks."""
+    tracks = [
+        _wt('Snoopafella', 'Snoop Dogg', 'alb1', 'Tha Doggfather',
+            artists=[{'name': 'Alanis Morissette'}]),
+        _wt('Doggfather', 'Snoop Dogg', 'alb1', 'Tha Doggfather',
+            artists=[{'name': 'Alanis Morissette'}]),
+    ]
+    group = group_wishlist_tracks_by_album(tracks).album_groups[0]
+    assert group.artist_context['id'] == 'wishlist'
+    assert group.artist_context['name'] == 'Snoop Dogg'
+
+
+def test_agreeing_row_album_artist_is_kept():
+    """#1316 companion: when the row's album artist agrees with the tracks,
+    the group context is untouched."""
+    tracks = [
+        _wt('Snoopafella', 'Snoop Dogg', 'alb1', 'Tha Doggfather',
+            artists=[{'name': 'Snoop Dogg'}]),
+        _wt('Doggfather', 'Snoop Dogg', 'alb1', 'Tha Doggfather',
+            artists=[{'name': 'Snoop Dogg'}]),
+    ]
+    group = group_wishlist_tracks_by_album(tracks).album_groups[0]
+    assert group.artist_context['name'] == 'Snoop Dogg'
+
+
+def test_the_artist_page_section_lock_survives_grouping():
+    tracks = [
+        _wt('Track A', 'Above & Beyond', 'fs1', 'Flow State Sampler',
+            album_type='album', album_type_locked=True),
+        _wt('Track B', 'Above & Beyond', 'fs1', 'Flow State Sampler',
+            album_type='album', album_type_locked=True),
+    ]
+    res = group_wishlist_tracks_by_album(tracks)
+    ctx = res.album_groups[0].album_context
+    assert ctx['album_type'] == 'album'
+    assert ctx['album_type_locked'] is True
+
+
+def _wt_no_id(track_name, artist, album_name, **extra):
+    """A wishlist row with no album id — the shape that forces the
+    ``_name_`` fallback bucket key (#1567)."""
+    t = _wt(track_name, artist, None, album_name, **extra)
+    del t['spotify_data']['album']['id']
+    return t
+
+
+def test_1567_name_fallback_bucket_with_distinct_artists_demoted_to_residual():
+    """#1567: several unrelated tracks sharing one bare album name ("music")
+    with no album ids bucketed together and the first row's artist would have
+    been stamped on all of them. A bare shared name with several distinct
+    artists is not an album — demote every track to the per-track flow."""
+    tracks = [
+        _wt_no_id('Paralyzer', 'Finger Eleven', 'music'),
+        _wt_no_id('Everlong', 'Foo Fighters', 'music'),
+        _wt_no_id('How You Remind Me', 'Nickelback', 'music'),
+        _wt_no_id('I Stand Alone', 'Godsmack', 'music'),
+    ]
+    res = group_wishlist_tracks_by_album(tracks)
+    assert res.album_groups == []
+    assert len(res.residual_tracks) == 4
+    assert {t['track_name'] for t in res.residual_tracks} == {
+        'Paralyzer', 'Everlong', 'How You Remind Me', 'I Stand Alone'}
+
+
+def test_1567_name_fallback_bucket_with_unanimous_artist_still_bundles():
+    """#1567 companion: a name-fallback bucket whose tracks unanimously name
+    one artist is a real (id-less) album and keeps bundling."""
+    tracks = [
+        _wt_no_id('S1', 'Artist', 'Same Album'),
+        _wt_no_id('S2', 'Artist', 'Same Album'),
+    ]
+    res = group_wishlist_tracks_by_album(tracks)
+    assert len(res.album_groups) == 1
+    assert res.album_groups[0].album_key == '_name_same album'
+    assert res.album_groups[0].artist_context['name'] == 'Artist'
+    assert res.residual_tracks == []
+
+
+def test_1567_genuine_compilation_with_real_id_still_bundles():
+    """#1567 companion: a genuine multi-artist compilation with a REAL shared
+    album id must keep bundling — the distrust only applies to weak
+    ``_name_`` buckets."""
+    tracks = [
+        _wt('Star Fighter', 'Wice', 'comp1', 'Magnatron 2.0', album_type='compilation'),
+        _wt('Omricon', 'Woob', 'comp1', 'Magnatron 2.0', album_type='compilation'),
+        _wt('Third Song', 'Zed', 'comp1', 'Magnatron 2.0', album_type='compilation'),
+    ]
+    res = group_wishlist_tracks_by_album(tracks)
+    assert len(res.album_groups) == 1
+    assert res.album_groups[0].artist_context['name'] == 'Various Artists'
+    assert len(res.album_groups[0].tracks) == 3
+    assert res.residual_tracks == []
+
+
+def test_1567_name_fallback_various_artists_compilation_still_bundles():
+    """#1567 companion: even without album ids, an explicit Various Artists
+    compilation marker means the multi-artist bucket is genuine."""
+    tracks = [
+        _wt_no_id('A', 'Singer A', 'Summer Mix', album_type='compilation'),
+        _wt_no_id('B', 'Singer B', 'Summer Mix', album_type='compilation'),
+    ]
+    res = group_wishlist_tracks_by_album(tracks)
+    assert len(res.album_groups) == 1
+    assert res.album_groups[0].artist_context['name'] == 'Various Artists'
+    assert res.residual_tracks == []
+

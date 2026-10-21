@@ -9,12 +9,12 @@ Reference: https://sabnzbd.org/wiki/configuration/4.3/api
 
 from __future__ import annotations
 
-import asyncio
 from typing import List, Optional, Union
 
 import requests as http_requests
 
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_control
 from core.usenet_clients.base import UsenetStatus
 from utils.logging_config import get_logger
 
@@ -77,8 +77,7 @@ class SABnzbdAdapter:
     async def check_connection(self) -> bool:
         if not self.is_configured():
             return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._check_connection_sync)
+        return await run_control(self._check_connection_sync)
 
     def _check_connection_sync(self) -> bool:
         # ``mode=version`` is the cheapest authenticated probe SAB exposes.
@@ -86,7 +85,7 @@ class SABnzbdAdapter:
         return bool(data and data.get('version'))
 
     async def category_exists(self, category: str) -> bool:
-        """Return whether SAB knows the category Commissary will submit with.
+        """Return whether SAB knows the category SoulSync will submit with.
 
         SAB silently rewrites an unknown category to ``*``.  Normal submits
         still retain their external job id, but a timed-out submit must be
@@ -94,10 +93,7 @@ class SABnzbdAdapter:
         during the settings connection test keeps that recovery boundary
         reliable without broadening monitor adoption to unrelated jobs.
         """
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._category_exists_sync, category,
-        )
+        return await run_control(self._category_exists_sync, category)
 
     def _category_exists_sync(self, category: str) -> bool:
         expected = str(category or "").strip().casefold()
@@ -128,10 +124,11 @@ class SABnzbdAdapter:
                 return None
             return resp.json()
         except http_requests.exceptions.RequestException as e:
-            logger.error("SABnzbd mode=%s request failed: %s", mode, e)
+            # requests errors can include API keys and nested signed NZB URLs.
+            logger.error("SABnzbd mode=%s request failed (%s)", mode, type(e).__name__)
             return None
         except ValueError as e:
-            logger.error("SABnzbd mode=%s response was not JSON: %s", mode, e)
+            logger.error("SABnzbd mode=%s response was not JSON (%s)", mode, type(e).__name__)
             return None
 
     def _post_sync(self, mode: str, files=None, **extra) -> Optional[dict]:
@@ -151,27 +148,27 @@ class SABnzbdAdapter:
                 return None
             return resp.json()
         except http_requests.exceptions.RequestException as e:
-            logger.error("SABnzbd POST mode=%s failed: %s", mode, e)
+            logger.error("SABnzbd POST mode=%s failed (%s)", mode, type(e).__name__)
             return None
         except ValueError as e:
-            logger.error("SABnzbd POST mode=%s response was not JSON: %s", mode, e)
+            logger.error("SABnzbd POST mode=%s response was not JSON (%s)", mode, type(e).__name__)
             return None
 
     async def add_nzb(
         self,
         url_or_bytes: Union[str, bytes],
+        # Commissary: None, not "soulsync" — a truthy literal meant
+        # ``category or self._category`` never reached the setting.
         category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_nzb_sync, url_or_bytes, category, save_path
-        )
+        return await run_control(
+            self._add_nzb_sync, url_or_bytes, category, save_path)
 
     def _add_nzb_sync(
         self,
         url_or_bytes: Union[str, bytes],
-        category: str,
+        category: Optional[str],
         save_path: Optional[str],
     ) -> Optional[str]:
         cat = category or self._category
@@ -186,8 +183,7 @@ class SABnzbdAdapter:
         return ids[0] if ids else None
 
     async def get_status(self, job_id: str) -> Optional[UsenetStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_status_sync, job_id)
+        return await run_control(self._get_status_sync, job_id)
 
     def _get_status_sync(self, job_id: str) -> Optional[UsenetStatus]:
         # Direct nzo_ids lookup against queue, then history. Falls back
@@ -218,8 +214,7 @@ class SABnzbdAdapter:
         return None
 
     async def get_all(self) -> List[UsenetStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_all_sync)
+        return await run_control(self._get_all_sync)
 
     def _get_all_sync(self) -> List[UsenetStatus]:
         out: List[UsenetStatus] = []
@@ -387,8 +382,7 @@ class SABnzbdAdapter:
         return None
 
     async def remove(self, job_id: str, delete_files: bool = False) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._remove_sync, job_id, delete_files)
+        return await run_control(self._remove_sync, job_id, delete_files)
 
     def _remove_sync(self, job_id: str, delete_files: bool) -> bool:
         # SAB deletes from queue or history depending on where the job is.
@@ -407,16 +401,14 @@ class SABnzbdAdapter:
         return bool(data and data.get('status'))
 
     async def pause(self, job_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._pause_sync, job_id)
+        return await run_control(self._pause_sync, job_id)
 
     def _pause_sync(self, job_id: str) -> bool:
         data = self._call_sync('queue', name='pause', value=job_id)
         return bool(data and data.get('status'))
 
     async def resume(self, job_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._resume_sync, job_id)
+        return await run_control(self._resume_sync, job_id)
 
     def _resume_sync(self, job_id: str) -> bool:
         data = self._call_sync('queue', name='resume', value=job_id)

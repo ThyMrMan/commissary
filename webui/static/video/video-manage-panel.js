@@ -1,5 +1,5 @@
 /*
- * Commissary — Manage panel (per-item metadata editor).
+ * SoulSync — Manage panel (per-item metadata editor).
  *
  *   VideoManage.open({kind, id})  — from "Manage" on a movie/show detail page.
  *
@@ -33,7 +33,7 @@
     // ── one-time styles ──────────────────────────────────────────────────────
     function ensureStyles() {
         if (document.getElementById('vmg-styles')) return;
-        var A = 'var(--accent-rgb, 88 101 242)';
+        var A = 'var(--accent-rgb)';
         var css =
             '.vmg-overlay{position:fixed;inset:0;z-index:9100;background:rgba(5,5,8,.55);backdrop-filter:blur(4px);' +
                 'opacity:0;transition:opacity .22s ease;}' +
@@ -61,9 +61,6 @@
             '.vmg-sect{font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.07em;' +
                 'color:rgba(255,255,255,.42);margin:6px 0 -8px;}' +
             '.vmg-field{display:flex;flex-direction:column;gap:6px;min-width:0;}' +
-            '.vmg-aka{resize:vertical;min-height:52px;line-height:1.4;}' +
-            '.vmg-hint{font-size:11.5px;line-height:1.4;color:rgba(255,255,255,.42);}' +
-            '.vmg-field [data-vmg-aka-save]{align-self:flex-start;}' +
             '.vmg-label{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:700;color:rgba(255,255,255,.6);}' +
             '.vmg-row2{display:grid;grid-template-columns:1fr 1fr;gap:12px;}' +
             '.vmg-input,.vmg-area{width:100%;box-sizing:border-box;padding:10px 12px;border-radius:10px;font-size:13.5px;' +
@@ -96,8 +93,6 @@
                 'background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);color:#eef1f7;transition:all .13s;white-space:nowrap;}' +
             '.vmg-btn-ghost:hover{background:rgba(255,255,255,.13);}' +
             '.vmg-toggles{display:grid;grid-template-columns:1fr 1fr;gap:12px;}' +
-            '.vmg-toggles--one{grid-template-columns:1fr;margin-top:12px;}' +
-            '.vmg-hint--lock{margin-top:6px;}' +
             '.vmg-toggle{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:11px 13px;' +
                 'border-radius:12px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.07);cursor:pointer;' +
                 'font-size:13px;font-weight:700;color:#eef1f7;transition:border .13s;}' +
@@ -146,6 +141,17 @@
             // save (in the header, clear of the app's floating bell/help orbs)
             '.vmg-hint{font-size:11.5px;color:rgba(255,255,255,.4);line-height:1.5;' +
                 'padding:2px 0 30px;}' +
+            // per-title acquisition overrides: source chips read as toggles, not
+            // as a checkbox list — they are a choice, not a form to fill in
+            '.vmg-srcs{display:flex;flex-wrap:wrap;gap:8px;}' +
+            '.vmg-src{display:inline-flex;align-items:center;gap:7px;cursor:pointer;' +
+                'padding:7px 13px;border-radius:9px;font-size:12.5px;font-weight:700;' +
+                'color:rgba(255,255,255,.62);background:rgba(255,255,255,.05);' +
+                'border:1px solid rgba(255,255,255,.1);transition:all .15s;}' +
+            '.vmg-src:hover{color:#fff;background:rgba(255,255,255,.09);}' +
+            '.vmg-src--on{color:#fff;background:rgba(' + A + ',.16);' +
+                'border-color:rgba(' + A + ',.5);}' +
+            '.vmg-src input{accent-color:rgb(' + A + ');margin:0;}' +
             '.vmg-save{position:absolute;top:18px;right:60px;padding:8px 18px;border-radius:999px;' +
                 'font-size:12.5px;font-weight:800;cursor:pointer;border:none;' +
                 'background:rgb(' + A + ');color:#fff;box-shadow:0 6px 18px rgba(' + A + ',.35);transition:all .15s;}' +
@@ -182,78 +188,7 @@
     }
 
     // ── panel ────────────────────────────────────────────────────────────────
-    // A title that isn't in your library has no local row and no server item, so
-    // every editor here — metadata, field locks, quality profile, series type,
-    // monitored/watched, Matches — has nothing to write to. "Also known as" is
-    // the exception: it's stored against the TMDB id, precisely so it can be set
-    // for something you don't own yet (which is when a release gets rejected as
-    // a wrong title). Rendering just that beats a panel of dead controls.
-    // Per-show season-pack preference. Beats the global setting in BOTH
-    // directions, so a show can be packs-only while packs are off globally, or
-    // stay on singles while they are on. A subtractive-only override could not
-    // say "always get this one as packs", which is the reason to come here.
-    var SEASON_PACK_CHOICES = [
-        ['', 'Follow the global setting'],
-        ['prefer', 'Prefer season packs, fall back to episodes'],
-        ['only', 'Season packs only — wait rather than use episodes'],
-        ['never', 'Never use season packs for this show']
-    ];
-
-    function seasonPackField(d) {
-        if (d.kind !== 'show') return '';
-        var cur = d.season_pack_mode || '';
-        return '<div class="vmg-field"><label>Season packs</label>' +
-            '<select class="vmg-input" data-vmg-season-pack-mode>' +
-            SEASON_PACK_CHOICES.map(function (c) {
-                return '<option value="' + c[0] + '"' + (c[0] === cur ? ' selected' : '') + '>' +
-                    c[1] + '</option>';
-            }).join('') + '</select>' +
-            '<div class="vmg-hint">Whether a season with several missing episodes is ' +
-                'grabbed as one release instead of episode by episode. ' +
-                '&ldquo;Season packs only&rdquo; applies to seasons that have finished ' +
-                'airing &mdash; a season still going out weekly is grabbed normally, so ' +
-                'nothing stalls waiting for a pack that cannot exist yet.</div>' +
-          '</div>';
-    }
-
-    function tmdbOnlyBodyHtml(d) {
-        // Series type decides HOW episodes are hunted (SxxExx / air date /
-        // absolute number), so it's needed while you're still acquiring the show.
-        // Stored as an override against the tmdb id; the library row takes over
-        // once the show exists.
-        var st = (d.kind === 'show')
-            ? '<div class="vmg-field"><label>Series type</label>' +
-                '<select class="vmg-input" data-vmg-series-type>' +
-                ['standard', 'daily', 'anime'].map(function (t) {
-                    var cur = d.series_type || 'standard';
-                    return '<option value="' + t + '"' + (t === cur ? ' selected' : '') + '>' +
-                        t.charAt(0).toUpperCase() + t.slice(1) +
-                        (t === 'daily' ? ' (releases by air date)'
-                            : t === 'anime' ? ' (absolute numbering)' : '') + '</option>';
-                }).join('') + '</select>' +
-                '<div class="vmg-hint">How episode releases are searched for. Anime and ' +
-                    'daily shows are named differently from standard SxxExx releases.</div>' +
-              '</div>' + seasonPackField(d)
-            : '';
-        return (
-            '<div class="vmg-sect">Matching</div>' + st +
-            '<div class="vmg-field"><label>Also known as</label>' +
-                '<textarea class="vmg-input vmg-aka" data-vmg-aka rows="3" ' +
-                    'placeholder="One title per line — releases named this way will match"' +
-                    '>' + esc((d.aka_titles || []).join('\n')) + '</textarea>' +
-                '<div class="vmg-hint">Used only for matching downloads. Add the name ' +
-                    'releases actually use if it differs from the one shown above.</div>' +
-                '<button class="vmg-btn-ghost" type="button" data-vmg-aka-save>Save titles</button>' +
-            '</div>' +
-            '<div class="vmg-hint" style="margin-top:14px;">' +
-                'The rest of Manage — metadata, artwork, quality profile — needs the title ' +
-                'to be in your library. It appears once you have downloaded it.' +
-            '</div>'
-        );
-    }
-
     function bodyHtml(d) {
-        if (d._tmdbOnly) return tmdbOnlyBodyHtml(d);
         var isShow = d.kind === 'show';
         var brandField = isShow ? 'network' : 'studio';
         var ratings = RATING_HINTS[d.kind] || [];
@@ -294,36 +229,15 @@
                 '<div class="vmg-toggle' + (d.monitored ? ' vmg-toggle--on' : '') + '" data-vmg-monitored role="switch" ' +
                     'aria-checked="' + (d.monitored ? 'true' : 'false') + '" tabindex="0"><span>Monitored</span><span class="vmg-sw"></span></div>' +
             '</div>' +
-            // Lock automatic edits. Unattended imports into this title are refused
-            // outright — an upgrade, a replacement and a brand-new episode alike —
-            // so a release whose name or season was mis-parsed cannot damage
-            // content you have already curated. It fails as import_failed naming
-            // the lock; placing it by hand still works, and is the check the lock
-            // exists to demand.
-            '<div class="vmg-toggles vmg-toggles--one">' +
-                '<div class="vmg-toggle' + (d.import_locked ? ' vmg-toggle--on' : '') + '" data-vmg-import-lock role="switch" ' +
-                    'aria-checked="' + (d.import_locked ? 'true' : 'false') + '" tabindex="0">' +
-                    '<span>Lock automatic edits</span><span class="vmg-sw"></span></div>' +
-            '</div>' +
-            '<div class="vmg-hint vmg-hint--lock">Refuses every automatic import for this ' +
-                (isShow ? 'show' : 'movie') + ' — new episodes included. A download that targets ' +
-                'it stops at placement and says so, instead of replacing what you already have. ' +
-                'Manual import still works.' +
-                (isShow ? ' Seasons can be locked on their own from the season list.' : '') + '</div>' +
+            // Everything below is about ACQUISITION, not metadata. These two sat
+            // at the tail of "Artwork & state" with no heading, so a section about
+            // posters and watched-state appeared to own the quality ladder.
+            '<div class="vmg-sect">Acquisition</div>' +
             // Per-title quality profile (arr-parity P2): which ladder/cutoff this
             // title is grabbed + upgraded under. Options fill in async.
             '<div class="vmg-field"><label>Quality profile</label>' +
                 '<select class="vmg-input" data-vmg-quality-profile>' +
                 '<option value="0">Default</option></select></div>' +
-            // Which configured Library this title is filed under. Decides where
-            // FUTURE work lands (wishlist drain, RSS instant-grab, upgrades all
-            // resolve their destination from it) — so this is the fix when a
-            // title ends up in the wrong tree. Options fill in async.
-            '<div class="vmg-field"><label>Library</label>' +
-                '<select class="vmg-input" data-vmg-library>' +
-                '<option value="">Default for ' + (isShow ? 'TV shows' : 'movies') + '</option></select>' +
-                '<div class="vmg-hint">Where new downloads and upgrades for this title go. ' +
-                    'Changing it does not move files already on disk.</div></div>' +
             // Series type (arr-parity P8, shows only): how episode releases are
             // hunted — SxxExx (standard), air date (daily), absolute number (anime).
             (d.kind === 'show'
@@ -335,76 +249,49 @@
                             t.charAt(0).toUpperCase() + t.slice(1) +
                             (t === 'daily' ? ' (releases by air date)' : t === 'anime' ? ' (absolute numbering)' : '') +
                             '</option>';
-                    }).join('') + '</select></div>' + seasonPackField(d) +
-                  // Re-read the episode list from TMDB on demand. A show is
-                  // cascaded once and then never revisited, so episodes TMDB
-                  // gains later (a season still airing, a late-added batch)
-                  // stay invisible — and nothing else in the app forces it:
-                  // "Sync show now" reconciles against Plex, and the page's
-                  // lazy refresh skips a show that already has its art.
-                  '<div class="vmg-field"><label>Episode list</label>' +
-                      // Provider-agnostic on purpose. All three buttons below act on
-                      // whichever database owns this show's numbering (the box above),
-                      // so naming one here would be wrong for any show using the other
-                      // — and would be a second place to keep in step.
-                      '<button class="vmg-btn-ghost" type="button" data-vmg-rescan-eps>' +
-                          'Re-scan episode list</button>' +
-                      '<div class="vmg-hint" data-vmg-rescan-note>Reads every season again ' +
-                          'from the database above. Use this when it lists episodes Commissary ' +
-                          'is missing.</div>' +
-                      // Your media server and TMDB can split a long-running show into
-                      // seasons differently (Plex files Bleach's newer run as S2 where
-                      // TMDB calls it S17). Those are separate rows, so the episode is
-                      // listed twice — once owned, once missing. Two clicks: look, then
-                      // agree, because this deletes rows.
-                      '<button class="vmg-btn-ghost" type="button" data-vmg-dupe-eps ' +
-                          'style="margin-top:8px;">Check for duplicate episodes</button>' +
-                      '<div class="vmg-hint" data-vmg-dupe-note>Finds episodes listed twice ' +
-                          'twice because the same episode is filed under two different ' +
-                          'season numbers. Compares your library against itself — no ' +
-                          'database is consulted.</div>' +
-                      // TVDB numbers some long-running shows' seasons differently from
-                      // TMDB (TMDB's Bleach S2 is the 2005 arc; TVDB's is the 2022+
-                      // run). The metadata gap-fill used to insert under TMDB's number,
-                      // filing episodes in a season they never belonged to. Same
-                      // two-click shape: look, then agree.
-                      // Which database supplies this show's episode LIST. Episodes
-                      // are keyed by your media server's season numbers, so a
-                      // provider that splits the show differently can only file
-                      // them wrongly. Auto compares both against your server.
-                      '<div class="vmg-field" style="margin-top:10px;">' +
-                          '<label>Episode numbering</label>' +
-                          '<select class="vmg-input" data-vmg-episode-source>' +
-                          [['auto', 'Auto — match my server'], ['tmdb', 'TMDB'], ['tvdb', 'TVDB']]
-                              .map(function (o) {
-                                  var cur = d.episode_source || 'auto';
-                                  return '<option value="' + o[0] + '"' +
-                                      (o[0] === cur ? ' selected' : '') + '>' + o[1] + '</option>';
-                              }).join('') +
-                          '</select>' +
-                          '<div class="vmg-hint" data-vmg-episode-source-note>Checking which ' +
-                              'database matches your server…</div>' +
-                      '</div>' +
-                      '<button class="vmg-btn-ghost" type="button" data-vmg-unlisted-eps ' +
-                          'style="margin-top:8px;">Check for out-of-place episodes</button>' +
-                      '<div class="vmg-hint" data-vmg-unlisted-note>Finds episodes filed ' +
-                          'under a season the database above doesn\'t list them in — they ' +
-                          'can never be matched by a search.</div>' +
-                  '</div>'
+                    }).join('') + '</select></div>'
                 : '') +
-            // Also known as (matching aid): extra titles the release-title gate will
-            // accept for this title. TMDB's alias coverage is patchy — most visibly
-            // for anime, where fansub groups release under a translation of the
-            // original title while TMDB lists a different localised name. Local only;
-            // never pushed to Plex/Jellyfin.
+            // Manual alternative titles — the arr answer to a scene name TMDB does
+            // not know. Its alias list already carries "Big Brother US" for
+            // "Big Brother (US)"; it has nothing at all for "Password (2022)", and
+            // that show could never match a release. Being told the name once beats
+            // inferring it: stripping the bracket collides "Avatar: The Last
+            // Airbender (2024)" with the 2005 series. It WIDENS what matches, so it
+            // sits with the quality ladder rather than under the narrowing overrides.
             '<div class="vmg-field"><label>Also known as</label>' +
-                '<textarea class="vmg-input vmg-aka" data-vmg-aka rows="2" ' +
-                    'placeholder="One title per line — releases named this way will match"' +
-                    '>' + esc((d.aka_titles || []).join('\n')) + '</textarea>' +
-                '<div class="vmg-hint">Used only for matching downloads. Add the name ' +
-                    'releases actually use if it differs from the one shown here.</div>' +
-                '<button class="vmg-btn-ghost" type="button" data-vmg-aka-save>Save titles</button>' +
-            '</div>' +
+                inputHtml2('aliases', (d.manual_aliases || []).join(', '),
+                           'names the scene uses, comma separated') +
+                '<div class="vmg-hint">TMDB\u2019s own aliases are already matched. Add one here ' +
+                'only when a release is named something TMDB does not list.</div></div>' +
+            // Per-title acquisition overrides (arr-parity P2). Empty everywhere
+            // means "follow the global config" — an override only exists when the
+            // user deliberately narrowed this one title.
+            '<div class="vmg-sect">Acquisition overrides</div>' +
+            '<div class="vmg-field"><label>Preferred sources</label>' +
+                '<div class="vmg-srcs" data-vmg-srcs>' +
+                SOURCES.map(function (s) {
+                    var on = (d.preferred_sources || []).indexOf(s[0]) !== -1;
+                    return '<label class="vmg-src' + (on ? ' vmg-src--on' : '') + '">' +
+                        '<input type="checkbox" data-vmg-src value="' + s[0] + '"' +
+                        (on ? ' checked' : '') + '>' + esc(s[1]) + '</label>';
+                }).join('') +
+                '</div>' +
+                '<div class="vmg-hint">None ticked follows the global download order.</div></div>' +
+            '<div class="vmg-field"><label>Only these release groups</label>' +
+                inputHtml2('rg-allow', (d.release_group_allow || []).join(', '),
+                           'e.g. NTb, FLUX — blank allows any') + '</div>' +
+            '<div class="vmg-field"><label>Never these release groups</label>' +
+                inputHtml2('rg-block', (d.release_group_block || []).join(', '),
+                           'comma separated') + '</div>' +
+            (d.kind === 'show'
+                ? '<div class="vmg-field"><label>Season packs</label>' +
+                    '<select class="vmg-input" data-vmg-pack-pref>' +
+                    PACK_PREFS.map(function (o) {
+                        var cur = d.pack_preference || 'auto';
+                        return '<option value="' + o[0] + '"' + (o[0] === cur ? ' selected' : '') +
+                            '>' + esc(o[1]) + '</option>';
+                    }).join('') + '</select></div>'
+                : '') +
             '<div class="vmg-sect">Matches</div>' +
             '<div class="vmg-matches" data-vmg-matches>' +
                 '<div class="vmg-msearch-hint">Loading matches…</div>' +
@@ -413,6 +300,70 @@
                 ? '<button class="vmg-btn-ghost vmg-report" type="button" data-vmg-report>⚑ Report an issue</button>'
                 : '')
         );
+    }
+
+    // The download chain, in the order the engine tries them.
+    var SOURCES = [['torrent', 'Torrent'], ['usenet', 'Usenet'], ['soulseek', 'Soulseek']];
+    var PACK_PREFS = [
+        ['auto', 'Follow the global setting'],
+        ['prefer', 'Always try a season pack first'],
+        ['never', 'Never grab season packs'],
+        ['only', 'Season packs only \u2014 wait for one'],   // Commissary
+    ];
+    // Like inputHtml but for the override fields, which are not lockable metadata
+    // (there is no server-side field to hand back, so no lock badge).
+    function inputHtml2(key, value, placeholder) {
+        return '<input class="vmg-input" data-vmg-ovr="' + esc(key) + '" value="' + esc(value) +
+            '" placeholder="' + esc(placeholder) + '" spellcheck="false">';
+    }
+
+    // A comma-separated list to a clean array: trimmed, de-duped case-insensitively,
+    // empties dropped. "NTb, , ntb ,FLUX" is two groups, not four.
+    function parseList(text) {
+        var seen = {}, out = [];
+        String(text || '').split(',').forEach(function (raw) {
+            var v = raw.trim();
+            if (!v) return;
+            var k = v.toLowerCase();
+            if (seen[k]) return;
+            seen[k] = 1; out.push(v);
+        });
+        return out;
+    }
+
+    function currentOverrides() {
+        var ov = state.overlay;
+        var srcs = [];
+        ov.querySelectorAll('[data-vmg-src]').forEach(function (cb) {
+            if (cb.checked) srcs.push(cb.value);
+        });
+        var pack = ov.querySelector('[data-vmg-pack-pref]');
+        var get = function (k) {
+            var el = ov.querySelector('[data-vmg-ovr="' + k + '"]');
+            return el ? el.value : '';
+        };
+        return {
+            preferred_sources: srcs,
+            release_group_allow: parseList(get('rg-allow')),
+            release_group_block: parseList(get('rg-block')),
+            manual_aliases: parseList(get('aliases')),
+            pack_preference: pack ? pack.value : 'auto',
+        };
+    }
+
+    function saveOverrides() {
+        if (!state) return;
+        var body = currentOverrides();
+        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/overrides', {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body) })
+            .then(function (r) {
+                if (!r.ok) throw new Error();
+                // The alias set is read on the NEXT search, not retroactively —
+                // saying so stops "I added it and nothing happened".
+                toast('Saved \u2014 applies from the next search', 'success');
+            })
+            .catch(function () { toast('Couldn\u2019t save the overrides', 'error'); });
     }
 
     // ── matches (per-service re-match editor) ────────────────────────────────
@@ -453,13 +404,31 @@
         '<div class="vmg-msearch-hint">Re-pointing a match clears the old data and re-enriches in the background.</div>';
     }
 
+    // Opened from a missing-id chip on the detail page: jump straight into that
+    // service's search instead of making the user find the row. One shot - a later
+    // reload of the matches must not yank the panel back here.
+    function applyFocusMatch() {
+        if (!state || !state.focusMatch) return;
+        var svc = state.focusMatch;
+        state.focusMatch = null;
+        var host = state.overlay.querySelector('[data-vmg-matches]');
+        if (!host) return;
+        if (svc === 'imdb') {
+            var inp = host.querySelector('[data-vmg-imdb-in]');
+            if (inp) { inp.focus(); inp.select(); }
+        } else if (MATCH_LABELS[svc]) {
+            openMatchSearch(svc);
+        }
+        host.scrollIntoView({ block: 'center' });
+    }
+
     function loadMatches() {
         if (!state) return;
         fetch('/api/video/enrichment/matches/' + state.kind + '/' + state.id)
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (res) {
                 if (!state) return;
-                if (res && res.matches && res.matches.length) renderMatches(res.matches);
+                if (res && res.matches && res.matches.length) { renderMatches(res.matches); applyFocusMatch(); }
                 else { var h = state.overlay.querySelector('[data-vmg-matches]'); if (h) h.innerHTML = ''; }
             })
             .catch(function () { /* section is a nicety — leave the loading hint */ });
@@ -559,21 +528,15 @@
                 '<div class="vmg-head">' +
                     '<div class="vmg-kick"><span class="vmg-kick-dot"></span>Manage</div>' +
                     '<div class="vmg-title">' + esc(d.title) + '</div>' +
-                    '<div class="vmg-sub">' + (d._tmdbOnly
-                        ? 'Not in your library yet — only download matching can be set.'
-                        : 'Edits are saved here, pushed to your server, and locked against scans.') + '</div>' +
+                    '<div class="vmg-sub">Edits are saved here, pushed to your server, and locked against scans.</div>' +
                     // Save lives in the header — the app's notification/help orbs
                     // float over the bottom-right corner (z 999999, by design),
                     // so a footer button there would sit underneath them.
-                    // Save drives the metadata editor, which a not-in-library title
-                    // has none of — its one control saves itself.
-                    (d._tmdbOnly ? ''
-                        : '<button class="vmg-save" type="button" data-vmg-save disabled>Save</button>') +
+                    '<button class="vmg-save" type="button" data-vmg-save disabled>Save</button>' +
                     '<button class="vmg-close" type="button" data-vmg-close aria-label="Close">×</button>' +
                 '</div>' +
                 '<div class="vmg-body">' + bodyHtml(d) +
-                    (d._tmdbOnly ? ''
-                        : '<div class="vmg-hint">Locked fields wear a badge — click it to hand one back to the server.</div>') +
+                    '<div class="vmg-hint">Locked fields wear a badge — click it to hand one back to the server.</div>' +
                 '</div>' +
             '</div>'
         );
@@ -624,8 +587,8 @@
         var d = state.data, vals = currentValues(), changes = {};
         Object.keys(vals).forEach(function (f) {
             if (f === 'genres') {
-                var was = (d.genres || []).slice().sort().join(' ');
-                var now = vals.genres.slice().sort().join(' ');
+                var was = (d.genres || []).slice().sort().join('\u0000');
+                var now = vals.genres.slice().sort().join('\u0000');
                 if (was !== now) changes.genres = vals.genres;
             } else if (f === 'year') {
                 var wasY = d.year == null ? '' : String(d.year);
@@ -698,363 +661,33 @@
         });
     }
 
-    // The profile this title INHERITS when it carries none of its own — the
-    // default set on its Library, by name. Empty when the title has no Library,
-    // or that Library sets no default, in which case "Default" means the global
-    // Default profile and is already saying the truth.
-    function inheritedProfileName(d, libRes, profiles) {
-        var rid = d && d.root_folder_id;
-        if (!rid || !libRes) return '';
-        var conf = libRes.configured || {};
-        var rows = (state.kind === 'show' ? conf.tv : conf.movies) || [];
-        for (var i = 0; i < rows.length; i++) {
-            if (String(rows[i].id) !== String(rid)) continue;
-            var pid = parseInt(rows[i].default_quality_profile_id, 10) || 0;
-            if (!pid) return '';
-            for (var j = 0; j < profiles.length; j++) {
-                if (profiles[j].id === pid) return profiles[j].name;
-            }
-            return '';
-        }
-        return '';
-    }
-
     // Per-title quality profile (P2): fill the picker with the real profile
     // list + the title's current assignment; change persists immediately.
-    //
-    // Leaving a title unassigned is INHERITANCE, not an absence: its Library can
-    // carry a default profile of its own. A picker reading "Default" while the
-    // title is actually being judged at 4K would be lying about the very setting
-    // it is showing, so option 0 names what it will really resolve to. Both
-    // lists are needed to say that, hence the pair.
     function loadQualityProfiles(d) {
         var sel = state.overlay && state.overlay.querySelector('[data-vmg-quality-profile]');
         if (!sel) return;
-        var get = function (url) {
-            return fetch(url, { headers: { 'Accept': 'application/json' } })
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .catch(function () { return null; });
-        };
-        Promise.all([get('/api/video/downloads/quality/profiles'), get('/api/video/libraries')])
-            .then(function (both) {
-                var res = both[0];
+        fetch('/api/video/downloads/quality/profiles', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (res) {
                 if (!res || !sel.isConnected) return;
-                var profiles = res.profiles || [];
                 var cur = parseInt(d.quality_profile_id, 10) || 0;
-                var inherited = inheritedProfileName(d, both[1], profiles);
-                sel.innerHTML = profiles.map(function (p) {
-                    var name = (p.id === 0 && inherited)
-                        ? 'Default — this Library uses ' + inherited : p.name;
+                sel.innerHTML = (res.profiles || []).map(function (p) {
                     return '<option value="' + p.id + '"' + (p.id === cur ? ' selected' : '') + '>' +
-                        esc(name) + '</option>';
+                        esc(p.name) + '</option>';
                 }).join('') || '<option value="0">Default</option>';
             })
             .catch(function () { /* picker keeps its Default option */ });
     }
 
-    // Which configured Library this title is filed under. Reads the REGISTRY
-    // (d.configured), not the live server-section discovery — the registry is
-    // what root_folder_id points at, and it is the half a non-admin can read.
-    function loadLibraries(d) {
-        var sel = state.overlay && state.overlay.querySelector('[data-vmg-library]');
-        if (!sel) return;
-        fetch('/api/video/libraries', { headers: { 'Accept': 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (res) {
-                if (!res || !sel.isConnected) return;
-                var conf = (res.configured || {});
-                var rows = (state.kind === 'show' ? conf.tv : conf.movies) || [];
-                var cur = d.root_folder_id;
-                // Keep the blank option: clearing the assignment is a real choice
-                // (falls back to the primary Library for this kind).
-                var head = '<option value=""' + (cur == null ? ' selected' : '') + '>Default for ' +
-                    (state.kind === 'show' ? 'TV shows' : 'movies') + '</option>';
-                sel.innerHTML = head + rows.map(function (l) {
-                    return '<option value="' + l.id + '"' + (String(l.id) === String(cur) ? ' selected' : '') +
-                        '>' + esc(l.label || l.path || ('Library ' + l.id)) + '</option>';
-                }).join('');
-            })
-            .catch(function () { /* picker keeps its Default option */ });
-    }
-
-    function setLibrary(sel) {
-        var raw = sel.value;
-        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/library', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ root_folder_id: raw === '' ? null : parseInt(raw, 10) }) })
-            .then(function (r) {
-                return r.json().catch(function () { return {}; }).then(function (b) {
-                    if (!r.ok) throw new Error(b.error || '');
-                    if (state.data) {
-                        state.data.root_folder_id = b.root_folder_id;
-                        // A different Library can carry a different default, so the
-                        // profile picker's "Default" option now means something else.
-                        loadQualityProfiles(state.data);
-                    }
-                    toast(b.root_folder_id == null
-                        ? 'Library cleared — new downloads use the default for this type'
-                        : 'Library updated — new downloads and upgrades go there', 'success');
-                });
-            })
-            .catch(function (e) {
-                toast((e && e.message) || 'Couldn’t change the Library', 'error');
-            });
-    }
-
-    // Re-read the episode list from TMDB. Long-running for a show with many
-    // seasons (one API call per season), so the button reports progress and the
-    // hint becomes the result — "added 12" is the answer the user actually wants,
-    // not a green tick that leaves them counting rows.
-    function rescanEpisodes(btn) {
-        if (btn.disabled) return;
-        var note = state.overlay && state.overlay.querySelector('[data-vmg-rescan-note]');
-        var orig = btn.textContent;
-        btn.disabled = true;
-        btn.textContent = 'Re-scanning…';
-        if (note) note.textContent = 'Reading every season — this can take a moment.';
-        fetch('/api/video/detail/show/' + state.id + '/rescan-episodes', {
-            method: 'POST', headers: { Accept: 'application/json' } })
-            .then(function (r) {
-                return r.json().catch(function () { return {}; }).then(function (b) {
-                    if (!r.ok || !b.ok) throw new Error(b.error || 'Re-scan failed');
-                    return b;
-                });
-            })
-            .then(function (b) {
-                var msg = b.added
-                    ? 'Added ' + b.added + ' episode' + (b.added === 1 ? '' : 's') +
-                      ' — ' + b.total + ' now known'
-                    : 'No new episodes — ' + b.total + ' known';
-                if (note) note.textContent = msg;
-                toast(msg, 'success');
-                if (b.added) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
-            })
-            .catch(function (e) {
-                if (note) note.textContent = (e && e.message) || 'Re-scan failed';
-                toast((e && e.message) || 'Re-scan failed', 'error');
-            })
-            .then(function () { btn.disabled = false; btn.textContent = orig; });
-    }
-
-    // Two-step on purpose: the first click only LOOKS, the second agrees to the
-    // delete. No modal — the button itself becomes the confirmation, and it names
-    // the exact number so "remove 12 duplicate rows" is what you agree to, not a
-    // generic yes. State lives on the button so re-opening the panel resets it.
-    function duplicateEpisodes(btn) {
-        if (btn.disabled) return;
-        var note = state.overlay && state.overlay.querySelector('[data-vmg-dupe-note]');
-        var armed = btn.getAttribute('data-armed') === '1';
-        btn.disabled = true;
-        btn.textContent = armed ? 'Removing…' : 'Checking…';
-        var req = armed
-            ? fetch('/api/video/repair/duplicate-episodes', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ show_id: state.id }) })
-            : fetch('/api/video/repair/duplicate-episodes?show_id=' + state.id,
-                { headers: { Accept: 'application/json' } });
-        req.then(function (r) {
-            return r.json().catch(function () { return {}; }).then(function (b) {
-                if (!r.ok || !b.ok) throw new Error(b.error || 'Request failed');
-                return b;
-            });
-        }).then(function (b) {
-            if (armed) {
-                btn.removeAttribute('data-armed');
-                btn.textContent = 'Check for duplicate episodes';
-                var msg = 'Removed ' + b.removed + ' duplicate row' + (b.removed === 1 ? '' : 's');
-                if (note) note.textContent = msg + '. Nothing on disk was touched.';
-                toast(msg, 'success');
-                if (b.removed) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
-                return;
-            }
-            if (!b.count) {
-                btn.textContent = 'Check for duplicate episodes';
-                if (note) note.textContent = 'No duplicates found for this show.';
-                toast('No duplicate episodes found', 'info');
-                return;
-            }
-            // Arm the confirm, and say exactly what would go.
-            btn.setAttribute('data-armed', '1');
-            btn.textContent = 'Remove ' + b.count + ' duplicate row' + (b.count === 1 ? '' : 's');
-            var eg = (b.items || []).slice(0, 3).map(function (it) {
-                return 'S' + it.season_number + 'E' + it.episode_number +
-                       ' (you have it as S' + it.owned_season + 'E' + it.owned_episode + ')';
-            }).join(', ');
-            if (note) {
-                note.textContent = b.count + ' episode(s) listed twice: ' + eg +
-                    (b.count > 3 ? ', …' : '') + '. Removing only clears the duplicate ' +
-                    'listing — no files are deleted.';
-            }
-        }).catch(function (e) {
-            btn.removeAttribute('data-armed');
-            btn.textContent = 'Check for duplicate episodes';
-            if (note) note.textContent = (e && e.message) || 'Check failed';
-            toast((e && e.message) || 'Check failed', 'error');
-        }).then(function () { btn.disabled = false; });
-    }
-
-    // Same two-step contract as duplicateEpisodes: look, then agree to a named
-    // count. Separate from it because the RULE is different — that one pairs a
-    // row against an episode you own under another season; this one asks the
-    // show's numbering database whether the season lists that number at all.
-    function unlistedEpisodes(btn) {
-        if (btn.disabled) return;
-        var note = state.overlay && state.overlay.querySelector('[data-vmg-unlisted-note]');
-        var armed = btn.getAttribute('data-armed') === '1';
-        var idle = 'Check for out-of-place episodes';
-        btn.disabled = true;
-        btn.textContent = armed ? 'Removing…' : 'Checking…';
-        var req = armed
-            ? fetch('/api/video/repair/unlisted-episodes', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ show_id: state.id }) })
-            : fetch('/api/video/repair/unlisted-episodes?show_id=' + state.id,
-                { headers: { Accept: 'application/json' } });
-        req.then(function (r) {
-            return r.json().catch(function () { return {}; }).then(function (b) {
-                if (!r.ok || !b.ok) throw new Error(b.error || 'Request failed');
-                return b;
-            });
-        }).then(function (b) {
-            // Which database the server judged against. Named in every outcome:
-            // "nothing found" and "asked the wrong one" are otherwise the same
-            // message, and telling them apart is the whole point of reporting it.
-            var src = String(b.source || 'tmdb').toUpperCase();
-            if (armed) {
-                btn.removeAttribute('data-armed');
-                btn.textContent = idle;
-                var msg = 'Removed ' + b.removed + ' out-of-place row' + (b.removed === 1 ? '' : 's');
-                if (note) note.textContent = msg + '. Nothing on disk was touched.';
-                toast(msg, 'success');
-                if (b.removed) document.dispatchEvent(new CustomEvent('soulsync:video-episodes-changed'));
-                return;
-            }
-            if (!b.count) {
-                btn.textContent = idle;
-                if (note) note.textContent = 'Checked against ' + src +
-                    ': every episode is filed under a season it lists.';
-                toast('No out-of-place episodes found (checked ' + src + ')', 'info');
-                return;
-            }
-            btn.setAttribute('data-armed', '1');
-            btn.textContent = 'Remove ' + b.count + ' out-of-place row' + (b.count === 1 ? '' : 's');
-            var eg = (b.items || []).slice(0, 3).map(function (it) {
-                return 'S' + it.season_number + 'E' + it.episode_number +
-                       (it.air_date ? ' (' + it.air_date + ')' : '');
-            }).join(', ');
-            if (note) {
-                note.textContent = b.count + ' episode(s) ' + src + ' doesn\'t list in that season: ' +
-                    eg + (b.count > 3 ? ', …' : '') + '. None are on disk — removing only ' +
-                    'clears the listing.';
-            }
-        }).catch(function (e) {
-            btn.removeAttribute('data-armed');
-            btn.textContent = idle;
-            if (note) note.textContent = (e && e.message) || 'Check failed';
-            toast((e && e.message) || 'Check failed', 'error');
-        }).then(function () { btn.disabled = false; });
-    }
-
-    // Name the provider that's ACTUALLY in force, and why. 'Auto' is otherwise
-    // unfalsifiable: when a re-scan reports nothing there's no way to tell
-    // whether auto chose what you expected or quietly kept the default because
-    // a probe failed. Also relabels the re-scan button, which used to claim
-    // TMDB regardless of where it really reads from.
-    function loadEpisodeSource() {
-        var note = state.overlay && state.overlay.querySelector('[data-vmg-episode-source-note]');
-        if (!note) return;
-        fetch('/api/video/detail/show/' + state.id + '/episode-source',
-              { headers: { Accept: 'application/json' } })
-            .then(function (r) { return r.json().catch(function () { return {}; }); })
-            .then(function (d) {
-                if (!d.success) {
-                    note.textContent = d.error || 'Could not check the databases just now.';
-                    return;
-                }
-                var name = String(d.source || 'tmdb').toUpperCase();
-                if (d.override) {
-                    note.textContent = 'Pinned to ' + name + '. Auto would use ' +
-                        (d.tvdb_score > d.tmdb_score ? 'TVDB' : 'TMDB') + '.';
-                    return;
-                }
-                var miss = (d.source === 'tvdb' ? d.missing_from_tmdb : d.missing_from_tvdb) || [];
-                note.textContent = 'Using ' + name + ' — it covers ' +
-                    Math.round((d.source === 'tvdb' ? d.tvdb_score : d.tmdb_score) * 100) +
-                    '% of your server\'s seasons' +
-                    (miss.length ? ' (the other is missing season' + (miss.length === 1 ? ' ' : 's ') +
-                        miss.slice(0, 6).join(', ') + (miss.length > 6 ? '…' : '') + ')' : '') + '.';
-            })
-            .catch(function () { note.textContent = 'Could not check the databases just now.'; });
-    }
-
-    // Which provider supplies the episode LIST. Changing it rewrites nothing on
-    // its own — the next re-scan is what applies it — so the toast says so
-    // rather than implying the library just changed.
-    function setEpisodeSource(sel) {
-        fetch('/api/video/detail/show/' + state.id + '/episode-source', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ episode_source: sel.value }),
-        }).then(function (r) { return r.json().catch(function () { return {}; }); })
-            .then(function (b) {
-                if (!b.success) { toast(b.error || 'Could not save', 'error'); return; }
-                toast(sel.value === 'auto'
-                    ? 'Episode numbering back to auto — re-scan to apply'
-                    : 'Episode numbering set to ' + sel.value.toUpperCase() + ' — re-scan to apply',
-                    'success');
-            })
-            .catch(function () { toast('Could not save', 'error'); });
-    }
-
     function setSeriesType(sel) {
         fetch('/api/video/detail/show/' + state.id + '/series-type', {
             method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            // Not in the library → state.id is the tmdb id, stored as an override.
-            body: JSON.stringify({ series_type: sel.value,
-                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
+            body: JSON.stringify({ series_type: sel.value }) })
             .then(function (r) {
                 if (!r.ok) throw new Error();
                 toast('Series type updated — episode searches follow it', 'success');
             })
             .catch(function () { toast('Couldn’t update the series type', 'error'); });
-    }
-
-    function setSeasonPackMode(sel) {
-        fetch('/api/video/detail/show/' + state.id + '/season-pack-mode', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            // Not in the library → state.id is the tmdb id, stored as an override.
-            body: JSON.stringify({ season_pack_mode: sel.value,
-                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
-            .then(function (r) {
-                if (!r.ok) throw new Error();
-                toast(sel.value
-                    ? 'Season pack preference saved for this show'
-                    : 'This show follows the global season pack setting again', 'success');
-            })
-            .catch(function () { toast('Couldn’t save the season pack preference', 'error'); });
-    }
-
-    function saveAkaTitles(btn) {
-        var box = document.querySelector('[data-vmg-aka]');
-        if (!box) return;
-        btn.disabled = true;
-        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/aka', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            // For a not-in-library title state.id IS the tmdb id, and the endpoint
-            // has to be told so — it resolves a library row id by default.
-            body: JSON.stringify({ titles: box.value,
-                                   source: state.tmdbOnly ? 'tmdb' : 'library' }) })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                btn.disabled = false;
-                if (!d || !d.ok) { toast('Couldn’t save those titles', 'error'); return; }
-                // Echo back what was actually stored (deduped, blanks dropped) so the
-                // box shows the truth rather than what was typed.
-                box.value = (d.aka_titles || []).join('\n');
-                toast(d.aka_titles.length
-                    ? 'Saved — releases using ' + (d.aka_titles.length === 1 ? 'that name' : 'those names') + ' will match'
-                    : 'Cleared — only the title above will match', 'success');
-            })
-            .catch(function () { btn.disabled = false; toast('Couldn’t save those titles', 'error'); });
     }
 
     function setQualityProfile(sel) {
@@ -1067,34 +700,6 @@
                 toast('Quality profile updated — grabs and upgrades follow it', 'success');
             })
             .catch(function () { toast('Couldn’t update the quality profile', 'error'); });
-    }
-
-    // "Lock automatic edits" — its own endpoint rather than a case in toggle()
-    // above, because it is neither watch state nor the monitored flag: it decides
-    // whether the unattended importer may write into this title at all.
-    function toggleImportLock(el) {
-        var on = !el.classList.contains('vmg-toggle--on');
-        el.classList.toggle('vmg-toggle--on', on);
-        el.setAttribute('aria-checked', on ? 'true' : 'false');
-        fetch('/api/video/detail/' + state.kind + '/' + state.id + '/import-lock', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ locked: on }),
-        })
-            .then(function (r) {
-                if (!r.ok) throw new Error();
-                if (state.data) state.data.import_locked = on;
-                toast(on ? 'Locked — automatic imports for this title will be refused'
-                         : 'Unlocked — automatic imports can write to this title again',
-                      'success');
-                document.dispatchEvent(new CustomEvent('soulsync:video-meta-changed', {
-                    detail: { kind: state.kind, id: state.id, quiet: true },
-                }));
-            })
-            .catch(function () {
-                el.classList.toggle('vmg-toggle--on', !on);
-                el.setAttribute('aria-checked', !on ? 'true' : 'false');
-                toast('Couldn’t change the lock', 'error');
-            });
     }
 
     function toggle(which, el) {
@@ -1204,14 +809,6 @@
                 applyMatch('imdb', iv, 'IMDb id set — ratings will refresh');
                 return;
             }
-            var akaBtn = e.target.closest('[data-vmg-aka-save]');
-            if (akaBtn) { saveAkaTitles(akaBtn); return; }
-            var rsc = e.target.closest('[data-vmg-rescan-eps]');
-            if (rsc) { rescanEpisodes(rsc); return; }
-            var dup = e.target.closest('[data-vmg-dupe-eps]');
-            if (dup) { duplicateEpisodes(dup); return; }
-            var unl = e.target.closest('[data-vmg-unlisted-eps]');
-            if (unl) { unlistedEpisodes(unl); return; }
             var tw = e.target.closest('[data-vmg-watched]');
             if (tw) { toggle('watched', tw); return; }
             var tm = e.target.closest('[data-vmg-monitored]');
@@ -1225,16 +822,16 @@
         ov.addEventListener('change', function (e) {
             var qp = e.target.closest('[data-vmg-quality-profile]');
             if (qp) setQualityProfile(qp);
-            var lk = e.target.closest('[data-vmg-import-lock]');
-            if (lk) { toggleImportLock(lk); return; }
             var st = e.target.closest('[data-vmg-series-type]');
             if (st) setSeriesType(st);
-            var spm = e.target.closest('[data-vmg-season-pack-mode]');
-            if (spm) setSeasonPackMode(spm);
-            var lib = e.target.closest('[data-vmg-library]');
-            if (lib) setLibrary(lib);
-            var es = e.target.closest('[data-vmg-episode-source]');
-            if (es) setEpisodeSource(es);
+            var src = e.target.closest('[data-vmg-src]');
+            if (src) {
+                var lab = src.closest('.vmg-src');
+                if (lab) lab.classList.toggle('vmg-src--on', src.checked);
+                saveOverrides();
+            }
+            if (e.target.closest('[data-vmg-pack-pref]') ||
+                e.target.closest('[data-vmg-ovr]')) saveOverrides();
         });
         ov.addEventListener('keydown', function (e) {
             var msin = e.target.closest('[data-vmg-msearch-in]');
@@ -1266,74 +863,30 @@
         document.addEventListener('keydown', onKey, true);
     }
 
-    // opts: { kind, id, source?, detail?, akaTitles? }
-    //   source 'tmdb'  → `id` is a TMDB id for a title NOT in the library. There
-    //                    is no row to fetch, so the caller passes what it already
-    //                    has and only the matching section renders.
-    //   anything else  → `id` is a library row id; unchanged behaviour.
     function open(opts) {
         if (!opts || !opts.kind || opts.id == null) return;
-        // Every save in this panel is admin-only server-side (/metadata, /lock,
-        // /aka, /library, /quality-profile, /series-type, /rescan-episodes,
-        // /episode-source). Defense in depth behind the hidden launcher, same as
-        // the Overlay and Collection studios — a panel that can only 403 should
-        // not open at all.
-        if (typeof currentProfile !== 'undefined' && currentProfile && !currentProfile.is_admin) return;
         if (state) close(true);
         ensureStyles();
-
-        if (String(opts.source || '').toLowerCase() === 'tmdb') {
-            var src = opts.detail || {};
-            // The overrides live against the tmdb id, so they're readable with no
-            // library row — fetch them rather than trusting whatever the caller had.
-            fetch('/api/video/detail/aka/' + encodeURIComponent(opts.kind) +
-                  '/' + encodeURIComponent(opts.id), { headers: { Accept: 'application/json' } })
-                .then(function (r) { return r.ok ? r.json() : null; })
-                .then(function (a) {
-                    _mount({ kind: opts.kind, id: opts.id, title: src.title || '',
-                             aka_titles: (a && a.aka_titles) || opts.akaTitles || [],
-                             series_type: (a && a.series_type) || src.series_type || 'standard',
-                             season_pack_mode: (a && a.season_pack_mode) || '',
-                             _tmdbOnly: true }, true);
-                })
-                .catch(function () {
-                    _mount({ kind: opts.kind, id: opts.id, title: src.title || '',
-                             aka_titles: opts.akaTitles || [],
-                             series_type: src.series_type || 'standard',
-                             _tmdbOnly: true }, true);
-                });
-            return;
-        }
-
         fetch('/api/video/detail/' + encodeURIComponent(opts.kind) + '/' + encodeURIComponent(opts.id))
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d) { toast('Couldn’t load item', 'error'); return; }
-                _mount(d, false);
+                var ov = document.createElement('div');
+                ov.className = 'vmg-overlay';
+                ov.innerHTML = panelHtml(d);
+                document.body.appendChild(ov);
+                state = { kind: d.kind, id: d.id, data: d, saving: false,
+                    genres: (d.genres || []).slice(), locked: (d.locked_fields || []).slice(),
+                    overlay: ov, focusMatch: opts.focusMatch || null };
+                renderChips();
+                wire();
+                loadGenreSuggestions(d.kind);
+                loadMatches();
+                loadQualityProfiles(d);
+                requestAnimationFrame(function () { ov.classList.add('vmg-open'); });
             })
             .catch(function () { toast('Couldn’t load item', 'error'); });
     }
 
-    function _mount(d, tmdbOnly) {
-        var ov = document.createElement('div');
-        ov.className = 'vmg-overlay';
-        ov.innerHTML = panelHtml(d);
-        document.body.appendChild(ov);
-        state = { kind: d.kind, id: d.id, data: d, saving: false,
-                  genres: (d.genres || []).slice(), locked: (d.locked_fields || []).slice(),
-                  overlay: ov, tmdbOnly: !!tmdbOnly };
-        wire();
-        if (!tmdbOnly) {
-            // All row-backed: genre chips, TMDB/IMDb matches, per-title profiles.
-            renderChips();
-            loadGenreSuggestions(d.kind);
-            loadMatches();
-            if (d.kind === 'show') loadEpisodeSource();
-            loadQualityProfiles(d);
-            loadLibraries(d);
-        }
-        requestAnimationFrame(function () { ov.classList.add('vmg-open'); });
-    }
-
-    window.VideoManage = { open: open };
+    window.VideoManage = { open: open, ensureStyles: ensureStyles };  // Commissary: styles for the pre-owned panel
 })();

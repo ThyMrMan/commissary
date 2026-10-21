@@ -4,7 +4,7 @@ The Audit Trail modal on the Library History view needs to show
 exactly what tags are currently embedded in a downloaded file —
 title/artist/album metadata, MusicBrainz/Spotify/Tidal IDs,
 ReplayGain values, ISRC, cover-art presence, lyrics, and anything
-else Commissary or its background enrichment workers wrote.
+else SoulSync or its background enrichment workers wrote.
 
 The file is the single source of truth. A persisted snapshot at
 post-process time would drift the moment a background worker
@@ -57,6 +57,7 @@ _ID3_TEXT_FRAMES = {
 # attribute. We pick known descriptions out of those.
 _KNOWN_TXXX_DESCS = {
     "MusicBrainz Album Id": "musicbrainz_albumid",
+    "MusicBrainz Album Comment": "musicbrainz_albumcomment",
     "MusicBrainz Artist Id": "musicbrainz_artistid",
     "MusicBrainz Album Artist Id": "musicbrainz_albumartistid",
     "MusicBrainz Release Group Id": "musicbrainz_releasegroupid",
@@ -118,7 +119,7 @@ _VORBIS_ALLOWED_KEYS = frozenset({
     "isrc", "barcode", "catalognumber", "asin", "script",
     "media", "originaldate", "releasecountry", "releasestatus",
     "releasetype", "artists", "composer", "performer",
-    "musicbrainz_albumid", "musicbrainz_artistid",
+    "musicbrainz_albumid", "musicbrainz_albumcomment", "musicbrainz_artistid",
     "musicbrainz_albumartistid", "musicbrainz_releasegroupid",
     "musicbrainz_releasetrackid", "musicbrainz_trackid",
     "spotify_track_id", "spotify_artist_id", "spotify_album_id",
@@ -261,6 +262,20 @@ def _extract_tags(audio: Any, symbols: Any) -> Dict[str, str]:
                     out[key] = val
         except Exception as exc:  # noqa: S110 — optional TXXX walk
             logger.debug("ID3 TXXX walk failed: %s", exc)
+        # UFID: picard (and soulsync's own writer) keep the musicbrainz
+        # RECORDING id in a UFID frame, not a TXXX one. without this an mp3
+        # showed every musicbrainz id except the recording.
+        try:
+            for frame in tags.getall("UFID"):
+                if getattr(frame, "owner", "") != "http://musicbrainz.org":
+                    continue
+                data = getattr(frame, "data", b"")
+                val = (data.decode("ascii", "ignore") if isinstance(data, bytes)
+                       else str(data or "")).strip()
+                if val:
+                    out.setdefault("musicbrainz_trackid", val)
+        except Exception as exc:  # noqa: S110 — optional UFID walk
+            logger.debug("ID3 UFID walk failed: %s", exc)
         # USLT (unsynchronised lyrics).
         try:
             for frame in tags.getall("USLT"):

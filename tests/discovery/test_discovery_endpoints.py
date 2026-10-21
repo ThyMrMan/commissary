@@ -55,6 +55,43 @@ def test_spotify_data_shape_basic():
     }]
 
 
+def test_manual_musicbrainz_comment_survives_sync_conversion():
+    results = [{'spotify_data': {
+        'id': 'rec-acoustic', 'name': 'Song', 'artists': ['Artist'], 'album': 'Album',
+        'source': 'musicbrainz', 'disambiguation': 'acoustic',
+    }}]
+
+    assert convert_results_to_spotify_tracks(results, 'YouTube')[0] == {
+        'id': 'rec-acoustic', 'name': 'Song', 'artists': ['Artist'], 'album': 'Album',
+        'duration_ms': 0, 'source': 'musicbrainz',
+        'disambiguation': 'acoustic',
+    }
+
+
+def test_fix_payload_and_beatport_conversion_keep_recording_comment():
+    from api.beatport_charts import convert_beatport_results_to_spotify_tracks
+    from api.source_playlists import _build_fix_modal_spotify_data
+
+    selected = {
+        'id': 'rec-acoustic', 'name': 'Song', 'artists': ['Artist'],
+        'album': 'Album', 'source': 'musicbrainz',
+        'disambiguation': 'acoustic',
+    }
+    saved = _build_fix_modal_spotify_data(selected)
+    assert saved['name'] == 'Song'
+    assert saved['disambiguation'] == 'acoustic'
+
+    synced = convert_beatport_results_to_spotify_tracks([{'spotify_data': saved}])
+    assert synced[0]['source'] == 'musicbrainz'
+    assert synced[0]['disambiguation'] == 'acoustic'
+
+    non_musicbrainz = convert_beatport_results_to_spotify_tracks([{'spotify_data': {
+        'id': 'sp-track', 'name': 'Song', 'artists': ['Artist'], 'album': 'Album',
+        'source': 'spotify',
+    }}])
+    assert non_musicbrainz[0]['source'] == 'beatport'
+
+
 def test_spotify_data_duration_defaults_to_zero():
     results = [{'spotify_data': {'id': 'x', 'name': 'n', 'artists': [], 'album': 'a'}}]
     out = convert_results_to_spotify_tracks(results, 'Deezer')
@@ -181,9 +218,9 @@ def test_cancel_sync_cancels_active_worker_and_reverts_state():
 
     assert code == 200
     assert body == {"success": True, "message": "Tidal sync cancelled"}
-    # sync marked cancelled, worker removed
+    # sync marked cancelled; retain the handle until the worker has finished
     assert infra['sync_states']['sp1'] == {"status": "cancelled"}
-    assert 'sp1' not in infra['active_sync_workers']
+    assert infra['active_sync_workers']['sp1'].cancelled
     # state reverted
     assert states['pl']['phase'] == 'discovered'
     assert states['pl']['sync_playlist_id'] is None
@@ -416,6 +453,31 @@ def test_reconcile_finished_flips_phase_and_posts_activity():
     assert state['phase'] == 'sync_complete'
     assert state['sync_progress'] == {"done": 3}
     assert calls == [("", "Sync Complete", "YouTube playlist 'Mix' synced successfully", "Now")]
+
+
+def test_reconcile_names_a_mirrored_playlist_as_a_playlist_not_youtube():
+    """cremonies #1404: a listenbrainz mirror synced from the discovery modal
+    posted "YouTube playlist 'Weekly Jams' synced successfully", because
+    mirrored states live in the youtube states dict."""
+    calls, add = _activity_recorder()
+    state = {'phase': 'syncing', 'playlist': {'id': 'mirrored_7', 'name': 'Weekly Jams'}}
+    reconcile_sync_phase(
+        state, {"status": "finished"},
+        activity_subject='YouTube playlist', playlist_name_getter=_pl_name_safe,
+        add_activity_item=add)
+    assert calls == [("", "Sync Complete", "Playlist 'Weekly Jams' synced successfully", "Now")]
+
+
+def test_start_sync_names_a_mirrored_playlist_as_a_playlist_not_youtube():
+    """#1404, the start half: "YouTube Sync Started" for a listenbrainz mirror."""
+    from core.discovery.endpoints import start_sync
+    infra = _cancel_infra()
+    kw, _, calls = _start_kwargs(infra, name='Weekly Jams', activity_label='YouTube',
+                                 error_label='YouTube', sync_id_prefix='youtube')
+    states = {'mirrored_7': {'phase': 'discovered', 'discovery_results': [1]}}
+    body, code = start_sync(states, 'mirrored_7', **kw)
+    assert code == 200
+    assert calls == [("", "Playlist Sync Started", "'Weekly Jams' - 1 tracks", "Now")]
 
 
 def test_reconcile_error_reverts_to_discovered():
@@ -703,7 +765,11 @@ def test_start_sync_happy_path():
     assert states['h1']['sync_playlist_id'] == 'spotify_public_h1'
     assert states['h1']['sync_progress'] == {}
     # sync infra seeded + worker registered
-    assert infra['sync_states']['spotify_public_h1'] == {"status": "starting", "progress": {}}
+    assert infra['sync_states']['spotify_public_h1'] == {
+        "status": "starting",
+        "playlist_name": "My Mix",
+        "progress": {"playlist_name": "My Mix", "total_tracks": 2, "progress": 0},
+    }
     assert infra['active_sync_workers']['spotify_public_h1'] == 'future:spotify_public_h1'
     # submit got name/tracks/image
     assert submitted == [('spotify_public_h1', 'My Mix', [{'id': 'a'}, {'id': 'b'}], 'cover.jpg')]
@@ -722,9 +788,10 @@ def test_start_sync_allows_resync_phases():
 
 
 def test_start_sync_refuses_while_a_sync_is_in_flight():
-    """The discovery modal's "Sync This Playlist" scheduled a second sync over a
-    running one and overwrote the worker handle. An un-done future for the same
-    sync id must 409 and leave everything untouched. (Upstream 3.3.1.)"""
+    """user report (aug 25): the discovery modal's Sync This Playlist
+    scheduled a second sync over a running one and overwrote the worker
+    handle. an un-done future for the same sync id must 409 and leave
+    everything untouched."""
     from core.discovery.endpoints import start_sync
 
     class _Running:
@@ -760,46 +827,6 @@ def test_start_sync_proceeds_when_the_previous_sync_finished():
     body, code = start_sync(states, 'k', **kw)
     assert code == 200 and body['success'] is True
     assert len(submitted) == 1
-
-
-def test_start_sync_tolerates_a_handle_that_cannot_say_whether_it_is_done():
-    """`getattr(existing, 'done', lambda: True)` rather than `.done()`. A stale
-    key holding something that is not a Future must not raise — that would turn
-    a leftover dict entry into a 500 on every subsequent sync. Treating it as
-    finished is also the pre-guard behaviour, so nothing regresses."""
-    from core.discovery.endpoints import start_sync
-
-    infra = _cancel_infra()
-    kw, submitted, _ = _start_kwargs(infra)
-    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0}}
-    infra['active_sync_workers']['tidal_k'] = object()      # no .done at all
-    body, code = start_sync(states, 'k', **kw)
-    assert code == 200, body
-    assert len(submitted) == 1
-
-
-def test_start_sync_leaves_no_activity_trace_for_a_refused_duplicate():
-    """The guard sits BEFORE the activity item and the phase mutation. Logging
-    "Sync Started" for a request that is about to 409 would be a second, quieter
-    wrong thing."""
-    from core.discovery.endpoints import start_sync
-
-    class _Running:
-        def done(self):
-            return False
-
-    infra = _cancel_infra()
-    kw, _submitted, calls = _start_kwargs(infra)
-    states = {'k': {'phase': 'discovered', 'discovery_results': [], 'last_accessed': 0,
-                    'sync_progress': {'kept': True}}}
-    infra['active_sync_workers']['tidal_k'] = _Running()
-    before_states = dict(infra['sync_states'])
-    body, code = start_sync(states, 'k', **kw)
-    assert code == 409
-    assert calls == [], "no activity item may be recorded for a refused duplicate"
-    assert 'sync_playlist_id' not in states['k']
-    assert states['k']['sync_progress'] == {'kept': True}
-    assert infra['sync_states'] == before_states
 
 
 def test_start_sync_exception_returns_500():
@@ -873,7 +900,7 @@ def test_update_match_state_not_found():
     gj, kw, _ = _update_kwargs(json_data={
         'identifier': 'p', 'track_index': 0, 'spotify_track': {'id': 'x'}})
     body, code = update_discovery_match({}, gj, **kw)
-    assert code == 404 and body == {'error': 'Discovery state not found'}
+    assert code == 404 and body == {'error': 'Identification state not found'}
 
 
 def test_update_match_invalid_index():
@@ -1181,4 +1208,4 @@ def test_update_match_no_state_and_no_originals_still_404():
     gj, kw, _ = _update_kwargs(json_data={
         'identifier': 'gone', 'track_index': 0, 'spotify_track': {'id': 'x'}})
     body, code = update_discovery_match({}, gj, **kw)
-    assert code == 404 and body == {'error': 'Discovery state not found'}
+    assert code == 404 and body == {'error': 'Identification state not found'}

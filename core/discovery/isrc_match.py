@@ -1,97 +1,118 @@
-"""Exact matches by ISRC for playlist discovery.
+"""identify a track by its isrc instead of searching for it.
 
-A playlist track that carries an ISRC -- Qobuz sends one with every track --
-names one recording exactly. Deezer looks tracks up by ISRC for free, so a hit
-there is the match, whichever metadata source discovery otherwise searches
-(iTunes has no ISRC lookup at all).
+an isrc names one recording. beatport hands one over with every track, and
+spotify (``isrc:`` search) and deezer (``/track/isrc:<code>``) can look it up
+directly, so the exact recording comes back: the extended mix stays the
+extended mix instead of whatever version a title search ranks first.
 
-The match is built with its full album -- track count and release date -- and
-its position on it. Anything less gets filled in at download time from the main
-metadata source using this album's id, which would hand a Deezer id to another
-source's client; so without them the ISRC isn't used, and discovery searches as
-it always did.
+isrcs do get reused and mis-assigned now and then, so a hit only counts when
+one of its artists agrees with the source's. anything that doesn't pan out is
+None and the normal search runs, so this can never do worse than before.
+
+same contract as direct_match: returns the provider's own Track object, the
+one a search would have returned, so the caller stores it unchanged.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Optional
+import re
+from typing import Any, Iterable, Optional
 
-from core.text.isrc import normalize_isrc
+from utils.logging_config import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger("discovery.isrc_match")
 
-ISRC_MATCH_SOURCE = 'deezer'
-# Both Qobuz and Deezer give lengths in whole seconds. A bigger gap means the
-# code points at another cut of the song, or the source's code is wrong.
-ISRC_DURATION_TOLERANCE_MS = 5000
-_ALBUM_TYPES = {'compile': 'compilation'}
+_ISRC_RE = re.compile(r'^[A-Z]{2}[A-Z0-9]{3}\d{7}$')
 
 
-def resolve_isrc_track(isrc: Any, duration_ms: Any, deezer_client: Any) -> Optional[dict]:
-    """Discovery ``matched_data`` for the Deezer recording with this ISRC, or None.
+def clean_isrc(value: Any) -> str:
+    """an isrc in its canonical form, or '' when it isn't one."""
+    code = re.sub(r'[\s-]', '', str(value or '')).upper()
+    return code if _ISRC_RE.match(code) else ''
 
-    None when the code isn't a valid ISRC, Deezer doesn't know it, the answer
-    carries a different ISRC, its length is more than 5 s off the playlist
-    track's, or its album's track count, its release date or its position on the
-    album can't be had. Never raises.
-    """
-    code = normalize_isrc(isrc)
-    if not code or deezer_client is None:
+
+def _norm(name: Any) -> str:
+    return re.sub(r'[^0-9a-z]+', '', str(name or '').casefold())
+
+
+def artists_agree(wanted: Iterable[Any], got: Iterable[Any]) -> bool:
+    """true when one of the source's artists is one of the hit's. a name
+    contained in the other counts ("Armin van Buuren" vs "Armin van Buuren &
+    Funk Tribu"). no source artists means nothing to check against."""
+    want = [n for n in (_norm(w) for w in wanted or []) if len(n) >= 2]
+    if not want:
+        return True
+    have = [n for n in (_norm(g) for g in got or []) if n]
+    return any(w in h or h in w for w in want for h in have)
+
+
+def _spotify_isrc(client: Any, code: str) -> Optional[Any]:
+    from core.spotify_client import Track as SpotifyTrack
+
+    if client is None or not getattr(client, 'sp', None):
         return None
+    # the isrc: field needs the real api. the no-auth path can't do it, and a
+    # free-text search for the code would match nothing useful
     try:
-        track = deezer_client.get_track_by_isrc(code)
-        if not isinstance(track, dict) or not track.get('id'):
+        if not client.is_spotify_authenticated() or client._free_active():
             return None
-        if normalize_isrc(track.get('isrc')) not in ('', code):
-            return None
-        track_ms = int(track.get('duration') or 0) * 1000
-        source_ms = int(duration_ms or 0)
-        if track_ms and source_ms and abs(track_ms - source_ms) > ISRC_DURATION_TOLERANCE_MS:
-            logger.info("[ISRC] %s runs %d ms on Deezer but %d ms in the playlist -- not used",
-                        code, track_ms, source_ms)
-            return None
-        album = track.get('album') if isinstance(track.get('album'), dict) else {}
-        full_album = deezer_client.get_album_raw(album['id']) if album.get('id') else None
-        return _matched_data(code, track, album, full_album if isinstance(full_album, dict) else {})
-    except Exception as exc:
-        logger.debug("[ISRC] lookup for %s failed: %s", code, exc)
+    except Exception:
         return None
+    results = client.sp.search(q=f"isrc:{code}", type="track", limit=5)
+    items = ((results or {}).get('tracks') or {}).get('items') or []
+    for raw in items:
+        if raw and raw.get('id'):
+            try:
+                from core.metadata.cache import get_metadata_cache
+                # the discovery workers read the full album from here
+                get_metadata_cache().store_entity('spotify', 'track', raw['id'], raw)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("spotify isrc cache write failed: %s", e)
+            return SpotifyTrack.from_spotify_track(raw)
+    return None
 
 
-def _matched_data(code: str, track: dict, album: dict, full_album: dict) -> Optional[dict]:
-    total_tracks = int(full_album.get('nb_tracks') or 0)
-    release_date = full_album.get('release_date') or album.get('release_date') or track.get('release_date') or ''
-    # Without its position a download looks the track up again, handing this Deezer id
-    # to the main source's client -- the lookup the full album is there to avoid.
-    track_number = int(track.get('track_position') or 0)
-    if not total_tracks or not release_date or track_number <= 0:
+def _deezer_isrc(client: Any, code: str) -> Optional[Any]:
+    from core.deezer_client import DeezerClient, Track as DeezerTrack
+
+    if not isinstance(client, DeezerClient):
         return None
-    artist = track.get('artist') if isinstance(track.get('artist'), dict) else {}
-    names = [c.get('name') for c in (track.get('contributors') or []) if isinstance(c, dict) and c.get('name')]
-    if not names and artist.get('name'):
-        names = [artist['name']]
-    album_artist = full_album.get('artist') if isinstance(full_album.get('artist'), dict) else {}
-    cover = album.get('cover_xl') or full_album.get('cover_xl') or album.get('cover_big') or ''
-    record_type = full_album.get('record_type') or 'album'
-    return {
-        'id': str(track['id']),
-        'name': track.get('title') or '',
-        'artists': [{'name': name} for name in names],
-        'album': {
-            'id': str(album.get('id') or full_album.get('id') or ''),
-            'name': album.get('title') or full_album.get('title') or '',
-            'release_date': release_date,
-            'total_tracks': total_tracks,
-            'album_type': _ALBUM_TYPES.get(record_type, record_type),
-            'images': [{'url': cover}] if cover else [],
-            'image_url': cover,
-            'artists': [{'name': album_artist.get('name') or (names[0] if names else '')}],
-        },
-        'duration_ms': int(track.get('duration') or 0) * 1000,
-        'image_url': cover,
-        'source': ISRC_MATCH_SOURCE,
-        'track_number': track_number,
-        'disc_number': track.get('disk_number') or None,
-        'isrc': code,
-    }
+    # public endpoint: a stale oauth token would fail it outright
+    raw = client._api_get(f"/track/isrc:{code}", use_token=False)
+    if not isinstance(raw, dict) or raw.get('error') or not raw.get('id'):
+        return None
+    return DeezerTrack.from_deezer_track(raw)
+
+
+def isrc_match(
+    isrc: Any,
+    discovery_source: str,
+    use_spotify: bool,
+    spotify_client: Any = None,
+    fallback_client: Any = None,
+    artists: Iterable[Any] = (),
+) -> Optional[Any]:
+    """the provider's track for this isrc, or None to fall back to search."""
+    code = clean_isrc(isrc)
+    if not code:
+        return None
+    source = (discovery_source or '').lower()
+    try:
+        if use_spotify and source == 'spotify':
+            track = _spotify_isrc(spotify_client, code)
+        elif source == 'deezer' and not use_spotify:
+            track = _deezer_isrc(fallback_client, code)
+        else:
+            return None
+    except Exception as e:  # noqa: BLE001 - a failed lookup just means search
+        logger.debug("isrc lookup failed for %s on %s: %s", code, source, e)
+        return None
+    if track is None:
+        return None
+    wanted = list(artists or [])
+    if not artists_agree(wanted, getattr(track, 'artists', None) or []):
+        logger.info("isrc %s on %s came back as %s by %s, not %s; searching instead",
+                    code, source, getattr(track, 'name', '?'),
+                    ', '.join(getattr(track, 'artists', None) or []), ', '.join(map(str, wanted)))
+        return None
+    return track

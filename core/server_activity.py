@@ -13,6 +13,8 @@ shape differs and is added in :func:`_jellyfin_sessions`).
 from __future__ import annotations
 
 import time
+import threading
+import hashlib
 from typing import Any, Dict, List, Optional
 
 from utils.logging_config import get_logger
@@ -39,11 +41,11 @@ def _first(seq: Any) -> Any:
 
 
 def _plex_config(db=None) -> Dict[str, str]:
-    """Any working Plex connection config — the music config first (Commissary's
+    """Any working Plex connection config — the music config first (SoulSync's
     origin), then the video side's effective creds. Both usually point at the
     same server, and sessions() returns everything, so either works."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         cfg = config_manager.get_plex_config() or {}
         if cfg.get("base_url") and cfg.get("token"):
             return {"base_url": cfg["base_url"], "token": cfg["token"]}
@@ -60,27 +62,50 @@ def _plex_config(db=None) -> Dict[str, str]:
 
 
 _server_cache: Dict[str, Any] = {"srv": None, "at": 0.0, "key": ""}
+_server_cache_lock = threading.RLock()
+
+
+def invalidate_plex_server_cache() -> None:
+    """Force the next _plex_server call to reconnect."""
+    with _server_cache_lock:
+        _server_cache.update(srv=None, at=0.0, key="")
 
 
 def _plex_server(db=None):
-    """A connected PlexServer (cached ~60s so a 3s poll doesn't reconnect each
-    time). Returns None when Plex isn't configured or is unreachable."""
+    """A connected PlexServer. Returns None when Plex isn't configured or is
+    unreachable.
+
+    a working connection is kept until a call on it fails (that marks it
+    unreachable) or the credentials change. it used to be rebuilt every 60 s,
+    a round trip to plex for nothing. a failure is still remembered for 60 s
+    so a down server isn't hammered."""
     cfg = _plex_config(db)
     if not cfg["base_url"] or not cfg["token"]:
         return None
-    key = cfg["base_url"] + "|" + cfg["token"][:6]
-    now = time.time()
-    if _server_cache["srv"] is not None and _server_cache["key"] == key and now - _server_cache["at"] < 60:
-        return _server_cache["srv"]
-    try:
-        from plexapi.server import PlexServer
-        srv = PlexServer(cfg["base_url"], cfg["token"], timeout=_PLEX_TIMEOUT)
-        _server_cache.update(srv=srv, at=now, key=key)
-        return srv
-    except Exception:   # noqa: BLE001 - unreachable server is an expected state
-        logger.debug("plex connect failed for activity", exc_info=True)
-        _server_cache.update(srv=None, at=now, key=key)
-        return None
+    key = hashlib.sha256(f"{cfg['base_url']}|{cfg['token']}".encode()).hexdigest()
+    with _server_cache_lock:
+        now = time.time()
+        if _server_cache["key"] == key:
+            if _server_cache["srv"] is not None:
+                return _server_cache["srv"]
+            if 0 <= now - _server_cache["at"] < 60:
+                return None
+        try:
+            from plexapi.server import PlexServer
+            srv = PlexServer(cfg["base_url"], cfg["token"], timeout=_PLEX_TIMEOUT)
+            _server_cache.update(srv=srv, at=time.time(), key=key)
+            return srv
+        except Exception:   # noqa: BLE001 - unreachable server is an expected state
+            logger.debug("plex connect failed for activity", exc_info=True)
+            _server_cache.update(srv=None, at=time.time(), key=key)
+            return None
+
+
+def _mark_plex_unreachable(srv):
+    # A late failure from an old credential's client must not poison a newer one.
+    with _server_cache_lock:
+        if _server_cache['srv'] is srv:
+            _server_cache.update(srv=None, at=time.time())
 
 
 # ── normalization (pure — unit-tested with fakes) ────────────────────────────
@@ -176,7 +201,7 @@ def normalize_session(item: Any) -> Dict[str, Any]:
     state = str(_g(player, "state", "") or "playing").lower()
     thumb = _g(item, "grandparentThumb") or _g(item, "parentThumb") or _g(item, "thumb")
     art = _g(item, "art") or _g(item, "grandparentArt")
-    # what identifies the Commissary library row to jump to: a movie is its own
+    # what identifies the SoulSync library row to jump to: a movie is its own
     # ratingKey; an episode links to its SHOW. Title+year are a fallback when the
     # server id doesn't line up (re-scan, different server_source, etc.).
     if mtype == "movie":
@@ -223,7 +248,7 @@ def normalize_session(item: Any) -> Dict[str, Any]:
 def _jellyfin_config(db=None) -> Dict[str, str]:
     """Any working Jellyfin config — music first, then video's effective creds."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         cfg = config_manager.get_jellyfin_config() or {}
         if cfg.get("base_url") and cfg.get("api_key"):
             return {"base_url": cfg["base_url"], "api_key": cfg["api_key"]}
@@ -306,8 +331,9 @@ def _jellyfin_activity(db=None) -> tuple:
         return [], None
     try:
         import requests
+        from core.jellyfin_client import jellyfin_auth_headers
         r = requests.get(cfg["base_url"].rstrip("/") + "/Sessions",
-                         headers={"X-Emby-Token": cfg["api_key"]}, timeout=_PLEX_TIMEOUT)
+                         headers=jellyfin_auth_headers(cfg["api_key"]), timeout=_PLEX_TIMEOUT)
         raw = r.json() if r.status_code == 200 else []
     except Exception:   # noqa: BLE001
         logger.debug("jellyfin /Sessions failed", exc_info=True)
@@ -344,7 +370,7 @@ def _summarize(sessions: List[Dict[str, Any]], server_name: str, version: str) -
 
 def _resolve_library_links(sessions: List[Dict[str, Any]], db=None) -> None:
     """Attach a ``link`` = {kind, id, source:'library'} to each session whose
-    media is in the Commissary video library, so a click opens THAT movie/show
+    media is in the SoulSync video library, so a click opens THAT movie/show
     page. One DB query maps native server ids (Plex ratingKey / Jellyfin id)
     back to our rows. Best-effort — a miss just leaves the card non-clickable."""
     db_obj = None
@@ -419,6 +445,7 @@ def get_activity(db=None) -> Dict[str, Any]:
             platform = "plex"
         except Exception:   # noqa: BLE001 - configured but unreachable
             logger.debug("plex sessions() failed", exc_info=True)
+            _mark_plex_unreachable(srv)
 
     jf_sessions, jf_name = _jellyfin_activity(db)
     if jf_name is not None:                       # Jellyfin is configured
@@ -523,6 +550,7 @@ def get_history(db=None, limit: int = 40) -> Dict[str, Any]:
         items = srv.history(maxresults=limit)
     except Exception:   # noqa: BLE001
         logger.debug("plex history() failed", exc_info=True)
+        _mark_plex_unreachable(srv)
         return {"ok": False, "reason": "unreachable", "history": []}
     key = str(_g(srv, "machineIdentifier", "") or "plex")
     accounts, devices = _lookups(srv, key)
@@ -607,6 +635,7 @@ def get_stats(db=None, days: int = 30) -> Dict[str, Any]:
         items = srv.history(maxresults=1000, mindate=datetime.now() - timedelta(days=days))
     except Exception:   # noqa: BLE001
         logger.debug("plex history() for stats failed", exc_info=True)
+        _mark_plex_unreachable(srv)
         return {"ok": False, "reason": "unreachable"}
     accounts, devices = _lookups(srv, str(_g(srv, "machineIdentifier", "") or "plex"))
     data = compute_stats(items or [], accounts, devices, days)

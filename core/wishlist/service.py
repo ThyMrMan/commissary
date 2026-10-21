@@ -34,6 +34,7 @@ class WishlistService:
         source_type: str = "unknown",
         source_context: Dict[str, Any] = None,
         profile_id: int = 1,
+        quality_profile_id: Optional[int] = None,
     ) -> bool:
         """
         Add a failed track from a download modal to the wishlist.
@@ -44,6 +45,35 @@ class WishlistService:
             source_context: Additional context (playlist name, album info, etc.)
         """
         try:
+            # Reject podcasts from music wishlist
+            _is_pod = False
+            if source_type == "podcast":
+                _is_pod = True
+            elif isinstance(track_info, dict) and (
+                track_info.get("download_source") == "Podcast"
+                or track_info.get("origin") == "podcast"
+                or track_info.get("batch_id") == "podcasts"
+                or track_info.get("playlist_id") == "podcasts"
+            ):
+                _is_pod = True
+            elif isinstance(source_context, dict) and (
+                source_context.get("source_page") == "Podcasts"
+                or source_context.get("playlist_id") == "podcasts"
+            ):
+                _is_pod = True
+            elif isinstance(source_context, str) and (
+                '"source_page": "Podcasts"' in source_context
+                or '"playlist_id": "podcasts"' in source_context
+            ):
+                _is_pod = True
+
+            if _is_pod:
+                logger.info(
+                    "Skipping wishlist addition for podcast item: %s",
+                    track_info.get("track_name") if isinstance(track_info, dict) else "",
+                )
+                return False
+
             # Extract track data from the modal structure.
             track_data = extract_wishlist_track_from_modal_info(track_info)
             if not track_data:
@@ -54,7 +84,12 @@ class WishlistService:
             failure_reason = track_info.get("failure_reason", "Download failed")
 
             # Create source info
-            source_info = source_context or {}
+            source_info = dict(source_context or {})
+            if quality_profile_id is None:
+                quality_profile_id = (
+                    track_info.get("quality_profile_id")
+                    or track_data.get("quality_profile_id")
+                )
 
             # Clean up candidates to avoid TrackResult serialization issues
             candidates = track_info.get("candidates", [])
@@ -86,6 +121,7 @@ class WishlistService:
                 source_type=source_type,
                 source_info=source_info,
                 profile_id=profile_id,
+                quality_profile_id=quality_profile_id,
             )
 
         except Exception as e:
@@ -101,6 +137,7 @@ class WishlistService:
         source_context: Dict[str, Any] = None,
         profile_id: int = 1,
         user_initiated: bool = False,
+        quality_profile_id: Optional[int] = None,
     ) -> bool:
         """
         Directly add a track to the wishlist.
@@ -121,13 +158,48 @@ class WishlistService:
             logger.error("No track data provided for wishlist add")
             return False
 
-        return self.database.add_to_wishlist(
+        return self.add_track_to_wishlist_detailed(
+            track_data=track_data,
+            failure_reason=failure_reason,
+            source_type=source_type,
+            source_context=source_context,
+            profile_id=profile_id,
+            user_initiated=user_initiated,
+            quality_profile_id=quality_profile_id,
+        )["created"]
+
+    def add_track_to_wishlist_detailed(
+        self,
+        track_data: Dict[str, Any] = None,
+        spotify_track_data: Dict[str, Any] = None,
+        failure_reason: str = "",
+        source_type: str = "manual",
+        source_context: Dict[str, Any] = None,
+        profile_id: int = 1,
+        user_initiated: bool = False,
+        quality_profile_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Like :meth:`add_track_to_wishlist` but reports the full outcome.
+
+        Callers that re-run over tracks which may already be queued (Artist
+        Enhance) must be able to tell "already there, refreshed" apart from a
+        real failure, instead of counting every repeat as an error (R2-03).
+        """
+        if track_data is None:
+            track_data = spotify_track_data
+
+        if not track_data:
+            logger.error("No track data provided for wishlist add")
+            return self.database._wishlist_outcome("rejected", reason="no track data")
+
+        return self.database.add_to_wishlist_detailed(
             track_data=track_data,
             failure_reason=failure_reason,
             source_type=source_type,
             source_info=source_context or {},
             profile_id=profile_id,
             user_initiated=user_initiated,
+            quality_profile_id=quality_profile_id,
         )
 
     def add_spotify_track_to_wishlist(
@@ -138,106 +210,142 @@ class WishlistService:
         source_type: str = "manual",
         source_context: Dict[str, Any] = None,
         profile_id: int = 1,
-    ) -> bool:
-        """Backward-compatible wrapper for `add_track_to_wishlist`."""
+        quality_profile_id: Optional[int] = None,
+        detailed: bool = False,
+        user_initiated: bool = False,
+    ):
+        """Backward-compatible wrapper for `add_track_to_wishlist`.
+
+        ``detailed=True`` returns the full outcome dict instead of the legacy
+        bool, so a caller can tell a refreshed duplicate from a failure (R2-03).
+        """
         if track_data is None:
             track_data = spotify_track_data
 
-        return self.add_track_to_wishlist(
+        outcome = self.add_track_to_wishlist_detailed(
             track_data=track_data,
             failure_reason=failure_reason,
             source_type=source_type,
             source_context=source_context,
             profile_id=profile_id,
+            quality_profile_id=quality_profile_id,
+            user_initiated=user_initiated,
         )
+        return outcome if detailed else outcome["created"]
+
+    @staticmethod
+    def format_track_for_download(wishlist_track: Dict[str, Any]) -> Dict[str, Any]:
+        """One wishlist row in the shape the download pipeline's track_info uses."""
+        track_data = wishlist_track.get("track_data") or wishlist_track.get("spotify_data") or {}
+        if isinstance(track_data, str):
+            try:
+                import json
+
+                track_data = json.loads(track_data)
+            except Exception:
+                track_data = {}
+        if not isinstance(track_data, dict):
+            track_data = {}
+
+        track_id = wishlist_track.get("spotify_track_id") or wishlist_track.get("id") or track_data.get("id")
+        track_name = track_data.get("name", "Unknown Track")
+        artists = track_data.get("artists", [])
+        album = track_data.get("album") if isinstance(track_data.get("album"), dict) else {}
+        if isinstance(artists, list) and artists:
+            first_artist = artists[0]
+            if isinstance(first_artist, dict):
+                artist_name = first_artist.get("name", "Unknown Artist")
+            else:
+                artist_name = str(first_artist)
+        else:
+            artist_name = "Unknown Artist"
+        album_name = album.get("name", "") if isinstance(album, dict) else str(album) if album else ""
+
+        # The row's metadata source, flattened onto the flat track (#1508).
+        # Rows carry it under "provider", "source", or "_source" depending on
+        # which path created them (playlist extras vs discography/wishlist
+        # dicts). One precedence for both flat keys — provider, then source,
+        # then _source — so every consumer of the formatted track sees the
+        # same source value and they can never disagree about it. Without the
+        # flat "_source", get_import_source() (which reads only the flat
+        # source/_source keys) resolved a Deezer-sourced wishlist row to ''
+        # and the Deezer contributors upgrade in extract_source_metadata()
+        # never ran.
+        row_source = (
+            track_data.get("provider")
+            or track_data.get("source")
+            or track_data.get("_source")
+            if isinstance(track_data, dict)
+            else None
+        )
+
+        formatted_track = {
+            "wishlist_id": wishlist_track["id"],
+            "track_id": track_id,
+            "track_data": track_data,
+            "track_name": track_name,
+            "artist_name": artist_name,
+            "album_name": album_name,
+            "provider": row_source,
+            "_source": row_source,
+            "spotify_track_id": wishlist_track["spotify_track_id"],
+            "spotify_data": track_data,
+            "failure_reason": wishlist_track["failure_reason"],
+            "retry_count": wishlist_track["retry_count"],
+            "date_added": wishlist_track["date_added"],
+            "last_attempted": wishlist_track["last_attempted"],
+            "source_type": wishlist_track["source_type"],
+            "source_info": wishlist_track["source_info"],
+            # Per-item quality-profile pointer, resolved once at
+            # wishlist-insert time (see core/quality/migrate_to_profiles.py).
+            # The download/import pipeline resolves the profile's actual
+            # settings LIVE via core/quality/selection.py::load_profile_by_id
+            # when it needs them — this is only ever the pointer.
+            "quality_profile_id": wishlist_track.get("quality_profile_id"),
+            "id": track_id,
+            "name": track_name,
+            "artists": artists,
+            "album": album or {},
+            "duration_ms": track_data.get("duration_ms", 0) if isinstance(track_data, dict) else 0,
+            "preview_url": track_data.get("preview_url") if isinstance(track_data, dict) else None,
+            "external_urls": track_data.get("external_urls", {}) if isinstance(track_data, dict) else {},
+            "popularity": track_data.get("popularity", 0) if isinstance(track_data, dict) else 0,
+            # "Track 01" bug: 0 = "unknown position", NOT a fabricated 1.
+            # A fake 1 looks authoritative and blocks the import
+            # pipeline's track-number recovery; 0 lets it recover the
+            # real position (file tag / source lookup) before the floor.
+            "track_number": track_data.get("track_number", 0) if isinstance(track_data, dict) else 0,
+            "disc_number": track_data.get("disc_number", 1) if isinstance(track_data, dict) else 1,
+        }
+        return formatted_track
 
     def get_wishlist_tracks_for_download(
         self,
         limit: Optional[int] = None,
         profile_id: int = 1,
+        approved_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Get wishlist tracks formatted for the download modal.
         Returns tracks in a format similar to playlist tracks for compatibility.
+        ``approved_only``: just the rows an admin approved (a profile without
+        download rights, see core/requests/music.py).
         """
         try:
-            wishlist_tracks = self.database.get_wishlist_tracks(limit=limit, profile_id=profile_id)
+            if approved_only:
+                wishlist_tracks = self.database.get_wishlist_tracks(limit=limit, profile_id=profile_id,
+                                                                    approved_only=True)
+            else:
+                wishlist_tracks = self.database.get_wishlist_tracks(limit=limit, profile_id=profile_id)
             formatted_tracks = []
 
             for wishlist_track in wishlist_tracks:
-                track_data = wishlist_track.get("track_data") or wishlist_track.get("spotify_data") or {}
-                if isinstance(track_data, str):
-                    try:
-                        import json
-
-                        track_data = json.loads(track_data)
-                    except Exception:
-                        track_data = {}
-                if not isinstance(track_data, dict):
-                    track_data = {}
-
-                track_id = wishlist_track.get("spotify_track_id") or wishlist_track.get("id") or track_data.get("id")
-                track_name = track_data.get("name", "Unknown Track")
-                artists = track_data.get("artists", [])
-                album = track_data.get("album") if isinstance(track_data.get("album"), dict) else {}
-                if isinstance(artists, list) and artists:
-                    first_artist = artists[0]
-                    if isinstance(first_artist, dict):
-                        artist_name = first_artist.get("name", "Unknown Artist")
-                    else:
-                        artist_name = str(first_artist)
-                else:
-                    artist_name = "Unknown Artist"
-                album_name = album.get("name", "") if isinstance(album, dict) else str(album) if album else ""
-
-                formatted_track = {
-                    "wishlist_id": wishlist_track["id"],
-                    "track_id": track_id,
-                    "track_data": track_data,
-                    "track_name": track_name,
-                    "artist_name": artist_name,
-                    "album_name": album_name,
-                    "provider": (
-                        track_data.get("provider") or track_data.get("source")
-                        if isinstance(track_data, dict)
-                        else None
-                    ),
-                    "spotify_track_id": wishlist_track["spotify_track_id"],
-                    "spotify_data": track_data,
-                    "failure_reason": wishlist_track["failure_reason"],
-                    "retry_count": wishlist_track["retry_count"],
-                    "date_added": wishlist_track["date_added"],
-                    "last_attempted": wishlist_track["last_attempted"],
-                    "source_type": wishlist_track["source_type"],
-                    "source_info": wishlist_track["source_info"],
-                    # Per-item quality-profile pointer, resolved once at
-                    # wishlist-insert time (see core/quality/migrate_to_profiles.py).
-                    # The download/import pipeline resolves the profile's actual
-                    # settings LIVE via core/quality/selection.py::load_profile_by_id
-                    # when it needs them — this is only ever the pointer.
-                    "quality_profile_id": wishlist_track.get("quality_profile_id"),
-                    # Which Music Library this track is destined for. Same
-                    # shape as the profile pointer above: only ever the id, and
-                    # the import pipeline resolves the library's path and
-                    # template live. None = the default library, which is the
-                    # destination every wishlist track had before libraries.
-                    "root_folder_id": wishlist_track.get("root_folder_id"),
-                    "id": track_id,
-                    "name": track_name,
-                    "artists": artists,
-                    "album": album or {},
-                    "duration_ms": track_data.get("duration_ms", 0) if isinstance(track_data, dict) else 0,
-                    "preview_url": track_data.get("preview_url") if isinstance(track_data, dict) else None,
-                    "external_urls": track_data.get("external_urls", {}) if isinstance(track_data, dict) else {},
-                    "popularity": track_data.get("popularity", 0) if isinstance(track_data, dict) else 0,
-                    # "Track 01" bug: 0 = "unknown position", NOT a fabricated 1.
-                    # A fake 1 looks authoritative and blocks the import
-                    # pipeline's track-number recovery; 0 lets it recover the
-                    # real position (file tag / source lookup) before the floor.
-                    "track_number": track_data.get("track_number", 0) if isinstance(track_data, dict) else 0,
-                    "disc_number": track_data.get("disc_number", 1) if isinstance(track_data, dict) else 1,
-                }
-
+                formatted_track = self.format_track_for_download(wishlist_track)
+                # H10: the formatted track must know which profile's wishlist
+                # row it came from. Without the owner, a cross-profile batch
+                # is stamped with the runtime's profile and the master worker
+                # downloads the track into the wrong library (#1199).
+                formatted_track.setdefault("profile_id", profile_id)
                 formatted_tracks.append(formatted_track)
 
             return formatted_tracks
@@ -252,6 +360,9 @@ class WishlistService:
         success: bool,
         error_message: str = None,
         profile_id: int = 1,
+        *,
+        profile_ids=None,
+        audit=None,
     ) -> bool:
         """
         Mark the result of a download attempt for a wishlist track.
@@ -261,15 +372,25 @@ class WishlistService:
             success: Whether the download was successful
             error_message: Error message if failed
             profile_id: Profile to scope the operation to
+            profile_ids: On success, the exact profiles whose library now holds
+                the file — those rows and no others are removed. None keeps the
+                historical all-profiles sweep for callers that cannot tell.
+            audit: Optional ``{reason, final_path, batch_id, source}`` recorded
+                alongside the removal so "why did this track vanish?" is a query
+                rather than a log-correlation exercise (#1289).
         """
-        return self.database.update_wishlist_retry(spotify_track_id, success, error_message, profile_id=profile_id)
+        return self.database.update_wishlist_retry(
+            spotify_track_id, success, error_message, profile_id=profile_id,
+            profile_ids=profile_ids, audit=audit)
 
     def remove_track_from_wishlist(self, spotify_track_id: str, profile_id: int = 1) -> bool:
         """Remove a track from the wishlist (typically after successful download)"""
         return self.database.remove_from_wishlist(spotify_track_id, profile_id=profile_id)
 
-    def get_wishlist_count(self, profile_id: int = 1) -> int:
+    def get_wishlist_count(self, profile_id: int = 1, approved_only: bool = False) -> int:
         """Get the total number of tracks in the wishlist"""
+        if approved_only:
+            return self.database.get_wishlist_count(profile_id=profile_id, approved_only=True)
         return self.database.get_wishlist_count(profile_id=profile_id)
 
     def clear_wishlist(self, profile_id: int = 1) -> bool:

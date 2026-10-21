@@ -51,7 +51,7 @@ class AudioQuality:
         }
         base = format_base.get(self.format.lower(), 10.0)
 
-        if self.format.lower() in ('flac', 'wav'):
+        if self.format.lower() in ('flac', 'alac', 'wav'):
             sr = self.sample_rate or 44100
             bd = self.bit_depth or 16
             # sample-rate contribution: 44.1 kHz = 0, 192 kHz = +20
@@ -107,7 +107,7 @@ class AudioQuality:
     def label(self) -> str:
         """Human-readable label, e.g. 'FLAC 24-bit/192kHz' or 'MP3 320kbps'."""
         fmt = self.format.upper()
-        if self.format.lower() in ('flac', 'wav'):
+        if self.format.lower() in ('flac', 'alac', 'wav'):
             bd = f"{self.bit_depth}-bit/" if self.bit_depth else ""
             sr = f"{self.sample_rate // 1000}kHz" if self.sample_rate else ""
             detail = f" {bd}{sr}".rstrip()
@@ -115,6 +115,29 @@ class AudioQuality:
         else:
             br = f" {self.bitrate}kbps" if self.bitrate else ""
             return f"{fmt}{br}"
+
+    def to_dict(self) -> dict:
+        """JSON-safe representation used by acquisition/retention provenance."""
+        return {
+            key: value for key, value in {
+                "format": self.format,
+                "bitrate": self.bitrate,
+                "sample_rate": self.sample_rate,
+                "bit_depth": self.bit_depth,
+            }.items() if value is not None
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> 'AudioQuality':
+        """Rebuild a quality descriptor from persisted provenance."""
+        if not isinstance(value, dict) or not value.get("format"):
+            raise ValueError("audio quality needs a format")
+        return cls(
+            format=str(value["format"]),
+            bitrate=_optional_int(value.get("bitrate")),
+            sample_rate=_optional_int(value.get("sample_rate")),
+            bit_depth=_optional_int(value.get("bit_depth")),
+        )
 
     @classmethod
     def from_slskd_file(cls, file_data: dict, extension: str) -> 'AudioQuality':
@@ -127,8 +150,12 @@ class AudioQuality:
         return cls(
             format=extension.lower().lstrip('.'),
             bitrate=file_data.get('bitRate') or attrs.get(0),
-            sample_rate=attrs.get(4),
-            bit_depth=attrs.get(5),
+            # Newer slskd responses expose these as direct fields while older
+            # versions only carry Soulseek protocol attributes.  Prefer the
+            # direct representation and retain the attribute fallback so both
+            # response shapes feed the same profile ranking.
+            sample_rate=file_data.get('sampleRate') or attrs.get(4),
+            bit_depth=file_data.get('bitDepth') or attrs.get(5),
         )
 
     @classmethod
@@ -140,6 +167,12 @@ class AudioQuality:
     def from_extension_and_bitrate(cls, extension: str, bitrate: Optional[int]) -> 'AudioQuality':
         """Minimal constructor when only format + bitrate are known (torrent, YouTube)."""
         return cls(format=extension.lower().lstrip('.'), bitrate=bitrate)
+
+
+def _optional_int(value) -> Optional[int]:
+    if value in (None, ""):
+        return None
+    return int(value)
 
 
 @dataclass
@@ -190,6 +223,66 @@ def rank_candidate(aq: AudioQuality, targets: List[QualityTarget]) -> Tuple[int,
     return (len(targets), aq.tier_score())
 
 
+def satisfies_a_target_on_stated_facts(
+    aq, targets, *, unproven_resolution_ok: bool = True,
+) -> bool:
+    """Whether a release COULD satisfy any target, judged on what it claimed.
+
+    ``matches_target`` is the rule for a probed file: a FLAC with no stated
+    resolution fails a hi-res target, because an unproven file must not
+    over-claim. A Prowlarr release is not a probed file. Its title almost never
+    carries sample rate, bit depth or bitrate, so that rule does not filter the
+    lane, it empties it. The stock MP3 target's min_bitrate of 320 is enough on
+    its own.
+
+    So a value the release never stated cannot disqualify it, and a value it did
+    state is enforced exactly. Format is always required: an unreadable format
+    matches no target, which is the same answer the pre-grab gate gives. The
+    file itself is still probed at import.
+
+    Lives here so the per-track lane and the album-bundle picker cannot drift.
+    They did: the picker used ``matches_target`` and refused whole albums the
+    per-track lane accepted from the same indexer.
+
+    ``unproven_resolution_ok=False`` keeps the silence rule for BITRATE only and
+    still requires a hi-res target's sample rate / bit depth to be stated. A
+    lossy title almost never carries its bitrate, so relaxing that is the
+    difference between filtering the lane and emptying it. Asking for 24/96 is
+    the opposite: a deliberate, narrow request, and a whole album is a lot of
+    bandwidth to spend on the hope that a bare ``[FLAC]`` happens to be hi-res.
+    The album picker passes False for that reason.
+    """
+    fmt = str(getattr(aq, 'format', '') or '').lower()
+    for target in targets or ():
+        wanted = str(getattr(target, 'format', '') or '').lower()
+        if wanted and wanted != fmt:
+            continue
+        if not wanted and fmt in ('', 'unknown'):
+            continue
+        bitrate = getattr(aq, 'bitrate', None)
+        minimum = getattr(target, 'min_bitrate', None)
+        if minimum and bitrate is not None and bitrate < minimum:
+            continue
+        sample_rate = getattr(aq, 'sample_rate', None)
+        min_rate = getattr(target, 'min_sample_rate', None)
+        if min_rate:
+            if sample_rate is None:
+                if not unproven_resolution_ok:
+                    continue
+            elif sample_rate < min_rate:
+                continue
+        depth = getattr(aq, 'bit_depth', None)
+        min_depth = getattr(target, 'bit_depth', None)
+        if min_depth:
+            if depth is None:
+                if not unproven_resolution_ok:
+                    continue
+            elif depth < min_depth:
+                continue
+        return True
+    return False
+
+
 def filter_and_rank(
     candidates: list,
     targets: List[QualityTarget],
@@ -220,8 +313,31 @@ def filter_and_rank(
         return winners
 
     if fallback_enabled:
+        # Nothing satisfied the ladder, so we take what's on offer — but the
+        # user's FORMAT preference still stands. Ranking purely by tier_score
+        # here always crowned FLAC (base 100) over MP3 (base 50), which is the
+        # exact opposite of what a "Space Saver" (MP3-only ladder) user asked
+        # for (#1130).
+        #
+        # This is reachable for a lossy ladder far more often than it looks:
+        # slskd frequently omits the bitrate attribute, and `matches_target`
+        # fails a `min_bitrate` target whenever the bitrate is unknown, so a
+        # perfectly good MP3 matches NO tier and drops into this branch. The
+        # FLAC targets already carry explicit "missing metadata" heuristics;
+        # the lossy side has none, so the fallback is where it lands.
+        #
+        # Formats the user actually named rank above formats they didn't.
+        # tier_score still orders within each group, so a profile naming both
+        # (e.g. "balanced") is unaffected.
+        preferred_formats = {t.format.lower() for t in targets if t.format}
         all_sorted = list(candidates)
-        all_sorted.sort(key=lambda c: c.audio_quality.tier_score(), reverse=True)
+        all_sorted.sort(
+            key=lambda c: (
+                c.audio_quality.format.lower() in preferred_formats,
+                c.audio_quality.tier_score(),
+            ),
+            reverse=True,
+        )
         return all_sorted
 
     return []

@@ -23,67 +23,53 @@ def _run(coro):
 
 
 def _torrent_category() -> str:
-    from config.settings import config_manager
+    from core.settings import config_manager
     return str(config_manager.get("torrent_client.category", "") or "soulsync")
 
 
 def _usenet_category() -> str:
-    from config.settings import config_manager
+    from core.settings import config_manager
     return str(config_manager.get("usenet_client.category", "") or "soulsync")
 
 
-def grab_torrent(url_or_magnet: str, *, category: Optional[str] = None,
-                 save_path: Optional[str] = None,
-                 fallback_magnet: Optional[str] = None) -> dict:
-    """Add a magnet/.torrent URL to the active torrent client. ``category``
-    overrides the global default (e.g. a per-Library category resolved from
-    root_folders) — omitted/blank falls back to torrent_client.category.
-    Returns ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``.
+def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None,
+                 fallback_magnet: Optional[str] = None,
+                 category: Optional[str] = None) -> dict:  # Commissary: per-Library category
+    """Add a magnet/.torrent URL to the active torrent client. Returns
+    ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``.
 
     ``fallback_magnet`` is the same release's magnet, carried from the search
-    hit. Callers hand over the .torrent URL first (#1139) so it can be fetched
-    server-side and pushed as a file; without the magnet to fall back on, a URL
-    this process cannot reach would be a dead end where the magnet worked."""
+    hit. Callers now hand over the .torrent URL first (#1139) so it can be
+    fetched server-side and pushed as a file; without the magnet to fall back
+    on, a URL this process cannot reach would be a dead end where the magnet
+    would have worked."""
     from core.torrent_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
         return {"ok": False, "error": "No torrent client configured — set it on Settings → Downloads."}
     try:
         from core.torrent_clients.base import add_torrent_smart
-        cat = category or _torrent_category()
-        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=cat,
-                                     save_path=save_path,
-                                     fallback_magnet=fallback_magnet))
+        ref = _run(add_torrent_smart(adapter, url_or_magnet, category=category or _torrent_category(),
+                                     save_path=save_path, fallback_magnet=fallback_magnet))
     except Exception as e:   # noqa: BLE001 - surface the client error to the grab handler
         logger.warning("torrent add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Torrent client: " + str(e)}
     if not ref:
-        # Name the handoff kind. A release the indexer only offers as a magnet
-        # behaves differently from one with a .torrent URL, and "didn't accept
-        # the release" alone cannot be acted on — it was logged 324 times for a
-        # single title over a week without ever saying what was tried.
-        kind = ("magnet" if str(url_or_magnet or '').lower().startswith("magnet:")
-                else "a .torrent URL" if str(url_or_magnet or '').lower().startswith("http")
-                else "an empty URL")
-        logger.warning("torrent client refused %s for this release (category=%s)",
-                       kind, cat)
-        return {"ok": False,
-                "error": "The torrent client didn't accept the release (handed over %s)." % kind}
+        return {"ok": False, "error": "The torrent client didn't accept the release."}
     return {"ok": True, "ref": str(ref)}
 
 
-def grab_usenet(url_or_nzb: Any, *, category: Optional[str] = None,
-                save_path: Optional[str] = None) -> dict:
-    """Add an NZB (URL or bytes) to the active usenet client. ``category``
-    overrides the global default the same way ``grab_torrent`` does. Returns
+def grab_usenet(url_or_nzb: Any, *, save_path: Optional[str] = None,
+                category: Optional[str] = None) -> dict:  # Commissary: per-Library category
+    """Add an NZB (URL or bytes) to the active usenet client. Returns
     ``{ok, ref}`` (ref = the nzo_id/NZBID to poll) or ``{ok: False, error}``."""
     from core.usenet_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
         return {"ok": False, "error": "No usenet client configured — set it on Settings → Downloads."}
     try:
-        cat = category or _usenet_category()
-        ref = _run(adapter.add_nzb(url_or_nzb, category=cat, save_path=save_path))
+        ref = _run(adapter.add_nzb(url_or_nzb, category=category or _usenet_category(),
+                                   save_path=save_path))
     except Exception as e:   # noqa: BLE001
         logger.warning("usenet add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Usenet client: " + str(e)}
@@ -92,16 +78,23 @@ def grab_usenet(url_or_nzb: Any, *, category: Optional[str] = None,
     return {"ok": True, "ref": str(ref)}
 
 
-def grab(source: str, url: Any, *, category: Optional[str] = None,
-        save_path: Optional[str] = None, fallback_magnet: Optional[str] = None) -> dict:
+def _category_kw(category):
+    """Commissary: pass a Library category only when there is one, so grab
+    stand-ins that predate it keep working."""
+    return {"category": category} if category else {}
+
+
+def grab(source: str, url: Any, *, save_path: Optional[str] = None,
+         fallback_magnet: Optional[str] = None,
+         category: Optional[str] = None) -> dict:  # Commissary: per-Library category
     """Dispatch a grab by source (torrent | usenet).
 
     ``fallback_magnet`` is torrent-only and ignored for usenet, which has no
-    such thing — keeping it on the shared signature means callers do not have to
-    branch on the source just to pass it."""
+    such thing — keeping it on the shared signature means callers don't have
+    to branch on the source just to pass it."""
     if str(source).lower() == "torrent":
-        return grab_torrent(url, category=category, save_path=save_path,
-                            fallback_magnet=fallback_magnet)
+        return grab_torrent(url, save_path=save_path, fallback_magnet=fallback_magnet,
+                            **_category_kw(category))
     if str(source).lower() == "usenet":
-        return grab_usenet(url, category=category, save_path=save_path)
+        return grab_usenet(url, save_path=save_path, **_category_kw(category))
     return {"ok": False, "error": "Unsupported source %r" % source}

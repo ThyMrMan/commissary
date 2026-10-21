@@ -73,14 +73,20 @@
         });
 
         overlay.querySelector('#cfgx-secrets').onchange = function () {
-            _withSecrets = this.checked;
-            if (_withSecrets && !window.confirm(
-                'Include credentials?\n\nThe exported file will contain your real API keys, ' +
-                'tokens and passwords in plain text. Only do this for a private migration, ' +
-                'and delete the file afterward.')) {
-                this.checked = false; _withSecrets = false; return;
-            }
-            loadExport();
+            var cb = this;
+            _withSecrets = cb.checked;
+            if (!_withSecrets) { loadExport(); return; }
+            showConfirmDialog({
+                title: 'Include credentials?',
+                message: 'The exported file will contain your real API keys, tokens and ' +
+                    'passwords in plain text. Only do this for a private migration, and ' +
+                    'delete the file afterward.',
+                confirmText: 'Include them',
+                destructive: true,
+            }).then(function (ok) {
+                if (!ok) { cb.checked = false; _withSecrets = false; return; }
+                loadExport();
+            });
         };
         overlay.querySelector('#cfgx-copy').onclick = function () {
             if (!_bundle) return;
@@ -168,7 +174,7 @@
                         .then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
                         .then(function (res) {
                             if (res.ok && res.j.success) {
-                                toast('Config imported — restart Commissary to apply everywhere', 'success');
+                                toast('Config imported — restart SoulSync to apply everywhere', 'success');
                                 close();
                             } else {
                                 toast((res.j && res.j.error) || 'Import failed', 'error');

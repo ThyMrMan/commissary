@@ -16,7 +16,7 @@ _ALLOWED_GET = frozenset({
     '/api/profiles/current',         # how the frontend detects login state
     '/api/setup/status',             # first-run check runs before the login screen
     '/api/auth/recovery-question',   # forgot-password: fetch the security question
-    '/api/auth/plex/status',         # Sign in with Plex: poll for PIN authorization
+    '/api/auth/plex/available',      # sign in with plex: show the button or not
 })
 
 # POST endpoints that drive the login flow.
@@ -24,7 +24,8 @@ _ALLOWED_POST = frozenset({
     '/api/auth/login',
     '/api/auth/logout',
     '/api/auth/recovery-reset',      # forgot-password: answer + set a new password
-    '/api/auth/plex/start',          # Sign in with Plex: start a PIN auth flow
+    '/api/auth/plex/start',          # sign in with plex: the pin, bound to this session
+    '/api/auth/plex/check',          # sign in with plex: poll it, sign in on approval
 })
 
 
@@ -49,6 +50,9 @@ def login_request_is_blocked(path: str, method: str, *,
     if method == 'GET' and path in _ALLOWED_GET:
         return False
     if method == 'POST' and path in _ALLOWED_POST:
+        return False
+    from core.security.session_profile import is_open_profile_path
+    if is_open_profile_path(path, method):
         return False
 
     return True

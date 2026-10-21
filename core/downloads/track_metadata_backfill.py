@@ -22,10 +22,10 @@ isn't paid twice.
 
 from __future__ import annotations
 
-import logging
+from utils.logging_config import get_logger
 from typing import Any, Dict, NamedTuple, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger("downloads.track_metadata_backfill")
 
 
 class ResolvedTrackMetadata(NamedTuple):
@@ -81,9 +81,17 @@ def _backfill_album_context(
     if not isinstance(dt_album, dict) or not isinstance(album_context, dict):
         return
 
-    for key in ('release_date', 'album_type', 'total_tracks', 'id'):
+    for key in ('release_date', 'album_type', 'total_tracks', 'id', 'upc', 'barcode'):
         if not album_context.get(key) and dt_album.get(key):
             album_context[key] = dt_album[key]
+
+    # the album's own credit, when the caller had none. a playlist track's
+    # album often arrives without artists, and the album is filed under its
+    # album artist (#1385)
+    if not album_context.get('artists'):
+        artists = dt_album.get('artists')
+        if isinstance(artists, list) and artists:
+            album_context['artists'] = artists
 
     if not album_context.get('image_url'):
         images = dt_album.get('images')
@@ -97,10 +105,19 @@ def _backfill_album_context(
 _SENTINEL_ALBUM_IDS = {'explicit_album', 'from_sync_modal', ''}
 
 
+def _album_id_source(source: Any) -> str:
+    """the track's own metadata source, when it names one. anything else
+    (a download source, a stray label) is ignored so the primary is used."""
+    from core.metadata.registry import METADATA_SOURCE_PRIORITY
+    name = str(source or '').strip().lower()
+    return name if name in METADATA_SOURCE_PRIORITY else ''
+
+
 def backfill_album_context_from_source(
     album_context: Dict[str, Any],
     primary_source: Optional[str],
     get_album_for_source_fn: Any,
+    album_source: Optional[str] = None,
 ) -> bool:
     """Hydrate a lean album context from the user's PRIMARY metadata source (#915).
 
@@ -114,21 +131,32 @@ def backfill_album_context_from_source(
 
     ``get_album_for_source_fn(source, album_id)`` is injected (the real one is
     ``core.metadata.album_tracks.get_album_for_source``) so this stays pure + testable.
-    No-op when: the context is already complete; the primary source is spotify (the existing
+    ``album_source`` is the source the track (and so its album id) came from; it wins over
+    the primary when it names a metadata source.
+    No-op when: the context is already complete; the album's source is spotify (the existing
     track-details path covers it); or no real source album id is present. Returns True when
     it filled anything. Never raises — a backfill failure must not break a download.
     """
-    if not isinstance(album_context, dict) or not _album_is_lean(album_context):
+    if not isinstance(album_context, dict):
         return False
-    if not primary_source or primary_source == 'spotify':
+    # no album credit counts as lean here too (#1385), but only here: the
+    # spotify track-details hydrate keeps its own trigger, so this never adds
+    # spotify calls
+    if not _album_is_lean(album_context) and album_context.get('artists'):
+        return False
+    # the album id belongs to the source the track came from. a deezer search
+    # result on a spotify-primary install carries a deezer album id, asking the
+    # primary with it finds nothing (#1605)
+    source = _album_id_source(album_source) or primary_source
+    if not source or source == 'spotify':
         return False
     album_id = album_context.get('id')
     if not album_id or str(album_id) in _SENTINEL_ALBUM_IDS:
         return False
     try:
-        album = get_album_for_source_fn(primary_source, str(album_id))
+        album = get_album_for_source_fn(source, str(album_id))
     except Exception as e:  # noqa: BLE001 — defensive: never let backfill break a download
-        logger.warning("[Context] primary-source (%s) album backfill failed: %s", primary_source, e)
+        logger.warning("[Context] %s album backfill failed: %s", source, e)
         return False
     if not isinstance(album, dict):
         return False
@@ -136,9 +164,9 @@ def backfill_album_context_from_source(
     _backfill_album_context(album_context, {'album': album})
     if album_context.get('release_date') and album_context.get('release_date') != before:
         logger.info(
-            "[Context] Hydrated lean album context from primary source %s "
+            "[Context] Hydrated lean album context from %s "
             "(release_date=%r, total_tracks=%r)",
-            primary_source, album_context.get('release_date'), album_context.get('total_tracks'),
+            source, album_context.get('release_date'), album_context.get('total_tracks'),
         )
     return True
 

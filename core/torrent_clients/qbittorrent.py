@@ -11,26 +11,30 @@ Reference: https://github.com/qbittorrent/qBittorrent/wiki/WebUI-API-(qBittorren
 
 from __future__ import annotations
 
-import asyncio
-import json
+import re
 import threading
 from typing import List, Optional
 
 import requests as http_requests
 
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_control
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
-from core.torrent_clients import infohash
-
-# Confirming a KNOWN hash is a lookup, not a race, so this can afford to be
-# patient: qBittorrent may still be resolving magnet metadata, and the old ~5s
-# diff window is exactly what made a good add look like a rejection.
-_CONFIRM_ATTEMPTS = 30
-_CONFIRM_INTERVAL = 0.5
-
 logger = get_logger("torrent.qbittorrent")
+
+# v1 info-hashes are 40 hex chars; qBittorrent reports them lowercase.
+_BTIH = re.compile(r"\bxt=urn:btih:([0-9a-fA-F]{40})\b")
+
+
+def _magnet_hash(url_or_magnet) -> Optional[str]:
+    """The v1 info-hash a magnet names, lowercased — or None for a .torrent URL
+    or a base32 magnet. Used to recognise "you already have this" so a duplicate
+    add resolves to the torrent already in the client instead of reading as a
+    refusal."""
+    m = _BTIH.search(str(url_or_magnet or ""))
+    return m.group(1).lower() if m else None
 
 
 # qBittorrent's native state strings. Mapped onto the adapter-uniform
@@ -49,6 +53,13 @@ _QBIT_STATE_MAP = {
     "moving":          "queued",
     "pausedDL":        "paused",
     "pausedUP":        "completed",
+    # qBittorrent 5.0 renamed paused* to stopped*. Without these a COMPLETED
+    # torrent on 5.x fell through to the "error" default below, so every
+    # finished grab was recorded as failed. Both spellings stay: 5.x can be
+    # configured to keep the old names, and 4.x is still widely run.
+    "stoppedDL":       "paused",
+    "stoppedUP":       "completed",
+    "forcedMetaDL":    "downloading",
     "queuedDL":        "queued",
     "queuedUP":        "queued",
     "stalledDL":       "stalled",
@@ -59,51 +70,18 @@ _QBIT_STATE_MAP = {
 
 
 def _map_state(qbit_state: str) -> str:
-    return _QBIT_STATE_MAP.get(qbit_state, "error")
+    """Map qBittorrent's own state name onto the adapter's vocabulary.
 
+    An UNKNOWN state is not an error. qBittorrent adds and renames states
+    between releases — 5.0's stopped* rename is exactly that — and defaulting
+    to "error" meant the next rename would again cancel healthy downloads and
+    corrupt the history. Unknown now reads as "stalled": the monitor keeps
+    watching, which is recoverable, instead of destroying the transfer.
 
-def _parse_add_response(body: str):
-    """Read qBittorrent's ``/torrents/add`` reply. Returns ``(accepted, hash)``.
-
-    WebAPI <= 2.10 answers with the bare string ``Ok.``. Newer builds answer
-    with JSON::
-
-        {"added_torrent_ids": [], "failure_count": 0,
-         "pending_count": 1, "success_count": 0}
-
-    and this module treated any body that was not exactly ``Ok.`` as a refusal.
-    It is not one. ``failure_count: 0`` says nothing failed, and
-    ``pending_count: 1`` says qBit accepted the URL and is still fetching the
-    .torrent from it — ``added_torrent_ids`` is empty only because the hash is
-    not known yet, not because the add was rejected.
-
-    Reading that as failure turned perfectly good grabs into "Torrent client
-    refused the URL": the client downloaded the release happily while the app
-    never polled it, so the download sat at "Downloading" for ever.
-
-    An unrecognised body is still refused. Guessing "probably fine" about a
-    shape we do not understand would hand back a download nothing can track.
+    The states that genuinely ARE errors ("error", "missingFiles") are mapped
+    explicitly, so nothing real is being softened here.
     """
-    try:
-        payload = json.loads(body)
-    except Exception:       # noqa: BLE001 - not JSON at all
-        return False, None
-    if not isinstance(payload, dict):
-        return False, None
-    failed = payload.get('failure_count')
-    if isinstance(failed, int) and failed > 0:
-        return False, None
-    ids = payload.get('added_torrent_ids')
-    if isinstance(ids, list) and ids:
-        first = str(ids[0] or '').strip().lower()
-        if first:
-            return True, first
-    # Accepted but not yet resolved: the hash is discovered by confirm/poll,
-    # which is the same path an http .torrent URL has always taken.
-    if isinstance(payload.get('success_count'), int) or isinstance(failed, int) \
-            or isinstance(payload.get('pending_count'), int):
-        return True, None
-    return False, None
+    return _QBIT_STATE_MAP.get(str(qbit_state or ""), "stalled")
 
 
 class QBittorrentAdapter:
@@ -120,7 +98,9 @@ class QBittorrentAdapter:
         self._url = normalize_client_url(config_manager.get('torrent_client.url', ''))
         self._username = config_manager.get('torrent_client.username', '') or ''
         self._password = config_manager.get('torrent_client.password', '') or ''
-        self._category = config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        self._category = str(
+            config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        ).strip() or 'soulsync'
         self._save_path = config_manager.get('torrent_client.save_path', '') or ''
         # Drop any existing session — credentials may have changed.
         with self._session_lock:
@@ -137,8 +117,7 @@ class QBittorrentAdapter:
     async def check_connection(self) -> bool:
         if not self.is_configured():
             return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._check_connection_sync)
+        return await run_control(self._check_connection_sync)
 
     def _check_connection_sync(self) -> bool:
         try:
@@ -215,13 +194,11 @@ class QBittorrentAdapter:
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_sync, url_or_magnet, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_sync, url_or_magnet, category, save_path)
 
     def _add_torrent_sync(
         self,
@@ -248,26 +225,70 @@ class QBittorrentAdapter:
                            resp.status_code if resp else 'no-response',
                            (resp.text[:200] if resp else ''))
             return None
-        _body = (resp.text or '').strip()
-        if _body and _body != 'Ok.':
-            _accepted, _direct = _parse_add_response(_body)
-            if not _accepted:
-                logger.warning("qBittorrent /torrents/add refused the request: %r", _body[:200])
-                return None
-            if _direct:
-                # The reply named the torrent outright; no discovery needed.
-                logger.info("qBittorrent accepted the add and returned %s", _direct)
-                return _direct
-            logger.info("qBittorrent accepted the add (still resolving the URL): %r", _body[:120])
-        # A magnet CARRIES its info-hash, so there is nothing to discover: confirm
-        # it landed and return it. The before/after diff below is a race — qBit
-        # needs longer than the poll whenever it is resolving magnet metadata or
-        # the torrent list is large — and losing that race reported a perfectly
-        # good add as "the client didn't accept the release", which also meant
-        # nothing ever polled the download and it was never imported.
-        expected = infohash.expected_hash(url_or_magnet)
-        new_hash = self._confirm_or_poll(expected, before)
+
+        body = (resp.text or '').strip()
+
+        # qBittorrent 5.0+ returns a JSON object on /api/v2/torrents/add, e.g.:
+        # {"added_torrent_ids": ["..."], "failure_count": 0, "pending_count": 0, "success_count": 1}
+        # In 4.x it returned plaintext 'Ok.' or 'Fails.'.
+        if body.startswith('{') and body.endswith('}'):
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    added_ids = payload.get('added_torrent_ids') or []
+                    if added_ids:
+                        added_hash = str(added_ids[0]).lower()
+                        logger.info("qBittorrent registered torrent hash: %s", added_hash)
+                        return added_hash
+
+                    # Success reported without an explicit ID list:
+                    if payload.get('success_count', 0) > 0:
+                        expected = _magnet_hash(url_or_magnet)
+                        if expected:
+                            return expected
+                        new_hash = self._poll_for_new_hash(before)
+                        if new_hash:
+                            return new_hash
+
+                    # Duplicate / existing check:
+                    existing = _magnet_hash(url_or_magnet)
+                    if existing and existing in {h.lower() for h in before}:
+                        logger.info("qBittorrent already holds %s — adopting the existing "
+                                    "torrent instead of reporting a failed add", existing[:12])
+                        return existing
+
+                    if payload.get('failure_count', 0) > 0:
+                        logger.warning("qBittorrent /torrents/add rejected torrent: %r", payload)
+                        return None
+            except Exception as json_err:
+                logger.debug("Failed parsing qBittorrent /torrents/add JSON: %s", json_err)
+
+        if body and body != 'Ok.':
+            # "Fails." is also what qBittorrent answers when it ALREADY HOLDS the
+            # torrent. Reporting that as a refusal made the video wishlist drain
+            # re-pick the same release every hour forever (one live row reached 133
+            # fruitless "searches" against a torrent sitting in the client the whole
+            # time). If the magnet names a hash we already have, the caller's intent
+            # — "this release is in the client, track it" — is already satisfied, so
+            # hand back the existing hash instead of a failure.
+            existing = _magnet_hash(url_or_magnet)
+            if existing and existing in {h.lower() for h in before}:
+                logger.info("qBittorrent already holds %s — adopting the existing "
+                            "torrent instead of reporting a failed add", existing[:12])
+                return existing
+            logger.warning("qBittorrent /torrents/add unexpected body: %r", resp.text[:200])
+            return None
+        expected = _magnet_hash(url_or_magnet)
+        if expected:
+            return expected
+        new_hash = self._poll_for_new_hash(before)
         if not new_hash:
+            # Same adoption rule on the silent-duplicate path: some builds answer
+            # 'Ok.' to a duplicate and simply never add a row.
+            existing = _magnet_hash(url_or_magnet)
+            if existing and existing in {h.lower() for h in before}:
+                logger.info("qBittorrent already holds %s — adopting it", existing[:12])
+                return existing
             logger.error("qBittorrent accepted the request but no new torrent appeared — "
                          "URL may have been rejected (bad magnet, unreachable HTTPS, "
                          "duplicate hash, etc.)")
@@ -284,27 +305,6 @@ class QBittorrentAdapter:
         except Exception as e:
             logger.error("qBittorrent /torrents/info parse failed: %s", e)
             return None
-
-    def _confirm_or_poll(self, expected: Optional[str], before: set) -> Optional[str]:
-        """The added torrent's hash.
-
-        When ``expected`` is known (magnet or .torrent bytes) it only has to be
-        CONFIRMED present, which is a direct lookup rather than a race — and a
-        duplicate add, where no new hash ever appears because the torrent was
-        already there, resolves correctly instead of looking like a failure.
-
-        Falls back to the historical before/after diff when the hash can't be
-        derived (an http .torrent URL handed straight to the client)."""
-        if expected:
-            for _ in range(_CONFIRM_ATTEMPTS):
-                current = self._all_hashes()
-                if current is not None and expected in current:
-                    return expected
-                import time as _time
-                _time.sleep(_CONFIRM_INTERVAL)
-            # It genuinely never showed up — fall through to the diff, which can
-            # still catch a client that normalised the hash differently.
-        return self._poll_for_new_hash(before)
 
     def _poll_for_new_hash(self, before: set) -> Optional[str]:
         """Poll up to ~5s for a new torrent to appear (qBit takes a
@@ -324,13 +324,11 @@ class QBittorrentAdapter:
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_file_sync, file_bytes, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_file_sync, file_bytes, category, save_path)
 
     def _add_torrent_file_sync(
         self,
@@ -342,6 +340,17 @@ class QBittorrentAdapter:
         before = self._all_hashes()
         if before is None:
             return None
+        # qbittorrent refuses a .torrent it already holds, and the hash poll
+        # below then finds nothing new, so a re-grab of a finished download
+        # read as "the client didn't accept the release". the magnet path
+        # adopts the existing torrent; a .torrent file (what mam and most
+        # private trackers hand out) has to be hashed to do the same.
+        from core.quality.torrent_contents import torrent_info_hash
+        existing = torrent_info_hash(file_bytes)
+        if existing and existing in {h.lower() for h in before}:
+            logger.info("qBittorrent already holds %s — adopting the existing "
+                        "torrent instead of adding it again", existing[:12])
+            return existing
         data = {'category': cat}
         if save_path or self._save_path:
             data['savepath'] = save_path or self._save_path
@@ -349,11 +358,22 @@ class QBittorrentAdapter:
         resp = self._call('POST', '/api/v2/torrents/add', data=data, files=files)
         if not resp or not resp.ok:
             return None
-        return self._confirm_or_poll(infohash.from_torrent_bytes(file_bytes), before)
+        body = (resp.text or '').strip()
+        if body.startswith('{') and body.endswith('}'):
+            try:
+                payload = resp.json()
+                if isinstance(payload, dict):
+                    added_ids = payload.get('added_torrent_ids') or []
+                    if added_ids:
+                        return str(added_ids[0]).lower()
+            except Exception as e:
+                # a body that looked like json but wasn't; the hash poll
+                # below still finds the torrent, so this is just a note
+                logger.debug("qBittorrent add: could not read json body (%s), polling for the hash", e)
+        return self._poll_for_new_hash(before)
 
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_status_sync, torrent_id)
+        return await run_control(self._get_status_sync, torrent_id)
 
     def _get_status_sync(self, torrent_id: str) -> Optional[TorrentStatus]:
         resp = self._call('GET', '/api/v2/torrents/info', params={'hashes': torrent_id})
@@ -368,26 +388,8 @@ class QBittorrentAdapter:
             return None
         return self._parse_status(items[0])
 
-    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
-
-    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
-        """qBittorrent returns [] for a magnet whose metadata hasn't arrived —
-        which is 'ask again', not 'this torrent is empty'. Passed straight
-        through; the caller owns that distinction."""
-        resp = self._call('GET', '/api/v2/torrents/files', params={'hash': torrent_id})
-        if not resp or not resp.ok:
-            return None
-        try:
-            return [str(f.get('name')) for f in (resp.json() or []) if f.get('name')]
-        except Exception as e:
-            logger.error("qBittorrent /torrents/files parse failed: %s", e)
-            return None
-
     async def get_all(self) -> List[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_all_sync)
+        return await run_control(self._get_all_sync)
 
     def _get_all_sync(self) -> List[TorrentStatus]:
         resp = self._call('GET', '/api/v2/torrents/info')
@@ -416,11 +418,11 @@ class QBittorrentAdapter:
             content_path=item.get('content_path'),   # exact path to this torrent's file/folder
             ratio=float(item['ratio']) if item.get('ratio') is not None else None,
             seeding_time=int(item['seeding_time']) if isinstance(item.get('seeding_time'), (int, float)) else None,
+            category=str(item.get('category') or '') or None,
         )
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._remove_sync, torrent_id, delete_files)
+        return await run_control(self._remove_sync, torrent_id, delete_files)
 
     def _remove_sync(self, torrent_id: str, delete_files: bool) -> bool:
         resp = self._call('POST', '/api/v2/torrents/delete', data={
@@ -430,15 +432,13 @@ class QBittorrentAdapter:
         return bool(resp and resp.ok)
 
     async def pause(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._pause_sync, torrent_id)
+        return await run_control(self._pause_sync, torrent_id)
 
     def _pause_sync(self, torrent_id: str) -> bool:
         return self._stop_start('/api/v2/torrents/stop', '/api/v2/torrents/pause', torrent_id)
 
     async def resume(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._resume_sync, torrent_id)
+        return await run_control(self._resume_sync, torrent_id)
 
     def _resume_sync(self, torrent_id: str) -> bool:
         return self._stop_start('/api/v2/torrents/start', '/api/v2/torrents/resume', torrent_id)
@@ -446,7 +446,7 @@ class QBittorrentAdapter:
     def _stop_start(self, v5_path: str, v4_path: str, torrent_id: str) -> bool:
         """qBittorrent 5.0 renamed pause→stop / resume→start and REMOVED the old
         paths (they 404). Try the 5.x endpoint first, fall back to the 4.x one so
-        Commissary pauses/resumes correctly on both — this is why a stalled torrent
+        SoulSync pauses/resumes correctly on both — this is why a stalled torrent
         wasn't getting paused on qBit 5.x (the old /pause silently 404'd)."""
         resp = self._call('POST', v5_path, data={'hashes': torrent_id})
         if resp is not None and resp.status_code == 404:
@@ -459,9 +459,8 @@ class QBittorrentAdapter:
         enforces them (arr-style). ``ratio_limit`` / ``seeding_time_limit`` use
         qBit's sentinels: -1 = no limit, -2 = use global. ``seeding_time_limit``
         is in MINUTES (qBit's unit). Returns True on a 2xx."""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._set_share_limits_sync, torrent_id, ratio_limit, seeding_time_limit)
+        return await run_control(
+            self._set_share_limits_sync, torrent_id, ratio_limit, seeding_time_limit)
 
     def _set_share_limits_sync(self, torrent_id: str, ratio_limit: float,
                                seeding_time_limit: int) -> bool:

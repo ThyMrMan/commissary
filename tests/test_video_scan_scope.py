@@ -56,16 +56,6 @@ def test_scan_uses_only_the_mapped_libraries():
     assert {x["title"] for x in avail["tv"]} == {"TV Shows", "YouTube"}
 
 
-def test_scan_uses_all_mapped_libraries_of_a_kind():
-    # Multiple libraries mapped to the same kind — both get scanned…
-    secs = [_Sec("movie", "Movies"), _Sec("movie", "4K Movies"), _Sec("movie", "Anime Movies")]
-    src = PlexVideoSource(_Server(secs), movies_lib=["Movies", "4K Movies"], tv_lib=None)
-    titles = {s.title for s in src._scan_sections("movie", src._movies_lib)}
-    assert titles == {"Movies", "4K Movies"}
-    # …but a third, unmapped movie library is still excluded.
-    assert "Anime Movies" not in titles
-
-
 def test_unmapped_kind_scans_nothing_not_everything():
     # The hardening: a missing selection must scan NOTHING, never fall back to all.
     src = PlexVideoSource(_Server(_SECTIONS), movies_lib=None, tv_lib=None)
@@ -73,32 +63,6 @@ def test_unmapped_kind_scans_nothing_not_everything():
     assert src._scan_sections("show", src._tv_lib) == []
     # _sections (used for LISTING) still returns all — only the SCAN path is gated.
     assert len(src._sections("movie")) == 2
-
-
-class _AllSec(_Sec):
-    """A section that can also yield items (._movie/._show are monkeypatched
-    to a trivial passthrough, since faking a full plexapi object isn't the point
-    of this test — only that iter_movies/iter_shows stamp the section's title)."""
-    def __init__(self, type_, title, items):
-        super().__init__(type_, title)
-        self._items = items
-
-    def all(self):
-        return self._items
-
-
-def test_iter_movies_stamps_the_source_section_title(monkeypatch):
-    secs = [_AllSec("movie", "Movies", ["raw-movie"])]
-    src = PlexVideoSource(_Server(secs), movies_lib="Movies", tv_lib=None)
-    monkeypatch.setattr(src, "_movie", lambda m: {"server_id": m})
-    assert list(src.iter_movies()) == [{"server_id": "raw-movie", "_server_title": "Movies"}]
-
-
-def test_iter_shows_stamps_the_source_section_title(monkeypatch):
-    secs = [_AllSec("show", "TV Shows", ["raw-show"])]
-    src = PlexVideoSource(_Server(secs), movies_lib=None, tv_lib="TV Shows")
-    monkeypatch.setattr(src, "_show", lambda sh: {"server_id": sh})
-    assert list(src.iter_shows()) == [{"server_id": "raw-show", "_server_title": "TV Shows"}]
 
 
 # ── 2. scan pauses every enricher (incl. the YouTube date singleton) ───────
@@ -199,7 +163,7 @@ def test_plex_is_scanning_falls_back_to_activity_feed():
 
 def test_scan_status_helper_is_none_when_no_server(monkeypatch):
     import core.video.sources as srcmod
-    monkeypatch.setattr(srcmod, "get_active_video_source", lambda: None)
+    monkeypatch.setattr(srcmod, "get_active_video_source", lambda **kwargs: None)
     assert srcmod.video_server_scan_in_progress("all") is None   # caller falls back to fixed wait
 
 
@@ -243,5 +207,5 @@ def test_plex_has_item_checks_specific_episode():
 
 def test_has_item_helper_false_when_no_server(monkeypatch):
     import core.video.sources as srcmod
-    monkeypatch.setattr(srcmod, "get_active_video_source", lambda: None)
+    monkeypatch.setattr(srcmod, "get_active_video_source", lambda **kwargs: None)
     assert srcmod.video_server_has_item("movie", {"title": "X"}) is False

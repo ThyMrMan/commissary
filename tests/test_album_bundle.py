@@ -36,6 +36,7 @@ from core.download_plugins.album_bundle import (
     resolve_reported_save_path,
     unique_staging_path,
 )
+from core.quality.model import QualityTarget
 
 
 # Minimal release-result shim — duck-types the fields the picker reads.
@@ -45,6 +46,14 @@ class _Release:
     size: int
     seeders: Optional[int] = None
     grabs: Optional[int] = None
+    indexer_priority: int = 25
+    publish_date: Optional[str] = None
+    protocol: str = 'torrent'
+
+
+def _iso_hours_ago(hours: float) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
 
 def _flac_quality_guess(title: str) -> str:
@@ -80,6 +89,66 @@ def test_picker_prefers_flac_when_tied_on_seeders() -> None:
     flac = _Release(title='Album [FLAC]', size=400_000_000, seeders=50)
     mp3 = _Release(title='Album [MP3]', size=130_000_000, seeders=50)
     assert pick_best_album_release([flac, mp3], _flac_quality_guess) is flac
+
+
+def test_profile_ladder_beats_hardcoded_codec_and_seed_order() -> None:
+    """A space-saving MP3-first profile must not be silently rewritten as
+    FLAC-first by the album picker, even when FLAC is more popular."""
+    flac = _Release(title='Album [FLAC 24-96]', size=500_000_000, seeders=900)
+    mp3 = _Release(title='Album [MP3 320]', size=140_000_000, seeders=3)
+
+    picked = pick_best_album_release(
+        [flac, mp3],
+        _flac_quality_guess,
+        quality_targets=[
+            QualityTarget(format='mp3', min_bitrate=320),
+            QualityTarget(format='flac'),
+        ],
+        fallback_enabled=False,
+    )
+
+    assert picked is mp3
+
+
+def test_lossless_resolution_is_ranked_before_usenet_popularity() -> None:
+    cd = _Release(
+        title='Album [FLAC 16bit 44.1kHz]',
+        size=400_000_000,
+        grabs=5_000,
+    )
+    hires = _Release(
+        title='Album [FLAC 24-96]',
+        size=900_000_000,
+        grabs=5,
+    )
+
+    picked = pick_best_album_release(
+        [cd, hires],
+        _flac_quality_guess,
+        quality_targets=[
+            QualityTarget(format='flac', bit_depth=24, min_sample_rate=96_000),
+            QualityTarget(format='flac', bit_depth=16),
+        ],
+        fallback_enabled=False,
+    )
+
+    assert picked is hires
+
+
+def test_strict_hires_profile_rejects_generic_flac_claim() -> None:
+    generic = _Release(title='Album [FLAC]', size=400_000_000, grabs=500)
+
+    picked = pick_best_album_release(
+        [generic],
+        _flac_quality_guess,
+        allowed_formats={'flac'},
+        quality_targets=[
+            QualityTarget(format='flac', bit_depth=24, min_sample_rate=96_000),
+        ],
+        fallback_enabled=False,
+    )
+
+    assert picked is None
 
 
 def test_picker_uses_grabs_when_seeders_is_none() -> None:
@@ -220,6 +289,229 @@ def test_picker_without_album_name_unchanged():
     a = _Release(title="Whatever [FLAC]", size=400_000_000, seeders=5)
     b = _Release(title="Other [FLAC]", size=400_000_000, seeders=999)
     assert pick_best_album_release([a, b], _flac_quality_guess) is b
+
+
+# ---------------------------------------------------------------------------
+# Identity gate: artist tokens + tribute/cover markers
+# ---------------------------------------------------------------------------
+
+
+def test_picker_rejects_tribute_album_for_original_wishlist_item():
+    """The tribute report: 'Animals Reimagined - A Tribute to Pink Floyd'
+    clears the title-relevance floor (it contains 'animals') and out-seeds
+    the real release, so on base it gets handed to the downloader. The
+    identity gate must drop it and pick the real 'Animals' instead."""
+    tribute = _Release(
+        title="Animals Reimagined \u2013 A Tribute to Pink Floyd [FLAC]",
+        size=400_000_000, seeders=5000)
+    real = _Release(
+        title="Pink Floyd \u2013 Animals (1977) [FLAC]",
+        size=380_000_000, seeders=10)
+    picked = pick_best_album_release(
+        [tribute, real], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is real
+
+
+def test_picker_drops_candidate_missing_all_artist_tokens():
+    """Requiring at least one artist token in the release title: the
+    hugely-seeded artist-less rip must lose to the quieter correctly-credited
+    one for a Pink Floyd 'Animals' wishlist item."""
+    no_artist = _Release(title="Animals (Remastered) [FLAC]",
+                         size=380_000_000, seeders=9000)
+    credited = _Release(title="Pink Floyd - Animals [FLAC]",
+                        size=380_000_000, seeders=5)
+    picked = pick_best_album_release(
+        [no_artist, credited], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is credited
+
+
+def test_picker_artist_gate_fail_open_without_artist_name():
+    """No artist info (old callers / unparseable) -> the gate must not engage:
+    the old popularity behavior is preserved."""
+    no_artist = _Release(title="Animals (Remastered) [FLAC]",
+                         size=380_000_000, seeders=9000)
+    credited = _Release(title="Pink Floyd - Animals [FLAC]",
+                        size=380_000_000, seeders=5)
+    picked = pick_best_album_release(
+        [no_artist, credited], _flac_quality_guess, album_name="Animals")
+    assert picked is no_artist
+
+
+def test_picker_artist_gate_fail_open_for_various_artists():
+    """VA placeholder is not an identity: 'Various Artists' wishlists must
+    not have every 'VA - ...' bundle refused (hostile-review BLOCK 1)."""
+    va = _Release(title="VA - Now Thats What I Call Music 115 [FLAC]",
+                  size=400_000_000, seeders=5000)
+    picked = pick_best_album_release(
+        [va], _flac_quality_guess,
+        album_name="Now That's What I Call Music! 115",
+        artist_name="Various Artists")
+    assert picked is va
+
+
+def test_picker_artist_gate_fail_open_for_unknown_artist():
+    unknown = _Release(title="VA - Now Thats What I Call Music 115 [FLAC]",
+                       size=400_000_000, seeders=5000)
+    picked = pick_best_album_release(
+        [unknown], _flac_quality_guess,
+        album_name="Now That's What I Call Music! 115",
+        artist_name="Unknown Artist")
+    assert picked is unknown
+
+
+def test_picker_returns_none_when_artist_gate_kills_everything():
+    """Every candidate fails the artist gate -> refuse the bundle (None) so
+    the caller falls back to per-track, rather than queueing a wrong-artist
+    release."""
+    wrong_artist = _Release(title="Some Other Band - Animals [FLAC]",
+                            size=380_000_000, seeders=9000)
+    assert pick_best_album_release(
+        [wrong_artist], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd") is None
+
+
+def test_picker_allows_tribute_album_when_it_is_the_wishlist_item():
+    """A user who ACTUALLY wishlisted the tribute album must still get it —
+    the marker filter only fires when the wishlist item is an original."""
+    tribute = _Release(
+        title="Animals Reimagined \u2013 A Tribute to Pink Floyd [FLAC]",
+        size=400_000_000, seeders=5000)
+    picked = pick_best_album_release(
+        [tribute], _flac_quality_guess,
+        album_name="Animals Reimagined \u2013 A Tribute to Pink Floyd",
+        artist_name="Pink Floyd")
+    assert picked is tribute
+
+
+def test_picker_tribute_marker_does_not_fire_inside_other_words():
+    """Word-boundary: 'Undercover' contains 'cover' as a substring but is not
+    a cover marker — a legit release with it in the title must survive."""
+    release = _Release(title="Pink Floyd - Animals Undercover [FLAC]",
+                       size=380_000_000, seeders=5)
+    picked = pick_best_album_release(
+        [release], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is release
+
+
+def test_picker_tribute_marker_explained_by_artist_name():
+    """An artist literally named 'Cover Drive' must not have their own
+    releases filtered as cover albums."""
+    release = _Release(title="Cover Drive - Hoods Up [FLAC]",
+                       size=380_000_000, seeders=5)
+    picked = pick_best_album_release(
+        [release], _flac_quality_guess,
+        album_name="Hoods Up", artist_name="Cover Drive")
+    assert picked is release
+
+
+def test_picker_rejects_a_tribute_to_variant_too():
+    """'A Tribute To' phrasing (multi-word marker) is filtered like 'tribute'
+    alone."""
+    tribute = _Release(title="Pink Floyd - Animals A Tribute To [FLAC]",
+                       size=400_000_000, seeders=5000)
+    real = _Release(title="Pink Floyd - Animals [FLAC]",
+                    size=380_000_000, seeders=10)
+    picked = pick_best_album_release(
+        [tribute, real], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is real
+
+
+def test_picker_keeps_album_rips_tagged_with_artwork_covers():
+    """Third-party review false positive: tracker/usenet naming tags legit
+    rips with artwork-scan words — [Covers], [Front Cover],
+    [FLAC + CUE + LOG + Covers], + Covers. Bare 'cover'/'covers' must NOT be
+    a tribute marker, or every seeded lossless copy carrying scans gets
+    refused and the bundle falls back to single-track for no reason."""
+    artwork_rips = [
+        _Release(title="Pink Floyd - Animals (1977) [FLAC] [cue, log, covers]",
+                 size=400_000_000, seeders=100),
+        _Release(title="Pink Floyd - Animals (1977) [FLAC] [Front Cover]",
+                 size=400_000_000, seeders=100),
+        _Release(title="Pink Floyd - Animals (1977) [FLAC + CUE + LOG + Covers]",
+                 size=400_000_000, seeders=100),
+        _Release(title="Pink Floyd - Animals (1977) [FLAC] + Covers",
+                 size=400_000_000, seeders=100),
+    ]
+    for rip in artwork_rips:
+        picked = pick_best_album_release(
+            [rip], _flac_quality_guess,
+            album_name="Animals", artist_name="Pink Floyd")
+        assert picked is rip, f"artwork tag falsely rejected: {rip.title}"
+
+
+def test_picker_still_rejects_real_cover_album_phrasing():
+    """Explicit cover-album phrasing still disqualifies a release for an
+    original wishlist item — only the bare artwork words were demoted."""
+    cover_album = _Release(title="Various Artists - Covers of Pink Floyd: Animals [FLAC]",
+                           size=400_000_000, seeders=5000)
+    real = _Release(title="Pink Floyd - Animals (1977) [FLAC]",
+                    size=380_000_000, seeders=10)
+    picked = pick_best_album_release(
+        [cover_album, real], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is real
+
+    cover_band = _Release(title="Cover Band Orchestra - Animals Reimagined [FLAC]",
+                          size=400_000_000, seeders=5000)
+    picked = pick_best_album_release(
+        [cover_band, real], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is real
+
+
+def test_picker_allows_cover_album_when_it_is_the_wishlist_item():
+    """A user who ACTUALLY wishlisted a cover album must still get it — the
+    album-name explanation works with the explicit-phrase markers too."""
+    tribute = _Release(title="Pink Floyd - Animals The Cover Album [FLAC]",
+                       size=400_000_000, seeders=100)
+    picked = pick_best_album_release(
+        [tribute], _flac_quality_guess,
+        album_name="Pink Floyd - Animals The Cover Album",
+        artist_name="Pink Floyd")
+    assert picked is tribute
+
+
+def test_picker_allows_album_literally_named_covers():
+    """An album whose canonical name is 'Covers' (or 'Cover') is no longer a
+    tribute marker at all — bare words only ever fired from artwork tags."""
+    named_covers = _Release(title="Placebo - Covers [FLAC]",
+                            size=400_000_000, seeders=100)
+    picked = pick_best_album_release(
+        [named_covers], _flac_quality_guess,
+        album_name="Covers", artist_name="Placebo")
+    assert picked is named_covers
+
+
+def test_picker_artist_gate_fail_open_for_various_placeholder():
+    """'Various' is a placeholder artist name like 'Various Artists'/'VA'
+    (core/library_reorganize.py treats 'Various' as a compilation signal) —
+    it carries no identity, so a 'VA - ...' bundle must not be refused by
+    the artist-token gate."""
+    va = _Release(title="VA - Animals (1977) [FLAC]",
+                  size=400_000_000, seeders=100)
+    picked = pick_best_album_release(
+        [va], _flac_quality_guess,
+        album_name="Animals", artist_name="Various")
+    assert picked is va
+
+
+def test_picker_bare_cover_tag_slip_through_is_the_accepted_tradeoff():
+    """Documented trade-off (third-party review demanded bare 'cover'/
+    'covers' go): a release whose ONLY marker is a bare '(Cover)'/'(Covers)'
+    no longer gets filtered. Real-world tracker naming uses explicit
+    phrasing ('tribute', 'covers of', 'cover album'), and the artist-token
+    gate still stands behind this one — so this documents the behavior
+    rather than letting it be an accident."""
+    bare_cover = _Release(title="Pink Floyd - Animals [FLAC] (Cover)",
+                          size=400_000_000, seeders=100)
+    picked = pick_best_album_release(
+        [bare_cover], _flac_quality_guess,
+        album_name="Animals", artist_name="Pink Floyd")
+    assert picked is bare_cover
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +759,7 @@ def test_get_completed_no_path_window_falls_back_on_garbage() -> None:
 
 # ---------------------------------------------------------------------------
 # resolve_reported_save_path — downloader→local path translation. The arr
-# remote-path problem: SAB reports its own container path, Commissary mounts
+# remote-path problem: SAB reports its own container path, SoulSync mounts
 # the same files elsewhere.
 # ---------------------------------------------------------------------------
 
@@ -490,7 +782,7 @@ def test_resolve_returns_reported_path_verbatim_when_readable(tmp_path: Path) ->
 
 def test_resolve_uses_explicit_prefix_mapping(tmp_path: Path) -> None:
     """Sonarr/Radarr-style remote path mapping: SAB's prefix is rewritten
-    to a Commissary-visible root."""
+    to a SoulSync-visible root."""
     (tmp_path / "MyAlbum").mkdir()
     cfg = _cfg({'download_source.usenet_path_mappings': [
         {'from': '/data/downloads/music', 'to': str(tmp_path)},
@@ -501,69 +793,11 @@ def test_resolve_uses_explicit_prefix_mapping(tmp_path: Path) -> None:
 
 def test_resolve_basename_fallback_against_download_root(tmp_path: Path) -> None:
     """Zero-config shared-volume case: the album folder shows up under
-    Commissary's own download root with the same name SAB reported."""
+    SoulSync's own download root with the same name SAB reported."""
     (tmp_path / "MyAlbum").mkdir()
     cfg = _cfg({'soulseek.download_path': str(tmp_path)})
     resolved = resolve_reported_save_path('/data/downloads/music/MyAlbum', config_get=cfg)
     assert resolved == str(tmp_path / "MyAlbum")
-
-
-def test_resolve_returns_a_readable_file_verbatim(tmp_path: Path) -> None:
-    """Single-file torrent/nzb, no release folder: the client's content_path
-    names the .mkv/.flac itself, not a directory. A file has no 'inside' to
-    check, so existence at the reported path is proof enough."""
-    movie = tmp_path / "X-Men.Apocalypse.2016.2160p.REMUX-EPSiLON.mkv"
-    movie.write_bytes(b"")
-    assert resolve_reported_save_path(str(movie), config_get=_cfg({})) == str(movie)
-
-
-def test_resolve_basename_fallback_matches_a_bare_file(tmp_path: Path) -> None:
-    """THE reported bug: a single-file release landing directly in a flat
-    category folder (no per-release subfolder) — the client reports its own
-    container's path, and the exact same filename sits under Commissary's
-    configured torrent_download_path. Every existing basename check required
-    a DIRECTORY, so this exact-match candidate was rejected purely for being
-    a file, and the download stayed at 100% forever with no error."""
-    movies = tmp_path / "complete" / "Movies"
-    movies.mkdir(parents=True)
-    name = "X-Men.Apocalypse.2016.2160p.UHD.BluRay.REMUX.HDR.HEVC.Atmos-EPSiLON.mkv"
-    (movies / name).write_bytes(b"")
-
-    cfg = _cfg({'download_source.torrent_download_path': str(movies)})
-    resolved = resolve_reported_save_path(
-        f'/data/torrents/complete/Movies/{name}', config_get=cfg)
-    assert resolved == str(movies / name)
-
-
-def test_resolve_basename_fallback_prefers_a_directory_over_a_same_named_file(
-        tmp_path: Path) -> None:
-    """A directory candidate (content-checked) still wins over a file
-    candidate at another root when both exist — files are the fallback,
-    never a competing priority."""
-    name = "Release"
-    file_root = tmp_path / "flat"
-    dir_root = tmp_path / "foldered"
-    file_root.mkdir()
-    (file_root / name).write_bytes(b"")
-    (dir_root / name / "track.flac").parent.mkdir(parents=True)
-    cfg = _cfg({'soulseek.transfer_path': str(file_root),
-                'soulseek.download_path': str(dir_root)})
-    resolved = resolve_reported_save_path(f'/data/{name}', config_get=cfg)
-    assert resolved == str(dir_root / name)
-
-
-def test_resolve_one_level_deeper_matches_a_bare_file(tmp_path: Path) -> None:
-    """Same bare-file case, but the root only names the PARENT of the
-    category folder — exercises the one-level-deeper pass (3b), not the
-    exact-root pass (3)."""
-    movies = tmp_path / "complete" / "Movies"
-    movies.mkdir(parents=True)
-    name = "Some.Movie.2024.mkv"
-    (movies / name).write_bytes(b"")
-
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
-    resolved = resolve_reported_save_path(f'/downloads/{name}', config_get=cfg)
-    assert resolved == str(movies / name)
 
 
 def test_resolve_mapping_takes_priority_over_basename(tmp_path: Path) -> None:
@@ -612,7 +846,7 @@ def test_resolve_skips_mapping_when_target_missing_then_tries_basename(tmp_path:
 def test_resolve_uses_custom_torrent_download_path(tmp_path: Path) -> None:
     """#857: the user's torrent client saves to a category folder (e.g. a
     'Music' category) mounted here at a custom in-container path. Setting
-    download_source.torrent_download_path lets Commissary find the release there."""
+    download_source.torrent_download_path lets SoulSync find the release there."""
     music_mount = tmp_path / "downloads" / "music"
     (music_mount / "MyAlbum").mkdir(parents=True)
     cfg = _cfg({'download_source.torrent_download_path': str(music_mount)})
@@ -631,7 +865,7 @@ def test_resolve_uses_custom_usenet_download_path(tmp_path: Path) -> None:
 
 def test_resolve_rejects_an_existing_but_contentless_verbatim_dir(tmp_path: Path) -> None:
     """TheHomeGuy's bug: the torrent client reports ITS OWN container's
-    '/downloads'; a directory by that name exists in Commissary's namespace
+    '/downloads'; a directory by that name exists in SoulSync's namespace
     too but doesn't hold this torrent. With the expected content name
     given, the verbatim short-circuit must NOT win — the configured root
     that actually contains the release does."""
@@ -685,6 +919,193 @@ def test_resolve_protocol_neutral_path_mappings_key(tmp_path: Path) -> None:
     ]})
     resolved = resolve_reported_save_path('/downloads/MyAlbum', config_get=cfg)
     assert resolved == str(tmp_path / "MyAlbum")
+
+
+# ---------------------------------------------------------------------------
+# resolve_reported_save_path — single-FILE torrents. qBittorrent's
+# content_path for a single-file torrent names the file itself (the standard
+# shape for audiobook downloads). The resolver used to be directory-only, so
+# a UNC content_path like \\NAS\Media\...\Book.m4b could never resolve: the
+# basename fallback required a directory, and the audio walker reported
+# "No audio files in the download" for a file sitting right there
+# (SeadogsBooty, Oct 2026). The audiobook monitor calls the resolver with no
+# expected name, straight off the client's content_path.
+# ---------------------------------------------------------------------------
+
+
+def _single_file_cfg(tmp_path: Path):
+    """SoulSync-side layout mirroring the report: the book file visible at
+    <torrent_download_path>/<filename>, the client's UNC path not."""
+    incoming = tmp_path / "Incoming" / "Audiobooks"
+    incoming.mkdir(parents=True)
+    book = incoming / "Columbus Day (R.C. Bray).m4b"
+    book.write_bytes(b"fake-m4b")
+    return incoming, book, _cfg({'download_source.torrent_download_path': str(incoming)})
+
+
+def test_resolve_single_file_unc_content_path_without_expect_name(tmp_path: Path) -> None:
+    """The production audiobook path: the monitor calls the resolver with no
+    expected name, and the client's UNC content_path names the single .m4b
+    file. Must resolve to the container-visible file, not the UNC path."""
+    _incoming, book, cfg = _single_file_cfg(tmp_path)
+    reported = r"\\10.10.16.115\Media\Torrents\Incoming\Audiobooks\Columbus Day (R.C. Bray).m4b"
+    assert resolve_reported_save_path(reported, config_get=cfg) == str(book)
+
+
+def test_resolve_single_file_basename_fallback_with_expect_name(tmp_path: Path) -> None:
+    """With the torrent name known (== the filename for single-file
+    torrents), the basename fallback hands back the file itself — returning
+    the shared download root would let the caller walk every other download
+    in it against this job."""
+    _incoming, book, cfg = _single_file_cfg(tmp_path)
+    reported = r"\\10.10.16.115\Media\Torrents\Incoming\Audiobooks\Columbus Day (R.C. Bray).m4b"
+    resolved = resolve_reported_save_path(reported, config_get=cfg,
+                                          expect_name="Columbus Day (R.C. Bray).m4b")
+    assert resolved == str(book)
+
+
+def test_resolve_single_file_verbatim_when_directly_readable(tmp_path: Path) -> None:
+    """Mounts already line up and the reported path IS the file: return it
+    unchanged, no translation needed."""
+    book = tmp_path / "Book.m4b"
+    book.write_bytes(b"fake-m4b")
+    assert resolve_reported_save_path(str(book), config_get=_cfg({})) == str(book)
+
+
+def test_resolve_rejects_file_when_name_mismatches_expect_name(tmp_path: Path) -> None:
+    """A same-basename file that is NOT the expected torrent must not win —
+    the content check applies to files as well as directories."""
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    (incoming / "Some Other Book.m4b").write_bytes(b"fake-m4b")
+    cfg = _cfg({'download_source.torrent_download_path': str(incoming)})
+    reported = r"\\10.10.16.115\Media\Torrents\Incoming\Audiobooks\Some Other Book.m4b"
+    # The expected name doesn't match the file: no resolution, the reported
+    # path comes back unchanged so the caller's error names it honestly.
+    assert resolve_reported_save_path(reported, config_get=cfg,
+                                      expect_name="Columbus Day (R.C. Bray).m4b") == reported
+
+
+def test_resolve_root_step_returns_file_for_single_file_torrent(tmp_path: Path) -> None:
+    """Step 4 (the roots themselves): when the expected name is a single file
+    under a root, the file is returned — never the whole shared root."""
+    root = tmp_path / "incoming"
+    root.mkdir()
+    book = root / "Columbus Day (R.C. Bray).m4b"
+    book.write_bytes(b"fake-m4b")
+    cfg = _cfg({'download_source.torrent_download_path': str(root)})
+    # The reported basename doesn't exist locally, so only the roots step
+    # can resolve — via the expected file name.
+    resolved = resolve_reported_save_path(r"\\NAS\Media\SomeOtherFolder", config_get=cfg,
+                                          expect_name="Columbus Day (R.C. Bray).m4b")
+    assert resolved == str(book)
+
+
+def test_resolve_root_step_still_returns_root_for_multi_file_torrent(tmp_path: Path) -> None:
+    """Back-compat pin for step 4: when the expected name is a FOLDER under
+    the root, the root itself is still returned (save-dir semantics)."""
+    root = tmp_path / "incoming"
+    (root / "My Release").mkdir(parents=True)
+    cfg = _cfg({'download_source.torrent_download_path': str(root)})
+    resolved = resolve_reported_save_path(r"\\NAS\Media\SomeOtherFolder", config_get=cfg,
+                                          expect_name="My Release")
+    assert resolved == str(root)
+
+
+def test_resolve_mapping_to_single_file(tmp_path: Path) -> None:
+    """An explicit remote-path mapping that translates to a single file
+    resolves to the file."""
+    book = tmp_path / "Book.m4b"
+    book.write_bytes(b"fake-m4b")
+    cfg = _cfg({'download_source.path_mappings': [
+        {'from': r'\\NAS\Media\Audiobooks', 'to': str(tmp_path)},
+    ]})
+    resolved = resolve_reported_save_path(r"\\NAS\Media\Audiobooks\Book.m4b", config_get=cfg)
+    assert resolved == str(book)
+
+
+def test_resolve_expect_name_cannot_escape_the_root(tmp_path: Path) -> None:
+    """expect_name is client-reported (a torrent/job name). A hostile name
+    carrying path components must never resolve outside the download root —
+    the old step 4 only ever returned the root directory itself, so the
+    traversed path was never handed to a caller."""
+    root = tmp_path / "incoming"
+    (root / "sub").mkdir(parents=True)
+    outside = tmp_path / "secret-track.mp3"
+    outside.write_bytes(b"ID3")
+    cfg = _cfg({'download_source.torrent_download_path': str(root)})
+    reported = r"\\NAS\Media\Audiobooks"
+    resolved = resolve_reported_save_path(reported, config_get=cfg,
+                                          expect_name="sub/../../secret-track.mp3")
+    # Fail-closed: the reported path comes back unchanged, never the file
+    # outside the root.
+    assert resolved == reported
+    assert Path(resolved) != outside
+
+
+def test_resolve_basename_fallback_prefers_newest_across_roots(tmp_path: Path) -> None:
+    """Two roots hold the same filename (a stale usenet copy and the fresh
+    torrent download — single-file audiobooks reuse the uploader's canonical
+    filename across sources, and usenet roots sort first). The most recently
+    written one wins: that is the download that just finished."""
+    import os
+    import time
+
+    usenet_root = tmp_path / "usenet-complete"
+    torrent_root = tmp_path / "torrent-incoming"
+    usenet_root.mkdir()
+    torrent_root.mkdir()
+    stale = usenet_root / "Book.m4b"
+    fresh = torrent_root / "Book.m4b"
+    stale.write_bytes(b"stale")
+    fresh.write_bytes(b"fresh")
+    now = time.time()
+    os.utime(stale, (now - 3600, now - 3600))   # an hour old
+    os.utime(fresh, (now, now))                 # just finished
+    cfg = _cfg({'download_source.usenet_download_path': str(usenet_root),
+                'download_source.torrent_download_path': str(torrent_root)})
+    resolved = resolve_reported_save_path(r"\\NAS\Media\Book.m4b", config_get=cfg)
+    assert resolved == str(fresh)
+
+
+def test_resolve_basename_fallback_tie_keeps_config_order(tmp_path: Path) -> None:
+    """Exact mtime ties are deterministic: the first root in config order wins."""
+    import os
+
+    a = tmp_path / 'a'
+    b = tmp_path / 'b'
+    a.mkdir()
+    b.mkdir()
+    fa = a / 'Book.m4b'
+    fb = b / 'Book.m4b'
+    fa.write_bytes(b'x')
+    fb.write_bytes(b'x')
+    stamp = 1_700_000_000.0
+    os.utime(fa, (stamp, stamp))
+    os.utime(fb, (stamp, stamp))
+    cfg = _cfg({'download_source.usenet_download_path': str(a),
+                'download_source.torrent_download_path': str(b)})
+    assert resolve_reported_save_path(r'\\NAS\Media\Book.m4b', config_get=cfg) == str(fa)
+
+
+def test_resolve_mapping_rejects_dotdot_escape(tmp_path: Path) -> None:
+    """A client-reported path must never escape the mapping target via '..'.
+    The old directory-only gates rejected file escapes implicitly; the
+    file-aware steps reject them explicitly instead."""
+    target = tmp_path / 'mapped'
+    target.mkdir()
+    outside = tmp_path / 'secret.mp3'
+    outside.write_bytes(b'ID3')
+    cfg = _cfg({'download_source.path_mappings': [
+        {'from': '/data/dl', 'to': str(target)},
+    ]})
+    reported = '/data/dl/../../secret.mp3'
+    resolved = resolve_reported_save_path(reported, config_get=cfg)
+    # Fail-closed: the reported path comes back unchanged, never the file
+    # outside the mapping target.
+    assert resolved == reported
+    assert Path(resolved) != outside
+
 
 
 # ---------------------------------------------------------------------------
@@ -1404,202 +1825,316 @@ def test_poll_get_status_exception_treated_as_transient_miss() -> None:
     assert 'failed' not in [c[0] for c in calls]
 
 
-# ---------------------------------------------------------------------------
-# Multiple completed-download paths + the category-subfolder layout.
-#
-# Torrent/usenet clients sort finished downloads into CATEGORY folders —
-# downloads/complete/Movies/<release>, .../TV-Shows/<release>. Commissary could
-# only be told about one completed-downloads folder per protocol and looked
-# exactly one level under it, so the release at <root>/<category>/<release>
-# was never found and the import silently never happened.
-# ---------------------------------------------------------------------------
+def test_the_no_target_sort_uses_the_shared_quality_ladder():
+    """One definition of "better audio", not a fourth private one.
+
+    Without ranked targets the picker fell back to a four-entry map
+    (flac/ogg/aac/mp3). ALAC, WAV, Opus and DSD were absent from it and scored
+    zero, so a lossless ALAC release lost to an MP3 with the same seeders.
+    """
+    alac = _Release(title='Artist - Album [ALAC]', size=400_000_000, seeders=10)
+    mp3 = _Release(title='Artist - Album [MP3 320]', size=400_000_000, seeders=10)
+
+    assert pick_best_album_release([mp3, alac], _flac_quality_guess) is alac
 
 
-def test_resolve_accepts_a_list_of_torrent_download_paths(tmp_path: Path) -> None:
-    """One entry per category folder — the reason these became lists."""
-    movies = tmp_path / "complete" / "Movies"
-    tv = tmp_path / "complete" / "TV-Shows"
-    for d in (movies, tv):
-        d.mkdir(parents=True)
-    (tv / "Some.Show.S01E01").mkdir()
+def test_the_no_target_sort_still_asks_the_plugin_when_the_title_is_mute():
+    """The plugin's guess is the fallback, not the primary.
 
-    cfg = _cfg({'download_source.torrent_download_path': [str(movies), str(tv)]})
-    resolved = resolve_reported_save_path(
-        '/downloads/complete/TV-Shows/Some.Show.S01E01', config_get=cfg)
-    assert resolved == str(tv / "Some.Show.S01E01")
+    ``quality_guess`` stays wired so a plugin that knows something the shared
+    parser does not can still place its release, but it only speaks when the
+    release itself said nothing.
+    """
+    def _always_flac(_title: str) -> str:
+        return 'flac'
 
+    mute = _Release(title='Artist - Album (2026)', size=400_000_000, seeders=10)
+    mp3 = _Release(title='Artist - Album [MP3 320]', size=400_000_000, seeders=10)
 
-def test_resolve_still_accepts_a_bare_string_path(tmp_path: Path) -> None:
-    """Back-compat lock: every install configured before these became lists
-    has a string, and soulseek.download_path is a string forever. A list-only
-    reader would stringify it into one garbage root that never matches."""
-    (tmp_path / "MyAlbum").mkdir()
-    cfg = _cfg({'download_source.torrent_download_path': str(tmp_path)})
-    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
-    assert resolved == str(tmp_path / "MyAlbum")
+    assert pick_best_album_release([mp3, mute], _always_flac) is mute
 
 
-def test_resolve_finds_a_release_inside_a_category_subfolder(tmp_path: Path) -> None:
-    """THE reported bug: the root names the parent, the release sits one
-    level down under its category folder."""
-    release = tmp_path / "complete" / "Movies" / "Some.Movie.2024"
-    release.mkdir(parents=True)
+def test_a_flac_release_too_small_for_its_own_claim_is_dropped():
+    """Lidarr's size specification, applied where the picker decides.
 
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
-    resolved = resolve_reported_save_path(
-        '/data/downloads/complete/Movies/Some.Movie.2024', config_get=cfg)
-    assert resolved == str(release)
+    A 45-minute album is roughly 340 MB in FLAC. A 60 MB "FLAC" is a transcode
+    with a lossless title, and grabbing it costs a full re-download later.
+    """
+    fake = _Release(title='Artist - Album [FLAC]', size=60_000_000, seeders=99)
+    real = _Release(title='Artist - Album [FLAC]', size=337_500_000, seeders=2)
 
+    picked = pick_best_album_release(
+        [fake, real], _flac_quality_guess,
+        expected_duration_seconds=2700,
+    )
 
-def test_resolve_finds_the_category_folder_when_the_client_reports_its_save_dir(
-        tmp_path: Path) -> None:
-    """Torrent clients report the save DIRECTORY, not a per-release folder.
-    The release still lives under <root>/<category>/."""
-    category = tmp_path / "complete" / "Movies"
-    category.mkdir(parents=True)
-    (category / "Some.Movie.2024").mkdir()
-
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
-    resolved = resolve_reported_save_path(
-        '/downloads', config_get=cfg, expect_name='Some.Movie.2024')
-    assert resolved == str(category)
+    assert picked is real
 
 
-def test_resolve_rejects_a_subfolder_that_lacks_the_expected_content(tmp_path: Path) -> None:
-    """The deeper search is still content-checked — a same-named folder in
-    the WRONG category must not be accepted."""
-    wrong = tmp_path / "complete" / "Movies" / "Some.Show.S01E01"
-    wrong.mkdir(parents=True)          # right name, no expected content inside
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path / "complete")]})
+def test_the_size_gate_refuses_the_bundle_when_nothing_survives():
+    fake = _Release(title='Artist - Album [FLAC]', size=60_000_000, seeders=99)
 
-    resolved = resolve_reported_save_path(
-        '/downloads/Some.Show.S01E01', config_get=cfg, expect_name='episode.mkv')
-    assert resolved == '/downloads/Some.Show.S01E01'    # unchanged = not resolved
+    assert pick_best_album_release(
+        [fake], _flac_quality_guess, expected_duration_seconds=2700,
+    ) is None
 
 
-def test_resolve_prefers_an_exact_root_match_over_a_subfolder(tmp_path: Path) -> None:
-    """Exact <root>/<release> beats <root>/*/<release>, even when the exact
-    match is under a LATER root — every root's exact match is tried first."""
-    deep = tmp_path / "a" / "Movies" / "Release"
-    deep.mkdir(parents=True)
-    exact = tmp_path / "b" / "Release"
-    exact.mkdir(parents=True)
+def test_without_a_duration_the_size_gate_has_no_opinion():
+    fake = _Release(title='Artist - Album [FLAC]', size=60_000_000, seeders=99)
 
-    cfg = _cfg({'download_source.torrent_download_path': [
-        str(tmp_path / "a"), str(tmp_path / "b")]})
-    resolved = resolve_reported_save_path('/downloads/Release', config_get=cfg)
-    assert resolved == str(exact)
+    assert pick_best_album_release([fake], _flac_quality_guess) is fake
 
 
-def test_resolve_skips_junk_entries_in_a_path_list(tmp_path: Path) -> None:
-    """A hand-edited config shouldn't crash the resolver."""
-    (tmp_path / "MyAlbum").mkdir()
-    cfg = _cfg({'download_source.torrent_download_path': [
-        None, 42, "", "   ", {"nope": 1}, str(tmp_path)]})
-    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
-    assert resolved == str(tmp_path / "MyAlbum")
+def test_a_repack_beats_the_rip_it_replaces_at_the_same_quality():
+    """Lidarr's Revision as a tiebreaker: only when the quality itself ties."""
+    original = _Release(title='Artist - Album [FLAC]', size=400_000_000, seeders=10)
+    repack = _Release(title='Artist - Album REPACK [FLAC]', size=400_000_000, seeders=10)
+
+    assert pick_best_album_release([original, repack], _flac_quality_guess) is repack
 
 
-def test_resolve_usenet_download_path_is_also_a_list(tmp_path: Path) -> None:
-    """Same treatment for usenet — SAB/NZBGet sort by category too."""
-    cat = tmp_path / "complete" / "music"
-    cat.mkdir(parents=True)
-    (cat / "MyAlbum").mkdir()
+def test_a_repack_does_not_beat_a_better_format():
+    """A corrected MP3 is still an MP3."""
+    repacked_mp3 = _Release(title='Artist - Album REPACK [MP3 320]',
+                            size=400_000_000, seeders=10)
+    flac = _Release(title='Artist - Album [FLAC]', size=400_000_000, seeders=10)
 
-    cfg = _cfg({'download_source.usenet_download_path': [str(tmp_path / "complete")]})
-    resolved = resolve_reported_save_path('/data/downloads/MyAlbum', config_get=cfg)
-    assert resolved == str(cat / "MyAlbum")
+    assert pick_best_album_release([repacked_mp3, flac], _flac_quality_guess) is flac
 
 
-def test_subfolder_scan_reaches_a_category_layout(tmp_path: Path) -> None:
-    """This asserted ONE level and that two must not resolve — which made the
-    layout the code's own comment named ('<root>/complete/Movies/<release>')
-    unreachable, so such a download never imported. The performance concern
-    behind the old limit is real and still met, by a depth cap plus a scan
-    budget rather than by refusing to look (see the two tests below)."""
-    buried = tmp_path / "complete" / "Movies" / "2024" / "Release"
-    buried.mkdir(parents=True)
+def test_a_repack_beats_the_original_under_ranked_targets_too():
+    targets = [QualityTarget(format='flac')]
+    original = _Release(title='Artist - Album [FLAC]', size=400_000_000, seeders=10)
+    repack = _Release(title='Artist - Album PROPER [FLAC]', size=400_000_000, seeders=10)
 
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path)]})
-    assert resolve_reported_save_path('/downloads/Release', config_get=cfg) == str(buried)
+    picked = pick_best_album_release(
+        [original, repack], _flac_quality_guess, quality_targets=targets,
+    )
 
-
-def test_subfolder_scan_stops_at_the_configured_depth(tmp_path: Path) -> None:
-    """Still bounded — beyond the limit it reports nothing rather than crawling,
-    so the caller's own 'not found' error surfaces with both paths logged."""
-    buried = tmp_path / "a" / "b" / "c" / "d" / "Release"
-    buried.mkdir(parents=True)
-
-    cfg = _cfg({'download_source.torrent_download_path': [str(tmp_path)],
-                'download_source.import_search_depth': 2})
-    assert resolve_reported_save_path('/downloads/Release', config_get=cfg) == '/downloads/Release'
+    assert picked is repack
 
 
-def test_subfolder_scan_is_budgeted(tmp_path: Path) -> None:
-    """The original worry, kept: a root accidentally pointed at a whole
-    filesystem must cost a bounded scan, not a directory crawl."""
-    for i in range(40):
-        (tmp_path / ("dir%02d" % i) / "inner").mkdir(parents=True)
-    from core.download_plugins.album_bundle import _descendant_dirs
-    assert len(_descendant_dirs(tmp_path, 3, 25)) <= 25
+def test_a_meaningless_seeder_difference_does_not_decide_the_pick():
+    """Lidarr rounds seeders to log10 before comparing them.
+
+    Availability is a tiebreaker inside one quality bucket, and 41 vs 38
+    seeders says nothing about which release is better. Compared raw, it
+    outvoted every key after it — including the size that actually describes
+    the encode.
+    """
+    targets = [QualityTarget(format='flac')]
+    thin = _Release(title='Artist - Album [FLAC]', size=900_000_000, seeders=38)
+    fat = _Release(title='Artist - Album [FLAC]', size=350_000_000, seeders=41)
+
+    picked = pick_best_album_release(
+        [fat, thin], _flac_quality_guess, quality_targets=targets,
+    )
+
+    assert picked is thin
 
 
-def test_subfolder_scan_survives_an_unreadable_root(tmp_path: Path) -> None:
-    """A root that doesn't exist must degrade, not raise."""
-    cfg = _cfg({'download_source.torrent_download_path': [
-        str(tmp_path / "does-not-exist"), str(tmp_path)]})
-    (tmp_path / "MyAlbum").mkdir()
-    assert resolve_reported_save_path(
-        '/data/downloads/MyAlbum', config_get=cfg) == str(tmp_path / "MyAlbum")
+def test_an_order_of_magnitude_more_seeders_still_wins():
+    targets = [QualityTarget(format='flac')]
+    dying = _Release(title='Artist - Album [FLAC]', size=900_000_000, seeders=3)
+    healthy = _Release(title='Artist - Album [FLAC]', size=350_000_000, seeders=400)
+
+    picked = pick_best_album_release(
+        [dying, healthy], _flac_quality_guess, quality_targets=targets,
+    )
+
+    assert picked is healthy
 
 
-# ---------------------------------------------------------------------------
-# Prefer deluxe editions: a deluxe request prefers a release naming an edition
-# ---------------------------------------------------------------------------
 
-_EDITION_SIZE = ALBUM_PICK_MIN_BYTES * 4
-_DELUXE_REQUEST = "Curtain Call: The Hits (Deluxe Edition)"
+def test_the_users_preferred_indexer_breaks_an_otherwise_equal_tie():
+    """Prowlarr's indexer priority is 1 (highest) to 50 (lowest), default 25.
 
+    Lidarr compares it right after quality and before seeders, and calls it
+    what it is: a tiebreaker for otherwise equal releases.
+    """
+    targets = [QualityTarget(format='flac')]
+    preferred = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                         seeders=10, indexer_priority=5)
+    other = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                     seeders=10, indexer_priority=40)
 
-def _edition_candidates(deluxe_seeders=5):
-    standard = _Release("Eminem - Curtain Call The Hits [FLAC]", _EDITION_SIZE, seeders=90)
-    deluxe = _Release("Eminem - Curtain Call The Hits (Deluxe Edition) [FLAC]", _EDITION_SIZE,
-                      seeders=deluxe_seeders)
-    return standard, deluxe
+    picked = pick_best_album_release(
+        [other, preferred], _flac_quality_guess, quality_targets=targets,
+    )
 
-
-def test_prefer_deluxe_picks_the_release_that_names_the_edition():
-    standard, deluxe = _edition_candidates()
-    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
-                                     album_name=_DELUXE_REQUEST, prefer_deluxe=True)
-    assert picked is deluxe
+    assert picked is preferred
 
 
-def test_without_prefer_deluxe_seeders_still_decide():
-    standard, deluxe = _edition_candidates()
-    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
-                                     album_name=_DELUXE_REQUEST, prefer_deluxe=False)
-    assert picked is standard
+def test_indexer_priority_does_not_outrank_quality():
+    targets = [QualityTarget(format='flac'), QualityTarget(format='mp3')]
+    good_indexer_mp3 = _Release(title='Artist - Album [MP3 320]', size=350_000_000,
+                                seeders=10, indexer_priority=1)
+    bad_indexer_flac = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                                seeders=10, indexer_priority=50)
+
+    picked = pick_best_album_release(
+        [good_indexer_mp3, bad_indexer_flac], _flac_quality_guess,
+        quality_targets=targets,
+    )
+
+    assert picked is bad_indexer_flac
 
 
-def test_a_dead_edition_release_is_not_preferred():
-    standard, deluxe = _edition_candidates(deluxe_seeders=0)
-    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
-                                     album_name=_DELUXE_REQUEST, prefer_deluxe=True)
-    assert picked is standard
+def test_a_fresh_usenet_post_beats_an_old_one():
+    """Usenet has no seeders; age is what says whether it is still complete.
+
+    Lidarr buckets it — under an hour, under a day, under a week, then log10 of
+    the age in days — so a few hours' difference is not a decision.
+    """
+    targets = [QualityTarget(format='flac')]
+    fresh = _Release(title='Artist - Album [FLAC]', size=350_000_000, grabs=5,
+                     protocol='usenet', publish_date=_iso_hours_ago(2))
+    ancient = _Release(title='Artist - Album [FLAC]', size=350_000_000, grabs=5,
+                       protocol='usenet', publish_date=_iso_hours_ago(24 * 900))
+
+    picked = pick_best_album_release(
+        [ancient, fresh], _flac_quality_guess, quality_targets=targets,
+    )
+
+    assert picked is fresh
 
 
-def test_a_standard_request_is_unaffected_by_prefer_deluxe():
-    standard, deluxe = _edition_candidates()
-    picked = pick_best_album_release([standard, deluxe], _flac_quality_guess,
-                                     album_name="Curtain Call: The Hits", prefer_deluxe=True)
-    assert picked is standard
+def test_age_says_nothing_about_a_torrent():
+    """A seeded swarm is alive whatever its post date, so age must not sort it."""
+    targets = [QualityTarget(format='flac')]
+    old_but_bigger = _Release(title='Artist - Album [FLAC]', size=900_000_000,
+                              seeders=10, publish_date=_iso_hours_ago(24 * 900))
+    fresh_but_smaller = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                                 seeders=10, publish_date=_iso_hours_ago(1))
+
+    picked = pick_best_album_release(
+        [fresh_but_smaller, old_but_bigger], _flac_quality_guess,
+        quality_targets=targets,
+    )
+
+    assert picked is old_but_bigger
 
 
-def test_the_picker_reads_the_setting_when_not_told(monkeypatch):
-    import core.download_plugins.album_bundle as album_bundle_module
-    monkeypatch.setattr(album_bundle_module.config_manager, "get",
-                        lambda key, default=None: True if key == "wishlist.prefer_deluxe_editions" else default)
-    standard, deluxe = _edition_candidates()
-    assert pick_best_album_release([standard, deluxe], _flac_quality_guess,
-                                   album_name=_DELUXE_REQUEST) is deluxe
+def test_a_healthy_swarm_outranks_a_preferred_indexer():
+    """Indexer priority is a tiebreaker, not a reason to take a dead swarm.
+
+    Lidarr can put indexer priority above peers because it has no seeder sort
+    key at all, only a minimum-seeders rejection. We have both, so priority
+    belongs below availability or it undoes the bucketing entirely.
+    """
+    targets = [QualityTarget(format='flac')]
+    preferred_but_dead = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                                  seeders=2, indexer_priority=1)
+    healthy = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                       seeders=5000, indexer_priority=25)
+
+    picked = pick_best_album_release(
+        [preferred_but_dead, healthy], _flac_quality_guess,
+        quality_targets=targets,
+    )
+
+    assert picked is healthy
+
+
+def test_priority_still_decides_inside_one_availability_bucket():
+    targets = [QualityTarget(format='flac')]
+    preferred = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                         seeders=40, indexer_priority=1)
+    other = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                     seeders=44, indexer_priority=40)
+
+    picked = pick_best_album_release(
+        [other, preferred], _flac_quality_guess, quality_targets=targets,
+    )
+
+    assert picked is preferred
+
+
+def test_a_torrent_without_a_seeder_count_is_still_a_torrent():
+    """`seeders is None` also means "this indexer omits the field".
+
+    The picker's own availability gate says so. Using it as the "this is
+    usenet" test handed such a torrent the full freshness bonus, which is the
+    exact sorting the age bucket is written to keep away from torrents.
+    """
+    targets = [QualityTarget(format='flac')]
+    fresh_unknown_swarm = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                                   seeders=None, protocol='torrent',
+                                   publish_date=_iso_hours_ago(1))
+    older_bigger = _Release(title='Artist - Album [FLAC]', size=900_000_000,
+                            seeders=None, protocol='torrent',
+                            publish_date=_iso_hours_ago(24 * 400))
+
+    picked = pick_best_album_release(
+        [fresh_unknown_swarm, older_bigger], _flac_quality_guess,
+        quality_targets=targets,
+    )
+
+    assert picked is older_bigger
+
+
+def test_an_nzb_of_unknown_age_does_not_beat_a_known_old_one():
+    """Missing publish date used to score 0.0, above every post over a week."""
+    targets = [QualityTarget(format='flac')]
+    unknown_age = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                           grabs=5, protocol='usenet', publish_date=None)
+    known_old = _Release(title='Artist - Album [FLAC]', size=350_000_000,
+                         grabs=5, protocol='usenet',
+                         publish_date=_iso_hours_ago(24 * 10))
+
+    picked = pick_best_album_release(
+        [unknown_age, known_old], _flac_quality_guess, quality_targets=targets,
+    )
+
+    assert picked is known_old
+
+
+def test_music_size_limit_uses_album_duration_and_never_falls_back_to_oversized(monkeypatch):
+    from core.downloads import size_limit
+    monkeypatch.setattr(size_limit, 'configured_limit', lambda: 10)
+    huge = _Release('Artist Album FLAC', 800_000_000, seeders=100)
+    fits = _Release('Artist Album FLAC', 400_000_000, seeders=5)
+    assert pick_best_album_release([huge, fits], _flac_quality_guess, expected_duration_seconds=2700) is fits
+    assert pick_best_album_release([huge], _flac_quality_guess, expected_duration_seconds=2700) is None
+
+
+def test_resolve_single_file_in_client_category_subfolder(tmp_path: Path) -> None:
+    """the download root is the client's Incoming folder and the audiobooks
+    category saves one level down. the file is at <root>/Audiobooks/<file>,
+    never <root>/<file>, so the bare basename lookup missed it."""
+    incoming = tmp_path / "Incoming"
+    (incoming / "Audiobooks").mkdir(parents=True)
+    book = incoming / "Audiobooks" / "Columbus Day (R.C. Bray).m4b"
+    book.write_bytes(b"fake-m4b")
+    cfg = _cfg({'download_source.torrent_download_path': str(incoming)})
+    reported = r"\\10.10.16.115\Media\Torrents\Incoming\Audiobooks\Columbus Day (R.C. Bray).m4b"
+    assert resolve_reported_save_path(reported, config_get=cfg) == str(book)
+
+
+def test_resolve_category_subfolder_beats_same_name_at_root(tmp_path: Path) -> None:
+    """parent + name is the more specific match: a same-named file at the
+    root (an older grab) must not win over the one in the reported folder,
+    even when the root copy is newer."""
+    import os
+    incoming = tmp_path / "Incoming"
+    (incoming / "Audiobooks").mkdir(parents=True)
+    book = incoming / "Audiobooks" / "Book.m4b"
+    book.write_bytes(b"right")
+    stale = incoming / "Book.m4b"
+    stale.write_bytes(b"wrong")
+    os.utime(book, (1_000_000, 1_000_000))
+    cfg = _cfg({'download_source.torrent_download_path': str(incoming)})
+    reported = r"\\NAS\Media\Incoming\Audiobooks\Book.m4b"
+    assert resolve_reported_save_path(reported, config_get=cfg) == str(book)
+
+
+def test_resolve_bare_basename_still_works_without_the_parent(tmp_path: Path) -> None:
+    """no category subfolder on this side: the bare name at the root still
+    resolves like before."""
+    incoming = tmp_path / "Incoming"
+    incoming.mkdir()
+    book = incoming / "Book.m4b"
+    book.write_bytes(b"x")
+    cfg = _cfg({'download_source.torrent_download_path': str(incoming)})
+    assert resolve_reported_save_path(r"\\NAS\Media\Whatever\Audiobooks\Book.m4b",
+                                      config_get=cfg) == str(book)

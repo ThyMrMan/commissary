@@ -11,7 +11,6 @@ from urllib.parse import quote
     [
         "/api/image-proxy?url=https%3A%2F%2Fexample.com%2Fcover.jpg",
         "/api/image-cache/" + ("a" * 64),
-        # c=SoulSync: the Subsonic client name is deliberately un-renamed.
         "http://host.docker.internal:4533/api/image-proxy?u=ketiska&t=abc&s=def&v=1.16.1&c=SoulSync&f=json",
     ],
 )
@@ -23,7 +22,7 @@ def test_normalize_image_url_leaves_existing_image_proxy_urls_alone(thumb_url):
 
 
 def test_normalize_image_url_registers_internal_http_urls_with_image_cache(monkeypatch):
-    """Raw internal image URLs should be routed through Commissary's hashed cache URL."""
+    """Raw internal image URLs should be routed through SoulSync's hashed cache URL."""
     from core.metadata import normalize_image_url
     from core.metadata import artwork
     import core.image_cache as image_cache
@@ -72,3 +71,14 @@ def test_normalize_image_url_falls_back_to_proxy_when_cache_registration_fails(m
 
     url = "http://localhost:4533/cover.jpg"
     assert normalize_image_url(url) == f"/api/image-proxy?url={quote(url, safe='')}"
+
+
+def test_navidrome_cover_normalization_is_stable_and_does_not_register_images(monkeypatch):
+    from core.metadata import artwork
+    import core.image_cache as image_cache
+    from types import SimpleNamespace
+    monkeypatch.setattr(artwork, 'get_config_manager', lambda: SimpleNamespace(get_active_media_server=lambda: 'navidrome'))
+    monkeypatch.setattr(image_cache, 'cached_image_url', lambda _: pytest.fail('library serialization must not write image cache'))
+    for salt in ('old', 'new'):
+        assert artwork.normalize_image_url(f'http://navidrome:4533/rest/getCoverArt?id=al-123&s={salt}&t=secret') == '/api/navidrome/cover/al-123'
+    assert artwork.normalize_image_url('/api/navidrome/cover/al-123') == '/api/navidrome/cover/al-123'

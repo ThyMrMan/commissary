@@ -9,13 +9,12 @@ This client provides:
 - Drop-in replacement compatible with Soulseek interface
 
 Requires a running Lidarr instance with configured indexers and download clients.
-Lidarr downloads full albums — Commissary imports only the tracks it needs.
+Lidarr downloads full albums — SoulSync imports only the tracks it needs.
 """
 
 import os
 import re
 import time
-import asyncio
 import uuid
 import shutil
 import threading
@@ -25,7 +24,8 @@ from pathlib import Path
 import requests as http_requests
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_blocking
 
 # Import Soulseek data structures for drop-in replacement compatibility
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
@@ -83,8 +83,7 @@ class LidarrDownloadClient(DownloadSourcePlugin):
         if not self.is_configured():
             return False
         try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self._check_connection_sync)
+            return await run_blocking(self._check_connection_sync)
         except Exception:
             return False
 
@@ -107,8 +106,7 @@ class LidarrDownloadClient(DownloadSourcePlugin):
             return ([], [])
 
         try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self._search_sync, query)
+            return await run_blocking(self._search_sync, query)
         except Exception as e:
             logger.error(f"Lidarr search failed: {e}")
             return ([], [])
@@ -403,7 +401,7 @@ class LidarrDownloadClient(DownloadSourcePlugin):
 
             # Step 5: Find and import the wanted track.
             #
-            # Lidarr grabs whole albums; Commissary's matched-context
+            # Lidarr grabs whole albums; SoulSync's matched-context
             # post-processing wants the SPECIFIC track the user
             # requested. Old behavior copied every track in the album
             # and reported `imported_files[0]` as `file_path` — which

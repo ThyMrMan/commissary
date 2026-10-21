@@ -16,16 +16,10 @@ from core.metadata.registry import get_primary_source, get_spotify_client
 logger = logging.getLogger(__name__)
 
 
-def get_current_profile_id() -> int:
-    """Mirror of web_server.get_current_profile_id — uses Flask g.
-
-    Catches RuntimeError too because reading `g` outside a request
-    context raises that (not AttributeError) — happens when this is
-    called from background threads (sync, automation, scanners)."""
-    try:
-        return g.profile_id
-    except (AttributeError, RuntimeError):
-        return 1
+# the one resolver (session, then the background profile an automation runs
+# as, then admin). this module used to carry its own copy that only read g, so
+# a sync thread running for a member looked up profile 1's matches.
+from core.profile_context import get_current_profile_id  # noqa: E402,F401
 
 
 def _get_active_discovery_source():
@@ -59,14 +53,56 @@ def init(get_metadata_fallback_client_fn):
     _get_metadata_fallback_client = get_metadata_fallback_client_fn
 
 
+# The hero is the FIRST thing the discover page shows, and computing it is the
+# single slowest request on the page (6-14s live: the 200-row consensus query,
+# up to ten metadata fetches for missing art, a rotation write). Cache the
+# payload per (profile, source) so only the first load after a restart pays;
+# the featured-rotation still advances on every fresh compute, just not on
+# every reload inside the window.
+_HERO_CACHE = {}  # (profile_id, source) -> (expiry_ts, payload)
+_HERO_TTL_S = 1800
+
+
+def billboard_order(hero_artists):
+    """a billboard needs a photo. deezer answers "no photo" with a real url
+    to a grey silhouette (the md5 of an empty string), and coldplay sat on
+    the hero like that. placeholder urls become none so the ui shows its own
+    fallback, and artists with a real photo go first. stable, so the
+    least-recently-featured rotation still holds inside each group."""
+    from core.metadata.artwork import usable_image_url
+    for a in hero_artists:
+        if a.get('image_url') and not usable_image_url(a.get('image_url')):
+            a['image_url'] = None
+    return sorted(hero_artists, key=lambda a: 0 if a.get('image_url') else 1)
+
+
 def get_discover_hero():
     """Get featured similar artists for hero slideshow"""
     try:
+        import time as _time
         database = get_database()
 
         # Determine active source
         active_source = _get_active_discovery_source()
         logger.info(f"Discover hero using source: {active_source}")
+
+        _cache_key = (get_current_profile_id(), active_source)
+        from core.discovery.feedback import Taste
+        _hero_taste = Taste.load(database, get_current_profile_id())
+        _cached = _HERO_CACHE.get(_cache_key)
+        from core.discovery.warm_refresh import refreshing
+        if _cached and _time.time() < _cached[0] and not refreshing():
+            if _hero_taste.is_empty:
+                return jsonify(_cached[1])
+            # less like this ranks lower everywhere: sink disliked artists
+            # below the visible cut even on a cached hero. the cached payload
+            # is shared, so sort a copy.
+            _payload = dict(_cached[1])
+            _payload['artists'] = sorted(
+                _payload.get('artists') or [],
+                key=lambda a: _hero_taste.artist_factor(a.get('artist_name')),
+                reverse=True)
+            return jsonify(_payload)
 
         # Import fallback client for non-Spotify lookups
         itunes_client = _get_metadata_fallback_client()
@@ -118,10 +154,20 @@ def get_discover_hero():
                 if hasattr(artist, 'image_url') and artist.image_url:
                     artist_data['image_url'] = artist.image_url
 
+                try:
+                    artist_data['owned_album_count'] = database.get_owned_album_count_by_artist_name(artist.artist_name)
+                except Exception as count_err:
+                    # The meter is garnish — never break the hero for it.
+                    logger.debug(f"owned-album count failed for {artist.artist_name}: {count_err}")
+
                 hero_artists.append(artist_data)
 
+            hero_artists = billboard_order(hero_artists)
             logger.warning(f"[Discover Hero] Returning {len(hero_artists)} watchlist artists as fallback")
-            return jsonify({"success": True, "artists": hero_artists, "source": active_source, "fallback": "watchlist"})
+            _payload = {"success": True, "artists": hero_artists, "source": active_source, "fallback": "watchlist"}
+            if hero_artists:
+                _HERO_CACHE[_cache_key] = (_time.time() + _HERO_TTL_S, _payload)
+            return jsonify(_payload)
 
         # Artists are already filtered by source in SQL — no post-filter needed
         valid_artists = list(similar_artists)
@@ -166,13 +212,40 @@ def get_discover_hero():
 
         logger.info(f"[Discover Hero] Found {len(valid_artists)} valid artists for source: {active_source}")
 
-        # Filter out blacklisted artists
-        blacklisted = database.get_discovery_blacklist_names()
-        if blacklisted:
-            valid_artists = [a for a in valid_artists if a.similar_artist_name.lower() not in blacklisted]
+        # this profile's blocked artists never make the hero (before the cut to
+        # 10, so a block doesn't leave the rotation short)
+        from core.discovery.blocked import BlockedArtists
+        blocked = BlockedArtists.load(database, get_current_profile_id())
+        if not blocked.is_empty:
+            valid_artists = [a for a in valid_artists if not blocked.blocks_artist({
+                'artist_name': a.similar_artist_name,
+                'spotify_artist_id': a.similar_artist_spotify_id,
+                'itunes_artist_id': a.similar_artist_itunes_id,
+                'deezer_artist_id': getattr(a, 'similar_artist_deezer_id', None),
+                'musicbrainz_id': getattr(a, 'similar_artist_musicbrainz_id', None),
+            })]
+
+        if not _hero_taste.is_empty:
+            # less like this ranks lower everywhere: sink disliked artists
+            # below the top-10 cut. the sort is stable, so the
+            # least-recently-featured rotation holds among equally-liked
+            # artists.
+            valid_artists = sorted(valid_artists,
+                                   key=lambda a: _hero_taste.artist_factor(a.similar_artist_name),
+                                   reverse=True)
 
         # Take top 10 (already ordered by least-recently-featured, then quality)
         similar_artists = valid_artists[:10]
+
+        # the artists of yours that point at each one, for the explanation
+        from core.discovery.explain import consensus_confidence, explanation
+        try:
+            sources_by_name = database.get_recommendation_sources(
+                [a.similar_artist_name for a in similar_artists],
+                profile_id=get_current_profile_id()) or {}
+        except Exception as e:
+            logger.debug("hero recommendation-sources lookup failed: %s", e)
+            sources_by_name = {}
 
         # Convert to JSON format — use cached metadata, only fetch from API if missing
         hero_artists = []
@@ -197,9 +270,15 @@ def get_discover_hero():
                 "similarity_rank": artist.similarity_rank,
                 "source": active_source
             }
+            because = sources_by_name.get(artist.similar_artist_name) or []
+            artist_data["explanation"] = explanation(
+                'similar_to', because,
+                consensus_confidence(len(because) or artist.occurrence_count))
 
-            # Use cached metadata if available
-            if artist.image_url:
+            # Use cached metadata if available (a placeholder is not an image,
+            # it goes down the fetch path like a missing one)
+            from core.metadata.artwork import usable_image_url
+            if usable_image_url(artist.image_url):
                 artist_data['image_url'] = artist.image_url
                 artist_data['genres'] = artist.genres or []
                 artist_data['popularity'] = artist.popularity or 0
@@ -245,13 +324,26 @@ def get_discover_hero():
                 except Exception as img_err:
                     logger.error(f"Could not fetch artist image: {img_err}")
 
+            try:
+                artist_data['owned_album_count'] = database.get_owned_album_count_by_artist_name(artist.similar_artist_name)
+            except Exception as count_err:
+                # The meter is garnish — never break the hero for it.
+                logger.debug(f"owned-album count failed for {artist.similar_artist_name}: {count_err}")
+
             hero_artists.append(artist_data)
+
+        hero_artists = billboard_order(hero_artists)
 
         # Mark these artists as featured so they cycle to the back of the queue
         featured_names = [a["artist_name"] for a in hero_artists]
         database.mark_artists_featured(featured_names)
 
-        return jsonify({"success": True, "artists": hero_artists, "source": active_source})
+        _payload = {"success": True, "artists": hero_artists, "source": active_source}
+        if hero_artists:
+            # An empty answer stays uncached so data appearing (first scan
+            # finishing, say) shows up on the next load, not in ten minutes.
+            _HERO_CACHE[_cache_key] = (_time.time() + _HERO_TTL_S, _payload)
+        return jsonify(_payload)
 
     except Exception as e:
         logger.error(f"Error getting discover hero: {e}")

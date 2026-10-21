@@ -56,7 +56,7 @@ VIDEO_EXTS = frozenset((
 
 
 def _conn():
-    from config.settings import config_manager
+    from core.settings import config_manager
     base = str(config_manager.get("soulseek.slskd_url", "") or "").rstrip("/")
     key = config_manager.get("soulseek.api_key", "") or ""
     headers = {"Accept": "application/json"}   # make slskd answer in JSON, not whatever default
@@ -84,13 +84,7 @@ def build_query(scope: str, title: Any, *, year: Any = None, season: Any = None,
         ad = str(air_date or "")[:10]
         if st == "daily" and len(ad) == 10:
             return "%s %s" % (t, ad.replace("-", "."))
-        # Anime, or a show nobody has typed yet. series_type is never derived
-        # automatically -- it is set by hand per show, or by a Library's
-        # default_series_type -- so requiring 'anime' here made the absolute
-        # query depend on a tag most shows simply do not carry, and an untyped
-        # anime was asked for as SxxExx only. A show explicitly marked standard
-        # or daily is believed and keeps SxxExx.
-        if absolute and st not in ("standard", "daily"):
+        if st == "anime" and absolute:
             return "%s %s" % (t, absolute)
     if scope == "episode" and s_i is not None and e_i is not None:
         return "%s S%02dE%02d" % (t, s_i, e_i)
@@ -177,7 +171,10 @@ def group_video_files(responses: Any) -> list:
             continue
         user = resp.get("username")
         speed = resp.get("uploadSpeed", 0) or 0
-        slots = resp.get("freeUploadSlots", 0) or 0
+        # Current slskd returns a boolean; retain the old numeric field for
+        # compatibility with older releases.
+        slots = (int(bool(resp.get("hasFreeUploadSlot")))
+                 if "hasFreeUploadSlot" in resp else resp.get("freeUploadSlots", 0) or 0)
         queue = resp.get("queueLength", 0) or 0
         avail = peer_availability(slots, speed, queue)
         for f in (resp.get("files") or []):
@@ -218,7 +215,7 @@ def group_video_files(responses: Any) -> list:
 
 
 def _min_speed_bytes() -> int:
-    from config.settings import config_manager
+    from core.settings import config_manager
     try:
         return int(config_manager.get("soulseek.min_peer_upload_speed", 0) or 0) * 125000
     except (TypeError, ValueError):
@@ -228,7 +225,7 @@ def _min_speed_bytes() -> int:
 def search_timeout_ms() -> int:
     """How long to ask slskd to keep searching — the SAME ``soulseek.search_timeout``
     the music side uses (default 60s), so results have time to arrive."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     try:
         secs = int(config_manager.get("soulseek.search_timeout", 60) or 60)
     except (TypeError, ValueError):
@@ -323,7 +320,7 @@ def poll_search(search_id: str) -> dict:
 def slskd_search(query: str, *, max_seconds: int = 8, slskd_timeout_ms: int = 4500) -> dict:
     """POST a search to slskd, poll responses, return {configured, hits[, error]}.
     Thin I/O glue around ``group_video_files``."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     base = str(config_manager.get("soulseek.slskd_url", "") or "").rstrip("/")
     if not base:
         return {"configured": False, "hits": []}

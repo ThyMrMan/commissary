@@ -26,6 +26,32 @@ def register_routes(bp):
             logger.exception("video health failed")
             return jsonify({"status": "ok", "checks": []})
 
+    @bp.route("/dashboard/continue-watching", methods=["GET"])
+    def video_continue_watching():
+        """The resume row: what you are part-way through, newest first.
+
+        Its own endpoint rather than a key on /dashboard, because it is the one
+        part of that page that changes while you are not looking at it - you
+        watch something on the TV and want the row right when you come back -
+        and the rest of the dashboard payload is a set of counts that does not
+        need re-fetching to answer that.
+
+        Always 200 with a list. An empty row renders nothing, so a failure here
+        must degrade to "nothing to resume" rather than to a broken band.
+        """
+        from . import get_video_db
+        from core.video.sources import resolve_video_server
+        try:
+            db = get_video_db()
+            rows = db.continue_watching(server_source=resolve_video_server(), limit=20)
+            from .kids import filter_mixed_library_items, video_cap
+            # a show row's id is the episode, the rating is on show_id
+            rows = filter_mixed_library_items(db, rows, video_cap(), show_id_key="show_id")
+            return jsonify({"items": rows})
+        except Exception:
+            logger.exception("continue watching failed")
+            return jsonify({"items": []})
+
     @bp.route("/dashboard", methods=["GET"])
     def video_dashboard():
         from . import get_video_db
@@ -36,6 +62,8 @@ def register_routes(bp):
             stats = db.dashboard_stats(server_source=server)
             stats["server"] = server
             stats["recent"] = db.recently_added(server_source=server, limit=20)
+            from .kids import filter_mixed_library_items, video_cap
+            stats["recent"] = filter_mixed_library_items(db, stats["recent"], video_cap())
             return jsonify(stats)
         except Exception:
             logger.exception("Failed to build video dashboard stats")

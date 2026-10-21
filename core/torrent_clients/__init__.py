@@ -2,7 +2,7 @@
 
 Each adapter wraps one BitTorrent client (qBittorrent, Transmission,
 Deluge) behind the ``TorrentClientAdapter`` Protocol so the rest of
-Commissary can talk to whichever client the user picked through one
+SoulSync can talk to whichever client the user picked through one
 uniform surface.
 
 The active adapter is selected at runtime by the ``torrent_client.type``
@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from config.settings import config_manager
+from core.settings import config_manager
 
 from core.torrent_clients.aria2 import Aria2Adapter
 from core.torrent_clients.base import TorrentClientAdapter, TorrentStatus

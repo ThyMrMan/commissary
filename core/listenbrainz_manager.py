@@ -183,6 +183,54 @@ class ListenBrainzManager:
             "playlist_type": playlist_type,
         }
 
+    def sync_created_for_index(self) -> Dict:
+        """Cache any created-for playlist LB has that we don't have yet.
+
+        One list call, plus a detail fetch per genuinely new MBID —
+        already-cached playlists are left alone (``refresh_playlist``
+        owns those). Rolling-series refreshes call this before
+        resolving their latest member: new weekly / yearly periods
+        otherwise only enter the cache via ``update_all_playlists``,
+        whose only scheduled caller is the watchlist auto-scan, and
+        that returns early when the watchlist is empty — freezing the
+        rolling mirrors on whatever period was cached last.
+
+        Returns
+        -------
+        Dict with ``success`` (bool) and ``new`` (int) on success, or
+        ``error`` (str) on failure.
+        """
+        if not self.client.is_authenticated():
+            return {"success": False, "error": "Not authenticated"}
+
+        playlists = self.client.get_playlists_created_for_user()
+
+        conn = self._get_db_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT playlist_mbid FROM listenbrainz_playlists WHERE profile_id = ?",
+                (self.profile_id,),
+            )
+            cached = {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+        new = 0
+        for playlist in playlists:
+            meta = playlist.get('playlist', playlist)
+            mbid = meta.get('identifier', '').split('/')[-1]
+            if not mbid or mbid in cached:
+                continue
+            if self._update_playlist(playlist, "created_for") == "new":
+                new += 1
+
+        if new:
+            logger.info(f"Cached {new} new created-for ListenBrainz playlist(s)")
+            self._cleanup_old_playlists()
+
+        return {"success": True, "new": new}
+
     def _update_playlist(self, playlist_data: Dict, playlist_type: str) -> str:
         """
         Update a single playlist. Returns 'updated', 'skipped', or 'new'
@@ -509,6 +557,16 @@ class ListenBrainzManager:
                     f"DELETE FROM mirrored_playlists WHERE id IN ({ph})",
                     mirror_ids,
                 )
+                # #1455: cascade the Auto-Sync board's schedule automations too,
+                # so the dashboard Sync band doesn't render ghost rows for the
+                # removed mirrors. The legacy-mirror SELECT is not
+                # profile-scoped, so match the mirror delete's scope (all).
+                from database.music_database import MusicDatabase
+
+                for _mid in mirror_ids:
+                    MusicDatabase._delete_auto_sync_automations_for_playlist(
+                        cursor, int(_mid), profile_id=None
+                    )
                 total += len(mirror_ids)
             if total:
                 logger.info(
@@ -656,6 +714,15 @@ class ListenBrainzManager:
                 f"DELETE FROM mirrored_playlists WHERE id IN ({mid_ph})",
                 mirror_ids,
             )
+            # #1455: cascade the Auto-Sync board's schedule automations too, so
+            # the dashboard Sync band doesn't render ghost rows for the pruned
+            # mirrors. Scoped to this profile like the mirror delete above.
+            from database.music_database import MusicDatabase
+
+            for _mid in mirror_ids:
+                MusicDatabase._delete_auto_sync_automations_for_playlist(
+                    cursor, int(_mid), profile_id=self.profile_id
+                )
             logger.info(
                 f"Cascade-removed {len(mirror_ids)} stale {source} mirrored playlists"
             )
@@ -708,7 +775,8 @@ class ListenBrainzManager:
                     INSERT INTO listenbrainz_playlists
                     (playlist_mbid, title, creator, playlist_type, track_count, annotation_data, profile_id)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (playlist_mbid, title, 'Last.fm', 'lastfm_radio', track_count, '{}', self.profile_id))
+                """, (playlist_mbid, title, 'Last.fm', 'lastfm_radio', track_count,
+                      json.dumps({'track_count': track_count}), self.profile_id))
                 playlist_id = cursor.lastrowid
                 logger.info(f"Saved new Last.fm radio playlist '{title}' ({track_count} tracks)")
 

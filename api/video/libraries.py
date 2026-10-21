@@ -1,21 +1,9 @@
-"""Video library mapping endpoints — the "Libraries" registry (multi-library, P.4).
+"""Video library mapping endpoints.
 
-GET  /api/video/libraries -> discover the active server's Movies/TV sections,
-                             plus the user's CONFIGURED Libraries for it (each:
-                             {id, server_title, label, path, sort_order}) —
-                             including any manually-named YouTube libraries.
-                             Open to any video-side profile (the Library tab bar
-                             and the download destination picker both need it);
-                             non-admins get only the configured registry, with
-                             no server discovery and no filesystem paths.
-POST /api/video/libraries -> save {movies, tv, youtube} — arrays of Library
-                             entries ({id?, server_title, label, path}) for
-                             the active server. The scanner then reads only
-                             their titles; each entry's ``path`` is where new
-                             grabs assigned to it land. ``youtube`` entries
-                             have no server-side discovery (YouTube isn't
-                             scanned from a Plex/Jellyfin section) — they're
-                             named by hand in the Settings UI.
+GET  /api/video/libraries -> discover the active server's Movies/TV libraries
+                             + the user's current selection.
+POST /api/video/libraries -> save {movies, tv} (library titles) for the active
+                             server. The scanner then reads only those.
 """
 
 from __future__ import annotations
@@ -28,86 +16,22 @@ logger = get_logger("video_api.libraries")
 
 
 def register_routes(bp):
-    # What a non-admin sees per configured Library: enough to render a tab and
-    # pick a download destination, and nothing else. Filesystem paths are
-    # settings-only detail, so they stay out of the member-facing payload.
-    _MEMBER_LIB_FIELDS = ("id", "server_title", "label", "sort_order", "category",
-                          "default_quality_profile_id")
-
     @bp.route("/libraries", methods=["GET"])
     def video_libraries():
-        from flask import g
         from . import get_video_db
         try:
-            from core.video.sources import list_video_libraries, resolve_video_server
-            is_admin = bool(getattr(g, "is_admin", getattr(g, "profile_id", 1) == 1))
-
-            if is_admin:
-                libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
-                server = libs.get("server") or resolve_video_server()
-            else:
-                # Members skip server DISCOVERY entirely — it's a live Plex/Jellyfin
-                # round-trip that enumerates every section on the server (Settings-only
-                # data). They only need the registry the admin already configured.
-                server = resolve_video_server()
-                libs = {"server": server, "movies": [], "tv": []}
-
-            configured = (get_video_db().list_libraries(server)
-                          if server else {"movies": [], "tv": [], "youtube": []})
-            if not is_admin:
-                configured = {
-                    kind: [{k: e.get(k) for k in _MEMBER_LIB_FIELDS} for e in (entries or [])]
-                    for kind, entries in configured.items()
-                }
-            libs["configured"] = configured
+            from core.video.sources import (_auto_pick_single_libraries, list_video_libraries,
+                                             resolve_video_server)
+            libs = list_video_libraries() or {"server": None, "movies": [], "tv": []}
+            server = libs.get("server") or resolve_video_server()
+            libs["selected"] = (_auto_pick_single_libraries(
+                                    libs.get("server"), libs, get_video_db().get_library_selection(server),
+                                    db=get_video_db())
+                                if server else {"movies": None, "tv": None})
             return jsonify(libs)
         except Exception:
             logger.exception("Failed to list video libraries")
             return jsonify({"error": "Failed to list video libraries"}), 500
-
-    @bp.route("/libraries/probe", methods=["GET"])
-    def video_libraries_probe():
-        """Can the server write into each configured Library?
-
-        A Library the server cannot write to is indistinguishable from one
-        nothing has been grabbed into yet — the grab fails, the folder stays
-        empty, and the reason is only in the log. Same failure the music side
-        hit, same probe.
-
-        Separate from the /libraries GET because that one is open to any
-        video-side profile (the tab bar and the destination picker need it)
-        and deliberately withholds filesystem paths from non-admins. This
-        returns paths and touches the disk, so it is admin-only — enforced in
-        the blueprint's gate, alongside the other Settings-class endpoints.
-        """
-        from . import get_video_db
-        try:
-            from core.destination_probe import probe_destination_writable
-            from core.video.sources import resolve_video_server
-            server = resolve_video_server()
-            configured = (get_video_db().list_libraries(server)
-                          if server else {"movies": [], "tv": []})
-            out = {}
-            # Probe each distinct path ONCE: two Libraries can legitimately
-            # share a root, and probing it twice would create and remove two
-            # folders in it for one page load.
-            seen = {}
-            for kind, entries in (configured or {}).items():
-                rows = []
-                for e in (entries or []):
-                    path = e.get("path")
-                    key = str(path or "")
-                    if key not in seen:
-                        seen[key] = probe_destination_writable(path)
-                    rows.append({"id": e.get("id"), "label": e.get("label"),
-                                 "server_title": e.get("server_title"),
-                                 "path": path, **seen[key]})
-                out[kind] = rows
-            return jsonify({"success": True, "server": server, "configured": out})
-        except Exception:
-            logger.exception("Failed to probe video libraries")
-            return jsonify({"success": False, "error": "Failed to probe libraries",
-                            "configured": {}}), 500
 
     @bp.route("/server", methods=["GET"])
     def video_server_status():
@@ -175,21 +99,43 @@ def register_routes(bp):
 
     @bp.route("/server-config", methods=["GET"])
     def video_server_config_get():
-        """The video side's OWN server connection — its stored creds when set, else
-        the values INHERITED (read-only) from music. 'inherited' flags tell the UI a
-        field is a placeholder it can override; tokens/keys are returned masked."""
+        """What the settings form shows: video's OWN stored creds when it has any,
+        else the values INHERITED (read-only) from music. Deliberately the stored
+        override and not the effective config - a half-filled override (url typed,
+        key not yet) has to stay on screen, or the field the user just typed gets
+        replaced by the inherited value and looks like it vanished. 'inherited'
+        flags tell the UI a field is a placeholder it can override; tokens/keys
+        are returned masked."""
+        from . import get_video_db
         try:
             from core.video.sources import video_plex_config, video_jellyfin_config
-            p, j = video_plex_config(), video_jellyfin_config()
+            db = get_video_db()
+
+            def own(key):
+                try:
+                    return (db.get_setting(key) or "").strip()
+                except Exception:
+                    return ""
+
+            def view(url_key, secret_key, inherited):
+                url, secret = own(url_key), own(secret_key)
+                if url or secret:
+                    return url, secret, False   # video's own, even half-filled
+                return (inherited.get("base_url") or "",
+                        inherited.get("token") or inherited.get("api_key") or "", True)
 
             def mask(v):
                 v = v or ""
                 return ("•" * 12) if v else ""
+
+            pu, pt, p_inh = view("video_plex_url", "video_plex_token", video_plex_config(db))
+            ju, jk, j_inh = view("video_jellyfin_url", "video_jellyfin_key",
+                                 video_jellyfin_config(db))
             return jsonify({
-                "plex": {"base_url": p.get("base_url") or "", "token": mask(p.get("token")),
-                         "has_token": bool(p.get("token")), "inherited": p.get("source") == "music"},
-                "jellyfin": {"base_url": j.get("base_url") or "", "api_key": mask(j.get("api_key")),
-                             "has_key": bool(j.get("api_key")), "inherited": j.get("source") == "music"},
+                "plex": {"base_url": pu, "token": mask(pt),
+                         "has_token": bool(pt), "inherited": p_inh},
+                "jellyfin": {"base_url": ju, "api_key": mask(jk),
+                             "has_key": bool(jk), "inherited": j_inh},
             })
         except Exception:
             logger.exception("video server-config get failed")
@@ -197,38 +143,31 @@ def register_routes(bp):
 
     @bp.route("/server-config", methods=["POST"])
     def video_server_config_set():
-        """Save the video side's OWN Plex/Jellyfin creds (NEVER the music server's).
-        They live in the app-wide config under video_plex.* / video_jellyfin.* so the
-        tokens are encrypted at rest like music's; they used to sit in video.db in
-        plaintext. An empty/blank field clears that override → video falls back to
+        """Save the video side's OWN Plex/Jellyfin creds to video.db (NEVER the music
+        config). An empty/blank field clears that override → video falls back to
         inheriting music's value. A masked token (all •) is left untouched."""
-        from config.settings import config_manager
-        from core.video.sources import _VIDEO_SERVER_KEYS, promote_video_server_creds_once
         from . import get_video_db
         body = request.get_json(silent=True) or {}
-        promote_video_server_creds_once(get_video_db())
+        db = get_video_db()
 
         def is_mask(v):
             return bool(v) and set(str(v)) == {"•"}
 
-        for kind, secret_field in (("plex", "token"), ("jellyfin", "api_key")):
-            (cfg_url, cfg_secret), _legacy = _VIDEO_SERVER_KEYS[kind]
-            section = body.get(kind) or {}
-            if "base_url" in section:
-                config_manager.set(cfg_url, (section.get("base_url") or "").strip())
-            if secret_field in section:
-                val = section.get(secret_field)
-                if not is_mask(val):        # a mask means "unchanged" — keep the stored one
-                    val = (val or "").strip()
-                    if val:
-                        config_manager.set(cfg_secret, val)
-                    else:
-                        # ConfigManager.set() ignores '' on a sensitive path (so a
-                        # settings autosave can't wipe a secret), so clearing has to
-                        # go through the URL: the override is all-or-nothing, and a
-                        # blank base_url turns it off. The old encrypted token stays
-                        # behind, inert, until a new one replaces it.
-                        config_manager.set(cfg_url, "")
+        def put(key, val):
+            if is_mask(val):
+                return  # unchanged masked secret — keep what's stored
+            db.set_setting(key, (val or "").strip())
+
+        plex = body.get("plex") or {}
+        jelly = body.get("jellyfin") or {}
+        if "base_url" in plex:
+            put("video_plex_url", plex.get("base_url"))
+        if "token" in plex:
+            put("video_plex_token", plex.get("token"))
+        if "base_url" in jelly:
+            put("video_jellyfin_url", jelly.get("base_url"))
+        if "api_key" in jelly:
+            put("video_jellyfin_key", jelly.get("api_key"))
         return jsonify({"status": "saved"})
 
     @bp.route("/server-config/test", methods=["POST"])
@@ -241,12 +180,13 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "bad server"}), 400
         try:
             if which == "plex":
-                from core.video.sources import video_plex_config, PLEX_SCAN_TIMEOUT
+                from core.video.sources import video_plex_config, PLEX_CONNECT_TIMEOUT, invalidate_video_source_cache
                 cfg = video_plex_config()
                 if not cfg.get("base_url") or not cfg.get("token"):
                     return jsonify({"success": False, "error": "Plex URL/token not set"})
                 from plexapi.server import PlexServer
-                srv = PlexServer(cfg["base_url"], cfg["token"], timeout=PLEX_SCAN_TIMEOUT)
+                srv = PlexServer(cfg["base_url"], cfg["token"], timeout=PLEX_CONNECT_TIMEOUT)
+                invalidate_video_source_cache()
                 return jsonify({"success": True, "message": "Connected to " + (srv.friendlyName or "Plex")})
             from core.video.sources import video_jellyfin_config, video_jellyfin_test
             ok, message = video_jellyfin_test(video_jellyfin_config())
@@ -270,7 +210,8 @@ def register_routes(bp):
             if not base or not key:
                 return jsonify({"success": False, "users": []})
             import requests
-            r = requests.get(base + "/Users", headers={"X-Emby-Token": key}, timeout=8)
+            from core.jellyfin_client import jellyfin_auth_headers
+            r = requests.get(base + "/Users", headers=jellyfin_auth_headers(key), timeout=8)
             if r.status_code != 200:
                 return jsonify({"success": False, "users": [], "error": "HTTP %d" % r.status_code})
             users = r.json() or []
@@ -299,13 +240,8 @@ def register_routes(bp):
             server = resolve_video_server()
             if not server:
                 return jsonify({"error": "no video server"}), 400
-            # ``youtube`` is deliberately NOT accepted: a content_kind='youtube'
-            # root_folder was never read back (primary_root_folder maps only
-            # movie/show), so the editor that wrote them was decorative. The
-            # YouTube destination is the youtube_path scalar.
-            configured = get_video_db().save_libraries(
-                server, body.get("movies"), body.get("tv"), None)
-            return jsonify({"status": "saved", "server": server, "configured": configured})
+            get_video_db().set_library_selection(server, body.get("movies"), body.get("tv"))
+            return jsonify({"status": "saved", "server": server})
         except Exception:
-            logger.exception("Failed to save video libraries")
-            return jsonify({"error": "Failed to save libraries"}), 500
+            logger.exception("Failed to save video library selection")
+            return jsonify({"error": "Failed to save selection"}), 500

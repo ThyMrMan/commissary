@@ -16,6 +16,7 @@ from core.runtime_state import (
     download_tasks,
     tasks_lock,
 )
+from core.downloads.decisions import is_quality_override
 from core.metadata.album_tracks import get_album_for_source
 from core.metadata.registry import (
     get_deezer_client,
@@ -78,15 +79,17 @@ spotify_client = _SpotifyClientProxy()
 _resolve_library_file_path = None
 _attempt_download_with_candidates = None
 missing_download_executor = None
+download_monitor = None
 
 
-def init(resolve_library_file_path_fn, attempt_download_with_candidates_fn, executor):
+def init(resolve_library_file_path_fn, attempt_download_with_candidates_fn, executor, monitor):
     """Bind shared helpers from web_server."""
     global _resolve_library_file_path, _attempt_download_with_candidates
-    global missing_download_executor
+    global missing_download_executor, download_monitor
     _resolve_library_file_path = resolve_library_file_path_fn
     _attempt_download_with_candidates = attempt_download_with_candidates_fn
     missing_download_executor = executor
+    download_monitor = monitor
 
 
 def redownload_start(track_id):
@@ -96,6 +99,7 @@ def redownload_start(track_id):
         metadata = data.get('metadata', {})
         candidate = data.get('candidate', {})
         delete_old = data.get('delete_old_file', True)
+        override_quality = is_quality_override(data.get('override'))
 
         if not candidate.get('username') or not candidate.get('filename'):
             return jsonify({"success": False, "error": "candidate with username and filename required"}), 400
@@ -233,6 +237,8 @@ def redownload_start(track_id):
                 'used_sources': set(),
                 'status_change_time': time.time(),
                 'metadata_enhanced': False,
+                '_user_manual_pick': True,
+                '_override_quality': override_quality,
                 'error_message': None,
                 '_redownload_context': {
                     'library_track_id': track_id,
@@ -282,6 +288,9 @@ def redownload_start(track_id):
                         download_tasks[task_id]['status'] = 'failed'
                         download_tasks[task_id]['error_message'] = str(e)
 
+        # Register before dispatch: fast streaming downloads can finish immediately.
+        # The monitor owns completion/import and failure cleanup for this batch.
+        download_monitor.start_monitoring(batch_id)
         missing_download_executor.submit(_run_redownload)
 
         return jsonify({

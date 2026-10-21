@@ -1,5 +1,5 @@
 /*
- * Commissary — headless video acquisition helper (VideoGrab).
+ * SoulSync — headless video acquisition helper (VideoGrab).
  *
  * Powers the TV detail page's inline per-episode / per-season buttons. Runs the
  * SAME backend contract the download modal uses — search/start → poll →
@@ -11,9 +11,9 @@
  * endpoints. Kept separate for now so wiring the detail page can't regress the
  * working modal — a later cleanup could fold the modal onto this core.
  *
- *   VideoGrab.episode({ title, source, season, episode, mediaId, mediaSource, year, poster, rootFolderId })
+ *   VideoGrab.episode({ title, source, season, episode, mediaId, mediaSource, year, poster })
  *       → Promise<{ ok:boolean, id?:string, error?:string }>
- *   VideoGrab.season({ title, source, season, episodes:[num...], mediaId, mediaSource, year, poster, rootFolderId }, onEp)
+ *   VideoGrab.season({ title, source, season, episodes:[num...], mediaId, mediaSource, year, poster }, onEp)
  *       // onEp(episodeNumber, 'searching' | 'grabbing' | 'none') fired per episode
  *       → Promise<{ grabbed:number, total:number }>
  *   VideoGrab.wishlistEpisodes(show, episodes) → Promise<boolean>
@@ -23,30 +23,34 @@
     'use strict';
 
     function postJSON(url, body) {
-        // Parse the body even on a non-2xx status — the backend's {ok:false, error:'…'}
-        // detail lives there too; discarding it on !r.ok left every failure falling
-        // back to the generic 'grab failed' text instead of the real reason.
         return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body) }).then(function (r) { return r.json().catch(function () { return null; }); })
+            body: JSON.stringify(body) }).then(function (r) { return r.ok ? r.json() : null; })
             .catch(function () { return null; });
     }
     function getJSON(url) {
         return fetch(url).then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; });
     }
 
-    // First configured download source — mirrors the modal's sourcesFromConfig.
-    var _srcCache;
-    function pickSource() {
-        if (_srcCache !== undefined) return Promise.resolve(_srcCache);
+    // Every configured download source, in order — mirrors the modal's
+    // sourcesFromConfig. pickSource() keeps returning just the first for callers
+    // that genuinely want one, but a season should ask them all: a show Soulseek
+    // has and Prowlarr doesn't was previously reported as unavailable without
+    // Soulseek ever being asked.
+    var _srcListCache;
+    function allSources() {
+        if (_srcListCache !== undefined) return Promise.resolve(_srcListCache);
         return getJSON('/api/video/downloads/config').then(function (c) {
             c = c || {};
             var list;
             if (c.download_mode === 'hybrid' && Array.isArray(c.hybrid_order) && c.hybrid_order.length) list = c.hybrid_order;
             else if (c.download_mode) list = [c.download_mode];
             else list = ['soulseek'];
-            _srcCache = list[0] || 'soulseek';
-            return _srcCache;
+            _srcListCache = list.length ? list : ['soulseek'];
+            return _srcListCache;
         });
+    }
+    function pickSource() {
+        return allSources().then(function (l) { return l[0] || 'soulseek'; });
     }
 
     // search/start → poll (until the results plateau) → return the accepted rows.
@@ -91,14 +95,9 @@
     function episode(opts) {
         opts = opts || {};
         var src = opts.source || 'soulseek';
-        // rootFolderId rides along so the grab lands in the show's OWN Library
-        // (an Anime show keeps its anime folder/category instead of falling back
-        // to the primary TV Library) and so the search gets that Library's
-        // preferred trackers. The backend re-derives it from mediaId when absent,
-        // so an older caller that omits it still routes correctly.
         var params = { scope: 'episode', title: opts.title, season: opts.season,
-            episode: opts.episode, source: src, root_folder_id: opts.rootFolderId || null,
-            media_id: opts.mediaId, media_source: opts.mediaSource };
+            episode: opts.episode, source: src,
+            media_id: opts.mediaId, media_source: opts.mediaSource };   // Commissary: which title
         return runSearch(params).then(function (rows) {
             var best = bestRow(rows);
             if (!best) return { ok: false, error: 'no release found' };
@@ -106,7 +105,6 @@
                 kind: 'show', title: opts.title, release_title: best.title,
                 source: src, size_bytes: best.size_bytes, quality_label: best.quality_label,
                 media_id: opts.mediaId, media_source: opts.mediaSource, year: opts.year, poster_url: opts.poster,
-                root_folder_id: opts.rootFolderId || null,
                 search_ctx: { scope: 'episode', title: opts.title, year: opts.year,
                     season: opts.season, episode: opts.episode }
             };
@@ -118,7 +116,8 @@
                         quality_label: x.quality_label, title: x.title }; });
             } else {
                 // torrent / usenet — the magnet/NZB carriers the backend hands to the client
-                payload.download_url = best.download_url; payload.magnet_uri = best.magnet_uri; payload.protocol = best.protocol;
+                payload.download_url = best.download_url; payload.protocol = best.protocol;
+            payload.magnet_uri = best.magnet_uri;   // #1139 fallback if the .torrent fetch fails
                 payload.indexer_id = best.indexer_id; payload.guid = best.guid;
                 payload.username = best.username; payload.filename = best.filename || best.title;
                 payload.candidates = [];
@@ -133,78 +132,92 @@
         });
     }
 
-    // Grab a season as ONE PACK: a single release covering the whole season,
-    // which the import fans out per episode (run_season_import) exactly the way
-    // the automation does.
-    //
-    // This used to run the per-episode auto-grab N times. That is N searches and
-    // N grabs for one season, it hammers the indexers, and it routinely assembles
-    // a season from a dozen unrelated releases at different qualities.
-    //
-    // Packs ONLY, deliberately: when no pack exists it reports that instead of
-    // quietly reverting to per-episode grabbing. Auto on each episode row still
-    // does exactly that, and a button doing something other than what it says is
-    // worse than a button that declines.
+    // One source, one question: is there a whole-season pack? Resolves {ok, id}.
+    // scope 'season' is what rides into search_ctx and tells the monitor this lands
+    // as a FOLDER to be mapped onto episodes, not a file to be narrowed to one.
+    function seasonPack(opts, src) {
+        return runSearch({ scope: 'season', title: opts.title, season: opts.season, source: src,
+                           media_id: opts.mediaId, media_source: opts.mediaSource })   // Commissary
+            .then(function (rows) {
+                var best = bestRow(rows);
+                if (!best) return { ok: false };
+                var payload = {
+                    kind: 'show', title: opts.title, release_title: best.title,
+                    source: src, size_bytes: best.size_bytes, quality_label: best.quality_label,
+                    media_id: opts.mediaId, media_source: opts.mediaSource, year: opts.year,
+                    poster_url: opts.poster,
+                    search_ctx: { scope: 'season', title: opts.title, year: opts.year,
+                        season: opts.season, episode: null }
+                };
+                if (src === 'soulseek') {
+                    payload.username = best.username; payload.filename = best.filename;
+                    payload.candidates = [];
+                } else {
+                    payload.download_url = best.download_url; payload.protocol = best.protocol;
+                    payload.magnet_uri = best.magnet_uri;
+                    payload.indexer_id = best.indexer_id; payload.guid = best.guid;
+                    payload.username = best.username; payload.filename = best.filename || best.title;
+                    payload.candidates = [];
+                }
+                return postJSON('/api/video/downloads/grab', payload).then(function (res) {
+                    if (res && res.ok) {
+                        document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
+                        return { ok: true, id: res.id };
+                    }
+                    return { ok: false };
+                });
+            });
+    }
+
+    // Auto-grab a season: try a PACK from each configured source first, then fall
+    // back to per-episode, 3 at a time. The pack is one grab and one swarm instead
+    // of 22 separate searches for a 22-episode season; the episode path is still
+    // the right answer for a half-owned season, so it stays.
     function season(opts, onEp) {
         opts = opts || {};
         var eps = (opts.episodes || []).slice().sort(function (a, b) { return a - b; });
         var total = eps.length;
-        if (!total) return Promise.resolve({ grabbed: 0, total: 0, pack: false });
-        var src = opts.source || 'soulseek';
-        if (onEp) eps.forEach(function (en) { onEp(en, 'searching'); });
-
-        var params = { scope: 'season', title: opts.title, season: opts.season, source: src,
-            root_folder_id: opts.rootFolderId || null,
-            media_id: opts.mediaId, media_source: opts.mediaSource };
-        return runSearch(params).then(function (rows) {
-            var best = bestRow(rows);
-            if (!best) {
-                if (onEp) eps.forEach(function (en) { onEp(en, 'none'); });
-                return { grabbed: 0, total: total, pack: false, error: 'no season pack found' };
-            }
-            // A soulseek pack is a FOLDER of files (grab-pack fans it out
-            // server-side); a torrent/usenet pack is one release the download
-            // monitor unpacks on completion.
-            if (src === 'soulseek' && best.files && best.files.length > 1) {
-                return postJSON('/api/video/downloads/grab-pack', {
-                    username: best.username, files: best.files, title: opts.title,
-                    quality_label: best.quality_label, media_id: opts.mediaId,
-                    media_source: opts.mediaSource, year: opts.year, poster_url: opts.poster,
-                    root_folder_id: opts.rootFolderId || null,
-                }).then(function (res) {
-                    var ok = !!(res && res.ok);
-                    if (onEp) eps.forEach(function (en) { onEp(en, ok ? 'grabbing' : 'none'); });
-                    if (ok) document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
-                    return { grabbed: ok ? (res.started || total) : 0, total: total, pack: true,
-                             error: ok ? null : ((res && res.error) || 'grab failed') };
+        if (!total) return Promise.resolve({ grabbed: 0, total: 0 });
+        return allSources().then(function (sources) {
+            if (opts.source && sources.indexOf(opts.source) === -1) sources = [opts.source].concat(sources);
+            var i = 0;
+            function tryPack() {
+                if (i >= sources.length) return Promise.resolve({ ok: false });
+                return seasonPack(opts, sources[i++]).then(function (r) {
+                    return (r && r.ok) ? r : tryPack();
                 });
             }
-            var payload = {
-                kind: 'show', title: opts.title, release_title: best.title,
-                source: src, size_bytes: best.size_bytes, quality_label: best.quality_label,
-                media_id: opts.mediaId, media_source: opts.mediaSource, year: opts.year,
-                poster_url: opts.poster, root_folder_id: opts.rootFolderId || null,
-                // scope 'season' is what makes the monitor treat the finished
-                // download as a pack and unpack it (_is_pack → run_season_import).
-                search_ctx: { scope: 'season', title: opts.title, year: opts.year,
-                    season: opts.season, episode: null }
-            };
-            if (src === 'soulseek') {
-                payload.username = best.username; payload.filename = best.filename;
-                payload.candidates = [];
-            } else {
-                payload.download_url = best.download_url; payload.magnet_uri = best.magnet_uri; payload.protocol = best.protocol;
-                payload.indexer_id = best.indexer_id; payload.guid = best.guid;
-                payload.username = best.username; payload.filename = best.filename || best.title;
-                payload.candidates = [];
-            }
-            return postJSON('/api/video/downloads/grab', payload).then(function (res) {
-                var ok = !!(res && res.ok);
-                if (onEp) eps.forEach(function (en) { onEp(en, ok ? 'grabbing' : 'none'); });
-                if (ok) document.dispatchEvent(new CustomEvent('soulsync:video-download-started'));
-                return { grabbed: ok ? total : 0, total: total, pack: true,
-                         error: ok ? null : ((res && res.error) || 'grab failed') };
+            if (onEp) eps.forEach(function (en) { onEp(en, 'searching'); });
+            return tryPack().then(function (packed) {
+                if (packed && packed.ok) {
+                    if (onEp) eps.forEach(function (en) { onEp(en, 'grabbing'); });
+                    return { grabbed: total, total: total, pack: true, id: packed.id };
+                }
+                return perEpisode(opts, eps, total, sources, onEp);
             });
+        });
+    }
+
+    function perEpisode(opts, eps, total, sources, onEp) {
+        var idx = 0, active = 0, grabbed = 0, MAX = 3;
+        return new Promise(function (resolve) {
+            function launch(en, n) {
+                active++;
+                if (onEp) onEp(en, 'searching');
+                // Round-robin the sources so one dead indexer can't sink a season.
+                episode({ title: opts.title, source: sources[n % sources.length],
+                    season: opts.season, episode: en,
+                    mediaId: opts.mediaId, mediaSource: opts.mediaSource, year: opts.year, poster: opts.poster })
+                    .then(function (r) {
+                        active--;
+                        if (r.ok) { grabbed++; if (onEp) onEp(en, 'grabbing'); }
+                        else if (onEp) { onEp(en, 'none'); }
+                        if (idx >= eps.length && active === 0) resolve({ grabbed: grabbed, total: total });
+                        else pump();
+                    });
+            }
+            function pump() { while (active < MAX && idx < eps.length) { launch(eps[idx], idx); idx++; } }
+            pump();
         });
     }
 

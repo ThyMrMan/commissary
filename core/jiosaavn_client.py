@@ -24,7 +24,7 @@ release in ``/api/artists/{id}/albums`` is labelled ``type: album`` even when
 it is a one-track single. Many standalone singles only appear under
 ``/api/artists/{id}/songs`` (individual tracks), not in the albums feed.
 
-Commissary does not synthesize a singles section from the songs feed. Artist
+SoulSync does not synthesize a singles section from the songs feed. Artist
 discography for JioSaavn therefore surfaces **albums only** — the Singles tab
 on artist detail will be empty. Individual songs are still searchable via
 ``/api/search/songs`` and openable as tracks; this limitation applies only to
@@ -49,8 +49,9 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import requests
+from core.http_error_status import http_error_status
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.api_call_tracker import api_call_tracker
 from core.metadata.cache import get_metadata_cache
 from utils.logging_config import get_logger
@@ -264,7 +265,7 @@ class JioSaavnClient:
         if isinstance(self.session, requests.Session):
             self.session.headers.update({
                 "Accept": "application/json",
-                "User-Agent": "Commissary/1.0",
+                "User-Agent": "SoulSync/1.0",
             })
 
     def reload_config(self) -> None:
@@ -282,7 +283,10 @@ class JioSaavnClient:
             response.raise_for_status()
             payload = response.json()
         except Exception as exc:
-            if "rate limit" in str(exc).lower() or "429" in str(exc) or "503" in str(exc):
+            status = http_error_status(exc)
+            backoff = (status in (429, 503) if status is not None
+                       else "rate limit" in str(exc).lower() or "429" in str(exc) or "503" in str(exc))
+            if backoff:
                 logger.warning("JioSaavn rate limit hit, implementing backoff: %s", exc)
                 time.sleep(2.0)
             raise

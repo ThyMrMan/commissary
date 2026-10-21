@@ -5,9 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 from typing import Any, Dict
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.imports.context import (
     extract_artist_name,
     get_import_clean_album,
@@ -22,6 +23,7 @@ from core.imports.context import (
     get_import_track_info,
     normalize_import_context,
     get_library_source_id_columns,
+    is_real_provider_album_id,
 )
 from database.music_database import get_database
 from utils.logging_config import get_logger
@@ -46,8 +48,43 @@ def _primary_track_artist_name(track_info: Dict[str, Any]) -> str:
     return str((track_info or {}).get("artist", "") or "")
 
 
+def _recording_identity(context: Dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return a recording MBID and its comment only when they belong together."""
+    track_info = get_import_track_info(context) or get_import_search_result(context)
+    source_ids = get_import_source_ids(context)
+    source_mbid = source_ids["track_id"] if get_import_source(context).lower() == "musicbrainz" else ""
+    embedded_mbid = (context.get("_embedded_id_tags") or {}).get("MUSICBRAINZ_RECORDING_ID")
+    candidate = embedded_mbid or track_info.get("musicbrainz_recording_id") or source_mbid
+    track_mbid = str(candidate or "").strip().lower() or None
+    if not track_mbid:
+        return None, None
+
+    disambiguation = context.get("_recording_disambiguation")
+    if disambiguation is None and str(
+        track_info.get("musicbrainz_recording_id") or source_mbid or ""
+    ).strip().lower() == track_mbid:
+        disambiguation = track_info.get("disambiguation")
+    return track_mbid, str(disambiguation or "").strip() or None
+
+
 def _stable_soulsync_id(text: str) -> str:
     return str(abs(int(hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest(), 16)) % (10 ** 9))
+
+
+def _retention_provenance_json(context: Dict[str, Any]) -> tuple[str | None, str | None]:
+    """Serialize acquisition/retention truth for either persistence path."""
+    from core.quality.model import AudioQuality
+    from core.quality.retention import quality_json, transforms_json
+
+    acquired_value = context.get("_acquired_audio_quality")
+    try:
+        acquired_quality = AudioQuality.from_dict(acquired_value) if acquired_value else None
+    except (TypeError, ValueError):
+        acquired_quality = None
+    return (
+        quality_json(acquired_quality),
+        transforms_json(context.get("_retention_transforms")),
+    )
 
 
 # Tiny SQL allowlist for the fill-empty helpers — prevents accidental
@@ -58,9 +95,27 @@ _SOULSYNC_FILLABLE_COLUMNS = {
                           "itunes_artist_id", "deezer_id", "discogs_id", "soul_id",
                           "hifi_artist_id"}),
     "albums": frozenset({"thumb_url", "genres", "year", "track_count", "duration",
+                         "record_type",
                          "spotify_album_id", "itunes_album_id", "deezer_id",
                          "discogs_id", "soul_id", "hifi_album_id"}),
 }
+
+
+def _fill_empty_mb_release_id(cursor, album_id: Any, release_id: str) -> None:
+    """Record the musicbrainz release an imported album is, when the row has none.
+
+    marked matched the way the embedded-id reconcile does, so the enrichment
+    worker doesn't go looking and land on a same-named sibling release (#1299).
+    never overwrites an id that's already there.
+    """
+    try:
+        cursor.execute(
+            "UPDATE albums SET musicbrainz_release_id = ?, musicbrainz_match_status = 'matched' "
+            "WHERE id = ? AND (musicbrainz_release_id IS NULL OR musicbrainz_release_id = '')",
+            (release_id, album_id),
+        )
+    except Exception as e:
+        logger.debug("album musicbrainz release id fill failed: %s", e)
 
 
 def _fill_empty_columns(cursor, table: str, row_id: Any, fields: Dict[str, Any]) -> None:
@@ -190,26 +245,11 @@ def record_library_history_download(context: Dict[str, Any]) -> None:
     try:
         search_result = context.get("original_search_result") or context.get("search_result") or {}
         username = search_result.get("username", context.get("_download_username", ""))
-        source_map = {
-            "youtube": "YouTube",
-            "tidal": "Tidal",
-            "qobuz": "Qobuz",
-            "hifi": "HiFi",
-            "deezer_dl": "Deezer",
-            "lidarr": "Lidarr",
-            "soundcloud": "SoundCloud",
-            "amazon": "Amazon",
-            "staging": "Staging",
-            "torrent": "Torrent",
-            "usenet": "Usenet",
-            # Auto-import isn't a download source, but flows through the
-            # same post-process pipeline (file lands → record provenance
-            # + history → write to library DB). Tagging it as "Auto-Import"
-            # in history avoids mislabeling staging-folder imports as
-            # Soulseek downloads.
-            "auto_import": "Auto-Import",
-        }
-        download_source = source_map.get(username, "Soulseek")
+        # One canonical username→label map (core/downloads/live_detail.py),
+        # shared with the live status payloads so a live row and its later
+        # history row can never disagree on a source's name (#1156).
+        from core.downloads.live_detail import SOURCE_LABELS
+        download_source = SOURCE_LABELS.get(username, "Soulseek")
 
         ti = context.get("track_info") or context.get("search_result") or {}
         artist_name = _primary_track_artist_name(ti)
@@ -359,13 +399,14 @@ def record_download_provenance(context: Dict[str, Any]) -> None:
         deezer_track_id = _embedded("DEEZER_TRACK_ID")
         tidal_track_id = _embedded("TIDAL_TRACK_ID")
         qobuz_track_id = _embedded("QOBUZ_TRACK_ID")
-        musicbrainz_recording_id = _embedded("MUSICBRAINZ_RECORDING_ID")
+        musicbrainz_recording_id, recording_disambiguation = _recording_identity(context)
         audiodb_id = _embedded("AUDIODB_TRACK_ID")
         soul_id = _embedded("SOUL_ID")
         isrc = context.get("_isrc")
+        acquired_quality_json, retention_json = _retention_provenance_json(context)
 
         db = get_database()
-        db.record_track_download(
+        download_row_id = db.record_track_download(
             file_path=file_path,
             source_service=source_service,
             source_username=username,
@@ -384,10 +425,16 @@ def record_download_provenance(context: Dict[str, Any]) -> None:
             tidal_track_id=tidal_track_id,
             qobuz_track_id=qobuz_track_id,
             musicbrainz_recording_id=musicbrainz_recording_id,
+            recording_disambiguation=recording_disambiguation,
             audiodb_id=audiodb_id,
             soul_id=soul_id,
             isrc=isrc,
+            acquired_quality_json=acquired_quality_json,
+            retention_json=retention_json,
         )
+        # the "why this file" record for the task that fetched it
+        if download_row_id and context.get("task_id"):
+            db.link_download_decision(context["task_id"], download_row_id)
     except Exception as e:
         logger.debug("record_download_provenance failed: %s", e)
 
@@ -422,7 +469,7 @@ def is_active_media_server_ready() -> tuple[bool, str]:
 
 
 def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[str, Any], album_info: Dict[str, Any]) -> None:
-    """Write imported media to the Commissary library tables when the active server is Commissary."""
+    """Write imported media to the SoulSync library tables when the active server is SoulSync."""
     try:
         if _get_config_manager().get_active_media_server() != "soulsync":
             return
@@ -432,11 +479,19 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         if not final_path:
             return
 
-        # Real downloads (manual search, watchlist/playlist auto-download, any
-        # slskd/YouTube/Tidal/etc. source) start flagged "to be purchased";
-        # the manual staging Import feature and the reorganize/retag scan both
-        # set is_local_import — those are the user's own files, not downloads.
-        to_be_purchased = 0 if context.get("is_local_import") else 1
+        # #1504: owning user profile for the new rows (from auto-import
+        # breadcrumb, download request, etc.). None = shared.
+        # Profile 1 IS the shared library scope (owner_profile_id IS NULL), so
+        # it must write NULL — writing 1 makes the rows invisible to every
+        # shared-scope lookup (the missing-tracks analysis, the dashboard),
+        # which then reports everything as missing and re-downloads.
+        owner_pid = context.get('profile_id')
+        try:
+            owner_pid = int(owner_pid) if owner_pid else None
+        except (TypeError, ValueError):
+            owner_pid = None
+        if owner_pid == 1:
+            owner_pid = None
 
         album_ctx = get_import_context_album(context)
         track_info = get_import_track_info(context)
@@ -445,17 +500,85 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         source_ids = get_import_source_ids(context)
         source_columns = get_library_source_id_columns(source)
 
+        # #1567 (round 4): when metadata extraction distrusted the batch album
+        # context, its year/track_count/art/release id are a stranger's and
+        # must not reach the library rows. extract_source_metadata stashes the
+        # verdict + the track's own provider album on this same context dict —
+        # read it here, never recomputed.
+        _album_ctx_distrusted = bool(context.get("_batch_album_distrusted"))
+        _own_provider_album = context.get("_track_own_provider_album")
+        if not isinstance(_own_provider_album, dict):
+            _own_provider_album = {}
+
         artist_name = extract_artist_name(artist_context) or get_import_clean_artist(context, default="")
+        if _album_ctx_distrusted:
+            # R4F1: the batch artist_context is a stranger's — the library
+            # artist/album identity must come from the track's own data, or
+            # the bogus batch album lands in the library DB as a real album.
+            _own_artist_names = context.get("_track_own_artist_display_names") or []
+            _own_artist_name = _own_artist_names[0] if _own_artist_names else ""
+            if _own_artist_name:
+                artist_name = _own_artist_name
+            else:
+                artist_name = get_import_clean_artist(context, default="")
         if not artist_name or artist_name in ("Unknown", "Unknown Artist"):
             return
 
+        # A compilation is imported one track at a time, and `artist_name` here
+        # is whoever the DOWNLOAD was for — so one contributor's track filed the
+        # whole soundtrack under them, over and over, until 45 compilations sat
+        # on one guitarist (sassmastawillis). When the album's own metadata says
+        # various artists, the ALBUM goes there; the track keeps its real artist
+        # through `track_artist` below, which exists for exactly this.
+        #
+        # R4F1: skipped when the batch album context is distrusted — its VA
+        # signal is the stranger's, not the track's. A genuinely VA own album
+        # is still grouped by name; enrichment sorts out the credit.
+        from core.imports.compilation import compilation_album_artist
+        if not _album_ctx_distrusted:
+            _va_artist = compilation_album_artist(album_ctx, artist_name)
+            if _va_artist:
+                logger.info(
+                    "[Import] '%s' is a various-artists release — filing the album "
+                    "under %s instead of %s (the track keeps its own artist)",
+                    album_ctx.get("name", "") or "album", _va_artist, artist_name,
+                )
+                artist_name = _va_artist
+
         album_name = ""
-        if album_info and isinstance(album_info, dict):
-            album_name = album_info.get("album_name", "")
-        if not album_name:
-            album_name = album_ctx.get("name", "") or original_search.get("album", "")
+        if _album_ctx_distrusted:
+            # R4F1: album_info['album_name'] and album_ctx['name'] are the
+            # stranger's in bundle flows — the track's own provider album
+            # name, or the track title as last resort (never the batch's).
+            album_name = _own_provider_album.get("name") or ""
+        else:
+            if album_info and isinstance(album_info, dict):
+                album_name = album_info.get("album_name", "")
+            if not album_name:
+                album_name = album_ctx.get("name", "") or original_search.get("album", "")
         if not album_name:
             album_name = track_info.get("name", "Unknown")
+
+        # #1562: the release kind the download pipeline already carries
+        # (post_processing stamps album_info['record_type']). Before this,
+        # the import wrote no kind at all — record_type was only backfilled
+        # by the enrichment sweep, so freshly imported releases were
+        # kind-blind (and the single/album gates lenient-always) until the
+        # workers ran. album_type is the fallback; '' stays unknown.
+        #
+        # NF-2: when the batch album context is distrusted, its record_type/
+        # album_type is the stranger's — leave unknown for the workers.
+        _import_record_type = ""
+        if not _album_ctx_distrusted:
+            if isinstance(album_info, dict):
+                _import_record_type = (
+                    album_info.get("record_type") or album_info.get("album_type") or ""
+                )
+            if not _import_record_type:
+                _import_record_type = (
+                    album_ctx.get("record_type") or album_ctx.get("album_type") or ""
+                )
+        _import_record_type = str(_import_record_type).strip().lower()
 
         track_name = get_import_clean_title(
             context,
@@ -466,22 +589,61 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         duration_ms = track_info.get("duration_ms", 0) or 0
 
         year = None
-        release_date = album_ctx.get("release_date", "")
+        if _album_ctx_distrusted:
+            # The batch context's date is a stranger's — use the track's own
+            # provider album date, or nothing (fill-only below + enrichment
+            # fill the gap; never the batch's year).
+            release_date = _own_provider_album.get("release_date") or ""
+        else:
+            release_date = album_ctx.get("release_date", "")
         if release_date and len(release_date) >= 4:
             try:
                 year = int(release_date[:4])
             except ValueError:
                 pass
 
-        image_url = album_ctx.get("image_url", "")
-        if not image_url:
-            images = album_ctx.get("images", [])
-            if images and isinstance(images, list) and len(images) > 0:
-                img = images[0]
-                image_url = img.get("url", "") if isinstance(img, dict) else str(img)
+        if _album_ctx_distrusted:
+            # Never take artwork from the poisoned batch — the track's own
+            # provider album art, or nothing. An empty value is a no-op for
+            # the fill-only writers below (never a clobber), and enrichment
+            # can still find per-track art later.
+            image_url = _own_provider_album.get("image_url") or ""
+        else:
+            image_url = album_ctx.get("image_url", "")
+            if not image_url:
+                images = album_ctx.get("images", [])
+                if images and isinstance(images, list) and len(images) > 0:
+                    img = images[0]
+                    image_url = img.get("url", "") if isinstance(img, dict) else str(img)
 
         artist_source_id = source_ids.get("artist_id", "")
-        album_source_id = source_ids.get("album_id", "")
+        if _album_ctx_distrusted:
+            # R4F1: the artist row is now the track's OWN artist (see above),
+            # so the batch artist's source id would mismatch the name — drop
+            # it and let enrichment fill the right one.
+            artist_source_id = ""
+        # R3F3: a provider-namespaced id column must only ever receive ids of
+        # that provider's family. The track's own album id can be cross-source
+        # (spotify_data attached to a Deezer download) — writing a Spotify id
+        # into albums.deezer_id makes the Deezer worker's honor_stored_match
+        # fail truthy and skips the name-search fallback forever.
+        _own_album_id_source = (
+            (_own_provider_album.get("id_source") or "").strip().lower()
+        )
+        _own_album_id_cross_source = bool(
+            _album_ctx_distrusted and _own_album_id_source == "spotify"
+        )
+        if _album_ctx_distrusted:
+            # A provider album id taken from the poisoned batch is a
+            # stranger's edition — the track's own provider album id when
+            # it's a real provider id, otherwise empty for enrichment to
+            # fill (never the batch's).
+            _own_album_id = _own_provider_album.get("id") or ""
+            album_source_id = (
+                _own_album_id if is_real_provider_album_id(_own_album_id) else ""
+            )
+        else:
+            album_source_id = source_ids.get("album_id", "")
         track_source_id = source_ids.get("track_id", "")
         for key in ("auto_import", "from_sync_modal", "explicit_artist", "explicit_album", ""):
             if artist_source_id == key:
@@ -491,7 +653,11 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             if track_source_id == key:
                 track_source_id = ""
 
-        genres = (artist_context or {}).get("genres", []) if isinstance(artist_context, dict) else []
+        genres = []
+        if not _album_ctx_distrusted:
+            # NF-1: the batch artist_context's genres are the stranger's —
+            # leave empty for enrichment when distrusted.
+            genres = (artist_context or {}).get("genres", []) if isinstance(artist_context, dict) else []
         if genres:
             from core.genre_filter import filter_genres as _filter_genres
 
@@ -499,12 +665,6 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         genres_json = json.dumps(genres) if genres else ""
 
         # File size on disk (powers Library Disk Usage card on Stats).
-        # Commissary standalone is the only path where the file is local
-        # at insert time, so we read it directly via os.path.getsize.
-        # Mirrors what JellyfinTrack/NavidromeTrack pull from API
-        # responses for the media-server flows.
-        # Read BEFORE the bitrate, which falls back to size/duration for a
-        # container that carries no bitrate header of its own.
         file_size = None
         try:
             file_size = os.path.getsize(final_path) or None
@@ -514,15 +674,9 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         bitrate = 0
         try:
             from mutagen import File as MutagenFile
+            from core.imports.file_ops import _kbps_from_stream_info, estimate_bitrate_kbps
 
-            from core.imports.file_ops import (
-                _kbps_from_stream_info,
-                estimate_bitrate_kbps,
-            )
             audio = MutagenFile(final_path)
-            # hasattr(info, "bitrate") was the gate, and OggOpusInfo has no such
-            # attribute — so every Opus import stored 0 and the library showed
-            # nothing for it.
             info = audio.info if audio is not None and getattr(audio, "info", None) else None
             kbps = _kbps_from_stream_info(info, final_path)
             if not kbps:
@@ -535,15 +689,27 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
         artist_id = _stable_soulsync_id(artist_name.lower().strip())
         album_id = _stable_soulsync_id(f"{artist_name}::{album_name}".lower().strip())
         track_id = _stable_soulsync_id(final_path)
-        total_tracks = album_ctx.get("total_tracks", 0) or 0
-        # Album total duration — auto-import passes the sum of every
-        # matched track's duration via `album.duration_ms`, mirroring
-        # what soulsync_client's deep scan computes. Falls back to
-        # the per-track duration for callers that don't provide an
-        # album total (legacy direct-download flow).
-        album_total_duration_ms = int(
-            album_ctx.get("duration_ms") or duration_ms or 0
-        )
+        if _album_ctx_distrusted:
+            # The batch context's track count is a stranger's album's — the
+            # track's own provider album count, or 0 (unknown) for the
+            # fill-only writers + enrichment to resolve.
+            total_tracks = _own_provider_album.get("total_tracks") or 0
+        else:
+            total_tracks = album_ctx.get("total_tracks", 0) or 0
+        if _album_ctx_distrusted:
+            # The batch's summed duration is a stranger's album total — use
+            # the track's own duration (the only duration this import
+            # actually knows); never the batch's sum.
+            album_total_duration_ms = int(duration_ms or 0)
+        else:
+            # Album total duration — auto-import passes the sum of every
+            # matched track's duration via `album.duration_ms`, mirroring
+            # what soulsync_client's deep scan computes. Falls back to
+            # the per-track duration for callers that don't provide an
+            # album total (legacy direct-download flow).
+            album_total_duration_ms = int(
+                album_ctx.get("duration_ms") or duration_ms or 0
+            )
 
         db = get_database()
         with db._get_connection() as conn:
@@ -598,12 +764,25 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                 cursor.execute("SELECT id FROM artists WHERE id = ?", (artist_id,))
                 if cursor.fetchone():
                     artist_id = _stable_soulsync_id(artist_name.lower().strip() + "::soulsync")
+                # #1504: stamp owner_profile_id only when the column exists —
+                # minimal test schemas / pre-migration DBs don't have it,
+                # and a missing column must not fail the whole insert.
+                try:
+                    _artist_cols = {c[1] for c in cursor.execute("PRAGMA table_info(artists)").fetchall()}
+                except Exception:
+                    _artist_cols = set()
+                _a_cols = ["id", "name", "genres", "thumb_url", "server_source"]
+                _a_vals = ["?", "?", "?", "?", "'soulsync'"]
+                _a_params: list = [artist_id, artist_name, genres_json, image_url]
+                if "owner_profile_id" in _artist_cols:
+                    _a_cols.append("owner_profile_id")
+                    _a_vals.append("?")
+                    _a_params.append(owner_pid)
+                _a_cols += ["created_at", "updated_at"]
+                _a_vals += ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"]
                 cursor.execute(
-                    """
-                    INSERT INTO artists (id, name, genres, thumb_url, server_source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, 'soulsync', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    (artist_id, artist_name, genres_json, image_url),
+                    f"INSERT INTO artists ({', '.join(_a_cols)}) VALUES ({', '.join(_a_vals)})",
+                    _a_params,
                 )
                 if artist_source_col and artist_source_id:
                     try:
@@ -616,6 +795,17 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
 
             # ── Album row: same insert-or-fill-empty-fields shape ──
             album_source_col = source_columns.get("album")
+            if _own_album_id_cross_source:
+                # R3F3: a cross-source Spotify own-album id goes in the
+                # SPOTIFY column — never the download source's (a Spotify id
+                # in deezer_id makes the Deezer worker's honor_stored_match
+                # fail truthy and skips the name-search fallback forever).
+                # Grouping follows the column, so the same Spotify release
+                # still unifies.
+                album_source_col = (
+                    get_library_source_id_columns("spotify").get("album")
+                    or album_source_col
+                )
 
             # Group by CANONICAL release id when we have one (not just the name
             # string), so differently-named imports of the SAME release land in
@@ -623,10 +813,26 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             # dressing each split row in its own cover art (Sokhi). Precedence:
             # name-hash id -> source release id -> (title, artist). Falls back to
             # the legacy name match, so nothing that grouped before stops now.
+            #
+            # a musicbrainz release id is the sharpest edition identity we get, and
+            # the only one a musicbrainz import has (that source has no album
+            # column of its own). two releases can share a name (#1299), so it
+            # keys the grouping whenever the import carries one.
             from core.imports.album_grouping import find_existing_soulsync_album_id
+            from core.metadata.musicbrainz_tags import selected_release_id
+            if _album_ctx_distrusted:
+                # A release id taken from the poisoned batch is a stranger's
+                # edition — group (and fill) by the per-track album_info id
+                # instead, mirroring extract_source_metadata's precedence.
+                mb_release_id = selected_release_id(album_info)
+            else:
+                mb_release_id = selected_release_id(album_ctx)
+            group_col, group_id = album_source_col, album_source_id
+            if mb_release_id:
+                group_col, group_id = "musicbrainz_release_id", mb_release_id
             existing_album_id = find_existing_soulsync_album_id(
                 cursor, name_key_id=album_id, artist_id=artist_id, album_name=album_name,
-                album_source_col=album_source_col, album_source_id=album_source_id,
+                album_source_col=group_col, album_source_id=group_id,
             )
             if existing_album_id is not None:
                 album_id = existing_album_id
@@ -645,6 +851,9 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                         "year": year,
                         "track_count": total_tracks,
                         "duration": album_total_duration_ms,
+                        # Fill-only: never overwrites a kind the enrichment
+                        # workers already wrote.
+                        "record_type": _import_record_type,
                     },
                 )
                 if album_source_col and album_source_id:
@@ -652,14 +861,38 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             else:
                 cursor.execute("SELECT id FROM albums WHERE id = ?", (album_id,))
                 if cursor.fetchone():
-                    album_id = _stable_soulsync_id(f"{artist_name}::{album_name}::soulsync".lower().strip())
+                    # the name-hash id is taken, by another server's row or by a
+                    # different release of the same name. a release id gives each
+                    # release its own stable id, so a third one can't collide.
+                    _scope = group_id or "soulsync"
+                    album_id = _stable_soulsync_id(f"{artist_name}::{album_name}::{_scope}".lower().strip())
+                # #1504: stamp owner_profile_id only when the column exists —
+                # minimal test schemas / pre-migration DBs don't have it,
+                # and a missing column must not fail the whole insert.
+                try:
+                    _album_cols = {c[1] for c in cursor.execute("PRAGMA table_info(albums)").fetchall()}
+                except Exception:
+                    _album_cols = set()
+                _al_cols = ["id", "artist_id", "title", "year", "thumb_url", "genres",
+                            "track_count", "duration", "server_source"]
+                _al_vals = ["?", "?", "?", "?", "?", "?", "?", "?", "'soulsync'"]
+                _al_params: list = [album_id, artist_id, album_name, year, image_url,
+                                    genres_json, total_tracks, album_total_duration_ms]
+                if "owner_profile_id" in _album_cols:
+                    _al_cols.append("owner_profile_id")
+                    _al_vals.append("?")
+                    _al_params.append(owner_pid)
+                # #1562: stamp the kind at import time (same PRAGMA guard as
+                # owner_profile_id — minimal test schemas may lack it).
+                if "record_type" in _album_cols:
+                    _al_cols.append("record_type")
+                    _al_vals.append("?")
+                    _al_params.append(_import_record_type or None)
+                _al_cols += ["created_at", "updated_at"]
+                _al_vals += ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"]
                 cursor.execute(
-                    """
-                    INSERT INTO albums (id, artist_id, title, year, thumb_url, genres, track_count,
-                                        duration, server_source, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'soulsync', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    (album_id, artist_id, album_name, year, image_url, genres_json, total_tracks, album_total_duration_ms),
+                    f"INSERT INTO albums ({', '.join(_al_cols)}) VALUES ({', '.join(_al_vals)})",
+                    _al_params,
                 )
                 if album_source_col and album_source_id:
                     try:
@@ -669,6 +902,9 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                         )
                     except Exception as e:
                         logger.debug("album source-id update failed: %s", e)
+
+            if mb_release_id:
+                _fill_empty_mb_release_id(cursor, album_id, mb_release_id)
 
             track_artist = None
             track_artists_list = track_info.get("artists", []) or original_search.get("artists", [])
@@ -691,7 +927,7 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             # so the watchlist scanner's stable-ID match path recognises
             # auto-imported tracks the next time the user adds the artist
             # to a watchlist.
-            track_mbid = (track_info.get("musicbrainz_recording_id") or "").strip().lower() or None
+            track_mbid, recording_disambiguation = _recording_identity(context)
             track_isrc = (track_info.get("isrc") or "").strip().upper() or None
             # Carries whatever the pipeline resolved for this item (a wishlist
             # row's or Auto-Import's own override, or None for "follow the
@@ -700,18 +936,26 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
             # Quality Upgrade Finder passes re-resolve the track against the
             # default profile instead of the one it was actually imported under.
             track_quality_profile_id = track_info.get("quality_profile_id")
+            acquired_quality_json, retention_json = _retention_provenance_json(context)
+            try:
+                track_columns = {
+                    column[1] for column in cursor.execute(
+                        "PRAGMA table_info(tracks)").fetchall()
+                }
+            except Exception:  # pragma is best-effort for non-SQLite test doubles
+                track_columns = set()
+            has_retention_columns = {
+                "acquired_quality_json", "retention_json"
+            }.issubset(track_columns)
+            # #1504: stamp owner_profile_id only when the column exists —
+            # minimal test schemas / pre-migration DBs don't have it,
+            # and a missing column must not fail the whole insert.
+            has_track_owner = "owner_profile_id" in track_columns
 
             cursor.execute("SELECT id FROM tracks WHERE file_path = ?", (final_path,))
-            if not cursor.fetchone():
-                cursor.execute(
-                    """
-                    INSERT INTO tracks (id, album_id, artist_id, title, track_number,
-                                        duration, file_path, bitrate, file_size, track_artist,
-                                        musicbrainz_recording_id, isrc, quality_profile_id, server_source,
-                                        to_be_purchased, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'soulsync', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                    """,
-                    (
+            existing_track = cursor.fetchone()
+            if not existing_track:
+                base_values = (
                         track_id,
                         album_id,
                         artist_id,
@@ -725,9 +969,58 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                         track_mbid,
                         track_isrc,
                         track_quality_profile_id,
-                        to_be_purchased,
-                    ),
                 )
+                # C4: _stable_soulsync_id is MD5 mod 1e9, so two different
+                # paths can share an id (the artist/album paths above mint
+                # a suffixed id on collision; the track path did not, and
+                # the IntegrityError silently dropped the second track).
+                # Retry the INSERT with a deterministic discriminator. The
+                # post-insert source-id UPDATE below reads `track_id`, so
+                # it follows the reminted id automatically.
+                # Build the track INSERT dynamically: retention columns and
+                # owner_profile_id are each included only when present.
+                _t_cols = ["id", "album_id", "artist_id", "title", "track_number",
+                           "duration", "file_path", "bitrate", "file_size", "track_artist",
+                           "musicbrainz_recording_id", "isrc", "quality_profile_id"]
+                _t_vals = ["?"] * 13
+                _t_params: list = list(base_values)
+                if has_retention_columns:
+                    _t_cols += ["acquired_quality_json", "retention_json"]
+                    _t_vals += ["?", "?"]
+                    _t_params += [acquired_quality_json, retention_json]
+                if "recording_disambiguation" in track_columns:
+                    _t_cols.append("recording_disambiguation")
+                    _t_vals.append("?")
+                    _t_params.append(recording_disambiguation)
+                _t_cols.append("server_source")
+                _t_vals.append("'soulsync'")
+                if has_track_owner:
+                    _t_cols.append("owner_profile_id")
+                    _t_vals.append("?")
+                    _t_params.append(owner_pid)
+                _t_cols += ["created_at", "updated_at"]
+                _t_vals += ["CURRENT_TIMESTAMP", "CURRENT_TIMESTAMP"]
+                _t_sql = (f"INSERT INTO tracks ({', '.join(_t_cols)}) "
+                          f"VALUES ({', '.join(_t_vals)})")
+                for _collision_attempt in range(10):
+                    try:
+                        _t_params[0] = track_id
+                        cursor.execute(_t_sql, _t_params)
+                        break
+                    except sqlite3.IntegrityError:
+                        track_id = _stable_soulsync_id(
+                            f"{final_path}::soulsync::{_collision_attempt + 1}"
+                        )
+                        logger.warning(
+                            "[SoulSync Library] track id collision for %s — "
+                            "reminted as %s",
+                            final_path,
+                            track_id,
+                        )
+                else:
+                    raise sqlite3.IntegrityError(
+                        f"track id still collides after retries: {final_path}"
+                    )
                 track_source_col = source_columns.get("track")
                 if track_source_col and track_source_id:
                     try:
@@ -736,15 +1029,50 @@ def record_soulsync_library_entry(context: Dict[str, Any], artist_context: Dict[
                             (track_source_id, track_id),
                         )
                         track_album_col = source_columns.get("track_album")
-                        if track_album_col and album_source_id:
+                        # R3F3: track_album_col belongs to the download
+                        # source's id family — never write a cross-source
+                        # (Spotify) album id into it.
+                        if (track_album_col and album_source_id
+                                and not _own_album_id_cross_source):
                             cursor.execute(
                                 f"UPDATE tracks SET {track_album_col} = ? WHERE id = ?",
                                 (album_source_id, track_id),
                             )
                     except Exception as e:
                         logger.debug("track source-id update failed: %s", e)
+            else:
+                # A repeated/import-resume write refreshes transformation
+                # provenance for the existing physical row.  Never retain an
+                # old destructive-policy claim after a clean untransformed
+                # import of that same path.
+                if has_retention_columns:
+                    cursor.execute(
+                        """UPDATE tracks
+                              SET acquired_quality_json=?, retention_json=?,
+                                  updated_at=CURRENT_TIMESTAMP
+                            WHERE id=?""",
+                        (acquired_quality_json, retention_json, existing_track[0]),
+                    )
+                if recording_disambiguation and "recording_disambiguation" in track_columns:
+                    cursor.execute(
+                        "UPDATE tracks SET recording_disambiguation = ?, "
+                        "musicbrainz_recording_id = COALESCE(NULLIF(musicbrainz_recording_id, ''), ?) "
+                        "WHERE id = ? AND (musicbrainz_recording_id IS NULL "
+                        "OR musicbrainz_recording_id = '' "
+                        "OR LOWER(musicbrainz_recording_id) = ?)",
+                        (recording_disambiguation, track_mbid, existing_track[0], track_mbid),
+                    )
 
             conn.commit()
-            logger.info("[Commissary Library] Added: %s / %s / %s", artist_name, album_name, track_name)
+            logger.info("[SoulSync Library] Added: %s / %s / %s", artist_name, album_name, track_name)
+            if not existing_track:
+                # Fresh import — queue Sample Studio background analysis.
+                # Lazy import + never raises: analysis must not break imports.
+                try:
+                    from core.sample.worker import enqueue_analysis as _enqueue_sample_analysis
+                    _enqueue_sample_analysis(track_id)
+                except Exception as hook_exc:  # noqa: BLE001
+                    logger.debug("Sample analysis enqueue failed for track %s: %s",
+                                 track_id, hook_exc)
     except Exception as exc:
-        logger.error("[Commissary Library] Could not record library entry: %s", exc)
+        logger.error("[SoulSync Library] Could not record library entry: %s", exc)

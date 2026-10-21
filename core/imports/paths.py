@@ -3,15 +3,19 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+
+from utils.logging_config import get_logger
 
 # Album grouping lives in core.imports.album_naming; this module keeps the
 # imported helper because the path builder still needs it.
 from core.imports.album_naming import resolve_album_group
+from core.imports.album_types import album_types_config, format_album_types
+from core.imports.collab_artist import first_listed_artist, listed_primary_of
+from core.imports.compilation import is_various_artists_credit
 from core.library.case_folding import resolve_existing_case_dir
 from core.imports.context import (
     extract_artist_name,
@@ -23,12 +27,46 @@ from core.imports.context import (
     normalize_import_context,
 )
 
-logger = logging.getLogger("imports.paths")
+logger = get_logger("imports.paths")
+
+
+def artist_letter(artist, symbol_fallback=None):
+    """The $artistletter value — the ONE implementation all four call sites
+    share (both template engines + the music-video path builder).
+
+    Literal mode (default, historical behavior byte-for-byte): the raw first
+    character uppercased — '365 Days' → '3', 'Édith Piaf' → 'É'.
+
+    Symbol-fallback mode (file_organization.artistletter_symbol_fallback,
+    #1072 QT3496): diacritics fold to their base letter first (Édith → E —
+    the iTunes/Plex shelving convention; É belongs under E, not #), then
+    anything that doesn't resolve to A-Z (digits, symbols, CJK, Cyrillic,
+    ...) lands in one '#' catch-all instead of fragmenting the library into
+    per-character folders.
+
+    ``symbol_fallback=None`` reads the config; pass a bool to force either
+    mode (tests, previews).
+    """
+    literal = (artist or "U")[0].upper()
+    if symbol_fallback is None:
+        try:
+            from core.settings import config_manager
+            symbol_fallback = bool(config_manager.get(
+                "file_organization.artistletter_symbol_fallback", False))
+        except Exception:   # config unavailable → historical behavior
+            symbol_fallback = False
+    if not symbol_fallback:
+        return literal
+    import unicodedata
+    folded = unicodedata.normalize("NFKD", str(artist or ""))
+    folded = "".join(c for c in folded if not unicodedata.combining(c))
+    lead = folded[:1].upper()
+    return lead if "A" <= lead <= "Z" else "#"
 
 
 def _get_config_manager():
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         return config_manager
     except Exception:
         class _FallbackConfig:
@@ -59,21 +97,6 @@ def _extract_year_from_release_date(release_date) -> str:
     return ""
 
 
-def _get_music_libraries():
-    """Configured Music Libraries, default first — or ``[]`` when none are set
-    up (or the DB isn't reachable), which resolves to ``soulseek.transfer_path``.
-
-    A module-level seam like ``_get_config_manager`` above, and for the same
-    reason: the path builders are unit-tested by injecting their inputs, and a
-    templating test should not depend on what happens to be in the database.
-    """
-    try:
-        from database.music_database import get_database
-        return get_database().list_music_libraries() or []
-    except Exception:   # noqa: BLE001 - resolution degrades to the configured path
-        return []
-
-
 def _get_itunes_client():
     try:
         from core.metadata_service import get_itunes_client
@@ -91,12 +114,226 @@ def _get_album_tracks_for_source(source: str, album_id: str):
 
 
 def docker_resolve_path(path_str: str) -> str:
-    """Resolve Docker-hosted Windows paths into container paths."""
+    """Resolve a configured folder to the canonical absolute path this process
+    can use: Docker-hosted Windows drives mapped, ``~`` expanded, made absolute.
+
+    Every caller of this hands the result to the filesystem, and several of them
+    also STORE it or compare it against a stored value. Returning a relative root
+    verbatim (``./Transfer`` is the shipped default) meant the same folder was
+    spelled three different ways depending on which code path produced it, and no
+    two of them compared equal. Absolutising here is what makes "the path in the
+    catalogue", "the path on disk" and "the path in a root comparison" one string.
+
+    An empty value stays empty: ``os.path.abspath('')`` is the CWD, which would
+    turn "this folder is not configured" into the application directory.
+    """
+    if not path_str:
+        return path_str
     if os.path.exists("/.dockerenv") and len(path_str) >= 3 and path_str[1] == ":" and path_str[0].isalpha():
         drive_letter = path_str[0].lower()
         rest_of_path = path_str[2:].replace("\\", "/")
         return f"/host/mnt/{drive_letter}{rest_of_path}"
-    return path_str
+    return os.path.abspath(os.path.expanduser(path_str))
+
+
+def config_root_path(path_str: Any, default: str = "") -> str:
+    """Canonical absolute form of a CONFIGURED root folder.
+
+    Every root in Settings (music library, downloads, import, music videos,
+    playlists) may be written relative — ``./Transfer`` is the shipped default
+    and what the settings page shows. :func:`docker_resolve_path` only maps
+    Windows drive letters, so that value used to reach the filesystem verbatim
+    and one folder ended up with three spellings that never compared equal:
+
+      * ``./Transfer/Artist/…``   — the album path builder (raw string)
+      * ``Transfer/Artist/…``     — the single/simple builder (``Path()`` eats
+        the leading ``./``)
+      * ``/app/Transfer/Artist/…``— anything that realpath()s, e.g. the repair
+        filesystem scan
+
+    The first two were written into the catalogue, so a stored path depended on
+    the process CWD, and every ``startswith(root)`` check silently missed.
+    Resolving once, here, is what makes "the path in the catalogue", "the path
+    on disk" and "the path in a root comparison" the same string. A root the
+    user already gave in full comes back unchanged apart from normalisation.
+    """
+    raw = str(path_str if path_str not in (None, "") else (default or "")).strip()
+    if not raw:
+        return ""
+    return docker_resolve_path(raw)
+
+
+# ── the library root a download lands in (#1199) ─────────────────────────────
+#
+# a profile with a library of its own has its own output folder. a download
+# knows its profile through the batch that made it (every batch carries
+# profile_id) or an explicit stamp on its context (imports from the page);
+# everything else, and every profile on the shared library, lands in the
+# configured transfer folder exactly as before.
+
+def import_profile_id(context) -> Optional[int]:
+    """the profile a download/import is for, or None when it has none."""
+    if not isinstance(context, dict):
+        return None
+    pid = context.get("profile_id")
+    if pid:
+        try:
+            return int(pid)
+        except (TypeError, ValueError):
+            pass
+    for subkey in ("search_result", "original_search_result", "track_info"):
+        sub = context.get(subkey)
+        if isinstance(sub, dict) and sub.get("profile_id"):
+            try:
+                return int(sub["profile_id"])
+            except (TypeError, ValueError):
+                pass
+    batch_id = context.get("batch_id")
+    if batch_id:
+        try:
+            from core.runtime_state import download_batches
+            batch = download_batches.get(batch_id) or {}
+            pid = batch.get("profile_id")
+            return int(pid) if pid else None
+        except Exception:  # noqa: BLE001 - runtime state not importable in a bare tool
+            return None
+    return None
+
+
+_notified_own_lib_fallback: set[int] = set()
+
+
+def reset_own_library_fallback_notifications() -> None:
+    """Clear notification throttle state (useful for tests and server switches)."""
+    _notified_own_lib_fallback.clear()
+
+
+def library_root_for_profile(profile_id, *, announce: bool = True) -> Optional[str]:
+    """the own-library output folder of a profile (docker-resolved), or None
+    when the profile is on the shared library.
+
+    announce=False skips the "own library inactive" warning + notification.
+    that's for lookups that aren't routing a download (the wishlist asks on
+    every removal and would repeat the warning each time)."""
+    if not profile_id:
+        return None
+    try:
+        from database.music_database import get_database
+        lib = get_database().get_profile_library(int(profile_id))
+    except Exception as exc:  # noqa: BLE001 - no db, no own library
+        logger.debug("own library lookup failed for profile %s: %s", profile_id, exc)
+        return None
+    if lib.get("mode") != "own" or not lib.get("root"):
+        return None
+
+    from core.library_scope import own_library_supported
+    if not own_library_supported():
+        if not announce:
+            return None
+        pid = int(profile_id)
+        cm = _get_config_manager()
+        getter = getattr(cm, "get_active_media_server", None)
+        active_server = getter() if callable(getter) else (getattr(cm, "get", lambda k, d=None: d)("active_media_server", "unknown") or "unknown")
+        shared_root = shared_transfer_root()
+        logger.warning(
+            "[Own Library] Profile %s has an own library configured (%s), "
+            "but active media server '%s' does not support own-library isolation. "
+            "Routing download to shared folder: %s",
+            pid, lib.get("root"), active_server, shared_root
+        )
+        if pid not in _notified_own_lib_fallback:
+            _notified_own_lib_fallback.add(pid)
+            try:
+                server_display = (active_server or 'this media server').capitalize()
+                get_database().add_notifications([{
+                    'type': 'warning',
+                    'message': (
+                        f"Own library is inactive on {server_display}. "
+                        f"Downloads for this profile will route to the shared library folder ({shared_root})."
+                    ),
+                }], profile_id=pid)
+            except Exception as notif_err:  # noqa: BLE001
+                logger.debug("failed to dispatch own library fallback notification: %s", notif_err)
+        return None
+
+    return config_root_path(lib["root"])
+
+
+
+def shared_transfer_root() -> str:
+    return config_root_path(_get_config_manager().get("soulseek.transfer_path", "./Transfer"), "./Transfer")
+
+
+def transfer_root_for_context(context) -> str:
+    """where this download/import's files go: the audiobook folder for a routed
+    artist, else the profile's own folder when it has one, else the configured
+    transfer folder."""
+    from core.audiobook_routing import routed_root_for_context
+    return (routed_root_for_context(context)
+            or library_root_for_profile(import_profile_id(context))
+            or shared_transfer_root())
+
+
+# ── reverse lookup: which profile owns a path (#1504) ─────────────────────────
+#
+# downloads stamp profile_id into the context going forward; maintenance and
+# repair tools work backwards from a file already on disk. these helpers answer
+# "whose library is this path in" without touching the database rows.
+
+def _own_library_match(path):
+    """(profile_id, canonical_root) of the own library containing path, or None.
+
+    Longest-prefix match so nested roots resolve to the innermost owner.
+    Returns None for the shared library (and on any DB error — fail closed)."""
+    if not path:
+        return None
+    try:
+        from database.music_database import get_database
+        profiles = get_database().get_own_library_profiles()
+    except Exception:  # noqa: BLE001 - no db, no own libraries
+        return None
+    if not profiles:
+        return None
+    norm_path = os.path.normpath(docker_resolve_path(str(path)))
+    best = None  # (root_len, profile_id, norm_root)
+    for p in profiles:
+        root = p.get("root")
+        if not root:
+            continue
+        norm_root = os.path.normpath(config_root_path(root))
+        # directory-boundary prefix match: /a/user1 must not match /a/user1-backup
+        if norm_path == norm_root or norm_path.startswith(norm_root + os.sep):
+            pid = p.get("id")
+            try:
+                pid = int(pid)
+            except (TypeError, ValueError):
+                continue
+            if best is None or len(norm_root) > best[0]:
+                best = (len(norm_root), pid, norm_root)
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def profile_id_for_path(path) -> Optional[int]:
+    """the profile whose own library contains this path, or None for shared.
+
+    Inverse of library_root_for_profile(). Used by maintenance/repair tools
+    (#1504) to route operations to the owning profile instead of assuming the
+    shared folder. None means shared library — current behavior everywhere."""
+    m = _own_library_match(path)
+    return m[0] if m else None
+
+
+def library_containing(path) -> Optional[str]:
+    """the own-library root containing this path, or None for shared.
+
+    Used by the cross-library move guard: a maintenance operation must never
+    move a file when library_containing(src) != library_containing(dst).
+    None == None for two shared-folder paths, so shared-to-shared moves still
+    pass the guard."""
+    m = _own_library_match(path)
+    return m[1] if m else None
 
 
 def build_simple_download_destination(context, file_path: str):
@@ -106,12 +343,7 @@ def build_simple_download_destination(context, file_path: str):
     if not isinstance(search_result, dict):
         search_result = {}
 
-    # Which Music Library this file belongs to. With no libraries configured
-    # this is soulseek.transfer_path — the pre-libraries destination.
-    from core.imports.destinations import resolve_music_destination
-    _root, _ = resolve_music_destination(
-        context, libraries=_get_music_libraries(), config_get=_get_config_manager().get)
-    transfer_dir = Path(docker_resolve_path(_root))
+    transfer_dir = Path(transfer_root_for_context(context))
     album_name = None
     original_filename = search_result.get("filename", "")
     if "/" in original_filename or "\\" in original_filename:
@@ -137,24 +369,36 @@ def build_simple_download_destination(context, file_path: str):
     return destination_dir / filename, album_name, filename
 
 
+def _truncate_utf8_bytes(value: str, max_bytes: int) -> str:
+    """Truncate to at most ``max_bytes`` UTF-8 bytes without splitting a
+    code point. M8: filesystems limit names by BYTES (255), so a 200-char
+    CJK name (600 bytes) must be cut by byte length, not char count."""
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    truncated = encoded[:max_bytes]
+    while truncated:
+        try:
+            return truncated.decode("utf-8")
+        except UnicodeDecodeError:
+            truncated = truncated[:-1]
+    return value[:1] if value else value
+
+
 def sanitize_filename(filename: str) -> str:
     """Sanitize filename for file system compatibility."""
     sanitized = re.sub(r'[<>:"/\\|?*]', "_", filename)
     sanitized = re.sub(r"\s+", " ", sanitized).strip()
-    sanitized = sanitized.rstrip(". ")
-    # Leading dots too, not just trailing (upstream #1129). The rstrip above is
-    # the WINDOWS rule — it rejects names ending in a dot or space. The UNIX rule
-    # is the other end: a leading dot makes the entry hidden. So an album like
-    # "...And Justice for All" or a track like ".5 The Gray Chapter" landed in a
-    # folder invisible to `ls`, to the user's file manager, and to the media
-    # server's scanner — the files were imported perfectly and simply could not
-    # be seen. Stripped rather than substituted: a leading "_" would be just as
-    # wrong a name, and the server takes its display title from the tags, not
-    # from the folder.
-    sanitized = sanitized.lstrip(". ") or "_"
+    # Windows forbids TRAILING dots/spaces; Unix hides anything with a LEADING
+    # dot. #1129: "...Baby One More Time" created a dotfile directory that was
+    # invisible to `ls` and that Plex/Jellyfin/Navidrome skip entirely, so the
+    # album silently vanished from the library. Strip both ends.
+    sanitized = sanitized.strip(". ") or "_"
     if re.match(r"^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)", sanitized, re.IGNORECASE):
         sanitized = "_" + sanitized
-    return sanitized[:200]
+    # M8: truncate by UTF-8 BYTES (filesystem limits are byte-based), never
+    # splitting a code point. Plain [:200] kept 200 CJK chars = 600 bytes.
+    return _truncate_utf8_bytes(sanitized, 200)
 
 
 def sanitize_context_values(context: dict) -> dict:
@@ -218,9 +462,29 @@ def strip_leading_track_number(title: str) -> str:
 
 
 
-def get_album_type_display(raw_type, track_count) -> str:
-    """Return the display form of an album's type for the $albumtype template variable."""
+def _source_labels_eps(source) -> bool:
+    """a metadata source with its own EP label. spotify has none: it calls
+    singles and EPs both 'single', which is what the track-count split is for.
+    an unknown source might be spotify, so it gets the split too."""
+    name = str(source or "").strip().lower()
+    return bool(name) and not name.startswith("spotify")
+
+
+_LOCKED_TYPE_DISPLAY = {
+    "album": "Album", "ep": "EP", "single": "Single",
+    "compilation": "Compilation", "compile": "Compilation",
+}
+
+
+def get_album_type_display(raw_type, track_count, source: str = "", locked: bool = False) -> str:
+    """Return the display form of an album's type for the $albumtype template variable.
+
+    ``locked``: the type is the section the release sat in on the artist
+    page, which the user already saw. it's used as-is, no track-count
+    guessing, so the folder always matches the section."""
     raw = (raw_type or "").strip().lower()
+    if locked and raw in _LOCKED_TYPE_DISPLAY:
+        return _LOCKED_TYPE_DISPLAY[raw]
     try:
         tc = int(track_count or 0)
     except (TypeError, ValueError):
@@ -228,9 +492,14 @@ def get_album_type_display(raw_type, track_count) -> str:
 
     if raw in ("compilation", "compile"):
         return "Compilation"
-    if raw == "album":
-        return "Album"
     if raw in ("single", "ep"):
+        # a source with its own EP label means what it says: deezer's 5-track
+        # 'single' is a single and its 9-track 'ep' an EP, which is also the
+        # section the artist page shows them in. re-judging them by track
+        # count filed Daft Punk's singles under EP/ and Above & Beyond's EPs
+        # under Album/ (discord, SeadogsBooty)
+        if _source_labels_eps(source):
+            return "EP" if raw == "ep" else "Single"
         # Unknown track count must not collapse to Single: an EP whose count
         # was lost in a handoff kept getting filed as [Single] (#1064). With
         # no count, trust the source's own word.
@@ -242,6 +511,12 @@ def get_album_type_display(raw_type, track_count) -> str:
             return "EP"
         return "Album"
 
+    # 'album', missing, or anything unrecognized: a bare 'album' is the
+    # default fallback at every upstream layer (wishlist payloads,
+    # album_grouping, import context) — not a signal. Deezer's track-level
+    # responses hardcode album_type='album', so trusting it files every
+    # Deezer single/EP under Album/. Verify against the track count when we
+    # have one; with no count, keep the "Album" default rather than guessing.
     if tc <= 0:
         return "Album"
     if tc <= 3:
@@ -249,6 +524,12 @@ def get_album_type_display(raw_type, track_count) -> str:
     if tc <= 6:
         return "EP"
     return "Album"
+
+
+def _first_album_artist_id(album_ctx) -> str:
+    artists = album_ctx.get("artists") if isinstance(album_ctx, dict) else None
+    first = artists[0] if isinstance(artists, list) and artists else None
+    return str(first.get("id") or "").strip() if isinstance(first, dict) else ""
 
 
 def _replace_template_variables(template: str, context: dict) -> str:
@@ -259,9 +540,17 @@ def _replace_template_variables(template: str, context: dict) -> str:
     collab_mode = _get_config_manager().get("file_organization.collab_artist_mode", "first")
     if collab_mode == "first" and album_artist_value:
         artists_list = context.get("_artists_list")
-        if artists_list and len(artists_list) > 1:
-            first = artists_list[0]
-            album_artist_value = first.get("name", first) if isinstance(first, dict) else str(first)
+        # match on the raw name: the list's names aren't sanitized either
+        _raw_album_artist = str(context.get("albumartist") or context.get("artist") or album_artist_value)
+        primary = first_listed_artist(_raw_album_artist, artists_list)
+        if not primary:
+            # the album list can be the combined name itself while the track
+            # names the primary on its own
+            track_list = context.get("_track_artists_list")
+            if track_list:
+                primary = listed_primary_of(_raw_album_artist, track_list[0])
+        if primary:
+            album_artist_value = primary
         elif artists_list and len(artists_list) == 1:
             itunes_artist_id = context.get("_itunes_artist_id")
             if itunes_artist_id and ("," in album_artist_value or " & " in album_artist_value):
@@ -282,16 +571,22 @@ def _replace_template_variables(template: str, context: dict) -> str:
     _total_discs = _coerce_int(clean_context.get("total_discs", 1), 1)
     _disc_number = _coerce_int(clean_context.get("disc_number", 1), 1)
     cdnum_value = f"CD{_disc_number:02d}" if _total_discs > 1 else ""
+    _track_number = clean_context.get("track_number", 1)
+    track_value = (
+        "00" if type(_track_number) is int and _track_number == 0
+        else f"{_coerce_int(_track_number, 1):02d}"
+    )
 
     bracket_map = {
         "albumartist": album_artist_value,
         "albumtype": clean_context.get("albumtype", "Album"),
+        "atypes": clean_context.get("atypes", ""),
         "playlist": clean_context.get("playlist_name", ""),
-        "artistletter": (clean_context.get("artist", "U") or "U")[0].upper(),
+        "artistletter": artist_letter(clean_context.get("artist", "U")),
         "artist": clean_context.get("artist", "Unknown Artist"),
         "album": clean_context.get("album", "Unknown Album"),
         "title": clean_context.get("title", "Unknown Track"),
-        "track": f"{_coerce_int(clean_context.get('track_number', 1), 1):02d}",
+        "track": track_value,
         "cdnum": cdnum_value,
         # #981: ${disc}/${discnum} vanish on single-disc albums, matching ${cdnum}
         # (a track on disc 2+ still shows even if total_discs wasn't populated).
@@ -299,22 +594,41 @@ def _replace_template_variables(template: str, context: dict) -> str:
         "discnum": (str(_disc_number) if (_total_discs > 1 or _disc_number > 1) else ""),
         "year": str(clean_context.get("year", "")),
         "quality": clean_context.get("quality", ""),
+        "disambiguation": clean_context.get("disambiguation", ""),
+        # #1536: the RECORDING's disambiguation, distinct from the album's
+        # $disambiguation above. Lets a filename tell "Song (acoustic)"
+        # from the album version.
+        "track_disambiguation": clean_context.get("track_disambiguation", ""),
+        # Record label (MusicBrainz label-info, first named label). Empty
+        # when the source didn't provide one; the folder cleanup below
+        # drops the empty segment like any other unset variable.
+        "label": clean_context.get("label", ""),
     }
     for var_name, val in bracket_map.items():
         result = result.replace("${" + var_name + "}", val)
 
+    result = result.replace("$disambiguation", clean_context.get("disambiguation", ""))
+    result = result.replace("$label", clean_context.get("label", ""))
     result = result.replace("$albumartist", album_artist_value)
     result = result.replace("$albumtype", clean_context.get("albumtype", "Album"))
+    # Order is not load-bearing here — "$atypes" and "$album" share only "$a",
+    # so neither can consume the other. ($albumtype above genuinely does start
+    # with $album, which is why THAT one has to come first.)
+    result = result.replace("$atypes", clean_context.get("atypes", ""))
     result = result.replace("$playlist", clean_context.get("playlist_name", ""))
-    result = result.replace("$artistletter", (clean_context.get("artist", "U") or "U")[0].upper())
+    result = result.replace("$artistletter", artist_letter(clean_context.get("artist", "U")))
     result = result.replace("$artist", clean_context.get("artist", "Unknown Artist"))
     result = result.replace("$album", clean_context.get("album", "Unknown Album"))
     result = result.replace("$title", clean_context.get("title", "Unknown Track"))
+    # $track_disambiguation must replace before $track: it starts with $track,
+    # so the shorter replace would otherwise eat its prefix (longest-prefix-first,
+    # same rule the $cdnum/$track pair below follows).
+    result = result.replace("$track_disambiguation", clean_context.get("track_disambiguation", ""))
     # $cdnum must replace before $track to follow the longest-prefix-first
     # rule used throughout this function (no current $c* var collides, but
     # ordering matches the web_server.py path-builder for parity).
     result = result.replace("$cdnum", cdnum_value)
-    result = result.replace("$track", f"{clean_context.get('track_number', 1):02d}")
+    result = result.replace("$track", track_value)
     result = result.replace("$year", str(clean_context.get("year", "")))
 
     result = re.sub(r"\s+", " ", result)
@@ -323,13 +637,168 @@ def _replace_template_variables(template: str, context: dict) -> str:
     return result
 
 
+# $album as its own token, not the front of $albumartist / $albumtype.
+_ALBUM_TOKEN_RE = re.compile(r"\$\{album\}|\$album(?!artist|type)")
+
+
+def album_name_carries(album_name: str, disambiguation: str) -> bool:
+    """Does the album name already say it? whole words, so "live" isn't in "alive"."""
+    disambiguation = (disambiguation or "").strip()
+    return bool(disambiguation) and re.search(
+        r"(?<!\w)" + re.escape(disambiguation) + r"(?!\w)", album_name or "", re.IGNORECASE,
+    ) is not None
+
+
+def with_disambiguation(template: str, disambiguation: str, album_name: str = "") -> str:
+    """Give the album folder the release's disambiguation when the template doesn't.
+
+    Callers gate this behind ``file_organization.auto_disambiguation`` (#1352):
+    it only runs when the user left the automatic suffix on.
+
+    two releases can share a title, artist and release group and differ only by
+    musicbrainz's disambiguation ("baby punk version"). without it in the folder
+    they land in one directory and their same-named tracks collide (#1299). so
+    the suffix goes on after the last $album in the folder part, unless the
+    template already places $disambiguation itself or the album name already
+    carries it. no disambiguation means the template comes back untouched.
+    """
+    disambiguation = (disambiguation or "").strip()
+    if not disambiguation or not template:
+        return template
+    if "$disambiguation" in template or "${disambiguation}" in template:
+        return template
+    if album_name_carries(album_name, disambiguation):
+        return template
+    folder, sep, filename = template.rpartition("/")
+    if not sep:
+        return template
+    matches = list(_ALBUM_TOKEN_RE.finditer(folder))
+    if not matches:
+        return template
+    end = matches[-1].end()
+    return folder[:end] + " ($disambiguation)" + folder[end:] + sep + filename
+
+
+# $title as its own token, not the front of $track_disambiguation.
+_TITLE_TOKEN_RE = re.compile(r"\$\{title\}|\$title(?![\w])")
+
+
+def with_track_disambiguation(template: str, track_disambiguation: str, track_title: str = "") -> str:
+    """Give the filename the recording's disambiguation when the template doesn't.
+
+    Track-level mirror of ``with_disambiguation`` (#1536): two recordings can
+    share a title and differ only by musicbrainz's recording disambiguation
+    ("acoustic", "live"). Without it in the filename they land on the same
+    name and collide. So the suffix goes on after the last $title in the
+    filename part, unless the template already places $track_disambiguation
+    itself or the track title already carries it. No disambiguation, or no
+    $title token to hang it on, means the template comes back untouched.
+
+    Callers gate this behind ``file_organization.auto_disambiguation`` just
+    like the album-level suffix.
+    """
+    track_disambiguation = (track_disambiguation or "").strip()
+    if not track_disambiguation or not template:
+        return template
+    if "$track_disambiguation" in template or "${track_disambiguation}" in template:
+        return template
+    if album_name_carries(track_title, track_disambiguation):
+        return template
+    folder, sep, filename = template.rpartition("/")
+    if not sep:
+        folder, filename = "", template
+    matches = list(_TITLE_TOKEN_RE.finditer(filename))
+    if not matches:
+        return template
+    end = matches[-1].end()
+    new_filename = filename[:end] + " ($track_disambiguation)" + filename[end:]
+    return folder + sep + new_filename if sep else new_filename
+
+
+def _auto_disambiguation_enabled() -> bool:
+    """Should the album folder get the release's disambiguation unasked?
+
+    #1352: ``with_disambiguation`` rewrites the user's template to keep
+    same-named releases in their own folders (#1299). That rewrite is only
+    wanted when the user opts in — otherwise the template is respected
+    exactly and $disambiguation renders only where explicitly placed.
+    Default True: existing installs keep the #1299 behavior.
+    """
+    try:
+        return bool(_get_config_manager().get("file_organization.auto_disambiguation", True))
+    except Exception:
+        return True
+
+
 def apply_path_template(template: str, context: dict) -> str:
     """Apply a template to build a path string."""
     return _replace_template_variables(template, context)
 
 
+# A folder segment that carried nothing but a disc label ("Disc $discnum") has
+# to disappear on a single-disc album — leaving a literal "Disc" folder behind
+# would silently collapse every disc of a release into one directory.
+_DANGLING_DISC_LABEL_RE = re.compile(
+    r"^(disc|disk|cd|volume|vol)\s*[.\-\u2013\u2014:]?\s*$", re.IGNORECASE)
+
+
+def template_uses_disc_variable(template: str) -> bool:
+    """Does ``template`` place the disc anywhere, in any of its spellings?
+
+    Must be asked of the RAW template. ``${disc}``, ``${discnum}`` and ``$cdnum``
+    are substituted globally, before the rendered path is split into segments, so
+    a per-segment look for "$disc" sees only the bare forms and misses the rest.
+    """
+    return any(token in (template or "")
+               for token in ("$disc", "$cdnum", "${disc", "${cdnum"))
+
+
+def _clean_folder_segment(part: str, disc_value: str, disc_value_raw: str,
+                          template_has_disc: bool = False) -> str:
+    """Resolve one FOLDER segment of a rendered path template.
+
+    ``$quality`` is the one variable the settings page documents as
+    filename-only, and it is stripped here. ``$disc`` and ``$discnum`` used to
+    be stripped alongside it, undocumented — so a user asking for a disc folder
+    got the folder silently deleted from their path, while ``$cdnum`` and the
+    ``${...}`` bracket forms (substituted globally, before the path is split)
+    worked. Same family of variables, three different behaviours. They now
+    substitute here exactly as they do in the filename, and resolve to the empty
+    string on a single-disc album — the ``$cdnum`` rule all along (#981).
+
+    ``$cdnum`` is already gone by this point; the replace is kept as a no-op
+    guard so a future change to the global pass cannot leak a raw token into a
+    directory name.
+    """
+    had_disc_var = template_has_disc or "$discnum" in part or "$disc" in part
+    part = part.replace("$quality", "")
+    part = part.replace("$discnum", disc_value_raw)
+    part = part.replace("$disc", disc_value)
+    part = part.replace("$cdnum", "")
+    # Same no-op guard, same reason: $atypes is substituted in the global pass
+    # above, and a raw token leaking into a directory name is the failure worth
+    # spending one replace to prevent.
+    part = part.replace("$atypes", "")
+    part = re.sub(r"\s*\[\s*\]", "", part)
+    part = re.sub(r"\s*\(\s*\)", "", part)
+    part = re.sub(r"\s*\{\s*\}", "", part)
+    part = re.sub(r"\s*-\s*$", "", part)
+    part = re.sub(r"^\s*-\s*", "", part)
+    part = re.sub(r"\s+", " ", part).strip()
+    if had_disc_var and not disc_value_raw and _DANGLING_DISC_LABEL_RE.match(part):
+        return ""
+    return part
+
+
 def get_file_path_from_template_raw(template: str, context: dict) -> tuple[str, str]:
     """Build file path using a user-provided template string directly."""
+    # #1352: the auto-suffix rewrites the template; only do it when enabled.
+    if _auto_disambiguation_enabled():
+        template = with_disambiguation(template, context.get("disambiguation", ""), context.get("album", ""))
+        # #1536: same for the recording's disambiguation on the filename.
+        template = with_track_disambiguation(
+            template, context.get("track_disambiguation", ""), context.get("title", ""))
+    _template_has_disc = template_uses_disc_variable(template)
     full_path = apply_path_template(template, context)
 
     quality_value = context.get("quality", "")
@@ -346,16 +815,8 @@ def get_file_path_from_template_raw(template: str, context: dict) -> tuple[str, 
 
         cleaned_folders = []
         for part in folder_parts:
-            part = part.replace("$quality", "")
-            part = part.replace("$discnum", "")
-            part = part.replace("$disc", "")
-            part = part.replace("$cdnum", "")
-            part = re.sub(r"\s*\[\s*\]", "", part)
-            part = re.sub(r"\s*\(\s*\)", "", part)
-            part = re.sub(r"\s*\{\s*\}", "", part)
-            part = re.sub(r"\s*-\s*$", "", part)
-            part = re.sub(r"^\s*-\s*", "", part)
-            part = re.sub(r"\s+", " ", part).strip()
+            part = _clean_folder_segment(part, disc_value, disc_value_raw,
+                                         _template_has_disc)
             if part:
                 cleaned_folders.append(part)
 
@@ -386,6 +847,29 @@ def get_file_path_from_template_raw(template: str, context: dict) -> tuple[str, 
     return "", sanitize_filename(full_path)
 
 
+_SINGLE_PATH_DEFAULTS = frozenset({
+    "$albumartist/$albumartist - $title/$title",
+    "$artist/$artist - $title/$title",
+})
+
+
+def is_single_path_customized() -> bool:
+    """Has the user actually customized the Single Path template?
+
+    Explicitly-typed singles are routed through ``album_path`` (so $albumtype
+    in the ALBUM template keeps working), which silently ignores a customized
+    ``single_path``. A stored template that is empty or one of the known
+    defaults means "not customized" — anything else is the user's explicit
+    choice and must win for singles.
+    """
+    try:
+        templates = _get_config_manager().get("file_organization.templates", {}) or {}
+    except Exception:
+        return False
+    template = str(templates.get("single_path") or "").strip()
+    return bool(template) and template not in _SINGLE_PATH_DEFAULTS
+
+
 def get_file_path_from_template(context: dict, template_type: str = "album_path") -> tuple[str, str]:
     """Build complete file path using configured templates."""
     if not _get_config_manager().get("file_organization.enabled", True):
@@ -414,6 +898,13 @@ def get_file_path_from_template(context: dict, template_type: str = "album_path"
         }
         template = default_templates.get(template_type, "$artist/$album/$track - $title")
 
+    # #1352: the auto-suffix rewrites the template; only do it when enabled.
+    if _auto_disambiguation_enabled():
+        template = with_disambiguation(template, context.get("disambiguation", ""), context.get("album", ""))
+        # #1536: same for the recording's disambiguation on the filename.
+        template = with_track_disambiguation(
+            template, context.get("track_disambiguation", ""), context.get("title", ""))
+    _template_has_disc = template_uses_disc_variable(template)
     full_path = apply_path_template(template, context)
 
     path_parts = full_path.split("/")
@@ -434,16 +925,8 @@ def get_file_path_from_template(context: dict, template_type: str = "album_path"
 
         cleaned_folders = []
         for part in folder_parts:
-            part = part.replace("$quality", "")
-            part = part.replace("$discnum", "")
-            part = part.replace("$disc", "")
-            part = part.replace("$cdnum", "")
-            part = re.sub(r"\s*\[\s*\]", "", part)
-            part = re.sub(r"\s*\(\s*\)", "", part)
-            part = re.sub(r"\s*\{\s*\}", "", part)
-            part = re.sub(r"\s*-\s*$", "", part)
-            part = re.sub(r"^\s*-\s*", "", part)
-            part = re.sub(r"\s+", " ", part).strip()
+            part = _clean_folder_segment(part, disc_value, disc_value_raw,
+                                         _template_has_disc)
             if part:
                 cleaned_folders.append(part)
 
@@ -503,6 +986,79 @@ def _coerce_int(value: Any, default: int = 1) -> int:
     return coerced if coerced > 0 else default
 
 
+def _reachable_original_file(original_path: Any) -> str | None:
+    """An enhance/upgrade's existing library file AS THIS PROCESS SEES IT, or ``None``.
+
+    ``None`` means "do not replace in place": either the recorded path can't be
+    mapped onto anything this process can see, or its folder no longer exists.
+    The caller then builds the normal template destination (#1109) instead of
+    trying to ``makedirs`` a media-server-only root such as ``/music``.
+
+    Returns the resolved FILE, not just its folder, because the caller needs
+    both halves of the destination to come from the SAME candidate. It used to
+    return only the parent, leaving the caller to rebuild the filename from the
+    RECORDED path with ``os.path.basename`` — which does not split backslashes
+    on posix. A library scanned on Windows (``\\\\server\\share\\...``) while
+    SoulSync runs in Linux therefore produced a destination whose "filename"
+    was the entire recorded path, and every upgrade died on the move (#1215).
+    The resolver already normalizes separators; keeping its answer whole is the
+    fix.
+
+    Note this only ever RETURNS an existing file — it never creates anything.
+    That is the whole point: the old behaviour created the media server's path
+    inside the container.
+    """
+    if not isinstance(original_path, str) or not original_path.strip():
+        return None
+    candidates = [original_path]
+    try:
+        from core.library.path_resolver import resolve_library_file_path
+        resolved = resolve_library_file_path(
+            original_path, config_manager=_get_config_manager())
+        if resolved:
+            candidates.append(resolved)
+    except Exception as exc:  # noqa: BLE001 - resolution is best-effort
+        logger.debug("[Enhance] library path resolution failed for %r: %s",
+                     original_path, exc)
+    roots = _configured_root_dirs()
+    for candidate in candidates:
+        parent = os.path.dirname(candidate)
+        if not parent or not os.path.isdir(parent):
+            continue
+        # A ROOT is not an album folder. When the recorded file sits loose in
+        # the Transfer/download root or a library root, that root exists, so
+        # "replace in place" would drop the upgrade straight back into the root
+        # — the exact symptom #1109 was reported as. Falling through to the
+        # template files it under Artist/Album instead, and the retirement step
+        # then removes the loose original.
+        if os.path.normpath(parent) in roots:
+            logger.debug(
+                "[Enhance] original sits in a library root (%s) — filing the "
+                "upgrade by template instead of replacing in place", parent)
+            continue
+        return candidate
+    return None
+
+
+def _configured_root_dirs() -> set[str]:
+    """Normalized roots that must never be treated as an album folder."""
+    roots: set[str] = set()
+    try:
+        cfg = _get_config_manager()
+        raw = [cfg.get("soulseek.transfer_path", "./Transfer"),
+               cfg.get("soulseek.download_path", "./downloads")]
+        music_paths = cfg.get("library.music_paths", []) or []
+        if isinstance(music_paths, str):
+            music_paths = [music_paths]
+        raw.extend(music_paths)
+        for value in raw:
+            if isinstance(value, str) and value.strip():
+                roots.add(config_root_path(value))
+    except Exception as exc:  # noqa: BLE001 - a missing config must not block the upgrade
+        logger.debug("[Enhance] could not read the configured roots: %s", exc)
+    return roots
+
+
 def build_final_path_for_track(context, artist_context, album_info, file_ext, create_dirs: bool = True):
     """Shared path builder used by both post-processing and verification.
 
@@ -518,20 +1074,33 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             _real_makedirs(path, exist_ok=True)
 
     context = normalize_import_context(context)
-    # Resolve AFTER normalizing — normalize_import_context mutates in place and
-    # preserves unknown keys, so `_music_root_id` is intact either way, but
-    # reading the context first keeps the ordering honest for future fields.
-    # A library may override the naming template; None means "use the global
-    # one", which is what every install has until it says otherwise.
-    from core.imports.destinations import resolve_music_destination
-    _root, _library_template = resolve_music_destination(
-        context, libraries=_get_music_libraries(), config_get=_get_config_manager().get)
-    transfer_dir = docker_resolve_path(_root)
+    transfer_dir = transfer_root_for_context(context)
     track_info = get_import_track_info(context)
     original_search = get_import_original_search(context)
     album_context = get_import_context_album(context)
     source = get_import_source(context)
     artist_name = extract_artist_name(artist_context)
+
+    # R4F3: when the batch album context was distrusted (verdict stashed on
+    # the context by pipeline.py before filing), the stranger's album
+    # identity must not shape the filing path. Substitute the track's own
+    # album year/type/artist at the read sites below. The album NAME is left
+    # alone — it may be unrecoverable (the honest #1567 limit) — but the
+    # file is now filed under the track's own artist, not the stranger's,
+    # and never under the stranger's year or a poisoned Compilations/ type.
+    _path_distrusted = bool(
+        isinstance(context, dict) and context.get("_batch_album_distrusted"))
+    _path_own_album = (
+        (context.get("_track_own_provider_album") or {})
+        if isinstance(context, dict) else {})
+    _path_own_artist = ""
+    _path_own_artists = (
+        (context.get("_track_own_artist_display_names") or [])
+        if isinstance(context, dict) else [])
+    if _path_own_artists and _path_own_artists[0]:
+        _path_own_artist = str(_path_own_artists[0])
+    if _path_distrusted and _path_own_artist:
+        artist_name = _path_own_artist
 
     source_info = track_info.get("source_info") or {}
     if isinstance(source_info, str):
@@ -539,28 +1108,147 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             source_info = json.loads(source_info)
         except (json.JSONDecodeError, TypeError):
             source_info = {}
-    if source_info.get("enhance") and source_info.get("original_file_path"):
-        original_path = source_info["original_file_path"]
-        original_dir = os.path.dirname(original_path)
-        original_stem = os.path.splitext(os.path.basename(original_path))[0]
-        final_path = os.path.join(original_dir, original_stem + file_ext)
-        _ensure_dir(original_dir, exist_ok=True)
-        logger.info("[Enhance] Using original file location: %s", final_path)
-        return final_path, True
+    if not isinstance(source_info, dict):
+        source_info = {}
+    replace_original = source_info.get("enhance") or source_info.get("job") == "quality_upgrade"
+    if replace_original and source_info.get("original_file_path"):
+        original_file = _reachable_original_file(source_info["original_file_path"])
+        if original_file:
+            # Folder AND stem from the resolved file, swapping only the
+            # extension. Splitting the RECORDED path here is what produced a
+            # windows path as a filename (#1215).
+            final_path = os.path.splitext(original_file)[0] + file_ext
+            logger.info("[Enhance] Using original file location: %s", final_path)
+            return final_path, True
+        # #1109: `original_file_path` is the path as RECORDED, which is usually
+        # the media server's view of the library ("/music/…") rather than
+        # anything this process can reach. The old code ran makedirs on it
+        # unconditionally — creating a bogus container-local tree at best, and
+        # at worst dying with PermissionError, which aborted post-processing
+        # and left the finished upgrade sitting unsorted in the library root.
+        # An unreachable original is not a destination: fall through to the
+        # normal template so the upgrade still lands in Artist/Album.
+        logger.info(
+            "[Enhance] Original location %r is not reachable from here — "
+            "using the normal template destination instead.",
+            source_info["original_file_path"])
 
     year = ""
     if album_context and album_context.get("release_date"):
         year = _extract_year_from_release_date(album_context["release_date"])
+    if _path_distrusted:
+        # R4F3: the stranger's year (e.g. 2001) must not date the folder —
+        # use the track's own provider album year, or no year at all.
+        _own_release_date = _path_own_album.get("release_date") or ""
+        year = _extract_year_from_release_date(_own_release_date) if _own_release_date else ""
 
     raw_album_type = ""
-    if album_context:
-        raw_album_type = album_context.get("album_type", "") or ""
-    total_tracks = (album_context.get("total_tracks", 0) or 0) if album_context else 0
-    album_type_display = get_album_type_display(raw_album_type, total_tracks)
+    if not _path_distrusted:
+        # R4F3: when distrusted, none of the type sources are trustworthy
+        # (the batch context's "compilation" claim is the stranger's) —
+        # leave the type empty so the track files as a regular album under
+        # its own artist instead of under Compilations/.
+        if album_context:
+            raw_album_type = (
+                album_context.get("album_type", "")
+                or album_context.get("record_type", "")
+                or ""
+            )
+        if not raw_album_type and isinstance(album_info, dict):
+            raw_album_type = (
+                album_info.get("album_type", "")
+                or album_info.get("record_type", "")
+                or ""
+            )
+        if not raw_album_type and isinstance(context, dict):
+            raw_album_type = (
+                context.get("album_type", "")
+                or context.get("record_type", "")
+                or ""
+            )
+    raw_album_type = str(raw_album_type or "").strip().lower()
+    if raw_album_type in ("compile", "compilations"):
+        raw_album_type = "compilation"
 
-    if album_info and album_info.get("is_album"):
+    # R4F3: when distrusted, the "explicit compilation" flags are the
+    # stranger's — skip them (raw_album_type stays empty, see above).
+    is_explicit_comp = False
+    if not _path_distrusted:
+        is_explicit_comp = (
+            (album_context and bool(album_context.get("is_compilation")))
+            or (isinstance(album_info, dict) and bool(album_info.get("is_compilation")))
+            or (isinstance(context, dict) and bool(context.get("is_compilation")))
+        )
+    if is_explicit_comp:
+        raw_album_type = "compilation"
+
+    # L2: resolve the track count from the same chain import album building
+    # uses (core/imports/context.py): album_context -> track_info ->
+    # album_info -> 0. Reading only album_context left $albumtype blind
+    # when the count arrived on track_info or album_info.
+    total_tracks = (
+        (album_context.get("total_tracks") if album_context else None)
+        or track_info.get("total_tracks")
+        or (album_info.get("total_tracks") if isinstance(album_info, dict) else None)
+        or 0
+    )
+    # reorganize names the source its release type came from; a download's
+    # type came from the source it was downloaded from
+    _type_source = (context.get("_album_type_source") if isinstance(context, dict) else None) or source
+    _type_locked = bool(
+        (album_context and album_context.get("album_type_locked"))
+        or (isinstance(album_info, dict) and album_info.get("album_type_locked"))
+    )
+    album_type_display = get_album_type_display(raw_album_type, total_tracks, _type_source, _type_locked)
+
+    # $atypes: every qualifier the release actually carries, bracketed, and
+    # nothing at all for a plain album — the beets convention, so a library
+    # organised by beets before SoulSync keeps one layout instead of two.
+    # Computed here so the album and single contexts below cannot disagree.
+    try:
+        # Only single<->ep is resolved from the track count, and only when the
+        # source actually said one of them. get_album_type_display infers a
+        # type from the count alone when the source is silent, which is right
+        # for $albumtype — it must always produce a word — and wrong here: a
+        # release tagged only [live] would start claiming [EP] off a five-track
+        # count that nobody called an EP. $atypes says nothing when the source
+        # says nothing; that is the whole point of it.
+        _raw_primary = str(
+            (album_context or {}).get("album_type")
+            or (album_context or {}).get("record_type")
+            or ""
+        ).strip().lower()
+        _atypes_primary = (
+            album_type_display.strip().lower() if _raw_primary in ("single", "ep") else None
+        )
+        atypes_value = format_album_types(
+            album_context,
+            album_types_config(_get_config_manager()),
+            is_various_artists=is_various_artists_credit(album_context),
+            primary_override=_atypes_primary,
+        )
+    except Exception as _at_err:  # noqa: BLE001 - a label must never fail an import
+        logger.debug("[atypes] could not build release-type labels: %s", _at_err)
+        atypes_value = ""
+
+    # An explicitly-typed single (the source said "single", so is_album is True
+    # via explicit_release_type) still belongs on the SINGLE template when the
+    # user customized it — otherwise the custom single_path is silently dead
+    # and every single lands in its own title-named folder via album_path.
+    # Default/empty single_path keeps the album_path routing so $albumtype in
+    # the ALBUM template keeps filing singles under "Singles".
+    _single_template_override = (
+        bool(album_info)
+        and bool(album_info.get("is_album"))
+        and raw_album_type == "single"
+        and is_single_path_customized()
+    )
+
+    if album_info and album_info.get("is_album") and not _single_template_override:
         clean_track_name = get_import_clean_title(context, album_info=album_info, default=original_search.get("title", "Unknown Track"))
-        track_number = _coerce_int(album_info.get("track_number", 1), 1)
+        raw_track_number = album_info.get("track_number", 1)
+        track_number = (0 if raw_album_type in ("compilation", "compile") and raw_track_number == 0
+                        else _coerce_int(raw_track_number, 1))
         disc_number = _coerce_int(album_info.get("disc_number", 1), 1)
         _artists = original_search.get("artists") or track_info.get("artists") or []
         _album_ctx = album_context
@@ -574,12 +1262,30 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             _ext = _album_ctx.get("external_urls", {})
             if isinstance(_ext, dict) and _ext.get("itunes_artist_id"):
                 _itunes_aid = _ext["itunes_artist_id"]
+        # an itunes album names its primary's id even when the download
+        # context's artist carries none
+        if not _itunes_aid and source == "itunes" and _album_ctx:
+            _aid = _first_album_artist_id(_album_ctx)
+            if _aid.isdigit():
+                _itunes_aid = _aid
 
         _artist_name = artist_name
-        _album_artist_name = _artist_name
+        if raw_album_type in ("compilation", "compile") and _artists:
+            _first_track_artist = _artists[0]
+            _track_artist_name = (
+                _first_track_artist.get("name") if isinstance(_first_track_artist, dict)
+                else str(_first_track_artist)
+            )
+            if _track_artist_name:
+                _artist_name = _track_artist_name
+        _album_artist_name = artist_name
         _album_artists_for_collab = None
         _explicit_artist_ctx = track_info.get("_explicit_artist_context") if isinstance(track_info, dict) else None
-        if isinstance(_explicit_artist_ctx, dict) and _explicit_artist_ctx.get("name"):
+        if _path_distrusted and _path_own_artist:
+            # R4F3: the explicit artist context is the stranger's — the
+            # album-artist slot takes the track's own artist.
+            _album_artist_name = _path_own_artist
+        elif isinstance(_explicit_artist_ctx, dict) and _explicit_artist_ctx.get("name"):
             _album_artist_name = _explicit_artist_ctx["name"]
             _album_artists_for_collab = [_explicit_artist_ctx]
         elif isinstance(_explicit_artist_ctx, str) and _explicit_artist_ctx:
@@ -603,6 +1309,26 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
                 _artist_name and _artist_name != "Unknown Artist":
             _album_artist_name = _artist_name
 
+        # Check if the release or album artist indicates a compilation
+        if (not raw_album_type or raw_album_type == "album") and (
+            str(_album_artist_name or "").strip().lower() in ("various artists", "various", "va", "v.a.")
+            or str(artist_name or "").strip().lower() in ("various artists", "various", "va", "v.a.")
+        ):
+            raw_album_type = "compilation"
+            album_type_display = "Compilation"
+
+        # $artist is the track's artist, $albumartist the album's. only checking
+        # compilations named a label comp credited to its dj after the dj, while
+        # the tags said the real artist ("Vlad Jet - Blue Skies" by Framewerk)
+        if _artists:
+            _first_ta = _artists[0]
+            _track_artist_cand = _first_ta.get("name") if isinstance(_first_ta, dict) else str(_first_ta)
+            if _track_artist_cand:
+                _artist_name = _track_artist_cand
+        elif (raw_album_type in ("compilation", "compile", "compilations") or is_explicit_comp) \
+                and track_info.get("artist"):
+            _artist_name = track_info["artist"]
+
         template_context = {
             "artist": _artist_name,
             "albumartist": _album_artist_name,
@@ -613,15 +1339,41 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             "year": year,
             "quality": context.get("_audio_quality", ""),
             "albumtype": album_type_display,
+            "atypes": atypes_value,
             "_artists_list": _album_artists_for_collab if _album_artists_for_collab else _artists,
+            "_track_artists_list": _artists,
             "_itunes_artist_id": _itunes_aid,
+            # #1299: the one thing telling same-named releases apart.
+            "disambiguation": str((album_context or {}).get("disambiguation") or "").strip(),
+            # #1536: the one thing telling same-titled recordings apart.
+            "track_disambiguation": str((track_info or {}).get("disambiguation") or "").strip(),
+            # Record label for $label (MusicBrainz label-info; empty when
+            # the source didn't provide one).
+            "label": str((album_context or {}).get("label") or "").strip(),
         }
-        total_discs = _coerce_int(album_context.get("total_discs", 1) if album_context else 1, 1)
+        # A caller that KNOWS the disc count is authoritative: re-deriving it from
+        # a live provider tracklist made the destination depend on whether that
+        # lookup happened to succeed, so a cache miss or an offline provider filed
+        # two tracks of one album in two folders (Album/01.flac vs
+        # Album/Disc 1/01.flac).
+        #
+        # "Knows" has to be stated, not inferred from the value. Almost every
+        # context builder writes `.get("total_discs", 1)` (core/downloads/
+        # candidates.py, staging.py, master.py) and a Spotify album object carries
+        # no disc count at all, so a bare 1 means "nobody told me". Reading that as
+        # a declaration would silence the #981 lookup for playlist and wishlist
+        # downloads and file a disc-1 track of a real 2-disc release flat.
+        _declared_total_discs = bool(
+            album_context.get("total_discs_declared")) if album_context else False
+        total_discs = _coerce_int(
+            album_context.get("total_discs") if album_context else None, 1)
 
         if total_discs <= 1 and album_context and album_context.get("id"):
             if disc_number > 1:
+                # A track that is itself on disc 2+ proves the release is
+                # multi-disc whatever the caller said.
                 total_discs = disc_number
-            else:
+            elif not _declared_total_discs:
                 try:
                     _album_tracks = _get_album_tracks_for_source(source, str(album_context["id"]))
                     if _album_tracks:
@@ -640,17 +1392,9 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         # so $cdnum can decide between "CDxx" and an empty string.
         template_context["total_discs"] = total_discs
 
-        _template_key = "compilation_path" if raw_album_type in ("compilation", "compile") else "album_path"
+        _template_key = "compilation_path" if raw_album_type in ("compilation", "compile", "compilations") else "album_path"
 
-        # A library's own template replaces whichever template would have been
-        # used — including the compilation one. That's the simple, predictable
-        # reading of "files in this library are named like this", but it does
-        # mean a compilation in a library with a custom template is named by
-        # that template rather than the compilation one. Libraries with no
-        # template (every install, until someone sets one) are unaffected.
-        album_template = (_library_template
-                          or _get_config_manager().get("file_organization.templates", {})
-                          .get(_template_key, "") or "")
+        album_template = _get_config_manager().get("file_organization.templates", {}).get(_template_key, "") or ""
         # Suppress the auto-injected disc folder when the user already
         # encodes the disc in the filename via $disc, $discnum, or $cdnum.
         user_controls_disc = (
@@ -662,11 +1406,7 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         )
         disc_label = _get_config_manager().get("file_organization.disc_label", "Disc")
 
-        if _library_template:
-            folder_path, filename_base = get_file_path_from_template_raw(
-                _library_template, template_context)
-        else:
-            folder_path, filename_base = get_file_path_from_template(template_context, _template_key)
+        folder_path, filename_base = get_file_path_from_template(template_context, _template_key)
 
         # #829: if this album already lives in a single folder on disk, drop the
         # new track there instead of a freshly-templated folder — this is what
@@ -691,7 +1431,7 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         reuse_folder = None
         _multi_disc_album = total_discs > 1 or disc_number > 1
         if (filename_base and not _multi_disc_album
-                and raw_album_type not in ("compilation", "compile")
+                and raw_album_type not in ("compilation", "compile", "compilations")
                 and not context.get("_no_album_folder_reuse")):
             try:
                 from core.library.existing_album_folder import resolve_existing_album_folder
@@ -705,6 +1445,7 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
                 _expected_tracks = None
                 if album_context and album_context.get("total_tracks"):
                     _expected_tracks = _coerce_int(album_context.get("total_tracks"), 0) or None
+                from core.metadata.musicbrainz_tags import selected_release_id
                 reuse_folder = resolve_existing_album_folder(
                     db=get_database(),
                     transfer_dir=transfer_dir,
@@ -714,6 +1455,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
                     active_server=_active_server,
                     expected_track_count=_expected_tracks,
                     config_manager=_get_config_manager(),
+                    musicbrainz_release_id=selected_release_id(album_context),
+                    disambiguation=template_context.get("disambiguation", ""),
+                    # A single/EP sharing the album's title is a different
+                    # release — never let it reuse the album's folder.
+                    incoming_album_type=raw_album_type,
                 )
             except Exception as _reuse_err:
                 logger.debug("[Existing Album Folder] lookup failed: %s", _reuse_err)
@@ -724,13 +1470,13 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             return final_path, True
 
         if folder_path and filename_base:
-            # #1091: steer into the folder that already EXISTS when it differs
+            # #1091: steer into the folder that already exists when it differs
             # only in case. Without this, metadata casing that disagrees with
             # disk makes a SECOND folder on case-sensitive filesystems (the
-            # album shows twice) and, on case-insensitive ones, records a path
-            # that is not how the directory is actually spelled — so every later
-            # exact-path lookup misses. Resolved once and used for BOTH the
-            # created directory and the returned path, so they cannot disagree.
+            # album splits in Jellyfin) and, on case-insensitive ones, records
+            # a path that is not how the directory is actually spelled.
+            # Resolved once and used for BOTH the created directory and the
+            # returned path, so the two can never disagree.
             if total_discs > 1 and not user_controls_disc:
                 disc_folder = f"{disc_label} {disc_number}"
                 album_dir = resolve_existing_case_dir(
@@ -741,7 +1487,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             _ensure_dir(album_dir, exist_ok=True)
             return final_path, True
 
-        album_name_sanitized = sanitize_filename(album_info["album_name"])
+        _fallback_album = album_info["album_name"]
+        _disambiguation = template_context.get("disambiguation", "")
+        if _disambiguation and not album_name_carries(_fallback_album, _disambiguation):
+            _fallback_album = f"{_fallback_album} ({_disambiguation})"
+        album_name_sanitized = sanitize_filename(_fallback_album)
         if raw_album_type in ("compilation", "compile"):
             album_relative = os.path.join("Compilations", album_name_sanitized)
         else:
@@ -750,9 +1500,7 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             album_relative = os.path.join(artist_name_sanitized, album_folder_name)
         if total_discs > 1:
             album_relative = os.path.join(album_relative, f"{disc_label} {disc_number}")
-        # #1091, the same rule on the no-template path — both branches share one
-        # builder, so preview and apply can never disagree about where an album
-        # lives.
+        # #1091, same rule on the no-template path.
         album_dir = resolve_existing_case_dir(transfer_dir, album_relative)
         _ensure_dir(album_dir, exist_ok=True)
         final_track_name_sanitized = sanitize_filename(clean_track_name)
@@ -772,6 +1520,12 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         _ext = _album_ctx.get("external_urls", {})
         if isinstance(_ext, dict) and _ext.get("itunes_artist_id"):
             _itunes_aid = _ext["itunes_artist_id"]
+    # an itunes album names its primary's id even when the download
+    # context's artist carries none
+    if not _itunes_aid and source == "itunes" and _album_ctx:
+        _aid = _first_album_artist_id(_album_ctx)
+        if _aid.isdigit():
+            _itunes_aid = _aid
 
     template_context = {
         "artist": artist_name,
@@ -783,15 +1537,14 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         "year": year,
         "quality": context.get("_audio_quality", ""),
         "albumtype": album_type_display,
+        "atypes": atypes_value,
         "_artists_list": _artists,
         "_itunes_artist_id": _itunes_aid,
+        # #1536: recording disambiguation for the single filename.
+        "track_disambiguation": str((track_info or {}).get("disambiguation") or "").strip(),
     }
 
-    if _library_template:
-        folder_path, filename_base = get_file_path_from_template_raw(
-            _library_template, template_context)
-    else:
-        folder_path, filename_base = get_file_path_from_template(template_context, "single_path")
+    folder_path, filename_base = get_file_path_from_template(template_context, "single_path")
     if filename_base:
         if folder_path:
             final_path = os.path.join(transfer_dir, folder_path, filename_base + file_ext)

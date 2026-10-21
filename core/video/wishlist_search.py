@@ -6,8 +6,9 @@ returns immediately and the download monitor + badge polling surface progress):
   · manual_search(scope, tmdb_id, ...) — ONE wished movie / episode / season /
     show, straight through the drain's own search → pick → enqueue seams, but
     WITHOUT the release-window gate (the click is the override, like Sonarr's
-    manual search). Upgrade-until-cutoff semantics are identical: an owned item
-    only accepts a strictly-better release.
+    manual search). A user-triggered row carries an import policy: equal-or-better
+    valid files replace the current copy; lower-quality files are allowed to land
+    beside it as an intentional recovery/alternate copy.
 
   · search_all() — the whole eligible wishlist NOW (movies + episodes), gates
     intact: this is "don't wait for the hourly tick", not "hunt unreleased
@@ -33,6 +34,11 @@ _lock = threading.Lock()
 _inflight: set = set()          # item keys a manual search is currently working
 
 
+def _scene(items, db):
+    from core.video.numbering import annotate
+    return annotate(items, db=db)
+
+
 def _cutoff_rank() -> int:
     try:
         return vpw._default_cutoff_rank()
@@ -40,11 +46,14 @@ def _cutoff_rank() -> int:
         return 0
 
 
-def _prepare(items: List[Dict[str, Any]], media_type: str) -> List[Dict[str, Any]]:
+def _prepare(items: List[Dict[str, Any]], media_type: str, *, user_initiated: bool = False) -> List[Dict[str, Any]]:
     """The drain's pre-flight over raw wishlist rows: upgrade-until-cutoff
     judging for owned rows, then de-dupe against active downloads AND other
-    in-flight manual searches. Marks survivors in-flight (caller must _finish)."""
-    if any(it.get("owned") for it in items):
+    in-flight manual searches. Marks survivors in-flight (caller must _finish).
+
+    A direct user click means "go get this", so it bypasses the owned/cutoff skip
+    that protects the background drain from pointless equal-quality churn."""
+    if any(it.get("owned") for it in items) and not user_initiated:
         per_item = vpw._cutoff_rank_for_item if any(
             it.get("quality_profile_id") for it in items) else None
         items = vpw.annotate_upgrades(items, _cutoff_rank(), cutoff_for=per_item)
@@ -66,88 +75,193 @@ def _finish(items: List[Dict[str, Any]], media_type: str) -> None:
             _inflight.discard(vpw.item_key(it, media_type))
 
 
-def _one(item: Dict[str, Any], media_type: str, target: str) -> bool:
+def _all_source_search(item: Dict[str, Any], media_type: str):
+    """Search every video source for a user retry, not just the configured first winner."""
+    chain = ["torrent", "usenet", "soulseek"]
+    snapshot: Dict[str, Any] = {"chain": chain, "sources": {}}
+    item["_source_snapshot"] = snapshot
+    out: List[Dict[str, Any]] = []
+    skips: List[str] = []
+    for src in chain:
+        cands, err = vpw._search_one_source(src, item, media_type)
+        snapshot["sources"][src] = vpw.source_outcome(cands, err)
+        if cands is None:
+            skips.append("%s skipped — %s" % (src, err or "search didn't run"))
+            continue
+        out.extend(cands or [])
+    out.sort(key=lambda c: (1 if c.get("accepted") else 0, int(c.get("score") or 0), c.get("_avail") or 0),
+             reverse=True)
+    if out:
+        return out, "; ".join(skips) or None
+    if len(skips) == len(chain):
+        return None, "; ".join(skips) or None
+    return [], "; ".join(skips) or None
+
+
+class _Budget:
+    """One batch's grab budget + stop check. cap=None is uncapped (a click on one
+    title or season); search-all passes the drain's 'Max downloads per run'."""
+
+    def __init__(self, cap=None):
+        self.cap = cap
+        self.gen = vpw.stop_generation()
+        self.used = 0
+        self.stopped = 0
+        self.deferred = 0
+        self._lock = threading.Lock()
+
+    def _closed(self) -> bool:
+        if vpw.stop_requested(self.gen):
+            self.stopped += 1
+            return True
+        if self.cap is not None and self.used >= self.cap:
+            self.deferred += 1
+            return True
+        return False
+
+    def open(self) -> bool:
+        """Worth searching at all? (cheap pre-check, so a spent budget skips the search)."""
+        with self._lock:
+            return not self._closed()
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self._closed():
+                return False
+            self.used += 1
+            return True
+
+    def give_back(self) -> None:
+        """A refused grab isn't a download, hand the slot to a later item."""
+        with self._lock:
+            self.used -= 1
+
+
+def _one(item: Dict[str, Any], media_type: str, target: str, *, all_sources: bool = False,
+         budget: "_Budget | None" = None) -> bool:
+    budget = budget or _Budget()
     try:
-        found = vpw._default_search(item, media_type)
+        if not budget.open():
+            return False
+        item = {**item, "_user_initiated": True}
+        found = _all_source_search(item, media_type) if all_sources else vpw._default_search(item, media_type)
         cands = found[0] if isinstance(found, tuple) else found
         best = vpw.pick_best(cands or [], int(item.get("_min_rank") or 0))
         if not best:
             logger.info("manual search: no acceptable release for %s",
                         item.get("title") or item.get("show_title"))
             return False
-        # multi-library #1105: land in the item's own Library when it has one,
-        # falling back to `target` (the primary) exactly as before otherwise.
-        item_target = vpw._item_target_dir(item, target)
-        return bool(vpw._default_enqueue(item, best, cands or [], media_type, item_target))
+        if not budget.claim():
+            return False
+        ok = bool(vpw._default_enqueue(item, best, cands or [], media_type, target))
+        if not ok:
+            budget.give_back()
+        return ok
     except Exception:   # noqa: BLE001 - one item failing must not kill the batch
         logger.exception("manual wishlist search failed for %r",
                          item.get("title") or item.get("show_title"))
         return False
 
 
-def _run_batch(todo: List[Dict[str, Any]], media_type: str) -> None:
+def _run_batch(todo: List[Dict[str, Any]], media_type: str, *, all_sources: bool = False,
+               cap=None) -> None:
     try:
         target = vpw._default_target_dir(media_type)
         if not target:
             logger.warning("manual search: no %s library folder set — dropping %d item(s)",
                            media_type, len(todo))
             return
+        budget = _Budget(cap)
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="wl-manual") as ex:
-            grabbed = sum(1 for ok in ex.map(lambda it: _one(it, media_type, target), todo) if ok)
-        logger.info("manual wishlist search: %d/%d %s item(s) grabbed", grabbed, len(todo), media_type)
+            grabbed = sum(1 for ok in ex.map(
+                lambda it: _one(it, media_type, target, all_sources=all_sources, budget=budget), todo) if ok)
+        logger.info("manual wishlist search: %d/%d %s item(s) grabbed%s%s", grabbed, len(todo), media_type,
+                    (", %d left for later (cap %d)" % (budget.deferred, cap)) if budget.deferred else "",
+                    (", %d skipped (stopped by cancel all)" % budget.stopped) if budget.stopped else "")
     finally:
         _finish(todo, media_type)
 
 
-def manual_search(scope: str, tmdb_id, season_number=None, episode_number=None) -> Dict[str, Any]:
+def manual_search(scope: str, tmdb_id, season_number=None, episode_number=None,
+                  *, all_sources: bool = False, profile_id: int = 1) -> Dict[str, Any]:
     """Kick a background search for one wished item (or a season/show of
     episodes). Returns immediately: {queued, skipped, total}. 'skipped' =
-    already downloading / already being searched / owned-and-cutoff-met."""
+    already downloading / already being searched."""
     from api.video import get_video_db
     media_type = "movie" if scope == "movie" else "episode"
     items = get_video_db().wishlist_manual_search_items(
-        scope, tmdb_id, season_number=season_number, episode_number=episode_number)
+        scope, tmdb_id, season_number=season_number, episode_number=episode_number,
+        profile_id=profile_id)
+    if media_type == "episode":
+        from core.video.numbering import annotate
+        items = annotate(items)
     if not items:
         return {"queued": 0, "skipped": 0, "total": 0}
-    todo = _prepare(items, media_type)
+    todo = _prepare(items, media_type, user_initiated=True)
+    if todo and not vpw._default_target_dir(media_type):
+        _finish(todo, media_type)
+        return {"queued": 0, "skipped": len(items) - len(todo), "total": len(items),
+                "missing_target": media_type}
     if todo:
-        threading.Thread(target=_run_batch, args=(todo, media_type),
+        threading.Thread(target=_run_batch, args=(todo, media_type), kwargs={"all_sources": all_sources},
                          daemon=True, name="wishlist-manual-search").start()
     return {"queued": len(todo), "skipped": len(items) - len(todo), "total": len(items)}
 
 
 def search_all() -> Dict[str, str]:
     """Run the full (gated) wishlist drain NOW for both kinds, in the background.
-    Per kind: 'started', 'busy' (a drain tick is already running), or 'empty'."""
+    Grabs stop at the drain's 'Max downloads per run' (a click once handed the
+    clients the whole wishlist); "cancel all" on the downloads page stops it.
+    Per kind: 'started', 'busy' (a drain tick is already running), or 'empty'.
+    Scoped to the requesting profile's wishlist — a user clicking "search all"
+    searches their own list, not everyone's."""
     from api.video import get_video_db
+    from core.profile_context import get_current_profile_id
     db = get_video_db()
+    try:
+        pid = int(get_current_profile_id() or 1)
+    except Exception:
+        pid = 1
     out: Dict[str, str] = {}
-    for media_type, fetch in (("movie", db.movie_wishlist_to_download),
-                              ("episode", db.episode_wishlist_to_download)):
+    # due_only=False: the user asked for everything NOW. Backoff paces the
+    # machine's own hourly tick, it does not overrule a person clicking search.
+    for media_type, fetch in (("movie", lambda: db.movie_wishlist_to_download(due_only=False, profile_id=pid)),
+                              ("episode", lambda: _scene(db.episode_wishlist_to_download(due_only=False, profile_id=pid), db))):
         if vpw.is_running(media_type):
             out[media_type] = "busy"
+            continue
+        if not vpw._default_target_dir(media_type):
+            out[media_type] = "unconfigured"
             continue
         if media_type == "movie":
             # same pre-flight as the drain: resolve availability dates so the
             # release-window gate can skip cinema-only films
             vpw._backfill_movie_available_dates()
         items = fetch() or []
-        todo = _prepare(items, media_type)
+        todo = _prepare(items, media_type, user_initiated=True)
         if not todo:
             out[media_type] = "empty"
             continue
 
         def _guarded(todo=todo, media_type=media_type):
-            # take the drain's own guard so the hourly tick skips while we work
-            if vpw._running.get(media_type):
+            # claim the drain's own guard atomically (S10): the old
+            # check-then-act on vpw._running raced both the hourly tick and a
+            # second search click — two bodies drained at once. H14's
+            # _try_claim is the shared atomic backstop.
+            if not vpw._try_claim(media_type):
                 _finish(todo, media_type)
                 return
-            vpw._running[media_type] = True
             try:
-                _run_batch(todo, media_type)
+                _run_batch(todo, media_type, cap=vpw._default_max_downloads(media_type))
             finally:
-                vpw._running[media_type] = False
+                vpw._release(media_type)
 
         threading.Thread(target=_guarded, daemon=True, name="wishlist-search-all").start()
         out[media_type] = "started"
     return out
+
+
+def stop_all() -> None:
+    """Cancel all: halt every running search-all, manual search and drain tick.
+    Items already searched-but-not-grabbed simply stay on the wishlist."""
+    vpw.request_stop()

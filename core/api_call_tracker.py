@@ -10,7 +10,6 @@ import json
 import os
 import threading
 import time
-import uuid
 from collections import deque, defaultdict
 
 from utils.logging_config import get_logger
@@ -23,7 +22,10 @@ logger = get_logger("api_call_tracker")
 RATE_LIMITS = {
     'spotify': 171,       # MIN_API_INTERVAL=0.35s → ~171/min
     'itunes': 20,         # MIN_API_INTERVAL=3.0s → ~20/min
-    'deezer': 60,         # MIN_API_INTERVAL=1.0s → ~60/min
+    # core.deezer_throttle: 40 per 5s shared across every Deezer caller. The old
+    # 60 described a decorator that two of the busiest paths bypassed entirely,
+    # so the tracker read ~0/min during a playlist load.
+    'deezer': 480,        # deezer_throttle 40/5s → 8/s → 480/min
     'lastfm': 300,        # MIN_API_INTERVAL=0.2s → ~300/min
     'genius': 30,         # MIN_API_INTERVAL=2.0s → ~30/min
     'musicbrainz': 60,    # MIN_API_INTERVAL=1.0s → ~60/min
@@ -280,7 +282,6 @@ class ApiCallTracker:
         a SIGINT/SIGTERM/crash mid-write can't leave the JSON file truncated.
         Without this, an interrupted shutdown corrupts the history file and
         the next startup loses 24h of metrics."""
-        tmp_path = None
         try:
             now = time.time()
             cutoff = now - 86400
@@ -298,14 +299,7 @@ class ApiCallTracker:
                 events = [dict(e) for e in self._events if e['ts'] >= cutoff]
 
             payload = {'ts': now, 'history': data, 'events': events}
-            # Unique per process/thread/call. Shutdown saves twice -- the
-            # runtime-component shutdown calls save(), then sys.exit(0) fires the
-            # atexit handler which calls it again -- and a fixed '.tmp' name made
-            # the second open fail on Windows while the first still held the
-            # handle: "[Errno 13] Permission denied: api_call_history.json.tmp".
-            tmp_path = "%s.%d.%d.%s.tmp" % (_PERSIST_PATH, os.getpid(),
-                                            threading.get_ident(),
-                                            uuid.uuid4().hex[:8])
+            tmp_path = _PERSIST_PATH + '.tmp'
             with open(tmp_path, 'w') as f:
                 json.dump(payload, f)
                 f.flush()
@@ -313,12 +307,10 @@ class ApiCallTracker:
             os.replace(tmp_path, _PERSIST_PATH)
         except Exception as e:
             logger.error(f"[ApiCallTracker] Failed to save history: {e}")
-            # Best-effort cleanup of THIS call's tmp file. It used to remove
-            # the shared fixed name, which meant a save that failed could delete
-            # a concurrent save's file and take that one down with it.
+            # Best-effort cleanup of stale tmp file from a failed write.
             try:
-                if tmp_path and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
+                if os.path.exists(_PERSIST_PATH + '.tmp'):
+                    os.remove(_PERSIST_PATH + '.tmp')
             except Exception as e:
                 logger.debug("remove stale tmp file failed: %s", e)
 

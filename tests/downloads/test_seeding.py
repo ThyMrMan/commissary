@@ -10,6 +10,7 @@ transient client error never triggers an erroneous release.
 
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +30,17 @@ def db(tmp_path, monkeypatch):
     d = MusicDatabase(str(tmp_path / "music_library.db"))
     monkeypatch.setattr("database.music_database.get_database", lambda *a, **k: d)
     return d
+
+
+@pytest.fixture(autouse=True)
+def _private_sweep_guard(monkeypatch):
+    """Isolate the module-global already-running guard per test. A background
+    automation thread leaked by an earlier test can be mid-sweep when a test
+    here calls sweep(), which used to surface the guard's skip return in
+    place of the real pass (the video twin's CI KeyError-'seeding' flake).
+    A fresh flag and lock mean a stranger's in-flight sweep is invisible."""
+    monkeypatch.setattr(seeding, "_running", False)
+    monkeypatch.setattr(seeding, "_lock", threading.Lock())
 
 
 class _FakeAdapter:
@@ -168,6 +180,15 @@ def test_failed_removal_retries_next_sweep(db, monkeypatch):
     assert len(db.torrents_awaiting_seed_release()) == 1   # still managed
 
 
+def test_already_running_skip_keeps_the_one_return_shape(monkeypatch):
+    """Every sweep() return carries the same key set — the keyless
+    already_running skip used to KeyError callers that index directly."""
+    monkeypatch.setattr(seeding, "_running", True)
+    out = seeding.sweep()
+    assert out == {"status": "skipped", "reason": "already_running",
+                   "checked": 0, "released": 0, "seeding": 0}
+
+
 def test_seed_remove_data_flag_flows_to_adapter(db, monkeypatch):
     _goals(monkeypatch, ratio=1.0, remove_data=False)
     db.record_torrent_seed_grab("met", "A")
@@ -182,7 +203,7 @@ def test_seed_remove_data_flag_flows_to_adapter(db, monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_config_defaults_present_and_off():
-    import config.settings as cs
+    import core.settings as cs
     src = Path(cs.__file__).read_text(encoding="utf-8")
     assert '"seed_ratio_goal": 0' in src
     assert '"seed_time_goal_hours": 0' in src
@@ -199,6 +220,6 @@ def test_automation_wiring_exists():
 
 
 def test_settings_ui_has_the_goal_fields():
-    assert 'id="shared-seed-ratio"' in _INDEX and 'id="shared-seed-hours"' in _INDEX
-    assert 'id="shared-seed-remove-data"' in _INDEX
+    assert 'id="music-seed-ratio"' in _INDEX and 'id="music-seed-hours"' in _INDEX
+    assert 'id="music-seed-remove-data"' in _INDEX
     assert "seed_ratio_goal" in _SETTINGS_JS and "seed_time_goal_hours" in _SETTINGS_JS

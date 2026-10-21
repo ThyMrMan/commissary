@@ -104,6 +104,156 @@ def _mb_direct_lookup(entity_type, mbid):
     return []
 
 
+def _deezer_get(kind, entity_id):
+    """Public-API GET ``/{album|track|artist}/{id}``. None on any failure."""
+    import requests as req_lib
+    try:
+        from core.deezer_throttle import wait_for_slot
+        wait_for_slot()
+        resp = req_lib.get(
+            f'https://api.deezer.com/{kind}/{entity_id}', timeout=10,
+        )
+        data = resp.json()
+    except Exception as e:
+        logger.debug("Deezer direct %s %s failed: %s", kind, entity_id, e)
+        return None
+    if not isinstance(data, dict) or data.get('error') or not data.get('id'):
+        return None
+    return data
+
+
+def _deezer_shape_artist(a):
+    return {
+        'id': str(a.get('id', '')),
+        'name': a.get('name', ''),
+        'image': a.get('picture_medium'),
+        'extra': f"Direct ID match · {a.get('nb_fan', 0)} fans",
+    }
+
+
+def _deezer_shape_album(a):
+    artist = a.get('artist', {}) if isinstance(a.get('artist'), dict) else {}
+    artist_name = artist.get('name', '')
+    return {
+        'id': str(a.get('id', '')),
+        'name': a.get('title', ''),
+        'image': a.get('cover_medium'),
+        'extra': f"Direct ID match{' · ' + artist_name if artist_name else ''}",
+    }
+
+
+def _deezer_shape_track(t):
+    artist = t.get('artist', {}) if isinstance(t.get('artist'), dict) else {}
+    album = t.get('album', {}) if isinstance(t.get('album'), dict) else {}
+    artist_name = artist.get('name', '')
+    album_name = album.get('title', '')
+    bits = ' · '.join(b for b in (artist_name, album_name) if b)
+    return {
+        'id': str(t.get('id', '')),
+        'name': t.get('title', ''),
+        'image': album.get('cover_medium'),
+        'extra': f"Direct ID match{' · ' + bits if bits else ''}",
+    }
+
+
+def _deezer_direct_lookup(entity_type, deezer_id, query=''):
+    """Confirm a pasted Deezer URL/id and return a one-item result list.
+
+    Album/track URLs can resolve across kinds: a track URL while matching an
+    album returns the parent album (remix singles live on album pages); an
+    album URL while matching a track returns the first track. Failed lookups
+    return [] so the caller can fall through to fuzzy search.
+    """
+    from core.library.direct_id import extract_deezer_link
+    link = extract_deezer_link(query)
+    url_kind = link[0] if link else entity_type
+
+    if url_kind == 'album':
+        album = _deezer_get('album', deezer_id)
+        if not album:
+            return []
+        if entity_type == 'album':
+            return [_deezer_shape_album(album)]
+        if entity_type == 'track':
+            tracks = (album.get('tracks') or {}).get('data') or []
+            first = tracks[0] if tracks else None
+            tid = first.get('id') if isinstance(first, dict) else None
+            if not tid:
+                return []
+            track = _deezer_get('track', tid) or first
+            return [_deezer_shape_track(track)]
+        return []
+
+    if url_kind == 'track':
+        track = _deezer_get('track', deezer_id)
+        if not track:
+            return []
+        if entity_type == 'track':
+            return [_deezer_shape_track(track)]
+        if entity_type == 'album':
+            album_obj = track.get('album') if isinstance(track.get('album'), dict) else {}
+            album_id = album_obj.get('id')
+            if not album_id:
+                return []
+            album = _deezer_get('album', album_id)
+            if not album:
+                album = album_obj
+            return [_deezer_shape_album(album)] if album.get('id') else []
+        return []
+
+    if url_kind == 'artist' or entity_type == 'artist':
+        if entity_type != 'artist':
+            return []
+        artist = _deezer_get('artist', deezer_id)
+        return [_deezer_shape_artist(artist)] if artist else []
+
+    return []
+
+
+
+def _deezer_exact_title_first(query, plain, req_lib, limit=8):
+    """Deezer's plain track search for a typed query, plus ``track:"title" artist``.
+
+    The plain results can leave the real song out entirely (for "Auli'i Cravalho
+    How Far I'll Go" they are the Reprise and karaoke copies). When the query
+    names an artist, the exact-title results go first. The artist is read from
+    the plain results' artist names. Scoped results are used only if one is
+    credited to that artist. Returns ``plain`` unchanged otherwise.
+    """
+    from core.deezer_throttle import wait_for_slot
+    from core.deezer_track_query import (
+        artist_scoped_query,
+        credits_artist,
+        merge_by_id,
+        split_query_by_artist,
+    )
+
+    def get(kind, q, n):
+        wait_for_slot()
+        return req_lib.get(f'https://api.deezer.com/search/{kind}', params={'q': q, 'limit': n}, timeout=10).json().get('data', [])
+
+    def scoped_for(names):
+        scoped_query = artist_scoped_query(query, names)
+        split = split_query_by_artist(query, names) if scoped_query else None
+        if not split:
+            return None
+        scoped = get('track', scoped_query, limit)
+        # Deezer only RANKS by the artist words (its artist filter is broken), so
+        # covers by other artists can still lead: the artist's own tracks go first,
+        # then the plain results, and other artists' scoped hits only after those.
+        by_artist = [i for i in scoped if credits_artist([(i.get('artist') or {}).get('name')], split[0])]
+        if by_artist:
+            rest = [i for i in scoped if i not in by_artist]
+            return merge_by_id(by_artist, plain, rest, limit=limit)
+        return None
+
+    names = [(i.get('artist') or {}).get('name') for i in plain if isinstance(i.get('artist'), dict)]
+    found = scoped_for([n for n in names if n])
+    if found:
+        return found
+    return plain
+
+
 def _search_service(service, entity_type, query):
     """Search a service and return normalized results."""
     import requests as req_lib
@@ -119,6 +269,10 @@ def _search_service(service, entity_type, query):
         try:
             if service == 'musicbrainz':
                 hit = _mb_direct_lookup(entity_type, direct_id)
+                if hit:
+                    return hit
+            elif service == 'deezer':
+                hit = _deezer_direct_lookup(entity_type, direct_id, query)
                 if hit:
                     return hit
         except Exception as e:
@@ -159,9 +313,24 @@ def _search_service(service, entity_type, query):
             return [{'id': t.id, 'name': t.name, 'image': t.image_url, 'extra': f"{', '.join(t.artists)} · {t.album or ''}"} for t in items]
 
     elif service == 'musicbrainz':
-        if not mb_worker or not mb_worker.mb_service:
-            raise ValueError("MusicBrainz worker not initialized")
-        mb_client = mb_worker.mb_service.mb_client
+        # MusicBrainz needs no credentials and no worker — only a client. When
+        # the worker is there, use its service so both share one rate limiter;
+        # otherwise fall back to the process-wide shared instance. Requiring
+        # the worker meant a failed worker init took manual MusicBrainz search
+        # and enrichment down with it, reported as "worker not initialized" to
+        # a user who never asked for a worker.
+        mb_client = None
+        if mb_worker is not None and getattr(mb_worker, 'mb_service', None):
+            mb_client = mb_worker.mb_service.mb_client
+        else:
+            try:
+                from core.musicbrainz_service import get_musicbrainz_service
+
+                mb_client = get_musicbrainz_service().mb_client
+            except Exception as e:
+                logger.debug("shared MusicBrainz service unavailable: %s", e)
+        if mb_client is None:
+            raise ValueError("MusicBrainz client not available")
         # User-facing manual search — prefer recall (fuzzy / alias / diacritic-
         # folded) over strict phrase precision. User picks correct hit from list.
         if entity_type == 'artist':
@@ -192,10 +361,20 @@ def _search_service(service, entity_type, query):
         type_map = {'artist': 'artist', 'album': 'album', 'track': 'track'}
         deezer_type = type_map.get(entity_type, 'track')
         try:
+            # shared deezer budget — this call used to bypass it entirely
+            from core.deezer_throttle import wait_for_slot
+            wait_for_slot()
             resp = req_lib.get(f'https://api.deezer.com/search/{deezer_type}', params={'q': query, 'limit': 8}, timeout=10)
             data = resp.json().get('data', [])
         except Exception:
             data = []
+        if entity_type == 'track' and data:
+            # the plain search can leave the real song out of its 8 results; for
+            # a query that names an artist, put the exact-title results first
+            try:
+                data = _deezer_exact_title_first(query, data, req_lib)
+            except Exception as e:
+                logger.debug("deezer exact-title search skipped for %r: %s", query, e)
         results = []
         for item in data:
             if entity_type == 'artist':

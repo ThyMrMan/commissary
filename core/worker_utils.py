@@ -243,8 +243,8 @@ def set_album_api_track_count(cursor, album_id, count):
     Called by enrichment workers (Spotify / iTunes / Deezer / Discogs) after
     they fetch album metadata. The count is the EXPECTED total tracks
     according to that source — distinct from `albums.track_count`, which
-    server syncs (Plex `leafCount`, Commissary standalone `len(tracks)`)
-    populate with the OBSERVED count Commissary already has indexed. The
+    server syncs (Plex `leafCount`, SoulSync standalone `len(tracks)`)
+    populate with the OBSERVED count SoulSync already has indexed. The
     Album Completeness repair job reads `albums.api_track_count` as the
     expected total; populating it here during enrichment avoids a second
     round of API calls during the repair scan.
@@ -314,7 +314,7 @@ def read_enrichment_priority(service: str) -> str:
     Read every loop so the override applies without restarting the worker.
     Any error / unset / invalid value yields '' (no override)."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         val = (config_manager.get(f'{service}_enrichment_priority', '') or '')
         val = str(val).strip().lower()
         return val if val in PRIORITY_ENTITIES else ''
@@ -354,8 +354,13 @@ def priority_pending_item(cursor, service, entity, type_overrides=None):
 
     # track
     cursor.execute(
-        f"SELECT t.id, t.title, ar.name FROM tracks t JOIN artists ar ON t.artist_id = ar.id "
+        f"SELECT t.id, t.title, ar.name, t.isrc FROM tracks t JOIN artists ar ON t.artist_id = ar.id "
         f"WHERE t.{ms} IS NULL AND t.id IS NOT NULL ORDER BY t.id ASC LIMIT 1"
     )
     r = cursor.fetchone()
-    return {'type': type_overrides.get('track', 'track'), 'id': r[0], 'name': r[1], 'artist': r[2]} if r else None
+    # 'isrc' rides along for the MusicBrainz worker's exact-identifier
+    # rung (#1705): without it, a manually prioritised track — exactly
+    # the kind a user is waiting on — silently lost the rung the normal
+    # queue path provides. Other workers ignore the extra key.
+    return {'type': type_overrides.get('track', 'track'), 'id': r[0], 'name': r[1], 'artist': r[2],
+            'isrc': r[3]} if r else None

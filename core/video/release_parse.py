@@ -17,6 +17,10 @@ import re
 import unicodedata
 from typing import Any
 
+# Commissary: fansub names, colon subtitles and arcs (see the module).
+from core.commissary.release_titles import fansub_candidates as _fansub_candidates
+from core.commissary.release_titles import match_pairs as _match_pairs
+
 # Resolution — first match wins (most specific first).
 _RES = [
     (re.compile(r"\b(2160p|4k|uhd)\b", re.I), "2160p"),
@@ -75,45 +79,6 @@ _GROUP = re.compile(r"-([A-Za-z0-9]{2,})\s*$")
 _AIR_DATE = re.compile(r"\b((?:19|20)\d{2})[ ._-](0[1-9]|1[0-2])[ ._-](0[1-9]|[12]\d|3[01])\b")
 
 
-# Edition markers, longest/most specific first — the {Edition Tags} token, and
-# what Plex reads out of an 'edition-X' filename. Deliberately a fixed list of
-# real editions rather than "any of these words": 'cut' and 'edition' on their
-# own appear in ordinary titles ('The Final Cut', 'Special'), so matching them
-# loose would stamp an edition on films that have none.
-_EDITIONS = [
-    (re.compile(r"\bdirector'?s?[. _-]?cut\b", re.I), "Directors Cut"),
-    (re.compile(r"\bextended[. _-]?(?:edition|cut|version)\b", re.I), "Extended"),
-    (re.compile(r"\bfinal[. _-]?cut\b", re.I), "Final Cut"),
-    (re.compile(r"\bspecial[. _-]?edition\b", re.I), "Special Edition"),
-    (re.compile(r"\bultimate[. _-]?(?:edition|cut)\b", re.I), "Ultimate"),
-    (re.compile(r"\bdefinitive[. _-]?edition\b", re.I), "Definitive"),
-    (re.compile(r"\bcollector'?s?[. _-]?edition\b", re.I), "Collectors"),
-    (re.compile(r"\banniversary[. _-]?edition\b", re.I), "Anniversary"),
-    (re.compile(r"\bcriterion\b", re.I), "Criterion"),
-    (re.compile(r"\bremaster(?:ed)?\b", re.I), "Remastered"),
-    (re.compile(r"\bunrated\b", re.I), "Unrated"),
-    (re.compile(r"\buncut\b", re.I), "Uncut"),
-    (re.compile(r"\bimax\b", re.I), "IMAX"),
-    (re.compile(r"\bextended\b", re.I), "Extended"),
-]
-
-
-def edition_tags(release_name: Any) -> str | None:
-    """The edition a release advertises ('Directors Cut', 'IMAX'), or None.
-
-    Multiple markers join with a space, in the order listed above, so
-    'Extended.IMAX' reads 'IMAX Extended' consistently regardless of how the
-    release happened to order them."""
-    t = str(release_name or "")
-    if not t:
-        return None
-    found = []
-    for rx, label in _EDITIONS:
-        if label not in found and rx.search(t):
-            found.append(label)
-    return " ".join(found) if found else None
-
-
 def _first(table, text) -> Any:
     for rx, val in table:
         if rx.search(text):
@@ -149,8 +114,12 @@ def parse_release(title: Any) -> dict:
         "air_date": None,
         "is_season_pack": False,
         "is_series_pack": False,
-        "edition": edition_tags(t),
     }
+    # a DVD remux ('Duckman S01 NTSC DVD REMUX') is a disc at SD, not a
+    # resolution-less blu-ray remux: read as remux it had no tier at all
+    if (out["source"] == "remux" and not out["resolution"]
+            and re.search(r"\b(dvd|ntsc|pal)\b", t, re.I)):
+        out["source"] = "dvd"
     g = _GROUP.search(t)
     if g:
         out["group"] = g.group(1)
@@ -199,46 +168,16 @@ _META_BOUNDARY = re.compile(
     r"|x264|x265|h\.?264|h\.?265|hevc|avc|av1"
     r"|s\d{1,3}(?:e\d{1,3})?|season)\b", re.I)
 _ARTICLE = re.compile(r"^(?:the|a|an)\s+")
-# A leading fansub/release-group tag ('[SubsPlease] ...', '[Erai-raws] ...').
-_LEADING_GROUP_TAG = re.compile(r"^\s*\[[^\]]{1,40}\]\s*")
-# A bare episode number glued onto the title with a dash ('Title - 40', '- 0523v2') —
-# the fansub convention for absolute numbering, not part of the title itself.
-_TRAILING_EP_NUM = re.compile(r"[-_]\s*\d{1,4}(?:v\d+)?\s*(?=[\[(]|$)")
 # Trailing words that are an edition of the SAME film, not a different title.
 _EDITION_TOKENS = frozenset({
     "extended", "remastered", "remaster", "unrated", "uncut", "directors", "director",
     "cut", "edition", "theatrical", "special", "imax", "final", "ultimate", "definitive",
 })
 
-# ── Colon subtitles ───────────────────────────────────────────────────────────
-# A release often carries a work's FULL official title while TMDB stores only the
-# part before the colon ('The Frontier Lord Begins with Zero Subjects: Tales of Blue
-# Dias and the Onikin Alna' vs 'The Frontier Lord Begins with Zero Subjects') — common
-# for light-novel adaptations. normalize_title folds ':' to a space, so by comparison
-# time the one signal that the tail was a SUBTITLE and not a different show is already
-# gone; the head has to be offered as a candidate before that happens.
-#
-# Splitting on the colon is deliberately narrower than prefix matching. A sequel or
-# disambiguating marker always sits LEFT of any colon, so it is never dropped: 'Moana 2'
-# keeps its '2', and 'The Cloverfield Paradox' has no colon at all and so yields no
-# extra candidate. Two further guards close the one class this DOES open — franchise
-# installments whose distinguishing part sits right of the colon:
-_SUBTITLE_MIN_WORDS = 3          # 'Dune', 'Alien', 'Star Trek', 'The Hunger Games' → too short to split
-# ...and an explicit installment marker, for long franchise names that clear the floor.
-_INSTALLMENT_TAIL = re.compile(
-    r"^\s*(?:part|chapter|chap|vol|volume|book|episode|ep|season|series|act|"
-    r"the\s+(?:first|second|third|fourth|fifth|final|last))\b", re.I)
-
 
 def _spaces(s: Any) -> str:
-    """Separators (dots/underscores/dashes/brackets) → spaces, whitespace collapsed.
-
-    Brackets count as separators because a cut at a quality token lands INSIDE the
-    bracket that introduces it ('... - 04 [Web]' cuts before 'Web', keeping the '['),
-    and that orphan leaks into the user-facing 'Wrong title (…' message. Matching is
-    unaffected either way — ``normalize_title`` already folds every non-alphanumeric
-    to a space — so this is purely about what the rejection reason reads like."""
-    return re.sub(r"\s+", " ", re.sub(r"[._\-\[\]()]+", " ", str(s or ""))).strip()
+    """Separators (dots/underscores/dashes) → spaces, whitespace collapsed."""
+    return re.sub(r"\s+", " ", re.sub(r"[._\-]+", " ", str(s or ""))).strip()
 
 
 def extract_title(release_name: Any) -> str:
@@ -249,17 +188,6 @@ def extract_title(release_name: Any) -> str:
     AFTER the SxxExx, and cutting only at the year would leave numbering junk in the
     title. Returns '' when the title can't be isolated (e.g. a numeric-only title
     like '2012' with no release year)."""
-    return _spaces(_title_region(release_name))
-
-
-def _title_region(release_name: Any) -> str:
-    """The title portion of a release name exactly as written, separators intact.
-
-    ``extract_title`` is this with separators folded to spaces -- which is what a
-    reader wants and what every title comparison uses, but the fold destroys the
-    dash a fansub name glues its episode number onto ('... Hen - 48'), and that
-    dash is the only thing telling an episode number from a number that is part
-    of the name itself ('... Part 2')."""
     t = str(release_name or "").strip()
     if not t:
         return ""
@@ -272,26 +200,7 @@ def _title_region(release_name: Any) -> str:
         cut = m.start()
     if cut is None:
         cut = len(t)
-    return t[:cut]
-
-
-def fansub_absolute_episode(release_name: Any):
-    """The absolute episode number of a fansub-style release, or None.
-
-    The convention is a leading group tag plus a bare number glued on with a
-    dash — '[SubsPlease] Digimon Beatbreak - 40 [1080p]'. There's no SxxExx and
-    no season anywhere, so ``parse_release`` reports neither; this is the only
-    signal that such a file is an EPISODE at all. Requiring the group tag keeps
-    it off ordinary movie names, whose trailing '-GRP' carries no digits."""
-    t = str(release_name or "")
-    tagless = _LEADING_GROUP_TAG.sub("", t, count=1)
-    if tagless == t:
-        return None
-    m = _TRAILING_EP_NUM.search(tagless)
-    if not m:
-        return None
-    digits = "".join(ch for ch in m.group(0) if ch.isdigit())
-    return int(digits) if digits else None
+    return _spaces(t[:cut])
 
 
 def has_absolute_episode(release_name: Any, absolute: Any) -> bool:
@@ -313,95 +222,20 @@ def has_absolute_episode(release_name: Any, absolute: Any) -> bool:
     return bool(re.search(r"(?<!\w)[Ee]?0*%d(?:v\d+)?(?!\w)" % n, head))
 
 
-# The episode number a fansub-style name glues onto the END of its title region
-# with a dash ('... - Sennen Kessen Hen - 48'). The dash is the whole signal: it
-# separates an episode number from a number that is part of the name itself
-# ('... - Part 2'), which must never read as an episode.
-_ARC_GLUED_NUM = re.compile(r"[-_\u2013\u2014]\s*0*(\d{1,4})(?:v\d+)?$")
-
-
-def arc_episode_match(release_name: Any, want_title: Any, want_episode: Any) -> bool:
-    """True when a release names a show's ARC and numbers this episode within it.
-
-    TVDB files a long-running anime as one season per arc, so a season's own
-    episode numbers are what that arc's releases carry: Bleach S17E48 ships as
-    '[SubsPlease] Bleach - Sennen Kessen Hen - 48'. The show's absolute number
-    (414 -- the 366 episodes before the arc, plus 48) appears nowhere on it, so
-    ``has_absolute_episode`` can only miss, and the arc subtitle reads as a
-    different show to the title gate. Between them those two rejected every
-    release of the arc, on every tracker that names them this way.
-
-    Two independent signals must agree, which is what keeps this off the show's
-    OWN episode 48 ('[SubsPlease] Bleach - 48', the 2004 run in absolute
-    numbering): the title must EXTEND an acceptable title with an arc subtitle,
-    and the number glued onto the end of the title region with a dash must be
-    the episode wanted. Accept-only -- a miss is never a rejection by itself.
-
-    The cost is a show whose name extends another's ('Bleach Rock Musical - 48'
-    against 'Bleach'): it has to carry the same episode number for the same
-    wanted show to land. Telling those apart by the subtitle alone is what scene
-    mappings exist for, and we have none.
-    """
-    try:
-        want = int(want_episode)
-    except (TypeError, ValueError):
-        return False
-    n = arc_episode_number(release_name, want_title)
-    return n is not None and n == want
-
-
-def arc_episode_number(release_name: Any, want_title: Any):
-    """The episode number an ARC-named release of this show carries, or None.
-
-    Both signals of ``arc_episode_match`` live here: the title must EXTEND an
-    acceptable title with the arc's name, and a number must be glued onto the end
-    of the title region with a dash. Returning the number rather than a verdict
-    is what lets a caller say 'wrong episode' about the arc's OTHER episodes
-    instead of rejecting them as a title that doesn't match.
-    """
-    wants = acceptable_titles(want_title)
-    if not wants:
-        return None
-    raw = str(release_name or "")
-    cands = [raw]
-    tagless = _LEADING_GROUP_TAG.sub("", raw, count=1)
-    if tagless != raw:
-        cands.append(tagless)
-    for cand in cands:
-        # _title_region, not extract_title: the latter folds dashes into spaces
-        # and the dash is the signal. A cut at a quality token can leave behind
-        # the bracket that introduced it.
-        head = _title_region(cand).strip().rstrip(" ([{")
-        m = _ARC_GLUED_NUM.search(head)
-        if not m:
-            continue
-        name = normalize_title(head[:m.start()])
-        if any(name != w and name.startswith(w + " ") for w in wants):
-            return int(m.group(1))
-    return None
-
-
-def compared_title(release_name: Any) -> str:
-    """The title ``titles_match`` actually compares — ``extract_title`` once a
-    leading fansub/group tag is off the front.
-
-    The rejection reason used to print the raw extraction, tag and all
-    ('SubsPlease Re:ZERO'), while the matcher had stripped that tag before
-    comparing anything. It reads as though the group name were part of the title
-    the release claims, and it sends people off adding the group name to the
-    show's AKA titles — an alias that cannot ever help, because the tag never
-    reached the comparison in the first place."""
-    return extract_title(_LEADING_GROUP_TAG.sub("", str(release_name or ""), count=1))
-
-
 def normalize_title(s: Any) -> str:
     """Fold a title to a comparable key: strip accents, lowercase, '&'→'and',
     punctuation → space, drop a single leading article. 'The Dark Knight' and
     'dark.knight' both fold to 'dark knight'."""
-    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    raw = str(s or "")
+    s = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
     s = s.lower().replace("&", " and ")
     s = re.sub(r"[^a-z0-9]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
+    if not s:
+        # #1306: a title in a non-latin script folded to nothing, and a
+        # wanted title of nothing let ANY release through. keep its letters.
+        from core.text.fold import fold_title
+        return fold_title(raw.replace("&", " and "), drop_brackets=False)
     return _ARTICLE.sub("", s, count=1)
 
 
@@ -417,26 +251,39 @@ def acceptable_titles(want_title: Any) -> set:
     return {n for n in (normalize_title(x) for x in items) if n}
 
 
-def _title_variants(raw_title: Any, normalized: str) -> list:
-    """The normalized titles a RELEASE's extracted title may legitimately be known
-    by — itself, plus the part before each colon when the tail reads as a subtitle.
+# a wanted title that ends in its year: "Big Brother (2023)", "Dark Matter 2024"
+_WANT_YEAR_SUFFIX = re.compile(r"^(.*?\S)[\s.]*\(?((?:19|20)\d{2})\)?\s*$")
 
-    Only ever applied to the release side. Applying it to the wanted side would add
-    'mission' as an acceptable title for 'Mission: Impossible - Fallout' and let any
-    'Mission: …' release satisfy a search for the unrelated film 'Mission'."""
-    out = [normalized]
-    raw = str(raw_title or "")
-    if ":" not in raw:
-        return out
-    parts = raw.split(":")
-    for i in range(1, len(parts)):
-        head = normalize_title(":".join(parts[:i]))
-        tail = ":".join(parts[i:])
-        if (head and head not in out
-                and len(head.split()) >= _SUBTITLE_MIN_WORDS
-                and not _INSTALLMENT_TAIL.match(tail)):
-            out.append(head)
+
+def _year_qualified_wants(want_title: Any) -> list:
+    """(normalized base title, year) for every wanted title that ends in a year.
+    a title that IS a year ("1917") has no base and isn't one."""
+    if want_title is None:
+        return []
+    items = [want_title] if isinstance(want_title, str) else list(want_title)
+    out = []
+    for raw in items:
+        m = _WANT_YEAR_SUFFIX.match(str(raw or "").strip())
+        if not m:
+            continue
+        base = normalize_title(m.group(1))
+        if base:
+            out.append((base, int(m.group(2))))
     return out
+
+
+def title_region_year(cand: Any):
+    """public name for the year in a release's title region, see below"""
+    return _release_title_year(str(cand or ""))
+
+
+def _release_title_year(cand: str):
+    """the year a release name carries right after its title, or None:
+    'Big.Brother.2023.S03E16' -> 2023, 'Blade Runner 2049 2017 1080p' -> 2017"""
+    m = _META_BOUNDARY.search(cand)
+    head = cand[:m.start()] if m else cand
+    years = list(_YEAR_TOKEN.finditer(head))
+    return int(years[-1].group()) if years else None
 
 
 def titles_match(release_name: Any, want_title: Any) -> bool:
@@ -449,56 +296,63 @@ def titles_match(release_name: Any, want_title: Any) -> bool:
     SEGMENT is tried as a title candidate, not just the whole string. An
     unknown/unisolable title passes (the year gate still applies) so a numeric
     title like '2012' is never falsely rejected — we only ever REJECT on a
-    confident mismatch against every acceptable title, never guess a match.
-
-    Fansub releases ('[SubsPlease] One Piece - 1071 (1080p)') hide the real title
-    behind a leading release-group tag AND glue the absolute episode number onto
-    it with a bare dash — neither of which extract_title's year/quality-boundary
-    cut accounts for, so 'subsplease one piece 1071' never matches 'one piece'.
-    Every candidate that HAS such a tag gets a second try with the tag and the
-    glued-on episode number stripped; candidates without one are untouched, so
-    ordinary scene names (including ones that legitimately end in a number, like
-    'Moana 2') can't be affected.
-
-    Each candidate is finally tried both whole and colon-split (see
-    ``_title_variants``), because a release often carries the full official title
-    where TMDB stores only the part before the colon."""
+    confident mismatch against every acceptable title, never guess a match."""
     wants = acceptable_titles(want_title)
     if not wants:
         return True
+    # "Big Brother (2023)" is how a library names a show to tell it from the
+    # others, and the scene writes it 'Big.Brother.2023.S03E16', whose title
+    # parses as "Big Brother" with the year cut off. that never equals
+    # "big brother 2023", so every release for the show was "Wrong title". a
+    # year-qualified title matches its bare base when the release carries the
+    # same year (one either way). a release WITHOUT a year still doesn't, so
+    # "Avatar: The Last Airbender (2024)" never takes the 2005 show's files.
+    year_wants = _year_qualified_wants(want_title)
     raw = str(release_name or "")
     cands = [raw]
     segs = [s for s in re.split(r"[\\/]+", raw) if s.strip()]
     if len(segs) > 1:
         cands += segs
-    fansub_cands = []
-    for c in cands:
-        tagless = _LEADING_GROUP_TAG.sub("", c, count=1)
-        if tagless != c:
-            fansub_cands.append(tagless)
-            fansub_cands.append(_TRAILING_EP_NUM.sub("", tagless))
-    cands += [c for c in fansub_cands if c not in cands]
+    cands += _fansub_candidates(cands)   # Commissary: '[Group] Title - 07'
     saw_any = False
     for cand in cands:
-        head = extract_title(cand)
-        norm = normalize_title(head)
-        if not norm:
+        got = normalize_title(extract_title(cand))
+        if not got:
             continue
         saw_any = True
-        for got in _title_variants(head, norm):
-            for want in wants:
-                if got == want:
+        if year_wants:
+            rel_year = _release_title_year(cand)
+            if rel_year and any(got == base and abs(rel_year - year) <= 1
+                                for base, year in year_wants):
+                return True
+        # Commissary: also the part before a colon subtitle ('Title: Subtitle')
+        for got, want in _match_pairs(extract_title(cand), normalize_title(extract_title(cand)), wants):
+            if got == want:
+                return True
+            if got.replace(" ", "") == want.replace(" ", ""):
+                return True                              # '90DayFiance' == '90 day fiance'
+            if got.startswith(want + " "):
+                rest = got[len(want):].split()
+                if rest and all(tok in _EDITION_TOKENS for tok in rest):
                     return True
-                if got.replace(" ", "") == want.replace(" ", ""):
-                    return True                          # '90DayFiance' == '90 day fiance'
-                if got.startswith(want + " "):
-                    rest = got[len(want):].split()
-                    if rest and all(tok in _EDITION_TOKENS for tok in rest):
-                        return True
     return not saw_any
 
 
-__all__ = ["parse_release", "extract_title", "compared_title", "normalize_title",
-           "arc_episode_match",
-           "arc_episode_number",
-           "acceptable_titles", "titles_match", "has_absolute_episode"]
+def search_title(release_name: Any) -> str:
+    """The title to PREFILL a metadata search with, from a raw release name.
+
+    extract_title plus a trailing-punctuation trim, because a cut that lands right
+    after a separator ("Silo S03E08 ..." -> "Silo", but "The.Bear.S03..." -> "The.Bear.")
+    leaves a dot/dash the metadata search then treats as part of the name. Falls back
+    to the raw name when nothing can be isolated, so the box is never empty.
+
+    Shared by the Fresh Releases and Basic Search identify modals so the same release
+    prefills the same way in both.
+    """
+    value = extract_title(release_name) or str(release_name or "")
+    value = re.sub(r"[\s(\[{._-]+$", "", value).strip()
+    return value or str(release_name or "")
+
+
+__all__ = ["parse_release", "extract_title", "normalize_title", "title_region_year",
+           "acceptable_titles", "titles_match", "has_absolute_episode", "search_title"]

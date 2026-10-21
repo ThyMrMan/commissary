@@ -1,5 +1,5 @@
 /*
- * Commissary — Video wishlist state hydration (shared).
+ * SoulSync — Video wishlist state hydration (shared).
  *
  * Cards for un-owned titles render a "Preview" ribbon and the Discover hero
  * renders a "+ Wishlist" CTA — but neither knew whether the title was ALREADY

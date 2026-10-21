@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import re
+import unicodedata
 from typing import Any, Dict, List, Optional
 
 import requests
 
 from core.metadata import registry as metadata_registry
+from core.metadata.album_tracks import _artist_catalog_weight
 from core.metadata.artist_image import _extract_artist_image_url
 from core.metadata.discography import (
     _extract_lookup_value,
     _normalize_artist_name,
-    _pick_best_artist_match,
     _search_artists_for_source,
 )
 from core.metadata.lookup import MetadataLookupOptions
@@ -22,7 +24,41 @@ logger = get_logger("metadata.similar_artists")
 __all__ = [
     "get_musicmap_similar_artists",
     "iter_musicmap_similar_artist_events",
+    "clean_musicmap_artist_name",
 ]
+
+
+_MULTI_ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|;|\||\bfeat\.?\b|\bft\.?\b|\bfeaturing\b)\s*", re.IGNORECASE)
+_PLACEHOLDER_ARTIST_NAMES = {
+    'unknown',
+    'unknown artist',
+    'unknown artists',
+    'various artists',
+    'no artist',
+    'none',
+    'n/a',
+}
+
+
+def clean_musicmap_artist_name(artist_name: str) -> Optional[str]:
+    """Return a single safe artist name for MusicMap, or None to skip lookup."""
+    name = ' '.join(str(artist_name or '').strip().split())
+    if not name:
+        return None
+
+    if (name.startswith('[') and name.endswith(']')) or (name.startswith('(') and name.endswith(')')):
+        return None
+
+    parts = [part.strip() for part in _MULTI_ARTIST_SPLIT_RE.split(name) if part.strip()]
+    name = parts[0] if parts else name
+    normalized = _normalize_artist_name(name)
+    if not normalized or normalized in _PLACEHOLDER_ARTIST_NAMES:
+        return None
+    if len(name) > 120:
+        return None
+    if any(ch in name for ch in '<>{}'):
+        return None
+    return name
 
 
 def _get_source_chain_for_lookup(options: MetadataLookupOptions) -> List[str]:
@@ -41,13 +77,14 @@ def _get_source_chain_for_lookup(options: MetadataLookupOptions) -> List[str]:
 
 def _fetch_musicmap_similar_artist_names(artist_name: str) -> List[str]:
     """Fetch similar artist names from MusicMap."""
-    if not (artist_name or '').strip():
-        raise ValueError('Artist name is required')
+    lookup_artist_name = clean_musicmap_artist_name(artist_name)
+    if not lookup_artist_name:
+        raise ValueError('Artist name is not suitable for MusicMap lookup')
 
     from bs4 import BeautifulSoup
     from urllib.parse import quote_plus
 
-    url_artist = quote_plus(artist_name.strip())
+    url_artist = quote_plus(lookup_artist_name)
     musicmap_url = f'https://www.music-map.com/{url_artist}'
 
     headers = {
@@ -65,7 +102,7 @@ def _fetch_musicmap_similar_artist_names(artist_name: str) -> List[str]:
     if not gnod_map:
         raise ValueError('Could not find artist map on MusicMap')
 
-    searched_artist_lower = _normalize_artist_name(artist_name)
+    searched_artist_lower = _normalize_artist_name(lookup_artist_name)
     similar_artist_names: List[str] = []
     seen_names = set()
 
@@ -79,6 +116,58 @@ def _fetch_musicmap_similar_artist_names(artist_name: str) -> List[str]:
 
     logger.debug("Found %s similar artists from MusicMap", len(similar_artist_names))
     return similar_artist_names
+
+
+# how many search results a musicmap name is checked against. one request
+# either way; the first hit is often a namesake (deezer ranks a 78-fan
+# "Korn" above the real band, a 16-fan "Cold" above Cold)
+_MATCH_SEARCH_LIMIT = 10
+
+# letters bands swap in as styling: KoЯn, P!nk, Ke$ha
+_LOOKALIKES = str.maketrans({'я': 'r', '!': 'i', '$': 's', 'ø': 'o'})
+
+
+def _name_keys(value: Any) -> set:
+    """the forms a name can match under: accents dropped, punctuation and
+    spaces dropped, with and without the look-alike letters read back."""
+    text = unicodedata.normalize('NFKD', str(value or '').casefold())
+    text = ''.join(ch for ch in text if not unicodedata.combining(ch))
+    keys = set()
+    for form in (text, text.translate(_LOOKALIKES)):
+        key = ''.join(ch for ch in form if ch.isalnum())
+        if key:
+            keys.add(key)
+    return keys
+
+
+def _pick_named_artist(search_results: List[Any], artist_name: str) -> Optional[Any]:
+    """the search result that IS this name, or None. never a blind first
+    result or a near spelling: that stored Colde for Cold and a thai pop act
+    for Korn. among namesakes the biggest catalog wins."""
+    target = _name_keys(artist_name)
+    if not target:
+        return None
+    named = [
+        a for a in search_results or []
+        if _name_keys(_extract_lookup_value(a, 'name', 'artist_name', 'title')) & target
+    ]
+    return max(named, key=_artist_catalog_weight) if named else None
+
+
+def _cached_artist_image_url(url: Optional[str]) -> Optional[str]:
+    """Register a remote artist image with the cache and return its local URL.
+
+    Fails OPEN: any problem (cache disabled, registration error) yields the
+    original url, so a broken cache can never be worse than the raw link.
+    """
+    if not url or not str(url).startswith(('http://', 'https://')):
+        return url
+    try:
+        from core.image_cache import cached_image_url
+        return cached_image_url(url) or url
+    except Exception as exc:   # noqa: BLE001 - never fail a listing over art
+        logger.debug("similar-artist image cache registration failed: %s", exc)
+        return url
 
 
 def _build_similar_artist_payload(artist_data: Any, source: str) -> Optional[Dict[str, Any]]:
@@ -115,7 +204,15 @@ def _build_similar_artist_payload(artist_data: Any, source: str) -> Optional[Dic
     return {
         'id': str(artist_id),
         'name': str(name or artist_id),
-        'image_url': _extract_artist_image_url(artist_data),
+        # Served FIRST-PARTY through SoulSync's image cache, like every other
+        # artwork surface (core.metadata.artwork._browser_safe_image_url does
+        # the same). These bubbles were the one place still handing the
+        # browser a raw third-party CDN url, so a privacy browser or content
+        # blocker dropped the request and the bubble stayed empty while the
+        # url itself was perfectly valid — wishx saw exactly that in Brave
+        # AND LibreWolf, with his hover-preview extension (which fetches from
+        # the extension context, not the page) still showing the image (#1201).
+        'image_url': _cached_artist_image_url(_extract_artist_image_url(artist_data)),
         'genres': genres,
         'popularity': popularity,
         'source': source,
@@ -131,8 +228,9 @@ def _resolve_musicmap_artist_source_ids(artist_name: str, source_chain: List[str
             searched_source_ids[source] = None
             continue
 
-        search_results = _search_artists_for_source(source, client, artist_name, limit=1)
-        searched_source_ids[source] = _extract_lookup_value(search_results[0], 'id', 'artist_id') if search_results else None
+        search_results = _search_artists_for_source(source, client, artist_name, limit=_MATCH_SEARCH_LIMIT)
+        searched = _pick_named_artist(search_results, artist_name)
+        searched_source_ids[source] = _extract_lookup_value(searched, 'id', 'artist_id')
 
     return searched_source_ids
 
@@ -151,11 +249,11 @@ def _match_musicmap_similar_artist(
         if not client:
             continue
 
-        search_results = _search_artists_for_source(source, client, candidate_name, limit=1)
+        search_results = _search_artists_for_source(source, client, candidate_name, limit=_MATCH_SEARCH_LIMIT)
         if not search_results:
             continue
 
-        matched_artist = _pick_best_artist_match(search_results, candidate_name)
+        matched_artist = _pick_named_artist(search_results, candidate_name)
         if not matched_artist:
             continue
 
@@ -179,13 +277,17 @@ def _match_musicmap_similar_artist(
         if source == 'itunes' and not payload.get('image_url') and hasattr(client, 'get_artist'):
             try:
                 full_artist = client.get_artist(str(matched_id))
+                # BOTH assignments go through the cache like the builder's —
+                # this late enrichment path was writing raw CDN urls straight
+                # onto the payload, so an iTunes-sourced bubble kept the exact
+                # third-party link #1201 is about.
                 image_url = _extract_artist_image_url(full_artist)
                 if image_url:
-                    payload['image_url'] = image_url
+                    payload['image_url'] = _cached_artist_image_url(image_url)
                 elif hasattr(client, '_get_artist_image_from_albums'):
                     album_image_url = client._get_artist_image_from_albums(str(matched_id))
                     if album_image_url:
-                        payload['image_url'] = album_image_url
+                        payload['image_url'] = _cached_artist_image_url(album_image_url)
             except Exception as exc:
                 logger.debug("Could not enrich iTunes image for %s: %s", matched_id, exc)
 
@@ -203,6 +305,15 @@ def iter_musicmap_similar_artist_events(
     source_override: Optional[str] = None,
 ):
     """Yield MusicMap similar-artist events using source priority."""
+    lookup_artist_name = clean_musicmap_artist_name(artist_name)
+    if not lookup_artist_name:
+        yield {
+            'type': 'error',
+            'error': 'Artist name is not suitable for MusicMap lookup',
+            'status_code': 400,
+        }
+        return
+
     try:
         source_chain = _get_source_chain_for_lookup(
             MetadataLookupOptions(source_override=source_override, allow_fallback=True)
@@ -216,12 +327,12 @@ def iter_musicmap_similar_artist_events(
             }
             return
 
-        similar_artist_names = _fetch_musicmap_similar_artist_names(artist_name)
-        searched_source_ids = _resolve_musicmap_artist_source_ids(artist_name, source_chain)
+        similar_artist_names = _fetch_musicmap_similar_artist_names(lookup_artist_name)
+        searched_source_ids = _resolve_musicmap_artist_source_ids(lookup_artist_name, source_chain)
 
         yield {
             'type': 'start',
-            'artist_name': artist_name,
+            'artist_name': lookup_artist_name,
             'total_found': len(similar_artist_names),
             'source_priority': source_chain,
         }
@@ -238,7 +349,7 @@ def iter_musicmap_similar_artist_events(
             source, payload = _match_musicmap_similar_artist(
                 candidate_name,
                 source_chain,
-                artist_name,
+                lookup_artist_name,
                 searched_source_ids,
             )
             if not payload:
@@ -263,7 +374,7 @@ def iter_musicmap_similar_artist_events(
             'complete': True,
             'total': matched_count,
             'total_found': len(similar_artist_names),
-            'artist_name': artist_name,
+            'artist_name': lookup_artist_name,
             'source_priority': source_chain,
         }
 

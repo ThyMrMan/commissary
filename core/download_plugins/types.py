@@ -118,13 +118,8 @@ class TrackResult(SearchResult):
     title: Optional[str] = None
     album: Optional[str] = None
     track_number: Optional[int] = None
-    # Whether this candidate is the explicit cut, when the source says so at all
-    # (Deezer's explicit_lyrics, HiFi's explicit). None = not reported, which is
-    # a different answer from False and must stay distinguishable: see
-    # core/downloads/explicit_preference.py. Soulseek, torrent and usenet
-    # results have no such flag and fall back to their release name.
-    explicit: Optional[bool] = None
     _source_metadata: Optional[Dict[str, Any]] = None
+    _release_sources: List['TrackResult'] = field(default_factory=list, repr=False)
 
     def __post_init__(self):
         self.result_type = "track"
@@ -166,15 +161,36 @@ class AlbumResult:
 
     @property
     def audio_quality(self) -> AudioQuality:
-        """Unified quality descriptor derived from dominant track quality."""
-        sample_rates = [t.sample_rate for t in self.tracks if t.sample_rate]
-        bit_depths = [t.bit_depth for t in self.tracks if t.bit_depth]
-        bitrates = [t.bitrate for t in self.tracks if t.bitrate]
+        """Conservative whole-album quality descriptor.
+
+        Maxima can synthesize a release that does not exist — one 24-bit track
+        plus a different 96-kHz track used to become a claimed 24/96 album.
+        A bundle is only as strong as its weakest track, and missing metadata
+        stays unknown. Mixed-format folders are ``unknown`` rather than being
+        labelled with the majority codec.
+        """
+        tracks = list(self.tracks or [])
+        format_values = [
+            str(track.quality or 'unknown').lower()
+            for track in tracks
+        ]
+        formats = set(format_values)
+
+        def _complete_min(attribute):
+            values = [getattr(track, attribute, None) for track in tracks]
+            if not values or any(value is None for value in values):
+                return None
+            return min(values)
+
         return AudioQuality(
-            format=self.dominant_quality.lower() if self.dominant_quality else 'unknown',
-            bitrate=max(bitrates) if bitrates else None,
-            sample_rate=max(sample_rates) if sample_rates else None,
-            bit_depth=max(bit_depths) if bit_depths else None,
+            format=(
+                next(iter(formats))
+                if len(formats) == 1 and 'unknown' not in formats
+                else 'unknown'
+            ),
+            bitrate=_complete_min('bitrate'),
+            sample_rate=_complete_min('sample_rate'),
+            bit_depth=_complete_min('bit_depth'),
         )
 
     @property
@@ -248,3 +264,8 @@ class DownloadStatus:
     time_remaining: Optional[int] = None
     file_path: Optional[str] = None
     audio_files: Optional[List[str]] = None
+    # why a failed download failed, in words a user can act on. the status
+    # poll shows it instead of a bare "state: Errored" (#1349)
+    error: Optional[str] = None
+    # Explicit verification failures differ from failed retrieval/transfer.
+    failure_kind: Optional[str] = None

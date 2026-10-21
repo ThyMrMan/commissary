@@ -46,12 +46,28 @@ def test_direct_download_requires_a_youtube_folder(client):
 def test_direct_download_enqueues_like_the_wishlist_drain(client, monkeypatch):
     """Same row shape as the automation's enqueue: kind/source youtube, ctx with
     channel identity, target_dir = the youtube root — and the pump is kicked."""
+    import threading
+
     import core.video.disk_guard as disk_guard
     import core.video.youtube_download as ytd
     c, db = client
     db.set_setting("youtube_path", "/media/youtube")
+
+    # Record WHICH thread pumped, not just that something did.
+    #
+    # `ensure_started` spawns a daemon 'video-download-monitor' thread behind a
+    # module-global `_started`, so once any test in the session triggers a grab
+    # that thread lives for the whole run — looping _recover_youtube ->
+    # recover_and_pump -> start_next_queued. This monkeypatch is global, so that
+    # thread hits the spy too, and it will happily pump the very row this test
+    # just queued. Asserting a raw call count therefore asserts "no background
+    # tick happened while I ran", which is timing, not behaviour — and it is
+    # what made this fail on CI and pass locally.
     started = []
-    monkeypatch.setattr(ytd, "start_next_queued", lambda provider: started.append(1) or 7)
+    monkeypatch.setattr(
+        ytd, "start_next_queued",
+        lambda provider: started.append(threading.current_thread().name) or 7)
+    this_thread = threading.current_thread().name
     # Hermetic: the enqueue path probes REAL free disk space for the target
     # dir's nearest existing ancestor ('/' on a CI runner, whose fill level
     # varies run to run). The guard is not what this test is about.
@@ -73,8 +89,11 @@ def test_direct_download_enqueues_like_the_wishlist_drain(client, monkeypatch):
     assert vapi._video_db is db, \
         f"videoapi._video_db was swapped DURING the request: {vapi._video_db!r}"
     assert out.get("success") is True, f"download endpoint refused: {out}"
-    assert out.get("started") is True and started == [1], \
-        f"pump not kicked: {out}, started={started}"
+    # The request runs inline on this thread, so exactly one pump must be
+    # attributable to it. Anything the monitor thread did is ignored.
+    ours = [name for name in started if name == this_thread]
+    assert out.get("started") is True and ours == [this_thread], \
+        f"pump not kicked by the request: {out}, started={started}"
 
     rows = db.list_video_downloads()
     assert len(rows) == 1
@@ -115,12 +134,16 @@ def test_owned_yt_rows_keep_the_download_button():
 
 
 def test_channel_season_bar_matches_tv_minus_manual_search():
-    bar = _DETAIL_JS.split("Season-level acquisition bar")[1].split("host.innerHTML = seasonBar")[0]
+    # The bar moved out of renderEpisodes into its own seasonActionsHtml() when it
+    # grew the monitor + clear-failures actions, so the old comment anchor is gone.
+    bar = _DETAIL_JS.split("function seasonActionsHtml(")[1].split("function renderEpisodes(")[0]
     assert "isYt" in bar
-    assert "Download ' + (isYt ? 'year' : 'season')" in bar
+    assert "Grab ' + (isYt ? 'year' : 'season')" in bar
     assert "Wishlist ' + (isYt ? 'year' : 'season')" in bar
-    assert "(isYt ? '' :" in bar                       # manual search hidden for channels
+    assert "canAcquire && !isYt ?" in bar              # manual search hidden for channels
     assert "ytFilter.q" in bar                         # a filtered view isn't "the season"
+    # ...and a channel gets no library management: no episode rows to monitor.
+    assert "seasonManage = !isYt" in bar
 
 
 def test_historic_completed_rows_do_not_hide_the_regrab_button():

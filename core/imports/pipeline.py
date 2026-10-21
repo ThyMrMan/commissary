@@ -4,20 +4,20 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import shutil
 import threading
 import time
 from types import SimpleNamespace
 from typing import Any
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.imports.file_ops import (
     cleanup_empty_directories,
     cleanup_slskd_dedup_siblings,
     create_lossy_copy,
     downsample_hires_flac,
     get_audio_quality_string,
-    get_quality_tier_from_extension,
+    probe_audio_quality,
     safe_move_file,
 )
 from core.imports.context import (
@@ -26,15 +26,19 @@ from core.imports.context import (
     extract_artist_name,
     get_import_clean_artist,
     get_import_clean_title,
+    get_import_context_album,
     get_import_context_artist,
     get_import_has_clean_metadata,
     get_import_original_search,
+    get_import_search_result,
     get_import_source,
+    get_import_source_ids,
     get_import_track_info,
     normalize_import_context,
 )
 from core.imports.file_integrity import (
     check_audio_integrity,
+    duration_reference_for_context,
     expected_duration_for_check,
     probe_decoded_duration,
     resolve_duration_tolerance,
@@ -55,9 +59,11 @@ from core.imports.side_effects import (
     record_library_history_download,
     record_soulsync_library_entry,
 )
+from core.downloads.atomic_album_publish import split_staged_path
+from core.wishlist.library_match import artist_names
+from core.wishlist.removal_guard import STAGED as GUARD_STAGED, classify_publication
 from core.wishlist.resolution import check_and_remove_from_wishlist
 from core.runtime_state import (
-    TERMINAL_TASK_STATUSES,
     add_activity_item,
     download_batches,
     download_tasks,
@@ -70,13 +76,17 @@ from core.runtime_state import (
     tasks_lock,
 )
 from core.metadata.artwork import download_cover_art
-from core.metadata.common import wipe_source_tags
+from core.metadata.common import strip_musicbrainz_identity_tags, wipe_source_tags
 from core.imports.tag_policy import should_wipe_tags_on_enhancement_failure
+from core.imports.quality_replace import is_profile_upgrade
 from core.metadata.enrichment import enhance_file_metadata
+from core.metadata.source import evaluate_batch_album_distrust
 from core.imports.paths import (
     build_final_path_for_track,
     build_simple_download_destination,
     docker_resolve_path,
+    import_profile_id,
+    transfer_root_for_context,
 )
 from core.imports.album_naming import resolve_album_group
 from core.metadata.lyrics import generate_lrc_file
@@ -124,155 +134,6 @@ def _replacement_length_is_safe(existing_path: str, incoming_path: str,
     return incoming_s >= existing_s * min_ratio
 
 
-def _existing_library_copy(final_path: str, track_number=None,
-                           quality_profile: dict | None = None) -> str | None:
-    """The copy the library already holds for this track when it is NOT sitting
-    at ``final_path``, or None.
-
-    Every replace/upgrade decision below used to hang off
-    ``os.path.exists(final_path)``, an exact path match — extension included.
-    An upgrade is precisely a change of CONTAINER, so that test is False for
-    every format upgrade there is: replacing a 130 kbps ``.opus`` with a FLAC
-    computes ``Track.flac``, does not find ``Track.opus``, and moves the new
-    file in ALONGSIDE the old one. Both then live in the library and the media
-    server shows the track twice. A reported library had nine such pairs,
-    including ``01 - STAY.opus`` next to ``01 - STAY.flac`` — identical stems,
-    the extension alone keeping them apart.
-
-    Scope is deliberately ONE directory: the folder the incoming file is being
-    placed into, never a search of the library. A track downloaded as a single
-    templates into its own album folder, so it cannot reach into an album's
-    folder and replace that album's copy — the two simply never meet. That is a
-    structural guarantee rather than a rule someone has to remember.
-
-    A leading track number is tolerated in the EXISTING name (a library
-    organised as ``01 - Title`` while the current template writes ``Title``),
-    but only when the number agrees with the incoming track's own — otherwise
-    importing track 5 of an album whose track 1 is called ``Intro`` could delete
-    track 1's file.
-
-    A lossy sibling that the lossy-copy feature deliberately maintains is NOT a
-    replacement candidate; it is a companion this install asked for.
-    """
-    from core.imports.paths import strip_leading_track_number
-    from core.imports.staging import AUDIO_EXTENSIONS
-    try:
-        target_dir = os.path.dirname(final_path)
-        if not target_dir or not os.path.isdir(target_dir):
-            return None
-        final_ext = os.path.splitext(final_path)[1].lower()
-        final_stem = os.path.splitext(os.path.basename(final_path))[0]
-        final_key = strip_leading_track_number(final_stem).casefold().strip()
-        if not final_key:
-            return None
-
-        # Extensions the lossy-copy feature owns: with it on, a lossy file beside
-        # the FLAC is a companion, not a stale original.
-        companion_exts = set()
-        _qp = quality_profile if isinstance(quality_profile, dict) else {}
-        if final_ext == '.flac' and _qp.get(
-                'lossy_copy_enabled', config_manager.get('lossy_copy.enabled', False)):
-            _codec = _qp.get('lossy_copy_codec',
-                             config_manager.get('lossy_copy.codec', 'mp3'))
-            companion_exts.add({'mp3': '.mp3', 'opus': '.opus',
-                                'aac': '.m4a'}.get(_codec, '.mp3'))
-
-        try:
-            incoming_num = int(track_number) if track_number is not None else None
-        except (TypeError, ValueError):
-            incoming_num = None
-
-        matches = []
-        for name in os.listdir(target_dir):
-            candidate = os.path.join(target_dir, name)
-            stem, ext = os.path.splitext(name)
-            ext = ext.lower()
-            if ext not in AUDIO_EXTENSIONS or ext in companion_exts:
-                continue
-            if os.path.normpath(candidate) == os.path.normpath(final_path):
-                continue
-            if not os.path.isfile(candidate):
-                continue
-            stripped = strip_leading_track_number(stem)
-            if stripped.casefold().strip() != final_key:
-                continue
-            if stripped != stem:
-                # The existing name carries a track number — it has to be THIS
-                # track's, or we would be deleting a different song. With no
-                # incoming number to check it against there is nothing to verify,
-                # so refuse: a duplicate is recoverable, a deletion is not.
-                m = re.match(r"\s*(\d{1,3})", stem)
-                if incoming_num is None or not m or int(m.group(1)) != incoming_num:
-                    continue
-            matches.append(candidate)
-
-        if len(matches) == 1:
-            logger.info("[Upgrade] Existing library copy for this track is '%s' — "
-                        "replacing it rather than adding '%s' beside it",
-                        os.path.basename(matches[0]), os.path.basename(final_path))
-            return matches[0]
-        if matches:
-            # Ambiguous: several files could be this track. Refuse to guess —
-            # adding a duplicate is recoverable, deleting the wrong file is not.
-            logger.warning("[Upgrade] %d existing files could be this track (%s) — "
-                           "not replacing any of them",
-                           len(matches), ", ".join(os.path.basename(m) for m in matches))
-        return None
-    except Exception:   # noqa: BLE001 - never let a tidy-up cost the import
-        logger.debug("existing-library-copy lookup failed for %s", final_path, exc_info=True)
-        return None
-
-
-def _resolve_replace_target(final_path: str, source_path: str, track_number=None,
-                            quality_profile: dict | None = None) -> str | None:
-    """The library file this import is about to replace, or None for a new track.
-
-    Three cases, in order:
-
-      · Something is already at ``final_path`` — the pre-existing behaviour, and
-        still the answer whenever it applies.
-      · The incoming file is gone. Nothing is being placed, so nothing is being
-        replaced; the pre-move recovery further down owns that situation and
-        must see it exactly as it did before.
-      · Otherwise ask ``_existing_library_copy`` whether the same track is
-        already in that folder under another container or another naming — the
-        case a bare ``os.path.exists(final_path)`` could never see.
-    """
-    if os.path.exists(final_path):
-        return final_path
-    if not os.path.exists(source_path):
-        return None
-    return _existing_library_copy(final_path, track_number, quality_profile)
-
-
-def _user_download_replaces(context: dict) -> bool:
-    """True when the user personally asked for THIS file and the install lets a
-    user's choice outrank the copy already on disk.
-
-    ``force_replace`` covers the modal's Force toggle, but that is a box most
-    people never find. Everything else — picking a candidate in the manual
-    search, choosing a release, re-downloading a track you already own — was
-    treated as an unattended import and silently discarded whenever the library
-    already held something "same or better". The file was fetched, moved,
-    compared and deleted; the user got their old copy back with no explanation.
-
-    Deliberately keyed on ``_user_manual_pick``, which is set only where a
-    person chose the exact file (see core/downloads/candidates.py). The wishlist
-    drain, the auto-import sweep and the retry monitor never set it, so nothing
-    unattended can overwrite a library file through this door.
-
-    Defaults ON: a person pressing download is a clearer statement of intent
-    than a quality comparison. ``import.user_download_always_replaces`` turns it
-    off for installs that would rather keep what they have.
-    """
-    if not (context or {}).get('_user_manual_pick'):
-        return False
-    try:
-        return bool(config_manager.get('import.user_download_always_replaces', True))
-    except Exception:   # noqa: BLE001 - a config read must never block an import
-        return True
-
-
 def _batch_force_replace(context: dict) -> bool:
     """True when the USER explicitly forced this download (the 'Force
     download' toggle on the download modal). An explicit re-download of a
@@ -284,7 +145,14 @@ def _batch_force_replace(context: dict) -> bool:
     ``force_download_all``: the wishlist sets that on every background batch
     (it means "skip ownership checks" there) and Wing It auto-enables it —
     neither may ever overwrite library files. Anything missing or unreadable
-    → False, i.e. the protective default."""
+    → False, i.e. the protective default.
+
+    A file the user approved out of quarantine is replace-intent too: the
+    approve endpoint stamps ``_approved_quarantine_trigger``, and without this
+    the guard deleted the approved file as "redundant" whenever the wrong file
+    already sat at its destination."""
+    if (context or {}).get('_approved_quarantine_trigger'):
+        return True
     try:
         batch_id = (context or {}).get('batch_id')
         if not batch_id:
@@ -294,7 +162,32 @@ def _batch_force_replace(context: dict) -> bool:
         return False
 
 
+def _record_manual_lock(context: dict, final_path: str) -> None:
+    """remember a hand-tagged file so enrichment and the maintenance jobs leave
+    its album alone, now and after any future library scan"""
+    from core.metadata.manual import is_manual_context
+    if not is_manual_context(context):
+        return
+    try:
+        from database.music_database import get_database
+        album = get_import_context_album(context) or {}
+        artist = get_import_context_artist(context) or {}
+        get_database().record_manual_metadata_file(
+            context.get('_final_processed_path') or final_path,
+            album_title=album.get('name') or '',
+            album_artist=artist.get('name') or '',
+        )
+    except Exception as lock_err:  # noqa: BLE001 - the file is imported either way
+        logger.error("[Manual] could not record the manual lock: %s", lock_err)
+
+
 def _should_skip_quarantine_check(context: dict, check_name: str) -> bool:
+    # a hand-tagged download (bootleg, live set) fails the studio fingerprint
+    # by design, acoustid has nothing true to say about it
+    if check_name == 'acoustid':
+        from core.metadata.manual import is_manual_context
+        if is_manual_context(context):
+            return True
     bypass = context.get('_skip_quarantine_check')
     if bypass == 'all':
         return True
@@ -371,15 +264,6 @@ def _resolve_context_quality_profile(context: dict) -> dict:
     if isinstance(cached, dict):
         return cached
     try:
-        # A destination Music Library may carry its own profile. Stamped onto
-        # track_info here rather than resolved separately, so the library's
-        # profile inherits this whole mechanism instead of becoming a second,
-        # divergent one. An item that already names a profile keeps it.
-        from core.imports.destinations import apply_library_quality_profile
-        apply_library_quality_profile(context)
-    except Exception as e:  # noqa: BLE001 - never block an import on this
-        logger.debug("library quality profile stamp failed: %s", e)
-    try:
         from core.quality.selection import load_profile_by_id
         track_info = context.get('track_info')
         profile_id = track_info.get('quality_profile_id') if isinstance(track_info, dict) else None
@@ -438,17 +322,29 @@ def _requeue_quarantined_task_for_retry(task_id, batch_id, trigger) -> bool:
         return False
 
 
+def _record_failed_download_blocklist(task_id, reason):
+    """Terminal import give-up: the file burned every quarantine retry, so its
+    fingerprint joins the failed-download blocklist (90 days) and future
+    searches skip it. Fail-open — the blocklist never sinks the import."""
+    if not task_id:
+        return
+    try:
+        with tasks_lock:
+            task = dict(download_tasks.get(task_id) or {})
+        from core.downloads.failed_blocklist import record_task_giveup
+        if record_task_giveup(get_database(), task, reason=reason):
+            logger.info(f"[FailedBlocklist] Task {task_id} blocked after terminal "
+                        f"import give-up: {reason}")
+    except Exception as exc:  # noqa: BLE001 - defensive
+        logger.debug(f"[FailedBlocklist] give-up record failed: {exc}")
+
+
 def import_rejection_reason(context: dict) -> str | None:
     """Human-readable reason if post-processing terminally rejected the file
     (quarantine or race-guard), else ``None`` for a clean import.
 
     ``post_process_matched_download`` signals these outcomes by setting context
-    flags and returning normally. It does NOT raise on unexpected errors
-    either: its outer handler logs them, re-queues the file for retry and
-    returns — so an exception is invisible to the caller unless it is recorded
-    here too. A PermissionError creating the album folder used to be reported
-    as "Track Imported" for that reason: the file was still in the download
-    folder and the UI said it had landed. The
+    flags and returning normally — it only raises on unexpected errors. The
     download path reads those flags in
     ``post_process_matched_download_with_verification`` and marks the task
     failed, but the MANUAL-import routes call ``post_process_matched_download``
@@ -469,13 +365,20 @@ def import_rejection_reason(context: dict) -> str | None:
         return "rejected by audio guard (incomplete or silent audio)"
     if context.get('_race_guard_failed'):
         return "source file disappeared before import completed"
-    # Checked LAST on purpose: the flags above describe deliberate, precisely
-    # worded outcomes, and an exception raised after one of them shouldn't
-    # replace that wording. This is the catch-all for everything the pipeline
-    # did not anticipate — most often a filesystem permission or disk error.
+    # Commissary: an exception the outer handler swallowed (it returns normally
+    # so the download monitor can retry; a manual import has no monitor and read
+    # that as success). Checked LAST so a precisely worded outcome above wins.
     if context.get('_post_process_error'):
         return f"import failed: {context['_post_process_error']}"
     return None
+
+
+def kept_existing_library_file(context: dict) -> bool:
+    """the pipeline found this track already at its library path and left
+    that copy alone (not an improvement, or already tagged). nothing was
+    imported, but nothing went wrong either: for an import that means
+    "already in library", not a failure and not a fresh import."""
+    return bool(context.get('_kept_existing_library_file'))
 
 
 def build_import_pipeline_runtime(
@@ -493,6 +396,92 @@ def build_import_pipeline_runtime(
         repair_worker=repair_worker,
     )
 
+
+
+def _wishlist_context_snapshot(context):
+    """The slice of an import context a later wishlist removal actually needs.
+
+    Stored on the batch and in the on-disk manifest, so it has to stay small and
+    JSON-clean. These six keys are exactly what ``get_import_source_ids`` and the
+    metadata fallback read, so a snapshot resolves to the same track id the live
+    context would.
+    """
+    return {
+        'source': context.get('source') or context.get('_source') or '',
+        'artist': get_import_context_artist(context),
+        'album': get_import_context_album(context),
+        'track_info': get_import_track_info(context),
+        'original_search_result': get_import_original_search(context),
+        'search_result': get_import_search_result(context),
+        'batch_id': context.get('batch_id') or context.get('_atomic_publish_batch_id'),
+    }
+
+
+def _settle_wishlist_for_completed_track(context, completed_path):
+    """Clear this track's wishlist row — or defer it until the album publishes.
+
+    #1289. Atomic album publishing (#999) moved the moment a track becomes
+    visible in the library from here to batch completion, but the wishlist
+    removal stayed here, so between the two a track was in neither the library
+    nor the wishlist. That gap is not a millisecond: it lasts until the LAST
+    track of the album finishes, and a restart, a failed publish or a cancel
+    inside it left the user with no file and no request to retry it.
+
+    A staged track is recorded instead — on the batch, for the publish to act
+    on, and in the on-disk manifest, so a process that never reaches the publish
+    can still be reconciled by the next one. Returns True when deferred.
+    """
+    state = classify_publication(completed_path)
+    if state != GUARD_STAGED:
+        check_and_remove_from_wishlist(context, published_path=completed_path)
+        return False
+
+    staged_path = os.path.normpath(str(completed_path))
+    split = split_staged_path(staged_path)
+    transfer_dir, staging_root, rel = split if split else (None, None, None)
+    final_path = os.path.join(transfer_dir, rel) if (transfer_dir and rel) else ''
+
+    track_info = get_import_track_info(context)
+    entry = {
+        'staged_path': staged_path,
+        'final_path': final_path,
+        'track_name': track_info.get('name', '') or '',
+        # artist_names, not artists[0]: a bare-string 'Band' indexes to 'B', and
+        # that is what would land in the manifest and, on the recovery path, in
+        # the context its metadata fallback matches on.
+        'artist_name': next(iter(artist_names(track_info.get('artists'))), ''),
+        'context': _wishlist_context_snapshot(context),
+    }
+
+    batch_id = context.get('batch_id') or context.get('_atomic_publish_batch_id')
+    with tasks_lock:
+        batch = download_batches.get(batch_id) if batch_id else None
+        if batch is not None:
+            batch.setdefault('_wishlist_pending', []).append(entry)
+            staging_root = batch.get('_atomic_staging_root') or staging_root
+
+    if staging_root:
+        try:
+            from core.downloads.atomic_manifest import record_staged_track
+            record_staged_track(
+                staging_root,
+                staged_path=staged_path,
+                final_path=final_path,
+                source=entry['context']['source'],
+                source_ids=get_import_source_ids(context),
+                track_name=entry['track_name'],
+                artist_name=entry['artist_name'],
+                profile_id=import_profile_id(context),
+            )
+        except Exception as man_err:  # noqa: BLE001 - bookkeeping never fails a download
+            logger.warning("[Atomic Publish] Could not record %r in the batch manifest: %s",
+                           entry['track_name'] or staged_path, man_err)
+
+    logger.info(
+        "[Wishlist] Deferring removal for %r — staged for atomic album publish "
+        "(batch=%s, staged=%s, final=%s)",
+        entry['track_name'] or os.path.basename(staged_path), batch_id, staged_path, final_path)
+    return True
 
 
 def _maybe_stage_album_track(context, final_path):
@@ -532,16 +521,54 @@ def _maybe_stage_album_track(context, final_path):
                     logger.info("[Atomic Publish] Batch %s: NOT flagged as an album download "
                                 "— publishing directly (atomic only applies to album batches)", batch_id)
                 else:
-                    transfer_dir = docker_resolve_path(
-                        config_manager.get('soulseek.transfer_path', './Transfer'))
+                    # an own-library profile's batch stages under its folder (#1199)
+                    from core.audiobook_routing import routed_root_for_context
+                    from core.imports.paths import library_root_for_profile
+                    transfer_dir = (routed_root_for_context(context)
+                                    or library_root_for_profile(batch.get('profile_id'))
+                                    or docker_resolve_path(
+                                        config_manager.get('soulseek.transfer_path', './Transfer')))
                     album_folder = os.path.dirname(final_path)
                     if album_folder_is_fresh(album_folder):
-                        batch['_atomic_active'] = True
-                        batch['_atomic_transfer_dir'] = transfer_dir
-                        batch['_atomic_staging_root'] = staging_root_for_batch(transfer_dir, batch_id)
-                        logger.info("[Atomic Publish] Batch %s: STAGING album until complete "
-                                    "(album=%r, transfer=%s)", batch_id,
-                                    os.path.basename(album_folder), transfer_dir)
+                        _staging_root = staging_root_for_batch(transfer_dir, batch_id)
+                        # Prove we can actually WRITE there before committing the
+                        # batch to staging. This used to be assumed, and when the
+                        # assumption failed the download failed with it: mkdir
+                        # raised PermissionError deep inside safe_move_file, the
+                        # track never left downloads, and the user got "File
+                        # verification failed: expected file at ... but it was not
+                        # found after processing". A feature that cannot stage
+                        # must degrade to today's direct publish, never take the
+                        # download down with it.
+                        try:
+                            os.makedirs(_staging_root, exist_ok=True)
+                            _staging_ok = os.access(_staging_root, os.W_OK)
+                        except OSError as _stage_err:
+                            _staging_ok = False
+                            logger.warning(
+                                "[Atomic Publish] Batch %s: cannot create staging dir %s (%s) "
+                                "— publishing directly instead. The album may be visible to "
+                                "your media server before every track lands.",
+                                batch_id, _staging_root, _stage_err)
+                        if _staging_ok:
+                            batch['_atomic_active'] = True
+                            batch['_atomic_transfer_dir'] = transfer_dir
+                            batch['_atomic_staging_root'] = _staging_root
+                            logger.info("[Atomic Publish] Batch %s: STAGING album until complete "
+                                        "(album=%r, transfer=%s)", batch_id,
+                                        os.path.basename(album_folder), transfer_dir)
+                            # #1289: put the batch's identity on disk NOW. Everything
+                            # that knows what this directory is lives in a dict in
+                            # this process; if the process goes away mid-album the
+                            # tree becomes anonymous audio that no scanner looks at.
+                            try:
+                                from core.downloads.atomic_manifest import begin_batch
+                                begin_batch(_staging_root, batch_id=batch_id,
+                                            transfer_dir=transfer_dir,
+                                            profile_id=batch.get('profile_id'),
+                                            album_name=os.path.basename(album_folder))
+                            except Exception as _man_err:  # noqa: BLE001
+                                logger.debug("[Atomic Publish] manifest header failed: %s", _man_err)
                     else:
                         logger.info("[Atomic Publish] Batch %s: album folder already has tracks "
                                     "(completeness fill) — publishing directly: %s",
@@ -581,6 +608,162 @@ def _persist_verification_status(context, final_path):
         logger.debug(f"verification-status persist skipped: {_vs_err}")
 
 
+def _maybe_write_artist_nfo(context: dict, final_path: str, config_manager) -> None:
+    """#1449: optional artist.nfo (Jellyfin/Kodi/Emby) in the artist folder.
+
+    Idempotent (skips when the nfo exists) and never raises — a sidecar
+    must not break the import. Called on every path where a file actually
+    lands in the library (normal post-processing, another-thread-won, and
+    stream-processor-variant paths).
+    """
+    try:
+        from core.library.artist_nfo import ensure_artist_nfo_for_track
+        _nfo_ok, _nfo_detail = ensure_artist_nfo_for_track(
+            context.get('_final_processed_path', final_path), config_manager)
+        if _nfo_ok:
+            logger.info(f"artist.nfo written: {_nfo_detail}")
+    except Exception as _nfo_err:  # noqa: BLE001 — best effort sidecar
+        logger.debug(f"artist.nfo write skipped: {_nfo_err}")
+
+
+def _apply_profile_output_transforms(final_path: str, context: dict,
+                                     profile: dict) -> str:
+    """Apply downsample/lossy retention while preserving acquisition truth."""
+    acquired_quality = probe_audio_quality(final_path)
+    if acquired_quality is not None:
+        context['_acquired_audio_quality'] = acquired_quality.to_dict()
+
+    downsampled_path = downsample_hires_flac(
+        final_path, context, enabled=profile.get('downsample_enabled'))
+    if downsampled_path:
+        final_path = downsampled_path
+        context['_final_processed_path'] = final_path
+        retained_quality = probe_audio_quality(final_path)
+        context.setdefault('_retention_transforms', []).append({
+            'type': 'downsample_hires_flac',
+            'source_replaced': True,
+            'target_bit_depth': 16,
+            'target_sample_rate': 44100,
+            'output_quality': retained_quality.to_dict() if retained_quality else None,
+        })
+
+    _persist_verification_status(context, final_path)
+
+    lossy_path = create_lossy_copy(final_path, settings={
+        'enabled': profile.get('lossy_copy_enabled'),
+        'codec': profile.get('lossy_copy_codec'),
+        'bitrate': profile.get('lossy_copy_bitrate'),
+        'delete_original': profile.get('lossy_copy_delete_original'),
+    } if profile else None)
+    if not lossy_path:
+        return final_path
+
+    source_retained = os.path.isfile(final_path)
+    lossy_quality = probe_audio_quality(lossy_path)
+    context.setdefault('_retention_transforms', []).append({
+        'type': 'lossy_copy',
+        'source_replaced': not source_retained,
+        'codec': profile.get('lossy_copy_codec'),
+        'bitrate': profile.get('lossy_copy_bitrate'),
+        'output_quality': lossy_quality.to_dict() if lossy_quality else None,
+    })
+    if source_retained:
+        companions = context.setdefault('_companion_file_paths', [])
+        if lossy_path not in companions:
+            companions.append(lossy_path)
+        context['_final_processed_path'] = final_path
+        return final_path
+
+    context['_final_processed_path'] = lossy_path
+    return lossy_path
+
+
+def _update_moved_track_file_path(old_path: str, new_path: str) -> None:
+    """Point the SoulSync library row at a track file's new location after
+    an M5 album-folder merge. Best-effort: a stale file_path is worse than
+    a missed update, but a failed update must never fail the import."""
+    try:
+        if config_manager.get_active_media_server() != "soulsync":
+            return
+        db = get_database()
+        with db._get_connection() as conn:
+            conn.execute(
+                "UPDATE tracks SET file_path = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE file_path = ?",
+                (new_path, old_path),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.debug("[M5] Could not update moved track path %s -> %s: %s", old_path, new_path, e)
+
+
+def _merge_upgraded_album_folder(context, artist_context, album_info, old_album_name,
+                                 file_ext, new_final_path) -> None:
+    """M5: the album group just upgraded standard -> deluxe. Tracks filed
+    earlier under the standard folder are moved into the deluxe folder so
+    the album is not split across two folders by processing order.
+
+    The old folder is located with a dry-run of the real path builder, so
+    custom templates stay consistent. Never raises — a failed merge leaves
+    the split in place (the pre-existing behavior), it must not fail the
+    deluxe track's own import.
+    """
+    try:
+        old_album_info = dict(album_info) if isinstance(album_info, dict) else {}
+        old_album_info["album_name"] = old_album_name
+        old_final_path, old_is_replace = build_final_path_for_track(
+            context, artist_context, old_album_info, file_ext, create_dirs=False
+        )
+        if old_is_replace:
+            return
+        old_folder = os.path.dirname(old_final_path or "")
+        new_folder = os.path.dirname(new_final_path or "")
+        if not old_folder or not new_folder or old_folder == new_folder:
+            return
+        # Safety: only touch folders under the transfer/library root.
+        transfer_dir = os.path.normpath(transfer_root_for_context(context))
+        if os.path.commonpath([os.path.normpath(old_folder), transfer_dir]) != transfer_dir:
+            logger.warning("[M5] Upgrade merge refused: %s is outside the library root", old_folder)
+            return
+        if not os.path.isdir(old_folder):
+            return
+        os.makedirs(new_folder, exist_ok=True)
+        try:
+            entries = os.listdir(old_folder)
+        except OSError:
+            return
+        for entry in entries:
+            src = os.path.join(old_folder, entry)
+            if not os.path.isfile(src):
+                continue
+            dst = os.path.join(new_folder, entry)
+            if os.path.exists(dst):
+                logger.warning(
+                    "[M5] Upgrade merge: %s already exists in %s — leaving %s in place",
+                    entry, new_folder, src,
+                )
+                continue
+            try:
+                shutil.move(src, dst)
+            except OSError as e:
+                logger.error("[M5] Upgrade merge: could not move %s -> %s: %s", src, dst, e)
+                continue
+            _update_moved_track_file_path(src, dst)
+        try:
+            os.rmdir(old_folder)
+        except OSError:
+            pass  # not empty (name conflicts) — leave the remainder in place
+        logger.info("[M5] Merged upgraded album folder %s -> %s", old_folder, new_folder)
+    except Exception as e:
+        logger.error("[M5] Album folder merge failed (non-fatal): %s", e)
+
+
+def owning_batch_id(context):
+    """the batch a file was downloaded for. the verification wrapper pops
+    batch_id (it owns the completion callbacks) and keeps it here instead."""
+    return context.get('batch_id') or context.get('_owning_batch_id')
+
+
 def post_process_matched_download(context_key, context, file_path, runtime, metadata_runtime=None):
     on_download_completed = getattr(runtime, "on_download_completed", None)
     automation_engine = getattr(runtime, "automation_engine", None)
@@ -592,44 +775,6 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         if on_download_completed:
             on_download_completed(batch_id, task_id, success=success)
 
-    def _settle_task(*, success: bool, outcome: str, final_path=None):
-        """Bring this download's TASK to a terminal state, whatever the outcome.
-
-        Every ``return`` out of this function ends the work for that task, and
-        several of them mean "the library already has this" — a success from the
-        user's side, not a reason to stay silent. Those returned without touching
-        the task at all, so the row sat at "Downloading" indefinitely and whatever
-        queued it queued it again: one track was re-downloaded 64 times across
-        three days and skipped identically every time.
-
-        Deliberately NOT gated on ``batch_id``. A manual pick from the search
-        modal has a task and no batch, and requiring both is why 836 successful
-        imports in one instance's logs marked exactly zero tasks completed. The
-        batch NOTIFY still needs one — without a batch there is no queue slot to
-        release — but a task's own status never did.
-        """
-        task_id = context.get('task_id')
-        if not task_id:
-            return
-        batch_id = context.get('batch_id')
-        with tasks_lock:
-            task = download_tasks.get(task_id)
-            if isinstance(task, dict):
-                if success:
-                    _mark_task_completed(task_id, context.get('track_info'))
-                    if final_path:
-                        task['final_file_path'] = final_path
-                else:
-                    task['status'] = 'failed'
-                    task['stream_processed'] = True
-                    task['status_change_time'] = time.time()
-                    if outcome:
-                        task['error_message'] = outcome
-                logger.info("[Post-Process] Task %s settled as %s — %s",
-                            task_id, task.get('status'), outcome)
-        if batch_id:
-            _notify_download_completed(batch_id, task_id, success=success)
-
     with post_process_locks_lock:
         if context_key not in post_process_locks:
             post_process_locks[context_key] = threading.Lock()
@@ -637,6 +782,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
     file_lock.acquire()
     try:
+        # Commissary: a retried context starts without the last attempt's error.
+        if isinstance(context, dict):
+            context.pop('_post_process_error', None)
         if not os.path.exists(file_path):
             existing_final = context.get('_final_processed_path')
             if existing_final and os.path.exists(existing_final):
@@ -644,6 +792,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     f"[Race Guard] Source gone but destination exists — already processed by another thread: "
                     f"{os.path.basename(existing_final)}"
                 )
+                context['_pipeline_import_succeeded'] = True
                 return
             # File was intentionally moved to quarantine by a concurrent/earlier
             # post-process call — this is a stale duplicate dispatch, not a race.
@@ -695,6 +844,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         # skip the duration-agreement leg (it would false-quarantine a file that
         # drifts from a re-resolved release; #804). Size + parse legs still run.
         _is_local_import = bool(context.get('is_local_import')) if isinstance(context, dict) else False
+        _expected_duration_ms = duration_reference_for_context(_expected_duration_ms, context)
         _expected_duration_ms = expected_duration_for_check(_expected_duration_ms, _is_local_import)
         if _is_local_import and _expected_duration_ms is None:
             logger.debug("[Integrity] Local import — duration-agreement leg skipped for %s", _basename)
@@ -718,6 +868,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     file_path,
                     _expected_duration_ms,
                     length_tolerance_s=_duration_tolerance_override,
+                    verify_flac_decode=bool(
+                        config_manager.get('post_processing.verify_flac_decode', False)),
                 )
             except Exception as integrity_error:
                 logger.error(f"[Integrity] Check raised unexpectedly (continuing): {integrity_error}")
@@ -793,6 +945,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         if audio_reason:
             logger.error(f"[AudioGuard] Rejected {_basename}: {audio_reason}")
             context['_silence_rejected'] = True
+            # Stashed for the verification wrapper, which runs this pipeline
+            # with task_id popped out of the context (see _mark_task_quarantined)
+            # and so must do the retry/fail marking itself afterward.
+            context['_quarantine_reject_reason'] = f"Audio guard: {audio_reason}"
             try:
                 quarantine_path = move_to_quarantine(
                     file_path, context, audio_reason, automation_engine,
@@ -826,6 +982,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     if task_id in download_tasks:
                         download_tasks[task_id]['status'] = 'failed'
                         download_tasks[task_id]['error_message'] = f"Audio guard: {audio_reason}"
+                _record_failed_download_blocklist(task_id, f"audio guard: {audio_reason}")
             if task_id and batch_id:
                 _notify_download_completed(batch_id, task_id, success=False)
             return
@@ -835,13 +992,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         # audio quality is recorded on the context (→ quarantine sidecar) for
         # EVERY trigger, so it's known when reviewing/approving any quarantined
         # file. force_import still never fires on a quality mismatch.
-        # The source's own pre-download claim (a YouTube itag, a Tidal tier) is
-        # the only bitrate available for a container that carries none.
-        _claim = get_import_original_search(context) or {}
         context['_audio_quality'] = get_audio_quality_string(
             file_path,
-            claimed_format=_claim.get('quality'),
-            claimed_bitrate=_claim.get('bitrate'),
+            claimed_format=(get_import_original_search(context) or {}).get('quality'),
+            claimed_bitrate=(get_import_original_search(context) or {}).get('bitrate'),
         )
         if context['_audio_quality']:
             logger.info(f"Audio quality detected: {context['_audio_quality']}")
@@ -871,6 +1025,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     )
 
                 context['_bitdepth_rejected'] = True
+                # Same wrapper stash as the audio guard above.
+                context['_quarantine_reject_reason'] = f"Quality filter: {rejection_reason}"
                 task_id = context.get('task_id')
                 batch_id = context.get('batch_id')
                 with matched_context_lock:
@@ -1057,7 +1213,9 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             # automation; fail open when the engine isn't available.
             _auto_scan_on = (automation_engine is None
                              or automation_engine.is_event_action_enabled('batch_complete', 'scan_library'))
-            if web_scan_manager and _auto_scan_on:
+            # a simple download inside a batch (basic search as-is) gets its
+            # scan from batch_complete, scanning here too would run it twice
+            if web_scan_manager and _auto_scan_on and not context.get('batch_id'):
                 threading.Thread(
                     target=lambda: web_scan_manager.request_scan("Simple download completed"),
                     daemon=True,
@@ -1068,12 +1226,13 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             logger.info(f"Simple download post-processing complete: {activity_target}")
             context['_simple_download_completed'] = True
             context['_final_path'] = str(destination)
+            context['_pipeline_import_succeeded'] = True
             _persist_verification_status(context, destination)
             emit_track_downloaded(context, automation_engine)
             record_library_history_download(context)
             record_download_provenance(context)
             try:
-                check_and_remove_from_wishlist(context)
+                check_and_remove_from_wishlist(context, published_path=str(destination))
             except Exception as wishlist_error:
                 logger.error(f"[Simple Download] Error checking wishlist removal: {wishlist_error}")
             return
@@ -1088,6 +1247,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
         if not artist_context:
             logger.error("Post-processing failed: Missing artist context.")
+            # H4: leave an outcome flag — without it the verification
+            # wrapper falls through to "cannot verify, assuming success"
+            # and marks the task Completed for a file that went nowhere.
+            context['_context_failure_msg'] = 'Missing artist context'
             return
 
         _junk_artist_names = {'', 'unknown', 'unknown artist', 'various artists', 'none', 'null'}
@@ -1232,6 +1395,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     "onto track 1)", scan_order,
                 )
                 track_number = scan_order
+            elif (album_info.get('is_album') and
+                  get_import_context_album(context).get('album_type') in ('compilation', 'compile')):
+                logger.warning("No reliable compilation track number; preserving unknown position")
+                track_number = 0
             else:
                 logger.error(f"Invalid track number ({track_number}), defaulting to 1")
                 track_number = 1
@@ -1251,10 +1418,85 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             logger.info(f"[FIX] Updated album_info disc_number to {_resolved_disc} for consistent metadata")
         album_info['disc_number'] = _resolved_disc
 
-        final_path, _ = build_final_path_for_track(context, artist_context, album_info, file_ext)
+        _enhance_source_info = get_import_track_info(context).get('source_info') or {}
+        if isinstance(_enhance_source_info, str):
+            try:
+                _enhance_source_info = json.loads(_enhance_source_info)
+            except (json.JSONDecodeError, TypeError):
+                _enhance_source_info = {}
+        if not isinstance(_enhance_source_info, dict):
+            _enhance_source_info = {}
+        is_enhance_download = _enhance_source_info.get('enhance', False)
+        # Finder-approved wishlist items already persist this per-track job
+        # provenance. It authorizes a measured upgrade, never a blanket force
+        # overwrite of the batch (ordinary wishlist items stay protected).
+        is_quality_upgrade = _enhance_source_info.get('job') == 'quality_upgrade'
+
+        # M5: re-resolve the album group just before filing — a concurrent
+        # track may have upgraded standard -> deluxe after this track
+        # resolved it above. The group only ever upgrades, never
+        # downgrades, so this can only move the track into the newer folder.
+        _group_upgraded_from = None
+        if album_info and album_info.get('is_album') and not is_album_download:
+            _regrouped = resolve_album_group(artist_context, album_info, original_album)
+            if _regrouped and _regrouped != album_info.get('album_name'):
+                logger.info(
+                    "Album grouping re-resolved before filing: %r -> %r",
+                    album_info.get('album_name'), _regrouped,
+                )
+                album_info['album_name'] = _regrouped
+            _group_upgraded_from = album_info.pop('_album_group_upgraded_from', None)
+
+        # R4F3: the filing path is built BEFORE metadata enhancement computes
+        # the batch-album distrust verdict — a poisoned batch context would
+        # otherwise stamp the stranger's folder/year/type. Compute the verdict
+        # here (pure function of the per-track inputs) and stash it on the
+        # shared context dict: build_final_path_for_track substitutes the
+        # track's own album year/type/artist when distrusted, and
+        # extract_source_metadata + the library row writer reuse the verdict
+        # instead of recomputing (this also covers enhancement-disabled
+        # imports, where the verdict was never stashed before).
+        try:
+            _f3_track_info = get_import_track_info(context)
+            _f3_verdict = evaluate_batch_album_distrust(
+                get_import_original_search(context),
+                _f3_track_info,
+                get_import_context_album(context),
+                _f3_track_info.get("_explicit_artist_context")
+                if isinstance(_f3_track_info, dict) else None,
+            )
+            if _f3_verdict.get("distrusted"):
+                context["_batch_album_distrust_verdict"] = _f3_verdict
+                context["_batch_album_distrusted"] = True
+                context["_track_own_provider_album"] = dict(
+                    _f3_verdict.get("own_album") or {})
+                context["_track_own_artist_display_names"] = list(
+                    _f3_verdict.get("own_artist_display_names") or [])
+                logger.warning(
+                    "[Import] batch album context distrusted before filing: %s",
+                    _f3_verdict.get("reason") or "",
+                )
+        except Exception:  # noqa: BLE001 — a filing-path verdict must never fail an import
+            logger.warning(
+                "[Import] batch-album distrust pre-check failed; filing without distrust")
+            logger.debug(
+                "[Import] batch-album distrust pre-check traceback", exc_info=True)
+
+        final_path, _final_is_replace = build_final_path_for_track(context, artist_context, album_info, file_ext)
+        if _group_upgraded_from and not _final_is_replace:
+            # M5: this track upgraded the group — relocate tracks already
+            # filed under the standard folder so the album isn't split
+            # across two folders by processing order.
+            _merge_upgraded_album_folder(
+                context, artist_context, album_info,
+                _group_upgraded_from, file_ext, final_path,
+            )
         # #999 atomic album publish (opt-in): redirect to a private staging mirror
         # for fresh whole-album batches; returns final_path unchanged otherwise.
-        final_path = _maybe_stage_album_track(context, final_path)
+        # Upgrades publish at the live destination before retiring an old copy;
+        # a private album staging path is not a completed replacement.
+        if not is_quality_upgrade:
+            final_path = _maybe_stage_album_track(context, final_path)
         logger.info(f"Resolved path: '{final_path}'")
         context['_final_processed_path'] = final_path
 
@@ -1284,48 +1526,70 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                     "[Metadata] Enhancement failed but import has clean/matched metadata — "
                     "preserving the file's existing tags (not wiping): %s",
                     os.path.basename(file_path))
+                # #1555: the preserved tags can carry the Soulseek uploader's
+                # FOREIGN MusicBrainz album ids. One divergent release id is
+                # enough to split the album into duplicate entries on the
+                # media server while its siblings carry SoulSync's pinned
+                # release id. Strip only the album-identity ids; everything
+                # else stays exactly as the #804 protection requires.
+                strip_musicbrainz_identity_tags(file_path)
 
-        _enhance_source_info = context.get('track_info', {}).get('source_info') or {}
-        if isinstance(_enhance_source_info, str):
-            try:
-                _enhance_source_info = json.loads(_enhance_source_info)
-            except (json.JSONDecodeError, TypeError):
-                _enhance_source_info = {}
-        is_enhance_download = _enhance_source_info.get('enhance', False)
         # "Force download" is replace-intent: the user explicitly re-downloaded
         # something they already own, so the metadata-protection skip must not
         # discard it (#1045). Rides the same replace path as enhance — the
         # short-file replacement guard above still applies.
-        force_replace = _batch_force_replace(context) or _user_download_replaces(context)
+        force_replace = _batch_force_replace(context)
+
+        quality_profile = _resolve_context_quality_profile(context)
+        replace_lower = quality_profile.get(
+            'replace_lower_quality', config_manager.get('import.replace_lower_quality', False))
+        upgrade_original = None
+        if is_quality_upgrade and _enhance_source_info.get('original_file_path'):
+            from core.library.path_resolver import resolve_library_file_path
+            upgrade_original = resolve_library_file_path(
+                _enhance_source_info['original_file_path'], config_manager=config_manager)
+
+        # Run outside the metadata try/except: neither missing tags nor a
+        # metadata read error may turn a failed quality comparison into a
+        # permitted overwrite. Check the original too when the extension or
+        # destination changed; it must survive until the new file is published.
+        if is_quality_upgrade or (replace_lower and not is_enhance_download and not force_replace):
+            replacement_paths = {p for p in (final_path, upgrade_original) if p and os.path.isfile(p)}
+            for existing_path in replacement_paths:
+                if not is_profile_upgrade(existing_path, file_path, quality_profile):
+                    reason = 'Incoming file is not a verified improvement under the quality profile'
+                    logger.info("[Protection] %s: %s", reason, existing_path)
+                    context['_context_failure_msg'] = reason
+                    context['_kept_existing_library_file'] = True
+                    return
+            if upgrade_original and os.path.normpath(upgrade_original) != os.path.normpath(final_path):
+                if not _replacement_length_is_safe(upgrade_original, file_path):
+                    reason = 'Replacement guard: incoming file is far shorter than the library file'
+                    context['_integrity_failure_msg'] = reason
+                    try:
+                        qpath = move_to_quarantine(file_path, context, reason, automation_engine, trigger='integrity')
+                        _mark_task_quarantined(context, qpath)
+                    except Exception as exc:
+                        logger.error("Could not quarantine short upgrade (original retained): %s", exc)
+                    return
 
         logger.info(f"Moving '{os.path.basename(file_path)}' to '{final_path}'")
-        # The library's existing copy of this track, which is NOT necessarily at
-        # final_path: an upgrade changes the container, so .opus -> .flac never
-        # lands on the same path and every check below used to be skipped. Only
-        # consulted while the source file is still here — with it gone, the
-        # pre-move recovery further down owns the situation, exactly as before.
-        existing_path = _resolve_replace_target(
-            final_path, file_path,
-            album_info.get('track_number') if album_info else None,
-            _resolve_context_quality_profile(context))
-        if existing_path:
+        if os.path.exists(final_path):
             if not os.path.exists(file_path):
-                # Only reachable with existing_path == final_path; see above.
                 logger.info(f"[Protection] Destination exists and source already gone - file already transferred: {os.path.basename(final_path)}")
-                _settle_task(success=True, outcome='already in the library',
-                             final_path=final_path)
+                context['_pipeline_import_succeeded'] = True
                 return
             # THE backstop for sella's incident: an upgrade/replace must NEVER
             # swap a good library file for a materially shorter one. Every path
-            # below can os.remove(existing_path) and move the incoming file in — so
+            # below can os.remove(final_path) and move the incoming file in — so
             # before any of them, compare the REAL decoded lengths. A 30s HiFi
             # preview replacing a 220s track is caught here even if every header
             # (and AcoustID) was faked, and even for files no other gate saw.
-            if not _replacement_length_is_safe(existing_path, file_path):
+            if not _replacement_length_is_safe(final_path, file_path):
                 logger.error(
                     "[Protection] Refusing to replace %s — the incoming file is "
                     "far shorter (likely a preview/truncated clip). Quarantining it.",
-                    os.path.basename(existing_path))
+                    os.path.basename(final_path))
                 try:
                     qpath = move_to_quarantine(
                         file_path, context,
@@ -1336,62 +1600,30 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 except Exception as _qe:   # noqa: BLE001
                     logger.error("[Protection] Could not quarantine the short replacement "
                                  "(leaving in place, NOT replacing): %s", _qe)
-                _settle_task(success=False, outcome=(
-                    "Replacement rejected: incoming file is far shorter "
-                    "than the existing library file"))
+                task_id = context.get('task_id')
+                batch_id = context.get('batch_id')
+                if task_id:
+                    with tasks_lock:
+                        if task_id in download_tasks:
+                            download_tasks[task_id]['status'] = 'failed'
+                            download_tasks[task_id]['error_message'] = (
+                                "Replacement rejected: incoming file is far shorter "
+                                "than the existing library file")
+                    if batch_id:
+                        _notify_download_completed(batch_id, task_id, success=False)
                 with matched_context_lock:
                     if context_key in matched_downloads_context:
                         del matched_downloads_context[context_key]
                 return
             try:
                 from mutagen import File as MutagenFile
-                existing_file = MutagenFile(existing_path)
+                existing_file = MutagenFile(final_path)
                 has_metadata = existing_file is not None and len(existing_file.tags or {}) > 2
                 if has_metadata and not is_enhance_download and not force_replace:
-                    _replace_lower = _resolve_context_quality_profile(context).get(
-                        'replace_lower_quality',
-                        config_manager.get('import.replace_lower_quality', False))
-                    if _replace_lower:
-                        _existing_tier = get_quality_tier_from_extension(existing_path)
-                        _incoming_tier = get_quality_tier_from_extension(file_path)
-                        if _incoming_tier[1] < _existing_tier[1]:
-                            logger.info(f"[Quality Replace] Replacing {_existing_tier[0]} with {_incoming_tier[0]}: {os.path.basename(existing_path)}")
-                            try:
-                                os.remove(existing_path)
-                            except Exception as e:
-                                logger.error(f"[Quality Replace] Could not remove existing file: {e}")
-                        else:
-                            logger.info(
-                                f"[Protection] Existing file is same or better quality ({_existing_tier[0]} vs {_incoming_tier[0]}) - skipping: "
-                                f"{os.path.basename(existing_path)}"
-                            )
-                            try:
-                                os.remove(file_path)
-                            except FileNotFoundError:
-                                pass
-                            except Exception as e:
-                                logger.error(f"[Protection] Error removing redundant file: {e}")
-                            _settle_task(success=True, outcome=(
-                                'the library copy is the same or better quality'),
-                                final_path=existing_path)
-                            return
-                    elif existing_path != final_path:
-                        # The existing copy is a DIFFERENT container or naming, and
-                        # this install has not asked for lower-quality replacement.
-                        # Discarding the download here would be a new way to lose a
-                        # file: before the cross-container lookup existed this case
-                        # was invisible and the incoming file was simply placed. Keep
-                        # that outcome — a duplicate, as before — rather than deleting
-                        # what may well be the better copy. Turning on "replace lower
-                        # quality" is what asks for the upgrade.
-                        logger.info(
-                            "[Protection] '%s' already exists in another format and "
-                            "replace-lower-quality is off — placing '%s' alongside it "
-                            "rather than discarding it",
-                            os.path.basename(existing_path), os.path.basename(final_path))
-                        existing_path = None
+                    if replace_lower or is_quality_upgrade:
+                        logger.info("[Quality Replace] Verified profile improvement: %s", os.path.basename(final_path))
                     else:
-                        logger.info(f"[Protection] Existing file already has metadata enhancement - skipping overwrite: {os.path.basename(existing_path)}")
+                        logger.info(f"[Protection] Existing file already has metadata enhancement - skipping overwrite: {os.path.basename(final_path)}")
                         logger.info(f"[Protection] Removing redundant download file: {os.path.basename(file_path)}")
                         try:
                             os.remove(file_path)
@@ -1399,40 +1631,28 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                             logger.error(f"[Protection] Could not remove redundant file (already gone): {file_path}")
                         except Exception as e:
                             logger.error(f"[Protection] Error removing redundant file: {e}")
-                        _settle_task(success=True, outcome=(
-                            'the library copy already has enhanced metadata'),
-                            final_path=existing_path)
+                        context['_pipeline_import_succeeded'] = not os.path.exists(file_path)
+                        if not context['_pipeline_import_succeeded']:
+                            context['_context_failure_msg'] = 'could not remove redundant import source'
+                        context['_kept_existing_library_file'] = True
                         return
                 elif is_enhance_download or force_replace:
                     if is_enhance_download:
-                        logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(existing_path)}")
+                        logger.info(f"[Enhance] Quality enhance mode — replacing existing file: {os.path.basename(final_path)}")
                     else:
-                        logger.info(f"[Force] User-forced re-download — replacing existing file: {os.path.basename(existing_path)}")
-                    try:
-                        os.remove(existing_path)
-                    except Exception as e:
-                        logger.error(f"[Enhance] Could not remove existing file for replacement: {e}")
+                        logger.info(f"[Force] User-forced re-download — replacing existing file: {os.path.basename(final_path)}")
                 else:
-                    logger.info(f"[Protection] Existing file lacks metadata - safe to overwrite: {os.path.basename(existing_path)}")
-                    try:
-                        os.remove(existing_path)
-                    except FileNotFoundError:
-                        pass
+                    logger.info(f"[Protection] Existing file lacks metadata - safe to overwrite: {os.path.basename(final_path)}")
             except Exception as check_error:
                 logger.error(f"[Protection] Error checking existing file metadata, proceeding with overwrite: {check_error}")
-                try:
-                    if os.path.exists(existing_path):
-                        os.remove(existing_path)
-                except Exception as e:
-                    logger.error(f"[Protection] Failed to remove existing file for overwrite: {e}")
 
         if not os.path.exists(file_path):
             if os.path.exists(final_path):
                 logger.info(f"[Pre-Move] Source already gone and destination exists - another thread completed transfer: {os.path.basename(final_path)}")
                 download_cover_art(album_info, os.path.dirname(final_path), context)
                 generate_lrc_file(final_path, context, artist_context, album_info)
-                _settle_task(success=True, outcome='another thread completed the transfer',
-                             final_path=final_path)
+                context['_pipeline_import_succeeded'] = True
+                _maybe_write_artist_nfo(context, final_path, config_manager)
                 return
             expected_dir = os.path.dirname(final_path)
             expected_stem = os.path.splitext(os.path.basename(final_path))[0]
@@ -1457,8 +1677,8 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 context['_final_processed_path'] = found_variant
                 download_cover_art(album_info, expected_dir, context)
                 generate_lrc_file(found_variant, context, artist_context, album_info)
-                _settle_task(success=True, outcome='the stream processor already placed it',
-                             final_path=found_variant)
+                context['_pipeline_import_succeeded'] = True
+                _maybe_write_artist_nfo(context, found_variant, config_manager)
                 return
             logger.warning(f"[Pre-Move] Source file gone and no matching file in destination: {os.path.basename(file_path)}")
             raise FileNotFoundError(f"Source file vanished before move and destination does not exist: {file_path}")
@@ -1468,12 +1688,43 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         move_companion_sidecars(file_path, final_path)
         cleanup_slskd_dedup_siblings(file_path)
 
+        if (is_quality_upgrade and upgrade_original
+                and os.path.normpath(upgrade_original) != os.path.normpath(final_path)
+                and os.path.isfile(upgrade_original)):
+            # Recheck before retiring a different-path original: another import
+            # may have upgraded it while this download was being published.
+            if (is_profile_upgrade(upgrade_original, final_path, quality_profile)
+                    and _replacement_length_is_safe(upgrade_original, final_path)):
+                try:
+                    os.remove(upgrade_original)
+                    logger.info("[Quality Replace] Retired superseded file: %s", upgrade_original)
+                except OSError as exc:
+                    logger.warning("[Quality Replace] New file imported but old copy could not be removed: %s", exc)
+
         if is_enhance_download and _enhance_source_info.get('original_file_path'):
             original_enhance_path = _enhance_source_info['original_file_path']
-            if os.path.normpath(original_enhance_path) != os.path.normpath(final_path) and os.path.exists(original_enhance_path):
+            # #1109 second half: the recorded path is the MEDIA SERVER's view of
+            # the library ("/music/…"), which this process usually cannot see.
+            # `os.path.exists` therefore said False, the removal was skipped, and
+            # the branch below logged "Replaced in-place" — while the superseded
+            # copy stayed on disk next to the new one. Resolve it through the
+            # same resolver the destination uses before deciding.
+            _old_path = original_enhance_path
+            if not os.path.exists(_old_path):
                 try:
-                    os.remove(original_enhance_path)
-                    old_fmt = os.path.splitext(original_enhance_path)[1]
+                    from core.library.path_resolver import resolve_library_file_path
+                    _old_path = resolve_library_file_path(
+                        original_enhance_path, config_manager=config_manager) or _old_path
+                except Exception as _resolve_err:   # noqa: BLE001 - best effort
+                    logger.debug(
+                        f"[Enhance] could not resolve the old file's path: {_resolve_err}")
+            # Compare the RESOLVED path, not the recorded one. An in-place
+            # replacement resolves to the file we just wrote; deleting that would
+            # destroy the upgrade itself.
+            if os.path.normpath(_old_path) != os.path.normpath(final_path) and os.path.exists(_old_path):
+                try:
+                    os.remove(_old_path)
+                    old_fmt = os.path.splitext(_old_path)[1]
                     new_fmt = os.path.splitext(final_path)[1]
                     logger.info(f"[Enhance] Upgraded {old_fmt} → {new_fmt}: {os.path.basename(final_path)}")
                 except Exception as e:
@@ -1498,23 +1749,10 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
                 pp_logger.debug(f"ReplayGain analysis skipped: {rg_err}")
 
         _qp_post = _resolve_context_quality_profile(context)
-        downsampled_path = downsample_hires_flac(
-            final_path, context,
-            enabled=_qp_post.get('downsample_enabled'))
-        if downsampled_path:
-            final_path = downsampled_path
-            context['_final_processed_path'] = final_path
+        final_path = _apply_profile_output_transforms(
+            final_path, context, _qp_post)
 
-        _persist_verification_status(context, final_path)
-
-        blasphemy_path = create_lossy_copy(final_path, settings={
-            'enabled': _qp_post.get('lossy_copy_enabled'),
-            'codec': _qp_post.get('lossy_copy_codec'),
-            'bitrate': _qp_post.get('lossy_copy_bitrate'),
-            'delete_original': _qp_post.get('lossy_copy_delete_original'),
-        } if _qp_post else None)
-        if blasphemy_path:
-            context['_final_processed_path'] = blasphemy_path
+        _maybe_write_artist_nfo(context, final_path, config_manager)
 
         downloads_path = docker_resolve_path(config_manager.get('soulseek.download_path', './downloads'))
         cleanup_empty_directories(downloads_path, file_path)
@@ -1525,6 +1763,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         record_library_history_download(context)
         record_download_provenance(context)
         record_soulsync_library_entry(context, artist_context, album_info)
+        _record_manual_lock(context, final_path)
 
         try:
             completed_path = context.get('_final_processed_path', final_path)
@@ -1538,7 +1777,7 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
 
         try:
             completed_path = context.get('_final_processed_path', final_path)
-            batch_id_for_consistency = context.get('batch_id')
+            batch_id_for_consistency = owning_batch_id(context)
             if completed_path and batch_id_for_consistency and album_info and album_info.get('is_album'):
                 _file_info = {
                     'path': str(completed_path),
@@ -1557,15 +1796,34 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
             logger.error(f"[Post-Process] Album consistency registration failed: {cons_err}")
 
         try:
-            check_and_remove_from_wishlist(context)
+            # A routed artist's album gets its metadata.opf (series, episode number)
+            # as soon as a track lands; a no-op for everything filed as music.
+            from core.audiobook_routing import write_album_sidecars_for_file
+            write_album_sidecars_for_file(context.get('_final_processed_path', final_path))
+        except Exception as sidecar_err:
+            logger.debug(f"[Post-Process] Audiobook sidecar skipped: {sidecar_err}")
+
+        try:
+            _settle_wishlist_for_completed_track(
+                context, context.get('_final_processed_path', final_path))
         except Exception as wishlist_error:
             logger.error(f"[Post-Process] Error checking wishlist removal: {wishlist_error}")
 
-        # `final_file_path` is additive: it records where the imported file
-        # landed so downstream (playlist materialization) knows the real path of
-        # a freshly downloaded track without re-resolving it.
-        _settle_task(success=True, outcome='imported',
-                     final_path=context.get('_final_processed_path', final_path))
+        task_id = context.get('task_id')
+        batch_id = context.get('batch_id')
+        if task_id and batch_id:
+            logger.info(f"[Post-Process] Calling completion callback for task {task_id} in batch {batch_id}")
+            with tasks_lock:
+                if task_id in download_tasks:
+                    download_tasks[task_id]['stream_processed'] = True
+                    download_tasks[task_id]['status'] = 'completed'
+                    # Additive: record where the imported file landed so downstream
+                    # (playlist materialization) knows the real path of a freshly
+                    # downloaded track without re-resolving it.
+                    download_tasks[task_id]['final_file_path'] = context.get('_final_processed_path')
+                    logger.info(f"[Post-Process] Marked task {task_id} as completed")
+            _notify_download_completed(batch_id, task_id, success=True)
+        context['_pipeline_import_succeeded'] = True
 
     except Exception as e:
         import traceback
@@ -1573,21 +1831,13 @@ def post_process_matched_download(context_key, context, file_path, runtime, meta
         pp_logger.info(traceback.format_exc())
         logger.error(f"\nCRITICAL ERROR in post-processing for {context_key}: {e}")
         traceback.print_exc()
-
-        # Tell the CALLER it failed. This handler returns normally so the
-        # download monitor can retry, but a manual import has no monitor — it
-        # just saw a clean return and counted a success, so the file sat in the
-        # download folder while the UI said "Track Imported". Recorded on the
-        # context because that is how every other terminal outcome is already
-        # reported (see `import_rejection_reason`), rather than adding a second
-        # signalling mechanism the two paths could disagree about.
-        try:
+        # Commissary: tell the caller it failed (see import_rejection_reason).
+        if isinstance(context, dict):
             context['_post_process_error'] = str(e) or e.__class__.__name__
-        except Exception:   # noqa: BLE001 - context is always a dict here; never mask `e`
-            pass
 
         source_exists = os.path.exists(file_path) if file_path else False
         if source_exists:
+            context.setdefault('_context_failure_msg', f'post-processing failed: {e}')
             if context_key in processed_download_ids:
                 processed_download_ids.remove(context_key)
                 logger.warning(f"Removed {context_key} from processed set - will retry on next check")
@@ -1652,37 +1902,32 @@ def _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, meta
 
 def post_process_matched_download_with_verification(context_key, context, file_path, task_id, batch_id, runtime, metadata_runtime=None):
     on_download_completed = getattr(runtime, "on_download_completed", None)
-
-    # EXACTLY-ONCE batch notification.
-    #
-    # This function has a dozen exits. Most notify the batch that the task is
-    # over; four deliberately do NOT, because the task is going around again and
-    # something else owns its outcome. That worked only while every one of those
-    # exits remembered which kind it was — and one that forgets costs a wedged
-    # batch: the slot it reserved is never released, active_count can never fall
-    # to zero, and the batch hangs showing work in progress until the healer
-    # notices. Observed on a real 9-track album: one integrity retry, then
-    # "reported=3, actual=2" every pass for 80 seconds, then "all 9 task(s)
-    # finished but the batch never completed".
-    #
-    # So the bookkeeping is no longer per-exit. A hand-off must be declared; any
-    # other way out of this function notifies, and it can only happen once.
-    _state = {"notified": False, "handed_off": None}
+    # Commissary: a retry hand-off must be declared; the finally below frees
+    # the slot for every exit that neither notified nor handed off (1.9.16).
+    _slot_state = {"notified": False, "handed_off": None}
 
     def _notify_download_completed(batch_id, task_id, success=True):
-        if _state["notified"]:
-            return
-        _state["notified"] = True
+        _slot_state["notified"] = True
         if on_download_completed:
             on_download_completed(batch_id, task_id, success=success)
 
     def _hand_off(reason):
-        """Declare that this task's outcome now belongs to someone else — a
-        queued retry, or the inner pipeline. Suppresses the safety net below."""
-        _state["handed_off"] = reason
+        _slot_state["handed_off"] = reason
 
     logger = pp_logger
     try:
+        # #1351: a batched download only knows its profile through the batch.
+        # The pops below strip batch_id before the inner pipeline builds the
+        # final import path, so import_profile_id() resolved to None and the
+        # file fell back to the shared transfer folder — even for own-library
+        # profiles. The staging route (try_staging_match) never puts batch_id
+        # in its context at all, so resolve through the wrapper's batch_id
+        # argument as well. The pop semantics below stay untouched: this only
+        # preserves the profile the inner pipeline was always meant to see.
+        if not context.get('profile_id'):
+            _resolved_pid = import_profile_id(context) or import_profile_id({'batch_id': batch_id})
+            if _resolved_pid:
+                context['profile_id'] = _resolved_pid
         original_task_id = context.pop('task_id', None)
         original_batch_id = context.pop('batch_id', None)
         # #999: the atomic-publish stage redirect runs inside the inner pipeline
@@ -1692,28 +1937,61 @@ def post_process_matched_download_with_verification(context_key, context, file_p
         # (no extra context key), and popped again before the wrapper continues.
         if original_batch_id and config_manager.get('album_downloads.atomic_publish', False):
             context['_atomic_publish_batch_id'] = original_batch_id
+        # the album-consistency registration needs the batch too. without it
+        # no batched download ever reached the album pass (#1618).
+        # the staging route never puts batch_id in its context, so the argument
+        # is the fallback.
+        context['_owning_batch_id'] = original_batch_id or batch_id
         post_process_matched_download(context_key, context, file_path, runtime, metadata_runtime=metadata_runtime)
         context.pop('_atomic_publish_batch_id', None)
+        context.pop('_owning_batch_id', None)
         if original_task_id:
             context['task_id'] = original_task_id
         if original_batch_id:
             context['batch_id'] = original_batch_id
 
-        # Quality / audio-guard quarantine. Unlike acoustid/integrity (whose
-        # retry+fail is driven by THIS wrapper below), the inner pipeline fully
-        # owns the quality and audio-guard outcome: it quarantines the file and
-        # then either re-queues the next-best candidate or marks the task failed
-        # and notifies. The wrapper must NOT continue to the "assume success"
-        # fall-through — that marked the quarantined file Completed, so the same
-        # track showed in BOTH Completed and Quarantine (e.g. an MP3-VBR rejected
-        # by a FLAC-only profile). It must also NOT mark it failed here, which
-        # would clobber a successful next-candidate retry. Just return.
+        # Quality / audio-guard quarantine. The wrapper must NOT continue to the
+        # "assume success" fall-through — that marked the quarantined file
+        # Completed, so the same track showed in BOTH Completed and Quarantine
+        # (e.g. an MP3-VBR rejected by a FLAC-only profile).
+        #
+        # And the retry/fail marking has to happen HERE, not in the inner
+        # pipeline: this wrapper pops task_id/batch_id out of the context before
+        # the inner run (line ~1434), so the inner branch's own
+        # ``context.get('task_id')`` was None — its requeue returned False
+        # unfired and its failed-marking no-op'd. This code used to just return
+        # on the claim that "the inner pipeline already handled retry/fail",
+        # which is only ever true for DIRECT callers; through the wrapper the
+        # task stayed in post_processing until Stuck Detection V2 reaped it at
+        # 1800s, wedging a download slot for half an hour per quarantine
+        # (Sokhi's "stuck on Processing" report, Aug 16). Same stash-and-apply
+        # pattern _mark_task_quarantined already uses for the entry id.
         if context.get('_bitdepth_rejected') or context.get('_silence_rejected'):
+            trigger = 'quality' if context.get('_bitdepth_rejected') else 'silence'
+            reason = context.get('_quarantine_reject_reason') or \
+                f"{'Quality' if trigger == 'quality' else 'Audio'} guard rejected the file"
+            # Requeue-first, fail-second — the same order the direct path uses.
+            # A successful requeue means the task is live again on its next-best
+            # candidate, so it must not be marked failed.
+            if _requeue_quarantined_task_for_retry(task_id, batch_id, trigger):
+                logger.info(
+                    f"Task {task_id} quarantined by the {trigger} guard — "
+                    f"retrying next-best candidate"
+                )
+                _hand_off(f"{trigger} retry queued")  # Commissary
+                return
             logger.info(
-                f"Task {task_id} quarantined by the quality/audio guard — inner "
-                f"pipeline already handled retry/fail; wrapper not marking completed"
+                f"Task {task_id} quarantined by the {trigger} guard with no "
+                f"retry candidate — marking failed: {reason}"
             )
-            _hand_off("quality/audio guard — inner pipeline owns retry/fail")
+            _record_failed_download_blocklist(task_id, reason)
+            if task_id:
+                with tasks_lock:
+                    if task_id in download_tasks:
+                        download_tasks[task_id]['status'] = 'failed'
+                        download_tasks[task_id]['error_message'] = reason
+            if task_id and batch_id:
+                _notify_download_completed(batch_id, task_id, success=False)
             return
 
         if context.get('_race_guard_failed'):
@@ -1766,15 +2044,16 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"AcoustID mismatch for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
-                _hand_off("acoustid retry queued")
+                _hand_off("acoustid retry queued")  # Commissary
                 return
             # Retries exhausted. Opt-in last resort: if every quarantined
             # candidate for this track failed the SAME version mismatch (e.g. all
             # instrumental), accept the best one rather than leaving it missing.
             if _attempt_version_mismatch_fallback(context, task_id, batch_id, runtime, metadata_runtime):
-                _hand_off("version-mismatch fallback re-dispatched")
+                _hand_off("version-mismatch fallback re-dispatched")  # Commissary
                 return
             logger.info(f"File was quarantined by AcoustID verification (task={task_id}): {failure_msg}")
+            _record_failed_download_blocklist(task_id, f"AcoustID verification failed: {failure_msg}")
             with tasks_lock:
                 if task_id in download_tasks:
                     download_tasks[task_id]['status'] = 'failed'
@@ -1832,7 +2111,7 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 logger.info(
                     f"Integrity check failed for task {task_id} — retrying next-best candidate: {failure_msg}"
                 )
-                _hand_off("integrity retry queued")
+                _hand_off("integrity retry queued")  # Commissary
                 return
             logger.error(
                 f"Task {task_id} failed integrity check — marking failed: {failure_msg}"
@@ -1868,8 +2147,50 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             return
 
         expected_final_path = context.get('_final_processed_path')
+        # H4: an explicit inner-pipeline failure ALWAYS wins — even when
+        # _final_processed_path points at an existing file. The path is
+        # assigned before the quality-upgrade rejection, so a rejected
+        # import can carry both; honoring the destination would mark a
+        # failed import Completed.
+        failure_msg = context.get('_context_failure_msg')
+        if failure_msg:
+            logger.error(f"Task {task_id} failed in post-processing: {failure_msg}")
+            with tasks_lock:
+                if task_id in download_tasks:
+                    download_tasks[task_id]['status'] = 'failed'
+                    download_tasks[task_id]['error_message'] = failure_msg
+            with matched_context_lock:
+                if context_key in matched_downloads_context:
+                    del matched_downloads_context[context_key]
+            _notify_download_completed(batch_id, task_id, success=False)
+            return
         if not expected_final_path:
-            logger.info(f"No _final_processed_path in context for task {task_id} — cannot verify, assuming success")
+            # H4: with no destination and no failure, the inner pipeline
+            # ended in one of two ways — an explicit no-destination success
+            # (e.g. redundant source removal where the destination already
+            # exists) or an unrecognized outcome. Only the former may
+            # complete; the latter must fail rather than "assume success"
+            # (that marked missing/quarantined files Completed).
+            if not context.get('_pipeline_import_succeeded'):
+                failure_msg = (
+                    'Post-processing finished with no destination file and '
+                    'no recorded outcome'
+                )
+                logger.error(f"Task {task_id} failed in post-processing: {failure_msg}")
+                with tasks_lock:
+                    if task_id in download_tasks:
+                        download_tasks[task_id]['status'] = 'failed'
+                        download_tasks[task_id]['error_message'] = failure_msg
+                with matched_context_lock:
+                    if context_key in matched_downloads_context:
+                        del matched_downloads_context[context_key]
+                _notify_download_completed(batch_id, task_id, success=False)
+                return
+            logger.info(
+                f"No _final_processed_path for task {task_id} — pipeline "
+                f"reported success without a destination (e.g. redundant "
+                f"source already at destination); marking completed"
+            )
             with tasks_lock:
                 if task_id in download_tasks:
                     _mark_task_completed(task_id, context.get('track_info'))
@@ -1890,6 +2211,13 @@ def post_process_matched_download_with_verification(context_key, context, file_p
             with tasks_lock:
                 if task_id in download_tasks:
                     _mark_task_completed(task_id, context.get('track_info'))
+                    # The playback queue polls the task status and needs the
+                    # verified library path before it can replace its original
+                    # ``missing`` row with a playable one.  The inner pipeline
+                    # cannot persist this itself because this wrapper removes
+                    # task_id/batch_id while post-processing runs.  Keep the
+                    # path on the task at the same point we mark it completed.
+                    download_tasks[task_id]['final_file_path'] = expected_final_path
                     download_tasks[task_id]['metadata_enhanced'] = True
                     if context.get('_verification_status'):
                         download_tasks[task_id]['verification_status'] = context['_verification_status']
@@ -1970,25 +2298,8 @@ def post_process_matched_download_with_verification(context_key, context, file_p
                 del matched_downloads_context[context_key]
         _notify_download_completed(batch_id, task_id, success=False)
     finally:
-        # The safety net. Reaching here un-notified and without a declared
-        # hand-off means a path returned while still holding the batch slot —
-        # the bug this whole mechanism exists to stop. Free it and say so
-        # loudly: the batch recovers, and the log names the task so the gap can
-        # be found rather than being absorbed silently.
-        if not _state["notified"] and not _state["handed_off"]:
-            logger.error(
-                "[Batch Accounting] Post-processing for task %s (batch %s, %s) returned "
-                "without completing it and without queueing a retry — freeing the worker "
-                "slot so the batch can finish. This is a bug; the task is being marked "
-                "failed rather than left to wedge the batch.",
-                task_id, batch_id, context_key,
-            )
-            with tasks_lock:
-                _t = download_tasks.get(task_id)
-                if isinstance(_t, dict) and _t.get('status') not in TERMINAL_TASK_STATUSES:
-                    _t['status'] = 'failed'
-                    _t.setdefault(
-                        'error_message',
-                        'Post-processing ended without recording an outcome',
-                    )
-            _notify_download_completed(batch_id, task_id, success=False)
+        # Commissary: an exit that neither notified nor handed off leaks the
+        # worker slot and wedges the batch — free it and name the task.
+        from core.commissary.batch_slots import release_unclaimed_slot
+        release_unclaimed_slot(_slot_state, task_id, batch_id, context_key,
+                               _notify_download_completed)

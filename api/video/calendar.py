@@ -13,6 +13,16 @@ from flask import jsonify, request
 
 from utils.logging_config import get_logger
 
+def _profile() -> int:
+    """The requesting profile: the video watchlist/wishlist are per-profile
+    (like the music side) — a non-admin must never see the admin's lists."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
+
+
 logger = get_logger("video.calendar")
 
 
@@ -54,12 +64,40 @@ def register_routes(bp):
             scope = (request.args.get("scope") or "watchlist").lower()
             eps = db.calendar_upcoming(start.isoformat(), end.isoformat(),
                                        server_source=resolve_video_server(),
-                                       watchlist_only=(scope != "all"))
+                                       watchlist_only=(scope != "all"),
+                                       profile_id=_profile())
 
             # Movie release events (wishlisted movies): cinema + home-availability
             # dates in the same window — Radarr's calendar lane, plus the per-type
             # client filter Radarr never shipped.
-            movies = db.calendar_movie_releases(start.isoformat(), end.isoformat())
+            movies = db.calendar_movie_releases(start.isoformat(), end.isoformat(),
+                                                profile_id=_profile())
+
+            # kids profiles: episodes go by their show's rating, movie events by
+            # the library's. before the counts, so the day dots agree.
+            from .kids import filter_library_items, filter_tmdb_items, video_cap
+            cap = video_cap()
+            if cap is not None:
+                eps = filter_library_items(db, eps, cap, "show", id_key="show_id")
+                movies = filter_tmdb_items(db, [{**m, "kind": "movie"} for m in movies], cap)
+
+            # Acquisition state per episode. The calendar knew the air date and
+            # whether a file existed, which cannot tell an episode nothing is
+            # looking for from one that is downloading right now.
+            from core.video import calendar_state as cs
+            from core.automation.handlers.video_process_wishlist import (
+                active_download_keys)
+            try:
+                live_rows = db.get_active_video_downloads() or []
+            except Exception:   # noqa: BLE001 - a card without live state still draws
+                logger.exception("calendar: active downloads unreadable")
+                live_rows = []
+            # active_download_keys gives identities; keep each one's status too so
+            # queued and downloading stay distinguishable on the card.
+            live: dict = {}
+            for row in live_rows:
+                for key in active_download_keys([row]):
+                    live[key] = row.get("status")
 
             # Per-date counts drive the day-strip dots without a second query.
             counts: dict[str, int] = {}
@@ -68,6 +106,9 @@ def register_routes(bp):
                 counts[e["air_date"]] = counts.get(e["air_date"], 0) + 1
                 if e.get("has_file"):
                     owned += 1
+                state = cs.acquisition_state(e, today=today.isoformat(), active=live)
+                e["acq"] = state
+                e["needs_action"] = cs.needs_action(state)
             return jsonify({
                 "today": today.isoformat(),       # real today (for the highlight)
                 "start": start.isoformat(),       # window start (may be a future week)
@@ -77,6 +118,9 @@ def register_routes(bp):
                 "counts_by_date": counts,
                 "total": len(eps),
                 "owned": owned,
+                "acq_counts": cs.summarize(e.get("acq") for e in eps),
+                "needs_action": sum(1 for e in eps if e.get("needs_action")),
+                "schedule": db.calendar_schedule_freshness(),
                 "episodes": eps,
                 "movies": movies,
             })
@@ -102,10 +146,13 @@ def register_routes(bp):
             from core.video.sources import resolve_video_server
             eps = get_video_db().calendar_upcoming(
                 start.isoformat(), end.isoformat(),
-                server_source=resolve_video_server(), watchlist_only=(scope != "all"))
+                server_source=resolve_video_server(), watchlist_only=(scope != "all"),
+                profile_id=_profile())
+            from .kids import filter_library_items, video_cap
+            eps = filter_library_items(get_video_db(), eps, video_cap(), "show", id_key="show_id")
             lines = ["BEGIN:VCALENDAR", "VERSION:2.0",
-                     "PRODID:-//Commissary//Video Calendar//EN",
-                     "X-WR-CALNAME:Commissary Airings", "CALSCALE:GREGORIAN"]
+                     "PRODID:-//SoulSync//Video Calendar//EN",
+                     "X-WR-CALNAME:SoulSync Airings", "CALSCALE:GREGORIAN"]
             for e in eps:
                 day = str(e.get("air_date") or "")[:10].replace("-", "")
                 if len(day) != 8:
@@ -132,7 +179,8 @@ def register_routes(bp):
             # Movie release events (wishlisted movies) — whole-day, typed.
             if (request.args.get("movies") or "1") != "0":
                 _MOVIE_LABEL = {"cinema": "In Cinemas", "available": "Home Release"}
-                for m in get_video_db().calendar_movie_releases(start.isoformat(), end.isoformat()):
+                for m in get_video_db().calendar_movie_releases(
+                        start.isoformat(), end.isoformat(), profile_id=_profile()):
                     day = m["date"].replace("-", "")
                     title = m["title"] or "?"
                     if m.get("year"):

@@ -8,8 +8,9 @@ from datetime import datetime, timedelta
 from utils.logging_config import get_logger
 from database.music_database import MusicDatabase
 from core.qobuz_client import _qobuz_is_rate_limited
-from core.worker_utils import accept_artist_match, idle_backoff_seconds, interruptible_sleep
-from core.enrichment.manual_match_honoring import honor_stored_match
+from core.worker_utils import (accept_artist_match, _names_equivalent,
+                               idle_backoff_seconds, interruptible_sleep)
+from core.enrichment.manual_match_honoring import MATCHED, honor_stored_match
 
 logger = get_logger("qobuz_worker")
 
@@ -244,7 +245,7 @@ class QobuzWorker:
             cursor.execute("""
                 SELECT id, name
                 FROM artists
-                WHERE qobuz_match_status = 'not_found' AND qobuz_last_attempted < ?
+                WHERE qobuz_match_status IN ('not_found', 'error') AND qobuz_last_attempted < ?
                 ORDER BY qobuz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -258,7 +259,7 @@ class QobuzWorker:
                 SELECT a.id, a.title, ar.name AS artist_name, ar.qobuz_id AS artist_qobuz_id
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.qobuz_match_status = 'not_found' AND a.qobuz_last_attempted < ?
+                WHERE a.qobuz_match_status IN ('not_found', 'error') AND a.qobuz_last_attempted < ?
                 ORDER BY a.qobuz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -271,7 +272,7 @@ class QobuzWorker:
                 SELECT t.id, t.title, ar.name AS artist_name, ar.qobuz_id AS artist_qobuz_id
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.qobuz_match_status = 'not_found' AND t.qobuz_last_attempted < ?
+                WHERE t.qobuz_match_status IN ('not_found', 'error') AND t.qobuz_last_attempted < ?
                 ORDER BY t.qobuz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -291,8 +292,8 @@ class QobuzWorker:
     def _normalize_name(self, name: str) -> str:
         """Normalize name for comparison"""
         name = name.lower().strip()
-        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'\s*\(.*?\)\s*', ' ', name)
+        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'[^\w\s]', '', name)
         name = re.sub(r'\s+', ' ', name).strip()
         return name
@@ -301,6 +302,13 @@ class QobuzWorker:
         """Check if Qobuz result name matches our query with fuzzy matching"""
         norm_query = self._normalize_name(query_name)
         norm_result = self._normalize_name(result_name)
+        if not norm_query or not norm_result:
+            # Titles that normalize to NOTHING ("(Intro)", "[Skit]", "!!!",
+            # "...") would compare at SequenceMatcher ratio 1.0 against any
+            # other such title — fall back to exact raw comparison instead.
+            raw_q = (query_name or '').strip().lower()
+            raw_r = (result_name or '').strip().lower()
+            return bool(raw_q) and raw_q == raw_r
 
         similarity = SequenceMatcher(None, norm_query, norm_result).ratio()
         logger.debug(f"Name similarity: '{query_name}' vs '{result_name}' = {similarity:.2f}")
@@ -318,14 +326,20 @@ class QobuzWorker:
             return True
 
         if str(result_artist_id) != str(parent_qobuz_id):
+            # Guard: only correct on a POSITIVE name match. The old check
+            # skipped only on a CONFIRMED mismatch — Qobuz payloads without a
+            # performer/artist name (compilations, collabs) left
+            # result_artist_name as None, the guard never fired, and the
+            # parent artist's qobuz_id was rewritten unconditionally. Same
+            # failure the Deezer #988 fix closed.
             parent_name = item.get('artist') or ''
-            if (result_artist_name and parent_name
-                    and not self._name_matches(parent_name, result_artist_name)):
+            if not (result_artist_name and parent_name
+                    and self._name_matches(parent_name, result_artist_name)):
                 logger.info(
                     f"Skipping artist-ID correction from {item['type']} "
-                    f"'{item['name']}': result artist '{result_artist_name}' "
-                    f"≠ parent '{parent_name}' (collab/compilation, not a "
-                    f"correction)"
+                    f"'{item['name']}': cannot verify result artist "
+                    f"'{result_artist_name}' == parent '{parent_name}' "
+                    f"(collab/compilation or missing name, not a correction)"
                 )
                 return True
 
@@ -351,6 +365,23 @@ class QobuzWorker:
                 return
 
             artist_id = row[0]
+            # #988-class guard (ported from the Deezer fix): never overwrite
+            # with a Qobuz id already owned by a DIFFERENTLY-named artist.
+            # Same-named holders legitimately share an id.
+            cursor.execute("SELECT name FROM artists WHERE id = ?", (artist_id,))
+            _self_row = cursor.fetchone()
+            this_name = (_self_row[0] if _self_row else '') or (item.get('artist') or '')
+            cursor.execute(
+                "SELECT name FROM artists WHERE qobuz_id = ? AND id != ?",
+                (str(correct_qobuz_id), artist_id))
+            for (other_name,) in cursor.fetchall():
+                if not _names_equivalent(this_name, other_name):
+                    logger.warning(
+                        f"Refusing Qobuz-ID correction: id {correct_qobuz_id} is "
+                        f"already held by '{other_name}' (≠ '{this_name}') — avoiding a "
+                        f"shared/duplicate id (artist #{artist_id})")
+                    return
+
             cursor.execute("""
                 UPDATE artists SET
                     qobuz_id = ?,
@@ -471,14 +502,22 @@ class QobuzWorker:
         """Process an album: search Qobuz, verify, fetch full details, store metadata"""
         # Issue #501: honor manual matches. Pre-fix this just marked
         # status='matched' without refreshing metadata.
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='albums', entity_id=album_id,
             id_column='qobuz_id',
             client_fetch_fn=self.client.get_album,
             on_match_fn=self._refresh_album_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='qobuz_match_status',
             log_prefix='Qobuz',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
             return
 
         result = self.client.search_album(artist_name, album_name)
@@ -533,14 +572,22 @@ class QobuzWorker:
     def _process_track(self, track_id: int, track_name: str, artist_name: str, item: Dict[str, Any]):
         """Process a track: search Qobuz, verify, fetch full details, store metadata"""
         # Issue #501: honor manual matches.
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='tracks', entity_id=track_id,
             id_column='qobuz_id',
             client_fetch_fn=self.client.get_track,
             on_match_fn=self._refresh_track_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='qobuz_match_status',
             log_prefix='Qobuz',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
             return
 
         result = self.client.search_track(artist_name, track_name)
@@ -685,7 +732,7 @@ class QobuzWorker:
                 genre_name = genre.get('name', '') if isinstance(genre, dict) else str(genre) if genre else ''
                 if genre_name:
                     from core.genre_filter import filter_genres
-                    from config.settings import config_manager as _cfg
+                    from core.settings import config_manager as _cfg
                     _filtered = filter_genres([genre_name], _cfg)
                     if _filtered:
                         cursor.execute("""

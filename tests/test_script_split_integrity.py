@@ -27,22 +27,24 @@ _ROOT = Path(__file__).resolve().parent.parent
 _STATIC = _ROOT / "webui" / "static"
 _INDEX = _ROOT / "webui" / "index.html"
 
-# The 17 modules that replaced script.js + shared-helpers.js extracted from
-# artists.js (order matters for first/last checks)
+# The modules that replaced script.js + shared-helpers.js extracted from
+# artists.js (order matters for first/last checks).
+#
+# search.js is GONE — /search is entirely React now (webui/src/routes/search/)
+# and the file was deleted. Its one live symbol, loadInitialData, was the app's
+# boot routine and moved to init.js.
 SPLIT_MODULES = [
     "core.js",
     "shared-helpers.js",
     "media-player.js",
     "settings.js",
-    "search.js",
     "sync-spotify.js",
     "downloads.js",
     "wishlist-tools.js",
     "sync-services.js",
     "api-monitor.js",
-    "library.js",
-    "beatport-ui.js",
-    "discover.js",
+    # library-globals.js + manual-library-match.js ported to typescript
+    # (src/shell, aug 26) - their globals now flow through the shell bundle
     "enrichment.js",
     "stats-automations.js",
     "auto-sync.js",
@@ -52,29 +54,46 @@ SPLIT_MODULES = [
 
 # Other JS files that exist in static/ but are NOT part of the split
 NON_SPLIT_JS = {"setup-wizard.js", "docs.js", "helper.js", "particles.js", "worker-orbs.js",
-                "enrichment-manager.js", "origin-history.js", "blocklist.js",
-                "watchlist-history.js", "service-switch.js", "my-accounts.js",
+                "enrichment-manager.js",
                 "config-migration.js", "video/video-service-status.js"}
+
+# Classic scripts ported to typescript live in webui/src/shell and reach the
+# page as the shell IIFE bundle (static/dist/shell.js). Their window globals
+# come from the SHELL_WINDOW_EXPORTS map in src/shell/index.ts - parse the
+# export names from there so onclick coverage keeps holding as files migrate.
+# (blocklist / origin-history / watchlist-history / my-accounts / service-switch
+# moved out of NON_SPLIT_JS in the aug 26 port.)
+_SHELL_INDEX = _ROOT / "webui" / "src" / "shell" / "index.ts"
+
+
+def _shell_window_exports() -> set[str]:
+    text = _SHELL_INDEX.read_text(encoding="utf-8")
+    block = text.split("SHELL_WINDOW_EXPORTS = {", 1)[1].split("} as const", 1)[0]
+    return {m.group(1) for m in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*),", block, re.M)}
 
 # Pre-existing duplicate helper functions that lived in the original monolith.
 # In a plain <script> context the last-loaded declaration wins.  These are NOT
 # regressions from the split — they should be deduplicated in a follow-up.
 KNOWN_CROSS_FILE_DUPES = {
-    "escapeHtml",        # downloads.js, shared-helpers.js, discover.js
+    "escapeHtml",        # downloads.js, shared-helpers.js
     "formatDuration",    # sync-spotify.js, wishlist-tools.js, sync-services.js
-    "matchedDownloadTrack",    # downloads.js, wishlist-tools.js
-    "matchedDownloadAlbum",    # downloads.js, wishlist-tools.js
-    "matchedDownloadAlbumTrack",  # downloads.js, wishlist-tools.js
-    "_esc",              # library.js, stats-automations.js
     "_escAttr",          # downloads.js, stats-automations.js
-    "_formatDuration",   # stats-automations.js, pages-extra.js
-    "loadDashboardData", # search.js, wishlist-tools.js
+    "_formatDuration",   # stats-automations.js, wishlist-tools.js
+                         # (pages-extra.js declared a THIRD, millisecond-based
+                         #  copy that loaded last and shadowed both; it went
+                         #  with the playlist-explorer port, which fixed the
+                         #  "0:00" durations in the download-audit UI)
 }
+# Resolved by the basic-search React port, and removed from the set above
+# because test_known_dupes_still_tracked fails on a stale entry:
+#   matchedDownloadTrack / matchedDownloadAlbum / matchedDownloadAlbumTrack
+#     — downloads.js declared all three AND so did wishlist-tools.js, which
+#       loads second, so the downloads.js copies had never run. Deleted.
+#   loadDashboardData — search.js's copy went with the file.
 
-# Same-file duplicates that are tolerated. Empty on purpose: the five that
-# used to be listed here were one 160-line block pasted twice into
-# wishlist-tools.js, deleted upstream in c5a8bf24. Keeping the set empty means
-# the next accidental double-paste gets fixed rather than added to a list.
+# Pre-existing same-file duplicates (two filter UIs reuse the same names).
+# (the wishlist-tools double-pasted filter block was removed — c5a8bf241 —
+# so this set is empty; new same-file dupes should be FIXED, not listed.)
 KNOWN_SAME_FILE_DUPES = set()
 
 # ---------------------------------------------------------------------------
@@ -234,6 +253,9 @@ class TestOnclickCoverage:
             if path.exists():
                 self.all_fns.update(_all_onclick_targets(_read(path)))
 
+        # Shell-bundle globals (typescript ports of former classic scripts)
+        self.all_fns.update(_shell_window_exports())
+
         # Extract all onclick function references from HTML
         html = _read(_INDEX)
         self.onclick_fns: set[str] = set()
@@ -277,6 +299,12 @@ class TestNoCrossFileWindowAssignments:
             text = _read(_STATIC / module)
             self.module_fns[module] = set(_all_function_decls(text))
             for prop, value in _WINDOW_ASSIGN_RE.findall(text):
+                # `window.flag = false;` assigns a LITERAL, not a function —
+                # the identifier regex catches keywords too (e.g. core.js's
+                # window._socketConnected mirror). Only identifier values can
+                # be cross-file ReferenceErrors.
+                if value in ("true", "false", "null", "undefined"):
+                    continue
                 self.window_assigns[module].append((prop, value))
 
     def test_no_cross_file_references(self):

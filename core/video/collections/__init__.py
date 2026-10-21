@@ -1,4 +1,4 @@
-"""Commissary video Collections — Commissary-managed movie/show collections.
+"""SoulSync video Collections — SoulSync-managed movie/show collections.
 
 Kometa-parity feature that mirrors the overlay studio's shape: DB-backed
 definitions, a pure resolver, and (later phases) a server-agnostic sync engine

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import glob as _glob
 import os
-import shutil as _shutil
 import sqlite3
 import time
 from datetime import datetime
@@ -32,25 +31,13 @@ from core.automation.deps import AutomationDeps
 def auto_clear_quarantine(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str, Any]:
     """Purge every file/folder under the configured ss_quarantine path."""
     automation_id = config.get('_automation_id')
-    quarantine_path = os.path.join(
-        deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads')),
-        'ss_quarantine',
-    )
-    if not os.path.exists(quarantine_path):
+    from core.library.cleanup import clear_quarantine_folder, quarantine_path as _qpath
+    result = clear_quarantine_folder(_qpath(
+        deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads'))))
+    if not result['existed']:
         deps.update_progress(automation_id, log_line='No quarantine folder found', log_type='info')
         return {'status': 'completed', 'removed': '0'}
-    removed = 0
-    for f in os.listdir(quarantine_path):
-        fp = os.path.join(quarantine_path, f)
-        try:
-            if os.path.isfile(fp):
-                os.remove(fp)
-                removed += 1
-            elif os.path.isdir(fp):
-                _shutil.rmtree(fp)
-                removed += 1
-        except Exception as e:  # noqa: BLE001 — best-effort purge
-            deps.logger.debug("quarantine entry purge failed: %s", e)
+    removed = result['removed']
     deps.update_progress(
         automation_id,
         log_line=f'Removed {removed} quarantined items',
@@ -80,12 +67,18 @@ def auto_cleanup_wishlist(config: Dict[str, Any], deps: AutomationDeps) -> Dict[
 
 def auto_update_discovery_pool(config: Dict[str, Any], deps: AutomationDeps) -> Dict[str, Any]:
     """Run an incremental refresh of the discovery pool via the
-    watchlist scanner."""
+    watchlist scanner.
+
+    A manual Run Now press (``_manual_run``, #1719) forces the refresh
+    past the scanner's 6-hour cooldown — the user pressed it precisely
+    so a refresh happens now, e.g. to apply changed settings. Scheduled
+    and event-triggered runs keep the cooldown."""
     automation_id = config.get('_automation_id')
     try:
+        manual = bool(config.get('_manual_run'))
         scanner = deps.get_watchlist_scanner(deps.spotify_client)
         deps.update_progress(automation_id, log_line='Updating discovery pool...', log_type='info')
-        scanner.update_discovery_pool_incremental(deps.get_current_profile_id())
+        scanner.update_discovery_pool_incremental(deps.get_current_profile_id(), force=manual)
         deps.update_progress(
             automation_id, status='finished', progress=100,
             phase='Complete', log_line='Discovery pool updated', log_type='success',

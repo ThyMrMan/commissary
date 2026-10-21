@@ -10,6 +10,32 @@ from utils.logging_config import get_logger
 logger = get_logger("repair_job.dead_files")
 
 
+def _active_media_server(config_manager) -> str:
+    if not config_manager:
+        return 'unknown'
+    try:
+        getter = getattr(config_manager, 'get_active_media_server', None)
+        if callable(getter):
+            return getter() or 'unknown'
+        return config_manager.get('active_media_server', 'unknown') or 'unknown'
+    except Exception:
+        return 'unknown'
+
+
+def _path_mapping_hint(config_manager) -> str:
+    active = _active_media_server(config_manager)
+    if str(active).lower() == 'navidrome':
+        return (
+            'Active media server: navidrome. In Navidrome, open Profile → Players → '
+            'SoulSync and enable "Report Real Path", then run a full database refresh. '
+            'Also confirm Settings → Library → Music Paths contains the path SoulSync can read.'
+        )
+    return (
+        f'Active media server: {active}. Check Docker volume mapping and '
+        'Settings → Library → Music Paths.'
+    )
+
+
 def _resolve_file_path(file_path, transfer_folder, download_folder=None, config_manager=None):
     """Backwards-compat wrapper. Use ``resolve_library_file_path`` directly."""
     return resolve_library_file_path(
@@ -27,7 +53,7 @@ class DeadFileCleanerJob(RepairJob):
     description = 'Finds database entries pointing to missing files'
     help_text = (
         'Checks every track in your database to verify the actual audio file still exists '
-        'on disk. If a file has been moved, renamed, or deleted outside of Commissary, the '
+        'on disk. If a file has been moved, renamed, or deleted outside of SoulSync, the '
         'database entry becomes a "dead" reference.\n\n'
         'Each dead reference is reported as a finding. You can then resolve it by re-downloading '
         'the track or dismiss it to clean up the database entry.\n\n'
@@ -38,7 +64,7 @@ class DeadFileCleanerJob(RepairJob):
     default_interval_hours = 24
     default_settings = {
         # Mass-false-positive guard: if at least this fraction of tracks resolve
-        # to no file on disk, treat it as a path-mapping/mount problem (Commissary
+        # to no file on disk, treat it as a path-mapping/mount problem (SoulSync
         # can't SEE the library — e.g. Docker, or library.music_paths unset for
         # this environment) rather than thousands of individually-deleted files,
         # and abort without creating findings. Mirrors the transfer-folder abort.
@@ -48,6 +74,37 @@ class DeadFileCleanerJob(RepairJob):
         'min_tracks_for_guard': 25,
     }
     auto_fix = False
+
+    def _setting_float(self, context: JobContext, key: str, default: float) -> float:
+        """A float setting. The Tools page saves job settings as one dict under
+        ``repair.jobs.<id>.settings``; this job used to read only the flat
+        ``repair.jobs.<id>.<key>``, so a value set in the UI never applied.
+        Both are read, the dict first."""
+        cm = getattr(context, 'config_manager', None)
+        if cm is None:
+            return default
+        saved = cm.get(self.get_config_key('settings'), {})
+        value = saved.get(key) if isinstance(saved, dict) else None
+        if value is None:
+            value = cm.get(self.get_config_key(key), None)
+        try:
+            return default if value is None else float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _setting_int(self, context: JobContext, key: str, default: int) -> int:
+        """An int setting — same dict-first lookup as :meth:`_setting_float`."""
+        cm = getattr(context, 'config_manager', None)
+        if cm is None:
+            return default
+        saved = cm.get(self.get_config_key('settings'), {})
+        value = saved.get(key) if isinstance(saved, dict) else None
+        if value is None:
+            value = cm.get(self.get_config_key(key), None)
+        try:
+            return default if value is None else int(value)
+        except (TypeError, ValueError):
+            return default
 
     def scan(self, context: JobContext) -> JobResult:
         result = JobResult()
@@ -98,19 +155,12 @@ class DeadFileCleanerJob(RepairJob):
             download_folder = context.config_manager.get('soulseek.download_path', '')
 
         # Mass-false-positive guard thresholds (see default_settings).
-        max_unresolved_fraction = 0.5
-        min_tracks_for_guard = 25
-        if context.config_manager:
-            try:
-                max_unresolved_fraction = float(context.config_manager.get(
-                    self.get_config_key('max_unresolved_fraction'), 0.5))
-            except (TypeError, ValueError):
-                max_unresolved_fraction = 0.5
-            try:
-                min_tracks_for_guard = int(context.config_manager.get(
-                    self.get_config_key('min_tracks_for_guard'), 25))
-            except (TypeError, ValueError):
-                min_tracks_for_guard = 25
+        # The Tools page saves these as one dict under
+        # repair.jobs.dead_file_cleaner.settings (dict first, flat key fallback).
+        max_unresolved_fraction = self._setting_float(
+            context, 'max_unresolved_fraction', 0.5)
+        min_tracks_for_guard = self._setting_int(
+            context, 'min_tracks_for_guard', 25)
 
         if context.report_progress:
             context.report_progress(phase=f'Checking {total} tracks...', total=total)
@@ -149,7 +199,7 @@ class DeadFileCleanerJob(RepairJob):
                 context.update_progress(i + 1, total)
 
         # Mass-false-positive guard: a large fraction of unresolvable paths almost
-        # always means Commissary can't SEE the library (Docker mount, or
+        # always means SoulSync can't SEE the library (Docker mount, or
         # Settings → Library → Music Paths not set for this environment), NOT that
         # thousands of files were individually deleted. Refuse to flag and say so
         # — same principle as the transfer-folder abort above. (#828: a Plex-on-
@@ -158,17 +208,20 @@ class DeadFileCleanerJob(RepairJob):
         if (dead_rows
                 and result.scanned >= min_tracks_for_guard
                 and len(dead_rows) >= result.scanned * max_unresolved_fraction):
+            sample_path = dead_rows[0][4] if dead_rows and len(dead_rows[0]) > 4 else None
+            hint = _path_mapping_hint(context.config_manager)
             logger.error(
                 "Dead file scan: %d/%d tracks unresolvable (>= %.0f%%) — aborting without "
-                "creating findings; this is a path-mapping/mount problem, not deleted files.",
-                len(dead_rows), result.scanned, max_unresolved_fraction * 100)
+                "creating findings; this is a path-mapping/mount problem, not deleted files. "
+                "Example DB path: %r. %s",
+                len(dead_rows), result.scanned, max_unresolved_fraction * 100, sample_path, hint)
             result.errors += 1
             if context.report_progress:
                 context.report_progress(
                     phase='Aborted — too many unreachable paths',
-                    log_line=(f"{len(dead_rows)} of {result.scanned} tracks point to paths Commissary "
-                              f"can't reach — almost always a path-mapping issue (Docker mount, or "
-                              f"Settings → Library → Music Paths), not deleted files. No findings created."),
+                    log_line=(f"{len(dead_rows)} of {result.scanned} tracks point to paths SoulSync "
+                              f"can't reach — almost always a path-mapping issue, not deleted files. "
+                              f"No findings created. Example DB path: {sample_path or 'unknown'}. {hint}"),
                     log_type='error'
                 )
             if context.update_progress:

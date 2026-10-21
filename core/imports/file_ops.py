@@ -8,11 +8,11 @@ import os
 import re
 import shutil
 import subprocess
-import time
+import tempfile
 from pathlib import Path
 from typing import Iterable, List
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.imports.ffmpeg_errors import summarize_ffmpeg_error
 
 logger = logging.getLogger("imports.file_ops")
@@ -104,6 +104,37 @@ def cleanup_slskd_dedup_siblings(source_path) -> List[str]:
     return deleted
 
 
+def _apply_publish_mode(path: Path, dest_dir: Path) -> None:
+    """Widen ``path``'s permissions to the audience ``dest_dir`` implies.
+
+    An imported file must not simply inherit the staging file's mode. The
+    staging file was written by a download client, and slskd/SABnzbd running in
+    a container with umask 077 writes its downloads 0600 — carrying that into
+    the library publishes a track only the importing user can read, while
+    Plex/Jellyfin run as somebody else. That is the whole symptom the
+    permission handling exists to fix (PR #1121 review), and copying the source
+    mode only fixes it when the downloader already got it right.
+
+    The destination DIRECTORY is the statement of who the library is for, so
+    the read/write bits come from it — 0755 → 0644, 0775 → 0664, 0700 → 0600.
+    Only ever widening (union with what the file already grants) means an
+    import can never narrow a file that was already shareable, and a private
+    library stays private because nobody can traverse the directory anyway.
+    """
+    try:
+        current = os.stat(path).st_mode & 0o777
+        desired = current | (os.stat(dest_dir).st_mode & 0o666) | 0o600
+    except OSError as e:
+        logger.debug("could not resolve publish mode for %s: %s", path, e)
+        return
+    if desired == current:
+        return
+    try:
+        os.chmod(path, desired)
+    except OSError as e:
+        logger.debug("could not widen permissions on %s: %s", path, e)
+
+
 def _atomic_cross_device_move(src: Path, dst: Path) -> None:
     """Move ``src`` to ``dst`` across filesystems WITHOUT ever exposing a partial file at
     the final path.
@@ -115,9 +146,13 @@ def _atomic_cross_device_move(src: Path, dst: Path) -> None:
     null/incomplete metadata (tracks landing with no disc). Cleans up the temp on failure.
     """
     src, dst = Path(src), Path(dst)
-    tmp = dst.parent / f".{dst.name}.ssync-tmp"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{dst.name}.", suffix=".ssync-tmp", dir=dst.parent,
+    )
+    tmp = Path(tmp_name)
     try:
-        with open(src, "rb") as f_src, open(tmp, "wb") as f_dst:
+        with open(src, "rb") as f_src, os.fdopen(fd, "wb") as f_dst:
+            fd = -1
             shutil.copyfileobj(f_src, f_dst)
             f_dst.flush()
             os.fsync(f_dst.fileno())
@@ -125,8 +160,14 @@ def _atomic_cross_device_move(src: Path, dst: Path) -> None:
             shutil.copystat(str(src), str(tmp))   # preserve mtime/permissions (copy2-like)
         except OSError:
             pass
+        # AFTER copystat, which re-applies the source's mode and can also fail
+        # partway (its utime/xattr steps are the ones that realistically do),
+        # leaving mkstemp's 0600 on the file about to be published.
+        _apply_publish_mode(tmp, dst.parent)
         os.replace(str(tmp), str(dst))            # atomic within dst's filesystem
     except Exception:
+        if fd >= 0:
+            os.close(fd)
         try:
             if tmp.exists():
                 tmp.unlink()
@@ -140,7 +181,7 @@ def _atomic_cross_device_move(src: Path, dst: Path) -> None:
 
 
 def safe_move_file(src, dst):
-    """Move a file safely across filesystems."""
+    """Atomically publish ``src`` at ``dst`` without pre-deleting ``dst``."""
     src = Path(src)
     dst = Path(dst)
 
@@ -152,19 +193,7 @@ def safe_move_file(src, dst):
             return
         raise FileNotFoundError(f"Source file not found and destination does not exist: {src}")
 
-    if dst.exists():
-        for _attempt in range(3):
-            try:
-                dst.unlink()
-                break
-            except PermissionError:
-                if _attempt < 2:
-                    time.sleep(1)
-                else:
-                    logger.warning(f"Could not remove locked destination after 3 attempts: {dst.name}")
-            except Exception:
-                break
-
+    destination_preexisted = dst.exists()
     try:
         # Same-filesystem move: an atomic rename that also overwrites dst. A media-server
         # watcher (Jellyfin/Plex real-time monitoring) therefore never sees a partial file
@@ -172,20 +201,23 @@ def safe_move_file(src, dst):
         # EPERM/EACCES) and we copy atomically below instead of letting the move write the
         # destination incrementally — the partial-file-at-final-name is what caused tracks
         # to land in Jellyfin with null/incomplete metadata (no disc).
+        # The rename keeps the source's mode, so widen BEFORE it — same inode,
+        # and the published file is then never briefly visible at a mode the
+        # media server cannot read.
+        _apply_publish_mode(src, dst.parent)
         os.replace(str(src), str(dst))
         return
     except FileNotFoundError:
-        if dst.exists():
+        if not destination_preexisted and not src.exists() and dst.exists():
             logger.info(f"Source moved by another thread, destination exists: {dst.name}")
             return
         raise
     except (OSError, PermissionError) as e:
-        if dst.exists() and dst.stat().st_size > 0:
-            logger.warning(f"Move raised {type(e).__name__} but destination exists, treating as success: {e}")
-            try:
-                src.unlink()
-            except Exception:
-                logger.info(f"Could not delete source file (may be owned by another process): {src}")
+        # Some filesystems report an error after committing the rename. Only
+        # the disappeared source proves that happened; an existing destination
+        # may simply be the old library file and must never be treated as proof.
+        if not destination_preexisted and not src.exists() and dst.exists():
+            logger.warning(f"Move raised {type(e).__name__} after transfer completed: {e}")
             return
 
         error_msg = str(e).lower()
@@ -219,11 +251,18 @@ def protected_root_dirs():
     """
     roots = set()
     try:
-        from core.imports.paths import docker_resolve_path
-        for key in ('soulseek.staging_path', 'soulseek.download_path', 'soulseek.transfer_path'):
-            raw = config_manager.get(key, '') or ''
-            if raw:
-                roots.add(os.path.normpath(docker_resolve_path(raw)))
+        from core.imports.paths import config_root_path
+        # `import.staging_path` is the key the settings page writes (see
+        # webui/static/settings.js) and the key every other reader uses. This
+        # read used to name `soulseek.staging_path`, which nothing writes: the
+        # lookup returned '', the import folder never made it into the protected
+        # set, and #976's whole point — the cleanup must not rmdir the staging
+        # root when it sits under the download folder — silently did not apply.
+        for key in ('import.staging_path', 'soulseek.download_path',
+                    'soulseek.transfer_path'):
+            resolved = config_root_path(config_manager.get(key, '') or '')
+            if resolved:
+                roots.add(resolved)
     except Exception as e:
         logger.debug(f"protected_root_dirs: could not resolve configured roots: {e}")
     return roots
@@ -243,11 +282,14 @@ def ensure_staging_dir():
     not-yet-mounted volume path (which would mask the real mount).
     """
     try:
-        from core.imports.paths import docker_resolve_path
-        raw = config_manager.get('soulseek.staging_path', './Staging') or ''
-        if not raw:
+        from core.imports.paths import config_root_path
+        # Same key correction as protected_root_dirs(): reading the key nothing
+        # writes made this recreate a literal ./Staging next to the app instead
+        # of the import folder the user configured.
+        staging = config_root_path(
+            config_manager.get('import.staging_path', './Staging') or '')
+        if not staging:
             return
-        staging = os.path.normpath(docker_resolve_path(raw))
         if os.path.isdir(staging):
             return
         parent = os.path.dirname(staging)
@@ -282,13 +324,90 @@ def cleanup_empty_directories(download_path, moved_file_path):
         logger.error(f"An error occurred during directory cleanup: {e}")
 
 
-def estimate_bitrate_kbps(*, size_bytes=None, duration_seconds=None,
-                          duration_ms=None, file_path=None):
+# what a ripped/downloaded release carries next to its music. a folder holding
+# only these (and no audio) is finished with; anything else in it is the
+# user's and keeps the folder.
+_STAGING_SIDECAR_EXTS = {
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp',
+    '.cue', '.log', '.nfo', '.txt', '.m3u', '.m3u8', '.sfv', '.md5',
+    '.accurip', '.ffp', '.st5', '.lrc', '.json', '.ini', '.db',
+}
+_STAGING_AUDIO_EXTS = {
+    '.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma',
+    '.aiff', '.aif', '.ape', '.alac', '.wv', '.dsf', '.dff',
+}
+
+
+def _only_sidecars_left(folder: str) -> bool:
+    for _root, _dirs, files in os.walk(folder):
+        for name in files:
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _STAGING_AUDIO_EXTS or ext not in _STAGING_SIDECAR_EXTS:
+                if not name.startswith('.'):
+                    return False
+    return True
+
+
+def clear_finished_staging(staging_root: str, files: Iterable[str]) -> List[str]:
+    """delete staged files an import is done with, then every folder they
+    leave with no music in it, up to (never including) the staging root.
+
+    for "clear finished folders from staging": the dragged-in Artist/Album
+    folder goes once every track in it was imported or found already in the
+    library. a folder still holding audio, or anything that isn't release
+    clutter (cover art, cue, log, nfo...), stays. returns what was removed.
+    """
+    removed: List[str] = []
+    if not staging_root:
+        return removed
+    root = os.path.normpath(os.path.realpath(staging_root))
+    protected = {os.path.normpath(os.path.realpath(p)) for p in protected_root_dirs()}
+    protected.add(root)
+
+    def _inside(path: str) -> bool:
+        try:
+            return os.path.commonpath([root, path]) == root and path != root
+        except ValueError:  # another drive
+            return False
+
+    folders = set()
+    for f in files or []:
+        if not f:
+            continue
+        path = os.path.normpath(os.path.realpath(f))
+        if not _inside(path):
+            logger.warning("clear_finished_staging: refusing %s (outside staging)", path)
+            continue
+        folders.add(os.path.dirname(path))
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+                removed.append(path)
+            except OSError as e:
+                logger.warning("clear_finished_staging: could not remove %s: %s", path, e)
+
+    # deepest first, so an Album folder goes before its Artist folder is judged
+    for folder in sorted(folders, key=len, reverse=True):
+        current = folder
+        while _inside(current) and current not in protected and os.path.isdir(current):
+            if not _only_sidecars_left(current):
+                break
+            try:
+                shutil.rmtree(current)
+                removed.append(current)
+                logger.info("cleared finished staging folder: %s", current)
+            except OSError as e:
+                logger.warning("clear_finished_staging: could not remove %s: %s", current, e)
+                break
+            current = os.path.dirname(current)
+    return removed
+
+
+def estimate_bitrate_kbps(*, size_bytes=None, duration_seconds=None, duration_ms=None, file_path=None):
     """Effective kbps from file size and duration.
 
-    The honest answer for a container with no bitrate header, and for library
-    rows already stored as 0. It is an AVERAGE, which is why callers that
-    display it mark it as one — see ``stream_uses_vbr_display``.
+    Used when the container has no bitrate header (Ogg Opus) and for
+    already-imported library rows stored as 0.
     """
     size = size_bytes
     if not size and file_path:
@@ -316,12 +435,10 @@ def estimate_bitrate_kbps(*, size_bytes=None, duration_seconds=None,
 
 
 def stream_uses_vbr_display(file_path, info=None) -> bool:
-    """True when a bitrate for this file is an AVERAGE, not a constant.
+    """True when the library bitrate cell should show an average (``~N kbps``).
 
-    Opus and Vorbis are always VBR. AAC/WMA report mutagen's average (the MP4
-    ``esds`` avgBitrate), not a CBR constant. MP3 is VBR only when mutagen says
-    so. Printing any of those as a bare "137 kbps" claims a precision the format
-    does not have.
+    Opus/Vorbis are always VBR. AAC/WMA store mutagen's average (MP4 esds
+    ``avgBitrate``), not a CBR constant. MP3 is VBR only when mutagen says so.
     """
     ext = os.path.splitext(file_path or "")[1].lower()
     if ext in {".opus", ".ogg", ".m4a", ".aac", ".wma"}:
@@ -330,17 +447,16 @@ def stream_uses_vbr_display(file_path, info=None) -> bool:
         try:
             from mutagen.mp3 import BitrateMode
             return getattr(info, "bitrate_mode", None) == BitrateMode.VBR
-        except Exception:   # noqa: BLE001 - a display hint is never worth raising for
+        except Exception:
             return False
     return False
 
 
 def fill_missing_track_bitrate(track: dict) -> dict:
-    """Fill a library row's missing bitrate with a size/duration average.
+    """If the DB row has no bitrate, fill an average from size and duration.
 
-    Opus rows were stored as 0 or NULL because mutagen.oggopus exposes no
-    bitrate attribute at all, so the library showed nothing for them. Also
-    stamps ``bitrate_vbr`` so a display can say ~N rather than N.
+    The enhanced library table reads ``tracks.bitrate``. Opus import used
+    to store 0 because mutagen.oggopus has no bitrate attribute.
     """
     try:
         existing = int(track.get("bitrate") or 0)
@@ -360,12 +476,10 @@ def fill_missing_track_bitrate(track: dict) -> dict:
 
 
 def _kbps_from_stream_info(info, file_path: str, *, estimate: bool = True):
-    """Bitrate in kbps from mutagen, optionally falling back to an estimate.
+    """Bitrate in kbps from mutagen, optionally a size/duration estimate.
 
-    ``mutagen.oggopus.OggOpusInfo`` declares only ``length`` and ``channels``
-    and never sets ``bitrate`` — so ``audio.info.bitrate`` on an Opus file
-    raises AttributeError, which the callers below swallowed, leaving the
-    quality label blank for every Opus download there has ever been.
+    Ogg Opus headers have no bitrate field (mutagen.oggopus only exposes
+    length + channels). YouTube remux writes ``.opus``.
     """
     if info is not None:
         raw = getattr(info, "bitrate", None)
@@ -379,15 +493,14 @@ def _kbps_from_stream_info(info, file_path: str, *, estimate: bool = True):
     length = None
     if info is not None:
         length = getattr(info, "length", None) or getattr(info, "duration", None)
-    return estimate_bitrate_kbps(duration_seconds=length, file_path=file_path)
+    return estimate_bitrate_kbps(file_path=file_path, duration_seconds=length)
 
 
 def _claim_kbps(on_disk_format: str, claimed_format, claimed_bitrate):
-    """The SOURCE's pre-download claim (a YouTube itag, a Tidal tier), but only
-    when the file on disk is still that codec.
+    """YouTube (and other streaming) itag/API bitrate, if the file codec matches.
 
-    Never copy the claim onto an MP3: that is the transcode case, where the
-    original stream's bitrate says nothing about the file that was written.
+    Mutagen cannot read Opus bitrate; the player-response probe already has it.
+    Never copy an Opus/AAC claim onto an MP3 — that is the transcode case.
     """
     disk = (on_disk_format or "").lower()
     claim = (claimed_format or "").lower()
@@ -421,8 +534,6 @@ def _lossy_kbps(info, file_path, on_disk_format, claimed_format, claimed_bitrate
 
 
 def _chip_lossy(fmt: str, kbps) -> str:
-    """'OPUS-160', or a bare 'OPUS' when nothing could be determined — better
-    than the empty string the old code returned, which read as "unknown file"."""
     if kbps:
         return f"{fmt}-{kbps}"
     return fmt
@@ -431,9 +542,8 @@ def _chip_lossy(fmt: str, kbps) -> str:
 def get_audio_quality_string(file_path, *, claimed_format=None, claimed_bitrate=None):
     """Return a compact audio quality string for the given file.
 
-    ``claimed_*`` is the pre-download probe (a YouTube itag, a Tidal tier).
-    Consulted only when the file itself carries no bitrate and its codec still
-    matches the claim.
+    ``claimed_*`` is the pre-download probe (YouTube itags, Tidal tier, …).
+    Used only when the file itself has no bitrate (Opus) and the codec matches.
     """
     try:
         ext = os.path.splitext(file_path)[1].lower()
@@ -451,7 +561,8 @@ def get_audio_quality_string(file_path, *, claimed_format=None, claimed_bitrate=
 
             audio = MP3(file_path)
             bitrate_kbps = _lossy_kbps(
-                audio.info, file_path, "mp3", claimed_format, claimed_bitrate)
+                audio.info, file_path, "mp3", claimed_format, claimed_bitrate,
+            )
             if getattr(audio.info, "bitrate_mode", None) == BitrateMode.VBR:
                 return "MP3-VBR"
             return _chip_lossy("MP3", bitrate_kbps)
@@ -459,37 +570,41 @@ def get_audio_quality_string(file_path, *, claimed_format=None, claimed_bitrate=
         if ext in (".m4a", ".aac", ".mp4"):
             from mutagen.mp4 import MP4
             audio = MP4(file_path)
-            return _chip_lossy("M4A", _lossy_kbps(
-                audio.info, file_path, "aac", claimed_format, claimed_bitrate))
+            return _chip_lossy(
+                "M4A",
+                _lossy_kbps(audio.info, file_path, "aac", claimed_format, claimed_bitrate),
+            )
 
         if ext == ".ogg":
-            # .ogg is a CONTAINER: Vorbis usually, but yt-dlp writes Opus into
-            # one too. Reading it as Vorbis raises, so fall through rather than
-            # report nothing.
             try:
                 from mutagen.oggvorbis import OggVorbis
                 audio = OggVorbis(file_path)
-                return _chip_lossy("OGG", _lossy_kbps(
-                    audio.info, file_path, "ogg", claimed_format, claimed_bitrate))
-            except Exception:   # noqa: BLE001 - not Vorbis; try Opus below
+                return _chip_lossy(
+                    "OGG",
+                    _lossy_kbps(audio.info, file_path, "ogg", claimed_format, claimed_bitrate),
+                )
+            except Exception:
                 from mutagen.oggopus import OggOpus
                 audio = OggOpus(file_path)
-                return _chip_lossy("OPUS", _lossy_kbps(
-                    audio.info, file_path, "opus", claimed_format, claimed_bitrate))
+                return _chip_lossy(
+                    "OPUS",
+                    _lossy_kbps(audio.info, file_path, "opus", claimed_format, claimed_bitrate),
+                )
 
         if ext == ".opus":
             from mutagen.oggopus import OggOpus
 
             audio = OggOpus(file_path)
-            return _chip_lossy("OPUS", _lossy_kbps(
-                audio.info, file_path, "opus", claimed_format, claimed_bitrate))
+            return _chip_lossy(
+                "OPUS",
+                _lossy_kbps(audio.info, file_path, "opus", claimed_format, claimed_bitrate),
+            )
 
         if ext in (".webm", ".weba"):
-            # A leftover DASH container: Matroska, not Ogg, so mutagen's Ogg
-            # readers cannot open it at all.
             aq = probe_audio_quality(file_path)
             kbps = (aq.bitrate if aq else None) or _claim_kbps(
-                "opus", claimed_format, claimed_bitrate)
+                "opus", claimed_format, claimed_bitrate,
+            )
             if kbps:
                 return _chip_lossy("OPUS", kbps)
             if aq is None:
@@ -532,14 +647,15 @@ def probe_audio_quality(file_path: str):
                 sample_rate=audio.info.sample_rate,
             )
 
-        if ext in ('m4a', 'aac', 'mp4'):
+        if ext in ('m4a', 'aac', 'mp4', 'alac'):
             from mutagen.mp4 import MP4
             audio = MP4(file_path)
             # .m4a can carry AAC (lossy) OR ALAC (lossless) — only the real
-            # codec tells them apart, which is why extension-based classification
-            # defaults to 'aac' and we correct it here from the probed file.
+            # codec tells them apart.  The explicit .alac extension is already
+            # unambiguous and is accepted by the lossy-copy path, so it must be
+            # probed here as ALAC as well to preserve acquisition provenance.
             codec = (getattr(audio.info, 'codec', '') or '').lower()
-            if 'alac' in codec:
+            if ext == 'alac' or 'alac' in codec:
                 return AudioQuality(
                     format='alac',
                     bitrate=audio.info.bitrate // 1000 if audio.info.bitrate else None,
@@ -561,7 +677,7 @@ def probe_audio_quality(file_path: str):
                     bitrate=_kbps_from_stream_info(audio.info, file_path),
                     sample_rate=getattr(audio.info, 'sample_rate', None),
                 )
-            except Exception:   # noqa: BLE001 - an .ogg holding Opus, not Vorbis
+            except Exception:
                 from mutagen.oggopus import OggOpus
                 audio = OggOpus(file_path)
                 return AudioQuality(
@@ -571,23 +687,20 @@ def probe_audio_quality(file_path: str):
                 )
 
         if ext in ('opus', 'webm', 'weba'):
-            # OggOpusInfo carries neither bitrate NOR sample_rate — the old code
-            # asked for both. Opus is always 48 kHz internally, so that one is a
-            # fact rather than a guess; the bitrate is measured from the file.
-            # A .webm leftover is Matroska and mutagen's Ogg reader cannot open
-            # it, so don't fake a probe for one.
+            # .opus: FFmpegExtractAudio remux of YouTube itag 251/774.
+            # mutagen.oggopus has no bitrate/sample_rate attributes.
+            # .webm leftover is Matroska, not Ogg — don't fake a probe.
             info = None
             try:
                 from mutagen.oggopus import OggOpus
                 info = OggOpus(file_path).info
-            except Exception:   # noqa: BLE001
+            except Exception:
                 if ext != 'opus':
                     return None
             return AudioQuality(
                 format='opus',
                 bitrate=_kbps_from_stream_info(info, file_path),
-                sample_rate=(getattr(info, 'sample_rate', None) or 48000)
-                            if info is not None else 48000,
+                sample_rate=(getattr(info, 'sample_rate', None) or 48000) if info is not None else 48000,
             )
 
         if ext in ('wav', 'aiff', 'aif'):
@@ -884,21 +997,10 @@ def create_lossy_copy(final_path, settings=None):
 
         if result.returncode == 0:
             logger.info(f"[Lossy Copy] Created {quality_label} copy: {os.path.basename(out_path)}")
-            try:
-                from mutagen import File as MutagenFile
-                audio = MutagenFile(out_path)
-                if audio is not None:
-                    if codec == "mp3":
-                        from mutagen.id3 import TXXX
-                        audio.tags.add(TXXX(encoding=3, desc="QUALITY", text=[quality_label]))
-                    elif codec == "opus":
-                        audio["QUALITY"] = [quality_label]
-                    elif codec == "aac":
-                        from mutagen.mp4 import MP4FreeForm
-                        audio["----:com.apple.iTunes:QUALITY"] = [MP4FreeForm(quality_label.encode("utf-8"))]
-                    audio.save()
-            except Exception as tag_err:
-                logger.error(f"[Lossy Copy] Could not update QUALITY tag: {tag_err}")
+            # ffmpeg's -map_metadata leaves vorbis names in an mp3 and -vn drops
+            # the cover, so rebuild the copy's tags from the source (#1422)
+            from core.metadata.lossy_tags import carry_tags_to_lossy_copy
+            carry_tags_to_lossy_copy(final_path, out_path, quality_label)
 
             # Honor the delete-original setting — without this the original
             # FLAC was always kept alongside the converted MP3/OPUS/AAC even
@@ -947,7 +1049,7 @@ def create_lossy_copy(final_path, settings=None):
 # Sidecars that belong to ONE audio file (same filename stem) and should travel
 # with it. Only synced lyrics for now: .nfo/.txt/.json alongside downloads are
 # usually release junk the import correctly leaves behind, but a .lrc IS part
-# of the track (Commissary even generates them) — imports used to move the audio
+# of the track (SoulSync even generates them) — imports used to move the audio
 # and strand the lyrics in the source folder (lilbob5769's report).
 _COMPANION_SIDECAR_EXTS = ('.lrc',)
 

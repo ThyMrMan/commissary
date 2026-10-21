@@ -1,28 +1,27 @@
 """When has a download stopped making progress — measured in wall-clock, not uptime.
 
 The monitor already had a stall timeout, but it kept the clock in a module-level
-dict keyed by ``time.monotonic()``. Two consequences, both seen on a live install:
+dict keyed by ``time.monotonic()``. Two consequences, both visible on the live
+install:
 
 **A restart wiped it.** Six torrents sat at the same percentage for 199 minutes
-against a 30-minute timeout and were never failed, because the app had restarted
+against a 30-minute timeout and were never failed, because SoulSync had restarted
 inside that window and the clock restarted with it. A torrent dead for three days
-looks brand new twenty minutes after a deploy — so the longer a download had been
-stuck, the *less* likely the old design was to notice it.
+looks brand new twenty minutes after a deploy — so the longer a download has been
+stuck, the *less* likely the old design was to notice.
 
 **"Finished, but the file never appeared" was not tracked at all.** When a torrent
-reports complete and the importer cannot find its file, the resulting patch carries
-progress but NO status. The monitor's stall branch only looked at
-``queued``/``downloading``, so that row fell through every guard and sat at 100%
-forever. It is the shape a path-mapping failure takes — the bytes are on disk,
-Commissary just cannot see where — and it deserves to say so rather than spin.
+reports complete and the importer cannot find its file, ``process_client_download``
+returns a patch carrying progress but NO status. The monitor's stall branch only
+looked at ``queued``/``downloading``, so that row fell through every guard and sat
+at 100% forever. It is the shape a path-mapping failure takes — the bytes are on
+disk, SoulSync just cannot see where — and it deserves to say so rather than spin.
 
 So the clock is stored with the row (``progress_at``) and compared in wall-clock
 time. It survives restarts, and it is the same measure a person would use looking
 at the Downloads page: "this has not moved since 4pm".
 
 Pure: no DB, no clock of its own — the caller supplies ``now``.
-
-Ported from upstream SoulSync 3.2.1.
 """
 
 from __future__ import annotations
@@ -39,22 +38,26 @@ SEEDED = "seeded"        # no clock stored yet (new or migrated row) — start o
 
 
 def _ts(value: Any) -> Optional[float]:
-    """Parse a stored ``progress_at`` to epoch seconds.
-
-    This used to read the value as UTC. It is written by
-    ``download_monitor._now()`` in LOCAL wall-clock, and compared here against
-    ``time.time()`` — so on a UTC-4 host every download reported 14400 seconds
-    of idleness the moment it was written, against a 1800-second timeout. The
-    first tick without forward progress was therefore instantly STALLED, and
-    two films were killed four seconds after their last progress reading, one
-    of them at 100.0% while it was still being finalised.
-
-    See core/video/timestamps.py for why the storage stayed local rather than
-    the writer moving to UTC. None for anything unparseable, which the caller
-    treats as 'no clock yet' rather than 'infinitely stalled' — a bad timestamp
-    must never mass-fail a queue."""
-    from core.video.timestamps import LOCAL, to_epoch
-    return to_epoch(value, naive_is=LOCAL)
+    """Parse a stored SQLite timestamp ('YYYY-MM-DD HH:MM:SS', UTC) to epoch
+    seconds. Returns None for anything unparseable, which the caller treats as
+    'no clock yet' rather than 'infinitely stalled' — a bad timestamp must never
+    mass-fail a queue."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    from datetime import datetime, timezone
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(text.replace("Z", ""), fmt).replace(
+                tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def _pct(value: Any) -> float:
@@ -88,7 +91,7 @@ def classify(previous_progress: Any, new_progress: Any, progress_at: Any,
 def reason(verdict: str, idle_seconds: Any, *, at_completion: bool = False) -> str:
     """What to write on the row. The two situations read completely differently to
     the person looking at them: one is a download nobody is seeding, the other is a
-    download that FINISHED and whose file Commissary then could not find — that one
+    download that FINISHED and whose file SoulSync then could not find — that one
     is a path problem, and saying 'no progress' would send them hunting seeders."""
     try:
         mins = int(max(0.0, float(idle_seconds or 0)) // 60)
@@ -96,9 +99,9 @@ def reason(verdict: str, idle_seconds: Any, *, at_completion: bool = False) -> s
         mins = 0          # a message is never worth raising over
 
     if at_completion:
-        return ("Finished downloading, but the file never appeared where Commissary "
+        return ("Finished downloading, but the file never appeared where SoulSync "
                 "could reach it (%d min). Check the download client's save path "
-                "and Commissary's library folders." % mins)
+                "and SoulSync's library folders." % mins)
     return "Stalled — no progress for %d min" % mins
 
 

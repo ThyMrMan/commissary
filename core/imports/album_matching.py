@@ -29,7 +29,6 @@ test surface is just dicts in / dicts out.
 from __future__ import annotations
 
 import os
-import re
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 # Use the project's namespaced logger so diagnostic lines actually
@@ -76,6 +75,17 @@ ALBUM_SEARCH_ARTIST_WEIGHT = 0.2
 ALBUM_SEARCH_TRACK_COUNT_WEIGHT = 0.3
 ALBUM_SEARCH_THRESHOLD = 0.4
 
+# M7: minimum artist similarity a result must clear before its title score
+# can pass. Without this, an exact title match (0.5) clears the 0.4
+# threshold on a completely wrong artist. Calibrated against the real
+# similarity engine (Sep 2026):
+#   "Target Artist" vs "Some Other Band": 0.143 -> reject
+#   "Metallica" vs "Metallica Tribute Band": 0.581 -> reject
+#   Beatles variant 0.778, Kendrick Lamar & SZA 0.875, AC/DC vs ACDC 0.889
+#   -> accept. Applies only when BOTH sides name an artist; album-only
+#   searches and artist-less results keep the old behavior.
+ALBUM_SEARCH_ARTIST_MIN_SIMILARITY = 0.6
+
 _FORMAT_QUALITY_RANK = {
     '.flac': 10, '.wav': 9, '.aiff': 9, '.aif': 9, '.ape': 8,
     '.m4a': 7, '.ogg': 6, '.opus': 6, '.mp3': 5, '.wma': 3, '.aac': 5,
@@ -105,7 +115,13 @@ def score_album_search_result(
         r_artist = artists[0] if artists else ''
         if isinstance(r_artist, dict):
             r_artist = r_artist.get('name', '')
-        score += artist_similarity(target_artist, str(r_artist)) * ALBUM_SEARCH_ARTIST_WEIGHT
+        r_artist = str(r_artist)
+        artist_sim = artist_similarity(target_artist, r_artist)
+        if r_artist and artist_sim < ALBUM_SEARCH_ARTIST_MIN_SIMILARITY:
+            # M7: clearly the wrong artist — no title score can rescue it.
+            # An exact title (0.5) used to clear the 0.4 threshold alone.
+            return 0.0
+        score += artist_sim * ALBUM_SEARCH_ARTIST_WEIGHT
 
     r_tracks = getattr(album_result, 'total_tracks', 0) or 0
     if r_tracks > 0 and file_count > 0:
@@ -231,65 +247,6 @@ def _extract_track_artist(track: Dict[str, Any]) -> str:
     return a.get('name', str(a)) if isinstance(a, dict) else str(a)
 
 
-# Separators a ripper puts between the album name and what follows it.
-_PREFIX_SEPARATORS = " -_.–—|/\\"
-
-
-def strip_album_prefix(stem: str, album: str) -> str:
-    """``'Blue Blood 01 Blue Blood'`` + album ``'Blue Blood'`` → ``'Blue Blood'``.
-
-    Untagged rips are often named ``<Album> <NN> <Title>``. The title fallback
-    only strips a track number at the START of the stem, so with the album
-    name sitting in front of it nothing was stripped and the whole string was
-    scored against the track title — ``"Blue Blood 01 Blue Blood"`` vs
-    ``"Blue Blood"`` scored 0.34 against a 0.40 threshold, so a correctly
-    named album matched nothing at all.
-
-    Returns the stem unchanged unless removing the prefix leaves something
-    real: a track genuinely titled after its album ("Blue Blood" on *Blue
-    Blood*) must not be reduced to nothing.
-    """
-    # Imported here, not at module scope, matching the existing convention in
-    # this file — core.imports.paths pulls in the wider import machinery.
-    from core.imports.paths import strip_leading_track_number
-    s = (stem or "").strip()
-    a = (album or "").strip()
-    if not s or not a or not s.casefold().startswith(a.casefold()):
-        return s
-    rest_raw = s[len(a):]
-    # The album name has to end on a token boundary. Without this, album
-    # "Blue Blood" would strip "Blue Bloodhound Blues" down to "hound Blues"
-    # — a prefix match on a longer word, not the album name at all.
-    if rest_raw and rest_raw[0] not in _PREFIX_SEPARATORS:
-        return s
-    rest = strip_leading_track_number(rest_raw.lstrip(_PREFIX_SEPARATORS))
-    if rest and not rest.isdigit() and re.search(r"[^\W_]", rest):
-        return rest
-    return s
-
-
-def _title_candidates(file_path: str, file_tags: Dict[str, Any], target_album: str) -> List[str]:
-    """The title spellings worth scoring for this file, best-known first.
-
-    A real title tag is authoritative and used alone — rewriting it risks
-    mangling a track legitimately named after its album. The filename is a
-    guess, so when that is all there is, both readings of the guess are
-    offered and the caller keeps whichever agrees better.
-    """
-    from core.imports.paths import strip_leading_track_number
-    tag_title = (file_tags.get('title') or '').strip() if file_tags else ''
-    if tag_title:
-        return [strip_leading_track_number(tag_title)]
-
-    stem = os.path.splitext(os.path.basename(file_path))[0]
-    base = strip_leading_track_number(stem)
-    candidates = [base]
-    without_album = strip_album_prefix(base, target_album)
-    if without_album != base:
-        candidates.append(without_album)
-    return candidates
-
-
 def score_file_against_track(
     file_path: str,
     file_tags: Dict[str, Any],
@@ -321,17 +278,15 @@ def score_file_against_track(
 
     score = 0.0
 
-    # Title similarity (TITLE_WEIGHT). Falls back to the filename stem when
+    # Title similarity (TITLE_WEIGHT). Falls back to filename stem when
     # the file has no title tag — strip a leading track-number prefix off that
-    # stem (#890) so "01 - Sun It Rises" scores against "Sun It Rises", and
-    # also try it without a leading album name so the equally common
-    # "<Album> <NN> <Title>" rip naming scores against the title too.
-    # Best-of rather than a single reading: the filename is a guess, and the
-    # right interpretation of it depends on how the ripper was configured.
+    # stem (#890) so "01 - Sun It Rises" scores against "Sun It Rises".
+    # Commissary: also try a filename without a leading album name
+    # ("<Album> <NN> <Title>" rips) and keep the better reading.
+    from core.commissary.title_candidates import title_candidates
     track_name = track.get('name', '')
-    score += max(title_sim(candidate, track_name)
-                 for candidate in _title_candidates(file_path, file_tags, target_album)
-                 ) * TITLE_WEIGHT
+    score += max(title_sim(title, track_name)
+                 for title in title_candidates(file_path, file_tags, target_album)) * TITLE_WEIGHT
 
     # Artist similarity (ARTIST_WEIGHT). Partial credit when either side
     # lacks an artist tag so title-only pairs can still clear threshold.
@@ -572,14 +527,12 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
 
     Decision order:
     1. If the track carries a source name + that source is in the
-       seconds-only list, treat a bare ``duration`` as seconds and × 1000.
-       A value under ``duration_ms`` is milliseconds for EVERY source.
+       seconds-only list, treat raw value as seconds and × 1000.
     2. If source is ms-only, take the value as-is.
     3. If source unknown / missing (e.g. mocked test data), fall back
        to a magnitude heuristic — values < 30000 treated as seconds.
        This is the legacy behavior, kept as the safety net.
     """
-    from_ms_key = bool(track.get('duration_ms'))
     raw = track.get('duration_ms') or track.get('duration') or 0
     try:
         value = int(raw)
@@ -591,18 +544,11 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
     source = (track.get('source') or track.get('_source') or track.get('provider') or '').strip().lower()
 
     if source in _SECONDS_DURATION_SOURCES:
-        # Only a bare ``duration`` is seconds. A value that arrived under
-        # ``duration_ms`` is already milliseconds: the Discogs client turns
-        # "3:25" into 205000 before returning, and MusicBrainz ``length`` IS
-        # milliseconds. Multiplying those by 1000 made a Discogs or MusicBrainz
-        # track "last" roughly 57 hours. It stayed latent: only a track tagged
-        # with its source reaches this branch, and tagged tracks come from
-        # _normalize_match_track -- the Import page and the album Re-identify
-        # preview -- neither of which compared against a real length until
-        # 2.3.5. The auto-import worker matches raw get_album tracks, which
-        # carry no tag and take the magnitude heuristic below (only Discogs'
-        # get_album_tracks fallback tags them, when get_album returns nothing).
-        if from_ms_key:
+        # Commissary: only a bare ``duration`` is seconds. A value under
+        # ``duration_ms`` is already ms for every source (the Discogs client
+        # turns "3:25" into 205000, MusicBrainz ``length`` is ms); x1000 made a
+        # track "last" ~57 hours and the duration gate rejected every file.
+        if track.get('duration_ms'):
             return value
         return value * 1000
     if source in _MS_DURATION_SOURCES:
@@ -617,175 +563,6 @@ def _track_duration_ms(track: Dict[str, Any]) -> int:
     return value
 
 
-# ---------------------------------------------------------------------------
-# Language versions, and pairing by place in the album and length
-# ---------------------------------------------------------------------------
-# A title in another language scores ~0 against the tracklist, so a Japanese-
-# titled file paired only through its track number -- and not at all when a
-# multi-disc release is numbered straight through (file 41 is disc 2, track 1).
-# Position alone is too weak to trust; a file and a track at the same place in
-# the album whose lengths agree within a few seconds are the same song. And a
-# language version is a different recording, whatever else agrees.
-
-POSITION_DURATION_TOLERANCE_MS = 3000
-# Recorded for such a pair: above MATCH_THRESHOLD, below the 0.8 at which a
-# single auto-import match carries a whole album on its own.
-POSITION_DURATION_CONFIDENCE = 0.7
-
-_SPACED_NUMBER_RE = re.compile(r'^\s*(\d{1,3})\s+\S')
-
-
-def _positive_int(value: Any) -> int:
-    try:
-        number = int(str(value).split('/')[0].strip())
-    except (TypeError, ValueError):
-        return 0
-    return number if number > 0 else 0
-
-
-def durations_agree(file_duration_ms: Any, track_duration_ms: Any,
-                    tolerance_ms: int = POSITION_DURATION_TOLERANCE_MS) -> bool:
-    """True when both lengths are known and within ``tolerance_ms`` of each other."""
-    try:
-        a, b = int(float(file_duration_ms or 0)), int(float(track_duration_ms or 0))
-    except (TypeError, ValueError):
-        return False
-    return a > 0 and b > 0 and abs(a - b) <= tolerance_ms
-
-
-def file_track_number(file_path: str, tag_number: Any = 0) -> int:
-    """A file's track number: its tag, else the number its filename starts with --
-    "01 - Title" and "1-03 Title", and also the bare "41 常夏の島" that
-    ``extract_explicit_track_number`` leaves alone."""
-    number = _positive_int(tag_number)
-    if number:
-        return number
-    from core.imports.filename import extract_explicit_track_number
-    number = extract_explicit_track_number(file_path)
-    if number:
-        return number
-    match = _SPACED_NUMBER_RE.match(os.path.splitext(os.path.basename(file_path or ''))[0])
-    return int(match.group(1)) if match else 0
-
-
-def _file_disc_number(file_path: str, tags: Dict[str, Any]) -> int:
-    """The file's disc: its tag, else the disc folder it sits in ("CD2"), else 1."""
-    disc = _coerce_disc_number(tags.get('disc_number'), default=1)
-    if disc <= 1:
-        folder = DISC_FOLDER_RE.match(os.path.basename(os.path.dirname(file_path)))
-        if folder:
-            return max(int(folder.group(1)), 1)
-    return max(disc, 1)
-
-
-def _file_language_version(file_path: str, tags: Dict[str, Any]) -> Optional[str]:
-    """The language version a file's title, album tag or filename names."""
-    from core.text.language_version import language_version
-    return (language_version(tags.get('title'))
-            or language_version(tags.get('album'))
-            or language_version(os.path.splitext(os.path.basename(file_path))[0]))
-
-
-def _track_language_version(track: Dict[str, Any], target_album: str) -> Optional[str]:
-    """The language version a track's name names -- or failing that its album's
-    ("UNDEAD" on the single "UNDEAD (English Version)")."""
-    from core.text.language_version import language_version
-    return language_version(track.get('name')) or language_version(target_album)
-
-
-def pair_by_position_and_duration(
-    audio_files: List[str],
-    file_tags: Dict[str, Dict[str, Any]],
-    tracks: List[Dict[str, Any]],
-    *,
-    target_album: str,
-    matches: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """Pair the files ``matches`` left over with the tracks it left over, by
-    their place in the album, where their lengths agree.
-
-    A track's place is its position counted through the discs: disc 2, track 1
-    of a 40 + 44 track album is 41. A file's place is its number -- the tag, or
-    one its filename starts with -- read per disc when the file names a disc (a
-    tag, or a "CD2" folder) and the number fits that disc, and straight through
-    otherwise.
-
-    Position is trusted only once the numbering is confirmed: at least two pairs
-    in all sit at the same place (the matches already made count), and most of
-    the leftover places agree on length. A place pairs only with a single file
-    that agrees, and different language versions never pair. Returns the new
-    matches, each with ``'match_type': 'position_duration'``."""
-    disc_lengths: Dict[int, int] = {}
-    for track in tracks:
-        number = _positive_int(track.get('track_number'))
-        if number:
-            disc = _extract_track_disc(track)
-            disc_lengths[disc] = max(disc_lengths.get(disc, 0), number)
-    if not disc_lengths:
-        return []
-    offsets: Dict[int, int] = {}
-    total = 0
-    for disc in sorted(disc_lengths):
-        offsets[disc] = total
-        total += disc_lengths[disc]
-
-    def track_place(track: Dict[str, Any]) -> int:
-        number = _positive_int(track.get('track_number'))
-        disc = _extract_track_disc(track)
-        return offsets[disc] + number if number and disc in offsets else 0
-
-    def file_place(file_path: str) -> int:
-        tags = file_tags.get(file_path, {})
-        number = file_track_number(file_path, tags.get('track_number'))
-        if not number:
-            return 0
-        disc = _file_disc_number(file_path, tags)
-        if disc > 1:
-            if disc not in offsets:
-                return 0
-            if number <= disc_lengths[disc]:
-                return offsets[disc] + number
-        return number if number <= total else 0
-
-    matched_files = {m['file'] for m in matches}
-    matched_tracks = {id(m['track']) for m in matches}
-    confirmed = sum(1 for m in matches
-                    if track_place(m['track']) and file_place(m['file']) == track_place(m['track']))
-
-    files_at: Dict[int, List[str]] = {}
-    for file_path in audio_files:
-        if file_path not in matched_files:
-            place = file_place(file_path)
-            if place:
-                files_at.setdefault(place, []).append(file_path)
-
-    placed = 0
-    agreeing: List[Tuple[Dict[str, Any], str]] = []
-    taken: Set[str] = set()
-    for track in tracks:
-        if id(track) in matched_tracks:
-            continue
-        candidates = files_at.get(track_place(track)) or []
-        if not candidates:
-            continue
-        placed += 1
-        track_ms = _track_duration_ms(track)
-        language = _track_language_version(track, target_album)
-        fits = [f for f in candidates
-                if f not in taken
-                and durations_agree(file_tags.get(f, {}).get('duration_ms'), track_ms)
-                and _file_language_version(f, file_tags.get(f, {})) == language]
-        if len(fits) == 1:
-            agreeing.append((track, fits[0]))
-            taken.add(fits[0])
-
-    if len(agreeing) + confirmed < 2 or len(agreeing) * 2 < placed:
-        return []
-    return [{'track': track, 'file': file_path,
-             'confidence': POSITION_DURATION_CONFIDENCE, 'match_type': 'position_duration'}
-            for track, file_path in agreeing]
-
-
 def match_files_to_tracks(
     audio_files: List[str],
     file_tags: Dict[str, Dict[str, Any]],
@@ -794,7 +571,6 @@ def match_files_to_tracks(
     target_album: str,
     quality_rank: QualityRankFn,
     similarity: Optional[SimilarityFn] = None,
-    log_diagnostics: bool = True,
 ) -> Dict[str, Any]:
     """Match staging files to album tracks.
 
@@ -815,20 +591,16 @@ def match_files_to_tracks(
        sanity gate (files whose audio length is more than
        ``DURATION_TOLERANCE_MS`` from the candidate track are rejected
        before scoring, regardless of how good the title agreement
-       looks). A file and a track in different language versions are
-       never scored either (``core.text.language_version``).
-
-    4. **Place and length** (``pair_by_position_and_duration``) — what
-       titles could not pair (a title in another language, files numbered
-       straight through the discs) pairs by position in the album where
-       the lengths agree, once the numbering is confirmed. These matches
-       carry ``'match_type': 'position_duration'``.
+       looks).
 
     Returns a dict with:
     - ``matches``: list of ``{'track': dict, 'file': str, 'confidence': float}``;
       exact-id matches additionally carry ``'match_type'``.
     - ``unmatched_files``: files left over after every track found its
-      best (or none).
+      best (or none) — quality-dedup losers included.
+    - ``duplicate_files``: the dedup-loser subset of ``unmatched_files``,
+      so a caller can distinguish "a lower-quality copy of a track that
+      imported" from "a song nothing claimed".
 
     Each file matches at most one track. Each track matches at most one
     file. Pure function — no side effects, no I/O, no metadata client.
@@ -849,19 +621,25 @@ def match_files_to_tracks(
         remaining_files, file_tags, quality_rank=quality_rank, similarity=similarity)
 
     # Phase 3 — fuzzy scoring on remaining tracks.
+    # #1289: was greedy per-track in tracklist order — an early track with a
+    # mediocre score (0.402) could permanently claim a file that a later
+    # track would match at 1.0 (the Give Up Deluxe cover mislabeling). Now
+    # collect all candidate scores first and claim in descending-score order,
+    # so the best match always wins regardless of track order.
+    # Note: descending-greedy is not globally optimal (Hungarian assignment
+    # could match more tracks in adversarial score matrices), but it is a
+    # strict improvement over track-order greedy for the reported bug class.
     duration_rejected = 0     # diagnostics for the "no matches" case
-    file_languages = {f: _file_language_version(f, file_tags.get(f, {})) for f in deduped}
-    below_threshold = 0
     sample_rejection_logged = False
+    from core.commissary.language_versions import (  # Commissary: language versions
+        file_language as _file_language, first_language as _first_language)
+    scored: list[tuple[float, int, str]] = []  # (score, track_idx, file)
+    below_threshold_tracks: set[int] = set()
     for i, track in enumerate(tracks):
         if i in used_track_indices:
             continue
 
         track_duration = _track_duration_ms(track)
-        track_language = _track_language_version(track, target_album)
-
-        best_file = None
-        best_score = 0.0
 
         for f in deduped:
             if f in used_files:
@@ -882,7 +660,7 @@ def match_files_to_tracks(
                 # unit mismatch (seconds vs ms), genuine drift, or some
                 # third thing. Logging every rejection would spam the
                 # log on a 21-file × 19-track album (399 lines).
-                if log_diagnostics and not sample_rejection_logged:
+                if not sample_rejection_logged:
                     sample_rejection_logged = True
                     raw_dur_ms = track.get('duration_ms')
                     raw_dur = track.get('duration')
@@ -898,10 +676,10 @@ def match_files_to_tracks(
                     )
                 continue
 
-            # A language version is a different recording: "FEARLESS (Japanese
-            # Version)" must not fill the Korean album's "FEARLESS", however well
-            # its position, artist and album tag agree.
-            if file_languages.get(f) != track_language:
+            # Commissary: "FEARLESS (Japanese Version)" never fills the Korean
+            # album's "FEARLESS" (core/commissary/language_versions.py)
+            if _file_language(f, tags.get('title'), tags.get('album')) != \
+                    _first_language(track.get('name'), target_album):
                 continue
 
             score = score_file_against_track(
@@ -909,156 +687,62 @@ def match_files_to_tracks(
                 target_album=target_album,
                 similarity=similarity,
             )
-            if score > best_score and score >= MATCH_THRESHOLD:
-                best_score = score
-                best_file = f
+            if score >= MATCH_THRESHOLD:
+                scored.append((score, i, f))
+            else:
+                below_threshold_tracks.add(i)
 
-        if best_file:
-            used_files.add(best_file)
-            matches.append({
-                'track': track,
-                'file': best_file,
-                'confidence': round(best_score, 3),
-            })
-        elif deduped:
-            below_threshold += 1
+    # Claim in descending-score order. A track/file already claimed by a
+    # higher-scoring pair is skipped.
+    scored.sort(key=lambda t: t[0], reverse=True)
+    for best_score, i, best_file in scored:
+        if i in used_track_indices or best_file in used_files:
+            continue
+        used_files.add(best_file)
+        used_track_indices.add(i)
+        matches.append({
+            'track': tracks[i],
+            'file': best_file,
+            'confidence': round(best_score, 3),
+        })
 
-    # Phase 4 — place and length, for what titles could not pair.
-    paired = pair_by_position_and_duration(
-        deduped, file_tags, tracks, target_album=target_album, matches=matches,
-    )
-    if paired:
-        matches.extend(paired)
-        used_files.update(m['file'] for m in paired)
-        if log_diagnostics:
-            logger.info(
-                "[Album Matching] '%s': paired %d file(s) by their place in the album and length",
-                target_album, len(paired),
-            )
+    # Commissary: what titles couldn't pair, by place in the album and length
+    # (core/commissary/position_pairing.py)
+    from core.commissary.position_pairing import add_position_pairs
+    add_position_pairs(deduped, file_tags, tracks, target_album=target_album,
+                       matches=matches, used_files=used_files)
 
     # Diagnostic surface — when the matcher returns 0 matches against
     # a non-trivial input, it's nearly always one of: duration gate too
     # strict, title agreement too low, or wrong tracks list passed in.
     # Log a one-line summary at INFO so users grep'ing app.log for
     # "no matches" cases see WHY without needing to bump log level.
-    if log_diagnostics and not matches and (audio_files or tracks):
+    if not matches and (audio_files or tracks):
         logger.info(
             "[Album Matching] No matches: %d files, %d tracks, "
             "%d duration-rejected pairs, %d tracks below threshold. "
             "Album: %r",
             len(audio_files), len(tracks),
-            duration_rejected, below_threshold, target_album,
+            duration_rejected, len(below_threshold_tracks), target_album,
         )
 
     # Final unmatched list: every file that didn't get used in any
     # phase. Includes quality-dedup losers (lower-quality copies of
     # files we already matched) so the caller can see the full picture.
+    # `duplicate_files` names that subset, because the two halves mean
+    # opposite things to an importer: a dedup loser is the expected
+    # outcome of a healthy album, while an unclaimed file is a song
+    # nobody imported. Callers that cannot tell them apart either mark
+    # healthy albums 'partial' or silently abandon real songs.
+    deduped_set = set(deduped)
     return {
         'matches': matches,
         'unmatched_files': [f for f in audio_files if f not in used_files],
+        'duplicate_files': [
+            f for f in remaining_files
+            if f not in deduped_set and f not in used_files
+        ],
     }
-
-
-# ---------------------------------------------------------------------------
-# Folder affinity (the Import page's unscoped match)
-# ---------------------------------------------------------------------------
-# A download folder holds many albums side by side. Matching a tracklist
-# against every file in it lets each track take its best-scoring file from ANY
-# folder, so an "Intro", an interlude or a same-numbered track from another
-# album wins a slot -- and the position dedup can even discard the album's own
-# copy first, because it keeps one file per (disc, track) across all folders.
-# An album almost always lives in one folder, so match each on its own.
-
-# One rule for multi-disc layouts ("CD1", "Disc 2"). The auto-import worker
-# imports this rather than keeping a copy that could drift from it.
-DISC_FOLDER_RE = re.compile(r'^(?:disc|cd|disk)\s*(\d+)$', re.IGNORECASE)
-
-
-def album_folder_of(path: str) -> str:
-    """The folder an audio file's ALBUM lives in.
-
-    Its parent directory, except that a disc subfolder ("CD1", "Disc 2")
-    belongs to the folder above it -- otherwise a two-disc album would be split
-    into two folders and only one disc could ever be matched."""
-    parent = os.path.dirname(path)
-    if DISC_FOLDER_RE.match(os.path.basename(parent)):
-        return os.path.dirname(parent)
-    return parent
-
-
-def match_files_to_tracks_by_folder(
-    audio_files: List[str],
-    file_tags: Dict[str, Dict[str, Any]],
-    tracks: List[Dict[str, Any]],
-    *,
-    target_album: str,
-    quality_rank: QualityRankFn,
-    similarity: Optional[SimilarityFn] = None,
-) -> Dict[str, Any]:
-    """``match_files_to_tracks``, confined to the one album folder that fits best.
-
-    Each album folder is matched in isolation, so a file elsewhere can never
-    take a slot from -- or be deduped against -- the album's own files. The
-    winner is the folder with the most matched tracks, then the highest total
-    confidence; ties go to the first folder in path order, so the pick is
-    deterministic.
-
-    Returns the winning folder's result, plus:
-
-    - ``folder``: the folder the matches were drawn from (``None`` on fallback)
-    - ``folders_considered``: how many album folders the files spanned
-    - ``candidate_files``: the files that were eligible to match
-
-    When NO folder matches anything, falls back to matching across every file,
-    which is exactly the behaviour before folders were considered -- so an
-    album spread unusually across folders is never worse off than it was.
-    """
-    by_folder: Dict[str, List[str]] = {}
-    for f in audio_files:
-        by_folder.setdefault(album_folder_of(f), []).append(f)
-
-    if len(by_folder) <= 1:
-        result = match_files_to_tracks(
-            audio_files, file_tags, tracks,
-            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
-        )
-        result['folder'] = next(iter(by_folder), None)
-        result['folders_considered'] = len(by_folder)
-        result['candidate_files'] = list(audio_files)
-        return result
-
-    best_folder: Optional[str] = None
-    best_result: Optional[Dict[str, Any]] = None
-    best_key: Optional[Tuple[int, float]] = None
-    for folder in sorted(by_folder):
-        result = match_files_to_tracks(
-            by_folder[folder], file_tags, tracks,
-            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
-            log_diagnostics=False,
-        )
-        key = (len(result['matches']), sum(m['confidence'] for m in result['matches']))
-        if best_key is None or key > best_key:
-            best_folder, best_result, best_key = folder, result, key
-
-    if best_result is None or not best_result['matches']:
-        result = match_files_to_tracks(
-            audio_files, file_tags, tracks,
-            target_album=target_album, quality_rank=quality_rank, similarity=similarity,
-        )
-        result['folder'] = None
-        result['folders_considered'] = len(by_folder)
-        result['candidate_files'] = list(audio_files)
-        return result
-
-    logger.info(
-        "[Album Matching] '%s': matched %d/%d tracks from %r (best of %d folders)",
-        target_album, len(best_result['matches']), len(tracks),
-        best_folder, len(by_folder),
-    )
-    best_result['folder'] = best_folder
-    best_result['folders_considered'] = len(by_folder)
-    best_result['candidate_files'] = list(by_folder[best_folder])
-    return best_result
 
 
 # ---------------------------------------------------------------------------
@@ -1223,7 +907,6 @@ __all__ = [
     'CROSS_DISC_POSITION_WEIGHT',
     'ALBUM_WEIGHT',
     'MATCH_THRESHOLD',
-    'strip_album_prefix',
     'EXACT_MATCH_CONFIDENCE',
     'DURATION_TOLERANCE_MS',
     'ALBUM_SEARCH_NAME_WEIGHT',

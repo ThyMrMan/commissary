@@ -420,10 +420,6 @@ def test_album_match_warns_without_source_and_passes_file_filter():
                 "album_artist": "Artist",
                 "file_paths": {"a.flac", "b.flac"},
                 "source": None,
-                # The folder this request scans. Omitting it made the builder
-                # read the configured Import folder even when the page showed
-                # a different one.
-                "staging_path": runtime.get_staging_path(),
             },
         )
     ]
@@ -446,6 +442,7 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
     refresh_calls = []
     automation = _FakeAutomationEngine()
     runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
         resolve_album_artist_context=lambda album, source="": {"name": "Artist"},
         build_album_import_context=lambda album, track, **kwargs: {"album": album, "track": track, **kwargs},
         post_process_matched_download=lambda key, context, path: processed_contexts.append((key, context, path)),
@@ -479,6 +476,23 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
         "processed": 1,
         "total": 2,
         "errors": ["File not found: missing.flac"],
+        # existing-library pre-check: per-track dispositions + summary.
+        "dispositions": [
+            {
+                "track_name": "Good Track",
+                "file_name": "good.flac",
+                "decision": "imported",
+                "reason": "paired by fuzzy scoring (no match type) — "
+                          "cannot prove identity, proceeding",
+            },
+            {
+                "track_name": "Missing Track",
+                "file_name": "missing.flac",
+                "decision": "error",
+                "reason": "File not found: missing.flac",
+            },
+        ],
+        "summary": {"imported": 1, "skipped_owned": 0, "upgraded": 0},
     }
     assert len(processed_contexts) == 1
     key, context, path = processed_contexts[0]
@@ -490,9 +504,7 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
     # explicit user match — quality profile has no veto (#1017)
     assert context["_skip_quarantine_check"] == ["quality", "bit_depth"]
     assert path == str(good_file)
-    # Two matches in one request really is an album-level import, so the album
-    # wording is right here. The per-track case is covered below.
-    assert activity == [("", "Album Imported", "Album by Artist (1/2 tracks)", "Now")]
+    assert activity == [("", "Album Imported", "Album by Artist (1 imported)", "Now")]
     assert refresh_calls == ["refresh"]
     assert automation.events == [
         (
@@ -509,103 +521,6 @@ def test_album_process_posts_valid_files_and_records_side_effects(tmp_path):
             },
         ),
     ]
-
-
-def _single_match_runtime(activity):
-    return ImportRouteRuntime(
-        resolve_album_artist_context=lambda album, source="": {"name": "IVE"},
-        build_album_import_context=lambda album, track, **kwargs: {"album": album, "track": track, **kwargs},
-        post_process_matched_download=lambda key, context, path: None,
-        add_activity_item=lambda *args: activity.append(args),
-        refresh_import_suggestions_cache=lambda: None,
-        automation_engine=_FakeAutomationEngine(),
-        is_active_media_server_ready=lambda: (True, ""),
-        logger=_FakeLogger(),
-    )
-
-
-def test_a_single_track_import_does_not_claim_the_album_imported(tmp_path):
-    """The Import page submits an album ONE TRACK PER REQUEST, so this handler
-    almost always sees a single match. Reporting each one as "Album Imported —
-    (1/1 tracks)" made an 11-track album look like it had imported with one
-    file found, which is alarming and false. Name the track instead."""
-    f = tmp_path / "01.flac"
-    _touch(f)
-    activity = []
-    payload, status = album_process(
-        _single_match_runtime(activity),
-        {
-            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
-            "matches": [{
-                "staging_file": {"full_path": str(f), "filename": "01.flac"},
-                "track": {"name": "Kitsch", "track_number": 1},
-            }],
-        },
-    )
-    assert status == 200 and payload["processed"] == 1
-    assert len(activity) == 1
-    verb, detail = activity[0][1], activity[0][2]
-    assert verb == "Track Imported"
-    assert "Kitsch" in detail and "I'VE IVE" in detail
-    assert "1/1" not in detail
-
-
-def test_a_failed_single_track_says_so_rather_than_reporting_an_import(tmp_path):
-    """The old message said "Album Imported" even when nothing imported —
-    processed was simply 0 inside a string nobody reads that closely."""
-    activity = []
-    payload, status = album_process(
-        _single_match_runtime(activity),
-        {
-            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
-            "matches": [{
-                "staging_file": {"full_path": str(tmp_path / "gone.flac"), "filename": "gone.flac"},
-                "track": {"name": "Kitsch", "track_number": 1},
-            }],
-        },
-    )
-    assert status == 200 and payload["processed"] == 0
-    assert activity[0][1] == "Track Import Failed"
-
-
-def test_a_post_process_exception_is_not_reported_as_an_import(tmp_path):
-    """Reported from a live install: every track of "I've IVE" logged
-    ``PermissionError: [Errno 13] Permission denied:
-    '/media/completed/listening/music/IVE'`` and every track still notified
-    "Track Imported".
-
-    ``post_process_matched_download`` catches everything, re-queues the file
-    for retry and RETURNS NORMALLY so the download monitor can try again. The
-    manual-import routes have no monitor — they saw a clean return and counted
-    a success, so the files stayed in the download folder while the UI said
-    they had landed. The failure is now carried on the context the same way
-    every other terminal outcome already is.
-    """
-    f = tmp_path / "11.flac"
-    _touch(f)
-    activity = []
-    runtime = _single_match_runtime(activity)
-    runtime.post_process_matched_download = lambda key, context, path: context.update(
-        _post_process_error="[Errno 13] Permission denied: "
-                            "'/media/completed/listening/music/IVE'")
-
-    payload, status = album_process(
-        runtime,
-        {
-            "album": {"id": "a1", "name": "I'VE IVE", "artist": "IVE"},
-            "matches": [{
-                "staging_file": {"full_path": str(f), "filename": "11.flac"},
-                "track": {"name": "Shine With Me", "track_number": 11},
-            }],
-        },
-    )
-
-    assert status == 200
-    assert payload["processed"] == 0
-    assert activity[0][1] == "Track Import Failed"
-    # The reason has to reach the user — "failed" alone sends them to the logs
-    # for something the app already knows.
-    assert any("Permission denied" in str(e) for e in payload.get("errors", [])), payload
 
 
 def test_album_process_requires_album_and_matches():
@@ -669,6 +584,7 @@ def test_process_single_import_file_resolves_and_posts_context(tmp_path):
     _touch(audio_file)
     post_calls = []
     runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
         parse_filename_metadata=lambda filename: {"title": "Song", "artist": "Artist"},
         get_single_track_import_context=lambda title, artist, **kwargs: {
             "source": "deezer",
@@ -696,7 +612,11 @@ def test_process_single_import_file_resolves_and_posts_context(tmp_path):
 def test_process_single_import_file_rejects_malformed_manual_match(tmp_path):
     audio_file = tmp_path / "Song.flac"
     _touch(audio_file)
-    runtime = ImportRouteRuntime(post_process_matched_download=lambda *_args: None, logger=_FakeLogger())
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(tmp_path)],
+        post_process_matched_download=lambda *_args: None,
+        logger=_FakeLogger(),
+    )
 
     outcome = process_single_import_file(
         runtime,
@@ -704,6 +624,65 @@ def test_process_single_import_file_rejects_malformed_manual_match(tmp_path):
     )
 
     assert outcome == ("error", "Malformed manual match for file: Song.flac")
+
+
+@pytest.mark.parametrize("path_kind", ["outside", "traversal", "symlink"])
+def test_single_import_rejects_paths_escaping_allowed_roots(tmp_path, path_kind):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside.flac"
+    _touch(outside)
+    if path_kind == "outside":
+        supplied = outside
+    elif path_kind == "traversal":
+        supplied = staging / ".." / outside.name
+    else:
+        supplied = staging / "escape.flac"
+        supplied.symlink_to(outside)
+    calls = []
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(staging)],
+        post_process_matched_download=lambda *args: calls.append(args),
+        logger=_FakeLogger(),
+    )
+
+    outcome = process_single_import_file(
+        runtime, {"full_path": str(supplied), "filename": supplied.name},
+    )
+
+    assert outcome[0] == "error"
+    assert "outside the allowed import folders" in outcome[1]
+    assert calls == []
+
+
+def test_album_import_rejects_forged_match_path_outside_allowed_root(tmp_path):
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    outside = tmp_path / "outside.flac"
+    _touch(outside)
+    calls = []
+    runtime = ImportRouteRuntime(
+        get_allowed_import_roots=lambda: [str(staging)],
+        resolve_album_artist_context=lambda *_args, **_kwargs: {"name": "Artist"},
+        post_process_matched_download=lambda *args: calls.append(args),
+        is_active_media_server_ready=lambda: (True, ""),
+        logger=_FakeLogger(),
+    )
+
+    payload, status = album_process(runtime, {
+        "album": {"id": "album-1", "name": "Album"},
+        "matches": [{
+            "staging_file": {"full_path": str(outside), "filename": outside.name},
+            "track": {"name": "Track", "track_number": 1},
+        }],
+    })
+
+    assert status == 200
+    assert payload["processed"] == 0
+    assert payload["errors"] == [
+        "File is outside the allowed import folders: outside.flac",
+    ]
+    assert calls == []
 
 
 def test_singles_process_aggregates_worker_results_and_side_effects():
@@ -813,3 +792,66 @@ def test_staging_scan_is_shared_across_files_groups_hints(tmp_path):
 
     # 2 files × ONE shared scan = 2 reads — not 6 (which is 2 files × 3 endpoints).
     assert sorted(reads) == [os.path.join("Album", "01.mp3"), os.path.join("Album", "02.mp3")]
+
+
+class TestBackfillStaleHistory:
+    """#1289 Bug 2: a stale terminal history row older than the 200-row
+    get_results window must still attach to its candidate."""
+
+    def _cand(self, path, folder_hash):
+        c = type('C', (), {})()
+        c.path = path
+        c.folder_hash = folder_hash
+        c.audio_files = []
+        return c
+
+    def _worker(self, db_rows):
+        import sqlite3
+        conn = sqlite3.connect(':memory:')
+        conn.row_factory = sqlite3.Row
+        conn.execute("CREATE TABLE auto_import_history (id INTEGER PRIMARY KEY, folder_hash TEXT, folder_path TEXT, status TEXT, created_at TEXT)")
+        for r in db_rows:
+            conn.execute("INSERT INTO auto_import_history (folder_hash, folder_path, status, created_at) VALUES (?,?,?,?)", r)
+        conn.commit()
+        w = type('W', (), {})()
+        w.database = type('D', (), {'_get_connection': lambda self: conn})()
+        return w
+
+    def test_stale_partial_row_backfilled(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([('oldhash', '/staging/Old', 'partial', '2020-01-01')])
+        cand = self._cand('/staging/Old', 'oldhash')
+        out = _backfill_stale_history(w, [cand], [])
+        assert len(out) == 1
+        assert out[0]['status'] == 'partial'
+        assert out[0]['folder_hash'] == 'oldhash'
+
+    def test_window_row_not_duplicated(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([('h1', '/staging/A', 'completed', '2024-01-01')])
+        cand = self._cand('/staging/A', 'h1')
+        window = [{'folder_hash': 'h1', 'folder_path': '/staging/A', 'status': 'completed'}]
+        out = _backfill_stale_history(w, [cand], window)
+        assert out == window
+
+    def test_none_path_does_not_crash(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([])
+        cand = self._cand(None, None)
+        # must not raise TypeError from os.path.normpath(None)
+        assert _backfill_stale_history(w, [cand], []) == []
+
+    def test_path_fallback_when_hash_missing(self):
+        from core.imports.routes import _backfill_stale_history
+        w = self._worker([(None, '/staging/ByPath', 'failed', '2020-01-01')])
+        cand = self._cand('/staging/ByPath', 'newhash')
+        out = _backfill_stale_history(w, [cand], [])
+        assert len(out) == 1
+        assert out[0]['status'] == 'failed'
+
+
+def test_partial_rows_kept_without_files():
+    """#1289 Bug 3: partial history rows must survive even with no staged files
+    (regression guard for _KEEP_WITHOUT_FILES)."""
+    from core.imports.inbox import _KEEP_WITHOUT_FILES
+    assert 'partial' in _KEEP_WITHOUT_FILES

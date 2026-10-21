@@ -19,20 +19,34 @@ import { PageHeader } from '@/components/page-header';
 import { useReactPageShell, useShellStatus } from '@/platform/shell/route-controllers';
 
 import type {
+  LastfmListeningImportStatus,
+  ListenbrainzListeningImportStatus,
   StatsAlbumRow,
   StatsArtistRow,
+  StatsClock,
   StatsDbStoragePayload,
   StatsHealth,
   StatsLibraryDiskUsagePayload,
+  StatsListeningEventsFilter,
+  StatsListeningEventTrack,
+  StatsNeglectedAlbum,
+  StatsOwnVsPlay,
   StatsRange,
   StatsRecentTrack,
+  StatsRhythm,
+  StatsTab,
   StatsTrackRow,
 } from '../-stats.types';
 
 import {
+  fetchStatsListeningEvents,
   invalidateStatsQueries,
+  lastfmListeningImportStatusQueryOptions,
+  listenbrainzListeningImportStatusQueryOptions,
   listeningStatsStatusQueryOptions,
   resolveStatsTrack,
+  runLastfmListeningImport,
+  runListenbrainzListeningImport,
   statsCachedQueryOptions,
   statsDbStorageQueryOptions,
   statsLibraryDiskUsageQueryOptions,
@@ -44,19 +58,27 @@ import {
   formatBytes,
   formatCompactNumber,
   formatDbStorageValue,
+  formatHourLabel,
   formatListeningTime,
+  formatPeakSlot,
   formatRelativePlayedAt,
   formatTotalDuration,
   getStatsRangeLabel,
   getTopArtistBubbles,
   groupDbStorageTables,
   hasStatsData,
+  heatIntensity,
+  isNewSincePrevious,
   STATS_DB_STORAGE_COLORS,
   STATS_GENRE_COLORS,
+  statDelta,
+  WEEKDAY_LABELS,
   visibleStatsEnrichmentServices,
 } from '../-stats.helpers';
+import { STATS_TAB_VALUES } from '../-stats.types';
 import { Route } from '../route';
 import styles from './stats-page.module.css';
+import { YearStory } from './year-story';
 
 const STATS_TOOLTIP_STYLE = {
   background: 'rgba(12, 12, 12, 0.96)',
@@ -74,15 +96,18 @@ const STATS_CHART_CURSOR = {
 } as const;
 
 const ARTIST_DETAIL_SOURCE = 'library' as const;
+const STATS_DETAIL_QUERY_KEY = ['stats-listening-events'] as const;
 
 export function StatsPage() {
   const bridge = useReactPageShell('stats');
 
   const navigate = useNavigate({ from: Route.fullPath });
   const queryClient = useQueryClient();
-  const { range } = Route.useSearch();
+  const { range, tab, story } = Route.useSearch();
   const syncTimeoutRef = useRef<number | null>(null);
   const [syncing, setSyncing] = useState(false);
+  const [listeningDetailFilter, setListeningDetailFilter] =
+    useState<StatsListeningEventsFilter | null>(null);
 
   const cachedStatsQuery = useQuery({
     ...statsCachedQueryOptions(range),
@@ -90,11 +115,29 @@ export function StatsPage() {
   const listeningStatusQuery = useQuery({
     ...listeningStatsStatusQueryOptions(),
   });
+  const lastfmImportQuery = useQuery({
+    ...lastfmListeningImportStatusQueryOptions(),
+    refetchInterval: (query) => (query.state.data?.running ? 3000 : 60000),
+  });
+  const listenbrainzImportQuery = useQuery({
+    ...listenbrainzListeningImportStatusQueryOptions(),
+    refetchInterval: (query) => (query.state.data?.running ? 3000 : 60000),
+  });
   const dbStorageQuery = useQuery({
     ...statsDbStorageQueryOptions(),
   });
   const diskUsageQuery = useQuery({
     ...statsLibraryDiskUsageQueryOptions(),
+  });
+  const listeningDetailsQuery = useQuery({
+    queryKey: [...STATS_DETAIL_QUERY_KEY, range, listeningDetailFilter],
+    queryFn: () => {
+      if (!listeningDetailFilter) throw new Error('No listening detail selected');
+      return fetchStatsListeningEvents(range, listeningDetailFilter);
+    },
+    enabled: !!listeningDetailFilter,
+    retry: false,
+    staleTime: 30_000,
   });
 
   useEffect(() => {
@@ -124,6 +167,49 @@ export function StatsPage() {
     },
   });
 
+  const lastfmMutation = useMutation({
+    mutationFn: () => runLastfmListeningImport(),
+    onSuccess: () => {
+      window.showToast?.('Last.fm listening import started', 'info');
+      void lastfmImportQuery.refetch();
+    },
+    onError: (error) => {
+      window.showToast?.(error instanceof Error ? error.message : 'Last.fm import failed', 'error');
+    },
+  });
+
+  const listenbrainzMutation = useMutation({
+    mutationFn: () => runListenbrainzListeningImport(),
+    onSuccess: () => {
+      window.showToast?.('ListenBrainz listening import started', 'info');
+      void listenbrainzImportQuery.refetch();
+    },
+    onError: (error) => {
+      window.showToast?.(
+        error instanceof Error ? error.message : 'ListenBrainz import failed',
+        'error',
+      );
+    },
+  });
+
+  useEffect(() => {
+    const onProgress = () => {
+      void lastfmImportQuery.refetch();
+      void invalidateStatsQueries(queryClient);
+    };
+    window.addEventListener('ss:lastfm-import-progress', onProgress);
+    return () => window.removeEventListener('ss:lastfm-import-progress', onProgress);
+  }, [lastfmImportQuery, queryClient]);
+
+  useEffect(() => {
+    const onProgress = () => {
+      void listenbrainzImportQuery.refetch();
+      void invalidateStatsQueries(queryClient);
+    };
+    window.addEventListener('ss:listenbrainz-import-progress', onProgress);
+    return () => window.removeEventListener('ss:listenbrainz-import-progress', onProgress);
+  }, [listenbrainzImportQuery, queryClient]);
+
   const cachedStats = cachedStatsQuery.data;
   const overview = cachedStats?.overview ?? EMPTY_STATS_OVERVIEW;
   const hasData = hasStatsData(overview);
@@ -134,7 +220,32 @@ export function StatsPage() {
   const onRangeChange = (nextRange: StatsRange) => {
     void navigate({
       to: Route.fullPath,
-      search: { range: nextRange },
+      search: { range: nextRange, tab, story },
+      replace: true,
+    });
+  };
+
+  const onTabChange = (nextTab: StatsTab) => {
+    // Range travels with the tab so switching to Library and back does not
+    // silently reset a range the user chose.
+    void navigate({
+      to: Route.fullPath,
+      search: { range, tab: nextTab, story },
+      replace: true,
+    });
+  };
+
+  // Opening the story is a real history entry (no `replace`) so Back closes it
+  // — the gesture people already reach for on a full-screen takeover. Closing
+  // replaces, so Back from the closed page does not drop them straight back in.
+  const openStory = () => {
+    void navigate({ to: Route.fullPath, search: { range, tab, story: 'year' } });
+  };
+
+  const closeStory = () => {
+    void navigate({
+      to: Route.fullPath,
+      search: { range, tab, story: undefined },
       replace: true,
     });
   };
@@ -145,12 +256,44 @@ export function StatsPage() {
         icon={<img src="/static/trans2.png" alt="" />}
         title="Listening Stats"
         actions={
-          <>
+          <div className={styles.headerPrimaryActions}>
+            {/* The story is a listening fact, so it does not belong on the
+                Library tab where nothing else is about the person. */}
+            {tab === 'listening' ? (
+              <button
+                type="button"
+                className={styles.statsYearButton}
+                onClick={openStory}
+                data-testid="stats-year-button"
+              >
+                <span className={styles.yearSparkle} aria-hidden="true">
+                  ✨
+                </span>
+                Your Year
+              </button>
+            ) : null}
+            <div className={styles.statsTabs} role="tablist" aria-label="Stats section">
+              {STATS_TAB_VALUES.map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  role="tab"
+                  aria-selected={tab === option}
+                  className={`${styles.statsTab} ${tab === option ? styles.statsTabActive : ''}`}
+                  onClick={() => onTabChange(option)}
+                >
+                  {option === 'listening' ? 'Listening' : 'Library'}
+                </button>
+              ))}
+            </div>
+            {/* Library stats are not range-scoped — disk usage is what it is
+                today — so the picker is hidden rather than left inert. */}
             <div
               id="stats-time-range"
               className={styles.statsTimeRange}
               role="tablist"
               aria-label="Listening stats range"
+              hidden={tab !== 'listening'}
             >
               {(['7d', '30d', '12m', 'all'] as const).map((option) => (
                 <button
@@ -165,51 +308,137 @@ export function StatsPage() {
                 </button>
               ))}
             </div>
-            <div className={styles.statsSyncControls}>
-              {isStandalone ? (
-                <span
-                  className={styles.statsStandaloneNotice}
-                  role="note"
-                  title="Commissary standalone does not use an external media server, so manual listening stats sync is unavailable."
-                >
-                  Standalone mode: manual sync unavailable
-                </span>
-              ) : (
-                <>
-                  <span className={styles.statsLastSynced}>
-                    {lastSynced ? `Last synced: ${lastSynced}` : 'Not synced yet'}
-                  </span>
-                  <button
-                    id="stats-sync-btn"
-                    type="button"
-                    className={`${styles.statsSyncButton} ${syncing ? styles.statsSyncButtonSyncing : ''}`}
-                    onClick={() => syncMutation.mutate()}
-                    disabled={syncing}
-                    aria-label="Sync listening stats"
-                    title="Sync now"
-                  >
-                    <span aria-hidden="true">↻</span>
-                  </button>
-                </>
-              )}
-            </div>
-          </>
+          </div>
         }
       />
+
+      {/* Dedicated Executive Data Sources & Sync Bar */}
+      <div className={styles.statsSyncBar}>
+        <div className={styles.statsServerSync}>
+          {isStandalone ? (
+            <span
+              className={styles.statsStandaloneNotice}
+              role="note"
+              title="SoulSync standalone does not use an external media server, so manual listening stats sync is unavailable."
+            >
+              Standalone mode: manual sync unavailable
+            </span>
+          ) : (
+            <div className={styles.statsServerSyncGroup}>
+              <span className={styles.statsSyncStatusDot} aria-hidden="true" />
+              <span className={styles.statsLastSynced}>
+                {lastSynced ? `Last synced: ${lastSynced}` : 'Not synced yet'}
+              </span>
+              <button
+                id="stats-sync-btn"
+                type="button"
+                className={`${styles.statsSyncButton} ${syncing ? styles.statsSyncButtonSyncing : ''}`}
+                onClick={() => syncMutation.mutate()}
+                disabled={syncing}
+                aria-label="Sync listening stats"
+                title="Sync now"
+              >
+                <span aria-hidden="true">↻</span>
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className={styles.statsSyncControls}>
+          {isImportCardYours(lastfmImportQuery.data) ? (
+            <LastfmImportControl
+              status={lastfmImportQuery.data}
+              onRun={() => lastfmMutation.mutate()}
+              running={lastfmMutation.isPending}
+            />
+          ) : null}
+          {isImportCardYours(listenbrainzImportQuery.data) ? (
+            <ListenbrainzImportControl
+              status={listenbrainzImportQuery.data}
+              onRun={() => listenbrainzMutation.mutate()}
+              running={listenbrainzMutation.isPending}
+            />
+          ) : null}
+        </div>
+      </div>
+
+      {story === 'year' ? <YearStory onClose={closeStory} /> : null}
 
       {cachedStatsQuery.isPending ? (
         <SectionLoadingState />
       ) : cachedStatsQuery.error ? (
         <SectionErrorState message={getErrorMessage(cachedStatsQuery.error)} />
+      ) : tab === 'library' ? (
+        /* Operational facts. Deliberately NOT range-scoped — disk usage and
+           database size are what they are right now, so the range picker is
+           hidden on this tab rather than sitting there doing nothing. */
+        <div className={styles.statsLibraryGrid}>
+          <StatsSectionCard title="Library Health" fullWidth>
+            <StatsLibraryHealth health={cachedStats?.health ?? {}} />
+          </StatsSectionCard>
+
+          <StatsSectionCard title="Library Disk Usage" fullWidth>
+            <StatsDiskUsage payload={diskUsageQuery.data} error={diskUsageQuery.error} />
+          </StatsSectionCard>
+
+          <StatsSectionCard title="Database Storage" fullWidth>
+            <StatsDbStorage payload={dbStorageQuery.data} error={dbStorageQuery.error} />
+          </StatsSectionCard>
+        </div>
       ) : hasData ? (
         <>
-          <OverviewCards overview={overview} />
+          <OverviewCards
+            overview={overview}
+            previous={cachedStats?.previous ?? null}
+            periodLabel={PREVIOUS_PERIOD_LABEL[range] ?? null}
+          />
           <div className={styles.statsMainGrid}>
-            <div className={styles.statsLeftCol}>
+            {/* Tier 1: Listening Activity & Habit Clock */}
+            <div className={styles.statsActivityRow}>
               <StatsSectionCard title="Listening Activity">
                 <div id="stats-timeline-chart" className={styles.chartContainer}>
-                  <StatsActivityChart timeline={cachedStats?.timeline ?? []} />
+                  <StatsActivityChart
+                    timeline={cachedStats?.timeline ?? []}
+                    onDateSelect={(date) => setListeningDetailFilter({ type: 'date', date })}
+                  />
                 </div>
+              </StatsSectionCard>
+              <StatsSectionCard title="When You Listen">
+                <StatsListeningClock
+                  clock={cachedStats?.clock}
+                  rangeLabel={getStatsRangeLabel(range)}
+                  rhythm={cachedStats?.rhythm}
+                  onCellSelect={(weekday, hour) =>
+                    setListeningDetailFilter({ type: 'weekday_hour', weekday, hour })
+                  }
+                />
+              </StatsSectionCard>
+            </div>
+
+            {/* Tier 2: Top Music Showcase (3 Columns) */}
+            <div className={styles.statsTopShowcase}>
+              <StatsSectionCard title="Top Artists">
+                <TopArtistsVisual artists={cachedStats?.top_artists ?? []} />
+                <StatsRankedArtists artists={cachedStats?.top_artists ?? []} />
+              </StatsSectionCard>
+              <StatsSectionCard title="Top Albums">
+                <StatsRankedAlbums albums={cachedStats?.top_albums ?? []} />
+              </StatsSectionCard>
+              <StatsSectionCard title="Top Tracks">
+                <StatsRankedTracks
+                  tracks={cachedStats?.top_tracks ?? []}
+                  onPlay={(track) => playStatsTrack(bridge, track)}
+                />
+              </StatsSectionCard>
+            </div>
+
+            {/* Tier 3: Insights & Recents */}
+            <div className={styles.statsInsightsRow}>
+              <StatsSectionCard title="Own vs Play">
+                <StatsOwnVsPlayCard
+                  rows={cachedStats?.own_vs_play ?? []}
+                  neglected={cachedStats?.neglected ?? []}
+                />
               </StatsSectionCard>
               <StatsSectionCard title="Genre Breakdown">
                 <div className={styles.statsGenreChartContainer}>
@@ -226,69 +455,523 @@ export function StatsPage() {
                 />
               </StatsSectionCard>
             </div>
-            <div className={styles.statsRightCol}>
-              <StatsSectionCard title="Top Artists">
-                <TopArtistsVisual artists={cachedStats?.top_artists ?? []} />
-                <StatsRankedArtists artists={cachedStats?.top_artists ?? []} />
-              </StatsSectionCard>
-              <StatsSectionCard title="Top Albums">
-                <StatsRankedAlbums albums={cachedStats?.top_albums ?? []} />
-              </StatsSectionCard>
-              <StatsSectionCard title="Top Tracks">
-                <StatsRankedTracks
-                  tracks={cachedStats?.top_tracks ?? []}
-                  onPlay={(track) => playStatsTrack(bridge, track)}
-                />
-              </StatsSectionCard>
-            </div>
           </div>
-
-          <StatsSectionCard title="Library Health" fullWidth>
-            <StatsLibraryHealth health={cachedStats?.health ?? {}} />
-          </StatsSectionCard>
-
-          <StatsSectionCard title="Library Disk Usage" fullWidth>
-            <StatsDiskUsage payload={diskUsageQuery.data} error={diskUsageQuery.error} />
-          </StatsSectionCard>
-
-          <StatsSectionCard title="Database Storage" fullWidth>
-            <StatsDbStorage payload={dbStorageQuery.data} error={dbStorageQuery.error} />
-          </StatsSectionCard>
         </>
       ) : (
         <StatsEmptyState />
       )}
+      {listeningDetailFilter ? (
+        <StatsListeningDetailModal
+          payload={listeningDetailsQuery.data}
+          filter={listeningDetailFilter}
+          loading={listeningDetailsQuery.isPending && !listeningDetailsQuery.data}
+          error={listeningDetailsQuery.error}
+          onClose={() => setListeningDetailFilter(null)}
+          onPlay={(track) => playStatsTrack(bridge, track)}
+        />
+      ) : null}
     </div>
   );
 }
 
+type OverviewShape = Partial<{
+  total_plays: number;
+  total_time_ms: number;
+  unique_artists: number;
+  unique_albums: number;
+  unique_tracks: number;
+}>;
+
+/**
+ * What the delta is measured against, per range. 'all' is absent on purpose —
+ * there is no period before everything, so its tiles carry no comparison.
+ */
+const PREVIOUS_PERIOD_LABEL: Partial<Record<StatsRange, string>> = {
+  '7d': 'vs previous 7 days',
+  '30d': 'vs previous 30 days',
+  '12m': 'vs previous 12 months',
+};
+
+/**
+ * your own history comes from your own accounts (#1293). a card for a service
+ * you didn't connect would fill the shared history, which you don't read.
+ */
+function isImportCardYours(
+  status: { history_scope?: string; own_account?: boolean } | undefined,
+): boolean {
+  return !(status?.history_scope === 'profile' && !status.own_account);
+}
+
+type HistoryImportControlProps = {
+  onRun: () => void;
+  running: boolean;
+};
+
+export function LastfmImportControl({
+  status,
+  ...props
+}: HistoryImportControlProps & { status: LastfmListeningImportStatus | undefined }) {
+  return (
+    <HistoryImportControl
+      {...props}
+      service="Last.fm"
+      status={status}
+      configured={
+        !!status?.api_key_configured && !!(status.username || status.authenticated_user_available)
+      }
+    />
+  );
+}
+
+export function ListenbrainzImportControl({
+  status,
+  ...props
+}: HistoryImportControlProps & { status: ListenbrainzListeningImportStatus | undefined }) {
+  return (
+    <HistoryImportControl
+      {...props}
+      service="ListenBrainz"
+      status={status}
+      configured={!!status?.token_configured}
+    />
+  );
+}
+
+function HistoryImportControl({
+  service,
+  status,
+  configured,
+  running,
+  onRun,
+}: HistoryImportControlProps & {
+  service: string;
+  status: LastfmListeningImportStatus | ListenbrainzListeningImportStatus | undefined;
+  configured: boolean;
+}) {
+  const active = running || !!status?.running;
+  const progress = clampProgress(status?.progress);
+  const needsResume = status?.status === 'partial' || status?.status === 'cancelled';
+  const failed = status?.status === 'error';
+  const label = !status
+    ? 'Checking settings…'
+    : !configured
+      ? 'Configure in Settings'
+      : active
+        ? `Syncing${progress == null ? '…' : ` · ${progress}%`}`
+        : failed
+          ? 'Sync failed'
+          : needsResume
+            ? 'Sync paused'
+            : status.last_success_at
+              ? 'Up to date'
+              : 'Ready to sync';
+  const detail = active
+    ? `${status?.phase || 'Starting sync'} · ${formatCompactNumber(status?.inserted || 0)} added`
+    : failed
+      ? status?.error || 'Check your account in Settings and retry.'
+      : status?.last_success_at
+        ? `Last synced ${status.last_success_at}${status.next_run_in_seconds ? ` · next check in ${formatShortDuration(status.next_run_in_seconds)}` : ''}`
+        : 'Uses your account from Settings. Sync once to enable hourly updates.';
+
+  return (
+    <div
+      className={styles.historyImportControl}
+      role="group"
+      aria-label={`${service} history sync`}
+    >
+      <div className={styles.historyImportInfo}>
+        <span className={styles.historyImportService}>{service}</span>
+        <span className={styles.historyImportAccount} title="Manage this account in Settings">
+          {status?.username || 'Account from Settings'}
+        </span>
+        <span className={styles.historyImportStatus} role="status" title={detail}>
+          {label}
+        </span>
+      </div>
+      <button
+        type="button"
+        className={styles.historyImportButton}
+        onClick={onRun}
+        disabled={active || !configured || !status?.success}
+        aria-label={`${active ? 'Syncing' : needsResume ? 'Resume' : failed ? 'Retry' : 'Sync'} ${service} history`}
+        aria-busy={active}
+        title={configured ? detail : `Configure ${service} in Settings`}
+      >
+        <span aria-hidden="true">↻</span>
+        {active ? 'Syncing…' : needsResume ? 'Resume sync' : failed ? 'Retry sync' : 'Sync now'}
+      </button>
+      {active || needsResume ? (
+        <progress
+          className={styles.historyImportProgress}
+          aria-label={`${service} sync progress`}
+          max={100}
+          value={progress ?? undefined}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function clampProgress(value: unknown): number | null {
+  if (value == null) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.max(0, Math.min(100, Math.round(n)));
+}
+
+function formatShortDuration(seconds: number): string {
+  const minutes = Math.max(1, Math.round(seconds / 60));
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `${hours}h ${rest}m` : `${hours}h`;
+}
+
 function OverviewCards({
   overview,
+  periodLabel,
+  previous,
 }: {
-  overview: Partial<{
-    total_plays: number;
-    total_time_ms: number;
-    unique_artists: number;
-    unique_albums: number;
-    unique_tracks: number;
-  }>;
+  overview: OverviewShape;
+  periodLabel: string | null;
+  previous: OverviewShape | null;
 }) {
   const cards = [
-    { label: 'Total Plays', value: formatCompactNumber(overview.total_plays) },
-    { label: 'Listening Time', value: formatListeningTime(overview.total_time_ms) },
-    { label: 'Artists', value: formatCompactNumber(overview.unique_artists) },
-    { label: 'Albums', value: formatCompactNumber(overview.unique_albums) },
-    { label: 'Tracks', value: formatCompactNumber(overview.unique_tracks) },
-  ];
+    {
+      key: 'total_plays',
+      label: 'Total Plays',
+      value: formatCompactNumber(overview.total_plays),
+      icon: (
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <polygon points="5 3 19 12 5 21 5 3" />
+        </svg>
+      ),
+    },
+    {
+      key: 'total_time_ms',
+      label: 'Listening Time',
+      value: formatListeningTime(overview.total_time_ms),
+      icon: (
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <polyline points="12 6 12 12 16 14" />
+        </svg>
+      ),
+    },
+    {
+      key: 'unique_artists',
+      label: 'Artists',
+      value: formatCompactNumber(overview.unique_artists),
+      icon: (
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+          <line x1="12" x2="12" y1="19" y2="22" />
+        </svg>
+      ),
+    },
+    {
+      key: 'unique_albums',
+      label: 'Albums',
+      value: formatCompactNumber(overview.unique_albums),
+      icon: (
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+      ),
+    },
+    {
+      key: 'unique_tracks',
+      label: 'Tracks',
+      value: formatCompactNumber(overview.unique_tracks),
+      icon: (
+        <svg
+          viewBox="0 0 24 24"
+          width="16"
+          height="16"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        >
+          <path d="M9 18V5l12-2v13" />
+          <circle cx="6" cy="18" r="3" />
+          <circle cx="18" cy="16" r="3" />
+        </svg>
+      ),
+    },
+  ] as const;
 
   return (
     <div id="stats-overview" className={styles.statsOverview}>
       {cards.map((card) => (
         <div key={card.label} className={styles.statsCard}>
+          <div className={styles.statsCardHeader}>
+            <span className={styles.statsCardLabel}>{card.label}</span>
+            <span className={styles.statsCardIconWrap} aria-hidden="true">
+              {card.icon}
+            </span>
+          </div>
           <div className={styles.statsCardValue}>{card.value}</div>
-          <div className={styles.statsCardLabel}>{card.label}</div>
+          <StatsCardDelta
+            current={overview[card.key]}
+            previous={previous?.[card.key]}
+            periodLabel={periodLabel}
+          />
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * The change against the equivalent previous period.
+ *
+ * Renders NOTHING rather than something misleading, in three cases: no
+ * previous period at all (range 'all'), a previous period of zero (there is no
+ * honest percentage for growth from nothing — that shows "new" instead), and a
+ * partial payload. A stats page that invents "+∞%" is worse than one that says
+ * less.
+ */
+function StatsCardDelta({
+  current,
+  periodLabel,
+  previous,
+}: {
+  current: number | undefined;
+  periodLabel: string | null;
+  previous: number | undefined;
+}) {
+  if (!periodLabel) return null;
+  if (isNewSincePrevious(current, previous)) {
+    return (
+      <div className={`${styles.statsCardDelta} ${styles.statsCardDeltaNew}`}>
+        new {periodLabel}
+      </div>
+    );
+  }
+  const delta = statDelta(current, previous);
+  if (!delta) return null;
+  const arrow = delta.direction === 'up' ? '↑' : delta.direction === 'down' ? '↓' : '·';
+  return (
+    <div className={`${styles.statsCardDelta} ${styles[`statsCardDelta_${delta.direction}`]}`}>
+      {arrow} {delta.pct}% {periodLabel}
+    </div>
+  );
+}
+
+/**
+ * The shape of a listening week — plays by weekday x hour — plus the habit
+ * numbers beside it.
+ *
+ * The page could say how MUCH you listened and never WHEN. This is the most
+ * personal thing the data can show, and it is one GROUP BY.
+ *
+ * The grid arrives dense (7x24, zeros included) from the backend, so this
+ * renders it directly: a UI that has to fill gaps is a UI where an empty hour
+ * and a missing hour look the same.
+ */
+function StatsListeningClock({
+  clock,
+  onCellSelect,
+  rangeLabel,
+  rhythm,
+}: {
+  clock: StatsClock | undefined;
+  onCellSelect: (weekday: number, hour: number) => void;
+  rangeLabel: string;
+  rhythm: StatsRhythm | undefined;
+}) {
+  const grid = clock?.grid;
+  const peak = clock?.peak;
+  const peakPlays = peak?.plays ?? 0;
+
+  if (!grid || !clock?.total) {
+    return <div className={styles.statsClockEmpty}>No plays in this range yet.</div>;
+  }
+
+  const peakSlot = formatPeakSlot(peak?.weekday, peak?.hour);
+
+  return (
+    <div className={styles.statsClock}>
+      <div className={styles.statsClockContext}>
+        <div>
+          <span className={styles.statsClockContextLabel}>Weekly pattern</span>
+          <span className={styles.statsClockContextRange}>in {rangeLabel}</span>
+        </div>
+        <strong>{formatCompactNumber(clock.total)} plays</strong>
+      </div>
+      <div className={styles.statsClockGrid}>
+        {grid.map((row, weekday) => (
+          <div key={weekday} className={styles.statsClockRow}>
+            <span className={styles.statsClockDay}>{WEEKDAY_LABELS[weekday]}</span>
+            {row.map((plays, hour) => (
+              <button
+                key={hour}
+                type="button"
+                className={`${styles.statsClockCell} ${plays > 0 ? styles.statsClockCellActive : ''}`}
+                style={{ opacity: heatIntensity(plays, peakPlays) }}
+                title={`${WEEKDAY_LABELS[weekday]} ${formatHourLabel(hour)} - ${plays} ${
+                  plays === 1 ? 'play' : 'plays'
+                }`}
+                aria-label={`${WEEKDAY_LABELS[weekday]} ${formatHourLabel(hour)}: ${plays} plays`}
+                disabled={plays <= 0}
+                onClick={() => onCellSelect(weekday, hour)}
+              />
+            ))}
+          </div>
+        ))}
+        <div className={styles.statsClockAxis}>
+          <span className={styles.statsClockDay} />
+          {[0, 6, 12, 18].map((h) => (
+            <span key={h} className={styles.statsClockAxisLabel}>
+              {formatHourLabel(h)}
+            </span>
+          ))}
+        </div>
+      </div>
+
+      <div className={styles.statsRhythm}>
+        {peakSlot ? (
+          <div className={styles.statsRhythmItem}>
+            <span className={styles.statsRhythmValue}>{peakSlot}</span>
+            <span className={styles.statsRhythmLabel}>peak slot</span>
+          </div>
+        ) : null}
+        {rhythm ? (
+          <>
+            <div className={styles.statsRhythmItem}>
+              <span className={styles.statsRhythmValue}>{rhythm.current_streak}</span>
+              <span className={styles.statsRhythmLabel}>
+                day{rhythm.current_streak === 1 ? '' : 's'} in a row
+              </span>
+            </div>
+            <div className={styles.statsRhythmItem}>
+              <span className={styles.statsRhythmValue}>{rhythm.longest_streak}</span>
+              <span className={styles.statsRhythmLabel}>longest streak</span>
+            </div>
+            <div className={styles.statsRhythmItem}>
+              <span className={styles.statsRhythmValue}>{rhythm.busiest_day.plays}</span>
+              <span className={styles.statsRhythmLabel}>busiest day</span>
+            </div>
+          </>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * What share of the library a genre is, against what share of the listening.
+ *
+ * The page's strongest claim to being worth visiting: Spotify has no library
+ * and Plex has no acquisition history, so nobody else can tell you that you
+ * own 40% metal and play 12% of it.
+ *
+ * Sorted by the size of the DISAGREEMENT, not by size — the biggest genre is
+ * something the user already knows.
+ */
+function StatsOwnVsPlayCard({
+  neglected,
+  rows,
+}: {
+  neglected: StatsNeglectedAlbum[];
+  rows: StatsOwnVsPlay[];
+}) {
+  if (!rows.length) {
+    return <div className={styles.statsClockEmpty}>Not enough tagged artists to compare yet.</div>;
+  }
+
+  return (
+    <div className={styles.statsOwnPlay}>
+      {rows.map((row) => (
+        <div key={row.genre} className={styles.statsOwnPlayRow}>
+          <span className={styles.statsOwnPlayGenre} title={row.genre}>
+            {row.genre}
+          </span>
+          <span className={styles.statsOwnPlayBars}>
+            <span
+              className={styles.statsOwnPlayOwned}
+              style={{ width: `${Math.min(row.owned_pct, 100)}%` }}
+              title={`${row.owned_pct}% of your library (${row.owned_tracks} tracks)`}
+            />
+            <span
+              className={styles.statsOwnPlayPlayed}
+              style={{ width: `${Math.min(row.played_pct, 100)}%` }}
+              title={`${row.played_pct}% of your plays (${row.plays})`}
+            />
+          </span>
+          <span
+            className={`${styles.statsOwnPlayGap} ${
+              row.gap >= 0 ? styles.statsOwnPlayGapUp : styles.statsOwnPlayGapDown
+            }`}
+            title={
+              row.gap >= 0
+                ? 'You play this more than you own it'
+                : 'You own this more than you play it'
+            }
+          >
+            {row.gap > 0 ? '+' : ''}
+            {row.gap}
+          </span>
+        </div>
+      ))}
+
+      <div className={styles.statsOwnPlayLegend}>
+        <span className={styles.statsOwnPlayKeyOwned} /> owned
+        <span className={styles.statsOwnPlayKeyPlayed} /> played
+      </div>
+
+      {neglected.length ? (
+        <div className={styles.statsNeglected}>
+          <div className={styles.statsNeglectedTitle}>Never played ({neglected.length})</div>
+          {neglected.slice(0, 5).map((album) => (
+            <div key={album.id} className={styles.statsNeglectedRow}>
+              <span className={styles.statsNeglectedName}>{album.name}</span>
+              <span className={styles.statsNeglectedArtist}>{album.artist}</span>
+              <span className={styles.statsNeglectedCount}>{album.tracks}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -310,23 +993,35 @@ function StatsSectionCard({
   );
 }
 
-function StatsActivityChart({ timeline }: { timeline: Array<{ date: string; plays: number }> }) {
+function StatsActivityChart({
+  onDateSelect,
+  timeline,
+}: {
+  onDateSelect: (date: string) => void;
+  timeline: Array<{ date: string; plays: number }>;
+}) {
   return (
     <ResponsiveContainer width="100%" height="100%">
-      <BarChart data={timeline} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+      <BarChart data={timeline} margin={{ top: 8, right: 6, bottom: 0, left: -10 }}>
+        <defs>
+          <linearGradient id="statsPlaysBarGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="rgb(var(--accent-rgb))" stopOpacity={0.9} />
+            <stop offset="100%" stopColor="rgb(var(--accent-rgb))" stopOpacity={0.35} />
+          </linearGradient>
+        </defs>
         <CartesianGrid stroke="rgba(255,255,255,0.04)" vertical={false} />
         <XAxis
           dataKey="date"
-          tick={{ fill: 'rgba(255,255,255,0.3)', fontSize: 10 }}
+          tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }}
           axisLine={false}
           tickLine={false}
         />
         <YAxis
-          tick={{ fill: 'rgba(255,255,255,0.3)', fontSize: 10 }}
+          tick={{ fill: 'rgba(255,255,255,0.4)', fontSize: 11 }}
           axisLine={false}
           tickLine={false}
           allowDecimals={false}
-          width={28}
+          width={30}
         />
         <Tooltip
           contentStyle={STATS_TOOLTIP_STYLE}
@@ -335,9 +1030,17 @@ function StatsActivityChart({ timeline }: { timeline: Array<{ date: string; play
         />
         <Bar
           dataKey="plays"
-          radius={[4, 4, 0, 0]}
-          fill="rgba(var(--accent-rgb), 0.55)"
-          stroke="rgba(var(--accent-rgb), 0.8)"
+          radius={[6, 6, 0, 0]}
+          fill="url(#statsPlaysBarGrad)"
+          stroke="rgba(var(--accent-rgb), 0.75)"
+          strokeWidth={1}
+          cursor="pointer"
+          onClick={(data: unknown) => {
+            const row = data as { date?: string; payload?: { date?: string; plays?: number } };
+            const date = row.payload?.date ?? row.date;
+            const plays = row.payload?.plays ?? 0;
+            if (date && plays > 0) onDateSelect(date);
+          }}
         />
       </BarChart>
     </ResponsiveContainer>
@@ -626,6 +1329,154 @@ function StatsRecentPlays({
   );
 }
 
+function getListeningDetailFallbackTitle(filter: StatsListeningEventsFilter): string {
+  if (filter.type === 'date') return formatDetailDateTitle(filter.date);
+  if (filter.type === 'weekday_hour') {
+    return `${WEEKDAY_LABELS[filter.weekday] ?? 'Selected day'} ${formatHourLabel(filter.hour)}`;
+  }
+  return formatHourLabel(filter.hour);
+}
+
+function formatDetailDateTitle(date: string): string {
+  if (/^\d{4}-\d{2}$/.test(date)) {
+    const parsedMonth = new Date(`${date}-01T00:00:00`);
+    if (!Number.isNaN(parsedMonth.getTime())) {
+      return new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(
+        parsedMonth,
+      );
+    }
+  }
+
+  const parsed = new Date(`${date}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) return date;
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: 'long',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+  }).format(parsed);
+}
+function StatsListeningDetailModal({
+  error,
+  filter,
+  loading,
+  onClose,
+  onPlay,
+  payload,
+}: {
+  error: unknown;
+  filter: StatsListeningEventsFilter;
+  loading: boolean;
+  onClose: () => void;
+  onPlay: (track: { title: string; artist: string; album: string }) => Promise<void>;
+  payload:
+    | {
+        title?: string;
+        total?: number;
+        limit?: number;
+        has_more?: boolean;
+        items?: StatsListeningEventTrack[];
+      }
+    | undefined;
+}) {
+  const tracks = payload?.items ?? [];
+  const total = payload?.total ?? 0;
+  const title = payload?.title || getListeningDetailFallbackTitle(filter);
+  const summary = loading
+    ? 'Finding the matching plays...'
+    : payload?.has_more
+      ? `Showing latest ${formatCompactNumber(tracks.length)} plays`
+      : `${formatCompactNumber(total)} ${total === 1 ? 'play' : 'plays'}`;
+  return (
+    <div className={styles.statsDetailBackdrop} role="presentation" onMouseDown={onClose}>
+      <div
+        className={styles.statsDetailModal}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Listening details"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className={styles.statsDetailHeader}>
+          <div>
+            <div className={styles.statsDetailEyebrow}>Listening Details</div>
+            <h3>{title}</h3>
+            <p>{summary}</p>
+          </div>
+          <button
+            type="button"
+            className={styles.statsDetailClose}
+            onClick={onClose}
+            aria-label="Close"
+          >
+            x
+          </button>
+        </div>
+
+        {error ? <SectionSubtleError message={getErrorMessage(error)} /> : null}
+        {!error && loading ? (
+          <div className={styles.statsDetailLoading}>Loading listening details...</div>
+        ) : null}
+        {!error && !loading && tracks.length === 0 ? (
+          <EmptyListState message="No plays found" />
+        ) : null}
+
+        {!error && tracks.length ? (
+          <div className={styles.statsDetailList}>
+            {tracks.map((track, index) => (
+              <div
+                key={`${track.title}-${track.artist ?? ''}-${track.played_at ?? ''}-${index}`}
+                className={styles.statsDetailRow}
+              >
+                {track.image_url ? (
+                  <img className={styles.statsDetailArt} src={track.image_url} alt="" />
+                ) : (
+                  <div className={styles.statsDetailArtFallback}>{(track.title || '?')[0]}</div>
+                )}
+                <div className={styles.statsDetailTrackMain}>
+                  <div className={styles.statsDetailTrackTitle}>{track.title}</div>
+                  <div className={styles.statsDetailTrackMeta}>
+                    {track.artist_db_id ? (
+                      <ArtistDetailLink
+                        artistId={track.artist_db_id}
+                        className={styles.statsArtistLink}
+                      >
+                        {track.artist || 'Unknown artist'}
+                      </ArtistDetailLink>
+                    ) : (
+                      <span>{track.artist || 'Unknown artist'}</span>
+                    )}
+                    {track.album ? ` · ${track.album}` : ''}
+                  </div>
+                </div>
+                <div className={styles.statsDetailWhen}>
+                  <span>{formatDetailPlayedAt(track.played_at)}</span>
+                  {track.server_source ? (
+                    <span className={styles.statsDetailSource}>{track.server_source}</span>
+                  ) : null}
+                </div>
+                <button
+                  type="button"
+                  className={styles.statsDetailPlay}
+                  onClick={() =>
+                    void onPlay({
+                      title: track.title,
+                      artist: track.artist || '',
+                      album: track.album || '',
+                    })
+                  }
+                  title="Play"
+                >
+                  ▶
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function StatsLibraryHealth({ health }: { health: StatsHealth }) {
   const shellStatus = useShellStatus();
   const jiosaavnEnabled = shellStatus?._experimental?.jiosaavn_enabled === true;
@@ -898,6 +1749,18 @@ async function playStatsTrack(
     bridge.hideLoadingOverlay();
     window.showToast?.(getErrorMessage(error), 'error');
   }
+}
+
+function formatDetailPlayedAt(value: string | null | undefined): string {
+  if (!value) return '';
+  const parsed = new Date(value.includes('T') ? value : value.replace(' ', 'T'));
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  });
 }
 
 function getErrorMessage(error: unknown): string {

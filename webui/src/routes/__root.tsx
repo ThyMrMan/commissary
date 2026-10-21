@@ -5,7 +5,9 @@ import type { AppRouterContext } from '@/app/router';
 import { waitForShellContext } from '@/platform/shell/bridge';
 import { shellStatusQueryOptions } from '@/platform/shell/status';
 
+import { VideoDownloadsBadgePoller } from './active-downloads/-vdl.use-downloads';
 import { IssueDomainHost } from './issues/-ui/issue-domain-host';
+import { AutoSyncHost } from './sync/-ui/autosync-host';
 
 export const Route = createRootRouteWithContext<AppRouterContext>()({
   beforeLoad: async ({ context }) => {
@@ -20,6 +22,12 @@ export const Route = createRootRouteWithContext<AppRouterContext>()({
     <>
       <Outlet />
       <IssueDomainHost />
+      {/* the dashboard opens auto-sync through a window global, this makes
+          it the same react manager the playlists page uses */}
+      <AutoSyncHost />
+      {/* keeps the video sidebar's downloads badge live while the unified
+          page's video view isn't mounted (its own poll owns the badge then) */}
+      <VideoDownloadsBadgePoller />
     </>
   ),
 });

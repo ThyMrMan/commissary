@@ -1,5 +1,5 @@
 /*
- * Commissary — Overlay Studio (Artwork Studio): the visual overlay-template editor.
+ * SoulSync — Overlay Studio (Artwork Studio): the visual overlay-template editor.
  *
  * A full-bleed design tool for authoring poster overlays. Phase 1a: a gallery of
  * saved templates + a canvas editor (palette · stage · layers) that can add text
@@ -294,6 +294,11 @@
                 '<div class="voe-brand"><span class="voe-brand-mark">' + I.brand + '</span>' +
                     '<span class="voe-brand-name">Overlay Studio</span></div>' +
                 '<div class="voe-top-spacer"></div>' +
+                // Portability sits beside Apply, not buried in a card menu: a
+                // template is the thing people share, and Collection Studio has
+                // offered the same pair from its own top bar since it shipped.
+                '<button class="voe-btn" data-voe-export title="Download every template as JSON">Export</button>' +
+                '<button class="voe-btn" data-voe-import title="Import templates from a JSON file">Import</button>' +
                 '<button class="voe-btn voe-btn--primary" data-voe-apply-open>' + I.apply + ' Apply to library</button>' +
                 '<button class="voe-x" data-voe-close aria-label="Close">&times;</button>' +
             '</div>' +
@@ -322,6 +327,8 @@
             '</div></div>';
         overlay.querySelector('[data-voe-close]').addEventListener('click', close);
         overlay.querySelector('[data-voe-apply-open]').addEventListener('click', openApplyDialog);
+        overlay.querySelector('[data-voe-export]').addEventListener('click', exportTemplates);
+        overlay.querySelector('[data-voe-import]').addEventListener('click', importTemplates);
         overlay.querySelector('[data-voe-cleanup]').addEventListener('click', startStudioCleanup);
         loadGallery();
         renderStudioSettings();
@@ -818,6 +825,63 @@
         ];
     }
     var _newKind = 'poster';
+    function exportTemplates() {
+        fetch('/api/video/overlays/templates/export', { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d || !d.templates || !d.templates.length) {
+                    toast('No templates to export yet', 'info'); return;
+                }
+                var blob = new Blob([JSON.stringify(d, null, 2)], { type: 'application/json' });
+                var a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = 'soulsync-overlay-templates.json';
+                a.click();
+                setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+                toast('Exported ' + d.templates.length + ' template' +
+                      (d.templates.length === 1 ? '' : 's'), 'success');
+            })
+            .catch(function () { toast('Export failed', 'error'); });
+    }
+
+    function importTemplates() {
+        var inp = document.createElement('input');
+        inp.type = 'file';
+        inp.accept = '.json,application/json';
+        inp.addEventListener('change', function () {
+            var f = inp.files && inp.files[0];
+            if (!f) return;
+            var reader = new FileReader();
+            reader.onload = function () {
+                var data;
+                try { data = JSON.parse(String(reader.result || '')); }
+                catch (e) { toast('That file is not valid JSON', 'error'); return; }
+                var rows = data && (data.templates || (Array.isArray(data) ? data : null));
+                if (!rows || !rows.length) { toast('No templates in that file', 'error'); return; }
+                fetch('/api/video/overlays/templates/import', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+                    body: JSON.stringify({ templates: rows })
+                })
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        if (!d || !d.ok) { toast((d && d.error) || 'Import failed', 'error'); return; }
+                        var n = (d.imported || []).length, sk = (d.skipped || []).length;
+                        // Naming the skips matters: silence would read as a
+                        // failed import when it is the safety working.
+                        toast(n ? ('Imported ' + n + ' template' + (n === 1 ? '' : 's') +
+                                   (sk ? ' · ' + sk + ' already existed' : ''))
+                                : (sk ? 'Already had all ' + sk + ' of those' : 'Nothing to import'),
+                              n ? 'success' : 'info');
+                        loadGallery();
+                    })
+                    .catch(function () { toast('Import failed', 'error'); });
+            };
+            reader.readAsText(f);
+        });
+        inp.click();
+    }
+
     function openStarterPicker() {
         _newKind = 'poster';
         var back = document.createElement('div');
@@ -1440,7 +1504,7 @@
                 ghost = document.createElement('div');
                 ghost.textContent = item.getAttribute('data-label') || kind;
                 ghost.style.cssText = 'position:fixed;z-index:9500;pointer-events:none;padding:6px 12px;border-radius:8px;' +
-                    'background:rgba(var(--accent-rgb,88,101,242),.9);color:#fff;font-size:12px;font-weight:700;box-shadow:0 8px 20px rgba(0,0,0,.5);';
+                    'background:rgba(var(--accent-rgb),.9);color:#fff;font-size:12px;font-weight:700;box-shadow:0 8px 20px rgba(0,0,0,.5);';
                 document.body.appendChild(ghost);
             }
             if (!dragging) return;
@@ -3147,7 +3211,7 @@
         back.className = 'voe-confirm-back';
         back.innerHTML = '<div class="voe-lp">' +
             '<div class="voe-lp-t">' + I.logo + ' Logo badges need an image pack</div>' +
-            '<div class="voe-lp-m">Commissary doesn’t ship logo art. Install Kometa’s public set — ' +
+            '<div class="voe-lp-m">SoulSync doesn’t ship logo art. Install Kometa’s public set — ' +
                 'resolution, audio codec, source, HDR, aspect, plus streaming / network / studio logos — ' +
                 'copied into your own library. Or drop your own PNGs in the logos folder.</div>' +
             '<div class="voe-lp-prog" data-lp-prog hidden><div class="voe-apply-bar"><div class="voe-apply-bar-fill" data-lp-fill></div></div>' +

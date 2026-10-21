@@ -170,7 +170,7 @@ def plan_align_rewrite(current_ids, matched_ids, keep_extras: bool = False):
 VALID_SYNC_MODES = ("replace", "append", "reconcile")
 
 
-def normalize_sync_mode(requested, configured, default: str = "replace") -> str:
+def normalize_sync_mode(requested, configured, default: str = "reconcile") -> str:
     """Resolve the effective playlist sync mode.
 
     An explicit per-request value wins; otherwise the configured default
@@ -178,9 +178,22 @@ def normalize_sync_mode(requested, configured, default: str = "replace") -> str:
     ``default``. Keeping ``reconcile`` in ``VALID_SYNC_MODES`` is load-bearing —
     a validation list that omits it silently downgrades reconcile to replace,
     which is exactly the #792 regression this helper exists to prevent.
+
+    #1289: default is reconcile (safer — preserves server edits) rather than
+    replace (wipes them). Existing saved settings are untouched.
     """
     mode = (requested or "") or (configured or "") or default
     return mode if mode in VALID_SYNC_MODES else default
+
+
+def resolve_sync_mode(own, configured, default: str = "reconcile") -> str:
+    """The mode a sync runs in, given a playlist's or pipeline's OWN mode (#1704).
+
+    Unlike a per-request value, a stored own mode that isn't a real one (a stale
+    or hand-edited row) falls back to the global setting, not the hardcoded
+    default: null or junk both mean "use global".
+    """
+    return normalize_sync_mode(own if own in VALID_SYNC_MODES else None, configured, default)
 
 
 __all__ = [
@@ -190,5 +203,16 @@ __all__ = [
     "plan_playlist_append",
     "plan_align_rewrite",
     "normalize_sync_mode",
+    "resolve_sync_mode",
     "VALID_SYNC_MODES",
 ]
+
+
+def playlist_backup_enabled(config) -> bool:
+    """should a replace sync copy the server playlist to "<name> Backup" first.
+
+    off unless someone turned it on (#1406). it clutters the server with
+    backup playlists, and soulsync already keeps its own copy of the source.
+    one place so plex / jellyfin / navidrome can't disagree on the default.
+    """
+    return bool(config.get('playlist_sync.create_backup', False))

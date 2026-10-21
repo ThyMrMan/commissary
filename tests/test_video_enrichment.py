@@ -26,7 +26,7 @@ class FakeClient:
         self._result = result
         self.calls = []
 
-    def match(self, kind, title, year, known_id=None, external_ids=None):
+    def match(self, kind, title, year, known_id=None):
         self.calls.append((kind, title, year, known_id))
         return self._result
 
@@ -111,7 +111,7 @@ def test_refresh_show_art_backfills_seasons_even_when_already_matched(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None, external_ids=None):
+        def match(self, kind, title, year, known_id=None):
             assert known_id == 1396
             return {"id": 1396, "metadata": {"seasons": [
                 {"season_number": 1, "poster_url": "https://img/s1.jpg"}]}}
@@ -151,7 +151,7 @@ def test_worker_background_episode_sync_pulls_full_list(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None, external_ids=None):
+        def match(self, kind, title, year, known_id=None):
             return {"id": 1396, "metadata": {"seasons": [{"season_number": 1, "poster_url": None}]}}
         def season_episodes(self, tv, sn):
             return {"episodes": [{"episode_number": 1}, {"episode_number": 2}, {"episode_number": 3}]}
@@ -227,8 +227,7 @@ def test_show_match_info(db):
     sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "S", "year": 2019,
                                        "tmdb_id": 1396, "seasons": []})
     # tvdb_id is included (the TVDB episode-fallback refresh reads it) — None until enriched.
-    assert db.show_match_info(sid) == {"title": "S", "year": 2019, "tmdb_id": 1396,
-                                       "tvdb_id": None, "episode_source": None}
+    assert db.show_match_info(sid) == {"title": "S", "year": 2019, "tmdb_id": 1396, "tvdb_id": None}
     assert db.show_match_info(999999) is None
 
 
@@ -548,7 +547,7 @@ def test_refresh_movie_art_backfills_cast_and_genres(db):
 
     class C:
         enabled = True
-        def match(self, kind, title, year, known_id=None, external_ids=None):
+        def match(self, kind, title, year, known_id=None):
             assert kind == "movie" and known_id == 438631
             return {"id": 438631, "metadata": {"genres": ["Sci-Fi"],
                                                "cast": [{"name": "Timothee", "tmdb_id": 1}]}}
@@ -560,10 +559,7 @@ def test_refresh_movie_art_backfills_cast_and_genres(db):
 
 def test_movie_match_info(db):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "Dune", "year": 2021, "tmdb_id": 438631})
-    # imdb_id rides along so an unmatched movie can be resolved EXACTLY through
-    # TMDB's /find instead of a title search that can only guess.
-    assert db.movie_match_info(mid) == {"title": "Dune", "year": 2021,
-                                        "tmdb_id": 438631, "imdb_id": None}
+    assert db.movie_match_info(mid) == {"title": "Dune", "year": 2021, "tmdb_id": 438631}
     assert db.movie_match_info(999999) is None
 
 
@@ -592,7 +588,7 @@ def test_show_worker_cascades_episode_backfill(db):
 
     class CascadeClient:
         enabled = True
-        def match(self, kind, title, year, known_id=None, external_ids=None):
+        def match(self, kind, title, year, known_id=None):
             return {"id": 1396, "metadata": {}}
         def season_episodes(self, tv_id, snum):
             assert tv_id == 1396
@@ -638,7 +634,7 @@ def test_tmdb_extras_parse(monkeypatch):
 def _no_server_config(monkeypatch):
     """Stub the shared config_manager so no media-server watch link is added
     (keeps these tests independent of the dev machine's Plex/Jellyfin config)."""
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {}
         def get_jellyfin_config(self): return {}
@@ -712,7 +708,7 @@ def test_movie_collection_reads_nested_metadata(db):
     # level (the top-level bug returned None → every franchise backfilled as id 0).
     class Tmdb:
         enabled = True
-        def match(self, kind, title, year, known_id=None, external_ids=None):
+        def match(self, kind, title, year, known_id=None):
             return {"id": known_id, "metadata": {
                 "tmdb_collection_id": 328, "tmdb_collection_name": "Jurassic Park Collection"}}
     eng = VideoEnrichmentEngine(db, {"tmdb": Tmdb()})
@@ -762,7 +758,7 @@ def test_tvdb_episode_gap_fill(db):
 
 def test_item_extras_caches_tmdb_call(db, monkeypatch):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A", "tmdb_id": 603})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {}
         def get_jellyfin_config(self): return {}
@@ -803,14 +799,10 @@ def test_item_extras_needs_tmdb_and_id(db, monkeypatch):
 
 def test_item_extras_adds_jellyfin_watch_link(db, monkeypatch):
     mid = db.upsert_movie("jellyfin", {"server_id": "abc123", "title": "Owned"})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_jellyfin_config(self): return {"base_url": "http://jelly:8096/"}
         def get_plex_config(self): return {}
-        # The video side's own server override lives in the app config now, so
-        # the stub needs the generic accessors (unset → inherit music's).
-        def get(self, key, default=None): return default
-        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     ex = VideoEnrichmentEngine(db, {}).item_extras("movie", mid)      # no tmdb worker needed
     assert ex["server"] == {"server": "Jellyfin",
@@ -819,14 +811,10 @@ def test_item_extras_adds_jellyfin_watch_link(db, monkeypatch):
 
 def test_item_extras_adds_plex_watch_link(db, monkeypatch):
     mid = db.upsert_movie("plex", {"server_id": "555", "title": "Owned"})
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
-        # The video side's own server override lives in the app config now, so
-        # the stub needs the generic accessors (unset → inherit music's).
-        def get(self, key, default=None): return default
-        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     class _R:
         text = ""
@@ -840,14 +828,10 @@ def test_item_extras_adds_plex_watch_link(db, monkeypatch):
 
 def test_item_extras_no_server_link_when_unowned(db, monkeypatch):
     # A wishlist-style row with no server id → no watch link.
-    import config.settings as cs
+    import core.settings as cs
     class CM:
         def get_plex_config(self): return {"base_url": "http://plex:32400", "token": "T"}
         def get_jellyfin_config(self): return {}
-        # The video side's own server override lives in the app config now, so
-        # the stub needs the generic accessors (unset → inherit music's).
-        def get(self, key, default=None): return default
-        def set(self, key, value): pass
     monkeypatch.setattr(cs, "config_manager", CM())
     with db.connect() as c:
         c.execute("INSERT INTO movies (title, server_source, server_id) VALUES ('W', NULL, NULL)")
@@ -977,10 +961,7 @@ def test_tvdb_client_refreshes_expired_token(monkeypatch):
         state["calls"] += 1
         if state["calls"] == 1:
             return _Resp(401, {})                      # stale token rejected
-        # A real TVDB search result carries the series name, and the matcher now
-        # requires one: a result that can't be shown to BE the show we asked for
-        # is a guess, not a match (see TVDBClient.match).
-        return _Resp(200, {"data": [{"tvdb_id": 77, "name": "Some Show", "overview": "O"}]})
+        return _Resp(200, {"data": [{"tvdb_id": 77, "overview": "O"}]})
 
     monkeypatch.setitem(sys.modules, "requests", types.SimpleNamespace(get=fake_get, post=fake_post))
     res = TVDBClient("KEY").match("show", "Some Show", 2020)
@@ -1479,6 +1460,7 @@ def test_rematch_tmdb_resets_the_derived_pipeline(db):
             "UPDATE shows SET tmdb_match_status='matched', details_synced=1, episodes_synced=1, "
             "ratings_synced=1, status='Ended', overview='wrong show', tagline='nope', "
             "trakt_status='ok', trakt_rating=7.5, poster_url='https://art/keep.jpg', "
+            "backdrop_url='https://art/wrong-bg.jpg', logo_url='https://art/wrong-logo.png', "
             "locked_fields='[\"overview\"]' WHERE id=?", (sid,))
         conn.execute("INSERT INTO people (name) VALUES ('Wrong Actor')")
         pid = conn.execute("SELECT id FROM people").fetchone()[0]
@@ -1492,10 +1474,25 @@ def test_rematch_tmdb_resets_the_derived_pipeline(db):
     assert row["tmdb_match_status"] is None               # worker re-picks, enriches BY the new id
     assert row["status"] is None and row["tagline"] is None    # old match's text cleared
     assert row["overview"] == "wrong show"                # locked field stays the user's
-    assert row["poster_url"] == "https://art/keep.jpg"    # art is never cleared
+    assert row["poster_url"] is None                    # wrong title's art cleared…
+    assert row["backdrop_url"] is None                   # …so workers re-download
+    assert row["logo_url"] is None                       # …for the new id
     assert (row["details_synced"], row["episodes_synced"], row["ratings_synced"]) == (0, 0, 0)
     assert row["trakt_status"] is None and row["trakt_rating"] is None
     assert credits == 0                                   # wrong title's credits dropped
+
+
+def test_rematch_tmdb_keeps_locked_poster(db):
+    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "M", "tmdb_id": 9})
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE movies SET tmdb_match_status='matched', poster_url='https://art/mine.jpg', "
+            "backdrop_url='https://art/wrong-bg.jpg', locked_fields='[\"poster_url\"]' WHERE id=?", (mid,))
+    assert db.rematch_item("movie", mid, "tmdb", 42) is True
+    with db.connect() as conn:
+        row = conn.execute("SELECT poster_url, backdrop_url FROM movies WHERE id=?", (mid,)).fetchone()
+    assert row["poster_url"] == "https://art/mine.jpg"   # user's explicit choice kept
+    assert row["backdrop_url"] is None                    # wrong title's art cleared
 
 
 def test_rematch_clear_reverts_to_not_found(db):

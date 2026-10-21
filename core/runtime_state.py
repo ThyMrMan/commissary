@@ -20,75 +20,12 @@ processed_download_ids = set()
 post_process_locks: Dict[str, threading.Lock] = {}
 post_process_locks_lock = threading.Lock()
 
-# A task in one of these is finished — its batch slot has been accounted for and
-# nothing more will happen to it. Lives here rather than in any one consumer so
-# the download tracker, the cleanup sweep and the post-processing safety net all
-# agree on what "done" means; two copies of this set would drift into a task
-# that one of them thinks is still running.
-TERMINAL_TASK_STATUSES = frozenset({
-    'completed', 'failed', 'not_found', 'cancelled', 'skipped', 'already_owned',
-})
-
-
-def task_is_active(status) -> bool:
-    """Whether a download task still holds a batch worker slot.
-
-    DERIVED from the terminal set rather than listing the live states, because
-    the enumerated version drifted and cost a wedged batch every time. The
-    worker-count validator listed ('searching', 'downloading', 'queued',
-    'post_processing') and omitted 'pending' — the status a task is created
-    with, and therefore the status of every worker the validator had just
-    started. Such a task matched neither the active branch nor the orphaned
-    branch: it was invisible, so the validator "corrected" a count that was
-    right, freed a slot still in use, and launched a replacement — whose task
-    was also pending, so the next pass did it again. Observed on five batches
-    out of five, oscillating 3->2 every few seconds for two minutes.
-
-    Deriving it also fails in the safe direction: a status nobody thought about
-    reads as STILL WORKING, so a batch waits rather than declaring itself free
-    and spawning phantom workers.
-
-    A missing/blank status is NOT active: a task that isn't in ``download_tasks``
-    has no slot to hold, and ``_wait_for_batch_drain`` would otherwise block on
-    something that does not exist."""
-    if not status:
-        return False
-    return str(status) not in TERMINAL_TASK_STATUSES
-
-
-def count_active_workers(batch: Dict[str, Any], tasks: Dict[str, Dict[str, Any]]) -> int:
-    """How many of ``batch``'s worker slots are in use: its tasks that have been
-    DISPATCHED to a worker and have not finished.
-
-    A task is dispatched once the batch's ``queue_index`` has moved past it —
-    ``start_next_batch_of_downloads`` advances the index as it hands each task
-    to a worker, and a batch that starts its own worker (a redownload) is
-    created already past it. Everything from ``queue_index`` on is waiting for a
-    slot and holds none.
-
-    The status alone cannot tell the two apart. ``task_is_active`` reads every
-    status that isn't terminal as still working, so an unknown one can never
-    free a slot — and 'pending', the status every waiting task has, is one of
-    them. Counted by status, a 98-track batch with three workers running held 98
-    busy slots. A worker only starts while the count is below
-    ``max_concurrent``, so once the first three tracks finished nothing else
-    started: the worker-count validator and the batch healer both re-asserted
-    that count on their ticks (3 → 98, 3 → 64, 3 → 102 in one live log), and
-    every wishlist album bigger than three tracks sat at 3/N until a restart
-    discarded it.
-
-    A task already through the completion callback (``_completed_task_ids``)
-    holds nothing even while its status catches up, and neither does a task
-    missing from ``tasks``."""
-    queue = batch.get('queue') or []
-    dispatched = queue[:batch.get('queue_index') or 0]
-    completed = batch.get('_completed_task_ids') or ()
-    return sum(
-        1 for task_id in dispatched
-        if task_id not in completed
-        and task_is_active((tasks.get(task_id) or {}).get('status'))
-    )
-
+# wishlist auto-processing flag pair. shared mutable state: the wishlist
+# routes, the stall checker, the downloads pipeline reset callback and the
+# post-process path all read/write it, so it lives here rather than as a
+# web_server module global.
+wishlist_auto_processing = False
+wishlist_auto_processing_timestamp = 0.0
 
 activity_feed = []
 activity_feed_lock = threading.Lock()

@@ -15,9 +15,19 @@ uses (resolve path → remove file → drop track row → drop history row).
 
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
+from typing import Optional
 
-from core.library.expired_cleanup import RETENTION_OPTIONS, select_expired
+from core.library.expired_cleanup import (
+    RETENTION_OPTIONS,
+    is_curated,
+    normalize_track_key,
+    parse_ts,
+    path_suffix_key,
+    select_expired,
+)
 from core.library.path_resolver import resolve_library_file_path
 from core.repair_jobs import register_job
 from core.repair_jobs.base import JobContext, JobResult, RepairJob
@@ -26,7 +36,106 @@ from utils.logging_config import get_logger
 logger = get_logger("repair_jobs.expired_download_cleaner")
 
 
-def delete_origin_download(db, entry, config_manager) -> dict:
+# id keys live in the same set as the artist|title keys. a title key always
+# has a '|', an id key never does, so the two can't collide.
+_ID_KEY = 'id:'
+
+
+def _mirror_track_ids(track: dict) -> list:
+    """every provider id a mirror track is known by: its own source id plus
+    the ids discovery matched it to. the download records the MATCHED id, so
+    matching on artist|title alone misses a track whose artist the matched
+    provider credits differently."""
+    ids = []
+    sid = str(track.get('source_track_id') or '').strip()
+    if sid:
+        ids.append(sid)
+    raw = track.get('extra_data')
+    try:
+        extra = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        extra = None
+    if isinstance(extra, dict):
+        for k in ('matched_data', 'spotify_hint'):
+            sub = extra.get(k)
+            if isinstance(sub, dict):
+                mid = str(sub.get('id') or '').strip()
+                if mid:
+                    ids.append(mid)
+    return ids
+
+
+def _deletion_rationale(entry, min_plays, curated_keys) -> str:
+    """Why this download is being proposed for deletion, in the user's terms.
+
+    A finding that says "past retention, not active, not replayed" when the job
+    also checked curation and the rebuild stamp is telling the user something
+    untrue about a decision to delete their file. This states what was actually
+    examined, including whether curation was consulted at all — "nobody
+    favourited it" and "we did not look" are very different claims.
+    """
+    plays = entry.get('play_count')
+    bits = ['past retention', 'not in an active playlist or watchlist']
+    if plays is None:
+        bits.append('play count unknown')
+    else:
+        bits.append(f'played {plays}x (keep at {min_plays})')
+    if curated_keys is None:
+        bits.append('curation signals not in use')
+    else:
+        bits.append('not favourited, rated or playlisted by anyone')
+    return ', '.join(bits)
+
+
+def _kept_summary(candidates, expired) -> str:
+    """One line saying what was SPARED and why — the reassurance a job that
+    deletes files owes the person reading its log."""
+    expired_ids = {id(e) for e in expired}
+    reasons = {'curated': 0, 'protected': 0, 'grandfathered': 0, 'played': 0}
+    for c in candidates:
+        if id(c) in expired_ids:
+            continue
+        if c.get('protected'):
+            reasons['protected'] += 1
+        elif c.get('curated'):
+            reasons['curated'] += 1
+        elif c.get('grandfathered'):
+            reasons['grandfathered'] += 1
+        else:
+            reasons['played'] += 1
+    parts = [f'{n} {name}' for name, n in reasons.items() if n]
+    return ', '.join(parts) if parts else 'none'
+
+
+def _path_mapping_hint(config_manager) -> str:
+    try:
+        active = config_manager.get_active_media_server()
+    except Exception:
+        active = None
+    if str(active or '').lower() == 'navidrome':
+        return (
+            'Navidrome may be reporting virtual paths. Open Profile -> Players -> '
+            'SoulSync, enable "Report Real Path", then run a full database refresh.'
+        )
+    return (
+        'Check Settings -> Library -> Music Paths so SoulSync can map media-server '
+        'paths to the real files on disk.'
+    )
+
+
+def _should_treat_unresolved_as_mapping_error(raw_path, config_manager) -> bool:
+    if not raw_path:
+        return False
+    try:
+        active = config_manager.get_active_media_server()
+    except Exception:
+        active = None
+    if str(active or '').lower() == 'navidrome':
+        return True
+    return not os.path.isabs(raw_path)
+
+
+def delete_origin_download(db, entry, config_manager, transfer_folder=None) -> dict:
     """Delete one origin-tracked download: the file on disk (resolved through
     the shared resolver), its library track row, and the history entry. A file
     that refuses deletion keeps its history row and reports the error. Returns
@@ -35,13 +144,19 @@ def delete_origin_download(db, entry, config_manager) -> dict:
     file_deleted = False
     error = None
     if raw_path:
-        resolved = resolve_library_file_path(raw_path, config_manager=config_manager)
+        resolved = resolve_library_file_path(
+            raw_path,
+            transfer_folder=transfer_folder,
+            config_manager=config_manager,
+        )
         if resolved and os.path.isfile(resolved):
             try:
                 os.remove(resolved)
                 file_deleted = True
             except OSError as e:
                 error = str(e)
+        elif resolved is None and _should_treat_unresolved_as_mapping_error(raw_path, config_manager):
+            error = f'Could not locate file: {raw_path}. {_path_mapping_hint(config_manager)}'
         # File gone or deleted → clean up the library track row either way.
         if error is None:
             try:
@@ -65,16 +180,28 @@ class ExpiredDownloadCleanerJob(RepairJob):
         'per origin.\n\n'
         'A download is only ever proposed for deletion when ALL are true: it is '
         'older than its origin\'s retention, it is NOT still in a playlist you '
-        'actively mirror (or an artist you still watch), and you have played it '
-        'fewer than the keep-threshold (default: played more than once is kept). '
+        'actively mirror (or an artist you still watch), NOBODY on your media '
+        'server has favourited it, rated it, or put it in a playlist, and you '
+        'have played it fewer than the keep-threshold (default: played more '
+        'than once is kept). '
+        'For playlist downloads, "still mirrored" is checked per track against '
+        'the playlist\'s current track list — songs rotated out of a refreshed '
+        'playlist become eligible once they pass retention, instead of staying '
+        'protected forever because the playlist itself still exists. '
+        'If a mirrored playlist\'s track list cannot be read (or is empty), '
+        'protection falls back to the playlist name, so emptying a playlist '
+        'without removing its mirror keeps the old behavior. '
         'It only touches downloads recorded from the Download Origins feature '
-        'forward — never your pre-existing or manually-added library.\n\n'
+        'forward — never your pre-existing or manually-added library, and never '
+        'anything downloaded before your library was last rebuilt.\n\n'
         'Dry run is ON by default: it only creates findings for you to review '
         'and delete — nothing is deleted automatically. Turn Dry run OFF for '
         'hands-off auto-cleanup.\n\n'
         'Settings:\n'
         '- Watchlist retention / Playlist retention: off, or a window\n'
         '- Keep if played at least: play count that protects a track (default 2)\n'
+        '- Use curation signals: keep anything favourited/rated/in a playlist\n'
+        '- Curation min rating: stars that count as "keep this" (default 3)\n'
         '- Dry run: ON = findings only (default); OFF = delete automatically'
     )
     icon = 'repair-icon-cleanup'
@@ -85,17 +212,252 @@ class ExpiredDownloadCleanerJob(RepairJob):
         'playlist_retention': 'off',
         'keep_if_played_at_least': 2,
         'dry_run': True,
+        # Keep anything a user favourited, rated, or put in a playlist.
+        'use_curation_signals': True,
+        'curation_min_rating': 3,
+        # Older than this and the signals are treated as unknown, which keeps
+        # everything. Two days covers a normal sweep cadence plus a server
+        # being down overnight.
+        'curation_max_age_hours': 48,
     }
     setting_options = {
         'watchlist_retention': RETENTION_OPTIONS,
         'playlist_retention': RETENTION_OPTIONS,
         'dry_run': [True, False],
+        'use_curation_signals': [True, False],
+        'curation_min_rating': [1, 2, 3, 4, 5],
     }
     # Has an auto mode (dry_run off → deletes in-scan). auto_fix is a UI/metadata
     # flag only — the worker never auto-applies from it; scan() self-manages the
     # dry_run vs delete decision. Setting True surfaces the Scan → Dry Run /
     # Auto-fix flow badge (without it the job mislabels as "Scan Only").
     auto_fix = True
+
+    def _curation_lookup(self, context: JobContext, settings: dict):
+        """``(curated_track_keys, stale)`` from the stored media-server signals.
+
+        Three outcomes, and the difference between them is the whole safety
+        contract (L2-001):
+
+        * ``(None, False)`` — curation cannot apply here: the user switched it
+          off, the database predates it, or no configured server can report it.
+          The job behaves exactly as it did before the feature existed.
+        * ``(set(), True)`` — curation applies but we do not have a trustworthy
+          picture: never swept, swept incompletely, swept too long ago, or the
+          signals could not be read. Nothing is deleted.
+        * ``(keys, False)`` — a complete, fresh snapshot. These keys are
+          protected; everything else is judged on retention and play count.
+
+        The middle case is the one that matters. A sweep that quietly broke —
+        server down, credentials rotated, a failed write for one user — used to
+        be indistinguishable from "nobody likes any of these", and deleting on
+        that basis is the exact failure this job exists to avoid.
+        """
+        if not bool(settings.get('use_curation_signals', True)):
+            return None, False
+        try:
+            max_age = float(settings.get('curation_max_age_hours', 48) or 48)
+        except (TypeError, ValueError):
+            max_age = 48.0
+
+        reader = getattr(context.db, 'get_curation_sync_at', None)
+        if not callable(reader):
+            # Database predates the feature — no signals to consult, and no
+            # claim to make about staleness.
+            return None, False
+
+        status, synced_at = None, None
+        try:
+            status_reader = getattr(context.db, 'get_curation_status', None)
+            if callable(status_reader):
+                status = status_reader()
+            synced_at = parse_ts(reader())
+        except Exception as e:
+            logger.warning("expired cleanup: curation sync state unreadable (%s) "
+                           "— keeping everything this run", e)
+            return set(), True
+
+        if status is not None:
+            if not status.get('expected_servers') and status.get('complete'):
+                # The sweep ran and found no server that can report curation.
+                # Nothing to protect, so the job runs on retention + play count
+                # exactly as it did before the feature existed.
+                return None, False
+            if not status.get('complete'):
+                logger.warning(
+                    "[Expired Cleaner] the last curation sweep was incomplete (%s) "
+                    "— keeping everything this run",
+                    ", ".join(status.get('failed') or []) or "reason unrecorded")
+                return set(), True
+            synced_at = parse_ts(status.get('at')) or synced_at
+
+        if synced_at is None:
+            # Curation is switched on and no sweep has ever completed, so we
+            # have no idea what anyone favourited. That is not the same as
+            # "nobody favourited anything", and this job deletes files. The
+            # sweep is scheduled by the same settings that enabled this job, so
+            # this state resolves itself on the next media-server poll; an
+            # install with no media server should switch use_curation_signals
+            # off, which restores the pre-feature behaviour immediately.
+            logger.warning(
+                "[Expired Cleaner] curation signals are enabled but no sweep has "
+                "completed yet — keeping everything this run. Switch off "
+                "'use_curation_signals' if this install has no media server.")
+            return set(), True
+        age_hours = (datetime.now(timezone.utc) - synced_at).total_seconds() / 3600.0
+        if age_hours > max_age:
+            logger.warning("[Expired Cleaner] curation signals are %.1fh old (max %.1fh) "
+                           "— keeping everything this run", age_hours, max_age)
+            return set(), True
+
+        try:
+            grouped = context.db.get_curation_signals_by_track_key() or {}
+        except Exception as e:
+            logger.warning("expired cleanup: curation signals unreadable (%s) "
+                           "— keeping everything this run", e)
+            return set(), True
+
+        min_rating = settings.get('curation_min_rating', 3)
+        return (
+            {key for key, signals in grouped.items()
+             if is_curated(signals, min_rating=min_rating)},
+            False,
+        )
+
+    @staticmethod
+    def _mirror_track_keys(context: JobContext, playlist_id, profile_id=None) -> Optional[set]:
+        """Normalized track keys for a mirror's CURRENT tracks, or None when
+        they cannot be read. None means "membership unknown" — the caller
+        keeps name-level protection rather than exposing the download."""
+        reader = getattr(context.db, 'get_mirrored_playlist_tracks', None)
+        if not callable(reader):
+            return None
+        try:
+            # playlist ids are global, so the unscoped call returns the same
+            # rows; the keyword is only passed when a profile was given.
+            kwargs = {} if profile_id is None else {'profile_id': int(profile_id)}
+            tracks = reader(int(playlist_id), **kwargs) or []
+        except Exception as e:
+            logger.debug("expired cleanup: mirror track list unreadable for %s: %s",
+                         playlist_id, e)
+            return None
+        keys = set()
+        for t in tracks:
+            if not isinstance(t, dict):
+                continue
+            key = normalize_track_key(t.get('artist_name'), t.get('track_name'))
+            if key:
+                keys.add(key)
+            keys.update(_ID_KEY + tid for tid in _mirror_track_ids(t))
+        return keys
+
+    def _protection_facts(self, context: JobContext):
+        """(playlist_membership, watched artist names).
+
+        ``playlist_membership`` maps every case-folded playlist name that
+        keeps downloads to ``{'unreadable': bool, 'keys': set()}``: the
+        normalized track keys of the mirror's CURRENT track list.
+        ``unreadable`` means the membership could not be verified (no track
+        reader, no usable id, a failed read, an empty track list, or a server
+        sync name with no mirror row behind it) — those names keep the old
+        name-level protection.
+
+        every profile's, not just the admin's: these defaulted to profile 1,
+        so another profile's still-mirrored playlist protected nothing and its
+        downloads aged out from under it (#1416). a download records the name
+        the sync ran under, which is the upstream name, the user's rename, or
+        a collision-suffixed sync name, so all three count.
+
+        membership is per TRACK, not per playlist: a rotating discovery
+        playlist (Listening Mix and friends) is always still mirrored, so
+        name-level protection kept every download it ever produced forever and
+        the cleaner could never fire for exactly the installs it was built
+        for. ``mirrored_playlist_tracks`` is replaced on every sync, so it is
+        the current membership.
+        """
+        db = context.db
+        try:
+            pids = [p.get('id') for p in (db.get_all_profiles() or []) if p.get('id') is not None]
+        except Exception as e:
+            logger.debug("expired cleanup: profile list failed: %s", e)
+            pids = []
+        pids = pids or [1]
+
+        membership = {}
+        watched = set()
+
+        def _entry(name):
+            n = str(name or '').strip().casefold()
+            if not n:
+                return None
+            return membership.setdefault(n, {'unreadable': False, 'keys': set()})
+
+        def _add(target, name):
+            n = str(name or '').strip().casefold()
+            if n:
+                target.add(n)
+
+        # server-side sync name per mirror id (a download records the name
+        # the sync ran under: upstream name, user rename, or collision-
+        # suffixed sync name). resolved once — mirror ids are global.
+        sync_names = {}
+        try:
+            from core.playlists.sync_names import all_sync_names
+            server = context.config_manager.get_active_media_server() if context.config_manager else None
+            sync_names = all_sync_names(db, server) or {}
+        except Exception as e:
+            logger.debug("expired cleanup: sync names unavailable: %s", e)
+
+        seen_mirror_ids = set()
+        for pid in pids:
+            try:
+                mirrors = db.get_mirrored_playlists(profile_id=pid) or []
+            except Exception as e:
+                logger.debug("expired cleanup: mirrored lookup failed for %s: %s", pid, e)
+                continue
+            for p in mirrors:
+                if not isinstance(p, dict):
+                    continue
+                mid = p.get('id')
+                seen_mirror_ids.add(mid)
+                keys = self._mirror_track_keys(context, mid, profile_id=pid)
+                names = [p.get('name'), p.get('custom_name')]
+                sname = sync_names.get(mid)
+                if sname:
+                    names.append(sname)
+                for name in names:
+                    entry = _entry(name)
+                    if entry is None:
+                        continue
+                    if not keys:
+                        # None (unreadable) or empty (no verifiable membership):
+                        # latch name-level protection. an empty track list is
+                        # ambiguous — emptied playlist vs a sync that never
+                        # populated it — and this job deletes files, so the
+                        # ambiguous case keeps the old behavior (#1416).
+                        entry['unreadable'] = True
+                    else:
+                        entry['keys'] |= keys
+            try:
+                for a in (db.get_watchlist_artists(profile_id=pid) or []):
+                    _add(watched, getattr(a, 'artist_name', None))
+            except Exception as e:
+                logger.debug("expired cleanup: watchlist lookup failed for %s: %s", pid, e)
+        for mid, sname in sync_names.items():
+            if mid in seen_mirror_ids:
+                continue
+            # a server sync name with no mirror row read behind it: no
+            # membership to check, so it keeps name-level protection.
+            entry = _entry(sname)
+            if entry is not None:
+                if entry['keys'] and not entry['unreadable']:
+                    # a stale sync name colliding with a readable mirror's
+                    # local name: the name-level latch wins (fail safe), which
+                    # silently neuters per-track protection for that playlist.
+                    logger.debug("expired cleanup: sync name %r latches name-level "
+                                 "protection over a readable mirror", sname)
+                entry['unreadable'] = True
+        return membership, watched
 
     def _get_settings(self, context: JobContext) -> dict:
         merged = dict(self.default_settings)
@@ -121,30 +483,67 @@ class ExpiredDownloadCleanerJob(RepairJob):
         if not candidates:
             return result
 
-        # Build the "protected" set: still-mirrored playlists + still-watched
-        # artists (by name — what origin_context stores). Case-folded.
-        mirrored_names, watched_names = set(), set()
-        try:
-            for p in (context.db.get_mirrored_playlists() or []):
-                n = (p.get('name') if isinstance(p, dict) else None) or ''
-                if n:
-                    mirrored_names.add(n.strip().casefold())
-        except Exception as e:
-            logger.debug("expired cleanup: mirrored-playlist lookup failed: %s", e)
-        try:
-            for a in (context.db.get_watchlist_artists() or []):
-                n = getattr(a, 'artist_name', None) or ''
-                if n:
-                    watched_names.add(n.strip().casefold())
-        except Exception as e:
-            logger.debug("expired cleanup: watchlist lookup failed: %s", e)
+        playlist_membership, watched_names = self._protection_facts(context)
+
+        # Anything downloaded before the library database was last rebuilt is
+        # permanently out of scope. A rebuild wipes tracks/albums/artists —
+        # destroying play_count, the only per-track protection — while
+        # library_history keeps the original created_at, so without this a
+        # much-played track reads as "old and never played" and gets deleted.
+        # No stamp (never rebuilt) means nothing is grandfathered.
+        # A database that doesn't track rebuilds at all has nothing to
+        # grandfather (normal operation). A read that FAILS is different: we
+        # cannot tell whether a rebuild happened, so grandfather everything
+        # rather than risk deleting across one we couldn't see.
+        rebuilt_at = None
+        _read_stamp = getattr(context.db, 'get_preference', None)
+        if callable(_read_stamp):
+            try:
+                rebuilt_at = parse_ts(_read_stamp('library_rebuilt_at'))
+            except Exception as e:
+                logger.warning(
+                    "expired cleanup: could not read the library-rebuild stamp "
+                    "(%s) — treating every download as pre-rebuild and keeping it", e)
+                rebuilt_at = datetime.now(timezone.utc)
+
+        # Per-user curation signals off the media server: what people
+        # deliberately CHOSE about a track. `stale` means we have no fresh
+        # picture of those choices, so nothing may be deleted this run — a
+        # sweep that silently stopped working must not quietly turn into
+        # "nobody likes anything".
+        curated_keys, signals_stale = self._curation_lookup(context, settings)
 
         for c in candidates:
             ctx = (c.get('origin_context') or '').strip().casefold()
             origin = (c.get('origin') or '').strip().lower()
-            c['protected'] = bool(
-                (origin == 'playlist' and ctx and ctx in mirrored_names) or
-                (origin == 'watchlist' and ctx and ctx in watched_names))
+            if origin == 'playlist' and ctx:
+                entry = playlist_membership.get(ctx)
+                if entry is None:
+                    # origin playlist is not mirrored anywhere: nothing to keep it
+                    c['protected'] = False
+                else:
+                    key = normalize_track_key(c.get('artist_name'), c.get('title'))
+                    tid = str(c.get('source_track_id') or '').strip()
+                    c['protected'] = bool(
+                        not key  # unidentifiable track — cannot prove it left
+                        or entry['unreadable']  # membership unknown — keep old behavior
+                        or key in entry['keys']  # still in the playlist's track list
+                        # same track by id: the provider can credit the artist
+                        # differently ("GTA" vs "Good Times Ahead")
+                        or (tid and _ID_KEY + tid in entry['keys'])
+                    )
+            else:
+                c['protected'] = bool(
+                    origin == 'watchlist' and ctx and ctx in watched_names)
+            if signals_stale:
+                c['curated'] = True
+            elif curated_keys is not None:
+                c['curated'] = path_suffix_key(c.get('file_path')) in curated_keys
+            if rebuilt_at is not None:
+                created = parse_ts(c.get('created_at'))
+                # An unparseable date is already kept by the pure core; treat
+                # it as grandfathered too so the reason reported is honest.
+                c['grandfathered'] = created is None or created <= rebuilt_at
 
         expired = select_expired(candidates, watchlist_retention=wl,
                                  playlist_retention=pl, min_plays=min_plays)
@@ -157,7 +556,9 @@ class ExpiredDownloadCleanerJob(RepairJob):
                 return result
             if not dry_run:
                 try:
-                    res = delete_origin_download(context.db, entry, context.config_manager)
+                    res = delete_origin_download(
+                        context.db, entry, context.config_manager,
+                        transfer_folder=context.transfer_folder)
                     if res.get('removed') or res.get('file_deleted'):
                         result.auto_fixed += 1
                 except Exception as e:
@@ -173,9 +574,15 @@ class ExpiredDownloadCleanerJob(RepairJob):
                         entity_id=str(entry.get('id')),
                         file_path=entry.get('file_path'),
                         title=f'Expired: {entry.get("title") or "Unknown"}',
+                        # Say what was actually CHECKED, not a fixed phrase.
+                        # The old wording ("past retention, not active, not
+                        # replayed") predates the curation and rebuild checks
+                        # and no longer described the real criteria — which
+                        # matters on a finding whose whole job is to justify
+                        # deleting someone's file.
                         description=(f'"{entry.get("title")}" by {entry.get("artist_name") or "Unknown"} '
                                      f'— via {entry.get("origin")} ({entry.get("origin_context") or "?"}), '
-                                     f'past retention, not active, not replayed.'),
+                                     f'{_deletion_rationale(entry, min_plays, curated_keys)}.'),
                         details={
                             'history_id': entry.get('id'),
                             'file_path': entry.get('file_path'),
@@ -194,9 +601,10 @@ class ExpiredDownloadCleanerJob(RepairJob):
             if context.update_progress and (i + 1) % 5 == 0:
                 context.update_progress(i + 1, len(expired))
 
-        logger.info("[Expired Cleaner] %d candidates, %d expired (%s)",
+        logger.info("[Expired Cleaner] %d candidates, %d expired (%s) — kept: %s",
                     len(candidates), len(expired),
-                    "findings created (dry run)" if dry_run else "auto-deleted")
+                    "findings created (dry run)" if dry_run else "auto-deleted",
+                    _kept_summary(candidates, expired))
         return result
 
     def estimate_scope(self, context: JobContext) -> int:

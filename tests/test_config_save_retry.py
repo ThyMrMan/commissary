@@ -11,40 +11,18 @@ ERROR. These tests pin the new behaviour:
 - Non-lock OperationalErrors don't trigger the lock-specific quiet path.
 """
 
-import contextlib
 import json
 import logging
 import sqlite3
-import threading
 import time
+from contextlib import contextmanager
+from threading import Thread
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
-from config.settings import ConfigManager
-
-# The logger ConfigManager writes to (get_logger("config") under the "soulsync"
-# namespace). Every assertion below scopes to it — see `_records`.
-_CONFIG_LOGGER = "soulsync.config"
-
-
-def _records(caplog: pytest.LogCaptureFixture, min_level: int) -> list:
-    """Records this module's logger emitted at ``min_level`` or above.
-
-    ``caplog`` captures at the ROOT handler, so ``caplog.records`` holds output
-    from every logger in the process — including background worker threads that
-    happen to be alive during the test. Filtering by level alone made these
-    assertions depend on whatever else logged in the same window: a stray
-    "database is locked" ERROR from ``soulsync.audiodb_worker`` failed the
-    lock-error test intermittently, reporting a config bug that did not exist.
-
-    Scoping by logger name is the fix, and it does not weaken anything — every
-    assertion here is about what ConfigManager logs, never about the process
-    being silent.
-    """
-    return [r for r in caplog.records
-            if r.name == _CONFIG_LOGGER and r.levelno >= min_level]
+from core.settings import ConfigManager
 
 
 @pytest.fixture
@@ -80,33 +58,16 @@ def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ConfigManager:
 # ---------------------------------------------------------------------------
 
 
-@contextlib.contextmanager
-def _count_retry_sleeps():
-    """Count ONLY the retry loop's own sleeps.
+@contextmanager
+def _mock_settings_sleep():
+    """Replace settings' time reference, never the process-wide time.sleep.
 
-    ``patch("config.settings.time.sleep")`` looks scoped but is not:
-    ``config.settings.time`` IS the stdlib time module, so patching its
-    ``sleep`` attribute replaces it process-wide. Once anything has imported
-    web_server, its background monitor threads are sitting in ``time.sleep``
-    loops, and any tick landing inside the patch window is counted as one of
-    the retry sleeps — which failed this test with 4 == 3 depending purely on
-    thread timing and test ordering.
-
-    So: record calls made on the calling thread (the retry loop), and let every
-    other thread sleep for real rather than turning their waits into spins.
+    Background metadata workers also sleep. Patching time.sleep itself records
+    their calls and removes their rate limiting while these assertions run.
     """
-    real_sleep = time.sleep
-    mine = threading.get_ident()
-    calls: list = []
-
-    def _sleep(seconds, *a, **kw):
-        if threading.get_ident() == mine:
-            calls.append(seconds)
-            return None
-        return real_sleep(seconds, *a, **kw)
-
-    with patch("config.settings.time.sleep", side_effect=_sleep):
-        yield calls
+    with patch("core.settings.time", wraps=time) as settings_time:
+        settings_time.sleep = Mock()
+        yield settings_time.sleep
 
 
 def _fail_n_times_then_succeed(n: int, manager: ConfigManager):
@@ -129,44 +90,17 @@ def _fail_n_times_then_succeed(n: int, manager: ConfigManager):
 # ---------------------------------------------------------------------------
 
 
-def test_another_thread_logging_an_error_cannot_fail_these_tests(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The flake itself, pinned.
-
-    ``soulsync.audiodb_worker`` logging "database is locked" on a background
-    thread once failed the lock-error test below — a config assertion broken by
-    an unrelated subsystem, which is indistinguishable from a real regression
-    when you are staring at a red sweep. This is the second cross-thread flake
-    in this file (see ``_count_retry_sleeps``), so it is worth a test rather
-    than a comment.
-    """
-    # Both levels set EXPLICITLY by logger name, the same way every other test
-    # here does it. `caplog.set_level(DEBUG)` with no logger only raises the
-    # ROOT level; once the app's logging config has run, `soulsync.config`
-    # carries its own INFO level and drops a .debug() before any handler sees
-    # it. That passes when this file runs alone and fails in a full suite —
-    # which is how this very test first went red.
-    caplog.set_level(logging.DEBUG, logger="soulsync.config")
-    caplog.set_level(logging.DEBUG, logger="soulsync.audiodb_worker")
-    logging.getLogger("soulsync.audiodb_worker").error("database is locked")
-    logging.getLogger("soulsync.config").debug("config is quiet")
-
-    assert _records(caplog, logging.ERROR) == []
-    assert len(_records(caplog, logging.DEBUG)) == 1
-
-
 def test_save_succeeds_on_first_attempt_emits_no_error_logs(
     manager: ConfigManager, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Happy path: a successful save should not log at ERROR."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
-    with _count_retry_sleeps() as retry_sleeps:
+    with _mock_settings_sleep() as sleep_mock:
         with patch.object(manager, "_save_to_database", return_value=True) as save_mock:
             manager._save_config()
     assert save_mock.call_count == 1
-    assert retry_sleeps == []
-    error_logs = _records(caplog, logging.ERROR)
+    sleep_mock.assert_not_called()
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs == []
 
 
@@ -176,13 +110,13 @@ def test_lock_errors_during_retries_log_at_debug_not_error(
     """Three transient locks then success should produce DEBUG noise only."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
     stub, state = _fail_n_times_then_succeed(3, manager)
-    with _count_retry_sleeps() as retry_sleeps:
+    with _mock_settings_sleep() as sleep_mock:
         with patch.object(manager, "_save_to_database", side_effect=stub):
             with patch.object(manager, "_ensure_database_exists"):
                 manager._save_config()
     assert state["calls"] == 4
-    assert len(retry_sleeps) == 3
-    error_logs = _records(caplog, logging.ERROR)
+    assert sleep_mock.call_count == 3
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs == [], "transient locks should not log ERROR"
 
 
@@ -190,17 +124,15 @@ def test_save_uses_six_attempts_with_exponential_backoff(
     manager: ConfigManager,
 ) -> None:
     """All six attempts must run, with the documented backoff schedule."""
-    with _count_retry_sleeps() as retry_sleeps:
+    with _mock_settings_sleep() as sleep_mock:
         with patch.object(manager, "_save_to_database", return_value=False) as save_mock:
-            with patch("builtins.open"):  # silence the json fallback's filesystem write
-                with patch.object(Path, "mkdir"):
-                    manager._save_config()
+            with patch.object(manager, "_save_config_file_atomic") as fallback:
+                manager._save_config()
+    fallback.assert_called_once_with()
     assert save_mock.call_count == 6
     expected_delays = [0.2, 0.5, 1.0, 2.0, 4.0]
-    # retry_sleeps holds the delays the retry loop itself asked for, in order —
-    # background threads' sleeps are excluded, so this can't be perturbed by
-    # whatever else the suite has running.
-    assert retry_sleeps == expected_delays
+    actual_delays = [c.args[0] for c in sleep_mock.call_args_list]
+    assert actual_delays == expected_delays
 
 
 def test_all_retries_exhausted_logs_single_error_and_falls_back_to_json(
@@ -209,10 +141,10 @@ def test_all_retries_exhausted_logs_single_error_and_falls_back_to_json(
     """Exhausting retries should produce one ERROR log + one fallback file."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
     manager.config_path = tmp_path / "config.json"
-    with patch("config.settings.time.sleep"):
+    with _mock_settings_sleep():
         with patch.object(manager, "_save_to_database", return_value=False):
             manager._save_config()
-    error_logs = _records(caplog, logging.ERROR)
+    error_logs = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(error_logs) == 1
     assert "falling back to config.json" in error_logs[0].getMessage()
     assert manager.config_path.exists()
@@ -226,16 +158,18 @@ def test_save_to_database_lock_error_logs_at_debug(
     """sqlite3.OperationalError("...locked...") must surface as DEBUG only."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
     with patch.object(manager, "_ensure_database_exists"):
-        with patch("config.settings.sqlite3.connect") as connect_mock:
+        with patch("core.settings.sqlite3.connect") as connect_mock:
             connect_mock.return_value.execute.side_effect = sqlite3.OperationalError(
                 "database is locked"
             )
             ok = manager._save_to_database({"x": 1})
     assert ok is False
-    error_logs = _records(caplog, logging.ERROR)
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert error_logs == []
-    debug_logs = [r for r in _records(caplog, logging.DEBUG)
-                  if r.levelno == logging.DEBUG and "locked" in r.getMessage().lower()]
+    debug_logs = [
+        r for r in caplog.records
+        if r.levelno == logging.DEBUG and "locked" in r.getMessage().lower()
+    ]
     assert len(debug_logs) == 1
 
 
@@ -245,13 +179,13 @@ def test_save_to_database_non_lock_operational_error_logs_at_error(
     """A non-lock OperationalError is a real failure and must log ERROR."""
     caplog.set_level(logging.DEBUG, logger="soulsync.config")
     with patch.object(manager, "_ensure_database_exists"):
-        with patch("config.settings.sqlite3.connect") as connect_mock:
+        with patch("core.settings.sqlite3.connect") as connect_mock:
             connect_mock.return_value.execute.side_effect = sqlite3.OperationalError(
                 "no such table: metadata"
             )
             ok = manager._save_to_database({"x": 1})
     assert ok is False
-    error_logs = _records(caplog, logging.ERROR)
+    error_logs = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert len(error_logs) == 1
 
 
@@ -268,3 +202,15 @@ def test_connect_db_sets_required_pragmas(manager: ConfigManager) -> None:
     assert busy_timeout == 30000
     # synchronous returns 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA
     assert synchronous == 1
+
+
+def test_settings_sleep_mock_does_not_capture_background_worker_delays():
+    """Reproduce the unrelated worker sleep that intermittently added a sixth delay."""
+    original_sleep = time.sleep
+    with _mock_settings_sleep() as sleep_mock:
+        worker = Thread(target=lambda: time.sleep(0))
+        worker.start()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert time.sleep is original_sleep
+        sleep_mock.assert_not_called()

@@ -146,16 +146,12 @@ def test_verification_wrapper_handles_simple_download(tmp_path, monkeypatch):
     monkeypatch.setattr(import_pipeline, "check_audio_integrity",
                         lambda *_a, **_kw: IntegrityResult(ok=True, checks={"size_bytes": 5, "actual_length_s": 0}))
     monkeypatch.setattr(import_paths, "_get_config_manager", lambda: _Config(str(transfer_root)))
-    # The destination root now comes from the Music Libraries table, falling back
-    # to the configured transfer_path when none exist. Stub it empty so this
-    # plumbing test keeps using the transfer_root it just injected rather than a
-    # library row seeded from the real config.
-    monkeypatch.setattr(import_paths, "_get_music_libraries", lambda: [])
     monkeypatch.setattr(import_pipeline, "add_activity_item", lambda *args, **kwargs: activity_calls.append((args, kwargs)))
     monkeypatch.setattr(import_pipeline, "emit_track_downloaded", lambda *args, **kwargs: None)
     monkeypatch.setattr(import_pipeline, "record_library_history_download", lambda *args, **kwargs: None)
     monkeypatch.setattr(import_pipeline, "record_download_provenance", lambda *args, **kwargs: None)
-    monkeypatch.setattr(import_pipeline, "check_and_remove_from_wishlist", lambda context: wishlist_calls.append(dict(context)))
+    monkeypatch.setattr(import_pipeline, "check_and_remove_from_wishlist",
+                        lambda context, **kw: wishlist_calls.append((dict(context), kw)))
     monkeypatch.setattr(import_pipeline, "_mark_task_completed", lambda task, track_info: mark_calls.append((task, track_info)))
     monkeypatch.setattr(import_pipeline.threading, "Thread", _ImmediateThread)
 
@@ -181,7 +177,12 @@ def test_verification_wrapper_handles_simple_download(tmp_path, monkeypatch):
         assert completion_calls == [(batch_id, task_id, True)]
         assert context_key not in runtime_state.matched_downloads_context
         assert scan_calls == ["Simple download completed"]
-        assert wishlist_calls and wishlist_calls[0]["search_result"]["is_simple_download"] is True
+        assert wishlist_calls
+        _wl_context, _wl_kwargs = wishlist_calls[0]
+        assert _wl_context["search_result"]["is_simple_download"] is True
+        # #1289: the removal is handed the library path the file actually landed
+        # at, so its guard can prove the request was satisfied.
+        assert _wl_kwargs["published_path"] == str(expected_path)
         assert activity_calls
     finally:
         runtime_state.matched_downloads_context.clear()
@@ -238,8 +239,7 @@ def test_post_process_matched_download_forwards_separate_metadata_runtime(tmp_pa
     )
     monkeypatch.setattr(import_pipeline, "resolve_album_group", lambda artist_context, album_info, original_album: album_info["album_name"])
     monkeypatch.setattr(import_pipeline, "get_import_clean_title", lambda *args, **kwargs: "Track")
-    monkeypatch.setattr(import_pipeline, "get_audio_quality_string",
-                        lambda file_path, **_kw: "")
+    monkeypatch.setattr(import_pipeline, "get_audio_quality_string", lambda file_path, **_k: "")
     monkeypatch.setattr(import_pipeline, "check_flac_bit_depth", lambda *args, **kwargs: None)
     # Bypass integrity check — the 5-byte fixture would fail it; this test
     # exercises the metadata-runtime forwarding path, not file integrity.
@@ -327,8 +327,7 @@ def _wire_post_process_common(monkeypatch, tmp_path, target_path, *, track_numbe
     )
     monkeypatch.setattr(import_pipeline, "resolve_album_group", lambda artist_context, album_info, original_album: album_info["album_name"])
     monkeypatch.setattr(import_pipeline, "get_import_clean_title", lambda *args, **kwargs: "Track")
-    monkeypatch.setattr(import_pipeline, "get_audio_quality_string",
-                        lambda file_path, **_kw: "")
+    monkeypatch.setattr(import_pipeline, "get_audio_quality_string", lambda file_path, **_k: "")
     monkeypatch.setattr(import_pipeline, "check_flac_bit_depth", lambda *args, **kwargs: None)
     from core.imports.file_integrity import IntegrityResult
     monkeypatch.setattr(import_pipeline, "check_audio_integrity",
@@ -377,59 +376,6 @@ def test_scan_order_fallback_used_for_album_bundle_download(tmp_path, monkeypatc
     assert library_calls[0]["track_number"] == 7
 
 
-def test_post_process_records_an_unexpected_failure_on_the_context(tmp_path, monkeypatch):
-    """A live install hit ``PermissionError`` creating the artist folder under
-    the music library, and every track still reported "Track Imported".
-
-    This handler deliberately swallows exceptions so the download monitor can
-    retry, which means the ONLY way a caller can learn the import failed is the
-    context flag. Reproduced where it really happened: building the final path
-    creates the destination folders, so that is what raises.
-    """
-    source_path = tmp_path / "source.flac"
-    source_path.write_bytes(b"audio")
-
-    _wire_post_process_common(
-        monkeypatch, tmp_path, tmp_path / "out.flac",
-        track_number=1, is_album_download=False)
-
-    def _denied(*_a, **_kw):
-        raise PermissionError(
-            13, "Permission denied", "/media/completed/listening/music/IVE")
-
-    monkeypatch.setattr(import_pipeline, "build_final_path_for_track", _denied)
-
-    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
-                                    web_scan_manager=None, repair_worker=None)
-    context = {"track_info": {}, "original_search_result": {"title": "Track", "album": "Album"}}
-
-    # Must NOT raise — the retry path depends on returning normally.
-    import_pipeline.post_process_matched_download("ctx-perm", context, str(source_path), runtime)
-
-    assert context.get('_post_process_error'), \
-        "the failure has to be visible to the caller, or it gets counted as an import"
-    assert "Permission denied" in context['_post_process_error']
-    assert import_pipeline.import_rejection_reason(context) is not None
-
-
-def test_a_clean_post_process_records_no_failure(tmp_path, monkeypatch):
-    """Guards the other direction: if the flag were set on the happy path,
-    every successful import would start reporting as failed."""
-    source_path = tmp_path / "source.flac"
-    source_path.write_bytes(b"audio")
-    _wire_post_process_common(
-        monkeypatch, tmp_path, tmp_path / "out.flac",
-        track_number=1, is_album_download=False)
-
-    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
-                                    web_scan_manager=None, repair_worker=None)
-    context = {"track_info": {}, "original_search_result": {"title": "Track", "album": "Album"}}
-    import_pipeline.post_process_matched_download("ctx-ok", context, str(source_path), runtime)
-
-    assert context.get('_post_process_error') is None
-    assert import_pipeline.import_rejection_reason(context) is None
-
-
 def test_scan_order_fallback_not_used_for_plain_download(tmp_path, monkeypatch):
     """A plain (non-bundle) download lands in a SHARED flat directory that
     can hold unrelated in-flight downloads at the same time — the
@@ -462,6 +408,93 @@ def test_scan_order_fallback_not_used_for_plain_download(tmp_path, monkeypatch):
     assert library_calls[0]["track_number"] == 1
 
 
+def test_unknown_compilation_track_number_does_not_claim_first_position(tmp_path, monkeypatch):
+    source_path = tmp_path / "Omricon.mp3"
+    source_path.write_bytes(b"audio")
+    library_calls = _wire_post_process_common(
+        monkeypatch, tmp_path, tmp_path / "Omricon.mp3",
+        track_number=0, is_album_download=True,
+    )
+    import core.imports.track_number as track_number_module
+    monkeypatch.setattr(track_number_module, "track_number_from_directory_order", lambda path: None)
+    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
+                                    web_scan_manager=None, repair_worker=None)
+    context = {
+        "album": {"name": "Magnatron 2.0", "album_type": "compilation"},
+        "track_info": {"name": "Omricon"},
+        "original_search_result": {"title": "Omricon"},
+        "is_album_download": True,
+    }
+
+    import_pipeline.post_process_matched_download("ctx-1", context, str(source_path), runtime)
+
+    assert library_calls[0]["track_number"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The duration reference a deliberately-preferred version is measured against
+# ---------------------------------------------------------------------------
+
+def _run_with_duration(tmp_path, monkeypatch, context_extra):
+    """Post-process one file and report the expected duration the integrity
+    check was handed."""
+    source_path = tmp_path / "source.flac"
+    source_path.write_bytes(b"audio")
+    target_path = tmp_path / "Album Folder" / "track.flac"
+    _wire_post_process_common(
+        monkeypatch, tmp_path, target_path, track_number=1, is_album_download=False)
+    # the source says 3:20; the extended mix we went and fetched runs 6:20
+    monkeypatch.setattr(import_pipeline, "get_import_track_info",
+                        lambda context: {"duration_ms": 200_000})
+
+    from core.imports.file_integrity import IntegrityResult
+    seen = []
+
+    def _capture(path, expected_ms, **_kw):
+        seen.append(expected_ms)
+        return IntegrityResult(ok=True, checks={})
+
+    monkeypatch.setattr(import_pipeline, "check_audio_integrity", _capture)
+
+    runtime = types.SimpleNamespace(automation_engine=None, on_download_completed=None,
+                                    web_scan_manager=None, repair_worker=None)
+    context = {"track_info": {}, "original_search_result": {"title": "Track", "album": "Album"}}
+    context.update(context_extra)
+    import_pipeline.post_process_matched_download("ctx", context, str(source_path), runtime)
+    return seen
+
+
+def test_an_ordinary_download_is_measured_against_the_source(tmp_path, monkeypatch):
+    assert _run_with_duration(tmp_path, monkeypatch, {}) == [200_000]
+
+
+def test_a_preferred_version_is_measured_against_the_peers_length(tmp_path, monkeypatch):
+    """Settings → prefer a version. The file is a different recording on
+    purpose, so the source's 3:20 describes the other cut — measuring against it
+    quarantines every file the setting went and found. The download stamps the
+    length the peer advertised, which still catches a truncated transfer.
+
+    This pins the WIRING. The reference itself is decided by
+    ``duration_reference_for_context`` and unit-tested in
+    tests/test_preferred_version.py; without this the pipeline could stop
+    calling it and every one of those tests would still pass."""
+    seen = _run_with_duration(tmp_path, monkeypatch, {
+        '_preferred_version_taken': 'extended',
+        '_preferred_version_duration_ms': 380_000,
+    })
+    assert seen == [380_000]
+
+
+def test_a_preferred_version_with_no_advertised_length_skips_the_leg(tmp_path, monkeypatch):
+    """The peer advertised nothing, so there is no honest reference. Skip the
+    duration leg rather than guess — size and parse legs still run."""
+    seen = _run_with_duration(tmp_path, monkeypatch, {
+        '_preferred_version_taken': 'extended',
+        '_preferred_version_duration_ms': None,
+    })
+    assert seen == [None]
+
+
 # ---------------------------------------------------------------------------
 # Quarantine entry-id propagation through the verification wrapper
 # (the wrapper pops task_id out of context, so _mark_task_quarantined can't
@@ -482,8 +515,7 @@ def test_quality_gate_runs_before_acoustid(tmp_path, monkeypatch):
     monkeypatch.setattr(import_pipeline, "detect_broken_audio", lambda *_a, **_kw: None)
 
     # Wrong quality → rejection.
-    monkeypatch.setattr(import_pipeline, "get_audio_quality_string",
-                        lambda fp, **_kw: "FLAC 16bit/44.1kHz")
+    monkeypatch.setattr(import_pipeline, "get_audio_quality_string", lambda fp, **_k: "FLAC 16bit/44.1kHz")
     monkeypatch.setattr(import_pipeline, "check_quality_target", lambda fp, ctx: "Quality mismatch: FLAC 16bit")
 
     triggers = []
@@ -580,6 +612,67 @@ def test_verification_wrapper_applies_quarantine_entry_id_on_integrity_failure(m
         runtime_state.download_tasks.update(original)
         runtime_state.matched_downloads_context.clear()
         runtime_state.matched_downloads_context.update(original_ctx)
+
+
+def test_verification_wrapper_persists_final_path_for_playback_queue(tmp_path, monkeypatch):
+    """A completed playback-prefetch task must expose its imported path.
+
+    The queue status endpoint only turns a ``missing`` player row into a ready
+    row when ``final_file_path`` is present.  The verification wrapper owns
+    task completion, so it must copy the path produced by the inner importer.
+    """
+    task_id, batch_id, context_key = "play-task", "play-batch", "play-context"
+    final_path = tmp_path / "Library" / "Artist" / "Album" / "01 - Track.flac"
+    final_path.parent.mkdir(parents=True)
+    final_path.write_bytes(b"audio")
+    context = {
+        "track_info": {"name": "Track"},
+        "task_id": task_id,
+        "batch_id": batch_id,
+    }
+
+    def _fake_inner(_key, inner_context, _source, _runtime, metadata_runtime=None):
+        inner_context["_final_processed_path"] = str(final_path)
+
+    monkeypatch.setattr(import_pipeline, "post_process_matched_download", _fake_inner)
+
+    original_tasks = dict(runtime_state.download_tasks)
+    original_contexts = dict(runtime_state.matched_downloads_context)
+    try:
+        runtime_state.download_tasks.clear()
+        runtime_state.download_tasks[task_id] = {
+            "track_info": context["track_info"],
+            "status": "post_processing",
+            "playlist_id": "playback_queue",
+        }
+        runtime_state.matched_downloads_context.clear()
+        runtime_state.matched_downloads_context[context_key] = context
+        completion = []
+        runtime = types.SimpleNamespace(
+            automation_engine=None,
+            on_download_completed=lambda b, t, success: completion.append((b, t, success)),
+            web_scan_manager=None,
+            repair_worker=None,
+        )
+
+        import_pipeline.post_process_matched_download_with_verification(
+            context_key,
+            context,
+            "/downloads/Artist - Track.flac",
+            task_id,
+            batch_id,
+            runtime,
+        )
+
+        task = runtime_state.download_tasks[task_id]
+        assert task["status"] == "completed"
+        assert task["final_file_path"] == str(final_path)
+        assert completion == [(batch_id, task_id, True)]
+    finally:
+        runtime_state.download_tasks.clear()
+        runtime_state.download_tasks.update(original_tasks)
+        runtime_state.matched_downloads_context.clear()
+        runtime_state.matched_downloads_context.update(original_contexts)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,3 +1129,39 @@ def test_quarantine_failure_preserves_file_instead_of_deleting(tmp_path, monkeyp
              runtime_state.post_process_locks), snap):
             d.clear()
             d.update(original)
+
+
+def test_replacement_move_failure_keeps_existing_library_file(tmp_path, monkeypatch):
+    source_path = tmp_path / "source.flac"
+    source_path.write_bytes(b"new audio")
+    target_path = tmp_path / "Library" / "track.flac"
+    target_path.parent.mkdir()
+    target_path.write_bytes(b"known good audio")
+    _wire_post_process_common(
+        monkeypatch, tmp_path, target_path,
+        track_number=1, is_album_download=True,
+    )
+    monkeypatch.setattr(import_pipeline, "_replacement_length_is_safe", lambda *_: True)
+
+    def fail_move(_src, _dst):
+        assert target_path.read_bytes() == b"known good audio"
+        raise OSError("injected move failure")
+
+    monkeypatch.setattr(import_pipeline, "safe_move_file", fail_move)
+    context = {
+        "track_info": {},
+        "original_search_result": {"title": "Track", "album": "Album"},
+        "is_album_download": True,
+    }
+    runtime = types.SimpleNamespace(
+        automation_engine=None, on_download_completed=None,
+        web_scan_manager=None, repair_worker=None,
+    )
+    import_pipeline.post_process_matched_download(
+        "replacement-failure", context, str(source_path), runtime,
+    )
+
+    assert source_path.read_bytes() == b"new audio"
+    assert target_path.read_bytes() == b"known good audio"
+    assert "injected move failure" in context["_context_failure_msg"]
+    assert context.get("_pipeline_import_succeeded") is not True

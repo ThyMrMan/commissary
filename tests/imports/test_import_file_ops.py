@@ -1,5 +1,6 @@
 import sys
 import types
+from pathlib import Path
 
 from core.imports.file_ops import (
     cleanup_empty_directories,
@@ -54,6 +55,23 @@ def test_safe_move_file_replaces_existing_destination(tmp_path):
     assert dst.read_text() == "new"
 
 
+def test_safe_move_failure_preserves_existing_destination_and_source(tmp_path, monkeypatch):
+    src = tmp_path / "source.flac"
+    dst = tmp_path / "track.flac"
+    src.write_bytes(b"new")
+    dst.write_bytes(b"old")
+
+    monkeypatch.setattr(_fo.os, "replace", lambda *_args: (_ for _ in ()).throw(
+        OSError(errno.ENOSPC, "No space left on device")
+    ))
+
+    with pytest.raises(OSError, match="No space"):
+        safe_move_file(src, dst)
+
+    assert src.read_bytes() == b"new"
+    assert dst.read_bytes() == b"old"
+
+
 def test_cleanup_empty_directories_removes_nested_empty_paths(tmp_path):
     download_root = tmp_path / "downloads"
     nested_dir = download_root / "Artist" / "Album"
@@ -98,10 +116,11 @@ def test_read_staging_file_metadata_reads_tags(monkeypatch, tmp_path):
         "album": "Album One",
         "track_number": 3,
         "disc_number": 2,
-        # The album matcher gates on duration and pairs on ISRC / MusicBrainz ID,
-        # so these are always present. The stub has no audio info and no
-        # identifier tags, so they read as empty rather than being absent.
+        # off audio.info; the dummy has none, and "fake" is 4 bytes on disk
         "duration_ms": 0,
+        "bitrate": 0,
+        "size": 4,
+        # Commissary: exact ids for the album matcher, empty without the tags
         "isrc": "",
         "mbid": "",
     }
@@ -174,10 +193,10 @@ def test_read_staging_file_metadata_uses_filename_fallbacks_when_tags_are_invali
         "album": "Album One",
         "track_number": 2,
         "disc_number": 1,
-        # The album matcher gates on duration and pairs on ISRC / MusicBrainz ID,
-        # so these are always present. The stub has no audio info and no
-        # identifier tags, so they read as empty rather than being absent.
         "duration_ms": 0,
+        "bitrate": 0,
+        "size": 4,
+        # Commissary: exact ids for the album matcher, empty without the tags
         "isrc": "",
         "mbid": "",
     }
@@ -186,6 +205,7 @@ def test_read_staging_file_metadata_uses_filename_fallbacks_when_tags_are_invali
 # ── atomic cross-filesystem move (Jellyfin null-disc mitigation) ──────────────
 import errno  # noqa: E402
 import os  # noqa: E402
+import stat  # noqa: E402
 
 import pytest  # noqa: E402
 
@@ -227,6 +247,45 @@ def test_cross_device_move_routes_to_atomic_and_completes(tmp_path, monkeypatch)
     assert not list(dstdir.glob(".*ssync-tmp"))   # complete file only, no leftover temp
 
 
+def test_cross_device_move_atomically_replaces_existing_destination(tmp_path, monkeypatch):
+    src = tmp_path / "s.flac"
+    src.write_bytes(b"new payload")
+    dst = tmp_path / "lib" / "t.flac"
+    dst.parent.mkdir()
+    dst.write_bytes(b"old payload")
+    real_replace = os.replace
+
+    def fake_replace(a, b):
+        if Path(a) == src:
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_replace(a, b)
+
+    monkeypatch.setattr(_fo.os, "replace", fake_replace)
+    safe_move_file(src, dst)
+
+    assert not src.exists()
+    assert dst.read_bytes() == b"new payload"
+
+
+def test_cross_device_copy_failure_keeps_old_destination(tmp_path, monkeypatch):
+    src = tmp_path / "s.flac"
+    src.write_bytes(b"new payload")
+    dst = tmp_path / "lib" / "t.flac"
+    dst.parent.mkdir()
+    dst.write_bytes(b"old payload")
+
+    monkeypatch.setattr(_fo.shutil, "copyfileobj", lambda *_args: (_ for _ in ()).throw(
+        OSError(errno.ENOSPC, "No space left on device")
+    ))
+
+    with pytest.raises(OSError, match="No space"):
+        _atomic_cross_device_move(src, dst)
+
+    assert src.read_bytes() == b"new payload"
+    assert dst.read_bytes() == b"old payload"
+    assert not list(dst.parent.glob(".*ssync-tmp"))
+
+
 def test_atomic_helper_completes_and_cleans_temp(tmp_path):
     src = tmp_path / "s.flac"
     src.write_text("payload")
@@ -237,6 +296,81 @@ def test_atomic_helper_completes_and_cleans_temp(tmp_path):
     assert dst.read_text() == "payload"
     assert not src.exists()
     assert not list(dstdir.glob(".*ssync-tmp"))
+
+
+def _publish(tmp_path, *, src_mode, dir_mode, cross_device=True):
+    """Move one file into a library folder of ``dir_mode`` and report its mode."""
+    src = tmp_path / "s.flac"
+    src.write_text("payload")
+    os.chmod(src, src_mode)
+    dstdir = tmp_path / "d"
+    dstdir.mkdir()
+    os.chmod(dstdir, dir_mode)
+    dst = dstdir / "t.flac"
+
+    if cross_device:
+        _atomic_cross_device_move(src, dst)
+    else:
+        _fo.safe_move_file(src, dst)
+    return stat.S_IMODE(dst.stat().st_mode)
+
+
+@pytest.mark.parametrize("cross_device", [True, False])
+@pytest.mark.parametrize("mode", [0o644, 0o664])
+def test_move_keeps_an_already_shareable_source_mode(tmp_path, mode, cross_device):
+    # PR #1121 review: tempfile.mkstemp creates at 0600 by design and os.replace
+    # preserves that mode, so a cross-device import (docker downloads-volume ->
+    # library-volume) landed files no other user could read — Plex/Jellyfin run
+    # as a different user. An import never NARROWS a file that was already
+    # readable.
+    assert _publish(tmp_path, src_mode=mode, dir_mode=0o755,
+                    cross_device=cross_device) == mode
+
+
+@pytest.mark.parametrize("cross_device", [True, False])
+def test_move_widens_a_private_staging_mode_to_the_library_audience(
+    tmp_path, cross_device,
+):
+    """Copying the SOURCE's mode only fixes the reported bug when the download
+    client happened to write a permissive one. slskd/SABnzbd in a container
+    with umask 077 writes its downloads 0600, so inheriting that publishes a
+    library file the media server still cannot read — the exact symptom. The
+    destination DIRECTORY is the statement of who the library is for."""
+    assert _publish(tmp_path, src_mode=0o600, dir_mode=0o755,
+                    cross_device=cross_device) == 0o644
+
+
+@pytest.mark.parametrize("cross_device", [True, False])
+def test_move_follows_a_group_writable_library(tmp_path, cross_device):
+    assert _publish(tmp_path, src_mode=0o600, dir_mode=0o775,
+                    cross_device=cross_device) == 0o664
+
+
+@pytest.mark.parametrize("cross_device", [True, False])
+def test_move_does_not_widen_past_a_private_library(tmp_path, cross_device):
+    """A 0700 library says only this user gets in — nobody can traverse the
+    directory anyway, so there is nothing to widen for."""
+    assert _publish(tmp_path, src_mode=0o600, dir_mode=0o700,
+                    cross_device=cross_device) == 0o600
+
+
+def test_atomic_helper_keeps_permissions_when_copystat_fails(tmp_path, monkeypatch):
+    # copystat also copies timestamps/xattrs; a filesystem that rejects those
+    # must not cost the file its mode and leave it 0600 (mkstemp's default).
+    src = tmp_path / "s.flac"
+    src.write_text("payload")
+    os.chmod(src, 0o644)
+    dstdir = tmp_path / "d"
+    dstdir.mkdir()
+    os.chmod(dstdir, 0o755)
+    dst = dstdir / "t.flac"
+
+    monkeypatch.setattr(_fo.shutil, "copystat", lambda *_a, **_k: (_ for _ in ()).throw(
+        OSError("utime not supported")
+    ))
+    _atomic_cross_device_move(src, dst)
+
+    assert stat.S_IMODE(dst.stat().st_mode) == 0o644
 
 
 def test_atomic_helper_cleans_temp_and_keeps_source_on_failure(tmp_path, monkeypatch):
@@ -267,7 +401,7 @@ def _enable_lossy(monkeypatch, codec="mp3", bitrate="320"):
     cfg = {"lossy_copy.enabled": True, "lossy_copy.codec": codec,
            "lossy_copy.bitrate": bitrate, "lossy_copy.delete_original": False}
     monkeypatch.setattr(_fo.config_manager, "get", lambda k, d=None: cfg.get(k, d))
-    monkeypatch.setattr(_fo, "get_audio_quality_string", lambda _p, **_kw: None)
+    monkeypatch.setattr(_fo, "get_audio_quality_string", lambda _p, **_k: None)
 
 
 def test_create_lossy_copy_rejects_non_lossless(monkeypatch, tmp_path):
@@ -314,3 +448,154 @@ def test_create_lossy_copy_skips_when_output_would_overwrite_source(monkeypatch,
     out = _fo.create_lossy_copy(str(src))
     assert out is None                 # skipped — output would overwrite source
     assert ran["called"] is False      # the original was never touched
+
+
+def test_opus_quality_chip_estimates_bitrate_when_header_has_none(tmp_path, monkeypatch):
+    """mutagen.oggopus exposes length, not bitrate. YouTube remux files were
+    importing with a blank quality chip because `info.bitrate // 1000` threw."""
+    path = tmp_path / "song.opus"
+    path.write_bytes(b"x" * 40_000)  # 40 KB over 2s ≈ 160 kbps
+
+    class _Info:
+        length = 2.0
+        channels = 2
+
+    class _Opus:
+        def __init__(self, _p):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.oggopus.OggOpus", _Opus)
+    assert _fo.get_audio_quality_string(str(path)) == "OPUS-160"
+    assert _fo.get_audio_quality_string(
+        str(path), claimed_format="opus", claimed_bitrate=256,
+    ) == "OPUS-256"
+    aq = _fo.probe_audio_quality(str(path))
+    assert aq is not None
+    assert aq.format == "opus"
+    assert aq.bitrate == 160
+
+
+def test_probe_audio_quality_reads_explicit_alac_extension(tmp_path, monkeypatch):
+    path = tmp_path / "source.alac"
+    path.write_bytes(b"fake-alac")
+
+    class _Info:
+        codec = "alac"
+        bitrate = 4_608_000
+        sample_rate = 96_000
+        bits_per_sample = 24
+
+    class _MP4:
+        def __init__(self, _path):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.mp4.MP4", _MP4)
+
+    aq = _fo.probe_audio_quality(str(path))
+
+    assert aq is not None
+    assert aq.format == "alac"
+    assert aq.bitrate == 4608
+    assert aq.sample_rate == 96_000
+    assert aq.bit_depth == 24
+
+
+def test_opus_256_estimate_meets_opus_192_target(tmp_path, monkeypatch):
+    path = tmp_path / "premium.opus"
+    path.write_bytes(b"x" * 64_000)  # 64 KB over 2s ≈ 256 kbps
+
+    class _Info:
+        length = 2.0
+        channels = 2
+
+    class _Opus:
+        def __init__(self, _p):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.oggopus.OggOpus", _Opus)
+    from core.quality.model import QualityTarget
+    from core.quality.selection import quality_meets_profile
+
+    aq = _fo.probe_audio_quality(str(path))
+    assert quality_meets_profile(
+        aq, [QualityTarget(label="OPUS ≥ 192", format="opus", min_bitrate=192)],
+    )
+
+
+def test_opus_chip_without_duration_is_still_opus(tmp_path, monkeypatch):
+    path = tmp_path / "nodur.opus"
+    path.write_bytes(b"x" * 100)
+
+    class _Info:
+        length = 0
+        channels = 2
+
+    class _Opus:
+        def __init__(self, _p):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.oggopus.OggOpus", _Opus)
+    assert _fo.get_audio_quality_string(str(path)) == "OPUS"
+    assert _fo.get_audio_quality_string(
+        str(path), claimed_format="opus", claimed_bitrate=256,
+    ) == "OPUS-256"
+
+
+def test_opus_chip_ignores_youtube_claim_when_file_is_mp3(tmp_path, monkeypatch):
+    """Re-encode to MP3 must not inherit the Opus itag bitrate."""
+    path = tmp_path / "song.mp3"
+    path.write_bytes(b"x" * 1000)
+
+    class _Info:
+        bitrate = 320_000
+        bitrate_mode = None
+        length = 2.0
+
+    class _MP3:
+        def __init__(self, _p):
+            self.info = _Info()
+
+    monkeypatch.setattr("mutagen.mp3.MP3", _MP3)
+    monkeypatch.setattr("mutagen.mp3.BitrateMode", type("BM", (), {"VBR": object()}))
+    assert _fo.get_audio_quality_string(
+        str(path), claimed_format="opus", claimed_bitrate=256,
+    ) == "MP3-320"
+
+
+def test_estimate_bitrate_kbps_from_size_and_duration():
+    """40 KB over 2s is 160 kbps — the YouTube Opus 160 effective rate."""
+    assert _fo.estimate_bitrate_kbps(size_bytes=40_000, duration_seconds=2.0) == 160
+    assert _fo.estimate_bitrate_kbps(size_bytes=40_000, duration_ms=2000) == 160
+    assert _fo.estimate_bitrate_kbps(size_bytes=0, duration_ms=2000) is None
+    assert _fo.estimate_bitrate_kbps(size_bytes=40_000, duration_ms=0) is None
+
+
+def test_fill_missing_track_bitrate_estimates_when_db_is_zero():
+    """Library enhanced view reads tracks.bitrate; Opus import left it at 0."""
+    track = {
+        "bitrate": 0,
+        "file_size": 40_000,
+        "duration": 2000,
+        "file_path": "Autumnal Embrace.opus",
+    }
+    assert _fo.fill_missing_track_bitrate(track)["bitrate"] == 160
+
+
+def test_fill_missing_track_bitrate_keeps_a_header_value():
+    track = {"bitrate": 320, "file_size": 40_000, "duration": 2000, "file_path": "a.mp3"}
+    filled = _fo.fill_missing_track_bitrate(track)
+    assert filled["bitrate"] == 320
+    assert not filled.get("bitrate_vbr")
+
+
+def test_fill_missing_track_bitrate_flags_aac_as_vbr():
+    track = {"bitrate": 256, "file_path": "song.m4a"}
+    assert _fo.fill_missing_track_bitrate(track).get("bitrate_vbr") == 1
+
+
+def test_stream_uses_vbr_display_for_lossy_averages():
+    assert _fo.stream_uses_vbr_display("a.opus") is True
+    assert _fo.stream_uses_vbr_display("a.m4a") is True
+    assert _fo.stream_uses_vbr_display("a.wma") is True
+    assert _fo.stream_uses_vbr_display("a.mp3") is False
+    assert _fo.stream_uses_vbr_display("a.flac") is False

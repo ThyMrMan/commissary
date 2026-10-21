@@ -9,6 +9,9 @@ import pytest
 from core.stats import queries
 from database.music_database import MusicDatabase
 
+# hour-of-day reads played_at in the server's local time; seeded hours are utc
+pytestmark = pytest.mark.usefixtures('utc_server')
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -80,14 +83,15 @@ def _seed_track(db, album_id, artist_id, title, file_path=None, bitrate=None, du
         conn.close()
 
 
-def _seed_history(db, title, artist, album, played_at, duration_ms=180000):
+def _seed_history(db, title, artist, album, played_at, duration_ms=180000,
+                  server_source=None, db_track_id=None):
     conn = db._get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO listening_history (title, artist, album, played_at, duration_ms) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (title, artist, album, played_at, duration_ms),
+            "INSERT INTO listening_history (title, artist, album, played_at, duration_ms, "
+            "server_source, db_track_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (title, artist, album, played_at, duration_ms, server_source, db_track_id),
         )
         conn.commit()
     finally:
@@ -135,7 +139,8 @@ def test_get_recent_tracks_empty_returns_empty(db):
 
 
 def test_get_recent_tracks_returns_full_shape(db):
-    _seed_history(db, "Money", "Pink Floyd", "DSOTM", "2026-04-01 00:00:00", duration_ms=383000)
+    _seed_history(db, "Money", "Pink Floyd", "DSOTM", "2026-04-01 00:00:00",
+                  duration_ms=383000, server_source="plex")
     rows = queries.get_recent_tracks(db, limit=1)
     assert rows == [{
         'title': "Money",
@@ -143,8 +148,137 @@ def test_get_recent_tracks_returns_full_shape(db):
         'album': "DSOTM",
         'played_at': "2026-04-01 00:00:00",
         'duration_ms': 383000,
+        'server_source': "plex",
+        # No db_track_id on the row -> the album-art join misses -> None.
+        'image_url': None,
+        'artist_db_id': None,
     }]
 
+
+def test_get_recent_tracks_joins_album_art_through_db_track_id(db, fix_url):
+    # A play the listening-stats worker matched to a library track carries
+    # its album art, run through the image fixer (media-server thumb URLs
+    # need auth and die raw in the browser).
+    aid = _seed_artist(db, "Pink Floyd")
+    alb = _seed_album(db, aid, "DSOTM", thumb="local://thumb.jpg")
+    tid = _seed_track(db, alb, aid, "Money", file_path="/music/money.flac",
+                      bitrate=1411, duration=383000)
+    _seed_history(db, "Money", "Pink Floyd", "DSOTM", "2026-04-01 00:00:00",
+                  db_track_id=tid)
+    rows = queries.get_recent_tracks(db, limit=1, image_url_fixer=fix_url)
+    assert rows[0]['image_url'] == "FIXED::local://thumb.jpg"
+    assert rows[0]['artist_db_id'] == aid
+
+
+
+# ---------------------------------------------------------------------------
+# get_listening_events
+# ---------------------------------------------------------------------------
+
+def test_get_listening_events_day_bucket_returns_rows(db):
+    _seed_history(db, "Morning", "Artist", "Album", "2026-08-22 09:00:00")
+    _seed_history(db, "Night", "Artist", "Album", "2026-08-22T22:30:00")
+    _seed_history(db, "Other", "Artist", "Album", "2026-08-23 09:00:00")
+
+    out = queries.get_listening_events(
+        db,
+        None,
+        time_range='all',
+        filter_type='date',
+        date='2026-08-22',
+        limit=10,
+    )
+
+    assert out['total'] == 2
+    assert [item['title'] for item in out['items']] == ["Night", "Morning"]
+
+
+def test_get_listening_events_month_bucket_returns_rows(db):
+    _seed_history(db, "Aug One", "Artist", "Album", "2026-08-01 00:00:00")
+    _seed_history(db, "Aug Two", "Artist", "Album", "2026-08-31 23:59:59")
+    _seed_history(db, "Sep", "Artist", "Album", "2026-09-01 00:00:00")
+
+    out = queries.get_listening_events(
+        db,
+        None,
+        time_range='all',
+        filter_type='date',
+        date='2026-08',
+        limit=10,
+    )
+
+    assert out['total'] == 2
+    assert [item['title'] for item in out['items']] == ["Aug Two", "Aug One"]
+
+
+def test_get_listening_events_weekday_hour_bucket_returns_rows(db):
+    _seed_history(db, "Match New", "Artist", "Album", "2026-08-23 16:30:00")
+    _seed_history(db, "Match Old", "Artist", "Album", "2026-08-16 16:00:00")
+    _seed_history(db, "Wrong Hour", "Artist", "Album", "2026-08-23 15:00:00")
+
+    out = queries.get_listening_events(
+        db,
+        None,
+        time_range='all',
+        filter_type='weekday_hour',
+        weekday=0,
+        hour=16,
+        limit=10,
+    )
+
+    assert out['total'] == 2
+    assert [item['title'] for item in out['items']] == ["Match New", "Match Old"]
+
+
+def test_get_listening_events_caches_repeated_image_normalization(db):
+    artist_id = _seed_artist(db, "Artist")
+    album_id = _seed_album(db, artist_id, "Album", thumb='/library/metadata/1/thumb/1')
+    track_new = _seed_track(db, album_id, artist_id, "Repeat New")
+    track_old = _seed_track(db, album_id, artist_id, "Repeat Old")
+    _seed_history(db, "Repeat New", "Artist", "Album", "2026-08-23 16:30:00", db_track_id=track_new)
+    _seed_history(db, "Repeat Old", "Artist", "Album", "2026-08-23 16:00:00", db_track_id=track_old)
+    calls = []
+
+    def fixer(url):
+        calls.append(url)
+        return f'/api/image-proxy?url={url}'
+
+    out = queries.get_listening_events(
+        db,
+        fixer,
+        time_range='all',
+        filter_type='weekday_hour',
+        weekday=0,
+        hour=16,
+        limit=10,
+    )
+
+    assert out['total'] == 2
+    assert calls == ['/library/metadata/1/thumb/1']
+    assert {item['image_url'] for item in out['items']} == {'/api/image-proxy?url=/library/metadata/1/thumb/1'}
+
+
+def test_listening_history_weekday_hour_index_exists(db):
+    conn = db._get_connection()
+    try:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ('idx_listening_weekday_hour_played_at',),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert row is not None
+
+def test_get_listening_events_rejects_unknown_date_bucket(db):
+    with pytest.raises(ValueError, match='YYYY-MM-DD or YYYY-MM'):
+        queries.get_listening_events(
+            db,
+            None,
+            time_range='all',
+            filter_type='date',
+            date='2026',
+        )
 
 # ---------------------------------------------------------------------------
 # resolve_track
@@ -214,7 +348,7 @@ def test_get_top_artists_enriches_with_artist_table_columns(db, fix_url, monkeyp
         lastfm_listeners=5000000, lastfm_playcount=100000000, soul_id="soul-pf",
     )
 
-    monkeypatch.setattr(db, "get_top_artists", lambda tr, lim: [{'name': 'Pink Floyd', 'play_count': 42}])
+    monkeypatch.setattr(db, "get_top_artists", lambda tr, lim, profile_id=None: [{'name': 'Pink Floyd', 'play_count': 42}])
 
     result = queries.get_top_artists(db, fix_url, time_range='all', limit=10)
     assert result[0]['name'] == 'Pink Floyd'
@@ -226,7 +360,7 @@ def test_get_top_artists_enriches_with_artist_table_columns(db, fix_url, monkeyp
 
 
 def test_get_top_artists_no_match_leaves_record_unenriched(db, fix_url, monkeypatch):
-    monkeypatch.setattr(db, "get_top_artists", lambda tr, lim: [{'name': 'Unknown', 'play_count': 1}])
+    monkeypatch.setattr(db, "get_top_artists", lambda tr, lim, profile_id=None: [{'name': 'Unknown', 'play_count': 1}])
     result = queries.get_top_artists(db, fix_url, time_range='all', limit=10)
     assert result == [{'name': 'Unknown', 'play_count': 1}]
 
@@ -235,7 +369,7 @@ def test_get_top_albums_enriches_with_album_thumb(db, fix_url, monkeypatch):
     aid = _seed_artist(db, "Pink Floyd")
     alb = _seed_album(db, aid, "DSOTM", thumb="local://album.jpg")
 
-    monkeypatch.setattr(db, "get_top_albums", lambda tr, lim: [{'name': 'DSOTM', 'play_count': 5}])
+    monkeypatch.setattr(db, "get_top_albums", lambda tr, lim, profile_id=None: [{'name': 'DSOTM', 'play_count': 5}])
 
     result = queries.get_top_albums(db, fix_url, time_range='all', limit=10)
     assert result[0]['image_url'] == 'FIXED::local://album.jpg'
@@ -246,7 +380,7 @@ def test_get_top_albums_enriches_with_album_thumb(db, fix_url, monkeypatch):
 def test_get_top_albums_skips_empty_thumb(db, fix_url, monkeypatch):
     aid = _seed_artist(db, "X")
     _seed_album(db, aid, "Empty", thumb="")
-    monkeypatch.setattr(db, "get_top_albums", lambda tr, lim: [{'name': 'Empty', 'play_count': 1}])
+    monkeypatch.setattr(db, "get_top_albums", lambda tr, lim, profile_id=None: [{'name': 'Empty', 'play_count': 1}])
 
     result = queries.get_top_albums(db, fix_url, time_range='all', limit=10)
     assert 'image_url' not in result[0]
@@ -257,7 +391,7 @@ def test_get_top_tracks_enriches_with_album_thumb(db, fix_url, monkeypatch):
     alb = _seed_album(db, aid, "DSOTM", thumb="local://thumb.jpg")
     tid = _seed_track(db, alb, aid, "Money")
 
-    monkeypatch.setattr(db, "get_top_tracks", lambda tr, lim: [{'name': 'Money', 'artist': 'Pink Floyd'}])
+    monkeypatch.setattr(db, "get_top_tracks", lambda tr, lim, profile_id=None: [{'name': 'Money', 'artist': 'Pink Floyd'}])
 
     result = queries.get_top_tracks(db, fix_url, time_range='all', limit=10)
     assert result[0]['image_url'] == 'FIXED::local://thumb.jpg'
@@ -266,7 +400,7 @@ def test_get_top_tracks_enriches_with_album_thumb(db, fix_url, monkeypatch):
 
 
 def test_get_top_tracks_unmatched_record_passed_through(db, fix_url, monkeypatch):
-    monkeypatch.setattr(db, "get_top_tracks", lambda tr, lim: [{'name': 'Phantom', 'artist': 'Nobody'}])
+    monkeypatch.setattr(db, "get_top_tracks", lambda tr, lim, profile_id=None: [{'name': 'Phantom', 'artist': 'Nobody'}])
     result = queries.get_top_tracks(db, fix_url, time_range='all', limit=10)
     assert result == [{'name': 'Phantom', 'artist': 'Nobody'}]
 
@@ -319,36 +453,36 @@ def test_get_overview_delegates_to_db(monkeypatch):
     called = {}
 
     class _DB:
-        def get_listening_stats(self, time_range):
-            called['arg'] = time_range
+        def get_listening_stats(self, time_range, profile_id=None):
+            called['arg'] = (time_range, profile_id)
             return sentinel
 
-    assert queries.get_overview(_DB(), '7d') is sentinel
-    assert called['arg'] == '7d'
+    assert queries.get_overview(_DB(), '7d', profile_id=4) is sentinel
+    assert called['arg'] == ('7d', 4)
 
 
 def test_get_timeline_delegates_to_db():
     called = {}
 
     class _DB:
-        def get_listening_timeline(self, time_range, granularity):
-            called['args'] = (time_range, granularity)
+        def get_listening_timeline(self, time_range, granularity, profile_id=None):
+            called['args'] = (time_range, granularity, profile_id)
             return ['data']
 
-    assert queries.get_timeline(_DB(), '30d', 'week') == ['data']
-    assert called['args'] == ('30d', 'week')
+    assert queries.get_timeline(_DB(), '30d', 'week', profile_id=4) == ['data']
+    assert called['args'] == ('30d', 'week', 4)
 
 
 def test_get_genres_delegates_to_db():
     called = {}
 
     class _DB:
-        def get_genre_breakdown(self, time_range):
-            called['arg'] = time_range
+        def get_genre_breakdown(self, time_range, profile_id=None):
+            called['arg'] = (time_range, profile_id)
             return [{'genre': 'rock'}]
 
-    assert queries.get_genres(_DB(), 'all') == [{'genre': 'rock'}]
-    assert called['arg'] == 'all'
+    assert queries.get_genres(_DB(), 'all', profile_id=4) == [{'genre': 'rock'}]
+    assert called['arg'] == ('all', 4)
 
 
 def test_get_library_health_delegates_to_db():
@@ -431,3 +565,4 @@ def test_trigger_listening_sync_swallows_worker_errors():
     _time.sleep(0.1)  # give thread time to crash
     # Counter not incremented because exception was raised before increment
     assert _BrokenWorker.stats['polls_completed'] == 0
+

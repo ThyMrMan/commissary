@@ -288,7 +288,23 @@ def _default_move(src: str, dest: str, on_progress: Optional[Callable[[int], Non
                 copied += len(chunk)
                 if on_progress and total:
                     on_progress(min(99, int(copied * 100 / total)))   # 100 only once it's in place
-        shutil.copystat(src, tmp)                   # preserve mtime, like shutil.move/copy2
+        # mtime is a courtesy. nfs/smb/unraid shares can refuse the metadata
+        # step (errno 524 on an nfs4 acl xattr, #1713) after the data landed.
+        try:
+            shutil.copystat(src, tmp)
+        except OSError as e:
+            logger.info("youtube import: kept the copy of %s without its timestamps/permissions (%s)",
+                        os.path.basename(dest), e)
+        # Verify the copy before the atomic rename — a silently short copy (SMB
+        # hiccup that didn't raise) must never be promoted to the real name.
+        if total > 0:
+            try:
+                tmp_size = os.path.getsize(tmp)
+            except OSError:
+                tmp_size = -1
+            if tmp_size != total:
+                raise OSError("short copy: %d of %d bytes for %s"
+                              % (tmp_size, total, os.path.basename(dest)))
         os.replace(tmp, dest)                       # atomic rename into the library (same fs now)
     except BaseException:
         try:
@@ -441,7 +457,7 @@ def _fetch_bytes(url: Any, timeout: int = 15) -> Optional[bytes]:
         return None
     try:
         import urllib.request
-        req = urllib.request.Request(u, headers={"User-Agent": "Commissary"})
+        req = urllib.request.Request(u, headers={"User-Agent": "SoulSync"})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.read()
     except Exception:   # noqa: BLE001 - a missing thumb just means the avatar backdrop
@@ -620,10 +636,18 @@ def process_youtube_download(
                    cookie_opts=cookie_opts, extra_opts=media_embed_opts(settings))
 
     if not res.get("ok"):
-        err = res.get("error") or "Download failed"
+        raw = res.get("error") or "Download failed"
+        # Say what actually went wrong. A raw yt-dlp line ("ERROR: unable to download
+        # video data: HTTP Error 403: Forbidden", five times, five channels) tells you
+        # nothing you can act on; the classified reason names the cause — and for 403
+        # names the fix, because that one is almost always a stale yt-dlp. The RAW text
+        # is kept in the archived row: the strike weighting reads it, so replacing it
+        # here would break the "not released yet doesn't count" rule.
+        from core.video.youtube_errors import human_reason
+        err = human_reason(raw) or raw
         completed = now()
         update_row(dl.get("id"), status="failed", error=err, completed_at=completed)
-        archive(dl, {"status": "failed", "error": err, "completed_at": completed})
+        archive(dl, {"status": "failed", "error": raw, "completed_at": completed})
         _publish_event("video_download_failed", dl, error=err)
         return {"status": "failed", "error": err}
 
@@ -800,13 +824,7 @@ def run_youtube_download(dl_id: Any, db_provider: Callable) -> None:
     from datetime import datetime, timezone
 
     def _now():
-        # Was an explicit-UTC ISO string, which made `completed_at` carry two
-        # different shapes depending on which downloader wrote it — and the
-        # history page, which prints the stored value verbatim, showed YouTube
-        # grabs in UTC while every row beside them was local. One format now;
-        # the reader still honours the offset on rows already written.
-        from core.video.timestamps import now_str
-        return now_str()
+        return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def _progress(d):
         # yt-dlp progress hook → row progress %. Best-effort; never raises into yt-dlp.
@@ -848,14 +866,15 @@ def run_youtube_download(dl_id: Any, db_provider: Callable) -> None:
         # Stage into the shared download folder (a 'youtube' subfolder), then transfer to the
         # library — same pipeline as movies/TV. Falls back to straight-to-library if no
         # download folder is configured.
-        from config.settings import config_manager
+        from core.settings import config_manager
         dl_root = str(config_manager.get("soulseek.download_path", "") or "").strip()
         stage_dir = os.path.join(dl_root, "youtube") if dl_root else None
 
         process_youtube_download(
             dl, profile=profile, settings=settings,
             update_row=db.update_video_download, archive=_archive,
-            clear_wishlist=lambda vid: db.remove_youtube_from_wishlist("video", vid),
+            clear_wishlist=lambda vid: db.remove_youtube_from_wishlist(
+                "video", vid, profile_id=None),  # landed file satisfies every profile
             stage_dir=stage_dir,
             # default sidecars + the remembered-channel-meta lookup (banner/description
             # for the channel folder's fanart.jpg / tvshow.nfo)

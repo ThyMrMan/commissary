@@ -8,8 +8,8 @@ The gate fires only when ALL conditions hold:
 
 - Batch is an album-context download (``is_album_download`` flag).
 - Active download source is ``torrent``, ``usenet``, or ``soulseek``.
-  In hybrid mode the caller may pass the first configured source as a
-  source override; later hybrid sources stay per-track to preserve fallback.
+  In hybrid mode the caller may pass one source from the consecutive
+  release-capable prefix as an override; the caller preserves source order.
 - Both album-name and artist-name are populated in batch context.
 - The resolved plugin exposes ``download_album_to_staging``.
 
@@ -63,9 +63,11 @@ class BatchStateAccess(Protocol):
 # Fields the album-bundle progress callback may carry. Anything in
 # this set gets mirrored onto the batch row as ``album_bundle_<key>``
 # so the Downloads page can render it without coupling to the
-# specific payload shape.
+# specific payload shape. 'query' rode the plugins' 'searching' emit
+# from day one but wasn't mirrored, which is why the whole prowlarr
+# search phase looked like dead air in the UI (#1156).
 _MIRRORED_KEYS = ('progress', 'release', 'speed', 'downloaded',
-                  'size', 'seeders', 'grabs', 'count', 'failed')
+                  'size', 'seeders', 'grabs', 'count', 'failed', 'query')
 
 
 def is_eligible(
@@ -74,22 +76,13 @@ def is_eligible(
     is_album: bool,
     album_name: str,
     artist_name: str,
-    user_picked: bool = False,
 ) -> bool:
     """Pure predicate: does this batch even qualify for the album
     flow? Separate from the resolution+run step so tests can pin
-    the gate logic without standing up a plugin.
-
-    ``user_picked`` relaxes the MODE check only. The mode gate exists to
-    stop an unattended batch claiming a whole release from a source the
-    user didn't nominate for that job — reasonable when the app is
-    guessing, backwards once the user has personally chosen a release
-    from this exact source. Everything else still has to hold: it must
-    be an album, and we still need both names for staging + matching.
-    """
+    the gate logic without standing up a plugin."""
     if not is_album:
         return False
-    if not user_picked and (mode or '').lower() not in ('torrent', 'usenet', 'soulseek'):
+    if (mode or '').lower() not in ('torrent', 'usenet', 'soulseek'):
         return False
     if not (album_name or '').strip():
         return False
@@ -121,22 +114,12 @@ def try_dispatch(
     BatchStateAccess shim. Injecting these keeps the module
     dependency-light + unit-testable.
     """
-    # The chain's FIRST entry is the one allowed to claim a whole album; a
-    # one-entry chain is the old single-source mode. `source_override` still
-    # wins — that is the caller having already resolved a specific source
-    # (a pinned release, or the master worker's own bundle resolution).
-    from core.downloads.source_chain import primary_source
-    mode = (str(source_override or '').lower() or primary_source(config_get))
+    mode = (source_override or config_get('download_source.mode', 'soulseek') or 'soulseek').lower()
     album_name = (album_context or {}).get('name') or ''
     artist_name = (artist_context or {}).get('name') or ''
 
-    # A pinned release means the user opened the album source picker and chose
-    # this exact release from this exact source, so the mode gate doesn't apply.
-    user_picked = bool((plugin_kwargs or {}).get('preferred_release'))
-
     if not is_eligible(mode=mode, is_album=is_album,
-                       album_name=album_name, artist_name=artist_name,
-                       user_picked=user_picked):
+                       album_name=album_name, artist_name=artist_name):
         return False
 
     album_name = album_name.strip()
@@ -172,6 +155,14 @@ def try_dispatch(
         'album_bundle_source': mode,
         'album_bundle_staging_path': staging_dir,
         'album_bundle_private_staging': True,
+        'album_bundle_partial': False,
+        'album_bundle_expected_count': None,
+        'album_bundle_completed_count': None,
+        # A previous source in a hybrid album-bundle prefix may have returned
+        # a fallback-eligible miss. Do not leave its error/progress attached to
+        # the next source's live attempt.
+        'album_bundle_error': None,
+        **{f'album_bundle_{key}': None for key in _MIRRORED_KEYS},
     })
 
     def _emit(payload):
@@ -233,13 +224,36 @@ def try_dispatch(
         "[Album Bundle] %s staged %d files for '%s' — handing off to per-track staging matcher",
         mode, len(outcome.get('files', [])), album_name,
     )
-    state.update_fields(batch_id, {
+    # THE PER-BATCH LIMIT OF 1 DOES NOT APPLY TO A STAGED ALBUM.
+    #
+    # Soulseek album batches are capped at one worker for source reuse: hold one
+    # peer and pull the album from them rather than scattering requests. That is
+    # right for the FALLBACK path, which really does download track by track.
+    #
+    # It is not right here. The bundle has already downloaded and staged every
+    # file. The per-track tasks below exist to MATCH those local files
+    # (try_staging_match) and never touch Soulseek at all, so serialising them
+    # throttles local disk work with a rule about network etiquette — a
+    # twelve-track album matched one at a time for no reason.
+    #
+    # Safe to lift now in a way it was not before: the global concurrency gate
+    # (#1166) caps total active workers across every batch, which is the job
+    # this 1 was quietly also doing. Raising the per-batch limit cannot flood
+    # anything while that holds.
+    staged_fields = {
         'phase': 'analysis',
         'album_bundle_state': 'staged',
         'album_bundle_partial': bool(outcome.get('partial')),
         'album_bundle_expected_count': outcome.get('expected_count'),
         'album_bundle_completed_count': outcome.get('completed_count', len(outcome.get('files', []))),
-    })
+    }
+    try:
+        staged_fields['max_concurrent'] = max(
+            1, int(config_get('download_source.max_concurrent', 3) or 1)
+        )
+    except (TypeError, ValueError):
+        pass  # a bad config value leaves the batch's existing limit alone
+    state.update_fields(batch_id, staged_fields)
     # Engaged-and-succeeded: we DON'T early-return because the
     # per-track flow needs to run to create + complete the per-track
     # task rows. Those tasks will hit try_staging_match and pull the

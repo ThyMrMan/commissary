@@ -2,7 +2,7 @@
 
 ## Understanding PUID/PGID/UMASK
 
-Commissary supports dynamic user/group ID configuration to ensure files are created with the correct ownership, especially important when sharing files with other containers like Lidarr, Sonarr, or Plex.
+SoulSync supports dynamic user/group ID configuration to ensure files are created with the correct ownership, especially important when sharing files with other containers like Lidarr, Sonarr, or Plex.
 
 ### What are PUID and PGID?
 
@@ -28,7 +28,7 @@ Your PUID is `1000` and PGID is `1000`.
 
 ### Matching Lidarr/Sonarr/Plex
 
-If you're using Commissary with Lidarr, check Lidarr's docker-compose to see what PUID/PGID it uses:
+If you're using SoulSync with Lidarr, check Lidarr's docker-compose to see what PUID/PGID it uses:
 
 ```yaml
 # Your Lidarr container
@@ -39,10 +39,10 @@ services:
       - PGID=100
 ```
 
-Then set Commissary to match:
+Then set SoulSync to match:
 
 ```yaml
-# Your Commissary container
+# Your SoulSync container
 services:
   soulsync:
     environment:
@@ -55,7 +55,7 @@ services:
 
 ### Scenario 1: Sharing with Lidarr (Unraid)
 
-**Problem**: Lidarr can't import files downloaded by Commissary
+**Problem**: Lidarr can't import files downloaded by SoulSync
 
 **Solution**: Match the PUID/PGID
 ```yaml
@@ -83,7 +83,7 @@ services:
 
 ### Scenario 3: Multiple Containers Sharing Files
 
-**Problem**: Multiple containers (Plex, Lidarr, Commissary) need access to same files
+**Problem**: Multiple containers (Plex, Lidarr, SoulSync) need access to same files
 
 **Solution**: All containers should use same PUID/PGID
 ```yaml
@@ -145,7 +145,7 @@ Permission denied: Access to the path '/music/Artist/Album/track.flac' is denied
    docker exec lidarr id
    ```
 
-3. Check what user Commissary runs as:
+3. Check what user SoulSync runs as:
    ```bash
    docker exec soulsync-webui id
    ```
@@ -193,7 +193,7 @@ docker logs soulsync-webui
 
 Look for:
 ```
-🐳 Commissary Container Starting...
+🐳 SoulSync Container Starting...
 📝 User Configuration:
    PUID: 99
    PGID: 100
@@ -201,7 +201,7 @@ Look for:
 🔧 Adjusting user permissions...
    Changing group ID from 1000 to 100
    Changing user ID from 1000 to 99
-🚀 Starting Commissary Web Server...
+🚀 Starting SoulSync Web Server...
 ```
 
 ## Example docker-compose.yml
@@ -211,7 +211,7 @@ version: '3.8'
 
 services:
   soulsync:
-    image: ghcr.io/thymrman/commissary:latest
+    image: boulderbadgedad/soulsync:latest
     container_name: soulsync-webui
     environment:
       # Match these to your Lidarr/Plex/other containers

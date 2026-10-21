@@ -21,13 +21,22 @@ file's own tags are used and the finding is filed as a loose 'file'.
 
 import os
 
-from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob
 # Same v3 quality primitives the download import guard and Quality Upgrade
 # Finder use. Module-level (not a local import inside scan()) so tests can
 # monkeypatch them the same way tests/repair_jobs/test_quality_upgrade.py does.
 from core.quality.model import rank_candidate
-from core.quality.selection import targets_from_profile, quality_meets_profile, load_profile_by_id
+from core.quality.retention import acquired_quality_from_json, retention_meets_profile
+from core.quality.selection import load_profile_by_id, quality_meets_profile, targets_from_profile
+from core.repair_jobs import register_job
+from core.repair_jobs.base import (
+    JobContext,
+    JobResult,
+    RepairJob,
+    has_metadata_locked,
+    hand_tagged_path_keys,
+    is_hand_tagged_path,
+    walk_library,
+)
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.quality_upgrade")
@@ -230,6 +239,7 @@ class QualityUpgradeScannerJob(RepairJob):
             return profile_bundle_cache[row_profile_id]
 
         from core.imports.file_ops import probe_audio_quality
+
         # Same real-file AudioGuard the download/import pipeline runs: ffmpeg
         # DECODES the file (astats + silencedetect) to catch truncated or
         # mostly-silent audio the header can't reveal.
@@ -256,8 +266,10 @@ class QualityUpgradeScannerJob(RepairJob):
         audio_files = []
         seen = set()
         for base in base_dirs:
-            for root, _dirs, files in os.walk(base):
+            for root, _dirs, files in walk_library(base):
                 if context.check_stop():
+                    # #1289: must not record 'completed' for a partial scan.
+                    result.stopped_early = "Scan interrupted during directory walk."
                     return result
                 for fname in files:
                     if os.path.splitext(fname)[1].lower() in AUDIO_EXTENSIONS:
@@ -290,10 +302,24 @@ class QualityUpgradeScannerJob(RepairJob):
         deep_verify = settings.get('deep_audio_verify', False)
         probe_failed = 0
         not_in_library = 0
+        from core.library.duplicate_rules import (
+            is_lossy_companion_file,
+            lossy_companion_exts,
+        )
+        companion_exts = lossy_companion_exts(
+            context.config_manager, context.db, logger=logger,
+        )
+        hand_tagged = hand_tagged_path_keys(context.db)
+        total = len(audio_files)
         for i, fpath in enumerate(audio_files):
             if context.check_stop():
+                # #1289: must not record 'completed' for a partial scan.
+                result.stopped_early = (
+                    f"Scan interrupted. Stopped at file {i + 1} of {total}.")
                 return result
             if i % 20 == 0 and context.wait_if_paused():
+                result.stopped_early = (
+                    f"Scan interrupted. Stopped at file {i + 1} of {total}.")
                 return result
 
             fname = os.path.basename(fpath)
@@ -302,6 +328,18 @@ class QualityUpgradeScannerJob(RepairJob):
             # the library, skip anything with no DB row BEFORE probing — no point
             # reading hundreds of orphan files.
             meta = self._match_db(fpath, db_index)
+            if is_lossy_companion_file(fpath, companion_exts):
+                # A deliberately retained lossy derivative belongs to the
+                # lossless track beside it. Media servers may catalogue both
+                # representations, so this applies regardless of whether the
+                # derivative itself has a DB row.
+                result.skipped += 1
+                continue
+            # hand-tagged: the user typed this release (a bootleg, a live
+            # recording). redownload would wishlist the studio cut and delete it
+            if is_hand_tagged_path(fpath, hand_tagged) or (meta and meta.get('metadata_locked')):
+                result.skipped += 1
+                continue
             if library_only and meta is None:
                 not_in_library += 1
                 result.skipped += 1
@@ -368,11 +406,24 @@ class QualityUpgradeScannerJob(RepairJob):
                 probe_failed += 1
                 result.skipped += 1
                 continue
-            elif cutoff_index is not None and rank_candidate(aq, targets)[0] > cutoff_index:
-                issue = 'below_profile'
-                current_label = aq.label()
-            elif cutoff_index is None and not quality_meets_profile(aq, targets):
-                issue = 'below_profile'
+            # Same call the Quality Upgrade job makes. Both used to inline the
+            # cutoff-vs-floor branch separately, so a change to one silently
+            # left the other disagreeing about what "good enough" means.
+            elif not retention_meets_profile(
+                    aq,
+                    targets,
+                    cutoff_index=cutoff_index,
+                    acquired_quality_json=meta.get('acquired_quality_json'),
+                    retention_json=meta.get('retention_json')):
+                # #1289: a file whose format the profile doesn't target at all
+                # (FLAC under an MP3-only profile) is not "below" anything —
+                # flag it honestly instead of mislabeling it.
+                if aq.format and not any(
+                        not t.format or t.format.lower() == aq.format.lower()
+                        for t in targets):
+                    issue = 'format_not_in_profile'
+                else:
+                    issue = 'below_profile'
                 current_label = aq.label()
             else:
                 # Decodes fully AND meets the profile → genuinely good.
@@ -389,6 +440,14 @@ class QualityUpgradeScannerJob(RepairJob):
                 _desc = (f'"{disp_title}" by {disp_artist} failed real-audio '
                          f'verification (ffmpeg): {broken_reason}')
                 _severity = 'warning'
+            elif issue == 'format_not_in_profile':
+                _title = f'Format not in profile: {disp_title} ({current_label})'
+                _desc = (f'"{disp_title}" by {disp_artist} is {current_label}, '
+                         f'which your quality profile does not target '
+                         f'({", ".join(target_labels[:3])}'
+                         f'{"…" if len(target_labels) > 3 else ""}). '
+                         f'Add a {aq.format.upper()} target to stop flagging these.')
+                _severity = 'info'
             else:
                 _pref = targets[cutoff_index].label if cutoff_index is not None else None
                 _title = f'{"Upgradeable" if _pref else "Below quality"}: {disp_title} ({current_label})'
@@ -409,6 +468,8 @@ class QualityUpgradeScannerJob(RepairJob):
                 # the new one (same job_id + entity/file_path, any status).
                 self._clear_stale_dismissed_finding(context.db, track_id, fpath)
             if context.create_finding:
+                acquired_aq = acquired_quality_from_json(
+                    meta.get('acquired_quality_json'))
                 inserted = context.create_finding(
                     job_id=self.job_id,
                     finding_type='quality_upgrade',
@@ -426,6 +487,7 @@ class QualityUpgradeScannerJob(RepairJob):
                         'current_bitrate': aq.bitrate if aq is not None else None,
                         'current_sample_rate': aq.sample_rate if aq is not None else None,
                         'current_bit_depth': aq.bit_depth if aq is not None else None,
+                        'acquired_quality': acquired_aq.label() if acquired_aq else None,
                         'target_qualities': target_labels,
                         'expected_title': disp_title,
                         'expected_artist': disp_artist,
@@ -520,12 +582,15 @@ class QualityUpgradeScannerJob(RepairJob):
         try:
             conn = context.db._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
+            locked_col = 't.metadata_locked' if has_metadata_locked(cursor, 'tracks') else '0'
+            cursor.execute(f"""
                 SELECT t.id, t.title,
                        COALESCE(NULLIF(t.track_artist, ''), ar.name) AS artist,
                        t.file_path, t.track_number,
                        al.title AS album_title, al.thumb_url, ar.thumb_url,
-                       t.quality_profile_id, ar.id
+                       t.quality_profile_id, ar.id,
+                       t.acquired_quality_json, t.retention_json,
+                       {locked_col}
                 FROM tracks t
                 LEFT JOIN artists ar ON ar.id = t.artist_id
                 LEFT JOIN albums al ON al.id = t.album_id
@@ -546,6 +611,9 @@ class QualityUpgradeScannerJob(RepairJob):
                     'artist_thumb_url': row[7] or None,
                     'quality_profile_id': row[8],
                     'artist_id': row[9],
+                    'acquired_quality_json': row[10],
+                    'retention_json': row[11],
+                    'metadata_locked': bool(row[12]) if len(row) > 12 else False,
                 }
                 for depth in range(1, min(4, len(parts) + 1)):
                     suffix = '/'.join(parts[-depth:]).lower()
@@ -586,7 +654,7 @@ class QualityUpgradeScannerJob(RepairJob):
     def estimate_scope(self, context: JobContext) -> int:
         count = 0
         for base in self._collect_music_dirs(context):
-            for _root, _dirs, files in os.walk(base):
+            for _root, _dirs, files in walk_library(base):
                 for fname in files:
                     if os.path.splitext(fname)[1].lower() in AUDIO_EXTENSIONS:
                         count += 1

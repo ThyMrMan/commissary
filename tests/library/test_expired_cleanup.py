@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from core.library.expired_cleanup import (
+    normalize_track_key,
     retention_cutoff,
     is_expired,
     select_expired,
@@ -87,11 +88,49 @@ def test_select_expired_filters():
         _entry(eid=3, days_old=70, protected=True),          # mirrored → keep
         _entry(eid=4, days_old=10),                          # too new → keep
     ]
-    # `now=NOW` is load-bearing. Without it select_expired reads the wall
-    # clock while the entries are dated from the frozen NOW, so entry 4 —
-    # written as "10 days old, too new to expire" — silently became 98 days
-    # old and started being selected for DELETION on 2026-07-27. The test
-    # then sat red in the known-failures list, which is exactly where a real
-    # regression in a file-deleting path would have hidden. (Upstream 3.3.1.)
+    # `now=NOW` is load-bearing, not decoration. Without it select_expired falls
+    # back to wall-clock while the entries carry created_at fixed relative to
+    # NOW, so entry 4 ("too new") silently ages past the 2mo window and the test
+    # starts failing on a date nobody touched anything — it armed on 2026-07-27.
     out = select_expired(entries, watchlist_retention="off", playlist_retention="2mo", now=NOW)
     assert [e["id"] for e in out] == [1]
+
+
+# ── normalize_track_key ──────────────────────────────────────────────────
+
+def test_normalize_track_key_case_and_whitespace():
+    assert normalize_track_key("Artist", "Song") == "artist|song"
+    assert normalize_track_key("  ARTIST  ", "  Song\tTitle ") == \
+        normalize_track_key("artist", "song title")
+
+
+def test_normalize_track_key_qualifiers_stripped():
+    # the two key sides come from different metadata provenances (playlist
+    # source title vs discovery provider's matched title), so qualifier
+    # drift must not unprotect a track that is still in the playlist.
+    base = normalize_track_key("Artist", "Midnight Drive")
+    assert normalize_track_key("Artist", "Midnight Drive (Remastered)") == base
+    assert normalize_track_key("Artist", "Midnight Drive [Remaster]") == base
+    assert normalize_track_key("Artist", "Midnight Drive - Remastered") == base
+    assert normalize_track_key("Artist", "Midnight Drive (feat. Someone)") == base
+    assert normalize_track_key("Artist", "Midnight Drive feat. Someone") == base
+    assert normalize_track_key("Artist", "Midnight Drive - Live") == base
+    # genuinely different qualifiers still key apart from the bare title
+    assert normalize_track_key("Artist", "Midnight Drive") != \
+        normalize_track_key("Artist", "Daylight Drive")
+
+
+def test_normalize_track_key_accents_and_punctuation():
+    import pytest
+    pytest.importorskip("unidecode")  # accent folding needs it; absent locally, present in CI/prod
+    assert normalize_track_key("Beyoncé", "Halo!") == \
+        normalize_track_key("beyonce", "halo")
+    assert normalize_track_key("AC/DC", "Song") == \
+        normalize_track_key("acdc", "song")
+
+
+def test_normalize_track_key_empty_side_unusable():
+    assert normalize_track_key("Artist", "") == ""
+    assert normalize_track_key("Artist", "   ") == ""
+    assert normalize_track_key("", "Song") == ""
+    assert normalize_track_key("", "") == ""

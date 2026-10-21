@@ -1,6 +1,6 @@
 """Per-title quality profiles + follow-time monitor policies (arr-parity P2).
 
-Radarr/Sonarr assign a profile PER title; Commissary had one global blob. Named
+Radarr/Sonarr assign a profile PER title; SoulSync had one global blob. Named
 profiles now live beside it ('quality_profiles', Default stays id 0 at the
 classic key so every old reader keeps working), titles carry an assignment
 (movies/shows/video_wishlist.quality_profile_id), the drain/RSS/manual seams
@@ -217,14 +217,21 @@ def test_policy_engine_failure_degrades_to_empty():
     assert episodes_for_policy(_Boom(), 1, "all", "2026-07-16") == []
 
 
-def test_follow_with_policy_wishes_the_back_catalog(client, db, monkeypatch):
+def test_follow_with_policy_wishes_the_back_catalog(client, db, monkeypatch,
+                                                   video_wishlist_forensics):
+    # This test joined the rotating video-wishlist flake family on CI
+    # (2026-07-28): the endpoint reported wished=2 and the wishlist read back
+    # empty, with the _video_db tripwire clean. It has never reproduced
+    # locally, so it records deletes instead — see the fixture.
+    video_wishlist_forensics.arm(db)
     import core.video.enrichment.engine as eng_mod
     monkeypatch.setattr(eng_mod, "get_video_enrichment_engine", lambda: _FakeEngine())
     out = client.post("/api/video/watchlist/add",
                       json={"kind": "show", "tmdb_id": 42, "title": "Poker Face",
                             "monitor": "first_season"}).get_json()
     assert out["success"] is True and out["wished"] == 2
-    assert db.wishlist_counts().get("episode") == 2
+    assert db.wishlist_counts().get("episode") == 2, video_wishlist_forensics(
+        db, "follow reported wished=%r" % out.get("wished"))
     # default follow stays exactly as before
     out2 = client.post("/api/video/watchlist/add",
                        json={"kind": "show", "tmdb_id": 43, "title": "Slow Horses"}).get_json()

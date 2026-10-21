@@ -168,7 +168,7 @@ function autoSyncSourceLabel(source) {
         itunes_link: 'iTunes Link',
         listenbrainz: 'ListenBrainz',
         lastfm: 'Last.fm Radio',
-        soulsync_discovery: 'Commissary Discovery',
+        soulsync_discovery: 'SoulSync Discovery',
     };
     return labels[source] || source || 'Other';
 }
@@ -240,7 +240,7 @@ function autoSyncIsScheduleOwned(auto) {
     return group === 'Playlist Auto-Sync' || name.startsWith('Auto-Sync:');
 }
 
-// ── Personalized (Commissary Discovery) rows in the Auto-Sync board ────────────
+// ── Personalized (SoulSync Discovery) rows in the Auto-Sync board ────────────
 // Variant kinds (Time Machine per-decade, Genre, Seasonal, ...) and not-yet-
 // generated singletons don't exist as mirrored rows until generated. We surface
 // them as synthetic schedulable rows with NEGATIVE numeric ids: negatives never
@@ -259,7 +259,7 @@ function autoSyncKindLabel(k) {
         .trim() || (k && k.kind) || '';
 }
 
-// Tag already-generated Commissary Discovery rows (real mirrored playlists) with
+// Tag already-generated SoulSync Discovery rows (real mirrored playlists) with
 // the kind/variant parsed from their 'ssd_<kind>_<variant>' source id, so a
 // generated Time Machine decade groups under the same collapsible header as the
 // not-yet-generated ones. Rows whose kind is no longer registered (e.g. a
@@ -585,7 +585,7 @@ async function openAutoSyncScheduleModal() {
                 </div>
                 <button class="auto-sync-close" onclick="closeAutoSyncScheduleModal()">&times;</button>
             </div>
-            <div class="auto-sync-loading">Loading schedule…</div>
+            <div class="auto-sync-loading">Loading schedule...</div>
         </div>
     `;
     overlay.style.display = 'flex';
@@ -713,6 +713,15 @@ function renderAutoSyncScheduleModal() {
     `;
     populateAutoSyncHistoryList(overlay);
     bindAutoSyncHistoryCardInteractions(overlay);
+    playlists.filter(p => !p._personalized).forEach(p => {
+        if (typeof hydratePlaylistQualityProfileSelects === 'function') {
+            void hydratePlaylistQualityProfileSelects(
+                p.source_playlist_id,
+                p.source,
+                p.quality_profile_id,
+            );
+        }
+    });
 
     if (_prevScroll != null) {
         const nl = overlay.querySelector('.auto-sync-tab-panel.active .auto-sync-lanes');
@@ -1006,7 +1015,10 @@ function autoSyncWeeklyCardHtml(playlist, schedule) {
                 </div>
             </div>
             <div class="auto-sync-scheduled-actions">
-                <button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id})" title="Run the playlist pipeline now" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Run now'}</button>
+                ${playlist._personalized
+                    ? `<button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id})" title="Run the playlist pipeline now" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Run now'}</button>`
+                    : `<button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id}, true)" title="Sync now — updates the playlist without adding missing tracks to the wishlist" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Sync'}</button>
+                <button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id}, false)" title="Sync now and download missing tracks" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Sync + download'}</button>`}
                 <button onclick="event.stopPropagation(); unscheduleAutoSyncWeekly(${playlist.id})" title="Remove this weekly schedule">&times;</button>
             </div>
         </div>
@@ -1075,6 +1087,15 @@ function setAutoSyncSidebarFilter(value) {
     if (!panel) return;
     const { playlists, playlistSchedules } = _autoSyncScheduleState;
     panel.innerHTML = renderAutoSyncSchedulePanel(playlists, playlistSchedules);
+    playlists.filter(p => !p._personalized).forEach(p => {
+        if (typeof hydratePlaylistQualityProfileSelects === 'function') {
+            void hydratePlaylistQualityProfileSelects(
+                p.source_playlist_id,
+                p.source,
+                p.quality_profile_id,
+            );
+        }
+    });
     // Restore focus to the search input + caret position at end.
     const input = panel.querySelector('.auto-sync-sidebar-search');
     if (input) {
@@ -1213,7 +1234,7 @@ function renderAutoSyncHistoryPanel(history, total) {
             </div>
         </div>
         <div class="auto-sync-history-list" data-renderer="pending">
-            <div class="auto-sync-history-loading">Preparing run history…</div>
+            <div class="auto-sync-history-loading">Preparing run history...</div>
         </div>
         ${canLoadMore ? `
             <div class="auto-sync-history-load-more-row">
@@ -1319,28 +1340,40 @@ async function bulkScheduleAutoSyncSource(source, hours) {
     await refreshAutoSyncScheduleModal();
 }
 
+// Every Auto-Sync schedule attached to a playlist, of EITHER kind. The bulk
+// paths predate weekly schedules and used to read the hourly map alone, which
+// made "Unschedule all" blind to weekly ones: it undercounted in its own
+// confirm dialog, claimed there was nothing to unschedule when there was, and
+// left the weekly automations running.
+function autoSyncSchedulesForPlaylist(playlistId) {
+    const { playlistSchedules, weeklySchedules } = _autoSyncScheduleState;
+    return [playlistSchedules?.[playlistId], weeklySchedules?.[playlistId]].filter(Boolean);
+}
+
+
 async function bulkUnscheduleAutoSyncSource(source) {
     closeAutoSyncBulkMenu();
-    const { playlists, playlistSchedules } = _autoSyncScheduleState;
-    const targets = (playlists || []).filter(p => p.source === source && playlistSchedules[p.id]);
+    const { playlists } = _autoSyncScheduleState;
+    const targets = (playlists || []).filter(
+        p => p.source === source && autoSyncSchedulesForPlaylist(p.id).length);
     if (!targets.length) {
         showToast(`No scheduled ${autoSyncSourceLabel(source)} playlists to unschedule`, 'info');
         return;
     }
     if (!await showConfirmDialog({
         title: `Unschedule ${targets.length} ${autoSyncSourceLabel(source)} playlist${targets.length === 1 ? '' : 's'}`,
-        message: 'Removes the Auto-Sync schedules. Mirrored playlists themselves stay.',
+        message: 'Removes the Auto-Sync schedules, hourly and weekly. Mirrored playlists themselves stay.',
     })) return;
     let ok = 0, fail = 0;
     for (const playlist of targets) {
-        const schedule = playlistSchedules[playlist.id];
-        if (!schedule) continue;
-        try {
-            const res = await fetch(`/api/automations/${schedule.automation_id}`, { method: 'DELETE' });
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
-            ok++;
-        } catch (_err) {
-            fail++;
+        for (const schedule of autoSyncSchedulesForPlaylist(playlist.id)) {
+            try {
+                const res = await fetch(`/api/automations/${schedule.automation_id}`, { method: 'DELETE' });
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                ok++;
+            } catch (_err) {
+                fail++;
+            }
         }
     }
     showToast(`Removed ${ok} schedule${ok === 1 ? '' : 's'}${fail ? ` (${fail} failed)` : ''}`, fail ? 'warning' : 'success');
@@ -1353,6 +1386,7 @@ async function saveAutoSyncPlaylistScheduleSilent(playlistId, hours) {
     // exists for the playlist.
     const playlist = _autoSyncScheduleState.playlists.find(p => parseInt(p.id, 10) === parseInt(playlistId, 10));
     if (!playlist) throw new Error('playlist not found');
+    await dropOpposingAutoSyncSchedule(playlistId, 'hourly');
     const existing = _autoSyncScheduleState.playlistSchedules[playlistId];
     const payload = {
         name: `Auto-Sync: ${playlist.name}`,
@@ -1502,7 +1536,7 @@ function createAutoSyncHistoryEntryElement(entry, index = 0) {
     autoSyncAppendFlowArrow(flow);
     autoSyncAppendFlowChip(flow, 'Refresh', 'flow-action');
     autoSyncAppendFlowArrow(flow);
-    autoSyncAppendFlowChip(flow, 'Discover', 'flow-action');
+    autoSyncAppendFlowChip(flow, 'Identify', 'flow-action');
     autoSyncAppendFlowArrow(flow);
     autoSyncAppendFlowChip(flow, 'Sync + wishlist', 'flow-notify');
 
@@ -1723,18 +1757,36 @@ function autoSyncHistoryDetailHtml(entry, before, after, result, deltas) {
         ['Synced', result.tracks_synced],
         ['Skipped', result.sync_skipped],
         ['Wishlisted', result.wishlist_queued],
+        ['Sync errors', Number(result.sync_errors) > 0 ? result.sync_errors : undefined],
     ].filter(([, v]) => v !== undefined && v !== null && v !== '')
      .map(([k, v]) => `<span class="auto-sync-history-result-pill"><em>${_esc(k)}</em>${_esc(String(v))}</span>`).join('');
     const errorBlock = result.error ? `<div class="auto-sync-history-error">${_esc(result.error)}</div>` : '';
     const logsHtml = autoSyncHistoryLogsCompactHtml(entry.log_lines);
     const playlistId = entry.playlist_id || after.playlist_id || before.playlist_id || '';
     const playlistName = entry.playlist_name || after.name || before.name || '';
+    // #1455: history entries outlive their mirrors — a deleted mirror's button
+    // would POST /pipeline/run and just 404. Disable it (not hidden) so the
+    // audit entry still reads naturally.
+    const mirrorStillExists = !!playlistId
+        && Array.isArray(_autoSyncScheduleState.playlists)
+        && _autoSyncScheduleState.playlists.some(p => parseInt(p.id, 10) === parseInt(playlistId, 10));
     const runAgainHtml = playlistId
         ? `<div class="auto-sync-history-detail-actions">
+              ${mirrorStillExists ? `
               <button type="button" class="auto-sync-history-run-again"
-                  onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${parseInt(playlistId, 10)}, '${_escAttr(playlistName)}')">
-                  Run pipeline again
+                  onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${parseInt(playlistId, 10)}, '${_escAttr(playlistName)}', true)"
+                  title="Sync now — updates the playlist without adding missing tracks to the wishlist">
+                  Sync
               </button>
+              <button type="button" class="auto-sync-history-run-again"
+                  onclick="event.stopPropagation(); runMirroredPlaylistPipeline(${parseInt(playlistId, 10)}, '${_escAttr(playlistName)}', false)"
+                  title="Sync now and download missing tracks">
+                  Sync + download
+              </button>` : `
+              <button type="button" class="auto-sync-history-run-again"
+                  disabled title="Playlist no longer exists">
+                  Run pipeline again
+              </button>`}
            </div>`
         : '';
     return `
@@ -1906,6 +1958,9 @@ function autoSyncOrganizeToggleHtml(playlist) {
             <input type="checkbox" ${checked} onchange="setAutoSyncOrganizeByPlaylist(${playlist.id}, this.checked)">
             <span>Organize by playlist</span>
         </label>
+        ${typeof playlistQualityProfileSelectHtml === 'function'
+            ? playlistQualityProfileSelectHtml(playlist.source_playlist_id, playlist.source, true)
+            : ''}
     `;
 }
 
@@ -1950,7 +2005,10 @@ function autoSyncScheduledCardHtml(playlist, schedule) {
                 </div>
             </div>
             <div class="auto-sync-scheduled-actions">
-                <button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id})" title="Run the playlist pipeline now" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Run now'}</button>
+                ${playlist._personalized
+                    ? `<button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id})" title="Run the playlist pipeline now" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Run now'}</button>`
+                    : `<button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id}, true)" title="Sync now — updates the playlist without adding missing tracks to the wishlist" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Sync'}</button>
+                <button class="run" onclick="event.stopPropagation(); runAutoSyncScheduledPlaylist(${playlist.id}, false)" title="Sync now and download missing tracks" ${isRunning ? 'disabled' : ''}>${isRunning ? 'Running' : 'Sync + download'}</button>`}
                 <button onclick="event.stopPropagation(); unscheduleAutoSyncPlaylist(${playlist.id})" title="Remove this Auto-Sync schedule">&times;</button>
             </div>
         </div>
@@ -2027,6 +2085,27 @@ function autoSyncDragEnd() {
     _autoSyncIsDragging = false;
 }
 
+// Enforce one-schedule-per-playlist. The engine can technically run an hourly
+// and a weekly automation for the same playlist side by side, but the UI
+// assumes one schedule per playlist and the playlist would then refresh on
+// BOTH cadences. Every save path drops the opposing schedule first.
+//
+// This lives in one place deliberately: it used to be copy-pasted into the two
+// interactive save paths, and the third — the bulk path — never got a copy, so
+// bulk-scheduling a source silently left weekly schedules running alongside the
+// new hourly ones. Delete-then-create is safe; the worst case leaves the
+// playlist unscheduled, which is recoverable from this modal.
+async function dropOpposingAutoSyncSchedule(playlistId, keep) {
+    const opposing = keep === 'hourly'
+        ? _autoSyncScheduleState.weeklySchedules?.[playlistId]
+        : _autoSyncScheduleState.playlistSchedules?.[playlistId];
+    if (!opposing) return;
+    try {
+        await fetch(`/api/automations/${opposing.automation_id}`, { method: 'DELETE' });
+    } catch (_) { /* best-effort cleanup */ }
+}
+
+
 async function saveAutoSyncPlaylistSchedule(playlistId, hours) {
     const playlist = _autoSyncScheduleState.playlists.find(p => parseInt(p.id, 10) === parseInt(playlistId, 10));
     if (!playlist) return;
@@ -2035,15 +2114,7 @@ async function saveAutoSyncPlaylistSchedule(playlistId, hours) {
         return;
     }
 
-    // Enforce one-schedule-per-playlist: if a weekly schedule exists,
-    // drop it before installing the hourly one. Mirrors the same
-    // mutual-exclusion the weekly save path enforces in reverse.
-    const existingWeekly = _autoSyncScheduleState.weeklySchedules?.[playlistId];
-    if (existingWeekly) {
-        try {
-            await fetch(`/api/automations/${existingWeekly.automation_id}`, { method: 'DELETE' });
-        } catch (_) { /* best-effort cleanup */ }
-    }
+    await dropOpposingAutoSyncSchedule(playlistId, 'hourly');
 
     const existing = _autoSyncScheduleState.playlistSchedules[playlistId];
     const payload = {
@@ -2227,19 +2298,7 @@ async function saveAutoSyncWeeklySchedule(playlistId, { time, days, tz }) {
         return;
     }
 
-    // Enforce one-schedule-per-playlist: if the playlist currently has
-    // an hourly schedule, drop it before installing the weekly one. The
-    // engine can technically run both side-by-side as two separate
-    // automations, but the UI assumes one schedule per playlist and
-    // showing two cards under the same playlist row would surprise
-    // users. Delete-then-create is safe — the worst case (POST fails)
-    // leaves the playlist unscheduled, which is recoverable from the UI.
-    const existingHourly = _autoSyncScheduleState.playlistSchedules?.[playlistId];
-    if (existingHourly) {
-        try {
-            await fetch(`/api/automations/${existingHourly.automation_id}`, { method: 'DELETE' });
-        } catch (_) { /* best-effort cleanup */ }
-    }
+    await dropOpposingAutoSyncSchedule(playlistId, 'weekly');
 
     const existingWeekly = _autoSyncScheduleState.weeklySchedules?.[playlistId];
     const payload = {
@@ -2284,7 +2343,7 @@ async function unscheduleAutoSyncWeekly(playlistId) {
 }
 
 
-async function runAutoSyncScheduledPlaylist(playlistId) {
+async function runAutoSyncScheduledPlaylist(playlistId, skipWishlist) {
     const playlist = _autoSyncScheduleState.playlists.find(p => parseInt(p.id, 10) === parseInt(playlistId, 10));
     if (!playlist) return;
     if (playlist._personalized) {
@@ -2306,7 +2365,7 @@ async function runAutoSyncScheduledPlaylist(playlistId) {
         }
         return;
     }
-    await runMirroredPlaylistPipeline(playlistId, playlist.name || `Playlist #${playlistId}`);
+    await runMirroredPlaylistPipeline(playlistId, playlist.name || `Playlist #${playlistId}`, skipWishlist);
     await refreshAutoSyncScheduleModal();
 }
 
@@ -2342,7 +2401,7 @@ async function parseMirroredPipelineResponse(res, fallbackMessage) {
             data = JSON.parse(text);
         } catch (_err) {
             const detail = res.status === 404
-                ? 'Auto-Sync endpoint not found. Restart the Commissary server so the new backend routes load.'
+                ? 'Auto-Sync endpoint not found. Restart the SoulSync server so the new backend routes load.'
                 : fallbackMessage;
             throw new Error(detail);
         }
@@ -2354,7 +2413,7 @@ async function parseMirroredPipelineResponse(res, fallbackMessage) {
 }
 
 async function editMirroredCustomName(playlistId, originalName, currentCustom) {
-    // Custom alias: changes the name shown in Commissary AND used when syncing to
+    // Custom alias: changes the name shown in SoulSync AND used when syncing to
     // the media server, while staying tied to the original upstream playlist.
     // Blank clears the alias (falls back to the original name).
     const nextName = window.prompt(
@@ -2443,19 +2502,21 @@ function applyMirroredPipelineState(playlistId, state) {
     updateMirroredCardPhase(hash, phase);
 }
 
-async function runMirroredPlaylistPipeline(playlistId, name) {
+async function runMirroredPlaylistPipeline(playlistId, name, skipWishlist) {
     try {
         const res = await fetch(`/api/mirrored-playlists/${playlistId}/pipeline/run`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({})
+            // #1455: explicit per-click choice — true = sync only,
+            // false = sync and queue missing tracks for download.
+            body: JSON.stringify({ skip_wishlist: !!skipWishlist })
         });
         const data = await parseMirroredPipelineResponse(res, 'Failed to start Auto-Sync');
-        applyMirroredPipelineState(playlistId, data.state || { status: 'running', progress: 0, phase: 'Starting pipeline…' });
+        applyMirroredPipelineState(playlistId, data.state || { status: 'running', progress: 0, phase: 'Starting pipeline...' });
         showToast(`Auto-Sync started for ${name}`, 'success');
         _autoSyncScheduleState.playlists = _autoSyncScheduleState.playlists.map(p => (
             parseInt(p.id, 10) === parseInt(playlistId, 10)
-                ? { ...p, pipeline_state: data.state || { status: 'running', progress: 0, phase: 'Starting pipeline…' } }
+                ? { ...p, pipeline_state: data.state || { status: 'running', progress: 0, phase: 'Starting pipeline...' } }
                 : p
         ));
         renderAutoSyncScheduleModal();

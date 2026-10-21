@@ -184,7 +184,7 @@ def test_wishlist_view_is_wanted_but_missing(db):
 
 def test_dashboard_stats_empty_is_all_zero(db):
     s = db.dashboard_stats()
-    assert s["library"] == {"movies": 0, "shows": 0, "episodes": 0, "size_bytes": 0, "by_library": []}
+    assert s["library"] == {"movies": 0, "shows": 0, "episodes": 0, "size_bytes": 0}
     assert s["downloads"] == {"active": 0, "finished": 0, "speed_bps": 0}
     assert s["watchlist"] == 0 and s["wishlist"] == 0
 
@@ -195,231 +195,31 @@ def test_dashboard_stats_counts_content_and_downloads(db):
         # airing library show → on the curated watchlist by default
         conn.execute("INSERT INTO shows(id,title,monitored,tmdb_id,status) VALUES (1,'S',1,555,'continuing')")
         conn.execute("INSERT INTO seasons(id,show_id,season_number) VALUES (1,1,1)")
-        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number) "
-                     "VALUES (1,1,1,1,1)")
+        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number,has_file) "
+                     "VALUES (1,1,1,1,1,1)")
+        # backfilled from tmdb, not on disk: not a library episode
+        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number,has_file) "
+                     "VALUES (2,1,1,1,2,0)")
         conn.execute("INSERT INTO media_files(movie_id,relative_path,size_bytes) VALUES (1,'m.mkv',1000)")
-        conn.execute("INSERT INTO downloads(movie_id,title,status,download_speed_bps) "
-                     "VALUES (1,'d','downloading',500)")
+        # the live queue is video_downloads; the old downloads table is never written
+        for title, status, speed in [("d", "downloading", 500), ("q", "queued", 0),
+                                     ("c", "completed", 0), ("f", "failed", 0)]:
+            conn.execute("INSERT INTO video_downloads(kind,title,status,speed_bps) VALUES ('movie',?,?,?)",
+                         (title, status, speed))
         conn.commit()
     s = db.dashboard_stats()
-    assert s["library"] == {"movies": 1, "shows": 1, "episodes": 1, "size_bytes": 1000, "by_library": []}
-    assert s["downloads"]["active"] == 1 and s["downloads"]["speed_bps"] == 500
+    assert s["library"] == {"movies": 1, "shows": 1, "episodes": 1, "size_bytes": 1000}
+    assert s["downloads"] == {"active": 2, "finished": 1, "speed_bps": 500}
     # watchlist = the airing show (curated default); wishlist is cleared for now
     assert s["watchlist"] == 1 and s["wishlist"] == 0
 
 
-def test_dashboard_stats_breaks_out_every_configured_library(db):
-    """EVERY configured movie/show Library gets an entry — the dashboard renders
-    these INSTEAD of the aggregate Movies/Shows tiles, so a single-library
-    install must still get its one entry (there'd be nothing to show otherwise)."""
-    solo_movie = _add_root_folder(db, path="/media/movies", kind="movie", label="Movies")
-    solo_show = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
-    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
-    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "B"})
-    with db.connect() as conn:
-        conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (solo_movie, mid))
-        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (solo_show, sid))
-        conn.commit()
-    assert {e["label"]: e["count"] for e in db.dashboard_stats()["library"]["by_library"]} \
-        == {"Movies": 1, "TV": 1}
-
-    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
-    aid = db.upsert_show_tree("plex", {"server_id": "s2", "title": "Anime Show"})
-    with db.connect() as conn:
-        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, aid))
-        conn.commit()
-    by_lib = db.dashboard_stats()["library"]["by_library"]
-    assert {e["label"]: e["count"] for e in by_lib} == {"Movies": 1, "TV": 1, "Anime": 1}
-    assert {e["label"]: e["kind"] for e in by_lib} \
-        == {"Movies": "movie", "TV": "show", "Anime": "show"}
-
-
-def test_dashboard_stats_by_library_carries_each_librarys_own_disk_size(db):
-    """The single aggregate size_bytes summed every Library; each entry now
-    carries only ITS OWN bytes — movie files hang off the movie row, episode
-    files off the show's episodes."""
-    movies = _add_root_folder(db, path="/media/movies", kind="movie", label="Movies")
-    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
-    tv = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
-    mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
-    aid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "Anime Show"})
-    with db.connect() as conn:
-        conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (movies, mid))
-        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, aid))
-        conn.execute("INSERT INTO media_files(movie_id,relative_path,size_bytes) VALUES (?,'m.mkv',700)",
-                     (mid,))
-        conn.execute("INSERT INTO seasons(id,show_id,season_number) VALUES (1,?,1)", (aid,))
-        conn.execute("INSERT INTO episodes(id,show_id,season_id,season_number,episode_number) "
-                     "VALUES (1,?,1,1,1)", (aid,))
-        conn.execute("INSERT INTO media_files(episode_id,relative_path,size_bytes) VALUES (1,'e.mkv',300)")
-        conn.commit()
-    sizes = {e["label"]: e["size_bytes"] for e in db.dashboard_stats()["library"]["by_library"]}
-    assert sizes == {"Movies": 700, "Anime": 300, "TV": 0}
-    assert db.dashboard_stats()["library"]["size_bytes"] == 1000   # aggregate unchanged
-    assert tv   # the empty Library still gets an entry, not omitted
-
-
-def test_dashboard_stats_by_library_scoped_to_server_source(db):
-    plex_lib = _add_root_folder(db, path="/media/plex-anime", kind="show", label="Plex Anime")
-    _add_root_folder(db, path="/media/plex-tv", kind="show", label="Plex TV")
-    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "On Plex"})
-    with db.connect() as conn:
-        conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (plex_lib, sid))
-        conn.commit()
-    by_plex = {e["label"]: e["count"] for e in db.dashboard_stats("plex")["library"]["by_library"]}
-    assert by_plex["Plex Anime"] == 1
-    by_jf = {e["label"]: e["count"] for e in db.dashboard_stats("jellyfin")["library"]["by_library"]}
-    assert by_jf["Plex Anime"] == 0   # scoped away — the show is on plex, not jellyfin
-
-
 def test_library_selection_roundtrip(db):
-    assert db.get_library_selection("plex") == {"movies": [], "tv": [], "youtube": []}
-    db.save_libraries("plex",
-                       [{"server_title": "Movies", "path": "/media/movies"},
-                        {"server_title": "Movies 4K", "label": "4K", "path": "/media/movies4k"}],
-                       [{"server_title": "TV Shows", "path": "/media/tv"}])
-    assert db.get_library_selection("plex") == {
-        "movies": ["Movies", "Movies 4K"], "tv": ["TV Shows"], "youtube": []}
+    assert db.get_library_selection("plex") == {"movies": None, "tv": None}
+    db.set_library_selection("plex", "Movies", "TV Shows")
+    assert db.get_library_selection("plex") == {"movies": "Movies", "tv": "TV Shows"}
     # Per-server keys don't collide.
-    assert db.get_library_selection("jellyfin") == {"movies": [], "tv": [], "youtube": []}
-
-
-def test_save_libraries_upserts_by_id_and_deletes_on_removal(db):
-    saved = db.save_libraries("plex", [{"server_title": "Movies", "path": "/m"}], [])
-    assert len(saved["movies"]) == 1
-    mid = saved["movies"][0]["id"]
-
-    # Re-saving with the same id UPDATES that row, not a duplicate.
-    saved2 = db.save_libraries(
-        "plex", [{"id": mid, "server_title": "Movies", "label": "Films", "path": "/m2"}], [])
-    assert len(saved2["movies"]) == 1
-    assert saved2["movies"][0]["id"] == mid
-    assert saved2["movies"][0]["label"] == "Films"
-    assert saved2["movies"][0]["path"] == "/m2"
-
-    # A scanned title pointed at it, then it's removed from the save list —
-    # deleted, and the title's root_folder_id is cleared, not left dangling.
-    db.upsert_movie("plex", {"server_id": "1", "title": "X", "root_folder_id": mid})
-    db.save_libraries("plex", [], [])
-    assert db.list_libraries("plex")["movies"] == []
-    with db.connect() as conn:
-        row = conn.execute("SELECT root_folder_id FROM movies WHERE server_id='1'").fetchone()
-    assert row["root_folder_id"] is None
-
-
-def test_youtube_libraries_manual_save(db):
-    # No server-side discovery for youtube — entries are named by hand, but
-    # saved/upserted/deleted through the same path as movies/tv.
-    saved = db.save_libraries(
-        "plex", [], [], [{"server_title": "YouTube", "path": "/media/youtube"}])
-    assert len(saved["youtube"]) == 1
-    yid = saved["youtube"][0]["id"]
-    assert saved["youtube"][0]["path"] == "/media/youtube"
-    assert db.get_library_selection("plex")["youtube"] == ["YouTube"]
-
-    # Re-saving with the same id UPDATES that row.
-    saved2 = db.save_libraries(
-        "plex", [], [], [{"id": yid, "server_title": "Kids", "path": "/media/yt-kids"}])
-    assert len(saved2["youtube"]) == 1
-    assert saved2["youtube"][0]["id"] == yid
-    assert saved2["youtube"][0]["server_title"] == "Kids"
-    assert saved2["youtube"][0]["path"] == "/media/yt-kids"
-
-    # Omitting it from the next save deletes it, independent of movies/tv.
-    db.save_libraries("plex", [{"server_title": "Movies", "path": "/m"}], [], [])
-    assert db.list_libraries("plex")["youtube"] == []
-    assert len(db.list_libraries("plex")["movies"]) == 1
-
-
-def test_library_category_roundtrips_and_defaults_to_none(db):
-    # Per-library torrent category (e.g. Movies -> "movies", Anime -> "anime").
-    saved = db.save_libraries(
-        "plex",
-        [{"server_title": "Movies", "path": "/m1", "category": "movies"},
-         {"server_title": "Anime Movies", "path": "/m2", "category": "anime"}],
-        [{"server_title": "TV Shows", "path": "/tv"}])   # no category set -> inherits the global default
-    assert saved["movies"][0]["category"] == "movies"
-    assert saved["movies"][1]["category"] == "anime"
-    assert saved["tv"][0]["category"] is None
-
-    mid = saved["movies"][0]["id"]
-    assert db.get_root_folder(mid)["category"] == "movies"
-    assert db.primary_root_folder("plex", "movie")["category"] == "movies"
-
-    # Re-saving with a blank category clears it back to "inherit".
-    saved2 = db.save_libraries(
-        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1", "category": ""}], [])
-    assert saved2["movies"][0]["category"] is None
-
-
-def test_library_preferred_indexer_ids_roundtrip_and_default_to_none(db):
-    # Per-library preferred tracker(s) — e.g. Anime -> tracker A, TV -> tracker B.
-    saved = db.save_libraries(
-        "plex",
-        [{"server_title": "Movies", "path": "/m1", "preferred_indexer_ids": "1, 3"},
-         {"server_title": "Anime Movies", "path": "/m2"}],   # unset -> no preference
-        [{"server_title": "TV Shows", "path": "/tv", "preferred_indexer_ids": "7"}])
-    assert saved["movies"][0]["preferred_indexer_ids"] == "1,3"
-    assert saved["movies"][1]["preferred_indexer_ids"] is None
-    assert saved["tv"][0]["preferred_indexer_ids"] == "7"
-
-    mid = saved["movies"][0]["id"]
-    assert db.get_root_folder(mid)["preferred_indexer_ids"] == "1,3"
-
-    # Garbage/non-digit tokens are dropped, not stored verbatim.
-    saved2 = db.save_libraries(
-        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1",
-                  "preferred_indexer_ids": "2, bogus, 9,"}], [])
-    assert saved2["movies"][0]["preferred_indexer_ids"] == "2,9"
-
-    # Re-saving with a blank value clears it back to "no preference".
-    saved3 = db.save_libraries(
-        "plex", [{"id": mid, "server_title": "Movies", "path": "/m1", "preferred_indexer_ids": ""}], [])
-    assert saved3["movies"][0]["preferred_indexer_ids"] is None
-
-
-def test_library_selection_legacy_plain_string(db):
-    # Pre-multi-library installs stored a bare name (not JSON) — must still read back.
-    db.set_setting("plex.movies_library", "Movies")
-    assert db.get_library_selection("plex") == {"movies": ["Movies"], "tv": [], "youtube": []}
-
-
-def test_legacy_kv_migrates_titles_and_flat_path(db):
-    import json
-    # Part-1-era: a JSON array of titles + the old flat movies_path scalar.
-    db.set_setting("plex.movies_library", json.dumps(["Movies", "Movies 4K"]))
-    db.set_setting("movies_path", "/media/movies")
-    libs = db.list_libraries("plex")
-    assert [e["server_title"] for e in libs["movies"]] == ["Movies", "Movies 4K"]
-    assert libs["movies"][0]["path"] == "/media/movies"              # primary keeps the legacy path exactly
-    assert libs["movies"][1]["path"] == "/media/movies/Movies 4K"    # best-guess subfolder for the rest
-    # Migration is one-time — re-listing doesn't duplicate rows.
-    assert len(db.list_libraries("plex")["movies"]) == 2
-
-
-def test_primary_root_folder_and_root_folder_id_for(db):
-    saved = db.save_libraries(
-        "plex", [{"server_title": "Movies", "path": "/m1"}, {"server_title": "Movies 4K", "path": "/m2"}], [])
-    primary = db.primary_root_folder("plex", "movie")
-    assert primary["server_title"] == "Movies"
-    assert db.root_folder_id_for("plex", "movie", "Movies 4K") == saved["movies"][1]["id"]
-    assert db.root_folder_id_for("plex", "movie", "Nope") is None
-    assert db.primary_root_folder("plex", "show") is None   # nothing configured for TV
-
-
-def test_query_library_root_folder_id_filter(db):
-    saved = db.save_libraries(
-        "plex", [{"server_title": "Movies", "path": "/m1"}, {"server_title": "Movies 4K", "path": "/m2"}], [])
-    lib1, lib2 = saved["movies"][0]["id"], saved["movies"][1]["id"]
-    db.upsert_movie("plex", {"server_id": "1", "title": "Dune", "root_folder_id": lib1})
-    db.upsert_movie("plex", {"server_id": "2", "title": "Akira", "root_folder_id": lib2})
-    db.upsert_movie("plex", {"server_id": "3", "title": "Legacy Item"})   # pre-migration: no root_folder_id
-
-    assert [i["title"] for i in db.query_library("movies", root_folder_id=lib1)["items"]] == ["Dune"]
-    assert [i["title"] for i in db.query_library("movies", root_folder_id=lib2)["items"]] == ["Akira"]
-    # include_unassigned buckets the un-attributed legacy item into the primary tab.
-    titles = {i["title"] for i in db.query_library("movies", root_folder_id=lib1, include_unassigned=True)["items"]}
-    assert titles == {"Dune", "Legacy Item"}
+    assert db.get_library_selection("jellyfin") == {"movies": None, "tv": None}
 
 
 def test_settings_kv_roundtrip(db):
@@ -775,73 +575,6 @@ def test_enrichment_next_pending_then_none_when_fresh(db):
     assert db.enrichment_next("tmdb") is None
 
 
-def _add_root_folder(db, *, path, kind="movie", label=None):
-    conn = db._get_connection()
-    cur = conn.execute(
-        "INSERT INTO root_folders (path, content_kind, server, label) VALUES (?,?,?,?)",
-        (str(path), kind, "plex", label))
-    rid = cur.lastrowid
-    conn.commit(); conn.close()
-    return rid
-
-
-def test_enrichment_next_library_scoped_priority_prefers_that_library_first(db):
-    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
-    standard = _add_root_folder(db, path="/media/tv", kind="show", label="TV")
-    show_a = db.upsert_show_tree("plex", {"server_id": "s1", "title": "Standard Show"})
-    show_b = db.upsert_show_tree("plex", {"server_id": "s2", "title": "Anime Show"})
-    conn = db._get_connection()
-    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (standard, show_a))
-    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, show_b))
-    conn.commit(); conn.close()
-    # no priority: whichever the plain 'id' order picks (Standard Show, added first)
-    assert db.enrichment_next("tmdb", priority=None)["title"] == "Standard Show"
-    # library-scoped priority: the Anime library's show comes first despite id order
-    nxt = db.enrichment_next("tmdb", priority="show:%d" % anime)
-    assert nxt["title"] == "Anime Show" and nxt["kind"] == "show"
-
-
-def test_enrichment_next_library_scoped_priority_falls_through_when_library_empty(db):
-    anime = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
-    db.upsert_show_tree("plex", {"server_id": "s1", "title": "Standard Show"})   # no root_folder_id
-    nxt = db.enrichment_next("tmdb", priority="show:%d" % anime)
-    assert nxt["title"] == "Standard Show"   # nothing in the pinned library → falls through
-
-
-def test_enrichment_next_bare_kind_priority_still_works_unscoped(db):
-    db.upsert_movie("plex", {"server_id": "m1", "title": "A Movie"})
-    db.upsert_show_tree("plex", {"server_id": "s1", "title": "A Show"})
-    assert db.enrichment_next("tmdb", priority="show")["kind"] == "show"
-    assert db.enrichment_next("tmdb", priority="movie")["kind"] == "movie"
-
-
-def test_enrichment_priority_endpoint_accepts_and_validates_library_scope(tmp_path):
-    import api.video as videoapi
-    from flask import Flask
-    db = VideoDatabase(database_path=str(tmp_path / "video_library.db"))
-    show_lib = _add_root_folder(db, path="/media/anime", kind="show", label="Anime")
-    movie_lib = _add_root_folder(db, path="/media/movies", kind="movie", label="Main")
-    videoapi._video_db = db
-    try:
-        app = Flask(__name__)
-        app.register_blueprint(videoapi.create_video_blueprint(), url_prefix="/api/video")
-        c = app.test_client()
-        ok = c.post("/api/video/enrichment/priority", json={"priority": "show:%d" % show_lib})
-        assert ok.get_json()["success"] is True
-        assert c.get("/api/video/enrichment/priority").get_json()["priority"] == "show:%d" % show_lib
-        # a movie-kind library id can't be used with the 'show' prefix
-        bad = c.post("/api/video/enrichment/priority", json={"priority": "show:%d" % movie_lib})
-        assert bad.status_code == 400
-        # an unknown library id
-        bad2 = c.post("/api/video/enrichment/priority", json={"priority": "show:99999"})
-        assert bad2.status_code == 400
-        # still accepts the plain bare-kind + auto forms
-        assert c.post("/api/video/enrichment/priority", json={"priority": "movie"}).get_json()["success"]
-        assert c.post("/api/video/enrichment/priority", json={"priority": ""}).get_json()["success"]
-    finally:
-        videoapi._video_db = None
-
-
 def test_enrichment_apply_matched_sets_id_status_and_metadata(db):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "A"})
     db.enrichment_apply("tmdb", "movie", mid, matched=True, external_id=27205,
@@ -1062,6 +795,34 @@ def test_backfill_inserts_missing_episodes_as_unowned(db):
     assert by[2]["title"] == "Two" and by[2]["air_date"] == "2020-01-08"
 
 
+def test_backfill_overwrite_air_date_moves_rescheduled_premiere(db):
+    # a rescheduled premiere: the stored air_date must move when the refresh
+    # re-pulls (gap-fill kept it stale forever)
+    sid = db.upsert_show_tree("plex", {"server_id": "s1", "title": "S", "seasons": [
+        {"season_number": 1, "episodes": [{"episode_number": 1}]}]})
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-01-08"}])
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-01-08"
+    # default (gap-fill): the reschedule does NOT move
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-02-01"}])
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-01-08"
+    # refresh with overwrite: the reschedule moves
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": "2020-02-01"}],
+                         overwrite_air_date=True)
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-02-01"
+    # a blank incoming date never blanks a stored one
+    db.backfill_episodes(sid, 1, [{"episode_number": 1, "air_date": ""}],
+                         overwrite_air_date=True)
+    with db.connect() as c:
+        assert c.execute("SELECT air_date FROM episodes WHERE show_id=? AND episode_number=1",
+                         (sid,)).fetchone()[0] == "2020-02-01"
+
+
 def test_apply_ratings_and_payload(db):
     mid = db.upsert_movie("plex", {"server_id": "m1", "title": "Dune"})
     db.apply_ratings("movie", mid, {"imdb_rating": 8.4, "rt_rating": 95, "metacritic": 74})
@@ -1247,18 +1008,7 @@ def test_watchlist_reAdd_is_upsert_and_coalesces_library_id(db):
     rows = db.list_watchlist("show")
     assert len(rows) == 1                                            # no duplicate
     assert rows[0]["title"] == "Game of Thrones"                    # refreshed
-    # Assert the COALESCE at the STORAGE layer, which is what this test is about.
-    # list_watchlist deliberately reports the LIVE library row instead of echoing
-    # the stored id (see test_video_watchlist_posters.py) — id 7 exists in no
-    # shows table here, and surfacing a dangling id gives cards that 404.
-    conn = db._get_connection()
-    try:
-        stored = dict(conn.execute("SELECT library_id, poster_url FROM video_watchlist "
-                                   "WHERE kind='show' AND tmdb_id=1399").fetchone())
-    finally:
-        conn.close()
-    assert stored["library_id"] == 7 and stored["poster_url"] == "/a.jpg"   # preserved
-    assert rows[0]["poster_url"] == "/a.jpg"        # still served to the card
+    assert rows[0]["library_id"] == 7 and rows[0]["poster_url"] == "/a.jpg"  # preserved
 
 
 def test_watchlist_state_and_counts(db):
@@ -1345,8 +1095,25 @@ def test_wishlist_episodes_group_into_show_tree(db):
     assert [s["season_number"] for s in show["seasons"]] == [1, 2]
     assert [e["episode_number"] for e in show["seasons"][0]["episodes"]] == [1, 2]
     counts = db.wishlist_counts()
-    assert {k: counts[k] for k in ("movie", "show", "episode", "total")} == {
-        "movie": 0, "show": 1, "episode": 3, "total": 3}
+    assert counts == {"movie": 0, "show": 1, "episode": 3, "total": 3}
+
+
+def test_add_episodes_returns_new_rows_only(db):
+    # the "Added N episodes" count must be genuinely-new rows, not attempted —
+    # a re-cover run re-wishing the same episodes reports 0, not phantoms.
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1},
+        {"season_number": 1, "episode_number": 2}])
+    assert n == 2
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1},   # already wished → 0
+        {"season_number": 1, "episode_number": 3}])  # new → 1
+    assert n == 1
+    n = db.add_episodes_to_wishlist(1396, "Breaking Bad", [
+        {"season_number": 1, "episode_number": 1}])   # all already wished
+    assert n == 0
+    assert db.wishlist_has_episode(1396, 1, 1) is True
+    assert db.wishlist_has_episode(1396, 9, 9) is False
 
 
 def test_wishlist_remove_scopes(db):
@@ -1574,9 +1341,7 @@ def test_youtube_rows_do_not_disturb_tmdb_counts(db):
     db.add_videos_to_wishlist({"youtube_id": "UCx", "title": "Chan"},
                               [{"youtube_id": "x1", "title": "X1"}])
     # existing shapes unchanged
-    _c = db.wishlist_counts()
-    assert {k: _c[k] for k in ("movie", "show", "episode", "total")} == {
-        "movie": 1, "show": 1, "episode": 1, "total": 2}
+    assert db.wishlist_counts() == {"movie": 1, "show": 1, "episode": 1, "total": 2}
     assert db.watchlist_counts() == {"show": 1, "person": 0, "studio": 0, "total": 1}
     # youtube counts live on their own surface
     assert db.youtube_wishlist_counts() == {"channel": 1, "video": 1}

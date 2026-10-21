@@ -4,7 +4,14 @@ import re
 from collections import defaultdict
 
 from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob
+from core.repair_jobs.base import (
+    JobContext,
+    JobResult,
+    RepairJob,
+    hand_tagged_path_keys,
+    is_hand_tagged_path,
+    not_locked_sql,
+)
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.live_commentary_cleaner")
@@ -28,14 +35,13 @@ _CONTENT_PATTERNS = [
     (r'\bcommentary\b', 'commentary'),
     (r'\bcommented\b', 'commentary'),
     (r'\btrack.?by.?track\b', 'commentary'),
-    # Interview
+    # Interview. Not 'interlude' or 'introduction': on most albums (and in
+    # classical titles) those are music, and the fix deletes the file.
     (r'\binterview\b', 'interview'),
-    (r'\binterlude\b', 'interview'),
     (r'\bskit\b', 'interview'),
     # Spoken word
     (r'\bspoken\s*word\b', 'spoken_word'),
     (r'\bnarrat(?:ion|ed)\b', 'spoken_word'),
-    (r'\bintroduction\b', 'spoken_word'),
     # Acappella
     (r'\ba\s*cappella\b', 'acappella'),
     (r'\bacappella\b', 'acappella'),
@@ -77,8 +83,8 @@ class LiveCommentaryCleanerJob(RepairJob):
         'Settings:\n'
         '- Flag Live: Flag live performances and concert recordings\n'
         '- Flag Commentary: Flag commentary and track-by-track content\n'
-        '- Flag Interviews: Flag interviews, skits, and interludes\n'
-        '- Flag Spoken Word: Flag spoken word, narration, and introductions\n'
+        '- Flag Interviews: Flag interviews and skits\n'
+        '- Flag Spoken Word: Flag spoken word and narration\n'
         '- Scan Album Titles: Also check album titles (catches "Live at Wembley" albums)\n'
         '- Scope: "tracks" flags individual tracks, "albums" flags entire albums with matching titles'
     )
@@ -127,6 +133,9 @@ class LiveCommentaryCleanerJob(RepairJob):
         try:
             conn = context.db._get_connection()
             cursor = conn.cursor()
+            # hand-tagged: the user typed this live/bootleg release on purpose,
+            # flagging it would offer to delete exactly what they asked for
+            locked_filter = not_locked_sql(cursor, 'tracks', 't') + not_locked_sql(cursor, 'albums', 'al')
             cursor.execute("""
                 SELECT t.id, t.title, ar.name, al.title, al.id, al.record_type,
                        t.file_path, t.bitrate, t.duration, t.track_number,
@@ -136,7 +145,7 @@ class LiveCommentaryCleanerJob(RepairJob):
                 LEFT JOIN albums al ON al.id = t.album_id
                 WHERE t.title IS NOT NULL AND t.title != ''
                   AND t.file_path IS NOT NULL AND t.file_path != ''
-            """)
+            """ + locked_filter)
             tracks = cursor.fetchall()
         except Exception as e:
             logger.error("Error fetching tracks: %s", e, exc_info=True)
@@ -157,6 +166,7 @@ class LiveCommentaryCleanerJob(RepairJob):
 
         # Track which albums we've already flagged (for album scope)
         flagged_album_ids = set()
+        hand_tagged = hand_tagged_path_keys(context.db)
 
         for idx, row in enumerate(tracks):
             if context.check_stop():
@@ -178,6 +188,12 @@ class LiveCommentaryCleanerJob(RepairJob):
             (track_id, title, artist_name, album_title, album_id,
              album_type, file_path, bitrate, duration, track_number,
              album_thumb, artist_thumb, artist_id) = row
+
+            # hand-tagged file whose row isn't locked yet (a media server scan
+            # that hasn't caught up): same reason, never offer to delete it
+            if is_hand_tagged_path(file_path, hand_tagged):
+                result.skipped += 1
+                continue
 
             # Check track title
             content_type = _detect_content_type(title, '')

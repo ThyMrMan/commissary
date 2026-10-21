@@ -1,3 +1,7 @@
+from types import SimpleNamespace
+
+import pytest
+
 from core.wishlist import processing
 
 
@@ -29,7 +33,7 @@ class _FakeWishlistService:
             if (track.get("spotify_track_id") or track.get("id")) not in self.removed_ids
         ]
 
-    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1):
+    def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1, **kwargs):
         self.removed_ids.add(spotify_track_id)
         return True
 
@@ -39,10 +43,12 @@ class _FakeMusicDatabase:
         self.owned_matches = set(owned_matches or [])
         self.track_checks = []
 
-    def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None):
+    def check_track_exists(self, track_name, artist_name, confidence_threshold=0.7, server_source=None, album=None, include_downloads=False):
         self.track_checks.append((track_name, artist_name, server_source, album))
         if (track_name, artist_name) in self.owned_matches:
-            return {"id": "db-track"}, 0.9
+            return SimpleNamespace(id='db-track', title=track_name,
+                                   artist_name=artist_name, album_title=album,
+                                   file_path='/music/owned.flac'), 0.9
         return None, 0.0
 
 
@@ -97,3 +103,69 @@ def test_cleanup_wishlist_against_library_handles_empty_wishlist():
 
     assert status == 200
     assert payload == {"success": True, "message": "No tracks in wishlist to clean up", "removed_count": 0}
+
+
+@pytest.mark.parametrize(('owned_title', 'owned_album', 'removed'), [
+    ('The Sun Maid', 'Grave Dancers Union', False),
+    ('Runaway Train', 'Another Release', False),
+    ('Runaway Train', 'Grave Dancers Union', True),
+])
+def test_processing_cleanup_checks_identity_and_accepts_edition_noise(owned_title, owned_album, removed):
+    service = _FakeWishlistService([{
+        'id': 'wish', 'name': 'Runaway Train (2022 Remaster)',
+        'artists': ['Soul Asylum'], 'album': 'Grave Dancers Union (2022 Remaster)',
+        'source_type': 'album',
+    }])
+    owned = SimpleNamespace(title=owned_title, album_title=owned_album, artist_name='Soul Asylum',
+                            file_path='/music/owned.flac')
+    db = _FakeMusicDatabase()
+    db.check_track_exists = lambda *a, **kw: (owned, 0.99)
+
+    payload, status = processing.cleanup_wishlist_against_library(
+        service, db, 1, 'navidrome', logger=_FakeLogger())
+
+    assert status == 200
+    assert payload['removed_count'] == int(removed)
+    assert service.removed_ids == ({'wish'} if removed else set())
+
+
+@pytest.mark.parametrize('source_type', ['discography', 'watchlist', 'watchlist_label'])
+def test_processing_cleanup_discography_row_survives_song_owned_on_other_release(source_type):
+    # #1447: a discography row names a specific release; owning the song on a
+    # different release must not clear the request for the unowned album.
+    service = _FakeWishlistService([{
+        'id': 'wish', 'spotify_track_id': 'sp-1', 'name': 'Runaway Train',
+        'artists': [{'name': 'Soul Asylum'}],
+        'album': {'name': 'Grave Dancers Union'}, 'source_type': source_type,
+    }])
+    owned = SimpleNamespace(title='Runaway Train', album_title='Greatest Hits 1990-2020',
+                            artist_name='Soul Asylum', file_path='/music/owned.flac')
+    db = _FakeMusicDatabase()
+    db.check_track_exists = lambda *a, **kw: (owned, 0.99)
+
+    payload, status = processing.cleanup_wishlist_against_library(
+        service, db, 1, 'navidrome', logger=_FakeLogger())
+
+    assert status == 200
+    assert payload['removed_count'] == 0
+    assert service.removed_ids == set()
+
+
+def test_processing_cleanup_discography_row_cleared_when_requested_album_owned():
+    # Sanity: when the requested release itself is owned, the row still clears.
+    service = _FakeWishlistService([{
+        'id': 'wish', 'spotify_track_id': 'sp-1', 'name': 'Runaway Train',
+        'artists': [{'name': 'Soul Asylum'}],
+        'album': {'name': 'Grave Dancers Union'}, 'source_type': 'discography',
+    }])
+    owned = SimpleNamespace(title='Runaway Train', album_title='Grave Dancers Union',
+                            artist_name='Soul Asylum', file_path='/music/owned.flac')
+    db = _FakeMusicDatabase()
+    db.check_track_exists = lambda *a, **kw: (owned, 0.99)
+
+    payload, status = processing.cleanup_wishlist_against_library(
+        service, db, 1, 'navidrome', logger=_FakeLogger())
+
+    assert status == 200
+    assert payload['removed_count'] == 1
+    assert service.removed_ids == {'sp-1'}

@@ -45,10 +45,13 @@ def test_atomic_replace_on_success(tmp_path):
     save_audio_file(Audio(), _symbols(180.0))
 
     assert f.read_bytes() == b"ORIGINAL-AUDIO+TAGS"     # replaced with the tagged copy
-    # The temp name now carries pid/thread/uuid so two writers on one file
-    # cannot collide, so match the SUFFIX rather than the whole path.
-    assert saved_to and saved_to[0].endswith(".sstmp")  # wrote the temp, NOT in place
-    assert saved_to[0] != str(f)                        # ...not the original
+    # dd28-31: the staging name is per-writer now (pid/thread/uuid), because a
+    # bulk fix and a scan's auto-fix can target the same file concurrently and
+    # a shared name made the loser fall back to a non-atomic in-place save.
+    assert len(saved_to) == 1
+    assert saved_to[0] != str(f)                       # wrote a temp, NOT in place
+    assert saved_to[0].startswith(str(f) + ".")
+    assert saved_to[0].endswith(".sstmp")
     assert not list(tmp_path.glob("song.flac.*sstmp"))  # temp cleaned up
 
 

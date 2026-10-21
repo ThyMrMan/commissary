@@ -8,8 +8,6 @@ client. Keys come from video_settings.
 
 from __future__ import annotations
 
-import re
-
 from utils.logging_config import get_logger
 
 logger = get_logger("video_enrichment.clients")
@@ -22,23 +20,31 @@ def _int(val):
         return None
 
 
-def _names_of(result) -> tuple:
-    """Every name a search result answers to (TV and movie shapes both)."""
-    r = result if isinstance(result, dict) else {}
-    return tuple(n for n in (r.get("name"), r.get("original_name"),
-                             r.get("title"), r.get("original_title")) if n)
+def tmdb_certification(kind, dr, region="US"):
+    """the title's certification out of a tmdb detail response, or None.
 
-
-def _is_named(result, want_norm: str) -> bool:
-    """True when a search result actually carries the title we searched for.
-
-    A search RANKS by relevance; it never promises the top hit is the thing you
-    asked for. Taking results[0] on faith is what filed 'Silo' under an
-    unrelated show — TMDB returned a namesake and nothing checked. Comparison
-    goes through the same ``normalize_title`` the release matcher uses, so
-    accents, articles, '&' and punctuation don't cause a false miss."""
-    from core.video.release_parse import normalize_title
-    return any(normalize_title(n) == want_norm for n in _names_of(result))
+    movies carry it under release_dates (per country, per release type),
+    shows under content_ratings. the viewer's region first, then US, since
+    the kids caps are written in us terms.
+    """
+    order = [c for c in dict.fromkeys([(region or "US").upper(), "US"]) if c]
+    if kind == "show":
+        rows = {str(x.get("iso_3166_1") or "").upper(): (x.get("rating") or "").strip()
+                for x in ((dr.get("content_ratings") or {}).get("results") or [])}
+        for c in order:
+            if rows.get(c):
+                return rows[c]
+        return None
+    by_country = {}
+    for x in ((dr.get("release_dates") or {}).get("results") or []):
+        certs = [(d.get("certification") or "").strip() for d in (x.get("release_dates") or [])]
+        certs = [c for c in certs if c]
+        if certs:
+            by_country[str(x.get("iso_3166_1") or "").upper()] = certs[0]
+    for c in order:
+        if by_country.get(c):
+            return by_country[c]
+    return None
 
 
 class TMDBClient:
@@ -67,96 +73,23 @@ class TMDBClient:
             logger.exception("TMDB test failed")
             return False, "Could not reach TMDB"
 
-    # Which of a row's other provider ids TMDB can resolve EXACTLY, per kind.
-    # tvdb_id is a TV-only external source; imdb_id works for both.
-    _FIND_SOURCES = {"show": ("tvdb_id", "imdb_id"), "movie": ("imdb_id",)}
-
-    def find_by_external_id(self, kind, external_ids):
-        """Resolve a TMDB id from another provider's id — exact, no guessing.
-
-        The media server routinely identifies a show by TVDB guid and gives us
-        no TMDB id at all. Falling straight through to a title search there is
-        what let 'Silo' be matched to an unrelated show; /find answers the same
-        question with certainty, in one call. Returns (id, overview) or
-        (None, None) when nothing is carried or nothing resolves."""
-        ids = external_ids if isinstance(external_ids, dict) else {}
-        if not self.api_key or not ids:
-            return (None, None)
-        import requests
-        key = "tv_results" if kind != "movie" else "movie_results"
-        for source in self._FIND_SOURCES.get("movie" if kind == "movie" else "show", ()):
-            val = str(ids.get(source) or "").strip()
-            if not val:
-                continue
-            r = requests.get(self.BASE + "/find/" + val,
-                             params={"api_key": self.api_key, "external_source": source},
-                             timeout=15)
-            # A 404 means "TMDB doesn't carry that id" — try the next one. Any
-            # other non-200 is a FAILED call and must propagate (see match()).
-            if r.status_code == 404:
-                continue
-            r.raise_for_status()
-            for hit in ((r.json() or {}).get(key) or []):
-                if hit.get("id") is not None:
-                    return (hit["id"], hit.get("overview"))
-        return (None, None)
-
-    def _search_verified(self, kind, title, year):
-        """Title-search fallback that REFUSES to guess. Returns (id, overview),
-        or (None, None) when no result actually carries the title we searched.
-
-        The year is tried first and then dropped, because a wrong or
-        episode-derived year silently excludes the real title from the results
-        and leaves only namesakes to choose from — the exact shape of the Silo
-        mis-match. Whatever survives still has to pass the name check."""
-        import requests
-        from core.video.release_parse import normalize_title
-        path = "/search/movie" if kind == "movie" else "/search/tv"
-        year_key = "year" if kind == "movie" else "first_air_date_year"
-        attempts = ([{year_key: year}] if year else []) + [{}]
-        want = normalize_title(title)
-        if not want:
-            return (None, None)
-        seen = []
-        for extra in attempts:
-            resp = requests.get(self.BASE + path,
-                                params={"api_key": self.api_key, "query": title, **extra},
-                                timeout=15)
-            # A non-200 (429 rate-limit, 5xx, timeout-as-error) is a FAILED call,
-            # not "no match" — raise so the worker records 'error' (retried later)
-            # instead of burning the item to 'not_found'.
-            resp.raise_for_status()
-            for r in ((resp.json() or {}).get("results") or []):
-                if r.get("id") is None:
-                    continue
-                if _is_named(r, want):
-                    return (r["id"], r.get("overview"))
-                if len(seen) < 5:
-                    seen.extend(n for n in _names_of(r) if n not in seen)
-        # Refusing is the point: 'not_found' is retried and shows up in the
-        # Metadata Gaps job, where a wrong id is silent and permanent.
-        logger.info("TMDB: no result named %r (%s) — refusing to guess; saw: %s",
-                    title, kind, ", ".join(repr(s) for s in seen[:5]) or "nothing")
-        return (None, None)
-
-    def match(self, kind, title, year, known_id=None, external_ids=None):
+    def match(self, kind, title, year, known_id=None, external_ids=None):  # Commissary: + external_ids
         if not self.api_key:
             return None
         import requests
-        # Identity, in descending order of certainty: the server's own TMDB id,
-        # then another provider's id resolved through /find, and only then a
-        # title search — which is a guess, and so has to prove itself.
+        # The server already knows the TMDB id → go straight to the details
+        # fetch (accurate, one call). Otherwise fall back to a title/year search.
         tmdb_id = _int(known_id)
         meta = {}
         if tmdb_id is None:
-            tmdb_id, overview = self.find_by_external_id(kind, external_ids)
-            if tmdb_id is None:
-                if not title:
-                    return None
-                tmdb_id, overview = self._search_verified(kind, title, year)
+            # Commissary: the server's TVDB/IMDb id resolved exactly through /find,
+            # then a title search that must PROVE itself - never results[0] on
+            # trust (how 'Silo' became an unrelated show). Failed calls still raise.
+            from core.commissary.tmdb_match import resolve as _resolve_tmdb
+            tmdb_id, _overview = _resolve_tmdb(self, kind, title, year, external_ids)
             if tmdb_id is None:
                 return None
-            meta["overview"] = overview
+            meta["overview"] = _overview
         # A failed details CALL (429 rate-limit, 5xx, timeout) must PROPAGATE so the
         # backfill records an error and retries — not get swallowed into empty
         # metadata that then gets marked details_synced=1 forever (the bug that left
@@ -581,33 +514,7 @@ class TMDBClient:
             if t and k not in seen:
                 seen.add(k)
                 out.append(t)
-        # TMDB's ORIGINAL title is not in /alternative_titles, but it's what fansub
-        # groups usually romanise from — an anime whose TMDB display name is a
-        # localised rewrite ("Oh Boy, Was I Wrong About Her") is released under the
-        # original instead, and without this the alias set can't bridge them.
-        for extra in self._original_titles(kind, tmdb_id):
-            k = extra.lower()
-            if k not in seen:
-                seen.add(k)
-                out.append(extra)
         return out[:30]
-
-    def _original_titles(self, kind, tmdb_id) -> list:
-        """The title(s) on the detail record that aren't the localised display name:
-        ``original_title``/``original_name``, plus the English ``name`` when TMDB is
-        serving a translated one. Best-effort — never raises."""
-        import requests
-        path = "/movie/" if kind == "movie" else "/tv/"
-        try:
-            r = requests.get(self.BASE + path + str(tmdb_id),
-                             params={"api_key": self.api_key}, timeout=12)
-            r.raise_for_status()
-            d = r.json() or {}
-        except Exception:
-            logger.debug("original-title fetch failed for %s %s", kind, tmdb_id, exc_info=True)
-            return []
-        vals = [d.get("original_title"), d.get("original_name"), d.get("title"), d.get("name")]
-        return [s for s in (str(v or "").strip() for v in vals) if s]
 
     def season_episodes(self, tv_id, season_number):
         """Episode-level data for one season (still/overview/rating) — the show
@@ -653,85 +560,17 @@ class TMDBClient:
                 "rating": d.get("vote_average") or None, "overview": d.get("overview") or None,
                 "runtime_minutes": d.get("runtime"), "air_date": d.get("air_date") or None}
 
-    # A trailing year the user typed ("Another World 2025", "Dune (2021)").
-    SEARCH_YEAR_RE = re.compile(r"^\s*(.+?)[\s(\[]+((?:19|20)\d{2})\s*[)\]]?\s*$")
-    SEARCH_PAGES = 3        # 20 results per TMDB page
-
-    @classmethod
-    def split_search_year(cls, query):
-        """('Another World 2025') → ('Another World', 2025); no year → (query, None).
-
-        /search/multi has NO year parameter, so a typed year goes to TMDB as part
-        of the TITLE and matches nothing — searching "Another World 2025"
-        returned zero results while "Another World" returned plenty. Pulling the
-        year out of the query and using it to RANK instead is what makes the
-        natural thing users type work at all.
-
-        Only a plausible film/TV year is treated as one: '1917' and 'Blake's 7'
-        are titles, so a bare number with no title before it is left alone.
-        """
-        m = cls.SEARCH_YEAR_RE.match(str(query or ""))
-        if not m:
-            return (str(query or "").strip(), None)
-        title, year = m.group(1).strip(), int(m.group(2))
-        if not title:                     # the whole query was a year — it's a title
-            return (str(query or "").strip(), None)
-        return (title, year)
-
-    def _multi_search_raw(self, term, pages):
-        """``pages`` pages of /search/multi for ``term``, deduped, in TMDB order."""
-        import requests
-        raw, seen = [], set()
-        for page in range(1, max(1, int(pages)) + 1):
-            try:
-                r = requests.get(self.BASE + "/search/multi", params={
-                    "api_key": self.api_key, "query": term, "include_adult": "false",
-                    "page": page}, timeout=15)
-                r.raise_for_status()
-                data = r.json() or {}
-            except Exception:   # noqa: BLE001 - page 2+ failing must not lose page 1
-                logger.debug("tmdb multi-search page %s failed for %r", page, term, exc_info=True)
-                break
-            for it in (data.get("results") or []):
-                key = (it.get("media_type"), it.get("id"))
-                if key in seen:
-                    continue
-                seen.add(key)
-                raw.append(it)
-            if page >= int(data.get("total_pages") or 1):
-                break
-        return raw
-
-    def search(self, query, pages: int | None = None):
+    def search(self, query):
         """Multi-search (movies / TV / people) for the in-app search page. Returns
         a flat list of {kind, tmdb_id, title, year, poster, ...} — no external IDs,
-        everything resolves back into Commissary.
-
-        Reads several PAGES, not one. TMDB returns 20 results a page ordered by
-        popularity, and the old single-page read meant a title sharing its name
-        with anything more popular was unreachable — a 2025 indie called 'Another
-        World' sits far below a long-running soap of the same name.
-
-        A typed year is handled as a FALLBACK, never a first move. /search/multi
-        has no year parameter, so 'Another World 2025' goes over the wire as a
-        literal title and matches nothing — but plenty of real titles END in a
-        year ('Blade Runner 2049', '9-1-1: Lone Star'), and stripping it up front
-        would wreck those. So: search exactly what was typed; only if that comes
-        back EMPTY and a trailing year was present, retry without it and float
-        that year's matches to the top. A query that works today cannot start
-        behaving differently."""
+        everything resolves back into SoulSync."""
         if not self.api_key or not (query or "").strip():
             return []
-        want_pages = max(1, int(pages or self.SEARCH_PAGES))
-        term_full = str(query).strip()
-        raw = self._multi_search_raw(term_full, want_pages)
-        term_bare, want_year = self.split_search_year(term_full)
-        if not raw and want_year and term_bare and term_bare != term_full:
-            raw = self._multi_search_raw(term_bare, want_pages)
-        else:
-            want_year = None    # the query as typed worked — don't re-rank it
+        # Commissary: up to three pages, and a trailing year retried without it
+        # when the exact query finds nothing (core/commissary/tmdb_search.py)
+        from core.commissary.tmdb_search import raw_results
         out = []
-        for it in raw:
+        for it in raw_results(self, query)[:60]:
             mt, tid = it.get("media_type"), it.get("id")
             if not tid:
                 continue
@@ -751,12 +590,6 @@ class TMDBClient:
                             "known_for": ", ".join([k for k in known if k][:3]) or None,
                             "department": it.get("known_for_department"),
                             "poster": (self.PROFILE + it["profile_path"]) if it.get("profile_path") else None})
-        if want_year:
-            # Float exact-year matches, keep everything else in TMDB's own
-            # popularity order below. A stable sort, and nothing is dropped: the
-            # year is a strong hint about which of several same-named titles was
-            # meant, not a filter — a wrong guess must not empty the results.
-            out.sort(key=lambda r: 0 if str(r.get("year") or "") == str(want_year) else 1)
         return out
 
     def search_companies(self, query):
@@ -843,7 +676,7 @@ class TMDBClient:
 
     # ── discover (browse TMDB by curated list / genre / year / decade) ────────
     def _disc_map(self, results, kind):
-        """Flatten a TMDB movie/tv list into Commissary items. ``kind`` forces the
+        """Flatten a TMDB movie/tv list into SoulSync items. ``kind`` forces the
         type for single-type endpoints; pass None to auto-detect each row's
         media_type (mixed lists like trending). Carries backdrop + overview so the
         Discover hero can render a rich slide."""
@@ -1120,10 +953,12 @@ class TMDBClient:
         import requests
         path = ("/movie/" if kind == "movie" else "/tv/") + str(tmdb_id)
         agg = ",aggregate_credits" if kind == "show" else ""
+        # the certification rides the same call, kids profiles need it
+        cert = ",content_ratings" if kind == "show" else ",release_dates"
         r = requests.get(self.BASE + path, params={
             "api_key": self.api_key,
             "append_to_response": "external_ids,credits,images,videos,watch/providers,similar,"
-                                  "recommendations,keywords,reviews" + agg,
+                                  "recommendations,keywords,reviews" + agg + cert,
             "include_image_language": "en,null"}, timeout=15)
         r.raise_for_status()
         dr = r.json() or {}
@@ -1149,6 +984,7 @@ class TMDBClient:
             "crew": [{"name": p["name"], "job": p.get("job"), "tmdb_id": p.get("tmdb_id")}
                      for p in cmeta.get("crew") or []],
             "_extras": self._parse_extras(kind, dr, region),
+            "content_rating": tmdb_certification(kind, dr, region),
         }
         self._fill_collection(out["_extras"])
         if kind == "movie":
@@ -1185,7 +1021,7 @@ class TMDBClient:
 
     def person(self, tmdb_id):
         """Person detail + their filmography (cast + crew credits) for the in-app
-        person page. Everything points back to TMDB ids we resolve in Commissary."""
+        person page. Everything points back to TMDB ids we resolve in SoulSync."""
         if not self.api_key or tmdb_id is None:
             return None
         import requests
@@ -1284,61 +1120,28 @@ class TVDBClient:
         r.raise_for_status()
         return r.json() or {}
 
-    def _remote_id_series(self, external_ids):
-        """A TVDB series id resolved from another provider's id — exact.
-        Returns (id, overview) or (None, None)."""
-        ids = external_ids if isinstance(external_ids, dict) else {}
-        for source in ("imdb_id", "tmdb_id"):
-            val = str(ids.get(source) or "").strip()
-            if not val:
-                continue
-            try:
-                r = self._authed_get("/search/remoteid/" + val)
-            except Exception:   # noqa: BLE001 - an unknown id 404s; try the next
-                continue
-            for hit in ((r or {}).get("data") or []):
-                series = hit.get("series") if isinstance(hit, dict) else None
-                if isinstance(series, dict) and _int(series.get("id")) is not None:
-                    return (_int(series["id"]), series.get("overview"))
-        return (None, None)
-
-    def match(self, kind, title, year, known_id=None, external_ids=None):
+    def match(self, kind, title, year, known_id=None):
         if kind != "show" or not self.api_key:
             return None
-        # Same certainty ladder as TMDB: the server's id, then another provider's
-        # id resolved through /search/remoteid, and only then a title search.
-        tvdb_id, meta = _int(known_id), {}
-        by_id = tvdb_id is not None
-        if tvdb_id is None:
-            tvdb_id, overview = self._remote_id_series(external_ids)
-            by_id = tvdb_id is not None
-            if overview:
-                meta["overview"] = overview
+        tvdb_id = _int(known_id)
+        meta = {}
         if tvdb_id is None:
             if not title:
                 return None
-            from core.video.release_parse import normalize_title
             r = self._authed_get("/search", {"query": title, "type": "series"})
             results = (r or {}).get("data") or []
-            want = normalize_title(title)
-            # A search ranks, it does not identify. Take the first result that
-            # actually carries this name, or none at all.
-            top = next((x for x in results if want and _is_named(x, want)), None)
-            if not top:
-                logger.info("TVDB: no series named %r — refusing to guess (%d result(s))",
-                            title, len(results))
+            if not results:
                 return None
+            top = results[0]
             tvdb_id = _int(top.get("tvdb_id") or top.get("id"))
             meta["overview"] = top.get("overview")
-        if tvdb_id is None:
-            return None
-        if by_id:
-            # We KNOW the id (server or cross-reference) → fetch the extended
-            # record (overview + genres + everything TVDB offers).
+        else:
+            # Known id from the server → fetch the extended record (overview +
+            # genres + everything TVDB offers).
             try:
                 dr = self._authed_get("/series/" + str(tvdb_id) + "/extended")
                 sd = (dr or {}).get("data") or {}
-                meta["overview"] = sd.get("overview") or meta.get("overview")
+                meta["overview"] = sd.get("overview")
                 gs = [g.get("name") for g in (sd.get("genres") or []) if g.get("name")]
                 if gs:
                     meta["genres"] = gs
@@ -1347,6 +1150,8 @@ class TVDBClient:
                 meta["airs_time"] = (sd.get("airsTime") or "").strip() or None
             except Exception:
                 logger.exception("TVDB details fetch failed for %s", title or tvdb_id)
+        if tvdb_id is None:
+            return None
         return {"id": tvdb_id, "metadata": {k: v for k, v in meta.items() if v}}
 
     def search_candidates(self, kind, query, limit=8):
@@ -1368,32 +1173,6 @@ class TVDBClient:
                         "poster_url": it.get("image_url") or None})
         return out
 
-    def season_numbers(self, series_id):
-        """The series' season numbers in TVDB's default (aired) order.
-
-        Used to compare TVDB's season STRUCTURE against the media server's, which
-        is how Commissary decides whose numbering to trust for episodes (see
-        core/video/episode_numbering). Best-effort — [] on any error, which
-        simply leaves TVDB out of the comparison."""
-        if not self.api_key or series_id is None:
-            return []
-        try:
-            d = self._authed_get("/series/" + str(series_id) + "/extended", {}) or {}
-        except Exception:
-            logger.exception("TVDB season list fetch failed for %s", series_id)
-            return []
-        out = set()
-        for s in (((d.get("data") or {}).get("seasons")) or []):
-            # TVDB carries several parallel orderings (aired / dvd / absolute).
-            # Only the aired order is comparable with what a media server reports.
-            stype = ((s.get("type") or {}).get("type") or "").lower()
-            if stype and stype != "official":
-                continue
-            n = s.get("number")
-            if isinstance(n, int):
-                out.add(n)
-        return sorted(out)
-
     def season_episodes(self, series_id, season_number):
         """A TVDB series+season's episodes (v4) → [{episode_number, title, overview, air_date,
         runtime_minutes, still_url}]. Used to GAP-FILL episode metadata TMDB is missing (TVDB
@@ -1401,44 +1180,29 @@ class TVDBClient:
         defensively in case the API's ``season`` param is loose. Best-effort — [] on any error."""
         if not self.api_key or series_id is None:
             return []
+        # Commissary: every page, not just page 0 (a long show's later seasons came back empty)
+        from core.commissary.episode_numbering import tvdb_season_episodes
+        return tvdb_season_episodes(self, series_id, season_number)
         try:
             sn = int(season_number)
         except (TypeError, ValueError):
             return []
-        # PAGINATED. /episodes/default returns the whole series in aired order,
-        # and the `season` parameter is not reliably applied server-side — so on
-        # a long-running show (Bleach: 366 + a 50-episode revival) reading only
-        # page 0 silently truncates, and the later seasons come back EMPTY. An
-        # empty answer is indistinguishable from "this season has no episodes",
-        # which is exactly the input that makes callers do nothing and report
-        # success. Walk until a page adds no episodes, with a hard cap so a
-        # misbehaving endpoint can't spin forever.
-        out, seen = [], set()
-        for page in range(0, 12):
-            try:
-                d = self._authed_get("/series/" + str(series_id) + "/episodes/default",
-                                     {"season": sn, "page": page}) or {}
-            except Exception:
-                logger.exception("TVDB season episodes fetch failed for %s S%s p%s",
-                                 series_id, sn, page)
-                break
-            batch = ((d.get("data") or {}).get("episodes")) or []
-            if not batch:
-                break
-            for e in batch:
-                if e.get("seasonNumber") != sn:
-                    continue
-                num = e.get("number")
-                if num is None or num in seen:
-                    continue
-                seen.add(num)
-                out.append({"episode_number": num, "title": e.get("name") or None,
-                            "overview": e.get("overview") or None, "air_date": e.get("aired") or None,
-                            "runtime_minutes": e.get("runtime") or None,
-                            "still_url": e.get("image") or None})
-            # A short page is the last one; ask no further.
-            if len(batch) < 100:
-                break
+        try:
+            d = self._authed_get("/series/" + str(series_id) + "/episodes/default",
+                                 {"season": sn, "page": 0}) or {}
+        except Exception:
+            logger.exception("TVDB season episodes fetch failed for %s S%s", series_id, sn)
+            return []
+        out = []
+        for e in (((d.get("data") or {}).get("episodes")) or []):
+            if e.get("seasonNumber") != sn:
+                continue
+            num = e.get("number")
+            if num is None:
+                continue
+            out.append({"episode_number": num, "title": e.get("name") or None,
+                        "overview": e.get("overview") or None, "air_date": e.get("aired") or None,
+                        "runtime_minutes": e.get("runtime") or None, "still_url": e.get("image") or None})
         return out
 
 

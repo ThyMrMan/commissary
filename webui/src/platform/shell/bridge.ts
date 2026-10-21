@@ -1,5 +1,7 @@
 import type { AnyRouter } from '@tanstack/react-router';
 
+import { appURL } from '@/platform/url-base';
+
 import type { ShellStatusPayload } from './status';
 
 import {
@@ -14,6 +16,9 @@ import {
 export interface ShellProfileContext {
   profileId: number;
   isAdmin: boolean;
+  name?: string;
+  avatarColor?: string;
+  avatarUrl?: string;
 }
 
 export interface ShellContext {
@@ -99,6 +104,16 @@ export function bindWindowWebRouter(router: AnyRouter) {
       }
 
       let href: `/${string}` = route.path;
+      // A query the caller wants appended (e.g. the downloads page's
+      // ?media=video) — the manifest only carries paths.
+      if (options?.query) {
+        const params = new URLSearchParams();
+        for (const [key, value] of Object.entries(options.query)) {
+          if (value !== undefined && value !== null) params.set(key, String(value));
+        }
+        const qs = params.toString();
+        if (qs) href = `${href}?${qs}` as `/${string}`;
+      }
       if (pageId === 'artist-detail' && options?.artistId) {
         const source = options.artistSource ? String(options.artistSource) : 'library';
         href =
@@ -106,8 +121,19 @@ export function bindWindowWebRouter(router: AnyRouter) {
         // Some sources (Bandcamp) have no numeric-ID lookup API — the name
         // has to travel with the URL or the route has nothing to resolve
         // against on mount.
+        const artistParams = new URLSearchParams();
         if (options.artistName) {
-          href = `${href}?name=${encodeURIComponent(options.artistName)}` as `/${string}`;
+          artistParams.set('name', String(options.artistName));
+        }
+        // ?album= names the album to open on arrival (the library's album
+        // grid). Without it the deep link silently degrades to the plain
+        // artist page.
+        if (options.focusAlbumId) {
+          artistParams.set('album', String(options.focusAlbumId));
+        }
+        const artistQuery = artistParams.toString();
+        if (artistQuery) {
+          href = `${href}?${artistQuery}` as `/${string}`;
         }
       }
       if (pageId === 'label-detail' && options?.labelId) {
@@ -119,7 +145,7 @@ export function bindWindowWebRouter(router: AnyRouter) {
         }
       }
 
-      await router.navigate({ href, replace: options?.replace === true });
+      await router.navigate({ href: appURL(href), replace: options?.replace === true });
       return true;
     },
   };

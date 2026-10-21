@@ -3,6 +3,7 @@ import time
 import threading
 from typing import Dict, Optional, Any, List
 from functools import wraps
+from core.http_error_status import http_error_status
 from utils.logging_config import get_logger
 
 logger = get_logger("lastfm_client")
@@ -36,7 +37,12 @@ def rate_limited(func):
             result = func(*args, **kwargs)
             return result
         except Exception as e:
-            if "rate limit" in str(e).lower() or "429" in str(e):
+            # Read the structured HTTP status first: the message can contain a
+            # URL whose entity ID holds "429", which is not a rate limit.
+            status = http_error_status(e)
+            is_rate_limit = (status == 429 if status is not None
+                             else "rate limit" in str(e).lower() or "429" in str(e))
+            if is_rate_limit:
                 logger.warning(f"Last.fm rate limit hit, implementing backoff: {e}")
                 time.sleep(5.0)
             raise e
@@ -54,7 +60,7 @@ class LastFMClient:
         self.session_key = session_key
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Commissary/1.0',
+            'User-Agent': 'SoulSync/1.0',
             'Accept': 'application/json'
         })
         logger.info("Last.fm client initialized")
@@ -69,7 +75,7 @@ class LastFMClient:
     def get_auth_url(self, callback_url: str) -> Optional[str]:
         """Generate the Last.fm authorization URL for scrobbling.
 
-        User visits this URL, authorizes Commissary, gets redirected back with a token.
+        User visits this URL, authorizes SoulSync, gets redirected back with a token.
         """
         if not self.api_key:
             return None
@@ -141,8 +147,13 @@ class LastFMClient:
             ts = t.get('timestamp')
             if isinstance(ts, str):
                 try:
-                    from datetime import datetime
+                    from datetime import datetime, timezone
                     dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                    if dt.tzinfo is None:
+                        # listening_history stores UTC; a naive stamp is UTC,
+                        # never system-local (else every scrobble outside UTC
+                        # ships shifted by the local offset).
+                        dt = dt.replace(tzinfo=timezone.utc)
                     ts = int(dt.timestamp())
                 except Exception:
                     continue
@@ -448,6 +459,24 @@ class LastFMClient:
             return []
 
         artists = data.get('similarartists', {}).get('artist', [])
+        return artists if isinstance(artists, list) else [artists] if artists else []
+
+    def get_tag_top_artists(self, tag: str, limit: int = 30) -> List[Dict[str, Any]]:
+        """Top artists for a Last.fm tag ("deep ambient techno", "shoegaze").
+
+        Genre-level radio: a YouTube mix or a "this is what X sounds like"
+        video has no artist to branch from, but its GENRE does. Returns
+        artist dicts (name, mbid, url); empty when the tag is unknown.
+        """
+        if not str(tag or '').strip():
+            return []
+        data = self._make_request('tag.gettopartists', {
+            'tag': str(tag).strip(),
+            'limit': limit,
+        })
+        if not data:
+            return []
+        artists = (data.get('topartists') or {}).get('artist', [])
         return artists if isinstance(artists, list) else [artists] if artists else []
 
     # ── Album Methods ──

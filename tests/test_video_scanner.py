@@ -49,38 +49,6 @@ def test_scan_sync_populates_library(db):
     assert (lib["movies"], lib["shows"], lib["episodes"]) == (1, 1, 1)
 
 
-def test_scan_stamps_root_folder_id_from_server_title(db):
-    """Multi-library (P.4): the source annotates each item with the server
-    section title it came from (as core/video/sources.py's real Plex/Jellyfin
-    iterators now do); the scanner resolves that to the configured Library's
-    root_folders id and persists it — the Library page's per-tab filtering
-    and the grab resolver's destination lookup both depend on this."""
-    libs = db.save_libraries(
-        "plex", [{"server_title": "Movies", "path": "/m"}], [{"server_title": "TV Shows", "path": "/t"}])
-    movie_lib_id = libs["movies"][0]["id"]
-    show_lib_id = libs["tv"][0]["id"]
-
-    movies = [{"server_id": "m1", "title": "A", "_server_title": "Movies"}]
-    shows = [{"server_id": "s1", "title": "Show", "_server_title": "TV Shows", "seasons": []}]
-    VideoLibraryScanner(db).scan_sync(lambda: FakeSource(movies, shows))
-
-    with db.connect() as conn:
-        m = conn.execute("SELECT root_folder_id FROM movies WHERE server_id='m1'").fetchone()
-        s = conn.execute("SELECT root_folder_id FROM shows WHERE server_id='s1'").fetchone()
-    assert m["root_folder_id"] == movie_lib_id
-    assert s["root_folder_id"] == show_lib_id
-
-
-def test_scan_leaves_root_folder_id_null_for_an_unconfigured_section(db):
-    # No Libraries configured at all — items scan in fine, just unattributed
-    # (the Library page buckets them into the primary/fallback tab).
-    movies = [{"server_id": "m1", "title": "A", "_server_title": "Some Section"}]
-    VideoLibraryScanner(db).scan_sync(lambda: FakeSource(movies, []))
-    with db.connect() as conn:
-        m = conn.execute("SELECT root_folder_id FROM movies WHERE server_id='m1'").fetchone()
-    assert m["root_folder_id"] is None
-
-
 def test_incremental_picks_up_new_episodes_of_known_show(db, monkeypatch):
     """The core fix: an incremental scan must catch NEW EPISODES of a show it already
     knows (a show's add-date doesn't move when episodes arrive)."""
@@ -88,14 +56,14 @@ def test_incremental_picks_up_new_episodes_of_known_show(db, monkeypatch):
     monkeypatch.setattr(sc, "INCREMENTAL_MIN_LIBRARY", 1)   # let incremental run on a tiny DB
     scanner = sc.VideoLibraryScanner(db)
     show_v1 = {"server_id": "s1", "title": "Show", "seasons": [
-        {"season_number": 1, "episodes": [{"server_id": "e1", "episode_number": 1, "title": "E1"}]}]}
+        {"season_number": 1, "episodes": [{"server_id": "e1", "episode_number": 1, "title": "E1", "file": {"relative_path": "e1.mkv"}}]}]}
     scanner.scan_sync(lambda: FakeSource([], [show_v1]), mode="full")
     assert db.dashboard_stats()["library"]["episodes"] == 1
 
     show_v2 = {"server_id": "s1", "title": "Show", "seasons": [
         {"season_number": 1, "episodes": [
-            {"server_id": "e1", "episode_number": 1, "title": "E1"},
-            {"server_id": "e2", "episode_number": 2, "title": "E2"}]}]}
+            {"server_id": "e1", "episode_number": 1, "title": "E1", "file": {"relative_path": "e1.mkv"}},
+            {"server_id": "e2", "episode_number": 2, "title": "E2", "file": {"relative_path": "e2.mkv"}}]}]}
     st = scanner.scan_sync(lambda: FakeSource([], [show_v2]), mode="incremental")
     assert st["shows"] == 1                                   # re-processed (had a new episode)
     assert db.dashboard_stats()["library"]["episodes"] == 2   # the new episode landed
@@ -108,7 +76,7 @@ def test_incremental_skips_fully_present_show(db, monkeypatch):
     monkeypatch.setattr(sc, "INCREMENTAL_MIN_LIBRARY", 1)
     scanner = sc.VideoLibraryScanner(db)
     show = {"server_id": "s1", "title": "Show", "seasons": [
-        {"season_number": 1, "episodes": [{"server_id": "e1", "episode_number": 1, "title": "E1"}]}]}
+        {"season_number": 1, "episodes": [{"server_id": "e1", "episode_number": 1, "title": "E1", "file": {"relative_path": "e1.mkv"}}]}]}
     scanner.scan_sync(lambda: FakeSource([], [show]), mode="full")   # sets the delta baseline
     # Unchanged → not in the delta → source yields nothing on the next incremental.
     st = scanner.scan_sync(lambda: FakeSource([], []), mode="incremental")

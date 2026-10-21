@@ -24,9 +24,9 @@ if "spotipy" not in sys.modules:
     sys.modules["spotipy"] = spotipy
     sys.modules["spotipy.oauth2"] = oauth2
 
-if "config.settings" not in sys.modules:
+if "core.settings" not in sys.modules:
     config_pkg = types.ModuleType("config")
-    settings_mod = types.ModuleType("config.settings")
+    settings_mod = types.ModuleType("core.settings")
 
     class _DummyConfigManager:
         def get(self, key, default=None):
@@ -38,7 +38,7 @@ if "config.settings" not in sys.modules:
     settings_mod.config_manager = _DummyConfigManager()
     config_pkg.settings = settings_mod
     sys.modules["config"] = config_pkg
-    sys.modules["config.settings"] = settings_mod
+    sys.modules["core.settings"] = settings_mod
 
 if "core.matching_engine" not in sys.modules:
     matching_engine_mod = types.ModuleType("core.matching_engine")
@@ -573,16 +573,29 @@ def test_scan_watchlist_artists_honors_cancel_check(monkeypatch):
     monkeypatch.setattr(scanner, "_should_include_track", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(scanner, "is_track_missing_from_library", lambda *_args, **_kwargs: False)
     monkeypatch.setattr(scanner, "add_track_to_wishlist", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(scanner, "update_artist_scan_timestamp", lambda *_args, **_kwargs: True)
+    # The user presses Cancel once Artist One has finished. Modelled as a FLAG
+    # rather than iter([False, True]): a real cancel_check reads
+    # watchlist_scan_state['cancel_requested'] and can be asked any number of
+    # times. A two-item iterator instead pins how OFTEN the scan is allowed to
+    # ask, which is not behaviour anyone relies on - and cancellation is now
+    # checked inside the album loop too, so that a long artist can be
+    # interrupted at all. What this test actually guards is unchanged: a cancel
+    # arriving after Artist One keeps Artist One's result.
+    cancel_requested = {'value': False}
+
+    def _finish_artist(*_args, **_kwargs):
+        cancel_requested['value'] = True
+        return True
+
+    monkeypatch.setattr(scanner, "update_artist_scan_timestamp", _finish_artist)
     monkeypatch.setattr(scanner, "update_similar_artists", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(scanner, "_backfill_similar_artists_fallback_ids", lambda *_args, **_kwargs: 0)
 
-    cancels = iter([False, True])
     scan_state = {}
     results = scanner.scan_watchlist_artists(
         [artist_a, artist_b],
         scan_state=scan_state,
-        cancel_check=lambda: next(cancels),
+        cancel_check=lambda: cancel_requested['value'],
     )
 
     assert len(results) == 1
@@ -1099,6 +1112,71 @@ def test_update_discovery_pool_incremental_uses_source_priority(monkeypatch):
     assert spotify_client.album_calls == []
 
 
+def test_update_discovery_pool_incremental_skips_within_cooldown_by_default():
+    # #1719: the 6-hour cooldown still gates ordinary (scheduled) runs.
+    scanner = _build_scanner({"tracks": {"items": []}}, [_build_artist("Cooldown Artist")])
+    gate_args = []
+    scanner.database.should_populate_discovery_pool = (
+        lambda hours_threshold=6, profile_id=1: gate_args.append((hours_threshold, profile_id)) or False)
+    fetched = []
+    scanner.database.get_watchlist_artists = lambda profile_id=1: fetched.append(profile_id) or []
+
+    scanner.update_discovery_pool_incremental(profile_id=1)
+
+    assert gate_args == [(6, 1)]  # gate consulted with the 6-hour threshold
+    assert fetched == []  # returned at the gate, before any artist work
+    assert scanner.database.discovery_pool_calls == []
+
+
+def test_update_discovery_pool_incremental_force_bypasses_cooldown(monkeypatch):
+    # #1719: force=True (a manual Run Now press) runs even when the pool
+    # was updated < 6 hours ago — end to end, tracks still land.
+    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ARTISTS", 0)
+    monkeypatch.setattr(watchlist_scanner_module, "time", types.SimpleNamespace(sleep=lambda *_args, **_kwargs: None))
+    monkeypatch.setattr(watchlist_scanner_module, "get_primary_source", lambda: "deezer")
+    monkeypatch.setattr(watchlist_scanner_module, "get_source_priority", lambda primary: [primary, "spotify", "itunes"])
+
+    artist = _build_artist("Forced Artist")
+    artist.spotify_artist_id = None
+    artist.deezer_artist_id = None
+
+    release = types.SimpleNamespace(
+        id="dz-release-9",
+        name="Forced Release",
+        release_date=_RECENT_RELEASE_DATE,
+        album_type="album",
+        image_url="https://example.com/forced-release.jpg",
+    )
+    deezer_client = _FakeSourceClient(
+        artist_id="dz-artist",
+        albums=[release],
+        image_url="https://example.com/forced-artist.jpg",
+        album_payload={
+            "id": "dz-release-9",
+            "name": "Forced Release",
+            "images": [{"url": "https://example.com/forced-release.jpg"}],
+            "release_date": _RECENT_RELEASE_DATE,
+            "popularity": 10,
+            "tracks": {"items": [{"id": "dz-track-9", "name": "Forced Track", "artists": [{"name": "Forced Artist"}], "duration_ms": 180000}]},
+            "artists": [{"id": "dz-artist"}],
+        },
+    )
+    monkeypatch.setattr(watchlist_scanner_module, "get_client_for_source",
+                        lambda source: {"deezer": deezer_client}.get(source))
+
+    scanner = _build_scanner({"tracks": {"items": []}}, [artist])
+    gate_calls = []
+    scanner.database.should_populate_discovery_pool = (
+        lambda hours_threshold=6, profile_id=1: gate_calls.append(hours_threshold) or False)
+
+    scanner.update_discovery_pool_incremental(profile_id=1, force=True)
+
+    assert gate_calls == []  # forced: the cooldown gate is never consulted
+    assert scanner.database.discovery_pool_calls
+    assert scanner.database.discovery_pool_calls[0][0]["deezer_track_id"] == "dz-track-9"
+    assert deezer_client.album_calls
+
+
 def test_curate_discovery_playlists_uses_source_priority_for_recent_albums(monkeypatch):
     monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ARTISTS", 0)
     monkeypatch.setattr(watchlist_scanner_module, "get_primary_source", lambda: "deezer")
@@ -1277,135 +1355,3 @@ def test_scan_records_per_run_track_ledger(monkeypatch):
     assert events[0]["artist_name"] == "Artist One"
     # The 10-item live FIFO only carries the ADDED one, as before.
     assert [a["track_name"] for a in scan_state["recent_wishlist_additions"]] == ["Added Track"]
-
-
-# ---------------------------------------------------------------------------
-# Prefer deluxe editions (wishlist.prefer_deluxe_editions)
-# ---------------------------------------------------------------------------
-
-def _set_config(monkeypatch, **values):
-    import config.settings as settings_module
-    monkeypatch.setattr(settings_module.config_manager, "get",
-                        lambda key, default=None: values.get(key, default))
-
-
-def _albums_checked_in_a_scan(monkeypatch, *, prefer):
-    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ARTISTS", 0)
-    monkeypatch.setattr(watchlist_scanner_module, "DELAY_BETWEEN_ALBUMS", 0)
-    _set_config(monkeypatch, **{"wishlist.prefer_deluxe_editions": prefer})
-
-    artist = _build_artist()
-    standard = types.SimpleNamespace(id="std", name="Curtain Call: The Hits", total_tracks=15)
-    deluxe = types.SimpleNamespace(id="dlx", name="Curtain Call: The Hits (Deluxe Edition)",
-                                   total_tracks=24)
-    song = {"id": "track-1", "name": "Stan", "track_number": 1, "disc_number": 1,
-            "artists": [{"name": "Artist One"}]}
-    album_data = {album.id: {"name": album.name, "images": [], "tracks": {"items": [song]}}
-                  for album in (standard, deluxe)}
-    scanner = _build_scanner(album_data["std"], [artist])
-    scanner._database.has_fresh_similar_artists = lambda *args, **kwargs: False
-    monkeypatch.setattr(scanner.metadata_service, "get_album", lambda album_id: album_data[album_id])
-
-    checked = []
-    monkeypatch.setattr(scanner, "_backfill_missing_ids", lambda *a, **k: None)
-    monkeypatch.setattr(scanner, "get_artist_image_url", lambda *a, **k: "https://example.com/a.jpg")
-    monkeypatch.setattr(scanner, "get_artist_discography_for_watchlist", lambda *a, **k: [standard, deluxe])
-    monkeypatch.setattr(scanner, "_get_lookback_period_setting", lambda: "30")
-    monkeypatch.setattr(scanner, "_get_rescan_cutoff", lambda: None)
-    monkeypatch.setattr(scanner, "_should_include_release", lambda *a, **k: True)
-    monkeypatch.setattr(scanner, "_should_include_track", lambda *a, **k: True)
-    monkeypatch.setattr(scanner, "is_track_missing_from_library",
-                        lambda track, album_name=None, album_track_count=None:
-                        checked.append(album_name) and False)
-    monkeypatch.setattr(scanner, "add_track_to_wishlist", lambda *a, **k: True)
-    monkeypatch.setattr(scanner, "update_artist_scan_timestamp", lambda *a, **k: True)
-    monkeypatch.setattr(scanner, "update_similar_artists", lambda *a, **k: True)
-    monkeypatch.setattr(scanner, "_backfill_similar_artists_fallback_ids", lambda *a, **k: 0)
-
-    scanner.scan_watchlist_artists([artist], scan_state={})
-    return checked
-
-
-def test_a_scan_with_both_editions_checks_only_the_deluxe(monkeypatch):
-    assert _albums_checked_in_a_scan(monkeypatch, prefer=True) == [
-        "Curtain Call: The Hits (Deluxe Edition)"]
-
-
-def test_without_prefer_deluxe_a_scan_checks_both_editions(monkeypatch):
-    assert _albums_checked_in_a_scan(monkeypatch, prefer=False) == [
-        "Curtain Call: The Hits", "Curtain Call: The Hits (Deluxe Edition)"]
-
-
-class _EditionLibrary:
-    """One owned song, on the album given; the per-track check's view of the library."""
-
-    def __init__(self, album_title, album_size):
-        self.album_title = album_title
-        self.album_size = album_size
-
-    def check_track_exists(self, title, artist, confidence_threshold=0.7, server_source=None,
-                           album=None, **kwargs):
-        if title != "Stan":
-            return (None, 0.0)
-        return (types.SimpleNamespace(album_id=7, album_title=self.album_title), 0.95)
-
-    def get_tracks_by_album(self, album_id):
-        return [object()] * self.album_size
-
-    def get_album_title_year(self, album_id):
-        return (self.album_title, 2005)
-
-
-def _missing_for_the_deluxe(monkeypatch, *, prefer, allow_duplicates, owned_album, owned_size,
-                            external_id_match=False):
-    import core.library.track_identity as track_identity
-
-    _set_config(monkeypatch, **{"wishlist.prefer_deluxe_editions": prefer,
-                                "wishlist.allow_duplicate_tracks": allow_duplicates})
-    monkeypatch.setattr(watchlist_scanner_module, "get_primary_source", lambda: "spotify")
-    owned = {"album_id": 7, "album_title": owned_album}
-    monkeypatch.setattr(track_identity, "extract_external_ids",
-                        lambda track, source_hint=None: {"isrc": "USIR10000001"} if external_id_match else {})
-    monkeypatch.setattr(track_identity, "find_library_track_by_external_id",
-                        lambda db, external_ids=None, server_source=None: owned if external_id_match else None)
-    monkeypatch.setattr(track_identity, "find_provenance_by_external_id",
-                        lambda db, external_ids=None: None)
-
-    scanner = _build_scanner({}, [])
-    scanner._database = _EditionLibrary(owned_album, owned_size)
-    scanner._matching_engine = types.SimpleNamespace(clean_title=lambda title: title)
-    track = {"name": "Stan", "artists": [{"name": "Eminem"}]}
-    return scanner.is_track_missing_from_library(
-        track, album_name="Curtain Call: The Hits (Deluxe Edition)", album_track_count=24)
-
-
-def test_prefer_deluxe_treats_a_standard_copy_as_missing_for_the_deluxe(monkeypatch):
-    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=True,
-                                   owned_album="Curtain Call: The Hits", owned_size=15) is True
-
-
-def test_without_prefer_deluxe_the_standard_copy_owns_the_song(monkeypatch):
-    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=True,
-                                   owned_album="Curtain Call: The Hits", owned_size=15) is False
-
-
-def test_prefer_deluxe_applies_with_duplicates_off(monkeypatch):
-    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=False,
-                                   owned_album="Curtain Call: The Hits", owned_size=15) is True
-    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=False,
-                                   owned_album="Curtain Call: The Hits", owned_size=15) is False
-
-
-def test_prefer_deluxe_applies_to_an_external_id_match(monkeypatch):
-    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=False,
-                                   owned_album="Curtain Call: The Hits", owned_size=15,
-                                   external_id_match=True) is True
-    assert _missing_for_the_deluxe(monkeypatch, prefer=False, allow_duplicates=False,
-                                   owned_album="Curtain Call: The Hits", owned_size=15,
-                                   external_id_match=True) is False
-
-
-def test_a_copy_on_the_deluxe_itself_still_owns_the_song(monkeypatch):
-    assert _missing_for_the_deluxe(monkeypatch, prefer=True, allow_duplicates=True,
-                                   owned_album="Curtain Call: The Hits (Deluxe Edition)",
-                                   owned_size=24) is False

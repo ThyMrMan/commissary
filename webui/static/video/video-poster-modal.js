@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Poster Manager (full-screen modal).
+ * SoulSync — Video Poster Manager (full-screen modal).
  *
  * Two entry points, one engine:
  *   VideoPoster.open({kind, tmdbId, libraryId, title, year})  — focused version,
@@ -26,7 +26,7 @@
     // ── one-time styles (kept off the shared 4k-line CSS; mirrors the get-modal) ─
     function ensureStyles() {
         if (document.getElementById('vpm-styles')) return;
-        var A = 'var(--accent-rgb, 88 101 242)';
+        var A = 'var(--accent-rgb)';
         var css =
             '.vpm-overlay{position:fixed;inset:0;z-index:9200;display:flex;align-items:center;justify-content:center;' +
                 'padding:24px;background:rgba(5,5,8,.74);backdrop-filter:blur(10px);opacity:0;transition:opacity .22s ease;}' +
@@ -456,16 +456,8 @@
     }
 
     // ── public API ─────────────────────────────────────────────────────────────
-    // Setting a poster is admin-only (/api/video/poster/set), so both entries are
-    // gated here as well as behind their hidden launchers — defense in depth, the
-    // same shape the dashboard's studio launchers use.
-    function _isAdmin() {
-        return (typeof currentProfile === 'undefined') || !currentProfile ||
-            !!currentProfile.is_admin || currentProfile.id === 1;
-    }
     // Focused entry (detail page): item already known → straight to the grid.
     function open(opts) {
-        if (!_isAdmin()) return;
         if (!opts || !opts.kind) return;
         var kind = kindSingular(opts.kind);
         if (!opts.tmdbId) { toast("No TMDB match — can't fetch alternate posters", 'info'); return; }
@@ -477,7 +469,7 @@
         loadPosters();
     }
     // Full manager entry (dashboard quick action).
-    function openSearch() { if (!_isAdmin()) return; build('search'); }
+    function openSearch() { build('search'); }
 
     window.VideoPoster = { open: open, openSearch: openSearch, close: close };
 })();

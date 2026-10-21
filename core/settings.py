@@ -1,0 +1,1497 @@
+import copy
+import json
+import os
+import sqlite3
+import time
+from typing import Dict, Any, Optional
+from cryptography.fernet import Fernet, InvalidToken
+from pathlib import Path
+from core.imports.album_types import (
+    DEFAULT_BRACKET as _ATYPE_DEFAULT_BRACKET,
+    DEFAULT_IGNORE_VA as _ATYPE_DEFAULT_IGNORE_VA,
+    DEFAULT_TYPES as _ATYPE_DEFAULT_TYPES,
+)
+from utils.logging_config import get_logger
+
+
+def default_sample_paths() -> list:
+    """Fresh-install default for ``library.sample_paths`` (Docker-aware).
+
+    Kept module-level so core/sample/folders.py can reuse the same default
+    for installs whose stored config predates the key (no deep-merge of
+    defaults happens on load — see ConfigManager._load_config).
+    """
+    is_docker = os.path.exists("/.dockerenv") or os.environ.get("SOULSYNC_IN_DOCKER", "").lower() in ("1", "true", "yes")
+    return ["/app/samples"] if is_docker else ["./samples"]
+
+
+logger = get_logger("config")
+
+class ConfigManager:
+    _VALID_LOG_LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"})
+
+    def __init__(self, config_path: str = "config/config.json"):
+        # Determine strict absolute path to settings.py directory to help resolve config.json
+        # This handles cases where CWD is different (e.g. running from /Users vs /Users/project)
+        self.base_dir = Path(__file__).parent.parent.absolute()
+        
+        # Check for environment variable override first (Unified logic with web_server.py)
+        env_config_path = os.environ.get('SOULSYNC_CONFIG_PATH')
+        if env_config_path:
+            config_path = env_config_path
+        
+        # Resolve config path
+        if os.path.isabs(config_path):
+            self.config_path = Path(config_path)
+        else:
+            # Try to resolve relative to CWD first (legacy behavior), then relative to project root
+            cwd_path = Path(config_path)
+            project_path = self.base_dir / config_path
+            
+            if cwd_path.exists():
+                self.config_path = cwd_path.absolute()
+            elif project_path.exists():
+                self.config_path = project_path
+            else:
+                # Default to project path even if it doesn't exist yet (for creation/fallback)
+                self.config_path = project_path
+
+        logger.info(f"ConfigManager initialized with path: {self.config_path}")
+        
+        self.config_data: Dict[str, Any] = {}
+        self._fernet: Optional[Fernet] = None
+        
+        # Use DATABASE_PATH env var, fallback to database/music_library.db
+        db_path_env = os.environ.get('DATABASE_PATH')
+        if db_path_env:
+             self.database_path = Path(db_path_env)
+        else:
+             self.database_path = self.base_dir / "database" / "music_library.db"
+             
+        logger.info(f"Database path set to: {self.database_path}")
+             
+        self.load_config(str(self.config_path))
+
+    def load_config(self, config_path: str = None):
+        """
+        Load configuration from database or file.
+        Can be called to reload settings into the existing instance.
+        """
+        if config_path:
+            self.config_path = Path(config_path)
+        
+        self._load_config()
+
+    # Placeholder shipped to the browser in place of a configured secret
+    # (#832 follow-up). The settings UI shows it as masked dots; if it's
+    # round-tripped back on save, ``set()`` treats it as "keep existing" so the
+    # real value is never overwritten by the mask.
+    REDACTED_SENTINEL = '__redacted_unchanged__'
+
+    # Dot-notation paths to sensitive config values that must be encrypted at rest.
+    # Paths pointing to dicts encrypt the entire dict as a JSON blob.
+    _SENSITIVE_PATHS = frozenset({
+        # Spotify
+        'spotify.client_id',
+        'spotify.client_secret',
+        # Tidal
+        'tidal.client_id',
+        'tidal.client_secret',
+        'tidal_tokens',              # full dict (access/refresh tokens)
+        'tidal_download.session',    # full dict (access/refresh/expiry)
+        # Qobuz
+        'qobuz.session',             # full dict (app_id, app_secret, user_auth_token)
+        # Media servers
+        'plex.token',
+        'jellyfin.api_key',
+        'navidrome.password',
+        # Download sources
+        'soulseek.api_key',
+        'deezer_download.arl',
+        'lidarr_download.api_key',
+        'prowlarr.api_key',
+        'torrent_client.password',
+        'usenet_client.api_key',
+        'usenet_client.password',
+        # Enrichment services
+        'listenbrainz.token',
+        'acoustid.api_key',
+        'lastfm.api_key',
+        'lastfm.api_secret',
+        'lastfm.session_key',
+        'genius.access_token',
+        # Deezer OAuth
+        'deezer.app_id',
+        'deezer.app_secret',
+        'deezer.access_token',
+        # Other
+        'hydrabase.api_key',
+        'discogs.token',
+    })
+
+    def _get_fernet(self) -> Fernet:
+        """Return a cached Fernet instance, creating the key file if needed."""
+        if self._fernet is not None:
+            return self._fernet
+        key_file = self.database_path.parent / ".encryption_key"
+        # Migrate key from old location (config/) to new location (database/)
+        old_key_file = self.config_path.parent / ".encryption_key"
+        if not key_file.exists() and old_key_file.exists():
+            try:
+                import shutil
+                shutil.move(str(old_key_file), str(key_file))
+                logger.info(f"Moved encryption key to {key_file}")
+            except Exception:
+                key_file = old_key_file  # Fall back to old location
+        if key_file.exists():
+            with open(key_file, 'rb') as f:
+                key = f.read()
+        else:
+            key = Fernet.generate_key()
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(key_file, 'wb') as f:
+                f.write(key)
+            try:
+                key_file.chmod(0o600)
+            except OSError:
+                pass  # Windows may not support Unix permissions
+        self._fernet = Fernet(key)
+        return self._fernet
+
+    def _encrypt_value(self, value) -> str:
+        """Encrypt a config value (string or dict/list) into a Fernet token string."""
+        f = self._get_fernet()
+        if isinstance(value, (dict, list)):
+            plaintext = json.dumps(value)
+        else:
+            plaintext = str(value)
+        return f.encrypt(plaintext.encode('utf-8')).decode('ascii')
+
+    def _decrypt_value(self, value):
+        """Decrypt a Fernet token string back to the original value.
+        If value is not encrypted (migration), returns it unchanged."""
+        if not isinstance(value, str):
+            return value
+        # Fernet tokens always start with 'gAAAAA'
+        if not value.startswith('gAAAAA'):
+            return value
+        try:
+            f = self._get_fernet()
+            decrypted = f.decrypt(value.encode('ascii')).decode('utf-8')
+            # Only parse JSON for dicts/lists (starts with { or [).
+            # Plain strings (including numeric ones like API keys) stay as strings.
+            if decrypted and decrypted[0] in ('{', '['):
+                try:
+                    return json.loads(decrypted)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            return decrypted
+        except InvalidToken:
+            # Key mismatch — encrypted with a different key (key file deleted/replaced)
+            logger.error(
+                "Failed to decrypt a config value — encryption key may have changed. "
+                "Re-enter credentials in Settings or restore the original .encryption_key file."
+            )
+            return value
+        except Exception:
+            return value
+
+    def _encrypt_sensitive(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a deep copy of config_data with sensitive values encrypted."""
+        encrypted = copy.deepcopy(config_data)
+        for path in self._SENSITIVE_PATHS:
+            keys = path.split('.')
+            # Navigate to the parent
+            parent = encrypted
+            for k in keys[:-1]:
+                if isinstance(parent, dict) and k in parent:
+                    parent = parent[k]
+                else:
+                    parent = None
+                    break
+            if parent is None or not isinstance(parent, dict):
+                continue
+            leaf = keys[-1]
+            if leaf not in parent:
+                continue
+            value = parent[leaf]
+            # Skip empty values (no point encrypting empty strings/dicts)
+            if not value and value != 0:
+                continue
+            # Skip already-encrypted values (idempotent)
+            if isinstance(value, str) and value.startswith('gAAAAA'):
+                continue
+            parent[leaf] = self._encrypt_value(value)
+        return encrypted
+
+    def _decrypt_sensitive(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Decrypt sensitive values in-place and return the config dict."""
+        for path in self._SENSITIVE_PATHS:
+            keys = path.split('.')
+            parent = config_data
+            for k in keys[:-1]:
+                if isinstance(parent, dict) and k in parent:
+                    parent = parent[k]
+                else:
+                    parent = None
+                    break
+            if parent is None or not isinstance(parent, dict):
+                continue
+            leaf = keys[-1]
+            if leaf not in parent:
+                continue
+            parent[leaf] = self._decrypt_value(parent[leaf])
+        return config_data
+
+    def _migrate_encrypt_if_needed(self):
+        """Re-save config to encrypt any plaintext sensitive values still in the DB."""
+        try:
+            # Read raw DB content to check if any sensitive value is still plaintext
+            conn = self._connect_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'app_config'")
+            row = cursor.fetchone()
+            conn.close()
+            if not row or not row[0]:
+                return
+            raw = json.loads(row[0])
+            needs_migration = False
+            for path in self._SENSITIVE_PATHS:
+                keys = path.split('.')
+                parent = raw
+                for k in keys[:-1]:
+                    if isinstance(parent, dict) and k in parent:
+                        parent = parent[k]
+                    else:
+                        parent = None
+                        break
+                if parent is None or not isinstance(parent, dict):
+                    continue
+                leaf = keys[-1]
+                if leaf not in parent:
+                    continue
+                value = parent[leaf]
+                if not value and value != 0:
+                    continue
+                # If the value is NOT a Fernet token, it's still plaintext
+                if not (isinstance(value, str) and value.startswith('gAAAAA')):
+                    needs_migration = True
+                    break
+            if needs_migration:
+                logger.info("Encrypting sensitive config values at rest...")
+                self._save_to_database(self.config_data)
+                logger.info("Sensitive config values encrypted successfully")
+        except Exception as e:
+            logger.warning(f"Could not migrate encryption: {e}")
+
+    def _connect_db(self) -> sqlite3.Connection:
+        """Open a configured SQLite connection for the config DB.
+
+        Centralizes pragma setup so every connection gets WAL mode,
+        a 30s busy timeout, and synchronous=NORMAL (the safe pairing
+        with WAL that avoids unnecessary fsyncs on slow disks).
+        """
+        conn = sqlite3.connect(str(self.database_path), timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _ensure_database_exists(self):
+        """Ensure database file and metadata table exist"""
+        try:
+            # Create database directory if it doesn't exist
+            self.database_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # Connect to database (creates file if it doesn't exist)
+            conn = self._connect_db()
+            cursor = conn.cursor()
+
+            # Create metadata table if it doesn't exist
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Could not ensure database exists: {e}")
+
+    def _load_from_database(self) -> tuple:
+        """Load configuration from database, decrypting sensitive values.
+
+        Returns ``(config_data, load_error)``. The two None cases are NOT
+        the same thing and must never be collapsed: ``(None, False)`` means
+        the row is POSITIVELY absent (fresh install — safe to write
+        defaults), while ``(None, True)`` means the row could not be read
+        (locked DB, I/O error, corrupt blob). Treating "unreadable" as
+        "absent" is how issue #1137 destroyed a user's whole config: the
+        loader regenerated defaults and INSERT OR REPLACE'd them over the
+        real row that one transient failure had hidden.
+        """
+        conn = None
+        try:
+            self._ensure_database_exists()
+
+            conn = self._connect_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'app_config'")
+            row = cursor.fetchone()
+
+            if row and row[0]:
+                try:
+                    config_data = json.loads(row[0])
+                except Exception as e:
+                    # The row EXISTS but its JSON is broken — preserve the
+                    # evidence where no later write can destroy it, and
+                    # report an error, never an absence.
+                    logger.error(f"Config row exists but is unreadable JSON: {e}")
+                    self._quarantine_corrupt_blob(row[0])
+                    return None, True
+                # Decrypt sensitive values (gracefully handles plaintext migration)
+                config_data = self._decrypt_sensitive(config_data)
+                logger.info("Configuration loaded from database")
+                return config_data, False
+            else:
+                return None, False
+
+        except Exception as e:
+            logger.warning(f"Could not load config from database: {e}")
+            return None, True
+        finally:
+            if conn:
+                conn.close()
+
+    def _quarantine_corrupt_blob(self, raw: str) -> None:
+        """Copy an unreadable config blob next to config.json before anything
+        else runs — whatever is recoverable from it stays recoverable."""
+        try:
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            path = self.config_path.parent / f"config.corrupt-{stamp}.json"
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(str(raw))
+            logger.error(f"Unreadable config blob preserved at {path}")
+        except Exception as e:
+            logger.error(f"Could not quarantine corrupt config blob: {e}")
+
+    def _load_stored_log_level(self) -> Optional[str]:
+        """Load the persisted UI log level preference, if one exists."""
+        conn = None
+        try:
+            self._ensure_database_exists()
+            conn = self._connect_db()
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM metadata WHERE key = 'log_level'")
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return None
+
+            level = str(row[0]).upper()
+            if level not in self._VALID_LOG_LEVELS:
+                logger.warning(f"Ignoring invalid stored log level: {row[0]}")
+                return None
+            return level
+        except Exception as e:
+            logger.warning(f"Could not load stored log level from database: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+
+    def _load_env_log_level(self) -> Optional[str]:
+        """Load the log level override from the environment, if one exists."""
+        raw_level = os.environ.get("SOULSYNC_LOG_LEVEL")
+        if not raw_level:
+            return None
+
+        level = raw_level.upper()
+        if level not in self._VALID_LOG_LEVELS:
+            logger.warning(f"Ignoring invalid SOULSYNC_LOG_LEVEL value: {raw_level}")
+            return None
+
+        return level
+
+    def _apply_log_level_overrides(self, config_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Overlay env and persisted log level preferences onto the loaded config."""
+        env_level = self._load_env_log_level()
+        if env_level:
+            config_data.setdefault("logging", {})["level"] = env_level
+            logger.info(f"Using log level from SOULSYNC_LOG_LEVEL: {env_level}")
+            return config_data
+
+        stored_level = self._load_stored_log_level()
+        if stored_level:
+            config_data.setdefault("logging", {})["level"] = stored_level
+            logger.info(f"Using stored logging level from database: {stored_level}")
+        return config_data
+
+    def _save_to_database(self, config_data: Dict[str, Any]) -> bool:
+        """Save configuration to database, encrypting sensitive values.
+
+        Returns ``True`` on success. Transient ``database is locked``
+        failures are logged at DEBUG so the caller's retry loop owns the
+        user-visible error message — otherwise every retry would spam
+        ERROR-level logs even when the next attempt succeeds.
+        """
+        conn = None
+        try:
+            self._ensure_database_exists()
+
+            # Encrypt sensitive values before writing (original dict is untouched)
+            encrypted_data = self._encrypt_sensitive(config_data)
+
+            conn = self._connect_db()
+            cursor = conn.cursor()
+
+            config_json = json.dumps(encrypted_data, indent=2)
+            cursor.execute("""
+                INSERT OR REPLACE INTO metadata (key, value, updated_at)
+                VALUES ('app_config', ?, CURRENT_TIMESTAMP)
+            """, (config_json,))
+
+            conn.commit()
+            return True
+
+        except sqlite3.OperationalError as e:
+            # SQLite raises OperationalError("database is locked") when the
+            # busy_timeout expires while another writer holds the lock.
+            # Log at DEBUG so the caller can decide whether the final
+            # outcome warrants an ERROR-level message.
+            if "locked" in str(e).lower():
+                logger.debug(f"Config DB locked, will retry: {e}")
+            else:
+                logger.error(f"Could not save config to database: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Could not save config to database: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def _load_from_config_file(self) -> Optional[Dict[str, Any]]:
+        """Load configuration from config.json file (for migration)"""
+        try:
+            if self.config_path.exists():
+                with open(self.config_path, 'r') as f:
+                    config_data = json.load(f)
+                    logger.info(f"Configuration loaded from {self.config_path}")
+                    return config_data
+            else:
+                return None
+        except Exception as e:
+            logger.warning(f"Could not load config from file: {e}")
+            return None
+
+    def _get_default_config(self) -> Dict[str, Any]:
+        """Get default configuration"""
+        is_docker = os.path.exists("/.dockerenv") or os.environ.get("SOULSYNC_IN_DOCKER", "").lower() in ("1", "true", "yes")
+        default_podcast_path = "/app/podcasts" if is_docker else "./podcasts"
+        default_audiobook_path = "/app/audiobooks" if is_docker else "./audiobooks"
+        return {
+            "active_media_server": "plex",
+            "spotify": {
+                "client_id": "",
+                "client_secret": "",
+                "redirect_uri": "http://127.0.0.1:8888/callback"
+            },
+            "tidal": {
+                "client_id": "",
+                "client_secret": "",
+                "redirect_uri": "http://127.0.0.1:8889/tidal/callback"
+            },
+            "plex": {
+                "base_url": "",
+                "token": "",
+                "auto_detect": True,
+                # Read timeout (seconds) for every Plex HTTP request. A deep
+                # scan enumerates the whole library in 100-item pages (plexapi
+                # batches internally); on a big library or a slow/remote server
+                # a single page can exceed the old hard-coded 15s and the scan
+                # died with "0 artists". 30s gives large libraries room without
+                # making a genuinely-dead server hang too long.
+                "request_timeout_seconds": 30,
+                # How many times a bulk library enumeration (artists / albums /
+                # tracks) is retried on a transient failure before giving up.
+                # plexapi has no per-page retry — one slow page used to zero the
+                # whole scan. 0 disables retries (original behavior).
+                "scan_retries": 2,
+            },
+            "jellyfin": {
+                "base_url": "",
+                "api_key": "",
+                "auto_detect": True
+            },
+            "navidrome": {
+                "base_url": "",
+                "username": "",
+                "password": "",
+                "auto_detect": True
+            },
+            "soulseek": {
+                "slskd_url": "",
+                "api_key": "",
+                "download_path": "./downloads",
+                "transfer_path": "./Transfer",
+                "max_peer_queue": 0,
+                # Measured transfer speed, not the peer's advertised upload
+                # speed. Opt in explicitly; 0 also disables fallback.
+                "observed_speed_fallback_enabled": False,
+                "min_observed_download_speed_kbps": 250,
+                "download_timeout": 600,
+                # Reddit report (YeloMelo95, Bell Canada): the existing
+                # 35-per-220s sliding-window cap allows all 35 searches in
+                # rapid succession before throttling — that burst trips ISP
+                # anti-abuse. This knob forces a min gap between consecutive
+                # searches even when the window cap isn't hit. 0 = disabled
+                # (preserves prior behavior).
+                "search_min_delay_seconds": 0,
+                # Refuse new downloads when the download disk has less than
+                # this many GB free (0 = off). A fresh LXC install left on the
+                # default paths otherwise fills its 8GB root until it hangs.
+                "min_free_disk_gb": 5.0,
+                # 'own' touches only transfers/searches this client created
+                # when cleaning slskd (it may be shared with Lidarr's slskd
+                # plugin or another SoulSync). 'all' clears every client's
+                # state, the pre-#1499 behavior for single-client installs.
+                "cleanup_scope": "own",
+            },
+            "download_source": {
+                "max_mb_per_minute": 0,  # Optional advertised music size limit; 0 = off
+                "mode": "soulseek",  # Options: "soulseek", "youtube", "tidal", "qobuz", "hifi", "hybrid", "torrent", "usenet"
+                "hybrid_primary": "soulseek",  # Legacy: primary source for hybrid mode
+                "hybrid_secondary": "youtube",  # Legacy: fallback source for hybrid mode
+                "hybrid_order": [],  # Ordered list of sources for hybrid mode (overrides primary/secondary)
+                "stream_source": "youtube",  # Options: "youtube" (instant, default), "active" (use download source; falls back to youtube if soulseek), "deezer_preview" (30s deezer clip, youtube when there is none)
+                # Album-bundle (torrent / usenet single-source) poll tuning.
+                # Downloader is polled every N seconds until the release
+                # lands; whole job aborts at the timeout. Defaults match
+                # the previous hard-coded constants. Users on slow private
+                # trackers / large box sets can extend the timeout without
+                # editing source.
+                "album_bundle_poll_interval_seconds": 2.0,
+                "album_bundle_timeout_seconds": 6 * 60 * 60,    # 6 hours
+                # Stalled-torrent handling (noldevin): abandon a torrent that
+                # makes zero download progress for this long (dead magnet
+                # stuck on "downloading metadata", no seeders) instead of
+                # holding the worker for the full album timeout. 0 disables.
+                "torrent_stall_timeout_seconds": 10 * 60,       # 10 minutes
+                # What to do when a torrent stalls: "abandon" (remove it +
+                # its partial data, fail the download so the next source can
+                # try) or "pause" (pause in the client, leave for the user).
+                "torrent_stall_action": "abandon",
+                # Minimum indexer-reported seeders before a torrent is queued
+                # at all (#1139). Picking the "most seeded" release still picks
+                # a dead one when the whole field is on zero, and the grab then
+                # occupies the queue until the poll deadline. Releases that
+                # report NO seeder count (usenet, and indexers that omit the
+                # field) are never gated by this. 0 disables.
+                "torrent_min_seeders": 1,
+                # Where THIS container can read completed torrent/usenet
+                # downloads (#857). The downloader (qBit/SAB) reports a save
+                # path from inside ITS OWN container — often a category folder
+                # like /data/downloads/music — which may be mounted at a
+                # different point here. Set these to the in-container path(s)
+                # where SoulSync sees those finished downloads; the resolver
+                # then finds the release by name under them. Empty = fall back
+                # to the soulseek download/transfer dirs (the shared-volume
+                # default). See core.download_plugins.album_bundle.resolve_reported_save_path.
+                "torrent_download_path": "",
+                "usenet_download_path": "",
+                # Explicit remote→local prefix mappings for non-shared / oddly
+                # mounted layouts (Sonarr/Radarr "Remote Path Mapping" style):
+                # a list of {"from": "<client path>", "to": "<soulsync path>"}.
+                # Tried before the basename fallback above.
+                "usenet_path_mappings": [],
+            },
+            "post_processing": {
+                # Tier-2 integrity: fully decode each downloaded FLAC with
+                # `flac -t` (frames + MD5). Off by default: a full decode per
+                # file. See core/imports/file_integrity.py.
+                "verify_flac_decode": False,
+                # When a download is quarantined (AcoustID mismatch, integrity /
+                # duration failure), retry the next-best candidate instead of
+                # failing outright. Default ON (PR #801's documented default —
+                # the monitor reads this with inline default True; this template
+                # said False, so fresh installs silently shipped with the retry
+                # engine off while existing configs got it on. CI caught the
+                # split: its fresh default config failed all 7 requeue tests).
+                "retry_next_candidate_on_mismatch": True,
+                # Opt-in exhaustive retry: budget retries PER SOURCE so every
+                # source (Soulseek, then HiFi/Tidal/…) gets its own attempts
+                # before the track gives up. Default off (single global cap).
+                "retry_exhaustive": False,
+                # Retries per search query per source in exhaustive mode. The
+                # per-source budget is query_count × this value.
+                "retries_per_query": 5,
+            },
+            "tidal_download": {
+                "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
+                "session": {
+                    "token_type": "",
+                    "access_token": "",
+                    "refresh_token": "",
+                    "expiry_time": 0
+                }
+            },
+            "qobuz": {
+                "quality": "lossless",  # Options: "mp3", "lossless", "hires", "hires_max"
+                "session": {
+                    "app_id": "",
+                    "app_secret": "",
+                    "user_auth_token": ""
+                }
+            },
+            "hifi_download": {
+                "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
+            },
+            "hifi": {
+                "embed_tags": True,
+                "tags": {
+                    "track_id": True,
+                    "artist_id": True,
+                    "isrc": True,
+                    "bpm": True,
+                    "copyright": True,
+                }
+            },
+            "lidarr_download": {
+                "url": "",
+                "api_key": "",
+                "root_folder": "",
+                "quality_profile": "Any",
+                "cleanup_after_import": True,
+            },
+            # Prowlarr — indexer aggregator. Feeds the torrent / usenet
+            # download plugins. Not a standalone source.
+            "prowlarr": {
+                "url": "",
+                "api_key": "",
+                # Comma-separated list of indexer IDs to limit searches to.
+                # Empty = search all enabled indexers.
+                "indexer_ids": "",
+                # Pacing, shared by music AND video (core.prowlarr_throttle).
+                # Prowlarr forwards every search straight to your indexers and
+                # shields them from nothing, so this is the only thing standing
+                # between a long wishlist drain and an indexer that stops
+                # answering. The arr stack paces its indexer queries; we have to
+                # be at least as well behaved.
+                # 0 on either knob disables that half of the budget.
+                "search_min_gap_seconds": 2.0,
+                "max_searches_per_minute": 20,
+            },
+            # Torrent client — receives .torrent / magnet URIs from the
+            # torrent download plugin. ``type`` picks which adapter to
+            # instantiate (qbittorrent | transmission | deluge).
+            "torrent_client": {
+                "type": "qbittorrent",
+                "url": "",
+                "username": "",
+                "password": "",
+                "category": "soulsync",
+                "save_path": "",
+                # Seeding lifecycle (mirror of the video side): seed a completed
+                # music torrent grab until the ratio/time goal is met, then remove
+                # it from the client. BOTH goals default 0 = sweep OFF = grabs seed
+                # forever (unchanged behavior). seed_remove_data also deletes the
+                # client's own copy on removal — the imported library file is a
+                # separate copy and is never touched.
+                "seed_ratio_goal": 0,
+                "seed_time_goal_hours": 0,
+                "seed_remove_data": True,
+                # Who enforces the seed goal above: "soulsync" (default) = the
+                # seeding sweep polls the client and removes when the goal is met;
+                # "client" = write the ratio/time limit straight into the torrent
+                # client (arr-style) and let it enforce, shown in its share-limit UI.
+                "seed_mode": "soulsync",
+            },
+            # Usenet client — receives .nzb URLs / payloads. ``type``
+            # picks the adapter (sabnzbd | nzbget). SABnzbd uses an
+            # API key; NZBGet uses username + password.
+            "usenet_client": {
+                "type": "sabnzbd",
+                "url": "",
+                "api_key": "",
+                "username": "",
+                "password": "",
+                "category": "soulsync",
+            },
+            "soundcloud_download": {
+                # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
+                # added later, with credentials living under a "session" subkey
+                # alongside Tidal/Qobuz. No quality knob: anonymous SoundCloud
+                # caps at the upload's transcoding (typically 128 kbps MP3 or
+                # AAC). yt-dlp resolves bestaudio at download time.
+            },
+            "listenbrainz": {
+                "base_url": "",
+                "token": "",
+                "scrobble_enabled": False
+            },
+            "acoustid": {
+                "api_key": "",
+                "enabled": False  # Disabled by default - requires API key and fpcalc
+            },
+            "lastfm": {
+                "api_key": "",
+                "api_secret": "",
+                "session_key": "",
+                "scrobble_enabled": False,
+                "username": "",
+                "listening_sync_enabled": False,
+                "tags": {
+                    # #1513: when no genre source yields a genre, fall back to
+                    # the artist's Last.fm top tags. opt-in, off by default.
+                    # Requires metadata_enhancement.tags.genre_merge to be on
+                    # (the fallback hooks into the genre-merge block).
+                    "artist_genre_fallback": False,
+                }
+            },
+            "genius": {
+                "access_token": ""
+            },
+            # Two providers answering two different questions: Ticketmaster for
+            # upcoming dates, Setlist.fm for what was actually played. Both
+            # optional and independent - most people set up one or neither.
+            # (Bandsintown would have been the better fit for the first half but
+            # only issues keys to partner organizations.)
+            "concerts": {
+                "ticketmaster_api_key": "",
+                "setlistfm_api_key": "",
+                # two-letter country for the discover inbox's concerts. empty
+                # means anywhere; artist pages always show every date.
+                "country": ""
+            },
+            "logging": {
+                "path": "logs/app.log",
+                "level": "INFO"
+            },
+            "database": {
+                "path": os.environ.get('DATABASE_PATH', 'database/music_library.db'),
+                "max_workers": 5
+            },
+            "image_cache": {
+                "enabled": True,
+                "path": "storage/image_cache",
+                "ttl_seconds": 2592000,
+                "failed_ttl_seconds": 21600,
+                "max_download_mb": 15
+            },
+            "metadata_enhancement": {
+                "enabled": True,
+                "embed_album_art": True,
+                "post_process_order": ["musicbrainz", "deezer", "audiodb", "tidal", "qobuz", "lastfm", "genius"],
+                # Ordered preferred cover-art sources (empty = use the
+                # download's own art, i.e. today's behavior). Resolved + walked
+                # with fallback by core/metadata/art_sources.py.
+                "album_art_order": [],
+                # Minimum cover-art resolution (shortest side, px). A preferred
+                # source whose art is smaller is skipped so the next source is
+                # tried — stops a low-res Cover Art Archive upload from winning.
+                # 0 disables the size gate.
+                "min_art_size": 1000,
+                # When a track matches a SINGLE release, look up the parent ALBUM
+                # that contains it and tag it as that album, so it groups with its
+                # album-mates and gets the album cover (not the single's). Off by
+                # default — it's an extra per-import metadata lookup.
+                "single_to_album": False,
+                "tags": {
+                    # the multi-value ARTISTS tag next to the display string,
+                    # so navidrome/jellyfin link a song to every artist on it.
+                    # on for fresh installs only. these defaults are never
+                    # merged into a saved config, so existing installs keep
+                    # tagging the way they always have
+                    "write_multi_artist": True,
+                },
+            },
+            "musicbrainz": {
+                "base_url": "https://musicbrainz.org/ws/2",
+                "request_interval": 1.05,
+                "embed_tags": True,
+                # #1451: beets-style "original date as DATE" (opt-in, default
+                # off). When True, the release-group first-release-date is
+                # written as DATE/TDRC instead of the downloaded edition's
+                # date. Independent precision guard (never downgrade a more
+                # precise same-year date) always applies.
+                "use_original_date_for_date": False,
+            },
+            "jiosaavn": {
+                "embed_tags": True,
+                "tags": {
+                    "track_id": True,
+                    "artist_id": True,
+                    "album_id": True,
+                },
+            },
+            "playlist_sync": {
+                # off by default (#1406): replace-sync server backups pile up
+                # as "<name> Backup" playlists most people never asked for
+                "create_backup": False,
+                # How a re-sync writes to the server playlist:
+                #   replace   — delete + recreate (default; today's behavior)
+                #   reconcile — edit in place (add/remove delta), preserving the
+                #               playlist's custom image, description, and identity (#792)
+                #   append    — only add new tracks, never remove
+                "mode": "replace",
+                # Add tracks missing from the library to the wishlist during
+                # playlist syncs (#1455). ON (default) = today's behavior:
+                # syncing queues missing tracks for download. OFF = syncs only
+                # ever update the playlist itself; nothing is queued.
+                "wishlist_missing_tracks": True
+            },
+            "settings": {
+                "audio_quality": "flac"
+            },
+            "lossy_copy": {
+                "enabled": False,
+                "codec": "mp3",
+                "bitrate": "320",
+                "delete_original": False,
+                "downsample_hires": False
+            },
+            "album_downloads": {
+                # Atomic album publishing (#999): when ON, an album / wishlist-album
+                # batch's tracks are staged privately and only moved into the
+                # media-library path once the WHOLE batch completes, so Plex /
+                # Jellyfin / Navidrome never sees a partial album mid-download.
+                # OFF by default — behavior is byte-for-byte today's (each track
+                # publishes to the library as it finishes). Strictly opt-in; only
+                # ever affects whole-album batches (never singles / completeness-fill).
+                "atomic_publish": False,
+                # #1289: at startup, publish staging trees left behind by a batch
+                # that never finished (restart / crash / failed publish) instead
+                # of leaving finished, tagged audio permanently invisible in a
+                # dot-directory no scanner reads. Turn it off to keep strict
+                # quarantine — the trees are then reported and left alone, never
+                # deleted. Only meaningful when atomic_publish has been used.
+                "atomic_recover_orphans": True,
+            },
+            "listening_stats": {
+                "enabled": True,
+                "poll_interval": 30
+            },
+            "library": {
+                "music_paths": [],
+                "music_videos_path": "",
+                "podcasts_path": default_podcast_path,
+                "audiobooks_path": default_audiobook_path,
+                # Sample Studio output folders (Phase 6): where saved chops
+                # are rendered. A list like music_paths — the first entry is
+                # the default destination; the save dialog lets the user pick
+                # per chop. Separate from the music library on purpose so
+                # media servers never index chops as albums.
+                "sample_paths": default_sample_paths(),
+                # Library Organize: when the tool re-resolves a track from the
+                # metadata source, the source's title/album CASING often differs
+                # from a file the user already curated (Spotify capitalizing
+                # prepositions, an ALL-CAPS artist, iTunes vs Deezer). With this
+                # on (default), a difference that is ONLY letter-case is left
+                # alone — no cosmetic rename churn on already-organized files.
+                # Turn off to canonicalize casing to the metadata source.
+                "reorganize_preserve_casing": True,
+                # #1449: write a Kodi-format artist.nfo (artist name +
+                # MusicBrainz artist ID) into the artist folder when an
+                # import creates it. Jellyfin/Kodi/Emby use it to identify
+                # the artist instead of guessing by name. Off by default —
+                # the Artist NFO Backfill repair job covers existing folders.
+                "write_artist_nfo": False,
+            },
+            "file_organization": {
+                "enabled": True,
+                "templates": {
+                    "album_path": "$albumartist/$albumartist - $album/$track - $title",
+                    "single_path": "$albumartist/$albumartist - $title/$title",
+                    "compilation_path": "Compilations/$album/$track - $artist - $title",
+                    "playlist_path": "$playlist/$artist - $title",
+                    "video_path": "$artist/$title-video",
+                    "podcast_path": "$show/Season $season/$title",
+                    # Author/Series/Book N - Title, the layout Audiobookshelf and
+                    # Plex both read. Series segments collapse when a book has no
+                    # series, exactly as the podcast season folder does.
+                    "audiobook_path": "$author/$series/$seriespos - $title",
+                    # Sample Studio chops, rendered inside the chosen sample
+                    # folder (see library.sample_paths). Variables:
+                    # $artist / $track / $album = the SOURCE track's metadata,
+                    # $chop = the chop's save name, $stem = stem name or empty.
+                    # Empty segments collapse, same as the audiobook template.
+                    "sample_path": "$artist/$track - $chop",
+                },
+                # $atypes — beets-compatible release-type labels for folder
+                # names. Empty for a plain album, bracketed and concatenated
+                # for anything that carries qualifiers ("[EP][Live]"). Only
+                # used by templates that mention $atypes, so this is inert
+                # unless a user opts in. Shapes match the beets albumtypes
+                # plugin so a config can be pasted across: "types" also accepts
+                # beets' list-of-single-key-maps form.
+                # Sourced from core.imports.album_types rather than repeated
+                # here: these defaults also apply in code for installs whose
+                # stored config predates the setting, and two copies would let
+                # a fresh install and an existing one disagree about what
+                # $atypes emits.
+                "album_types": {
+                    "types": dict(_ATYPE_DEFAULT_TYPES),
+                    "bracket": _ATYPE_DEFAULT_BRACKET,
+                    # A various-artists compilation already lives under
+                    # Compilations/; repeating the qualifier is noise.
+                    "ignore_va": list(_ATYPE_DEFAULT_IGNORE_VA),
+                },
+                "detect_multi_artist_compilations": True,
+            },
+            "wishlist": {
+                # When discovery finds no catalogue match for a track it stores a
+                # Wing It stub built from the source's own artist/title, and the
+                # sync deliberately keeps those OFF the wishlist — a stub is an
+                # unverified guess, and the Wing It Pool is where you resolve
+                # guesses by hand. On a large mirrored library that pool can hold
+                # hundreds of tracks, which is more than anyone will work through.
+                # Turn this on to let guesses be searched like any other wishlist
+                # track. Only stubs with a real artist AND title qualify; ones the
+                # source left nameless stay out either way. OFF by default —
+                # behavior is byte-for-byte today's.
+                "wing_it_guesses": False,
+            },
+            "scripts": {
+                "path": "./scripts",
+                "timeout": 60
+            },
+            "import": {
+                "staging_path": "./Staging",
+                # `replace_lower_quality` mirrors the Settings -> Quality page's
+                # checkbox. The pipeline enforces the PROFILE row (per item,
+                # live), not this key — it exists as the page's storage and is
+                # kept in sync with the active default profile in both
+                # directions (`apply_quality_profile_to_settings` pushes
+                # profile -> config on Apply; `sync_default_quality_profile_from_config`
+                # pushes config -> default profile on every settings save).
+                "replace_lower_quality": False,
+                # `folder_artist_override` is a plain global Auto-Import
+                # setting, read directly by `core/auto_import_worker.py` — a
+                # Staging folder-layout quirk, not a quality preference, so it
+                # deliberately does NOT live on a quality profile.
+                "folder_artist_override": True,
+                # off: staging keeps whatever an import didn't move (the user's
+                # own files). on: a folder whose every track was imported or
+                # found already in the library is removed from staging.
+                "clear_finished_from_staging": False
+            },
+            "m3u_export": {
+                "enabled": False,
+                "entry_base_path": "",
+                "relative_paths": False,
+                "library_enabled": False,
+                "library_path": ""
+            },
+            "playlists": {
+                # Where "Organize by playlist" materializes playlist folders.
+                # MUST be a separate root from the music library so the media
+                # server (and the maintenance jobs) never scan it — otherwise the
+                # same track would show up twice. Mapped separately for Docker.
+                "materialize_path": "./Playlists",
+                # "symlink" (relative links, ~zero disk) or "copy" (real
+                # duplicates for FAT/USB/DAPs that can't follow links). Symlink
+                # auto-falls back to copy when the filesystem can't link.
+                "materialize_mode": "symlink"
+            },
+            "audiobooks": {
+                "download_path": default_audiobook_path,
+                # Which Audible storefront the catalogue pages query. Valid
+                # codes: us/uk/de/fr/ca/au/it/es/in/jp. An unknown code falls
+                # back to the US store inside the audiobook client, so a
+                # typo degrades to US results instead of breaking.
+                "marketplace": "us",
+                # Audiobooks get their OWN source chain rather than inheriting
+                # music's. Five of music's sources (tidal, qobuz, hifi, deezer,
+                # amazon) are music-streaming services with no audiobooks in
+                # them at all, so every book search on the music chain would
+                # burn an attempt on each before it could succeed. The download
+                # ENGINE is shared — an audiobook is structurally an album, a
+                # directory of ordered chapter files with shared metadata, which
+                # is the shape core.download_plugins.album_bundle already
+                # handles — only the ordering of sources differs.
+                "download_source": {
+                    "mode": "hybrid",     # "soulseek", "torrent", "usenet", "hybrid"
+                    "hybrid_order": ["torrent", "usenet", "soulseek"],
+                },
+                # Newznab audiobook category. core/prowlarr_client.py already
+                # defines this as MUSIC_CATEGORY_AUDIOBOOK and deliberately
+                # keeps it OUT of music searches, so passing it here costs
+                # music nothing and reuses the shared Prowlarr throttle.
+                "prowlarr_categories": [3030],
+                # Downloader categories, so a finished book is never mistaken for a
+                # music release by anything watching the music category.
+                "torrent_category": "audiobooks",
+                "usenet_category": "audiobooks",
+                # How much of the runtime Audible publishes has to be on disk before a
+                # book is filed. A client says "complete" when the files it was ASKED
+                # for finished, which is not the same as the book being whole.
+                "completeness_tolerance": 0.92,
+                # A release implying less than this over the book's published
+                # runtime cannot be a complete copy at any bitrate a real
+                # audiobook uses (Audible's own are 32 kbps mono / 64 stereo),
+                # so it is hidden from the results. It is a piece of the book,
+                # a shorter edition, or the wrong title.
+                "min_complete_kbps": 24,
+                # Deleting a book moves it to the hidden <library>/.deleted
+                # unlinking it, and the daily purge empties what has sat there
+                # this long. Off, deletes are permanent immediately.
+                "recycle_deletes": True,
+                "recycle_keep_days": 7,
+                # What "good" means, for the whole audiobook side. ONE profile,
+                # not one per followed author: a listener's idea of an
+                # acceptable file does not change between authors.
+                "quality": {
+                    # Best first. m4b leads because it is the only format built
+                    # for the job — chapters, bookmarks, and one file instead
+                    # of ninety.
+                    "format_order": ["m4b", "m4a", "mp3", "opus", "ogg", "flac"],
+                    # 0 means no opinion. These REJECT rather than rank, so they
+                    # are separate from min_complete_kbps above, which asks the
+                    # different question of whether a release could be the whole
+                    # book at all.
+                    "min_bitrate_kbps": 0,
+                    "max_bitrate_kbps": 0,
+                    # GraphicAudio and the like. On by default because they are
+                    # already shown-but-outranked; turning this off removes them.
+                    "allow_dramatized": True,
+                    # Formats a release may be in at all; empty allows every
+                    # format. Unlike format_order this rejects, not ranks.
+                    "allowed_formats": [],
+                    # "single", "multiple" or "any": whether a book arrives as
+                    # one file or several. Rejects only where the count is known.
+                    "file_layout": "any",
+                },
+                # How long a short book is kept staged before giving up. Torrents
+                # finish late and uploaders repair releases, so patience is right;
+                # forever means one broken release holds a wishlist row for good.
+                "staging_days": 7,
+                "embed_metadata": True,
+                "embed_artwork": True,
+                "save_artwork": True,
+                "write_nfo": True,
+                # Chapter files arrive named however the uploader left them.
+                # On by default: a book whose files sort wrong plays wrong.
+                "renumber_chapters": True,
+                # Off keeps an owned book on the wishlist as "In library";
+                # on drops it, like the music wishlist does.
+                "remove_owned_from_wishlist": False,
+                # Optional post-import fold of multi-file books into one
+                # chaptered .m4b. Off by default: it rewrites the library
+                # copy, and a listener who prefers the per-file layout opts
+                # out by leaving this off.
+                "merge_m4b": False,
+            },
+            "podcasts": {
+                "download_path": default_podcast_path,
+                "media_format": "audio",  # "audio", "video", "both"
+                "embed_metadata": True,
+                "embed_artwork": True,
+                "save_artwork": True,
+                "write_nfo": True,
+                "write_json": True,
+            },
+            "youtube": {
+                "cookies_browser": "",      # "", "chrome", "firefox", "edge", "brave", "opera", "safari"
+                "download_delay": 3,        # seconds between sequential downloads
+                # Default: convert to MP3 320 after download. YouTube audio is
+                # Opus/AAC; re-encode does not add quality but matches common
+                # players. The quality profile ranks the file on disk.
+                "transcode": True,
+                "transcode_codec": "mp3",
+                "transcode_bitrate": "320",
+            },
+            "hydrabase": {
+                "url": "",
+                "api_key": "",
+                "auto_connect": False,
+                "enabled": False
+            },
+            "content_filter": {
+                "allow_explicit": True
+            },
+            "experimental": {
+                # JioSaavn is opt-in only — see Settings → Advanced → Experimental.
+                "jiosaavn_enabled": False,
+            },
+        }
+
+    def _load_config(self):
+        """
+        Load configuration with priority:
+        1. Database (primary storage)
+        2. config.json (migration from file-based config)
+        3. Defaults (fresh install)
+        """
+        logger.info("Loading configuration...")
+
+        # Try loading from database first
+        config_data, load_error = self._load_from_database()
+
+        # An unreadable row is usually a transient boot-time lock — retry
+        # before deciding anything. What we must NEVER do is mistake it for
+        # a fresh install: that path ends in defaults being written OVER the
+        # user's real row (issue #1137, "a crash lost all my settings").
+        if config_data is None and load_error:
+            for delay in (0.5, 1.0, 2.0, 4.0):
+                time.sleep(delay)
+                config_data, load_error = self._load_from_database()
+                if config_data is not None or not load_error:
+                    break
+
+        if config_data:
+            # Configuration exists in database
+            self.config_data = self._apply_log_level_overrides(config_data)
+            # Ensure sensitive values are encrypted at rest (one-time migration)
+            self._migrate_encrypt_if_needed()
+            return
+
+        if load_error:
+            # The row may still exist — we just can't read it right now.
+            # Run this session on config.json (if present) or defaults, but
+            # PROTECT the database row: no save this session may touch it.
+            self._db_row_protected = True
+            file_cfg = self._load_from_config_file()
+            self.config_data = self._apply_log_level_overrides(
+                file_cfg or self._get_default_config())
+            logger.error(
+                "Config could not be read from the database — running on %s. "
+                "The stored config row is PROTECTED and will not be "
+                "overwritten this session; restart once the database is "
+                "healthy to load it again.",
+                "config.json" if file_cfg else "defaults")
+            return
+
+        # Database is empty - try migration from config.json
+        logger.info(f"Configuration not found in database. Attempting migration from: {self.config_path}")
+        config_data = self._load_from_config_file()
+
+        if config_data:
+            # Migrate from config.json to database
+            logger.info("Migrating configuration from config.json to database...")
+            if self._save_to_database(config_data):
+                logger.info("Configuration migrated successfully to database.")
+                self.config_data = self._apply_log_level_overrides(config_data)
+                return
+            else:
+                logger.warning("Migration failed - using file-based config temporarily.")
+                self.config_data = self._apply_log_level_overrides(config_data)
+                return
+
+        # No config.json either - use defaults
+        logger.info("No existing configuration found (DB or File) - using defaults")
+        config_data = self._get_default_config()
+
+        # Try to save defaults to database
+        if self._save_to_database(config_data):
+            logger.info("Default configuration saved to database")
+        else:
+            logger.warning("Could not save defaults to database - using in-memory config")
+
+        self.config_data = self._apply_log_level_overrides(config_data)
+
+    def _save_config(self):
+        """Save configuration to database with exponential-backoff retry on lock.
+
+        Spread retries over ~7 seconds so a long-held writer (enrichment
+        worker batch insert, library scan commit, etc.) on a slow disk
+        has time to release the lock before we fall back to the JSON
+        file. The single 1s retry that used to live here gave up too
+        early on HDD-backed Docker volumes.
+        """
+        # Batch mode: callers writing dozens of leaves (the settings POST,
+        # config import) coalesce into ONE database write at batch exit —
+        # per-leaf saves were hundreds of full encrypt+serialize+commit
+        # cycles per click, and that self-inflicted lock contention is what
+        # pushed saves onto the fallback path in the first place (#1137).
+        if getattr(self, '_batch_depth', 0) > 0:
+            self._batch_dirty = True
+            return
+
+        # A session that could not READ the stored row must never WRITE
+        # over it — the row probably still holds the user's real config.
+        # Edits made while degraded persist to config.json only.
+        if getattr(self, '_db_row_protected', False):
+            logger.warning("Config DB row is protected this session — saving to config.json only")
+            self._save_config_file_atomic()
+            return
+
+        # Cumulative delay across attempts: 0.2 + 0.5 + 1.0 + 2.0 + 4.0 = 7.7s
+        # plus the 30s busy_timeout that already runs inside each attempt.
+        retry_delays = [0.2, 0.5, 1.0, 2.0, 4.0]
+        if self._save_to_database(self.config_data):
+            return
+
+        for delay in retry_delays:
+            time.sleep(delay)
+            if self._save_to_database(self.config_data):
+                return
+
+        # All retries exhausted — fall back to config.json so the user
+        # doesn't lose their settings, then log a single error.
+        logger.error(
+            f"Config DB save failed after {len(retry_delays) + 1} attempts (database is locked) — "
+            "falling back to config.json"
+        )
+        self._save_config_file_atomic()
+
+    def _save_config_file_atomic(self):
+        """Write config.json via temp-file + os.replace. The old plain
+        open(path,'w') truncated the file the instant it opened — a crash
+        mid-dump left zero bytes where the user's fallback config was."""
+        try:
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.config_path.with_suffix('.json.tmp')
+            with open(tmp_path, 'w') as f:
+                json.dump(self.config_data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.config_path)
+            logger.warning("Configuration saved to config.json as fallback")
+        except Exception as e:
+            logger.error(f"Failed to save configuration: {e}")
+
+    def batch(self):
+        """Context manager: suppress per-leaf saves, one write on exit."""
+        manager = self
+
+        class _Batch:
+            def __enter__(self):
+                manager._batch_depth = getattr(manager, '_batch_depth', 0) + 1
+                return manager
+
+            def __exit__(self, exc_type, exc, tb):
+                manager._batch_depth -= 1
+                if manager._batch_depth <= 0 and getattr(manager, '_batch_dirty', False):
+                    manager._batch_dirty = False
+                    manager._save_config()
+                return False
+
+        return _Batch()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        keys = key.split('.')
+        value = self.config_data
+
+        for k in keys:
+            if isinstance(value, dict) and k in value:
+                value = value[k]
+            else:
+                return default
+
+        return value
+
+    def get_full_config(self) -> Dict[str, Any]:
+        """Deep copy of the live, DECRYPTED config — including secrets. Used by
+        the config export ONLY when the user opts into embedding credentials;
+        never sent to the browser on the normal settings fetch (that's
+        ``redacted_config``)."""
+        return copy.deepcopy(self.config_data)
+
+    def apply_config_dict(self, incoming: Dict[str, Any]) -> int:
+        """Merge an imported config dict (config migration). Walks to LEAVES and
+        routes each through ``set()`` so its guards apply — a round-tripped
+        REDACTED_SENTINEL (a secrets-redacted export) is skipped instead of
+        blanking an existing secret. Returns the number of leaves written."""
+        count = 0
+
+        def _walk(node, prefix):
+            nonlocal count
+            for k, v in (node or {}).items():
+                path = f"{prefix}.{k}" if prefix else str(k)
+                if isinstance(v, dict) and v:
+                    _walk(v, path)
+                else:
+                    self.set(path, v)
+                    count += 1
+
+        if isinstance(incoming, dict):
+            with self.batch():          # one DB write for the whole import
+                _walk(incoming, "")
+        return count
+
+    def redacted_config(self) -> Dict[str, Any]:
+        """Deep copy of the live config with every sensitive value masked.
+
+        Used for ``GET /api/settings`` so decrypted secrets never reach the
+        browser (#832 follow-up). A *set* secret becomes ``REDACTED_SENTINEL``
+        (the UI renders it as masked dots); an unset one stays empty so the UI
+        can show "not configured". Dict-valued secrets (OAuth sessions) collapse
+        to the sentinel too — the UI has no field for them anyway. The matching
+        guard in ``set()`` turns a round-tripped sentinel back into a no-op.
+        """
+        import copy
+        data = copy.deepcopy(self.config_data)
+        for path in self._SENSITIVE_PATHS:
+            keys = path.split('.')
+            parent = data
+            for k in keys[:-1]:
+                if isinstance(parent, dict) and k in parent:
+                    parent = parent[k]
+                else:
+                    parent = None
+                    break
+            if not isinstance(parent, dict):
+                continue
+            leaf = keys[-1]
+            if leaf in parent and parent[leaf] not in (None, '', {}, [], 0, False):
+                parent[leaf] = self.REDACTED_SENTINEL
+        return data
+
+    def set(self, key: str, value: Any):
+        # Never let a bulk/settings save blank out a stored secret. Two ways it
+        # tried to:
+        #   1. The UI round-trips REDACTED_SENTINEL for an untouched masked field
+        #      (#832) — that mask must not overwrite the real value.
+        #   2. The settings auto-save fires 2s after any input; a masked secret
+        #      field is cleared to '' on focus, so a timer landing in that window
+        #      posted '' and WIPED the real secret. That surfaced as Spotify
+        #      "invalid_client" (an empty secret was being sent) even after the
+        #      user re-entered it (#992).
+        # So an empty ('' / None) value for a sensitive path means "keep the
+        # existing one"; clearing a credential is done via its explicit
+        # disconnect action, never by saving an empty settings form.
+        if key in self._SENSITIVE_PATHS and (
+            value == self.REDACTED_SENTINEL or value is None or value == ''
+        ):
+            return
+
+        keys = key.split('.')
+        config = self.config_data
+
+        for k in keys[:-1]:
+            if k not in config:
+                config[k] = {}
+            config = config[k]
+
+        config[keys[-1]] = value
+        self._save_config()
+
+    def resolve_secret(self, key: str, posted: Any) -> str:
+        """Resolve a secret value coming back from the settings UI.
+
+        The UI renders a saved-but-untouched secret as the REDACTED_SENTINEL (shown
+        masked); empty or that sentinel means "use the stored value", while a real
+        string is a genuine new secret. A connection-test endpoint should test the
+        EFFECTIVE secret, not the mask — otherwise testing a saved-but-untouched
+        token sends the sentinel and the source rejects it (#870)."""
+        if isinstance(posted, str):
+            posted = posted.strip()
+        if not posted or posted == self.REDACTED_SENTINEL:
+            return self.get(key, '') or ''
+        return posted
+
+    def get_spotify_config(self) -> Dict[str, str]:
+        return self.get('spotify', {})
+
+    def get_plex_config(self) -> Dict[str, str]:
+        return self.get('plex', {})
+
+    def get_jellyfin_config(self) -> Dict[str, str]:
+        return self.get('jellyfin', {})
+
+    def get_navidrome_config(self) -> Dict[str, str]:
+        return self.get('navidrome', {})
+
+    def get_soulseek_config(self) -> Dict[str, str]:
+        return self.get('soulseek', {})
+
+    def get_hydrabase_config(self) -> Dict[str, str]:
+        return self.get('hydrabase', {})
+
+    def get_settings(self) -> Dict[str, Any]:
+        return self.get('settings', {})
+
+    def get_database_config(self) -> Dict[str, str]:
+        return self.get('database', {})
+
+    def get_logging_config(self) -> Dict[str, str]:
+        return self.get('logging', {})
+
+    def get_source_search_timeout(self):
+        """#1056 — user override for streaming-source search/API timeouts, in
+        seconds. Returns None when unset/0/invalid, meaning "keep each source's
+        built-in default" (HiFi 15, Qobuz 15, Deezer 10, stream search 15) — so
+        out of the box NOTHING changes; only a user-entered value applies.
+        Clamped to 5-120 so a typo can neither hammer sources nor hang workers.
+        Soulseek is NOT governed by this — its windowed soulseek.search_timeout
+        has different semantics (results stream in over the window) and its own
+        setting."""
+        raw = self.get('download_source.source_search_timeout', 0)
+        try:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return max(5, min(120, value))
+
+    def get_active_media_server(self) -> str:
+        return self.get('active_media_server', 'plex')
+
+    def set_active_media_server(self, server: str):
+        """Set the active media server (plex, jellyfin, navidrome, or soulsync)"""
+        if server not in ['plex', 'jellyfin', 'navidrome', 'soulsync']:
+            raise ValueError(f"Invalid media server: {server}")
+        self.set('active_media_server', server)
+
+    def get_active_media_server_config(self) -> Dict[str, str]:
+        """Get configuration for the currently active media server"""
+        active_server = self.get_active_media_server()
+        if active_server == 'plex':
+            return self.get_plex_config()
+        elif active_server == 'jellyfin':
+            return self.get_jellyfin_config()
+        elif active_server == 'navidrome':
+            return self.get_navidrome_config()
+        elif active_server == 'soulsync':
+            return {'transfer_path': self.get('soulseek.transfer_path', './Transfer')}
+        else:
+            return {}
+
+    def is_configured(self) -> bool:
+        spotify = self.get_spotify_config()
+        active_server = self.get_active_media_server()
+        soulseek = self.get_soulseek_config()
+
+        # Check active media server configuration
+        media_server_configured = False
+        if active_server == 'plex':
+            plex = self.get_plex_config()
+            media_server_configured = bool(plex.get('base_url')) and bool(plex.get('token'))
+        elif active_server == 'jellyfin':
+            jellyfin = self.get_jellyfin_config()
+            media_server_configured = bool(jellyfin.get('base_url')) and bool(jellyfin.get('api_key'))
+        elif active_server == 'navidrome':
+            navidrome = self.get_navidrome_config()
+            media_server_configured = bool(navidrome.get('base_url')) and bool(navidrome.get('username')) and bool(navidrome.get('password'))
+        elif active_server == 'soulsync':
+            media_server_configured = True  # SoulSync standalone is always configured
+
+        return (
+            bool(spotify.get('client_id')) and
+            bool(spotify.get('client_secret')) and
+            media_server_configured and
+            bool(soulseek.get('slskd_url'))
+        )
+
+    def validate_config(self) -> Dict[str, bool]:
+        active_server = self.get_active_media_server()
+
+        validation = {
+            'spotify': bool(self.get('spotify.client_id')) and bool(self.get('spotify.client_secret')),
+            'soulseek': bool(self.get('soulseek.slskd_url'))
+        }
+
+        # Validate all server types but mark active one
+        validation['plex'] = bool(self.get('plex.base_url')) and bool(self.get('plex.token'))
+        validation['jellyfin'] = bool(self.get('jellyfin.base_url')) and bool(self.get('jellyfin.api_key'))
+        validation['navidrome'] = bool(self.get('navidrome.base_url')) and bool(self.get('navidrome.username')) and bool(self.get('navidrome.password'))
+        validation['soulsync'] = True  # Standalone mode is always valid
+        validation['active_media_server'] = active_server
+
+        return validation
+
+config_manager = ConfigManager()

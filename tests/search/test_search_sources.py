@@ -52,10 +52,11 @@ class _Track:
 
 
 class _Client:
-    def __init__(self, artists=None, albums=None, tracks=None, fail=None):
+    def __init__(self, artists=None, albums=None, tracks=None, playlists=None, fail=None):
         self._artists = artists or []
         self._albums = albums or []
         self._tracks = tracks or []
+        self._playlists = playlists or []
         self._fail = fail or set()
 
     def search_artists(self, q, limit=10):
@@ -73,6 +74,11 @@ class _Client:
             raise RuntimeError("tracks boom")
         return self._tracks
 
+    def search_playlists(self, q, limit=10):
+        if 'playlists' in self._fail:
+            raise RuntimeError("playlists boom")
+        return self._playlists
+
 
 # ---------------------------------------------------------------------------
 # search_kind
@@ -87,7 +93,16 @@ def test_search_kind_artists_returns_normalized_dicts():
         'source': 'spotify',
         'image_url': 'thumb.jpg',
         'external_urls': {'spotify': 'url'},
+        'followers': None,
     }]
+
+
+def test_search_kind_artists_carries_the_fan_count():
+    """three deezer artists all called U2: the fan count is how you tell."""
+    artist = _Artist('id1', 'U2')
+    artist.followers = 9_800_000
+    result = sources.search_kind(_Client(artists=[artist]), 'u2', 'artists', 'deezer')
+    assert result[0]['followers'] == 9_800_000
 
 
 def test_search_kind_artists_handles_none_external_urls():
@@ -141,10 +156,14 @@ def test_search_kind_tracks_returns_full_shape():
         'artists': ['Pink Floyd'],
         'source': '',
         'album': 'DSOTM',
+        # a source that doesn't know the album id gives None
+        'album_id': None,
         'duration_ms': 383000,
         'image_url': 'm.jpg',
         'release_date': '1973-03-01',
         'external_urls': {'a': 'b'},
+        # kids profiles filter on it; a source that doesn't say gives None
+        'explicit': None,
     }]
 
 
@@ -201,9 +220,32 @@ def test_search_source_partial_failure_does_not_break_others():
 
 
 def test_search_source_all_fail_returns_empty_lists():
-    client = _Client(fail={'artists', 'albums', 'tracks'})
+    client = _Client(fail={'artists', 'albums', 'tracks', 'playlists'})
     result = sources.search_source('q', client, 'spotify')
-    assert result == {'artists': [], 'albums': [], 'tracks': [], 'available': True}
+    # M16: total provider outage — empty lists, and available=False so the
+    # outage isn't cached as a successful empty search.
+    assert result == {'artists': [], 'albums': [], 'tracks': [], 'playlists': [], 'available': False}
+
+
+def test_search_kind_playlists_returns_normalized_dicts():
+    client = _Client(playlists=[{
+        'id': '12345',
+        'title': 'Synthwave Nights',
+        'creator': 'RetroMaster',
+        'track_count': 50,
+        'image_url': 'https://image.url/cover.jpg',
+        'link': 'https://deezer.com/playlist/12345',
+    }])
+    result = sources.search_kind(client, 'synthwave', 'playlists', 'deezer')
+    assert result == [{
+        'id': '12345',
+        'name': 'Synthwave Nights',
+        'creator': 'RetroMaster',
+        'track_count': 50,
+        'image_url': 'https://image.url/cover.jpg',
+        'source': 'deezer',
+        'link': 'https://deezer.com/playlist/12345',
+    }]
 
 
 # ── source field on serialized results (Netti93 multi-artist fix) ───────────
@@ -246,3 +288,48 @@ def test_serialized_tracks_carry_real_artists_list():
     out = sources.search_kind(client, 'q', 'tracks', source_name='spotify')
     assert out[0]['artists'] == ['Artist A', 'Artist B']
     assert out[0]['artist'] == 'Artist A, Artist B'   # display string unchanged
+
+
+# ---------------------------------------------------------------------------
+# M16: provider outage must be distinguishable from an empty success
+# ---------------------------------------------------------------------------
+
+def test_search_source_all_kinds_failing_marks_unavailable():
+    """M16: when the provider fails every kind, search_source must report
+    available=False so callers don't cache the empty result as a success."""
+    client = _Client(fail={'artists', 'albums', 'tracks', 'playlists'})
+    result = sources.search_source('q', client, 'spotify')
+    assert result['artists'] == [] and result['albums'] == [] \
+        and result['tracks'] == [] and result['playlists'] == []
+    assert result['available'] is False
+
+
+def test_search_source_partial_failure_still_available():
+    """One dead kind must not sink the source: as long as something
+    succeeded, available stays True."""
+    client = _Client(artists=[_Artist('a', 'A')], fail={'tracks'})
+    result = sources.search_source('q', client, 'spotify')
+    assert result['available'] is True
+    assert [a['id'] for a in result['artists']] == ['a']
+    assert result['tracks'] == []
+
+
+def test_search_source_healthy_marks_available():
+    client = _Client(artists=[_Artist('a', 'A')])
+    result = sources.search_source('q', client, 'spotify')
+    assert result['available'] is True
+
+
+def test_deezer_track_carries_its_album_id_through_search():
+    """#1605: a single-track download needs the track's own album id to look up
+    the album artist and track count. deezer search gives it, keep it."""
+    from core.deezer_client import Track as DeezerTrack
+    track = DeezerTrack.from_deezer_track({
+        'id': 136340808, 'title': "How Far I'll Go", 'duration': 163,
+        'artist': {'name': "Auli'i Cravalho"},
+        'album': {'id': 14582002, 'title': 'Moana (Deluxe)', 'cover_xl': 'c.jpg'},
+    })
+    assert track.album_id == '14582002'
+    out = sources.search_kind(_Client(tracks=[track]), 'q', 'tracks', source_name='deezer')
+    assert out[0]['album_id'] == '14582002'
+    assert out[0]['source'] == 'deezer'

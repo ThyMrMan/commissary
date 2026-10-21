@@ -1,13 +1,14 @@
+from core.library.navidrome_identity import validated_playlist_write
 import requests
 import hashlib
 import secrets
 import time
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple, Union
 from datetime import datetime
 from urllib.parse import urlencode
 import json
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 
 # Shared dataclasses live in the neutral media_server package — every
 # server client used to define a near-identical XTrackInfo /
@@ -16,15 +17,6 @@ from config.settings import config_manager
 from core.media_server.types import TrackInfo, PlaylistInfo
 
 logger = get_logger("navidrome_client")
-
-# The Subsonic `c` (client name) parameter. Navidrome creates one Player row
-# per (client, user) and hangs per-player settings off it — including "Report
-# Real Path", which #809's playback path resolution depends on the user having
-# enabled. Renaming this to "Commissary" would silently register a SECOND,
-# unconfigured player and break stream-path resolution on every existing
-# install until each user re-enabled the setting. It stays as the app was
-# first known, deliberately, and is NOT branding.
-SUBSONIC_CLIENT_NAME = "SoulSync"
 
 
 class NavidromeArtist:
@@ -68,6 +60,11 @@ class NavidromeArtist:
         """Get all albums for this artist"""
         return self._client.get_albums_for_artist(self.ratingKey)
 
+    def albums_verified(self):
+        """(albums, ok): ok is False when the server gave no answer, which
+        albums() folds into an empty list. the deep scan reads this one."""
+        return self._client.get_albums_for_artist_verified(self.ratingKey)
+
 class NavidromeAlbum:
     """Wrapper class to mimic Plex album object interface"""
     def __init__(self, navidrome_data: Dict[str, Any], client: 'NavidromeClient'):
@@ -109,6 +106,10 @@ class NavidromeAlbum:
     def tracks(self) -> List['NavidromeTrack']:
         """Get all tracks for this album"""
         return self._client.get_tracks_for_album(self.ratingKey)
+
+    def tracks_verified(self):
+        """(tracks, ok): ok is False when the server gave no answer."""
+        return self._client.get_tracks_for_album_verified(self.ratingKey)
 
 class NavidromeTrack:
     """Wrapper class to mimic Plex track object interface"""
@@ -360,22 +361,38 @@ class NavidromeClient(MediaServerClient):
             self.username = None
             self.password = None
 
-    def _generate_auth_params(self) -> Dict[str, str]:
-        """Generate authentication parameters for Subsonic API"""
-        if not self.username or not self.password:
+    def _generate_auth_params(self, username: str = None, password: str = None) -> Dict[str, str]:
+        """Generate authentication parameters for Subsonic API.
+
+        ``username``/``password`` override the configured account. Subsonic
+        scopes starred items and ratings to the AUTHENTICATED user and offers
+        no admin impersonation for them, so reading another user's curation
+        genuinely requires their own credentials (playlists are the exception —
+        ``getPlaylists`` takes an admin-only ``username`` parameter).
+        """
+        user = username or self.username
+        secret = password if username else (password or self.password)
+        if not user or not secret:
+            # No usable identity. Returning {} would send an UNAUTHENTICATED
+            # request that fails confusingly at the server; the caller treats
+            # an empty dict as "cannot authenticate" and skips the call.
+            if username and not password:
+                logger.warning("Navidrome: no password for user %r — skipping "
+                               "their request rather than sending it unauthenticated",
+                               username)
             return {}
 
         # Generate random salt (at least 6 characters)
         salt = secrets.token_hex(8)
         # Calculate token: md5(password + salt)
-        token = hashlib.md5((self.password + salt).encode()).hexdigest()
+        token = hashlib.md5((secret + salt).encode()).hexdigest()
 
         return {
-            'u': self.username,
+            'u': user,
             't': token,
             's': salt,
             'v': '1.16.1',  # API version
-            'c': SUBSONIC_CLIENT_NAME,  # Client name
+            'c': 'SoulSync',  # Client name
             'f': 'json'  # Response format
         }
 
@@ -407,7 +424,7 @@ class NavidromeClient(MediaServerClient):
             't': token,
             's': salt,
             'v': '1.16.1',
-            'c': SUBSONIC_CLIENT_NAME,
+            'c': 'SoulSync',
             'f': 'json',  # harmless for getCoverArt — it returns image binary
             'id': str(cover_id),
         }
@@ -418,9 +435,9 @@ class NavidromeClient(MediaServerClient):
     def build_stream_url(self, track_id, max_bitrate=0) -> Optional[str]:
         """Absolute, Subsonic-authenticated ``/rest/stream`` URL for a song.
 
-        Lets Commissary play a Navidrome library track by proxying the server's
+        Lets SoulSync play a Navidrome library track by proxying the server's
         own stream API — so playback works WITHOUT mounting the music into the
-        Commissary container (#809: Commissary otherwise reads library files off
+        SoulSync container (#809: SoulSync otherwise reads library files off
         disk, which fails when the user hasn't mirror-mounted the library).
         ``max_bitrate`` 0 = no transcode (original file). Returns None when not
         connected / no id."""
@@ -432,7 +449,7 @@ class NavidromeClient(MediaServerClient):
         token = hashlib.md5((self.password + salt).encode()).hexdigest()
         params = {
             'u': self.username, 't': token, 's': salt,
-            'v': '1.16.1', 'c': SUBSONIC_CLIENT_NAME,
+            'v': '1.16.1', 'c': 'SoulSync',
             'id': str(track_id),
         }
         if max_bitrate and int(max_bitrate) > 0:
@@ -449,16 +466,26 @@ class NavidromeClient(MediaServerClient):
         'startScan',
     })
 
-    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None,
+                      as_user: Optional[tuple] = None, timeout=None) -> Optional[Dict[str, Any]]:
         """Make authenticated request to Navidrome Subsonic API.
-        Uses POST for write operations (avoids URL length limits with large playlists)."""
+        Uses POST for write operations (avoids URL length limits with large playlists).
+
+        ``as_user`` is an optional ``(username, password)`` pair used INSTEAD of
+        the configured account for this one call. It does not mutate the
+        client, so concurrent callers cannot see each other's identity — the
+        opposite of the ``_apply_profile_library`` pattern, which sets
+        ``client.user_id`` on the shared singleton and leaks it to everyone.
+        """
         if not self.base_url or not self.username:
             return None
 
         url = f"{self.base_url}/rest/{endpoint}"
 
         # Add authentication parameters
-        auth_params = self._generate_auth_params()
+        auth_params = self._generate_auth_params(*(as_user or (None, None)))
+        if not auth_params:
+            return None  # no usable credentials — don't send an anonymous call
         if params:
             auth_params.update(params)
 
@@ -466,9 +493,9 @@ class NavidromeClient(MediaServerClient):
             # Use POST for write operations to avoid URL length limits
             # (e.g., createPlaylist with 161 songId params would exceed GET URL limits)
             if endpoint in self._WRITE_ENDPOINTS:
-                response = requests.post(url, data=auth_params, timeout=30)
+                response = requests.post(url, data=auth_params, timeout=timeout if timeout is not None else 30)
             else:
-                response = requests.get(url, params=auth_params, timeout=60)
+                response = requests.get(url, params=auth_params, timeout=timeout if timeout is not None else 60)
             response.raise_for_status()
 
             data = response.json()
@@ -489,9 +516,13 @@ class NavidromeClient(MediaServerClient):
 
         except requests.exceptions.RequestException as e:
             logger.error(f"Navidrome API request failed for {url}: {e}")
+            # never leave a STALE message (a previous call's 'empty') for the
+            # verified-empty check to misread as this call's answer
+            self.last_api_error = f"request failed: {e}"
             return None
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Navidrome response: {e}")
+            self.last_api_error = f"unparseable response: {e}"
             return None
 
     def is_connected(self) -> bool:
@@ -503,6 +534,63 @@ class NavidromeClient(MediaServerClient):
         return (self.base_url is not None and
                 self.username is not None and
                 self.password is not None)
+
+    def _empty_answer_is_verified(self, call: str) -> bool:
+        """Whether a falsy Navidrome answer means "the library really is empty".
+
+        Navidrome answers an EMPTY library with a hard Subsonic API error
+        ('Library not found or empty') rather than an empty envelope
+        (5BILLION's report). 'not found' and 'empty' share one message, so
+        confirm the selected folder actually EXISTS before believing 'empty' —
+        a wrong folder id must stay a FAILURE, because "empty" is the answer
+        that authorises deleting the user's library rows.
+
+        Shared by every fetch that can be asked about an empty library
+        (``get_all_artists``, ``get_all_artist_ids``, ``get_all_album_ids``).
+        It lives in ONE place deliberately: three rounds of this bug were fixed
+        in `get_all_artists` alone while the removal-detection fetchers kept the
+        original behaviour, which is why it kept bouncing back.
+        """
+        err = str(getattr(self, 'last_api_error', '') or '').lower()
+        if 'empty' not in err:
+            logger.error(
+                "Navidrome: %s failed with non-empty error %r — treating as a "
+                "failure (no stale removal)", call, err)
+            return False
+
+        folders = self._fetch_music_folders()
+        # _fetch_music_folders normalizes to {'title', 'key'} (the settings
+        # UI's shape) — NOT the raw subsonic {'id', 'name'}. Rounds 2-3 read
+        # f['id'] here, so with a folder SELECTED `known` was always {'None'}
+        # and this leg could never verify: 5BILLION kept getting the abort
+        # toast through three "fixed" rounds, on exactly the config a user who
+        # once had a library will have. The tests stayed green because their
+        # fixtures stubbed id-shaped folders — the same wrong key as the
+        # reader. 'id' is still read second in case another producer appears.
+        known = {str(f.get('key') if f.get('key') is not None else f.get('id'))
+                 for f in folders if isinstance(f, dict)}
+        if self.music_folder_id and str(self.music_folder_id) in known:
+            logger.info(
+                "Navidrome: selected library %s exists but is empty (%s said %r) "
+                "— verified empty, not a failure", self.music_folder_id, call, err)
+            return True
+        if not self.music_folder_id and isinstance(folders, list):
+            # With NO folder selected there is no misconfigured id to protect
+            # against: a server-wide 'empty' answer plus a live getMusicFolders
+            # response IS a verified empty server.
+            logger.info(
+                "Navidrome: no folder selected, %s answered 'empty' and "
+                "getMusicFolders responded (%d folder(s)) — verified empty, not "
+                "a failure", call, len(folders))
+            return True
+        # Diagnose loudly: the NEXT report must say which leg failed instead of
+        # a bare 'No artists found' toast.
+        logger.error(
+            "Navidrome: 'empty' answer to %s NOT verified — selected folder id "
+            "%r, server's folder ids %s — treating as a failure (no stale "
+            "removal). If the selected id is stale, re-pick the music folder in "
+            "Settings.", call, self.music_folder_id, sorted(known))
+        return False
 
     def get_all_artists(self) -> List[NavidromeArtist]:
         """Get all artists from the music library"""
@@ -522,49 +610,9 @@ class NavidromeClient(MediaServerClient):
                 params['musicFolderId'] = self.music_folder_id
             response = self._make_request('getArtists', params if params else None)
             if not response:
-                # Navidrome answers getArtists on an EMPTY library with a hard
-                # API error ('Library not found or empty') instead of an empty
-                # envelope (5BILLION's report). 'not found' and 'empty' share
-                # one message, so confirm the selected folder actually EXISTS
-                # before believing 'empty' — a wrong folder id must stay a
-                # failure (never wipe a library on a misconfig).
-                err = str(getattr(self, 'last_api_error', '') or '').lower()
-                if 'empty' in err:
-                    folders = self._fetch_music_folders()
-                    known = {str(f.get('id')) for f in folders if isinstance(f, dict)}
-                    if self.music_folder_id and str(self.music_folder_id) in known:
-                        logger.info(
-                            "Navidrome: selected library %s exists but is empty "
-                            "(API said %r) — verified empty, not a failure",
-                            self.music_folder_id, err)
-                        self.last_fetch_failed = False
-                        return []
-                    if not self.music_folder_id and isinstance(folders, list):
-                        # 5BILLION round 3: with NO folder selected, the old
-                        # guard could never verify-empty at all — the branch
-                        # required a selected id. A server-wide 'empty' answer
-                        # plus a live getMusicFolders response IS a verified
-                        # empty server (there's no misconfigured id to protect
-                        # against when none is selected).
-                        logger.info(
-                            "Navidrome: no folder selected, server answered 'empty' "
-                            "and getMusicFolders responded (%d folder(s)) — verified "
-                            "empty, not a failure", len(folders))
-                        self.last_fetch_failed = False
-                        return []
-                    # Diagnose loudly: the NEXT report must tell us exactly which
-                    # leg failed instead of a bare 'No artists found' toast.
-                    logger.error(
-                        "Navidrome: 'empty' API answer NOT verified — selected "
-                        "folder id %r, server's folder ids %s — treating as a "
-                        "failure (no stale removal). If the selected id is stale, "
-                        "re-pick the music folder in Settings.",
-                        self.music_folder_id, sorted(known))
-                else:
-                    logger.error(
-                        "Navidrome: getArtists failed with non-empty error %r — "
-                        "treating as a failure (no stale removal)", err)
-                # anything else is a FAILURE, not an empty library
+                if self._empty_answer_is_verified('getArtists'):
+                    self.last_fetch_failed = False
+                # otherwise a FAILURE, not an empty library
                 return []
 
             if self._progress_callback:
@@ -597,7 +645,13 @@ class NavidromeClient(MediaServerClient):
             return []
 
     def get_all_artist_ids(self) -> set:
-        """Get all artist IDs from Navidrome (lightweight, for removal detection)."""
+        """Get all artist IDs from Navidrome (lightweight, for removal detection).
+
+        Sets ``last_fetch_failed`` on the same contract as ``get_all_artists``:
+        an empty set means "failed" unless this flag says otherwise. Removal
+        detection reads it to tell a genuinely empty server from an API failure —
+        without it, an empty library could never have its stale rows removed."""
+        self.last_fetch_failed = True
         if not self.ensure_connection():
             return set()
         try:
@@ -606,6 +660,8 @@ class NavidromeClient(MediaServerClient):
                 params['musicFolderId'] = self.music_folder_id
             response = self._make_request('getArtists', params if params else None)
             if not response:
+                if self._empty_answer_is_verified('getArtists (ids)'):
+                    self.last_fetch_failed = False
                 return set()
             ids = set()
             for index in response.get('artists', {}).get('index', []):
@@ -613,6 +669,7 @@ class NavidromeClient(MediaServerClient):
                     aid = artist_data.get('id')
                     if aid:
                         ids.add(str(aid))
+            self.last_fetch_failed = False
             logger.info(f"Retrieved {len(ids)} artist IDs from Navidrome (lightweight)")
             return ids
         except Exception as e:
@@ -620,7 +677,14 @@ class NavidromeClient(MediaServerClient):
             return set()
 
     def get_all_album_ids(self) -> set:
-        """Get all album IDs from Navidrome (lightweight, paginated, for removal detection)."""
+        """Get all album IDs from Navidrome (lightweight, paginated, for removal detection).
+
+        Same ``last_fetch_failed`` contract as the artist fetchers. Note the
+        pagination distinction: a falsy answer on the FIRST page can be a
+        verified empty library, but a falsy answer part-way through is a partial
+        read and must stay a failure — removing "stale" rows from a truncated
+        catalogue would delete albums the server still has."""
+        self.last_fetch_failed = True
         if not self.ensure_connection():
             return set()
         try:
@@ -637,9 +701,25 @@ class NavidromeClient(MediaServerClient):
                     params['musicFolderId'] = self.music_folder_id
                 response = self._make_request('getAlbumList2', params)
                 if not response:
-                    break
+                    if offset == 0:
+                        # Nothing read yet: this can be a verified empty library.
+                        if self._empty_answer_is_verified('getAlbumList2'):
+                            self.last_fetch_failed = False
+                        return set()
+                    # A LATER page failed, so what we hold is a truncated
+                    # catalogue. Returning it would let removal detection treat
+                    # the unread albums as deleted. Discard it and stay flagged
+                    # as failed — the caller then skips removal entirely.
+                    logger.error(
+                        "Navidrome: getAlbumList2 failed at offset %d after %d "
+                        "albums — partial read, discarding (no stale removal)",
+                        offset, len(all_ids))
+                    return set()
                 album_list = response.get('albumList2', {}).get('album', [])
                 if not album_list:
+                    # An empty page IS an answer (Navidrome can return an empty
+                    # list rather than erroring), so the catalogue is complete.
+                    self.last_fetch_failed = False
                     break
                 for album_data in album_list:
                     aid = album_data.get('id')
@@ -648,6 +728,7 @@ class NavidromeClient(MediaServerClient):
                 if len(album_list) < page_size:
                     break
                 offset += page_size
+            self.last_fetch_failed = False
             logger.info(f"Retrieved {len(all_ids)} album IDs from Navidrome (lightweight)")
             return all_ids
         except Exception as e:
@@ -656,12 +737,19 @@ class NavidromeClient(MediaServerClient):
 
     def get_albums_for_artist(self, artist_id: str) -> List[NavidromeAlbum]:
         """Get all albums for a specific artist"""
+        return self.get_albums_for_artist_verified(artist_id)[0]
+
+    def get_albums_for_artist_verified(self, artist_id: str) -> Tuple[List[NavidromeAlbum], bool]:
+        """(albums, ok). ok is False when the request got no usable answer:
+        not connected, request failed, api error. an empty list with ok True
+        is an artist with no albums. the deep scan must tell the two apart,
+        it deletes what it does not see."""
         # Check cache first
         if artist_id in self._album_cache:
-            return self._album_cache[artist_id]
+            return self._album_cache[artist_id], True
 
         if not self.ensure_connection():
-            return []
+            return [], False
 
         try:
             # Get artist name for progress display
@@ -680,7 +768,7 @@ class NavidromeClient(MediaServerClient):
                 params['musicFolderId'] = self.music_folder_id
             response = self._make_request('getArtist', params)
             if not response:
-                return []
+                return [], False
 
             albums = []
             artist_data = response.get('artist', {})
@@ -705,11 +793,11 @@ class NavidromeClient(MediaServerClient):
             # Cache the result
             self._album_cache[artist_id] = albums
 
-            return albums
+            return albums, True
 
         except Exception as e:
             logger.error(f"Error getting albums for artist {artist_id}: {e}")
-            return []
+            return [], False
 
     def _get_folder_album_ids(self) -> Optional[set]:
         """Get set of album IDs belonging to the selected music folder.
@@ -722,6 +810,7 @@ class NavidromeClient(MediaServerClient):
             album_ids = set()
             offset = 0
             page_size = 500
+            complete = True
             while True:
                 params = {
                     'type': 'alphabeticalByArtist',
@@ -731,6 +820,11 @@ class NavidromeClient(MediaServerClient):
                 }
                 response = self._make_request('getAlbumList2', params)
                 if not response:
+                    # A failed page means the index is PARTIAL — never cache
+                    # it: callers filter artists against this set, and a
+                    # partial set would silently drop real albums (and, in a
+                    # deep scan, their tracks) while looking fully trusted.
+                    complete = False
                     break
                 album_list = response.get('albumList2', {}).get('album', [])
                 if not album_list:
@@ -742,6 +836,9 @@ class NavidromeClient(MediaServerClient):
                 if len(album_list) < page_size:
                     break
                 offset += page_size
+            if not complete:
+                logger.warning("Music folder album index incomplete (page failed) — skipping folder filter this scan")
+                return None
             self._folder_album_ids = album_ids
             logger.info(f"Built music folder album index: {len(album_ids)} albums in selected folder")
             return album_ids
@@ -792,12 +889,16 @@ class NavidromeClient(MediaServerClient):
 
     def get_tracks_for_album(self, album_id: str) -> List[NavidromeTrack]:
         """Get all tracks for a specific album"""
+        return self.get_tracks_for_album_verified(album_id)[0]
+
+    def get_tracks_for_album_verified(self, album_id: str) -> Tuple[List[NavidromeTrack], bool]:
+        """(tracks, ok). same contract as get_albums_for_artist_verified."""
         # Check cache first
         if album_id in self._track_cache:
-            return self._track_cache[album_id]
+            return self._track_cache[album_id], True
 
         if not self.ensure_connection():
-            return []
+            return [], False
 
         try:
             # Get album name for progress display
@@ -816,7 +917,7 @@ class NavidromeClient(MediaServerClient):
 
             response = self._make_request('getAlbum', {'id': album_id})
             if not response:
-                return []
+                return [], False
 
             tracks = []
             album_data = response.get('album', {})
@@ -831,11 +932,11 @@ class NavidromeClient(MediaServerClient):
             # Cache the result
             self._track_cache[album_id] = tracks
 
-            return tracks
+            return tracks, True
 
         except Exception as e:
             logger.error(f"Error getting tracks for album {album_id}: {e}")
-            return []
+            return [], False
 
     def get_artist_by_id(self, artist_id: str) -> Optional[NavidromeArtist]:
         """Get a specific artist by ID"""
@@ -1001,6 +1102,137 @@ class NavidromeClient(MediaServerClient):
             return {}
             return {}
 
+    def get_curation_signals(self, users=None):
+        """What each user deliberately CHOSE about a track.
+
+        Returns ``{username: [{path, favorite, rating, in_playlist}, ...]}``.
+
+        ``users`` is an optional list of ``(username, password)`` pairs. Subsonic
+        scopes ``getStarred2`` and ratings to the AUTHENTICATED user with no
+        admin impersonation, so reading someone else's favourites really does
+        need their own credentials — which is exactly what Cremonies described.
+        the configured account is always read first, then each listed user,
+        once per username. reading only the listed users used to drop the
+        admin's own stars the moment anyone else had a login saved.
+
+        Playlist membership is the exception: ``getPlaylists`` accepts an
+        admin-only ``username`` parameter, so one admin credential can see
+        whose playlists contain what.
+
+        A user whose read fails is OMITTED rather than stored as empty — an
+        empty set means "they like nothing", which would withdraw protection,
+        and a transient failure must never do that.
+        """
+        if not self.ensure_connection():
+            return {}
+
+        accounts = []
+        seen_names = set()
+        for username, password in [(self.username, self.password), *(users or [])]:
+            name = str(username or '').strip().lower()
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            accounts.append((username, password))
+
+        signals = {}
+        for username, password in accounts:
+            if not username:
+                continue
+            as_user = (username, password) if password else None
+            per_track = {}
+            ok = False
+
+            # Favourites + ratings for this user.
+            try:
+                starred = self._make_request('getStarred2', as_user=as_user)
+            except Exception as e:
+                logger.warning(f"Navidrome curation: getStarred2 failed for {username}: {e}")
+                starred = None
+            if starred:
+                ok = True
+                songs = (starred.get('starred2') or {}).get('song') or []
+                for song in songs if isinstance(songs, list) else [songs]:
+                    path = (song or {}).get('path') or ''
+                    if not path:
+                        continue
+                    entry = per_track.setdefault(
+                        path, {'path': path, 'favorite': False,
+                               'rating': None, 'in_playlist': False})
+                    entry['favorite'] = True
+                    if song.get('userRating') is not None:
+                        entry['rating'] = song.get('userRating')
+
+            # Playlist membership, read with the ADMIN account (this client's
+            # configured credentials) on that user's behalf.
+            try:
+                listing = self._make_request('getPlaylists', {'username': username})
+            except Exception as e:
+                logger.debug(f"Navidrome curation: getPlaylists failed for {username}: {e}")
+                listing = None
+            for playlist in ((listing or {}).get('playlists') or {}).get('playlist', []) or []:
+                pid = (playlist or {}).get('id')
+                if not pid:
+                    continue
+                try:
+                    detail = self._make_request('getPlaylist', {'id': pid})
+                except Exception as e:
+                    logger.debug(f"Navidrome curation: getPlaylist {pid} failed: {e}")
+                    continue
+                if not detail:
+                    continue
+                ok = True
+                entries = (detail.get('playlist') or {}).get('entry') or []
+                for song in entries if isinstance(entries, list) else [entries]:
+                    path = (song or {}).get('path') or ''
+                    if not path:
+                        continue
+                    entry = per_track.setdefault(
+                        path, {'path': path, 'favorite': False,
+                               'rating': None, 'in_playlist': False})
+                    entry['in_playlist'] = True
+
+            if ok:
+                signals[str(username)] = list(per_track.values())
+        logger.info(f"Navidrome curation: signals for {len(signals)} user(s)")
+        return signals
+
+    def _playlist_owner_filter(self) -> Optional[str]:
+        """the user whose playlists a NAME lookup may return: the configured
+        account here, the bound user on a NavidromeUserView.
+
+        subsonic lists other users' playlists too (every public one to
+        everyone, every one to an admin), and a sync finds its playlist by
+        name and then overwrites it, deleting "duplicates" on the way. with
+        one profile syncing "Chill" as itself and another as the app account
+        that would be one user's playlist stomping the other's. so a lookup
+        by name only ever returns the caller's own playlists; get_all_playlists
+        (the Server Playlists page) still lists everything the account sees."""
+        return self.username
+
+    def _owned_by_me(self, playlist: PlaylistInfo) -> bool:
+        mine = self._playlist_owner_filter()
+        if not mine or playlist.owner is None:
+            return True      # nothing to compare against: the old behaviour
+        return str(playlist.owner).lower() == str(mine).lower()
+
+    def as_user(self, username: str, password: str) -> 'NavidromeUserView':
+        """this client, acting as one navidrome user (see NavidromeUserView)."""
+        return NavidromeUserView(self, username, password)
+
+    def verify_user_login(self, username: str, password: str) -> tuple:
+        """(ok, error) for a user's own login: one ping as that user. the
+        profile settings page calls this before saving a per-profile login,
+        so a typo is refused there and not discovered by a failing sync."""
+        if not username or not password:
+            return False, "username and password are required"
+        if not self.ensure_connection():
+            return False, "Navidrome is not connected"
+        response = self._make_request('ping', as_user=(username, password))
+        if response and response.get('status') == 'ok':
+            return True, None
+        return False, getattr(self, "last_api_error", None) or "Navidrome refused the login"
+
     def get_all_playlists(self) -> List[PlaylistInfo]:
         """Get all playlists from Navidrome server"""
         if not self.ensure_connection():
@@ -1021,7 +1253,8 @@ class NavidromeClient(MediaServerClient):
                     description=playlist_data.get('comment'),
                     duration=playlist_data.get('duration', 0) * 1000,  # Convert to milliseconds
                     leaf_count=playlist_data.get('songCount', 0),
-                    tracks=[]  # Will be populated when needed
+                    tracks=[],  # Will be populated when needed
+                    owner=playlist_data.get('owner'),
                 )
                 playlists.append(playlist_info)
 
@@ -1033,12 +1266,22 @@ class NavidromeClient(MediaServerClient):
             return []
 
     def get_playlist_by_name(self, name: str) -> Optional[PlaylistInfo]:
-        """Get a specific playlist by name"""
+        """Get a specific playlist by name (own playlists only, see
+        _playlist_owner_filter)"""
         playlists = self.get_all_playlists()
         for playlist in playlists:
-            if playlist.title.lower() == name.lower():
+            if playlist.title.lower() == name.lower() and self._owned_by_me(playlist):
                 return playlist
         return None
+
+    def delete_playlist(self, playlist_id: str) -> bool:
+        """Delete a playlist by id (subsonic deletePlaylist), same call the
+        backup path has always made inline."""
+        result = self._make_request('deletePlaylist', {'id': playlist_id})
+        if result is not None:
+            logger.info(f"Deleted Navidrome playlist {playlist_id}")
+            return True
+        return False
 
     def set_playlist_image(self, playlist_name: str, image_url: str) -> bool:
         """Upload a cover image to a Navidrome playlist from a URL.
@@ -1103,8 +1346,16 @@ class NavidromeClient(MediaServerClient):
             logger.debug(f"Could not set Navidrome playlist poster for '{playlist_name}': {e}")
         return False
 
-    def create_playlist(self, name: str, tracks, playlist_id: str = None) -> bool:
-        """Create a new playlist or update existing one if playlist_id provided"""
+    @validated_playlist_write
+    def create_playlist(self, name: str, tracks, playlist_id: str = None) -> Union[str, bool]:
+        """Create a new playlist or update existing one if playlist_id provided.
+
+        Returns the server playlist ID on success (#1289 item 6: a newly
+        created playlist is linked to its mirrored playlist immediately from
+        this ID), False on failure. Backward compatible: every existing
+        caller only tests truthiness, and ``validated_playlist_write`` still
+        normalizes the externally visible return to bool.
+        """
         if not self.ensure_connection():
             return False
 
@@ -1117,7 +1368,14 @@ class NavidromeClient(MediaServerClient):
                 elif hasattr(track, 'id'):
                     track_ids.append(str(track.id))
 
-            if not track_ids:
+            if not track_ids and playlist_id is None:
+                # #1543: allow creating an EMPTY playlist (new mirror with
+                # no library matches yet — tracks land on later syncs).
+                # The Subsonic createPlaylist accepts a name with no songIds.
+                # Emptying an EXISTING playlist via update is still refused;
+                # the sync service's zero-match guard owns that decision.
+                logger.info(f"Creating empty Navidrome playlist '{name}'")
+            elif not track_ids:
                 logger.warning(f"No valid tracks provided for playlist '{name}'")
                 return False
 
@@ -1128,7 +1386,7 @@ class NavidromeClient(MediaServerClient):
                 'name': name,
                 'songId': track_ids  # Subsonic API accepts multiple songId parameters
             }
-            
+
             # If playlist_id is provided, it acts as an overwrite/update
             if playlist_id:
                 params['playlistId'] = playlist_id
@@ -1137,6 +1395,16 @@ class NavidromeClient(MediaServerClient):
 
             if response and response.get('status') == 'ok':
                 logger.info(f"{'Updated' if playlist_id else 'Created'} Navidrome playlist '{name}' with {len(track_ids)} tracks")
+                if playlist_id:
+                    return str(playlist_id)
+                # A fresh createPlaylist response carries no ID, so resolve
+                # the just-created playlist by name.
+                created = self.get_playlists_by_name(name)
+                if created:
+                    return str(created[0].id)
+                logger.warning(
+                    f"Created Navidrome playlist '{name}' but could not resolve its server ID"
+                )
                 return True
             else:
                 logger.error(f"Failed to {'update' if playlist_id else 'create'} Navidrome playlist '{name}'")
@@ -1245,35 +1513,152 @@ class NavidromeClient(MediaServerClient):
             return []
 
     def get_playlists_by_name(self, name: str) -> List[PlaylistInfo]:
-        """Get all playlists matching a specific name (case-insensitive)"""
+        """Get all playlists matching a specific name (case-insensitive), own
+        playlists only (see _playlist_owner_filter)"""
         matches = []
         playlists = self.get_all_playlists()
         for playlist in playlists:
-            if playlist.title.lower() == name.lower():
+            if playlist.title.lower() == name.lower() and self._owned_by_me(playlist):
                 matches.append(playlist)
         return matches
 
-    def append_to_playlist(self, playlist_name: str, tracks) -> bool:
+    def get_playlist_by_id(self, playlist_id: str) -> Optional[PlaylistInfo]:
+        """Fetch a single playlist by server ID.
+
+        The cheap existence check behind the mirrored-playlist server link
+        (#1289): a stored ``server_playlist_id`` is only followed when the
+        server still has that playlist. Returns None when the ID is unknown
+        (deleted on the server) or unreachable — never raises.
+        """
+        if not playlist_id:
+            return None
+        if not self.ensure_connection():
+            return None
+        try:
+            response = self._make_request('getPlaylist', {'id': str(playlist_id)})
+            playlist_data = (response or {}).get('playlist')
+            if not isinstance(playlist_data, dict) or not playlist_data.get('id'):
+                return None
+            return PlaylistInfo(
+                id=str(playlist_data.get('id')),
+                title=str(playlist_data.get('name') or 'Unknown Playlist'),
+                description=playlist_data.get('comment'),
+                duration=(playlist_data.get('duration') or 0) * 1000,
+                leaf_count=playlist_data.get('songCount', 0),
+                tracks=[],
+                owner=playlist_data.get('owner'),
+            )
+        except Exception as e:
+            logger.error(f"Error fetching Navidrome playlist {playlist_id}: {e}")
+            return None
+
+    def get_user(self, username: str) -> Optional[Dict[str, Any]]:
+        """Fetch a Navidrome user via Subsonic getUser.
+
+        Returns the user dict (with adminRole etc.) or None when the lookup
+        fails. Never raises.
+        """
+        if not username:
+            return None
+        if not self.ensure_connection():
+            return None
+        try:
+            response = self._make_request('getUser', {'username': str(username)})
+            user = (response or {}).get('user')
+            return user if isinstance(user, dict) else None
+        except Exception as e:  # noqa: BLE001 - lookup is best-effort
+            logger.debug("getUser failed for %r: %s", username, e)
+            return None
+
+    _ADMIN_ROLE_CACHE_TTL = 3600  # 1 hour
+
+    def is_server_admin(self, username: str) -> Optional[bool]:
+        """Whether a Navidrome user has the admin role.
+
+        Results are cached for an hour to avoid a getUser call per playlist
+        owner on every page load. Returns None when the role cannot be
+        determined (lookup failed) — callers should preserve existing
+        behavior in that case. Never raises.
+        """
+        if not username:
+            return None
+        cache = getattr(self, '_admin_role_cache', None)
+        if cache is None:
+            cache = {}
+            self._admin_role_cache = cache
+        now = time.time()
+        hit = cache.get(str(username).lower())
+        if hit is not None and now - hit[1] < self._ADMIN_ROLE_CACHE_TTL:
+            return hit[0]
+        user = self.get_user(username)
+        if user is None:
+            return None
+        is_admin = bool(user.get('adminRole'))
+        cache[str(username).lower()] = (is_admin, now)
+        return is_admin
+
+    def _follow_playlist_id(
+        self, playlist_name: str, playlist_id: Optional[str]
+    ) -> Optional[PlaylistInfo]:
+        """Validate an explicitly resolved server playlist ID (#1289 item 6).
+
+        Returns the PlaylistInfo when the server still has that ID (the sync
+        then writes to it directly, following a server-side rename silently),
+        or None when no ID was given / the server no longer has it — in which
+        case the caller falls back to the legacy name-match. Never raises.
+        """
+        if not playlist_id:
+            return None
+        try:
+            existing = self.get_playlist_by_id(playlist_id)
+        except Exception as e:  # noqa: BLE001 - validation failure == unusable ID
+            logger.debug("playlist-id validation failed for %r: %s", playlist_name, e)
+            return None
+        if existing is None:
+            logger.info(
+                f"Stored server playlist id {playlist_id} for '{playlist_name}' "
+                f"no longer exists — falling back to name match"
+            )
+            return None
+        logger.info(
+            f"Following stored server playlist id {playlist_id} for '{playlist_name}'"
+        )
+        return existing
+
+    @validated_playlist_write
+    def append_to_playlist(self, playlist_name: str, tracks, *,
+                           playlist_id: Optional[str] = None) -> bool:
         """Append tracks to an existing playlist (creates it if missing).
 
         Differs from `update_playlist`: never deletes existing tracks,
         never recreates the playlist, no backup. Used by sync mode
         'append' so user-added tracks on the server playlist survive
         re-syncing the source. Dedupe-by-id ensures we don't re-add
-        tracks the playlist already contains."""
+        tracks the playlist already contains.
+
+        `playlist_id`, when given and still on the server, is written to
+        directly (#1289 item 6: follow the mirrored playlist's stored server
+        ID silently across server-side renames). Falls back to the legacy
+        name-match when absent or stale."""
         if not self.ensure_connection():
             return False
 
         try:
-            existing_playlists = self.get_playlists_by_name(playlist_name)
-            if not existing_playlists:
-                logger.info(
-                    f"Navidrome append: playlist '{playlist_name}' doesn't exist yet — "
-                    f"creating with {len(tracks)} tracks"
-                )
-                return self.create_playlist(playlist_name, tracks)
+            # #1289 item 6: an explicit server playlist ID (resolved from the
+            # mirrored playlist's stored link by the sync service) skips the
+            # name-match entirely — a server-side rename is followed silently.
+            # An ID the server no longer has falls through to the legacy path.
+            primary = self._follow_playlist_id(playlist_name, playlist_id)
+            if primary is None:
+                existing_playlists = self.get_playlists_by_name(playlist_name)
+                if not existing_playlists:
+                    logger.info(
+                        f"Navidrome append: playlist '{playlist_name}' doesn't exist yet — "
+                        f"creating with {len(tracks)} tracks"
+                    )
+                    return self.create_playlist(playlist_name, tracks)
 
-            primary = existing_playlists[0]
+                primary = existing_playlists[0]
             # #823 round 2: the old dedupe read `t.id` — but NavidromeTrack only
             # defines `ratingKey`, so the existing-ids set was ALWAYS empty and
             # every sync re-appended the whole matched list (every track N
@@ -1327,22 +1712,31 @@ class NavidromeClient(MediaServerClient):
             logger.error(f"Error appending to Navidrome playlist '{playlist_name}': {e}")
             return False
 
-    def reconcile_playlist(self, playlist_name: str, tracks) -> bool:
+    @validated_playlist_write
+    def reconcile_playlist(self, playlist_name: str, tracks, *,
+                           playlist_id: Optional[str] = None) -> bool:
         """In-place reconcile (#792): add missing + remove gone via Subsonic
         updatePlaylist (songIdToAdd / songIndexToRemove), keeping the existing
         playlist object so its comment/identity survive — no delete/recreate.
         Creates the playlist if missing. Returns False so the caller can fall
-        back to replace on any failure."""
+        back to replace on any failure.
+
+        `playlist_id`, when given and still on the server, is reconciled
+        directly (#1289 item 6: follow the mirrored playlist's stored server
+        ID silently across server-side renames). Falls back to the legacy
+        name-match when absent or stale."""
         if not self.ensure_connection():
             return False
         try:
             from core.sync.playlist_edit import plan_playlist_reconcile
-            existing_playlists = self.get_playlists_by_name(playlist_name)
-            if not existing_playlists:
-                logger.info(f"Navidrome reconcile: '{playlist_name}' doesn't exist — creating")
-                return self.create_playlist(playlist_name, tracks)
+            primary = self._follow_playlist_id(playlist_name, playlist_id)
+            if primary is None:
+                existing_playlists = self.get_playlists_by_name(playlist_name)
+                if not existing_playlists:
+                    logger.info(f"Navidrome reconcile: '{playlist_name}' doesn't exist — creating")
+                    return self.create_playlist(playlist_name, tracks)
 
-            primary = existing_playlists[0]
+                primary = existing_playlists[0]
             existing_tracks = self.get_playlist_tracks(primary.id)
             # #905: NavidromeTrack exposes the Subsonic song id as `ratingKey` (NOT `.id`,
             # which doesn't exist) — same as append_to_playlist reads it. Reading `t.id` here
@@ -1385,18 +1779,44 @@ class NavidromeClient(MediaServerClient):
             logger.error(f"Error reconciling Navidrome playlist '{playlist_name}': {e}")
             return False
 
-    def update_playlist(self, playlist_name: str, tracks) -> bool:
-        """Update an existing playlist or create it if it doesn't exist. Handles duplicates."""
+    @validated_playlist_write
+    def update_playlist(self, playlist_name: str, tracks, *,
+                        playlist_id: Optional[str] = None) -> bool:
+        """Update an existing playlist or create it if it doesn't exist. Handles duplicates.
+
+        `playlist_id`, when given and still on the server, is overwritten
+        directly (#1289 item 6: follow the mirrored playlist's stored server
+        ID silently across server-side renames — no duplicate cleanup, no
+        rename adoption). Falls back to the legacy name-match when absent or
+        stale."""
         if not self.ensure_connection():
             return False
 
         try:
+            # Check if backup is enabled in config
+            from core.settings import config_manager
+            from core.sync.playlist_edit import playlist_backup_enabled
+            create_backup = playlist_backup_enabled(config_manager)
+
+            # #1289 item 6: an explicit server playlist ID (resolved from the
+            # mirrored playlist's stored link by the sync service) skips the
+            # name-match entirely. Silent follow: just write to the ID. The
+            # opt-in pre-sync backup still runs — against the playlist's
+            # CURRENT server-side title, so it works across renames too.
+            followed = self._follow_playlist_id(playlist_name, playlist_id)
+            if followed is not None:
+                if create_backup:
+                    backup_name = f"{playlist_name} Backup"
+                    logger.info(f"Creating backup playlist '{backup_name}' before sync")
+                    if self.copy_playlist(followed.title, backup_name):
+                        logger.info("Backup created successfully")
+                    else:
+                        logger.warning("Failed to create backup, continuing with sync")
+                logger.info(f"Updating existing playlist '{playlist_name}' (ID: {followed.id})")
+                return self.create_playlist(playlist_name, tracks, playlist_id=followed.id)
+
             # Find ALL existing playlists with this name to handle duplicates
             existing_playlists = self.get_playlists_by_name(playlist_name)
-            
-            # Check if backup is enabled in config
-            from config.settings import config_manager
-            create_backup = config_manager.get('playlist_sync.create_backup', True)
 
             # If we have existing playlists and want to backup, use the first one found
             if existing_playlists and create_backup:
@@ -1538,6 +1958,10 @@ class NavidromeClient(MediaServerClient):
         self._artist_cache.clear()
         self._album_cache.clear()
         self._track_cache.clear()
+        # The music-folder album index is rebuilt per scan, not per process:
+        # a stale set silently filters newly added albums out of incremental
+        # scans (their IDs aren't in it yet), and only a restart rebuilt it.
+        self._folder_album_ids = None
         logger.info("Navidrome client cache cleared")
 
     def search_tracks(self, title: str, artist: str, limit: int = 15) -> List[TrackInfo]:
@@ -1587,3 +2011,56 @@ class NavidromeClient(MediaServerClient):
         except Exception as e:
             logger.error(f"Error searching for tracks: {e}")
             return []
+
+
+class NavidromeUserView(NavidromeClient):
+    """the shared NavidromeClient, acting as one user.
+
+    subsonic has no admin impersonation for playlist writes: createPlaylist
+    and updatePlaylist act as whoever authenticated, so a playlist a profile
+    syncs lands on that profile's navidrome user only if the requests carry
+    that user's login. this is the shared client with exactly that: every
+    _make_request goes out as the bound user, and playlist lookups see only
+    that user's own playlists. it is a subclass so every method (reconcile,
+    append, update, the write validator) runs unchanged on the view and its
+    isinstance checks still hold; state it does not set itself is read from
+    the wrapped client, and nothing on the wrapped client is ever changed.
+    """
+
+    def __init__(self, client: NavidromeClient, username: str, password: str):
+        object.__setattr__(self, '_base_client', client)
+        object.__setattr__(self, '_as_user', (username, password))
+
+    def __getattr__(self, name):
+        # only reached when the view itself has no such attribute: read the
+        # shared client's (base_url, caches, connection state)
+        return getattr(object.__getattribute__(self, '_base_client'), name)
+
+    @property
+    def acting_as(self) -> str:
+        return self._as_user[0]
+
+    # the native-api paths (playlist cover upload) log in with
+    # username/password directly rather than through _make_request; on the
+    # view those are the bound user's, so those calls are the user's too
+    @property
+    def username(self) -> str:
+        return self._as_user[0]
+
+    @property
+    def password(self) -> str:
+        return self._as_user[1]
+
+    def ensure_connection(self) -> bool:
+        # the connection (url, app account) belongs to the shared client; a
+        # reconnect must set it up there, not on this view
+        return object.__getattribute__(self, '_base_client').ensure_connection()
+
+    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None,
+                      as_user: Optional[tuple] = None, timeout=None) -> Optional[Dict[str, Any]]:
+        base = object.__getattribute__(self, '_base_client')
+        result = base._make_request(endpoint, params, as_user=as_user or self._as_user, timeout=timeout)
+        # the error the base client recorded belongs to this call
+        object.__setattr__(self, 'last_api_error', getattr(base, 'last_api_error', None))
+        return result
+

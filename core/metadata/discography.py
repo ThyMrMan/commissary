@@ -6,7 +6,6 @@ from typing import Any, Callable, Dict, List, Optional
 
 from core.metadata import registry as metadata_registry
 from core.metadata.album_tracks import get_artist_albums_for_source
-from core.edition_preference import has_deluxe_marker, prefer_deluxe_enabled
 from core.metadata.lookup import MetadataLookupOptions
 from core.metadata.types import Album
 from utils.logging_config import get_logger
@@ -239,8 +238,7 @@ def _sort_discography_releases(releases: List[Dict[str, Any]]) -> List[Dict[str,
     return sorted(releases, key=get_release_year, reverse=True)
 
 
-def _dedup_variant_releases(releases: List[Dict[str, Any]],
-                            prefer_deluxe: bool = False) -> List[Dict[str, Any]]:
+def _dedup_variant_releases(releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Collapse obvious edition variants into a single canonical release card.
 
     This keeps a clean UI while still preserving distinct releases when the
@@ -303,20 +301,6 @@ def _dedup_variant_releases(releases: List[Dict[str, Any]],
         has_variant_suffix = _has_variant_suffix(title)
 
         # Higher is better.
-        if prefer_deluxe:
-            # "Prefer deluxe editions": a deluxe-marked edition wins the card, the
-            # biggest first. Between editions that aren't deluxe the usual order
-            # stands, so a regional or clean variant never outranks the standard.
-            is_deluxe = has_deluxe_marker(title)
-            return (
-                1 if not _is_compilation(release) else 0,
-                1 if is_deluxe else 0,
-                track_count if is_deluxe else 0,
-                1 if not has_variant_suffix else 0,
-                2 if has_explicit else (1 if not has_clean else 0),
-                track_count,
-                release_date,
-            )
         return (
             1 if not _is_compilation(release) else 0,
             1 if not has_variant_suffix else 0,
@@ -481,6 +465,7 @@ def _build_artist_detail_release_card(release: Dict[str, Any],
             'track_completion': 'checking',
             'explicit': typed_album.explicit,
             'secondary_types': _normalize_secondary_types(getattr(typed_album, 'secondary_types', None)),
+            'external_urls': typed_album.external_urls or {},
         }
         if typed_album.release_date:
             card['release_date'] = typed_album.release_date
@@ -519,6 +504,7 @@ def _build_artist_detail_release_card(release: Dict[str, Any],
         'secondary_types': _normalize_secondary_types(
             _extract_lookup_value(release, 'secondary_types', 'secondary-types', default=[])
         ),
+        'external_urls': _extract_lookup_value(release, 'external_urls', default={}) or {},
     }
 
     if release_date:
@@ -565,10 +551,9 @@ def get_artist_detail_discography(
             albums.append(card)
 
     if options is None or options.dedup_variants:
-        prefer_deluxe = prefer_deluxe_enabled()
-        albums = _dedup_variant_releases(albums, prefer_deluxe=prefer_deluxe)
-        eps = _dedup_variant_releases(eps, prefer_deluxe=prefer_deluxe)
-        singles = _dedup_variant_releases(singles, prefer_deluxe=prefer_deluxe)
+        albums = _dedup_variant_releases(albums)
+        eps = _dedup_variant_releases(eps)
+        singles = _dedup_variant_releases(singles)
 
     albums = _sort_discography_releases(albums)
     eps = _sort_discography_releases(eps)

@@ -24,7 +24,7 @@ import logging
 import logging.handlers
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
 
 # fpcalc binary location (downloaded automatically if needed)
 FPCALC_BIN_DIR = Path(__file__).parent.parent / "bin"
@@ -173,43 +173,6 @@ def _find_fpcalc() -> Optional[str]:
 CHROMAPRINT_AVAILABLE = False
 FPCALC_PATH = None
 
-# Confidence floor for letting a fingerprint DECIDE metadata (upstream #1132).
-# AcoustID scores run 0..1 and a weak hit is not a wrong answer, it is an
-# uncertain one — an ambiguous fingerprint (short track, heavy compression, a
-# widely-sampled loop) can return a plausible-looking recording at 0.3. Writing
-# that to the file is worse than leaving the tags alone, because it looks
-# authoritative afterwards. 0.8 matches the bar `auto_import_worker` already
-# applies to metadata-match confidence, so the two agree on what "identified"
-# means. Verification code that COMPARES a fingerprint against known-expected
-# metadata deliberately does NOT use this floor — a low score is still evidence
-# there, it just isn't grounds to invent a title.
-MIN_IDENTIFY_SCORE = 0.8
-
-
-def best_recording(lookup: Optional[Dict[str, Any]],
-                   min_score: float = MIN_IDENTIFY_SCORE) -> Optional[Dict[str, Any]]:
-    """The highest-scoring recording from a lookup, or None when nothing clears
-    ``min_score``.
-
-    Callers used ``result['recordings'][0]`` directly, which was wrong twice
-    over: index 0 was API order rather than best (fixed at the source in
-    ``lookup_with_status``), and nothing checked the score at all. Declining is
-    a real answer — the caller keeps whatever tags the file already had.
-    """
-    recordings = (lookup or {}).get('recordings') or []
-    if not recordings:
-        return None
-    best = max(recordings, key=lambda r: r.get('score') or 0.0)
-    score = best.get('score') or 0.0
-    if score < min_score:
-        logger.info(
-            "AcoustID declined: best match '%s' by '%s' scored %.2f, below the %.2f "
-            "confidence floor — leaving existing metadata alone",
-            best.get('title'), best.get('artist'), score, min_score,
-        )
-        return None
-    return best
-
 if ACOUSTID_AVAILABLE:
     # Try to find or download fpcalc
     FPCALC_PATH = _find_fpcalc()
@@ -236,24 +199,24 @@ class AcoustIDClient:
                     logger.info(f"Match: {mbid}")
     """
 
-    def __init__(self):
+    def __init__(self, api_key: Optional[str] = None):
         """Initialize AcoustID client with settings from config."""
-        self._api_key = None
+        self._api_key = api_key
         self._enabled = None
 
     @property
     def api_key(self) -> str:
-        """Get API key from config (cached)."""
-        if self._api_key is None:
-            self._api_key = config_manager.get('acoustid.api_key', '')
-        return self._api_key
+        """Get API key from config (or explicitly set override)."""
+        if self._api_key is not None:
+            return self._api_key
+        return (config_manager.get('acoustid.api_key', '') or '') if config_manager else ''
 
     @property
     def enabled(self) -> bool:
         """Check if AcoustID verification is enabled in config."""
-        if self._enabled is None:
-            self._enabled = config_manager.get('acoustid.enabled', False)
-        return self._enabled
+        if self._enabled is not None:
+            return self._enabled
+        return bool(config_manager.get('acoustid.enabled', False)) if config_manager else False
 
     def is_available(self) -> Tuple[bool, str]:
         """
@@ -352,10 +315,11 @@ class AcoustIDClient:
             if data.get('status') == 'error':
                 error = data.get('error', {})
                 error_code = error.get('code', 0)
+                error_msg = error.get('message', '')
 
                 # Error code 4 is specifically "invalid API key"
-                if error_code == 4:
-                    return False, "Invalid AcoustID API key - get one from https://acoustid.org/new-application"
+                if error_code == 4 or 'invalid api key' in error_msg.lower() or 'invalid client' in error_msg.lower() or 'invalid key' in error_msg.lower():
+                    return False, "Invalid AcoustID API key — use an Application API key from https://acoustid.org/new-application (not your user account key)"
                 # Any other error (e.g. "invalid fingerprint") means the API key
                 # was accepted — the dummy test fingerprint is just rejected as expected
                 return True, "AcoustID API key is valid"
@@ -418,12 +382,41 @@ class AcoustIDClient:
             api_key_preview = f"{self.api_key[:8]}..." if self.api_key and len(self.api_key) > 8 else "NOT SET"
             logger.info(f"Fingerprinting and looking up: {audio_file} (API key: {api_key_preview})")
 
-            logger.debug("Running acoustid.match()...")
             recordings = []
             seen_mbids = set()
             best_score = 0.0
 
-            for result in acoustid.match(self.api_key, audio_file, parse=True):
+            # Try to get raw parsed JSON response first if pyacoustid supports parse_lookup_result,
+            # so we can inspect error codes instead of losing them to pyacoustid's bare "status: error".
+            raw_response = None
+            if hasattr(acoustid, 'parse_lookup_result'):
+                try:
+                    raw_response = acoustid.match(self.api_key, audio_file, parse=False)
+                except (acoustid.NoBackendError, acoustid.FingerprintGenerationError):
+                    raise
+                except Exception:
+                    raw_response = None
+
+            if isinstance(raw_response, dict):
+                if raw_response.get('status') != 'ok':
+                    err = raw_response.get('error', {})
+                    err_code = err.get('code', 0)
+                    err_msg = err.get('message', 'Unknown AcoustID error')
+                    invalid = (err_code == 4 or 'invalid' in err_msg.lower() or 'key' in err_msg.lower())
+                    if invalid:
+                        logger.error(
+                            "AcoustID API key appears to be invalid (Application API key required): %s (code %s)",
+                            err_msg, err_code
+                        )
+                    elif 'rate' in err_msg.lower() or 'limit' in err_msg.lower() or err_code == 5:
+                        logger.warning("Rate limited by AcoustID — will retry later: %s", err_msg)
+                    return {'status': 'error', 'recordings': [], 'invalid_key': invalid,
+                            'error': f'AcoustID API error (code {err_code}): {err_msg}'}
+                match_results = acoustid.parse_lookup_result(raw_response)
+            else:
+                match_results = acoustid.match(self.api_key, audio_file, parse=True)
+
+            for result in match_results:
                 # match() with parse=True returns (score, recording_id, title, artist)
                 if not isinstance(result, tuple) or len(result) < 2:
                     logger.warning(f"Unexpected result format: {result}")
@@ -448,15 +441,6 @@ class AcoustIDClient:
                 logger.info(f"No AcoustID matches found for: {audio_file}")
                 return {'status': 'no_match', 'recordings': [], 'best_score': best_score,
                         'recording_mbids': [], 'error': 'Track not found in AcoustID database'}
-
-            # Best first. The loop above appends in whatever order the API
-            # returned, while tracking `best_score` in a separate variable — so
-            # `recordings[0]` was "whichever AcoustID happened to list first",
-            # and every caller that reads index 0 believes it is reading the
-            # best. That is upstream #1132's "variants were listed first": a
-            # remix, a live cut or a compilation entry sitting ahead of the
-            # actual recording, and its metadata written to the file.
-            recordings.sort(key=lambda r: r.get('score') or 0.0, reverse=True)
 
             logger.info(f"AcoustID found {len(recordings)} recording(s) (best score: {best_score:.2f})")
             return {'status': 'ok', 'recordings': recordings, 'best_score': best_score,

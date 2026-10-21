@@ -8,11 +8,13 @@ from typing import List, Dict, Any, Optional, Callable
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 import re
+import sqlite3
 import time
 from difflib import SequenceMatcher
 import requests
 from bs4 import BeautifulSoup
 from database.music_database import get_database, WatchlistArtist
+from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
 from core.spotify_client import SpotifyClient
 from core.metadata_service import (
     get_album_tracks_for_source,
@@ -20,13 +22,17 @@ from core.metadata_service import (
     get_primary_source,
     get_source_priority,
 )
+from core.metadata.artwork import usable_image_url
 from core.wishlist_service import get_wishlist_service
-from core.edition_preference import (
-    PREFER_DELUXE_KEY,
-    drop_smaller_editions,
-    owned_row_is_smaller_edition,
-)
 from core.matching_engine import MusicMatchingEngine
+from core.edition_grouping import (
+    EDITION_PREFERENCE_ALL,
+    EDITION_PREFERENCE_ONE_COMPLETE,
+    EDITION_PREFERENCE_ONE_STANDARD,
+    EDITION_PREFERENCE_VALUES,
+    edition_group_key,
+    reduce_edition_group,
+)
 from utils.logging_config import get_logger
 
 
@@ -43,6 +49,119 @@ def _mark_personalized_kinds_stale(database, kinds, profile_id=1):
     return mgr.mark_kinds_stale(list(kinds), profile_id=profile_id)
 
 logger = get_logger("watchlist_scanner")
+
+
+# Ligatures NFKD does not decompose (verified: œ æ ß ł ø ð þ survive
+# NFKD + combining-mark stripping unchanged). Map them explicitly so
+# "Cœur de pirate" still matches "Coeur de pirate" across providers.
+_LIGATURE_MAP = {
+    'œ': 'oe', 'Œ': 'OE', 'æ': 'ae', 'Æ': 'AE',
+    'ß': 'ss', 'ẞ': 'SS', 'ø': 'o', 'Ø': 'O',
+    'ł': 'l', 'Ł': 'L', 'ð': 'd', 'Ð': 'D',
+    'þ': 'th', 'Þ': 'TH', 'ŋ': 'n', 'Ŋ': 'N',
+}
+
+
+def _normalize_artist_credit(name: str) -> str:
+    """Normalize an artist name for cross-provider credit comparison.
+
+    The watched artist's name comes from whichever provider the user searched
+    (usually Spotify), while track credits come from the preferred metadata
+    source (Deezer/MusicBrainz/iTunes) — these routinely differ in quote
+    style, diacritics, ligatures, periods and articles ("Guns N’ Roses" vs
+    "Guns N' Roses", "Cœur de pirate" vs "Coeur de pirate", "T. Rex" vs
+    "T Rex", "The Beatles" vs "Beatles"). Normalizing both sides keeps real
+    tracks included. The substring guard is preserved by the exact
+    per-component match downstream ("Metallica" still never matches
+    "Metallica Tribute Band").
+
+    Known limitation: the leading-"the" strip cannot distinguish a distinct
+    act named "The X" from watched artist "X" (e.g. credit "The Metallica"
+    matches watched "Metallica"). No pure string comparison can; the strip
+    stays because dropping it reintroduces worse false negatives.
+    """
+    import unicodedata
+    t = name or ''
+    for lig, rep in _LIGATURE_MAP.items():
+        t = t.replace(lig, rep)
+    t = unicodedata.normalize('NFKD', t)
+    t = ''.join(c for c in t if not unicodedata.combining(c))
+    t = (t.replace('’', "'").replace('‘', "'")
+          .replace('“', '"').replace('”', '"'))
+    t = t.replace('.', '')
+    t = t.strip()
+    if t[:4].lower() == 'the ':
+        t = t[4:]
+    t = t.rstrip(',!?:;')
+    return t.strip()
+
+
+# the provider that owns each watchlist id column, most trusted first. the
+# internal row id is its OWN namespace and is named as such - it is not a
+# provider id and must never be compared against one.
+_WATCHLIST_IDENTITY_ORDER = (
+    ('spotify', 'spotify_artist_id'),
+    ('itunes', 'itunes_artist_id'),
+    ('deezer', 'deezer_artist_id'),
+    ('discogs', 'discogs_artist_id'),
+    ('musicbrainz', 'musicbrainz_artist_id'),
+)
+
+
+def _invalidate_discover_shelf_cache():
+    """Drop the discover shelf cache after curation stores new content.
+
+    the shelf responses are cached for 30 minutes in the web process. the
+    scanner runs in that same process, so a freshly stored generation would
+    otherwise sit behind a stale response for up to half an hour. guarded and
+    best-effort: no import cycle, and a missing web layer is not an error.
+    """
+    try:
+        from api.discover_routes import invalidate_discover_shelf_cache
+        invalidate_discover_shelf_cache()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("discover shelf cache invalidation skipped: %s", e)
+
+
+# #1309: each scan looked only at releases dated AFTER the previous scan. a
+# release lands in a provider's catalogue days late (and a day-precision date
+# reads as midnight utc, earlier than a scan that ran that morning), so once
+# the scan had passed its date it was never seen again, though the artist
+# page listed it. re-check this much before the last scan every time; owned,
+# wishlisted and ignore-listed albums are skipped downstream, so the overlap
+# only ever catches what was missed.
+INCREMENTAL_OVERLAP_DAYS = 14
+
+
+def incremental_cutoff(last_scan, lookback_period=None):
+    """the release-date cutoff for an incremental scan: the last scan minus
+    the overlap, never further back than a numeric lookback setting."""
+    if last_scan is None:
+        return None
+    ts = last_scan if last_scan.tzinfo else last_scan.replace(tzinfo=timezone.utc)
+    overlap = INCREMENTAL_OVERLAP_DAYS
+    try:
+        days = int(lookback_period)
+        if 0 < days < overlap:
+            overlap = days
+    except (TypeError, ValueError):
+        pass
+    return ts - timedelta(days=overlap)
+
+
+def watchlist_source_identity(artist):
+    """(id, provider) for a watchlist artist - never the id alone.
+
+    a bare deezer id and a bare itunes id are the same string, so an edge
+    stored without its provider cannot be matched back to one artist with
+    certainty. every similarity row now records which namespace its
+    source_artist_id came from, and the readers match the PAIR.
+    """
+    for provider, attr in _WATCHLIST_IDENTITY_ORDER:
+        value = getattr(artist, attr, None)
+        if value:
+            return str(value), provider
+    return str(getattr(artist, 'id', '')), 'watchlist_row'
 
 # Rate limiting constants for watchlist operations
 DELAY_BETWEEN_ARTISTS = 4.0      # 4 seconds between different artists (was 2s, increased to reduce Spotify rate limit risk)
@@ -159,29 +278,34 @@ def is_remix_version(track_name: str, album_name: str = "") -> bool:
     # Combine track and album names for comprehensive checking
     text_to_check = f"{track_name} {album_name}".lower()
 
-    # Remix patterns (but NOT remaster/remastered)
-    remix_patterns = [
-        r'\bremix\b',                   # Remix, Remixed
-        r'\bmix\b(?!.*\bremaster)',     # Mix (but not if followed by remaster)
-        r'\bedit\b',                    # Radio Edit, Extended Edit
-        r'\bversion\b(?=.*\bmix\b)',    # Version with Mix (e.g., "Dance Version Mix")
-        r'\bclub mix\b',                # Club Mix
-        r'\bdance mix\b',               # Dance Mix
-        r'\bradio edit\b',              # Radio Edit
-        r'\bextended\b(?=.*\bmix\b)',   # Extended Mix
-        r'\bdub\b',                     # Dub version
-        r'\bvip mix\b',                 # VIP Mix
-    ]
-
     # But exclude remaster/remastered - those are originals
     if re.search(r'\bremaster(ed)?\b', text_to_check, re.IGNORECASE):
         return False
 
-    for pattern in remix_patterns:
-        if re.search(pattern, text_to_check, re.IGNORECASE):
-            return True
+    # "remix" says it outright, wherever it sits
+    if re.search(r'\b(remix(es|ed)?|rmx)\b', text_to_check, re.IGNORECASE):
+        return True
+
+    # mix / edit / dub only mean a remix inside a version qualifier: "(Club
+    # Mix)", "[Dub]", "- Radio Edit". bare, they're ordinary title words,
+    # like 311's "Mix It Up" and "Rub a Dub" (#1381), the same trap
+    # is_live_version fixed for "Live Forever"
+    for name in (track_name, album_name or ''):
+        for qualifier in _version_qualifiers(name):
+            if re.search(r'\b(mix|edit|dub)\b', qualifier, re.IGNORECASE):
+                return True
 
     return False
+
+
+def _version_qualifiers(name: str) -> list:
+    """the bracketed parts of a title and its " - " suffix, where version
+    words live: "Song (Club Mix) - Radio Edit" -> ["Club Mix", "Radio Edit"]."""
+    found = re.findall(r'[\(\[]([^\)\]]*)[\)\]]', name)
+    dash = re.search(r'\s[-–—]\s+(.+)$', name)
+    if dash:
+        found.append(dash.group(1))
+    return found
 
 def is_acoustic_version(track_name: str, album_name: str = "") -> bool:
     """
@@ -453,6 +577,93 @@ def _extid_match_is_owned(wanted_album: str, library_album: str, allow_duplicate
     if not wanted_album or not library_album:
         return True   # nothing to compare -> conservative: treat as owned (prior behaviour)
     return _albums_likely_match(wanted_album, library_album)
+
+
+def _resolve_edition_preference(explicit_value=None) -> str:
+    """Validate a ``watchlist.edition_preference`` value.
+
+    Anything outside {"all", "one_standard", "one_complete"} — including
+    None and non-strings — falls back to "all" (today's behaviour). The
+    feature is fully opt-in: nobody's existing setup changes.
+    """
+    if isinstance(explicit_value, str) and explicit_value in EDITION_PREFERENCE_VALUES:
+        return explicit_value
+    if explicit_value is not None:
+        return EDITION_PREFERENCE_ALL
+    try:
+        from core.settings import config_manager
+        value = config_manager.get('watchlist.edition_preference', EDITION_PREFERENCE_ALL)
+    except Exception:
+        return EDITION_PREFERENCE_ALL
+    if isinstance(value, str) and value in EDITION_PREFERENCE_VALUES:
+        return value
+    return EDITION_PREFERENCE_ALL
+
+
+def _resolve_prefer_explicit_edition() -> bool:
+    """Read ``watchlist.prefer_explicit_edition`` (bool, default True).
+
+    This is the EDITION tie-break for #1450 — unrelated to
+    ``content_filter.prefer_explicit``, which re-ranks Soulseek download
+    candidates and never selects between editions.
+    """
+    try:
+        from core.settings import config_manager
+        value = config_manager.get('watchlist.prefer_explicit_edition', True)
+    except Exception:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() not in ('0', 'false', 'no', 'off', '')
+    return bool(value)
+
+
+def _group_albums_by_edition(albums):
+    """Group a provider album list into edition groups for #1450.
+
+    Provider order is preserved both across groups (first-seen order)
+    and within them, so the reduction's provider-order tie-break and all
+    downstream behaviour stay deterministic. Albums with no usable name
+    each get their own group (never fused).
+    """
+    groups = []
+    index_by_key = {}
+    for album in albums or []:
+        name = getattr(album, 'name', '') or ''
+        key = edition_group_key(name) if isinstance(name, str) else ''
+        if not key:
+            groups.append([album])
+            continue
+        if key in index_by_key:
+            groups[index_by_key[key]].append(album)
+        else:
+            index_by_key[key] = len(groups)
+            groups.append([album])
+    return groups
+
+
+def _edition_explicit_flag(album_data, tracks) -> bool:
+    """Best-effort explicit flag for one edition (album-level, then tracks).
+
+    Feeds the explicit tie-break in ``reduce_edition_group``. Providers
+    don't reliably set an album-level flag, so fall back to "any track
+    flagged explicit" — an edition containing explicit tracks is the
+    explicit edition.
+    """
+    try:
+        if isinstance(album_data, dict):
+            if album_data.get('explicit'):
+                return True
+        elif getattr(album_data, 'explicit', False):
+            return True
+        for track in tracks or []:
+            if isinstance(track, dict):
+                if track.get('explicit'):
+                    return True
+            elif getattr(track, 'explicit', False):
+                return True
+    except Exception:
+        return False
+    return False
 
 
 @dataclass
@@ -896,7 +1107,14 @@ class WatchlistScanner:
         try:
             if source == 'spotify':
                 return client.get_artist(artist_id, allow_fallback=False)
-            return client.get_artist(artist_id)
+            data = client.get_artist(artist_id)
+            # deezer artists carry no genres, only their albums do. without
+            # this every deezer track landed in the discovery pool genre-less
+            # and genre playlists (daily mix etc.) came back empty.
+            if (source == 'deezer' and isinstance(data, dict) and not data.get('genres')
+                    and hasattr(client, 'get_artist_genres')):
+                data['genres'] = client.get_artist_genres(artist_id)
+            return data
         except Exception as e:
             logger.debug("Could not fetch artist data for %s on %s: %s", artist_id, source, e)
             return None
@@ -960,7 +1178,9 @@ class WatchlistScanner:
                        deezer_artist_id, discogs_artist_id, musicbrainz_artist_id
                 FROM watchlist_artists
                 WHERE profile_id = ? AND (image_url IS NULL OR image_url = '' OR image_url = 'None'
-                      OR image_url NOT LIKE 'http%')
+                      OR image_url NOT LIKE 'http%'
+                      OR image_url LIKE '%/images/artist//%'
+                      OR image_url LIKE '%d41d8cd98f00b204e9800998ecf8427e%')
             """, (profile_id,))
             imageless = cursor.fetchall()
 
@@ -981,7 +1201,7 @@ class WatchlistScanner:
                     LIMIT 1
                 """, (name,))
                 cr = cursor.fetchone()
-                if cr:
+                if cr and usable_image_url(cr['image_url']):
                     img = cr['image_url']
 
                 # 2. Deezer direct URL (no API call needed)
@@ -1059,10 +1279,36 @@ class WatchlistScanner:
         logger.warning(f"No valid client/ID for {watchlist_artist.artist_name}")
         return None
 
+    def _apply_auto_download_default(self, watchlist_artists: List[WatchlistArtist]):
+        """Resolve each artist's effective auto-download: its own choice, else the
+        global default.
+
+        Deliberately NOT gated behind ``global_override_enabled``. That switch
+        governs the FORMAT overrides, which overwrite an artist wholesale; this is
+        a default an artist's own setting beats, so it applies on its own terms.
+        Folding it into the format switch would force auto-download on everyone
+        already using that override for formats — silently undoing any deliberate
+        follow-only they had set."""
+        from core.watchlist_auto_download import effective_with_legacy
+        try:
+            from core.settings import config_manager
+            g_auto = config_manager.get('watchlist.global_auto_download', True)
+        except Exception:   # noqa: BLE001 - a config hiccup keeps today's behaviour
+            g_auto = True
+        for artist in watchlist_artists or []:
+            pref = getattr(artist, 'auto_download_pref', None)
+            # The stored boolean is passed too: a row the backfill never reached
+            # can still hold a deliberate follow-only, and the global must not
+            # switch downloads back on for it.
+            legacy = getattr(artist, 'auto_download', True)
+            artist.auto_download = effective_with_legacy(pref, legacy, g_auto)
+
     def _apply_global_watchlist_overrides(self, watchlist_artists: List[WatchlistArtist]):
         """Apply global watchlist release-type overrides to a batch of artists."""
+        # Runs first and unconditionally — see _apply_auto_download_default.
+        self._apply_auto_download_default(watchlist_artists)
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
         except Exception:
             return
 
@@ -1077,10 +1323,11 @@ class WatchlistScanner:
         g_acoustic = config_manager.get('watchlist.global_include_acoustic', False)
         g_compilations = config_manager.get('watchlist.global_include_compilations', False)
         g_instrumentals = config_manager.get('watchlist.global_include_instrumentals', False)
+        g_other_artists = config_manager.get('watchlist.global_include_other_artists', False)
 
         logger.info(
             "Applying global watchlist override to %s artists "
-            "(albums=%s, eps=%s, singles=%s, live=%s, remixes=%s, acoustic=%s, compilations=%s, instrumentals=%s)",
+            "(albums=%s, eps=%s, singles=%s, live=%s, remixes=%s, acoustic=%s, compilations=%s, instrumentals=%s, other_artists=%s)",
             len(watchlist_artists),
             g_albums,
             g_eps,
@@ -1090,6 +1337,7 @@ class WatchlistScanner:
             g_acoustic,
             g_compilations,
             g_instrumentals,
+            g_other_artists,
         )
 
         for artist in watchlist_artists:
@@ -1101,6 +1349,187 @@ class WatchlistScanner:
             artist.include_acoustic = g_acoustic
             artist.include_compilations = g_compilations
             artist.include_instrumentals = g_instrumentals
+            artist.include_other_artists = g_other_artists
+
+    def _resolve_edition_unit(self, album_unit, album_fetcher, *,
+                              edition_preference=EDITION_PREFERENCE_ALL,
+                              prefer_explicit_edition=True):
+        """Fetch an edition unit and return the (album, album_data, tracks) to process.
+
+        A unit is one provider album for "all", or one edition group for
+        one_standard/one_complete. Track counts only exist after each
+        edition's track list is fetched, so the pick is deferred here:
+        every edition in the group is fetched, then reduce_edition_group
+        keeps a single edition and only it runs the normal per-track flow.
+
+        Returns None when no edition yielded usable track data (same
+        skip conditions as the old per-album code: fetch failure, no
+        tracks, placeholder tracks).
+        """
+        try:
+            if edition_preference == EDITION_PREFERENCE_ALL or len(album_unit) <= 1:
+                album = album_unit[0]
+                try:
+                    album_data = album_fetcher(album.id, getattr(album, 'name', ''))
+                except Exception as e:
+                    logger.warning("Error checking album %s: %s", getattr(album, 'name', '?'), e)
+                    return None
+                tracks = self._extract_track_items(album_data)
+                if not album_data or not tracks:
+                    logger.debug(
+                        "Skipping album %s (id=%s): no track data returned",
+                        getattr(album, 'name', '?'), getattr(album, 'id', '?'),
+                    )
+                    return None
+                return (album, album_data, tracks)
+
+            candidates = []
+            for album in album_unit:
+                album_name = getattr(album, 'name', '?')
+                try:
+                    album_data = album_fetcher(album.id, getattr(album, 'name', ''))
+                except Exception as e:
+                    logger.warning("Error checking album %s: %s", album_name, e)
+                    continue
+                tracks = self._extract_track_items(album_data)
+                if not album_data or not tracks:
+                    logger.debug(
+                        "Skipping album %s (id=%s): no track data returned",
+                        album_name, getattr(album, 'id', '?'),
+                    )
+                    continue
+                if self._has_placeholder_tracks(tracks):
+                    logger.info("Skipping album with placeholder tracks: %s", album_name)
+                    continue
+                candidates.append({
+                    'album': album,
+                    'album_data': album_data,
+                    'tracks': tracks,
+                    'track_count': len(tracks),
+                    'explicit': _edition_explicit_flag(album_data, tracks),
+                })
+            if not candidates:
+                return None
+            if len(candidates) == 1:
+                picked = candidates[0]
+            else:
+                picked = reduce_edition_group(
+                    candidates, edition_preference,
+                    prefer_explicit=prefer_explicit_edition,
+                )[0]
+                logger.info(
+                    "#1450 %s: picked '%s' (%d tracks) from %d editions",
+                    edition_preference,
+                    getattr(picked['album'], 'name', '?'),
+                    picked['track_count'], len(candidates),
+                )
+            return (picked['album'], picked['album_data'], picked['tracks'])
+        except Exception as e:
+            logger.warning("Error resolving edition unit: %s", e)
+            return None
+
+    def _edition_group_owned_by_library(self, tracks, album_name) -> bool:
+        """#1450 one_standard: does the library already own an edition of this group?
+
+        Probed with TODAY's per-track ownership semantics (explicit
+        ``edition_preference="all"``): if any track of the picked edition
+        is not missing from the library, the group counts as owned and the
+        whole group is skipped — never an extras-only folder.
+        """
+        for track in tracks or []:
+            if not self.is_track_missing_from_library(
+                track, album_name=album_name,
+                edition_preference=EDITION_PREFERENCE_ALL,
+            ):
+                return True
+        return False
+
+    def _is_track_missing_one_complete(self, track, active_server) -> bool:
+        """#1450 one_complete per-track semantics.
+
+        The picked edition must queue COMPLETE: the fuzzy same-album skip
+        is bypassed for non-exact matches, so a reissue's shared tracks
+        are still wishlisted. Only EXACT external-ID matches (library row
+        or download provenance with the file on disk) count as owned —
+        true duplicates are still skipped, and the album gate is
+        deliberately not applied: an exact recording hit is a duplicate
+        whichever edition it's filed under.
+
+        This branch only runs when ``wishlist.allow_duplicate_tracks`` is
+        on (see the call site): with duplicates off, the wider fuzzy
+        match of today's logic is the ownership test, so a library row
+        without external IDs still counts as owned.
+        """
+        try:
+            from core.library.track_identity import (
+                extract_external_ids,
+                find_library_track_by_external_id,
+                find_provenance_by_external_id,
+            )
+            import os as _os_local
+            from core.downloads.atomic_album_publish import contains_staging_segment
+            try:
+                _source_hint = get_primary_source()
+            except Exception:
+                _source_hint = None
+            source_ids = extract_external_ids(track, source_hint=_source_hint)
+            if source_ids:
+                matched = find_library_track_by_external_id(
+                    self.database,
+                    external_ids=source_ids,
+                    server_source=active_server,
+                )
+                if matched is not None:
+                    matched_path = (matched.get('file_path') if isinstance(matched, dict)
+                                    else getattr(matched, 'file_path', '')) or ''
+                    # #1289: a row whose file is still in atomic-publish
+                    # staging is not ownership — the file is quarantined and
+                    # may never publish, so the watchlist must keep asking.
+                    if contains_staging_segment(matched_path):
+                        logger.info(
+                            "[EditionPref:one_complete] ignoring staged library row — "
+                            "not published yet, keeping the request"
+                        )
+                    else:
+                        logger.info(
+                            "[EditionPref:one_complete] exact external-ID duplicate — skipping: "
+                            "'%s' (matched on: %s)",
+                            track.get('name', 'Unknown') if isinstance(track, dict)
+                            else getattr(track, 'name', 'Unknown'),
+                            ', '.join(sorted(source_ids.keys())),
+                        )
+                        return False
+                prov = find_provenance_by_external_id(
+                    self.database, external_ids=source_ids,
+                )
+                if prov is not None:
+                    prov_path = prov.get('file_path')
+                    if (prov_path and _os_local.path.exists(prov_path)
+                            and not contains_staging_segment(prov_path)):
+                        logger.info(
+                            "[EditionPref:one_complete] exact provenance duplicate — skipping"
+                        )
+                        return False
+        except sqlite3.Error as db_err:
+            # Fail CLOSED (mirrors the H11 rule at the bottom of
+            # is_track_missing_from_library): an infrastructure failure —
+            # locked DB, I/O error — means we cannot prove the track is
+            # missing. Treat it as present for this scan (it is rechecked
+            # on the next one) rather than wishlisting — and re-downloading
+            # — an owned track.
+            track_name = (track.get('name', 'Unknown') if isinstance(track, dict)
+                          else getattr(track, 'name', 'Unknown'))
+            logger.warning(
+                "[EditionPref:one_complete] library probe failed for '%s' (%s) — "
+                "treating as present this scan", track_name, db_err,
+            )
+            return False
+        except Exception as ext_id_err:
+            logger.debug(
+                "External-ID match probe failed (one_complete, treating as missing): %s",
+                ext_id_err,
+            )
+        return True
 
     def scan_watchlist_profile(
         self,
@@ -1221,12 +1650,72 @@ class WatchlistScanner:
             if source in {'spotify', 'itunes', 'deezer', 'discogs', 'musicbrainz'}
         ]
 
-        for provider in providers_to_backfill:
+        # The backfill is the longest phase of a scan for anyone who has just
+        # added artists, and it used to run silently with no way out: the page
+        # showed 0 of N for tens of minutes and Cancel did nothing, because the
+        # only cancel check was in the artist loop this runs before (#1240).
+        # It reports its own phase now, and it stops when asked.
+        backfill_cancelled = False
+        for provider_number, provider in enumerate(providers_to_backfill, 1):
+            # No cancel check out here on purpose. _backfill_missing_ids returns
+            # early without asking when a provider has nothing to match, and a
+            # pre-check here would consult the caller once per provider even
+            # then - work that does not exist cannot be worth cancelling, and
+            # asking anyway changes how often the check is called.
             try:
                 logger.info("Checking for missing %s IDs in watchlist...", provider)
-                self._backfill_missing_ids(watchlist_artists, provider)
+
+                def _backfill_progress(done, total, _p=provider, _n=provider_number):
+                    if scan_state is not None:
+                        scan_state.update({
+                            'current_phase': 'matching_sources',
+                            'matching_source': _p,
+                            'matching_source_number': _n,
+                            'matching_source_total': len(providers_to_backfill),
+                            'matching_artists_done': done,
+                            'matching_artists_total': total,
+                        })
+                    _emit(
+                        'matching_sources',
+                        profile_id=profile_id,
+                        source=_p,
+                        source_number=_n,
+                        source_total=len(providers_to_backfill),
+                        artists_done=done,
+                        artists_total=total,
+                    )
+
+                completed = self._backfill_missing_ids(
+                    watchlist_artists, provider,
+                    cancel_check=cancel_check,
+                    on_progress=_backfill_progress,
+                )
+                # ONLY an explicit False means "a cancel was honoured". A
+                # stub, a subclass or an older override that returns None is
+                # saying nothing, and reading that as a cancel would abort every
+                # scan before it started.
+                if completed is False:
+                    backfill_cancelled = True
+                    break
             except Exception as backfill_error:
                 logger.warning("Error during %s ID backfilling: %s", provider, backfill_error)
+
+        if backfill_cancelled:
+            logger.info("Watchlist scan cancelled during source matching")
+            if scan_state is not None:
+                scan_state.update({
+                    'status': 'cancelled',
+                    'current_phase': 'cancelled',
+                    'summary': {
+                        'total_artists': 0,
+                        'successful_scans': 0,
+                        'new_tracks_found': 0,
+                        'tracks_added_to_wishlist': 0,
+                        'cancelled': True,
+                    },
+                })
+            _emit('cancelled', processed=0, total=len(watchlist_artists))
+            return scan_results
 
         lookback_period = self._get_lookback_period_setting()
         is_full_discography = (lookback_period == 'all')
@@ -1253,6 +1742,17 @@ class WatchlistScanner:
             album_delay,
         )
 
+        # #1450: one-edition-per-album. Read ONCE per scan, not per album.
+        # Default "all" is today's behaviour — the feature is fully opt-in,
+        # so an unset/invalid value changes nothing for existing setups.
+        edition_preference = _resolve_edition_preference()
+        prefer_explicit_edition = _resolve_prefer_explicit_edition()
+        if edition_preference != EDITION_PREFERENCE_ALL:
+            logger.info(
+                "Edition preference for this scan: %s (prefer_explicit_edition=%s)",
+                edition_preference, prefer_explicit_edition,
+            )
+
         for i, artist in enumerate(watchlist_artists):
             if cancel_check and cancel_check():
                 logger.info("Watchlist scan cancelled after %s/%s artists", i, len(watchlist_artists))
@@ -1270,15 +1770,14 @@ class WatchlistScanner:
                 _emit('cancelled', processed=i, total=len(watchlist_artists))
                 break
 
-            source_artist_id = (
-                artist.spotify_artist_id
-                or artist.itunes_artist_id
-                or artist.deezer_artist_id
-                or artist.discogs_artist_id
-                or getattr(artist, 'musicbrainz_artist_id', None)
-                or str(artist.id)
-            )
+            source_artist_id, source_provider = watchlist_source_identity(artist)
 
+            # "is this track missing" is asked of the artist's owner's library
+            # (#1199): a scheduled scan walks every profile's artists on one
+            # thread, and without this an own-library profile was answered
+            # from the shared library, so anything the admin had was never
+            # wishlisted for them
+            _scope_token = set_library_scope(library_scope_for_profile(getattr(artist, 'profile_id', None) or profile_id))
             try:
                 discography_result = self.get_artist_discography_for_watchlist(artist, artist.last_scan_timestamp)
                 if discography_result is None:
@@ -1307,10 +1806,23 @@ class WatchlistScanner:
                     source = discography_result.source
                     albums = discography_result.albums
                     source_artist_id = discography_result.artist_id
+                    # the id changed namespace with it - keep the pair honest
+                    source_provider = str(source or '').strip().lower() or source_provider
                     artist_image_url = discography_result.image_url or self.get_artist_image_url(artist) or ''
                     album_fetcher = lambda album_id, album_name='', source=source: self._get_album_data_for_source(source, album_id, album_name)
 
-                albums = self._prefer_bigger_editions(albums)
+                # #1450: one-edition-per-album. Track counts only exist after
+                # each album's track list is fetched, so the grouping happens
+                # here but the pick is deferred into the album loop below
+                # (see _resolve_edition_unit): each edition's tracks are
+                # fetched, then reduce_edition_group keeps a single edition
+                # and only it runs the normal per-track flow. For "all" each
+                # unit is one album, so the loop below behaves exactly as
+                # before.
+                if edition_preference != EDITION_PREFERENCE_ALL:
+                    album_units = _group_albums_by_edition(albums)
+                else:
+                    album_units = [[album] for album in albums]
 
                 absolute_index = artist_index_offset + i + 1
                 if scan_state is not None:
@@ -1338,20 +1850,40 @@ class WatchlistScanner:
                 if scan_state is not None:
                     scan_state.update({
                         'current_phase': 'checking_albums',
-                        'albums_to_check': len(albums),
+                        'albums_to_check': len(album_units),
                         'albums_checked': 0,
                     })
 
                 artist_new_tracks = 0
                 artist_added_tracks = 0
 
-                for album_index, album in enumerate(albums):
+                artist_was_cancelled = False
+                albums_processed = 0
+                for album_index, album_unit in enumerate(album_units):
+                    # The album loop had no cancel point at all, so a cancel
+                    # could only land between ARTISTS. An artist with thirty
+                    # albums is thirty fetches and thirty sleeps first, and a
+                    # slow provider makes that minutes of an unstoppable scan.
+                    if cancel_check and cancel_check():
+                        artist_was_cancelled = True
+                        logger.info(
+                            "Cancel received while checking albums for %s (%s of %s)",
+                            artist.artist_name, album_index, len(album_units),
+                        )
+                        break
+                    # H8: count only albums actually attempted — the cancel
+                    # check above means a mid-artist cancel leaves the rest
+                    # untouched, and the result must report the real count.
+                    albums_processed += 1
                     try:
-                        album_data = album_fetcher(album.id, getattr(album, 'name', ''))
-                        tracks = self._extract_track_items(album_data)
-                        if not album_data or not tracks:
-                            logger.debug("Skipping album %s (id=%s): no track data returned", album.name, album.id)
+                        picked = self._resolve_edition_unit(
+                            album_unit, album_fetcher,
+                            edition_preference=edition_preference,
+                            prefer_explicit_edition=prefer_explicit_edition,
+                        )
+                        if picked is None:
                             continue
+                        album, album_data, tracks = picked
 
                         album_name = getattr(album, 'name', '')
                         if isinstance(album_data, dict):
@@ -1378,6 +1910,20 @@ class WatchlistScanner:
                                 getattr(artist, 'include_singles', True))
                             continue
 
+                        if edition_preference == EDITION_PREFERENCE_ONE_STANDARD and \
+                                self._edition_group_owned_by_library(tracks, album_name):
+                            # The library already owns an edition of this
+                            # group (probed with today's per-track ownership
+                            # semantics): one_standard wants the standard
+                            # edition only, so there is nothing to do — skip
+                            # the whole group instead of wishlisting an
+                            # extras-only folder.
+                            logger.info(
+                                "#1450 one_standard: library already owns an edition of '%s' — skipping group",
+                                album_name,
+                            )
+                            continue
+
                         album_image_url = ''
                         album_images = []
                         if isinstance(album_data, dict):
@@ -1394,7 +1940,7 @@ class WatchlistScanner:
                                 'albums_checked': album_index + 1,
                                 'current_album': album_name,
                                 'current_album_image_url': album_image_url,
-                                'current_phase': f'checking_album_{album_index + 1}_of_{len(albums)}',
+                                'current_phase': f'checking_album_{album_index + 1}_of_{len(album_units)}',
                             })
 
                         _emit(
@@ -1402,7 +1948,7 @@ class WatchlistScanner:
                             artist_name=artist.artist_name,
                             album_name=album_name,
                             album_index=album_index + 1,
-                            total_albums=len(albums),
+                            total_albums=len(album_units),
                             album_image_url=album_image_url,
                         )
 
@@ -1415,7 +1961,9 @@ class WatchlistScanner:
                                 scan_state['current_track_name'] = track_name
 
                             if self.is_track_missing_from_library(
-                                    track, album_name=album_name, album_track_count=len(tracks)):
+                                track, album_name=album_name,
+                                edition_preference=edition_preference,
+                            ):
                                 artist_new_tracks += 1
                                 if scan_state is not None:
                                     scan_state['tracks_found_this_scan'] += 1
@@ -1463,22 +2011,28 @@ class WatchlistScanner:
                                         if len(scan_state['recent_wishlist_additions']) > 10:
                                             scan_state['recent_wishlist_additions'].pop()
 
-                        if album_index < len(albums) - 1:
+                        if album_index < len(album_units) - 1:
                             time.sleep(album_delay)
 
                     except Exception as e:
-                        logger.warning("Error checking album %s: %s", album.name, e)
+                        _unit_name = getattr(album_unit[0], 'name', '?') if album_unit else '?'
+                        logger.warning("Error checking album %s: %s", _unit_name, e)
                         continue
 
-                self.update_artist_scan_timestamp(artist)
+                # H8: a cancelled artist is NOT fully scanned — stamping the
+                # timestamp would skip it next run, and reporting success (or
+                # the full album count) would lie about what was checked.
+                if not artist_was_cancelled:
+                    self.update_artist_scan_timestamp(artist)
 
                 scan_results.append(ScanResult(
                     artist_name=artist.artist_name,
                     spotify_artist_id=source_artist_id or artist.spotify_artist_id or '',
-                    albums_checked=len(albums),
+                    albums_checked=albums_processed,
                     new_tracks_found=artist_new_tracks,
                     tracks_added_to_wishlist=artist_added_tracks,
-                    success=True,
+                    success=not artist_was_cancelled,
+                    error_message="cancelled" if artist_was_cancelled else None,
                 ))
 
                 _emit(
@@ -1487,10 +2041,16 @@ class WatchlistScanner:
                     artist_index=absolute_index,
                     total_artists=total_artists_override if total_artists_override is not None else len(watchlist_artists),
                     profile_id=profile_id,
-                    albums_checked=len(albums),
+                    albums_checked=albums_processed,
                     new_tracks_found=artist_new_tracks,
                     tracks_added_to_wishlist=artist_added_tracks,
                 )
+
+                # a cancelled artist gets no discovery work and no pacing
+                # delay; the loop head handles the cancelled state properly
+                # on the next pass.
+                if artist_was_cancelled:
+                    continue
 
                 try:
                     if scan_state is not None:
@@ -1501,7 +2061,9 @@ class WatchlistScanner:
                         self._backfill_similar_artists_fallback_ids(source_artist_id, profile_id=artist_profile_id)
                     else:
                         logger.info("Fetching similar artists for %s (profile %s)...", artist.artist_name, artist_profile_id)
-                        self.update_similar_artists(artist, profile_id=artist_profile_id, source_artist_id=source_artist_id)
+                        self.update_similar_artists(artist, profile_id=artist_profile_id,
+                                                    source_artist_id=source_artist_id,
+                                                    source_provider=source_provider)
                         logger.info("Similar artists updated for %s", artist.artist_name)
                 except Exception as similar_error:
                     logger.warning("Failed to update similar artists for %s: %s", artist.artist_name, similar_error)
@@ -1530,6 +2092,8 @@ class WatchlistScanner:
                     profile_id=profile_id,
                     error_message=str(e),
                 )
+            finally:
+                reset_library_scope(_scope_token)
 
         if scan_state is not None:
             successful_scans = [r for r in scan_results if r.success]
@@ -1607,7 +2171,7 @@ class WatchlistScanner:
                 cutoff_timestamp = None
                 needs_full_discog = True
             elif last_scan_timestamp is not None:
-                cutoff_timestamp = last_scan_timestamp
+                cutoff_timestamp = incremental_cutoff(last_scan_timestamp, lookback_period)
 
                 # Check if a lookback period change requires a one-time wider window
                 rescan_cutoff = self._get_rescan_cutoff()
@@ -1652,8 +2216,24 @@ class WatchlistScanner:
                 logger.warning(f"API failure fetching albums for artist {artist_id}")
                 return None
             if not albums:
-                logger.debug(f"No albums found for artist {artist_id}")
-                return []
+                # RAW discography is empty — before any date filtering. A real
+                # artist always has releases, so this means the provider does
+                # not recognise this ID (commonly a foreign one: iTunes and
+                # Deezer IDs are both bare integers and get confused for each
+                # other). Returning [] said "success, nothing new", which ENDED
+                # the source fallback chain in
+                # get_artist_discography_for_watchlist — so a blind provider
+                # first in the priority order silently starved the wishlist and
+                # the sources that did know the artist were never asked.
+                #
+                # None means "this source failed, try the next one". A genuine
+                # "nothing new" still returns [] further down, AFTER the lookback
+                # filter, so the common fast path is unchanged and this costs no
+                # extra API calls.
+                logger.info(
+                    "No albums at all for artist %s — treating this source as unable "
+                    "to resolve it and falling through to the next", artist_id)
+                return None
 
             # Add small delay after fetching artist discography to be extra safe
             time.sleep(0.3)  # 300ms breathing room
@@ -1680,9 +2260,31 @@ class WatchlistScanner:
             logger.error(f"Error getting discography for artist {artist_id}: {e}")
             return None
 
-    def _backfill_missing_ids(self, artists: List[WatchlistArtist], provider: str):
+    def _backfill_missing_ids(
+        self,
+        artists: List[WatchlistArtist],
+        provider: str,
+        *,
+        cancel_check: Optional[Callable[[], bool]] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> bool:
         """
         Proactively match ALL artists missing IDs for the current provider.
+
+        Returns False when a cancel was honoured part way through, else True.
+
+        This runs BEFORE the artist loop and is usually the longest part of a
+        scan: one network lookup per artist per provider, with a sleep between
+        each. Somebody who has just added a few hundred artists has almost no
+        provider ids yet, so nearly every artist needs looking up against every
+        other provider - 379 artists over five providers is 1,895 lookups,
+        which is tens of minutes.
+
+        It used to run silently and ignore cancellation, so for all that time
+        the watchlist page sat on "0 / 379 artists" and the cancel button did
+        nothing - the only cancel check lived in the artist loop that had not
+        started yet. That is #1240: shows as scanning but never starts, and
+        cannot be cancelled.
         
         Example: User has 50 artists with only Spotify IDs.
         When iTunes becomes active, this matches ALL 50 to iTunes in one batch.
@@ -1698,13 +2300,13 @@ class WatchlistScanner:
 
         if not id_attr:
             logger.debug(f"Backfill not supported for provider: {provider}")
-            return
+            return True
 
         artists_to_match = [a for a in artists if not getattr(a, id_attr, None)]
 
         if not artists_to_match:
             logger.info(f"All artists already have {provider} IDs")
-            return
+            return True
 
         logger.info(f"Backfilling {len(artists_to_match)} artists with {provider} IDs...")
 
@@ -1726,11 +2328,25 @@ class WatchlistScanner:
 
         if not match_fn or not update_fn:
             logger.debug(f"No match/update function available for provider: {provider}")
-            return
+            return True
 
         matched_count = 0
         unmatched_names = []
-        for artist in artists_to_match:
+        total_to_match = len(artists_to_match)
+        for done, artist in enumerate(artists_to_match):
+            # checked BEFORE the lookup, so a cancel lands within one artist
+            # rather than after a whole provider pass
+            if cancel_check and cancel_check():
+                logger.info(
+                    "%s ID backfill cancelled after %s/%s artists",
+                    provider, done, total_to_match,
+                )
+                return False
+            if on_progress:
+                try:
+                    on_progress(done, total_to_match)
+                except Exception:                        # noqa: BLE001
+                    logger.debug("backfill progress callback failed", exc_info=True)
             try:
                 new_id = match_fn(artist.artist_name)
                 if new_id:
@@ -1748,10 +2364,16 @@ class WatchlistScanner:
                 unmatched_names.append(artist.artist_name)
                 continue
 
+        if on_progress:
+            try:
+                on_progress(total_to_match, total_to_match)
+            except Exception:                            # noqa: BLE001
+                logger.debug("backfill progress callback failed", exc_info=True)
         logger.info(f"Backfilled {matched_count}/{len(artists_to_match)} artists with {provider} IDs")
         if unmatched_names:
             logger.warning(f"Could not confidently match {len(unmatched_names)} artists: {', '.join(unmatched_names[:10])}"
                           f"{'...' if len(unmatched_names) > 10 else ''} — use Watchlist Settings to link manually")
+        return True
 
     @staticmethod
     def _normalize_artist_name(name: str) -> str:
@@ -2037,27 +2659,6 @@ class WatchlistScanner:
         # (some albums legitimately have a track called "Track X" but not most of them)
         return placeholder_count > len(tracks) / 2
 
-    def _prefer_bigger_editions(self, albums):
-        """With "Prefer deluxe editions" on, drop a release when a bigger edition of
-        the same album is in the same scan ("X" when "X (Deluxe Edition)" is there
-        too), so one album isn't wishlisted twice. Off, or on any error, the list
-        comes back unchanged."""
-        try:
-            from config.settings import config_manager
-            if not config_manager.get(PREFER_DELUXE_KEY, False):
-                return albums
-            kept = drop_smaller_editions(albums)
-            if len(kept) != len(albums):
-                kept_ids = {id(album) for album in kept}
-                for album in albums:
-                    if id(album) not in kept_ids:
-                        name = album.get('name') if isinstance(album, dict) else getattr(album, 'name', '')
-                        logger.info("[Prefer Deluxe] Skipping '%s' — a bigger edition of it is in this scan", name)
-            return kept
-        except Exception as e:
-            logger.debug("prefer-deluxe release filter skipped: %s", e)
-            return albums
-
     def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist) -> bool:
         """
         Check if a release should be included based on user's preferences.
@@ -2131,6 +2732,15 @@ class WatchlistScanner:
             include_acoustic = getattr(watchlist_artist, 'include_acoustic', False)
             include_compilations = getattr(watchlist_artist, 'include_compilations', False)
             include_instrumentals = getattr(watchlist_artist, 'include_instrumentals', False)
+            include_other_artists = getattr(watchlist_artist, 'include_other_artists', False)
+
+            # Check that the watched artist is credited on the track. Tribute
+            # albums, soundtracks and compilations surface tracks by unrelated
+            # artists; without this check they all get wishlisted.
+            if not include_other_artists:
+                if not self._track_credits_watched_artist(track, album_data, watchlist_artist):
+                    logger.debug(f"Skipping track '{track_name}' — not credited to watched artist")
+                    return False
 
             # Check compilation albums (album-level filter)
             if not include_compilations:
@@ -2162,7 +2772,7 @@ class WatchlistScanner:
 
             # Check custom exclusion terms
             try:
-                from config.settings import config_manager as _cfg
+                from core.settings import config_manager as _cfg
                 exclude_terms_str = _cfg.get('watchlist.exclude_terms', '')
                 if exclude_terms_str:
                     exclude_terms = [t.strip() for t in exclude_terms_str.split(',') if t.strip()]
@@ -2180,11 +2790,65 @@ class WatchlistScanner:
             logger.warning(f"Error checking track content type inclusion: {e}")
             return True  # Default to including on error
 
+    def _track_credits_watched_artist(self, track, album_data, watchlist_artist) -> bool:
+        """True if the watched artist is credited on the track.
+
+        Fail-open: when there is no artist data at all (thin providers), the
+        track is included rather than risk dropping real music. Uses the
+        shared track_artist_matches helper (exact per-component match, so
+        "Metallica" never matches "Metallica Tribute Band"). Lazy import —
+        discography_filters imports this module at load time, so a top-level
+        import would be circular.
+        """
+        try:
+            from core.metadata.discography_filters import track_artist_matches
+        except Exception as e:
+            logger.debug(f"artist-credit check unavailable ({e}); including track")
+            return True
+
+        artist_name = _normalize_artist_credit(getattr(watchlist_artist, 'artist_name', '') or '')
+
+        def _credit_names(obj):
+            raw = obj.get('artists', []) if isinstance(obj, dict) else getattr(obj, 'artists', [])
+            if isinstance(raw, str):
+                raw = [raw]
+            elif isinstance(raw, dict):
+                raw = [raw]
+            names = []
+            for entry in raw or []:
+                if isinstance(entry, dict):
+                    name = entry.get('name', '') or ''
+                else:
+                    name = str(entry or '')
+                name = _normalize_artist_credit(name)
+                if name:
+                    names.append(name)
+            return names
+
+        names = _credit_names(track)
+        if not names and album_data is not None:
+            # Fall back to album artists when the track carries no credits.
+            names = _credit_names(album_data)
+        if not names:
+            logger.debug("track has no artist credits; including (fail open)")
+            return True
+        return track_artist_matches(names, artist_name)
+
     def is_track_missing_from_library(self, track, album_name: str = None,
-                                      album_track_count: int = None) -> bool:
+                                      edition_preference: str = None) -> bool:
         """
         Check if a track is missing from the local library.
         Uses the same matching logic as the download missing tracks modals.
+
+        edition_preference: #1450 one-edition-per-album. The scan loop
+        passes the once-per-scan value. "one_complete" bypasses the fuzzy
+        same-album skip so the picked edition queues complete (only exact
+        external-ID matches count as owned) — but only when duplicates are
+        allowed; with duplicates off it falls through to today's logic,
+        which treats any fuzzy title/artist/album match as owned.
+        "one_standard" and "all"
+        use today's logic — the one_standard group-skip lives in the
+        scan loop, where the edition's full track list is available.
         """
         try:
             # Handle both dict and object track formats
@@ -2212,12 +2876,27 @@ class WatchlistScanner:
             unique_title_variations = list(dict.fromkeys(title_variations))
 
             # Search for each artist with each title variation
-            from config.settings import config_manager
+            from core.settings import config_manager
             active_server = config_manager.get_active_media_server()
             allow_duplicates = config_manager.get('wishlist.allow_duplicate_tracks', True)
-            # Prefer deluxe editions: a copy owned only on a SMALLER edition of the
-            # album being scanned doesn't count as owning the song for this edition.
-            prefer_deluxe = bool(album_name) and bool(config_manager.get(PREFER_DELUXE_KEY, False))
+
+            # #1450: one_complete redefines per-track ownership — the picked
+            # edition must queue COMPLETE, so the fuzzy same-album skip is
+            # bypassed and only exact external-ID matches count as owned.
+            # "all" and "one_standard" fall through to today's logic,
+            # byte-for-byte (the one_standard group-skip lives in the scan
+            # loop, where the edition's full track list is available).
+            # With allow_duplicates OFF the exact-ID-only branch must NOT
+            # run: today's logic treats any fuzzy title/artist/album match
+            # as owned (no external IDs needed), and the narrower branch
+            # would re-wishlist — and re-download — an owned track whose
+            # library row simply lacks external IDs (local imports, rows
+            # predating ID backfill), since add_to_wishlist_detailed dedupes
+            # by provider track ID only and standard/deluxe IDs differ.
+            if (allow_duplicates
+                    and _resolve_edition_preference(edition_preference)
+                    == EDITION_PREFERENCE_ONE_COMPLETE):
+                return self._is_track_missing_one_complete(track, active_server)
 
             # Provider-neutral external-ID short-circuit: before doing
             # title+artist+album fuzzy comparison, ask the library if any
@@ -2260,31 +2939,22 @@ class WatchlistScanner:
                         # same recording on a DIFFERENT edition (soundtrack remix vs the bonus edition
                         # the user owns) is one they WANT — wishlist it, and don't let the provenance
                         # fallback below re-skip it either.
-                        _on_smaller_edition = prefer_deluxe and owned_row_is_smaller_edition(
-                            self.database, album_name, album_track_count, matched)
-                        if (not _on_smaller_edition
-                                and _extid_match_is_owned(album_name, matched_album, allow_duplicates)):
+                        if _extid_match_is_owned(album_name, matched_album, allow_duplicates):
                             logger.info(
                                 f"[ExtID Match] Track found in library by external ID: "
                                 f"'{original_title}' by '{artists_to_search[0] if artists_to_search else 'Unknown'}' "
                                 f"(matched on: {', '.join(sorted(source_ids.keys()))})"
                             )
                             return False  # Track exists in library (same album / duplicates off)
-                        if _on_smaller_edition:
-                            logger.info(
-                                f"[Prefer Deluxe] '{original_title}' is owned only on a smaller "
-                                f"edition of '{album_name}' (library: '{matched_album}') — not counted"
-                            )
-                        else:
-                            logger.info(
-                                f"[ExtID Match] Same recording on a DIFFERENT album — allowing "
-                                f"(allow_duplicates): '{original_title}' (wanted: '{album_name}', "
-                                f"library: '{matched_album}')"
-                            )
+                        logger.info(
+                            f"[ExtID Match] Same recording on a DIFFERENT album — allowing "
+                            f"(allow_duplicates): '{original_title}' (wanted: '{album_name}', "
+                            f"library: '{matched_album}')"
+                        )
                         # fall through to the fuzzy path (same album gate), which wishlists it
                     else:
                         # Second-tier fallback: provenance table. Catches the
-                        # window between "Commissary downloaded the file" and
+                        # window between "SoulSync downloaded the file" and
                         # "media-server scan + sync populated the tracks row
                         # with IDs". File still has to exist on disk —
                         # otherwise a user who deleted a file would never get
@@ -2308,14 +2978,20 @@ class WatchlistScanner:
                 for query_title in unique_title_variations:
                     # When allow_duplicates is on, skip album hint so we get title+artist matches only
                     search_album = None if allow_duplicates else album_name
-                    db_track, confidence = self.database.check_track_exists(query_title, artist_name, confidence_threshold=0.7, server_source=active_server, album=search_album)
+                    from core.downloads.atomic_album_publish import contains_staging_segment
+                    db_track, confidence = self.database.check_track_exists(query_title, artist_name, confidence_threshold=0.7, server_source=active_server, album=search_album, include_downloads=True)
 
                     if db_track and confidence >= 0.7:
-                        if prefer_deluxe and owned_row_is_smaller_edition(
-                                self.database, album_name, album_track_count, db_track):
+                        # #1289: a row whose file is still in atomic-publish
+                        # staging is not ownership — the file is quarantined and
+                        # may never publish, so the watchlist must keep asking.
+                        # The rule rather than find_owned_match: this loop walks
+                        # title variations and has its own allow-duplicates album
+                        # logic that the shared helper does not model.
+                        if contains_staging_segment(getattr(db_track, 'file_path', '') or ''):
                             logger.info(
-                                f"[Prefer Deluxe] '{original_title}' owned only on a smaller "
-                                f"edition of '{album_name}' — not counted")
+                                f"[Watchlist] Ignoring staged library row for '{original_title}' "
+                                f"— not published yet, keeping the request")
                             continue
                         # When allow_duplicates is on, only skip if we believe
                         # the library copy is on the same album the watchlist
@@ -2343,6 +3019,14 @@ class WatchlistScanner:
             logger.info(f"Track missing from library: '{original_title}' by '{artists_to_search[0] if artists_to_search else 'Unknown'}' - adding to wishlist")
             return True  # Track is missing
             
+        except sqlite3.Error as e:
+            # H11: infrastructure failure (locked DB, I/O error) — we cannot
+            # prove the track is missing. Fail CLOSED: treat it as present
+            # for this scan (it is rechecked on the next scan) rather than
+            # wishlisting — and re-downloading — an owned track.
+            track_name = track.get('name', 'Unknown') if isinstance(track, dict) else getattr(track, 'name', 'Unknown')
+            logger.warning(f"Library check failed for '{track_name}' ({e}) — treating as present this scan")
+            return False
         except Exception as e:
             # Handle both dict and object track formats for error logging
             track_name = track.get('name', 'Unknown') if isinstance(track, dict) else getattr(track, 'name', 'Unknown')
@@ -2436,7 +3120,10 @@ class WatchlistScanner:
                     # #831: groups wishlist rows by the scan run that added them.
                     'scan_run_id': scan_run_id or '',
                 },
-                profile_id=getattr(watchlist_artist, 'profile_id', 1)
+                profile_id=getattr(watchlist_artist, 'profile_id', 1),
+                quality_profile_id=getattr(
+                    watchlist_artist, 'quality_profile_id', None
+                ),
             )
             
             if success:
@@ -2508,8 +3195,14 @@ class WatchlistScanner:
 
             # Construct MusicMap URL
             from urllib.parse import quote_plus
+            from core.metadata.similar_artists import clean_musicmap_artist_name
 
-            url_artist = quote_plus(artist_name.strip())
+            lookup_artist_name = clean_musicmap_artist_name(artist_name)
+            if not lookup_artist_name:
+                logger.info(f"Skipping MusicMap lookup for unsuitable artist name: {artist_name}")
+                return []
+
+            url_artist = quote_plus(lookup_artist_name)
             musicmap_url = f'https://www.music-map.com/{url_artist}'
 
             # Set headers to mimic a browser
@@ -2533,7 +3226,7 @@ class WatchlistScanner:
 
             # Extract similar artist names
             all_anchors = gnod_map.find_all('a')
-            searched_artist_lower = artist_name.lower().strip()
+            searched_artist_lower = lookup_artist_name.lower().strip()
 
             similar_artist_names = []
             for anchor in all_anchors:
@@ -2558,7 +3251,7 @@ class WatchlistScanner:
             available_sources = []
 
             for source in source_priority:
-                search_results = self._search_artists_for_source(source, artist_name, limit=1)
+                search_results = self._search_artists_for_source(source, lookup_artist_name, limit=1)
                 if search_results:
                     searched_source_ids[source] = self._extract_entity_id(search_results[0])
                     available_sources.append(source)
@@ -2723,6 +3416,7 @@ class WatchlistScanner:
         limit: int = 10,
         profile_id: int = 1,
         source_artist_id: Optional[str] = None,
+        source_provider: Optional[str] = None,
     ) -> bool:
         """
         Fetch and store similar artists for a watchlist artist.
@@ -2742,46 +3436,31 @@ class WatchlistScanner:
             logger.info(f"Found {len(similar_artists)} similar artists for {watchlist_artist.artist_name}")
 
             # Use the ID that matched the scan source when available; otherwise fall back to any known ID.
-            source_artist_id = (
-                source_artist_id
-                or watchlist_artist.spotify_artist_id
-                or watchlist_artist.itunes_artist_id
-                or watchlist_artist.deezer_artist_id
-                or watchlist_artist.discogs_artist_id
-                or str(watchlist_artist.id)
-            )
+            # The PROVIDER rides along: an id with no namespace is unprovable,
+            # and the recommendation readers refuse to use unprovable edges.
+            if not source_artist_id:
+                source_artist_id, derived_provider = watchlist_source_identity(watchlist_artist)
+                source_provider = source_provider or derived_provider
 
-            # Store each similar artist in database
-            stored_count = 0
-            for rank, similar_artist in enumerate(similar_artists, 1):
-                try:
-                    # similar_artist has 'name', provider IDs, 'image_url', 'genres', 'popularity'
-                    success = self.database.add_or_update_similar_artist(
-                        source_artist_id=source_artist_id,
-                        similar_artist_name=similar_artist['name'],
-                        similar_artist_spotify_id=similar_artist.get('spotify_id'),
-                        similar_artist_itunes_id=similar_artist.get('itunes_id'),
-                        similarity_rank=rank,
-                        profile_id=profile_id,
-                        image_url=similar_artist.get('image_url'),
-                        genres=similar_artist.get('genres'),
-                        popularity=similar_artist.get('popularity', 0),
-                        similar_artist_deezer_id=similar_artist.get('deezer_id'),
-                        similar_artist_musicbrainz_id=similar_artist.get('musicbrainz_id'),
-                    )
-
-                    if success:
-                        stored_count += 1
-                        ids = ', '.join(
-                            f"{k}: {similar_artist.get(v)}"
-                            for k, v in [('Spotify', 'spotify_id'), ('iTunes', 'itunes_id'), ('Deezer', 'deezer_id'), ('MB', 'musicbrainz_id')]
-                            if similar_artist.get(v)
-                        )
-                        logger.debug(f"  #{rank}: {similar_artist['name']} ({ids})")
-
-                except Exception as e:
-                    logger.warning(f"Error storing similar artist {similar_artist.get('name', 'Unknown')}: {e}")
-                    continue
+            # the fresh set replaces the old one whole: an upsert kept every
+            # wrong match an older fetch ever made
+            rows = [
+                dict(
+                    similar_artist_name=similar_artist['name'],
+                    similar_artist_spotify_id=similar_artist.get('spotify_id'),
+                    similar_artist_itunes_id=similar_artist.get('itunes_id'),
+                    similar_artist_deezer_id=similar_artist.get('deezer_id'),
+                    similar_artist_musicbrainz_id=similar_artist.get('musicbrainz_id'),
+                    similarity_rank=rank,
+                    image_url=similar_artist.get('image_url'),
+                    genres=similar_artist.get('genres'),
+                    popularity=similar_artist.get('popularity', 0),
+                )
+                for rank, similar_artist in enumerate(similar_artists, 1)
+                if similar_artist.get('name')
+            ]
+            stored_count = self.database.replace_similar_artists(
+                source_artist_id, rows, profile_id=profile_id, source_provider=source_provider)
 
             logger.info(f"Stored {stored_count}/{len(similar_artists)} similar artists for {watchlist_artist.artist_name}")
             return True
@@ -2789,6 +3468,21 @@ class WatchlistScanner:
         except Exception as e:
             logger.error(f"Error fetching similar artists for {watchlist_artist.artist_name}: {e}")
             return False
+
+    def _backfill_deezer_pool_genres(self) -> None:
+        """give a batch of genre-less deezer pool tracks their genres, before
+        the playlists get curated. every discovery scan path runs this, so the
+        pool catches up over a few scans. never lets a failure stop the scan."""
+        try:
+            if 'deezer' not in (self._discovery_source_priority() or []):
+                return
+            client = get_client_for_source('deezer')
+            if not client or not hasattr(client, 'get_artist_genres'):
+                return
+            from core.discovery.deezer_genre_backfill import backfill_deezer_discovery_genres
+            backfill_deezer_discovery_genres(self.database, client.get_artist_genres)
+        except Exception as e:
+            logger.debug("deezer pool genre backfill skipped: %s", e)
 
     def populate_discovery_pool(self, top_artists_limit: int = 50, albums_per_artist: int = 10, profile_id: int = 1, progress_callback=None):
         """
@@ -2819,6 +3513,7 @@ class WatchlistScanner:
                 self.cache_discovery_recent_albums(profile_id=profile_id)
                 if progress_callback:
                     progress_callback('phase', 'Curating playlists...')
+                self._backfill_deezer_pool_genres()
                 self.curate_discovery_playlists(profile_id=profile_id)
                 return
 
@@ -2845,6 +3540,7 @@ class WatchlistScanner:
                 self.cache_discovery_recent_albums(profile_id=profile_id)
                 if progress_callback:
                     progress_callback('phase', 'Curating playlists...')
+                self._backfill_deezer_pool_genres()
                 self.curate_discovery_playlists(profile_id=profile_id)
                 return
 
@@ -3209,6 +3905,7 @@ class WatchlistScanner:
             logger.info("Curating discovery playlists...")
             if progress_callback:
                 progress_callback('phase', 'Curating playlists...')
+            self._backfill_deezer_pool_genres()
             self.curate_discovery_playlists(profile_id=profile_id)
 
         except Exception as e:
@@ -3216,7 +3913,7 @@ class WatchlistScanner:
             import traceback
             traceback.print_exc()
 
-    def update_discovery_pool_incremental(self, profile_id: int = 1):
+    def update_discovery_pool_incremental(self, profile_id: int = 1, force: bool = False):
         """
         Lightweight incremental update for discovery pool - runs every 6 hours.
 
@@ -3224,15 +3921,23 @@ class WatchlistScanner:
         - Much faster than full populate_discovery_pool (only checks watchlist, not similar artists)
         - Only fetches latest 5 releases per artist
         - Only adds tracks from releases in last 7 days
-        - Respects 6-hour cooldown to avoid over-polling
+        - Respects 6-hour cooldown to avoid over-polling (unless forced)
+
+        ``force=True`` bypasses the cooldown: a manual run (an automation's
+        Run Now press, #1719) is the user explicitly asking for a refresh
+        right now — e.g. so changed discovery settings take effect — so
+        skipping it as "recently updated" defeats the press. Scheduled and
+        event-triggered runs keep the cooldown.
         """
         try:
             from datetime import datetime, timedelta
 
             # Check if we should run (prevents over-polling Spotify)
-            if not self.database.should_populate_discovery_pool(hours_threshold=6, profile_id=profile_id):
+            if not force and not self.database.should_populate_discovery_pool(hours_threshold=6, profile_id=profile_id):
                 logger.info("Discovery pool was updated recently (< 6 hours ago). Skipping incremental update.")
                 return
+            if force:
+                logger.info("Forced incremental discovery pool update — bypassing the 6-hour cooldown.")
 
             logger.info("Starting incremental discovery pool update (watchlist artists only)...")
 
@@ -3645,18 +4350,18 @@ class WatchlistScanner:
         Falls back to empty/default values if no listening data exists.
         """
         try:
-            stats = self.database.get_listening_stats('30d')
+            stats = self.database.get_listening_stats('30d', profile_id=profile_id)
             if not stats or stats.get('total_plays', 0) == 0:
                 return {'has_data': False, 'top_artist_names': set(), 'top_genres': set(),
                         'genre_weights': {}, 'artist_play_counts': {}, 'avg_daily_plays': 0, 'listening_diversity': 0}
 
-            top_artists = self.database.get_top_artists('30d', 20)
+            top_artists = self.database.get_top_artists('30d', 20, profile_id=profile_id)
             top_artist_names = {a['name'].lower() for a in top_artists}
 
             # Build play count lookup for artist penalty scoring
             artist_play_counts = {a['name'].lower(): a['play_count'] for a in top_artists}
 
-            genre_breakdown = self.database.get_genre_breakdown('30d')
+            genre_breakdown = self.database.get_genre_breakdown('30d', profile_id=profile_id)
             top_genres = {g['genre'].lower() for g in genre_breakdown[:5]} if genre_breakdown else set()
             genre_weights = {g['genre'].lower(): g['percentage'] for g in genre_breakdown} if genre_breakdown else {}
 
@@ -3900,6 +4605,17 @@ class WatchlistScanner:
                 # Save with source suffix for multi-source support
                 playlist_key = f'release_radar_{source}'
                 self.database.save_curated_playlist(playlist_key, release_radar_tracks, profile_id=profile_id)
+                # ALSO snapshot the full rows: the id list rehydrates from the
+                # rotating pool and silently shrinks (the "only 5-10 tracks"
+                # reports) - the snapshot can't
+                try:
+                    from core.discovery.curated_full import full_row_from_track_data
+                    self.database.save_curated_playlist(
+                        f'{playlist_key}_full',
+                        [full_row_from_track_data(t, source) for t in top_tracks[:50]],
+                        profile_id=profile_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"release radar full snapshot failed: {e}")
                 logger.info(f"Release Radar ({source}) curated: {len(release_radar_tracks)} tracks")
                 # Flag personalized Fresh Tape snapshot as stale so the
                 # pipeline auto-regenerates it on the next run.
@@ -3983,6 +4699,15 @@ class WatchlistScanner:
 
                 playlist_key = f'discovery_weekly_{source}'
                 self.database.save_curated_playlist(playlist_key, discovery_weekly_tracks, profile_id=profile_id)
+                # full-row snapshot, same reason as fresh tape's above
+                try:
+                    from core.discovery.curated_full import full_row_from_pool_track
+                    self.database.save_curated_playlist(
+                        f'{playlist_key}_full',
+                        [full_row_from_pool_track(t) for t in selected_tracks],
+                        profile_id=profile_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug(f"discovery weekly full snapshot failed: {e}")
                 logger.info(f"Discovery Weekly ({source}) curated: {len(discovery_weekly_tracks)} tracks")
                 try:
                     _mark_personalized_kinds_stale(
@@ -3991,88 +4716,11 @@ class WatchlistScanner:
                 except Exception as e:  # noqa: BLE001
                     logger.debug("Archives stale-flag failed: %s", e)
 
-            # 3. "Because You Listen To" — personalized sections based on top played artists
+            # 3. "Because You Listen To" — one generation per profile, built and
+            # stored whole (core/discovery/bylt.py + bylt_store.py).
             if profile['has_data']:
-                logger.info("Building 'Because You Listen To' playlists...")
-                top_played = self.database.get_top_artists('30d', 3)
-                active_source_for_bylt = None
-                all_pool_tracks = []
-                for candidate_source in sources_to_process:
-                    all_pool_tracks = self.database.get_discovery_pool_tracks(
-                        limit=2000, new_releases_only=False,
-                        source=candidate_source, profile_id=profile_id
-                    )
-                    if all_pool_tracks:
-                        active_source_for_bylt = candidate_source
-                        break
-                if not active_source_for_bylt:
-                    logger.warning("No discovery pool tracks found for Because You Listen To")
-                    all_pool_tracks = []
-
-                # Build source_artist_id → artist_name mapping from watchlist
-                _wa_id_to_name = {}
-                try:
-                    _wa_list = self.database.get_watchlist_artists(profile_id=profile_id)
-                    for _wa in _wa_list:
-                        _wa_id_to_name[str(_wa.id)] = (_wa.artist_name or '').lower()
-                except Exception as e:
-                    logger.debug("watchlist artist id-to-name map failed: %s", e)
-
-                all_similar = self.database.get_top_similar_artists(limit=200, profile_id=profile_id)
-
-                for i, played_artist in enumerate(top_played):
-                    try:
-                        artist_name = played_artist['name']
-                        artist_lower = artist_name.lower()
-
-                        # Find similar artists to this played artist via the similar_artists table
-                        similar_names = set()
-                        for s in all_similar:
-                            # Check if this similar artist's source matches our played artist
-                            src_id = str(getattr(s, 'source_artist_id', ''))
-                            src_name = _wa_id_to_name.get(src_id, '')
-                            sim_name = getattr(s, 'similar_artist_name', '') or ''
-                            if src_name == artist_lower and sim_name:
-                                similar_names.add(sim_name.lower())
-
-                        if not similar_names:
-                            # Fallback: find pool tracks from same genre
-                            played_genres = _artist_genre_cache.get(artist_lower, set())
-                            if played_genres:
-                                for t in all_pool_tracks:
-                                    t_artist_lower = (t.artist_name or '').lower()
-                                    if t_artist_lower != artist_lower and _artist_genre_cache.get(t_artist_lower, set()) & played_genres:
-                                        similar_names.add(t_artist_lower)
-                                    if len(similar_names) >= 20:
-                                        break
-
-                        if not similar_names:
-                            continue
-
-                        # Pick tracks from those similar artists in the pool
-                        matching_tracks = []
-                        for t in all_pool_tracks:
-                            if (t.artist_name or '').lower() in similar_names:
-                                if active_source_for_bylt == 'spotify' and t.spotify_track_id:
-                                    matching_tracks.append(t.spotify_track_id)
-                                elif active_source_for_bylt == 'itunes' and t.itunes_track_id:
-                                    matching_tracks.append(t.itunes_track_id)
-                                elif active_source_for_bylt == 'deezer' and t.deezer_track_id:
-                                    matching_tracks.append(t.deezer_track_id)
-
-                            if len(matching_tracks) >= 15:
-                                break
-
-                        if matching_tracks:
-                            import random as _rnd
-                            _rnd.shuffle(matching_tracks)
-                            playlist_key = f'because_you_listen_to_{i}'
-                            self.database.save_curated_playlist(playlist_key, matching_tracks[:10], profile_id=profile_id)
-                            # Store the source artist name in metadata
-                            self.database.set_metadata(f'bylt_artist_{i}', artist_name)
-                            logger.info(f"'Because You Listen To {artist_name}': {len(matching_tracks[:10])} tracks")
-                    except Exception as e:
-                        logger.debug(f"Error building BYLT for {played_artist.get('name', '?')}: {e}")
+                self._build_because_you_listen_to(
+                    profile_id, sources_to_process, _artist_genre_cache)
 
                 # #913: listening-driven recommendations — consensus-ranked artists you'd love but
                 # don't own + candidate playlist tracks. Self-contained + double-guarded so it can
@@ -4100,6 +4748,154 @@ class WatchlistScanner:
             import traceback
             traceback.print_exc()
 
+    def _build_because_you_listen_to(self, profile_id, sources_to_process,
+                                     artist_genre_cache=None):
+        """Build and store ONE Because You Listen To generation for a profile.
+
+        the decisions all live in core/discovery/bylt.py (pure, tested); this
+        gathers the inputs and owns the transaction. three properties matter
+        and each replaces a specific defect:
+
+          - seeds resolve through the library catalogue as (provider, id)
+            pairs, so an artist you play but do not WATCH still finds its
+            similarity edges, and a deezer id never matches an itunes one;
+          - the whole generation is written in one store call, so a run that
+            fills two shelves cannot leave a third from three weeks ago
+            standing beside them;
+          - a failed run stores a failure marker and leaves the last good
+            generation in place, instead of replacing it with an empty
+            success that reads as "no recommendations".
+        """
+        from datetime import datetime as _dt
+        from uuid import uuid4
+
+        from core.discovery import bylt_store
+        from core.discovery.bylt import (
+            MAX_SHELVES,
+            allocate_shelves,
+            build_generation,
+            collect_candidates,
+            collect_identities,
+            genre_document_counts,
+            norm,
+            related_from_edges,
+            related_from_genres,
+            section_from_shelf,
+            seed_identities,
+            validate_generation,
+        )
+        from core.discovery.curated_full import full_row_from_pool_track
+
+        generation_id = uuid4().hex
+        started_at = _dt.now().isoformat(timespec='seconds')
+        try:
+            logger.info("Building 'Because You Listen To' generation %s...", generation_id[:8])
+
+            # seeds: recent listening first, lifetime when nothing is recent.
+            # profile_id picks the pile, the payload reports which one it got.
+            top_played = self.database.get_top_artists('30d', MAX_SHELVES, profile_id=profile_id)
+            if not top_played:
+                top_played = self.database.get_top_artists('all', MAX_SHELVES, profile_id=profile_id)
+            seed_names = [t.get('name') for t in (top_played or []) if t.get('name')]
+
+            # the pool, from the first source that has one
+            active_source, pool = None, []
+            for candidate_source in sources_to_process:
+                pool = self.database.get_discovery_pool_tracks(
+                    limit=2000, new_releases_only=False,
+                    source=candidate_source, profile_id=profile_id)
+                if pool:
+                    active_source = candidate_source
+                    break
+            if not active_source:
+                logger.warning("No discovery pool tracks found for Because You Listen To")
+                active_source = (sources_to_process or ['spotify'])[0]
+                pool = []
+
+            # the pool grouped by artist, whole. the old builder walked this
+            # list in insertion order and stopped at the first 15 matches,
+            # which is why one album ingested that morning owned the shelf.
+            pool_by_artist = {}
+            for track in pool:
+                key = norm(getattr(track, 'artist_name', ''))
+                if not key:
+                    continue
+                row = full_row_from_pool_track(track)
+                row['source'] = row.get('source') or active_source
+                if not row.get('track_id'):
+                    continue
+                pool_by_artist.setdefault(key, []).append(row)
+
+            artist_rows = self.database.get_artist_identity_rows()
+            try:
+                watchlist_rows = self.database.get_watchlist_artists(profile_id=profile_id)
+            except Exception as e:  # noqa: BLE001 - the watchlist is additive here
+                logger.debug("watchlist identities unavailable: %s", e)
+                watchlist_rows = []
+            by_name, ownership = collect_identities(artist_rows, watchlist_rows)
+            thumb_by_name = {norm(r.get('name')): r.get('thumb_url')
+                             for r in artist_rows if r.get('name')}
+
+            seeds = seed_identities(seed_names, by_name)
+            # a seed you asked for more of gets its shelf first; one you asked
+            # for less of goes last (stable, so play order breaks ties)
+            from core.discovery.feedback import Taste
+            taste = Taste.load(self.database, profile_id)
+            seeds = sorted(seeds, key=lambda sd: -taste.seed_weight(sd.name))
+            edges = self.database.get_similar_artist_edges(
+                sorted({i for seed in seeds for i in seed.bare_ids}), profile_id=profile_id)
+
+            genre_by_artist = dict(artist_genre_cache or {})
+            doc_counts = genre_document_counts(genre_by_artist)
+            pool_artists = list(pool_by_artist.keys())
+
+            per_seed, edge_counts = [], {}
+            for seed in seeds:
+                related, counts = related_from_edges(seed, edges, ownership)
+                edge_counts[seed.key] = counts
+                # genre matches are APPENDED, never substituted: they score
+                # below every direct relationship, so they can only fill a
+                # shelf a real relationship could not.
+                related = related + related_from_genres(
+                    seed, genre_by_artist, pool_artists, doc_counts)
+                related = taste.adjust_related(seed.name, related)
+                per_seed.append((seed, collect_candidates(seed, related, pool_by_artist)))
+
+            shelves = allocate_shelves(per_seed)
+            sections = []
+            for shelf in shelves:
+                shelf.diagnostics['edges'] = edge_counts.get(shelf.seed.key, {})
+                sections.append(section_from_shelf(
+                    shelf, seed_image=thumb_by_name.get(shelf.seed.norm_name)))
+
+            generation = build_generation(
+                sections, profile_id=profile_id, source=active_source,
+                generation_id=generation_id,
+                generated_at=_dt.now().isoformat(timespec='seconds'))
+            if not validate_generation(generation):
+                raise ValueError("built an invalid BYLT generation")
+
+            if not bylt_store.save_generation(self.database, generation,
+                                              profile_id=profile_id):
+                raise RuntimeError("failed to store BYLT generation")
+
+            bylt_store.clear_failure(self.database, profile_id=profile_id)
+            bylt_store.retire_legacy_slots(self.database, profile_id=profile_id)
+            for section in generation['sections']:
+                logger.info("'Because You Listen To %s': %s tracks, %s artists (%s)",
+                            section['seed_name'], len(section['tracks']),
+                            section['diagnostics'].get('distinct_artists'),
+                            section['reason'].get('kind'))
+            if not generation['sections']:
+                logger.info("Because You Listen To: no shelf had enough evidence; "
+                            "stored an explicit empty generation")
+            _invalidate_discover_shelf_cache()
+
+        except Exception as e:  # noqa: BLE001 - a failed run must not curate over a good one
+            logger.error("Because You Listen To generation failed: %s", e)
+            bylt_store.save_failure(self.database, profile_id, str(e),
+                                    started_at, generation_id)
+
     def _build_listening_recommendations(self, profile_id, sources_to_process):
         """#913: consensus-ranked artists you'd love but don't own, plus candidate playlist
         tracks, derived from your most-played artists + the similar_artists graph.
@@ -4126,20 +4922,24 @@ class WatchlistScanner:
         try:
             import json as _json
             from core.discovery.listening_recommendations import (
+                RECS_ARTISTS_KEY,
+                RECS_TRACKS_KEY,
                 aggregate_candidate_tracks,
                 build_recency_weighted_seeds,
                 choose_mix_fetch_source,
                 group_similars_by_seed,
                 names_match,
                 rank_recommended_artists,
+                recs_key,
                 to_mix_track,
             )
 
             # Recency-weighted seeds: lifetime top artists, boosted by recent (30d) plays.
-            lifetime = [s for s in (self.database.get_top_artists('all', 30) or []) if s.get('name')]
+            lifetime = [s for s in (self.database.get_top_artists('all', 30, profile_id=profile_id) or [])
+                        if s.get('name')]
             if not lifetime:
                 return
-            recent_rows = self.database.get_top_artists('30d', 50) or []
+            recent_rows = self.database.get_top_artists('30d', 50, profile_id=profile_id) or []
             recent_counts = {r['name'].lower(): r.get('play_count', 0)
                              for r in recent_rows if r.get('name')}
             seeds = build_recency_weighted_seeds(lifetime, recent_counts)
@@ -4208,10 +5008,19 @@ class WatchlistScanner:
             # popularity are independent, so the top-200 already spans pop-96 favourites down to
             # pop-1 deep cuts. The track-mix fetch below still only touches recs[:20], so the scan
             # cost is unchanged; the row itself renders 18 and the dial chooses which 18.
+            # more / less like this: seeds you asked for more of count for more,
+            # artists and seed edges you asked for less of for less
+            from core.discovery.feedback import Taste
+            taste = Taste.load(self.database, profile_id)
+            seeds = taste.adjust_seeds(seeds)
+            similars_by_seed = {seed: taste.adjust_related(seed, sims, weight_key='score')
+                                for seed, sims in similars_by_seed.items()}
             recs = rank_recommended_artists(seeds, similars_by_seed, owned, limit=200)
             if not recs:
                 logger.info("[Listening Recs] no recommendations yet (no similar-artist coverage)")
                 return
+
+            from core.discovery.explain import consensus_confidence, explanation
 
             def _enrich(r):
                 m = artist_meta_by_name.get(r.name.lower(), {})
@@ -4222,13 +5031,16 @@ class WatchlistScanner:
                     except Exception:
                         genres = None
                 return {'name': r.name, 'seed_count': r.seed_count, 'seeds': r.seeds[:5],
+                        'explanation': explanation('listened', r.seeds[:5],
+                                                   consensus_confidence(r.seed_count),
+                                                   components=r.seed_scores or None),
                         'score': r.score, 'spotify_artist_id': m.get('spotify_artist_id'),
                         'itunes_artist_id': m.get('itunes_artist_id'),
                         'deezer_artist_id': m.get('deezer_artist_id'),
                         'image_url': m.get('image_url'),
                         'genres': (genres[:3] if isinstance(genres, list) else None)}
 
-            self.database.set_metadata('listening_recs_artists',
+            self.database.set_metadata(recs_key(RECS_ARTISTS_KEY, profile_id),
                                        _json.dumps([_enrich(r) for r in recs]))
 
             # Candidate tracks for the "Listening Mix" playlist row: each recommended artist's
@@ -4326,7 +5138,7 @@ class WatchlistScanner:
             mix = aggregate_candidate_tracks(recs, top_tracks_by_artist, per_artist=3, limit=50)
             track_ids = [m.get('track_id') for m in mix if m.get('track_id')]
             if mix:
-                self.database.set_metadata('listening_recs_tracks_full', _json.dumps(mix))
+                self.database.set_metadata(recs_key(RECS_TRACKS_KEY, profile_id), _json.dumps(mix))
                 self.database.save_curated_playlist('listening_recs_tracks', track_ids, profile_id=profile_id)
 
             logger.info("[Listening Recs] %d recommended artists, %d mix tracks (%d artists via top-tracks fetch)",
@@ -4450,7 +5262,7 @@ class WatchlistScanner:
         """
         try:
             from datetime import datetime, timedelta
-            from config.settings import config_manager
+            from core.settings import config_manager
             from database.music_database import get_database
 
             # Weekly throttle

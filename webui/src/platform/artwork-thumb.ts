@@ -1,0 +1,77 @@
+/**
+ * Ask the server for a right-sized copy of a cached image.
+ *
+ * SoulSync caches remote artwork and serves it from `/api/image-cache/<key>`.
+ * Adding `?v=grid` asks for a resized copy instead of the full-size original —
+ * the thing a 5,567-album library actually needs, because a wall of 200px tiles
+ * was being filled with 1400px CDN masters (#1141).
+ *
+ * Callers do NOT need to know whether thumbnails are switched on. The server
+ * ignores the parameter when the setting is off and serves the original, so a
+ * call site can always ask. The compact dashboard rail is an exception: its
+ * artwork is always bounded to avoid decoding full-size masters in tiny cards.
+ * That also means no config has to be plumbed into the browser.
+ */
+
+export type ThumbVariant = 'grid' | 'card' | 'hero' | 'rail';
+
+/** Only our own cache endpoint understands `?v=`. */
+const CACHE_PREFIX = '/api/image-cache/';
+const IMAGE_PROXY_PREFIX = '/api/image-proxy';
+
+const COVER_ART_HOST_RE = /^(?:https?:)?\/\/coverartarchive\.org\//i;
+const ARCHIVE_IMAGE_HOST_RE = /^(?:https?:)?\/\/(?:[^/]+\.)?archive\.org\//i;
+
+export function serviceWorkerControlsPage(): boolean {
+  return typeof navigator !== 'undefined' && Boolean(navigator.serviceWorker?.controller);
+}
+
+export function imageProxyUrl(url: string): string {
+  return `${IMAGE_PROXY_PREFIX}?url=${encodeURIComponent(url)}`;
+}
+
+export function isCoverArtArchiveUrl(url: string): boolean {
+  return COVER_ART_HOST_RE.test(url) || ARCHIVE_IMAGE_HOST_RE.test(url);
+}
+
+export function browserSafeImageUrl<T extends string | null | undefined>(
+  url: T,
+  serviceWorkerControlled = serviceWorkerControlsPage(),
+): T | string {
+  if (!url) return url;
+  if (url.startsWith('/') || url.startsWith(IMAGE_PROXY_PREFIX)) return url;
+  if (serviceWorkerControlled || !isCoverArtArchiveUrl(url)) return url;
+  return imageProxyUrl(url);
+}
+
+export function thumb<T extends string | null | undefined>(
+  url: T,
+  variant: ThumbVariant,
+  serviceWorkerControlled = serviceWorkerControlsPage(),
+): T | string {
+  // Dashboard rails need bounded images even when originals are preferred
+  // elsewhere. Route remote artwork through the same cached resize path.
+  if (url && variant === 'rail') {
+    let target = url as string;
+    if (/^https?:\/\//i.test(target) || target.startsWith('//')) {
+      target = imageProxyUrl(target.startsWith('//') ? `https:${target}` : target);
+    }
+    const path = target.split('?')[0];
+    if (path.startsWith(CACHE_PREFIX) || path === IMAGE_PROXY_PREFIX) {
+      const parsed = new URL(target, 'http://localhost');
+      parsed.searchParams.set('v', 'rail');
+      // Older servers cached originals under ?v=rail for 30 days. A new URL
+      // prevents those browser responses from surviving the resize rollout.
+      parsed.searchParams.set('thumb_rev', '2');
+      return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+    }
+    return target;
+  }
+  const safeUrl = browserSafeImageUrl(url, serviceWorkerControlled);
+  if (!safeUrl) return safeUrl;
+  if (!safeUrl.startsWith(CACHE_PREFIX)) return safeUrl;
+  // Already carries a query (a variant, or anything else) — leave it alone
+  // rather than producing a second `?`.
+  if (safeUrl.includes('?')) return safeUrl;
+  return `${safeUrl}?v=${variant}`;
+}

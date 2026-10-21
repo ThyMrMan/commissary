@@ -1,36 +1,46 @@
 {
+  "musicbrainz": {
+    "base_url": "https://musicbrainz.org/ws/2",
+    "request_interval": 1.05,
+    "embed_tags": true
+  },
   "active_media_server": "plex",
   "spotify": {
-    "client_id": "SpotifyClientID",
-    "client_secret": "SpotifyClientSecret",
+    "client_id": "",
+    "client_secret": "",
     "redirect_uri": "http://127.0.0.1:8888/callback"
   },
   "tidal": {
-    "client_id": "TidalClientID",
-    "client_secret": "TidalClientSecret",
+    "client_id": "",
+    "client_secret": "",
     "redirect_uri": "http://127.0.0.1:8889/tidal/callback"
   },
   "plex": {
-    "base_url": "http://192.168.86.36:32400",
-    "token": "PLEX_API_TOKEN",
+    "base_url": "",
+    "token": "",
     "auto_detect": true
   },
   "jellyfin": {
-    "base_url": "http://localhost:8096",
-    "api_key": "JELLYFIN_API_KEY",
+    "base_url": "",
+    "api_key": "",
     "auto_detect": true
   },
   "navidrome": {
-    "base_url": "http://localhost:4533",
-    "username": "NAVIDROME_USERNAME",
-    "password": "NAVIDROME_PASSWORD",
+    "base_url": "",
+    "username": "",
+    "password": "",
     "auto_detect": true
+  },
+  "download_source": {
+    "max_mb_per_minute": 0
   },
   "soulseek": {
     "slskd_url": "http://host.docker.internal:5030",
-    "api_key": "SoulseekAPIKey",
+    "api_key": "",
     "download_path": "/app/downloads",
     "transfer_path": "/app/Transfer",
+    "observed_speed_fallback_enabled": false,
+    "min_observed_download_speed_kbps": 250,
     "search_timeout": 60,
     "search_timeout_buffer": 15
   },
@@ -49,13 +59,18 @@
   },
   "file_organization": {
     "enabled": true,
-    "_template_variables": "Available: $artist, $albumartist, $artistletter, $album, $title, $track, $disc, $year, $playlist, $quality (filename only)",
+    "auto_disambiguation": true,
+    "_template_variables": "Available: $artist, $albumartist, $artistletter, $album, $albumtype, $atypes, $title, $track, $disc, $year, $playlist, $quality (filename only)",
     "templates": {
       "album_path": "$albumartist/$albumartist - $album/$track - $title",
       "single_path": "$artist/$artist - $title/$title",
       "compilation_path": "Compilations/$album/$track - $artist - $title",
-      "playlist_path": "$playlist/$artist - $title"
+      "playlist_path": "$playlist/$artist - $title",
+      "podcast_path": "$show/Season $season/$title"
     }
+  },
+  "podcasts": {
+    "download_path": "/app/podcasts"
   },
   "import": {
     "staging_path": "./Staging",
@@ -68,9 +83,20 @@
     "downsample_hires": false
   },
   "playlist_sync": {
-    "create_backup": true
+    "create_backup": false
   },
   "listenbrainz": {
-    "token": "LISTENBRAINZ_TOKEN"
+    "token": ""
+  },
+  "image_cache": {
+    "enabled": true,
+    "thumbnails": false,
+    "max_cache_mb": 2048,
+    "ttl_seconds": 2592000,
+    "max_download_mb": 15,
+    "fetch_timeout": 10,
+    "variant_grid_px": 240,
+    "variant_card_px": 480,
+    "variant_hero_px": 1200
   }
 }

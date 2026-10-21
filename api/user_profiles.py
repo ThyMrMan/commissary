@@ -1,0 +1,1668 @@
+"""Multi-user profile endpoints, lifted out of web_server.py.
+
+Profile CRUD, avatars, per-profile page permissions, per-profile service
+credentials and the login/launch-PIN flow. The login limiters and the page-id
+whitelist are web_server's (defined with its auth routes) and injected here."""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+from datetime import datetime
+
+import requests
+from flask import Blueprint, jsonify, request, session
+
+from core.metadata import registry as metadata_registry
+from core.metadata.status import invalidate_metadata_status_caches
+from core.permissions import may_manage_profile, profile_view_for
+from core.profile_context import admin_only, is_admin_request
+
+from utils.logging_config import get_logger
+
+logger = get_logger("api.user_profiles")
+
+bp = Blueprint("user_profiles", __name__)
+
+# Injected by configure() at boot.
+get_database = None
+config_manager = None
+get_current_profile_id = None
+VALID_PAGE_IDS = None
+_login_limiter = None
+_launch_pin_limiter = None
+_require_login_enabled = None
+
+
+
+_get_metadata_fallback_source = None
+clear_profile_tidal_client = None
+_download_orchestrator = lambda: None   # noqa: E731 - rebindable boot global
+_media_server_engine = lambda: None     # noqa: E731
+_spotify_client = lambda: None          # noqa: E731 - rebound on reconnect
+_listenbrainz_import_workers = lambda: None  # noqa: E731
+_lastfm_import_workers = lambda: None  # noqa: E731
+
+
+def configure(*, get_database, config_manager, get_current_profile_id, VALID_PAGE_IDS,
+              _login_limiter, _launch_pin_limiter, _require_login_enabled,
+              metadata_fallback_source, download_orchestrator_getter,
+              media_server_engine_getter, spotify_client_getter, tidal_client_clearer,
+              listenbrainz_import_workers_getter=lambda: None,
+              lastfm_import_workers_getter=lambda: None):
+    globals()['get_database'] = get_database
+    globals()['config_manager'] = config_manager
+    globals()['get_current_profile_id'] = get_current_profile_id
+    globals()['VALID_PAGE_IDS'] = VALID_PAGE_IDS
+    globals()['_login_limiter'] = _login_limiter
+    globals()['_launch_pin_limiter'] = _launch_pin_limiter
+    globals()['_require_login_enabled'] = _require_login_enabled
+    globals()['_get_metadata_fallback_source'] = metadata_fallback_source
+    globals()['_download_orchestrator'] = download_orchestrator_getter
+    globals()['_media_server_engine'] = media_server_engine_getter
+    globals()['_spotify_client'] = spotify_client_getter
+    globals()['clear_profile_tidal_client'] = tidal_client_clearer
+    globals()['_listenbrainz_import_workers'] = listenbrainz_import_workers_getter
+    globals()['_lastfm_import_workers'] = lastfm_import_workers_getter
+
+
+def create_blueprint():
+    return bp
+
+
+def _end_device():
+    """a sign-out takes this browser off the profile's device list."""
+    device_id, owner = session.get('device_id'), session.get('profile_id')
+    if device_id and owner:
+        try:
+            get_database().revoke_profile_device(owner, device_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("device revoke on logout failed", exc_info=True)
+
+
+def _audit(action, target_id=None, target_name=None, detail=None):
+    from api.profile_admin import audit
+    audit(action, target_id, target_name, detail)
+
+
+_RATINGS = ('G', 'PG', 'PG-13', 'R')
+
+
+def _admin_controls(data):
+    """the admin-only access knobs on a profile, cleaned: request quota and
+    the kids limits. returns (kwargs, error)."""
+    out = {}
+    if 'request_limit' in data:
+        try:
+            out['request_limit'] = max(0, min(1000, int(data['request_limit'] or 0)))
+        except (TypeError, ValueError):
+            return None, 'request_limit must be a number'
+    if 'request_limit_days' in data:
+        try:
+            out['request_limit_days'] = max(1, min(365, int(data['request_limit_days'] or 7)))
+        except (TypeError, ValueError):
+            return None, 'request_limit_days must be a number'
+    if 'hide_explicit' in data:
+        out['hide_explicit'] = 1 if data['hide_explicit'] else 0
+    if 'max_rating' in data:
+        rating = data['max_rating'] or None
+        if rating is not None and rating not in _RATINGS:
+            return None, 'max_rating must be one of ' + ', '.join(_RATINGS)
+        out['max_rating'] = rating
+    return out, None
+
+
+# --- Per-Profile ListenBrainz Settings ---
+
+def _get_lb_credentials_for_profile(profile_id=None):
+    """Get LB token + base_url for profile, falling back to global config."""
+    if profile_id is None:
+        profile_id = get_current_profile_id()
+    db = get_database()
+    settings = db.get_profile_listenbrainz(profile_id)
+    if settings and settings.get('token'):
+        return settings['token'], settings.get('base_url', ''), settings.get('username', ''), 'profile'
+    # Fallback to global config
+    return (config_manager.get('listenbrainz.token', ''),
+            config_manager.get('listenbrainz.base_url', ''),
+            None, 'global')
+
+def _validate_lb_token(token, base_url=''):
+    """Validate a ListenBrainz token and return (success, username_or_error)"""
+    try:
+        custom_base = (base_url or '').rstrip('/')
+        if custom_base:
+            if not custom_base.endswith('/1'):
+                custom_base += '/1'
+            lb_api_base = custom_base
+        else:
+            lb_api_base = "https://api.listenbrainz.org/1"
+        url = f"{lb_api_base}/validate-token"
+        headers = {'Authorization': f'Token {token}'}
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('valid'):
+                return True, data.get('user_name', 'Unknown')
+            return False, "Invalid ListenBrainz token."
+        elif response.status_code == 401:
+            return False, "Invalid ListenBrainz token (unauthorized)."
+        else:
+            return False, f"Could not connect to ListenBrainz (HTTP {response.status_code})"
+    except Exception as e:
+        return False, f"ListenBrainz connection error: {str(e)}"
+
+# --- Per-Profile Service Credentials API ---
+
+def _profile_spotify_connection(profile_id):
+    """(connected, account_name) for a profile's OWN connected Spotify — not the
+    global/admin fallback. A profile is connected only when its own token cache
+    exists and authenticates."""
+    if not profile_id or profile_id == 1:
+        return (False, None)
+    if not os.path.exists(f"config/.spotify_cache_profile_{profile_id}"):
+        return (False, None)
+    try:
+        client = metadata_registry.get_spotify_client_for_profile(profile_id)
+        if client and client.is_spotify_authenticated():
+            info = client.get_user_info() or {}
+            return (True, info.get('display_name') or info.get('id'))
+    except Exception as e:
+        logger.debug("profile %s spotify connection check failed: %s", profile_id, e)
+    return (False, None)
+
+
+def _profile_tidal_connection(profile_id):
+    """(connected, account_name) for a profile's OWN Tidal. Connected = it has
+    stored tokens; validity is checked (and refreshed) on actual use, so this
+    stays a cheap no-network check for the modal."""
+    if not profile_id or profile_id == 1:
+        return (False, None)
+    try:
+        toks = get_database().get_profile_tidal(profile_id) or {}
+        return (bool(toks.get('refresh_token') or toks.get('access_token')), None)
+    except Exception as e:
+        logger.debug("profile %s tidal connection check failed: %s", profile_id, e)
+        return (False, None)
+
+
+def _profile_listenbrainz_connection(profile_id):
+    """(connected, username) for a profile's OWN ListenBrainz token."""
+    if not profile_id or profile_id == 1:
+        return (False, None)
+    try:
+        s = get_database().get_profile_listenbrainz(profile_id) or {}
+        if s.get('token'):
+            return (True, s.get('username'))
+    except Exception as e:
+        logger.debug("profile %s listenbrainz connection check failed: %s", profile_id, e)
+    return (False, None)
+
+
+def _disconnect_profile_spotify(pid):
+    cache_path = f"config/.spotify_cache_profile_{pid}"
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except Exception as e:
+        logger.debug("could not remove profile spotify cache: %s", e)
+    try:
+        get_database().set_profile_spotify_tokens(pid, '', '')
+    except Exception as e:
+        logger.debug("could not clear profile spotify tokens: %s", e)
+    metadata_registry.clear_cached_profile_spotify_client(pid)
+
+
+def _disconnect_profile_tidal(pid):
+    try:
+        get_database().set_profile_tidal_tokens(pid, '', '')
+    except Exception as e:
+        logger.debug("could not clear profile tidal tokens: %s", e)
+    clear_profile_tidal_client(pid)
+
+
+def _listening_import_workers(service):
+    return _lastfm_import_workers() if service == 'lastfm' else _listenbrainz_import_workers()
+
+
+def _listening_import_connected(pid, previous_username, username, service='listenbrainz'):
+    """their own listenbrainz or last.fm makes their listening history their
+    own (#1293), start importing it now. never fails the save."""
+    try:
+        workers = _listening_import_workers(service)
+        if workers is not None:
+            workers.on_connected(pid, previous_username, username)
+    except Exception as e:
+        logger.warning("could not start %s listening import for profile %s: %s", service, pid, e)
+
+
+def _listening_import_disconnected(pid, service='listenbrainz'):
+    try:
+        workers = _listening_import_workers(service)
+        if workers is not None:
+            workers.on_disconnected(pid)
+    except Exception as e:
+        logger.debug("could not stop %s listening import for profile %s: %s", service, pid, e)
+
+
+def _profile_lastfm_connection(profile_id):
+    """(connected, username) for a profile's OWN last.fm."""
+    if not profile_id or profile_id == 1:
+        return (False, None)
+    try:
+        name = (get_database().get_profile_lastfm(profile_id) or {}).get('username')
+        return (bool(name), name or None)
+    except Exception as e:
+        logger.debug("profile %s last.fm connection check failed: %s", profile_id, e)
+        return (False, None)
+
+
+def _disconnect_profile_lastfm(pid):
+    try:
+        get_database().clear_profile_lastfm(pid)
+    except Exception as e:
+        logger.debug("could not clear profile last.fm: %s", e)
+    _listening_import_disconnected(pid, 'lastfm')
+
+
+def _disconnect_profile_listenbrainz(pid):
+    try:
+        get_database().clear_profile_listenbrainz(pid)
+    except Exception as e:
+        logger.debug("could not clear profile listenbrainz: %s", e)
+    _listening_import_disconnected(pid)
+
+
+_PROFILE_DISCONNECTORS = {
+    'spotify': _disconnect_profile_spotify,
+    'tidal': _disconnect_profile_tidal,
+    'listenbrainz': _disconnect_profile_listenbrainz,
+    'lastfm': _disconnect_profile_lastfm,
+}
+
+
+# ==================================================================================
+# SERVICE CREDENTIAL SETS  (admin-created named "pills" per auth service; #profiles)
+# ----------------------------------------------------------------------------------
+# Admin manages the named credential sets; any profile only SELECTS among them
+# (see /api/credentials/active + /select below). Payloads (the actual secrets)
+# are NEVER returned to the browser — only id/service/label.
+# ==================================================================================
+
+@bp.route('/api/credentials', methods=['GET'])
+@admin_only
+def list_service_credentials_endpoint():
+    """List all credential sets grouped by service (metadata only, no secrets)."""
+    try:
+        from core.credentials.store import SERVICE_CREDENTIAL_SCHEMA
+        rows = get_database().list_service_credentials()
+        grouped = {svc: [] for svc in SERVICE_CREDENTIAL_SCHEMA}
+        for r in rows:
+            grouped.setdefault(r['service'], []).append(
+                {'id': r['id'], 'label': r['label'], 'updated_at': r['updated_at']}
+            )
+        return jsonify({'success': True, 'services': grouped})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/credentials', methods=['POST'])
+@admin_only
+def create_service_credential_endpoint():
+    """Create a named credential set for a service. Body: {service, label, payload}."""
+    try:
+        from core.credentials.store import is_supported_service, validate_credential_payload
+        data = request.json or {}
+        service = (data.get('service') or '').strip()
+        label = (data.get('label') or '').strip()
+        payload = data.get('payload') or {}
+
+        if not is_supported_service(service):
+            return jsonify({'success': False, 'error': f'Unsupported service: {service}'}), 400
+        if not label:
+            return jsonify({'success': False, 'error': 'A name is required'}), 400
+        ok, missing = validate_credential_payload(service, payload)
+        if not ok:
+            return jsonify({'success': False, 'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+        cred_id = get_database().create_service_credential(service, label, payload)
+        if cred_id is None:
+            return jsonify({'success': False, 'error': f'A "{label}" set already exists for {service}'}), 409
+        return jsonify({'success': True, 'id': cred_id})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/credentials/<int:credential_id>', methods=['PUT'])
+@admin_only
+def update_service_credential_endpoint(credential_id):
+    """Update a credential set's label and/or payload. Only provided fields change."""
+    try:
+        from core.credentials.store import validate_credential_payload
+        data = request.json or {}
+        label = data.get('label')
+        payload = data.get('payload')  # None = leave secrets untouched
+
+        existing = get_database().get_service_credential(credential_id)
+        if not existing:
+            return jsonify({'success': False, 'error': 'Credential set not found'}), 404
+
+        if label is not None and not str(label).strip():
+            return jsonify({'success': False, 'error': 'Name cannot be empty'}), 400
+        if payload is not None:
+            ok, missing = validate_credential_payload(existing['service'], payload)
+            if not ok:
+                return jsonify({'success': False, 'error': f'Missing required fields: {", ".join(missing)}'}), 400
+
+        updated = get_database().update_service_credential(
+            credential_id,
+            label=str(label).strip() if label is not None else None,
+            payload=payload,
+        )
+        if not updated:
+            return jsonify({'success': False, 'error': 'Nothing to update or name already in use'}), 400
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/credentials/<int:credential_id>', methods=['DELETE'])
+@admin_only
+def delete_service_credential_endpoint(credential_id):
+    """Delete a credential set. Any profile that had it selected falls back to
+    the global/admin default automatically (selection is cleared in the DB)."""
+    try:
+        ok = get_database().delete_service_credential(credential_id)
+        if not ok:
+            return jsonify({'success': False, 'error': 'Credential set not found'}), 404
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ==================================================================================
+# QUICK-SWITCH: active metadata source / media server / download source
+# ----------------------------------------------------------------------------------
+# The read is open to any profile (so the sidebar modal renders). Setting is
+# admin-only and writes the GLOBAL config (same as the Settings page) — the
+# per-profile override for non-admins is a separate, later layer. `editable`
+# tells the UI whether to allow changes for the current profile.
+# ==================================================================================
+
+# Selectable metadata sources (mirrors the Settings <select>).
+def _qs_metadata_sources():
+    """Metadata sources offered in Connections / quick-switch UI."""
+    from core.metadata.registry import EXPERIMENTAL_SOURCES, is_source_enabled
+    sources = ['spotify', 'spotify_free', 'itunes', 'deezer', 'discogs', 'musicbrainz']
+    sources += [name for name in EXPERIMENTAL_SOURCES if is_source_enabled(name)]
+    return sources
+_QS_MEDIA_SERVERS = ['plex', 'jellyfin', 'navidrome', 'soulsync']
+
+
+def _qs_download_chain(mode, hybrid_order):
+    """The music download chain as settings saved it, each source with whether
+    it's set up (None when that can't be told). one source is single-source
+    mode, two or more is hybrid, same as the settings chain editor."""
+    if mode == 'hybrid':
+        order = [hybrid_order] if isinstance(hybrid_order, str) else (hybrid_order or [])
+        ids = [s for s in order if isinstance(s, str) and s]
+    else:
+        ids = [mode] if mode else []
+    try:
+        orchestrator = _download_orchestrator()
+        status = orchestrator.get_source_status() if orchestrator else {}
+    except Exception:
+        status = {}
+    return [{'id': s, 'ready': status.get(s)} for s in ids]
+
+
+def _qs_metadata_available(source):
+    try:
+        if source == 'spotify':
+            return bool(_spotify_client() and _spotify_client().is_spotify_authenticated())
+        if source == 'discogs':
+            return bool(config_manager.get('discogs.token'))
+        return True
+    except Exception:
+        return True
+
+
+def _qs_server_available(server):
+    try:
+        if server == 'soulsync':
+            return True
+        if server == 'plex':
+            return bool(config_manager.get('plex.base_url') or config_manager.get('plex.token'))
+        return bool(config_manager.get(f'{server}.base_url'))
+    except Exception:
+        return True
+
+
+
+
+@bp.route('/api/profiles', methods=['GET'])
+def list_profiles():
+    """List all profiles"""
+    try:
+        database = get_database()
+        viewer_id = get_current_profile_id()
+        viewer_is_admin = is_admin_request()
+        profiles = [profile_view_for(p, viewer_id=viewer_id, viewer_is_admin=viewer_is_admin)
+                    for p in database.get_all_profiles()]
+        return jsonify({'success': True, 'profiles': profiles,
+                        # where an own-library folder goes on this install (#1199):
+                        # a mount under /app in docker, anywhere otherwise
+                        'own_library_root_hint': _own_library_root_hint(),
+                        'own_library_supported': config_manager.get_active_media_server() in ('plex', 'jellyfin')})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles', methods=['POST'])
+def create_profile():
+    """Create a new profile (admin only)"""
+    try:
+        # Check that requester is admin
+        database = get_database()
+        # fails closed: a session holding a deleted profile read as None here
+        # and the old `current and not admin` check waved it through
+        if not is_admin_request():
+            return jsonify({'success': False, 'error': 'Admin only'}), 403
+
+        data = request.json or {}
+        name = data.get('name', '').strip()
+        if not name:
+            return jsonify({'success': False, 'error': 'Name is required'}), 400
+        if database.get_profile_by_name(name):
+            return jsonify({'success': False, 'error': 'Profile name already exists'}), 409
+
+        avatar_color = data.get('avatar_color', '#6366f1')
+        avatar_url = data.get('avatar_url') or None
+        pin = data.get('pin')
+        pin_hash = None
+        if pin:
+            from werkzeug.security import generate_password_hash
+            pin_hash = generate_password_hash(pin, method='pbkdf2:sha256')
+
+        # No-gaps: while login mode is on, a new member must be born with a login
+        # password or they could never sign in.
+        password = (data.get('password') or '').strip()
+        from core.security.login_provisioning import create_needs_password
+        if create_needs_password(_require_login_enabled()) and not password:
+            return jsonify({'success': False,
+                            'error': 'Login mode is on — give this profile a login '
+                                     'password so they can sign in.'}), 400
+
+        _controls, control_error = _admin_controls(data)
+        if control_error:
+            return jsonify({'success': False, 'error': control_error}), 400
+
+        # Profile settings: home_page, allowed_pages, can_download, allowed_sides
+        home_page = data.get('home_page') or None
+        allowed_pages = data.get('allowed_pages')  # list or None
+        can_download = data.get('can_download', True)
+        # Side access — music | video | both, never nothing. Anything else
+        # falls back to the shipped default (music-only for non-admins).
+        allowed_sides = data.get('allowed_sides')
+        if allowed_sides not in ('music', 'video', 'both'):
+            allowed_sides = None
+
+        # Validate page IDs
+        if home_page and home_page not in VALID_PAGE_IDS:
+            home_page = None
+        if allowed_pages is not None:
+            allowed_pages = [p for p in allowed_pages if p in VALID_PAGE_IDS]
+            # Non-admin should never have 'settings' in allowed_pages
+            if 'settings' in allowed_pages:
+                allowed_pages.remove('settings')
+            # If home_page not in allowed list, reset to first allowed or 'discover'
+            if home_page and home_page not in allowed_pages:
+                home_page = allowed_pages[0] if allowed_pages else None
+
+        profile_id = database.create_profile(
+            name, avatar_color, pin_hash, is_admin=False, avatar_url=avatar_url,
+            home_page=home_page, allowed_pages=allowed_pages, can_download=bool(can_download),
+            allowed_sides=allowed_sides
+        )
+        if profile_id is None:
+            return jsonify({'success': False, 'error': 'Profile name already exists'}), 409
+
+        if password:
+            database.set_profile_password(profile_id, password)
+        controls, _err = _admin_controls(data)
+        if controls:
+            database.update_profile(profile_id, **controls)
+        _audit('profile_created', profile_id, name)
+
+        return jsonify({'success': True, 'profile_id': profile_id})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/<int:profile_id>', methods=['PUT'])
+def update_profile(profile_id):
+    """Update a profile (admin or self)"""
+    try:
+        database = get_database()
+        current_pid = get_current_profile_id()
+        current = database.get_profile(current_pid)
+        if not current:
+            return jsonify({'success': False, 'error': 'Current profile not found'}), 404
+
+        # Only admin or self can update; profile 1 only by itself
+        if not may_manage_profile(current_pid, current['is_admin'], profile_id):
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
+        data = request.json or {}
+        kwargs = {}
+        if 'name' in data:
+            name = str(data['name'] or '').strip()
+            if not name:
+                return jsonify({'success': False, 'error': 'Name cannot be empty'}), 400
+            # names are login usernames, matched case-insensitively: "bob"
+            # next to "Bob" made sign-in pick whichever row came first
+            clash = database.get_profile_by_name(name)
+            if clash and int(clash['id']) != int(profile_id):
+                return jsonify({'success': False, 'error': 'Profile name already exists'}), 409
+            kwargs['name'] = name
+        if 'avatar_color' in data:
+            kwargs['avatar_color'] = data['avatar_color']
+        if 'avatar_url' in data:
+            kwargs['avatar_url'] = data['avatar_url'] or None
+        if 'is_admin' in data and current['is_admin']:
+            # profile 1 is always the admin everywhere (pid == 1 checks), so
+            # its flag can't be turned off; it would only make the row lie
+            if int(profile_id) == 1 and not data['is_admin']:
+                return jsonify({'success': False, 'error': 'The main admin profile stays an admin'}), 400
+            # Prevent demoting the last admin
+            if not data['is_admin']:
+                all_profiles = database.get_all_profiles()
+                admin_count = sum(1 for p in all_profiles if p['is_admin'])
+                target = database.get_profile(profile_id)
+                if target and target['is_admin'] and admin_count <= 1:
+                    return jsonify({'success': False, 'error': 'Cannot remove the last admin'}), 400
+            kwargs['is_admin'] = int(data['is_admin'])
+
+        # Home page — any user can change their own, admin can change anyone's
+        if 'home_page' in data:
+            hp = data['home_page'] or None
+            if hp and hp not in VALID_PAGE_IDS:
+                hp = None
+            # Non-admin self-edit: validate home_page is in their allowed pages
+            if not current['is_admin'] and current_pid == profile_id:
+                target = database.get_profile(profile_id)
+                ap = target.get('allowed_pages') if target else None
+                if ap is not None and hp and hp not in ap:
+                    return jsonify({'success': False, 'error': 'Page not permitted'}), 400
+            kwargs['home_page'] = hp
+
+        # Allowed pages & can_download — admin only
+        if current['is_admin']:
+            if 'allowed_pages' in data:
+                ap = data['allowed_pages']
+                if ap is not None:
+                    ap = [p for p in ap if p in VALID_PAGE_IDS]
+                    # Non-admin target should never have 'settings'
+                    target = database.get_profile(profile_id)
+                    if target and not target.get('is_admin'):
+                        ap = [p for p in ap if p != 'settings']
+                    # If current home_page not in new allowed list, reset it
+                    current_hp = kwargs.get('home_page') or (target.get('home_page') if target else None)
+                    if current_hp and current_hp not in ap:
+                        kwargs['home_page'] = ap[0] if ap else None
+                kwargs['allowed_pages'] = ap
+            if 'can_download' in data:
+                kwargs['can_download'] = int(bool(data['can_download']))
+            if 'allowed_sides' in data:
+                # music | video | both, never nothing — invalid values reset to
+                # NULL (the shipped music-only default for non-admins). Stored
+                # values on ADMIN profiles are inert: the read side always
+                # resolves admins to 'both'.
+                sides = data['allowed_sides']
+                kwargs['allowed_sides'] = sides if sides in ('music', 'video', 'both') else None
+            controls, control_error = _admin_controls(data)
+            if control_error:
+                return jsonify({'success': False, 'error': control_error}), 400
+            kwargs.update(controls)
+            if 'disabled' in data:
+                # turn a profile off without deleting it. never the owner or
+                # yourself: that would lock the install or you out
+                if int(profile_id) == 1 or int(profile_id) == int(current_pid):
+                    return jsonify({'success': False, 'error': "You can't turn this profile off"}), 400
+                kwargs['disabled'] = 1 if data['disabled'] else 0
+
+        # own library (#1199): admin only, never on the admin profile itself
+        library_result = None
+        if current['is_admin'] and ('library_mode' in data or 'library_root' in data):
+            if int(profile_id) == 1:
+                return jsonify({'success': False, 'error': 'The admin profile is the shared library'}), 400
+            mode = 'own' if data.get('library_mode') == 'own' else 'shared'
+            root = str(data.get('library_root') or '').strip()
+            if mode == 'own':
+                if config_manager.get_active_media_server() not in ('plex', 'jellyfin'):
+                    existing_lib = database.get_profile_library(profile_id)
+                    is_already_own = (existing_lib.get('mode') == 'own' and
+                                      str(existing_lib.get('root') or '').strip() == root)
+                    if not is_already_own:
+                        return jsonify({'success': False, 'error': 'Own libraries require Plex or Jellyfin. Switch this profile to the shared library for Navidrome or Standalone.'}), 400
+                if not root:
+                    return jsonify({'success': False, 'error': 'An own library needs an output folder'}), 400
+                shared_root = str(config_manager.get('soulseek.transfer_path', '') or '').strip().rstrip('/\\')
+                if shared_root and root.rstrip('/\\') == shared_root:
+                    return jsonify({'success': False, 'error': 'That is the shared library folder; pick a different one'}), 400
+                problem = _own_library_root_problem(root)
+                if problem:
+                    return jsonify({'success': False, 'error': problem}), 400
+                problem = _own_library_root_overlap(root, shared_root, database, profile_id)
+                if problem:
+                    return jsonify({'success': False, 'error': problem}), 400
+            library_result = database.set_profile_library(profile_id, mode, root or None)
+            from core.library_scope import invalidate_library_scope_cache
+            invalidate_library_scope_cache()
+            try:
+                from core.imports.paths import reset_own_library_fallback_notifications
+                reset_own_library_fallback_notifications()
+            except Exception:  # noqa: S110 — resetting notification state is best-effort
+                pass
+
+        success = database.update_profile(profile_id, **kwargs) if kwargs else True
+        if library_result is False:
+            return jsonify({'success': False, 'error': 'Failed to save the library setting'}), 500
+        if success and kwargs.get('disabled'):
+            # turning it off signs it out everywhere now, not at its next pick
+            database.bump_profile_session_epoch(profile_id)
+            from core.security.session_epoch import forget
+            forget(profile_id)
+        if success and 'disabled' in kwargs:
+            _audit('profile_disabled' if kwargs['disabled'] else 'profile_enabled', profile_id,
+                   (database.get_profile(profile_id) or {}).get('name'))
+            kwargs.pop('disabled')
+        if success and (kwargs or library_result is not None):
+            changed = sorted(set(kwargs) | ({'library'} if library_result is not None else set()))
+            if 'is_admin' in kwargs:
+                _audit('admin_granted' if kwargs['is_admin'] else 'admin_revoked', profile_id,
+                       (database.get_profile(profile_id) or {}).get('name'))
+            if int(profile_id) != int(current_pid) or set(changed) - {'name', 'avatar_color', 'avatar_url', 'home_page'}:
+                _audit('profile_updated', profile_id, (database.get_profile(profile_id) or {}).get('name'),
+                       ', '.join(changed))
+        return jsonify({'success': success})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/<int:profile_id>', methods=['DELETE'])
+def delete_profile(profile_id):
+    """Delete a profile (admin only, can't delete self)"""
+    try:
+        database = get_database()
+        current_pid = get_current_profile_id()
+        current = database.get_profile(current_pid)
+
+        if not current or not current['is_admin']:
+            return jsonify({'success': False, 'error': 'Admin only'}), 403
+        if current_pid == profile_id:
+            return jsonify({'success': False, 'error': 'Cannot delete your own profile'}), 400
+
+        target = database.get_profile(profile_id)
+        if not target:
+            return jsonify({'success': False, 'error': 'Profile not found'}), 404
+
+        success = database.delete_profile(profile_id)
+        if success:
+            from api.profiles import _sweep_video_profile_data
+            _sweep_video_profile_data(profile_id)
+            _audit('profile_deleted', profile_id, target.get('name'))
+        return jsonify({'success': success})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/select', methods=['POST'])
+def select_profile():
+    """Select a profile (validates PIN if set)"""
+    try:
+        data = request.json or {}
+        try:
+            profile_id = int(data.get('profile_id', 0))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'Invalid profile_id'}), 400
+        pin = data.get('pin', '')
+        password = data.get('password', '')
+
+        if not profile_id:
+            return jsonify({'success': False, 'error': 'profile_id required'}), 400
+
+        database = get_database()
+        profile = database.get_profile(profile_id)
+        if not profile:
+            return jsonify({'success': False, 'error': 'Profile not found'}), 404
+        if profile.get('disabled') and not profile.get('is_admin'):
+            return jsonify({'success': False, 'error': 'This profile is turned off', 'disabled': True}), 403
+
+        _ip = request.remote_addr or 'unknown'
+        _now = time.time()
+        pin_checked = False
+        if _require_login_enabled() and session.get('profile_id') != profile_id:
+            _locked, _retry_after = _login_limiter.is_locked(_ip, profile['name'], _now)
+            if _locked:
+                return (jsonify({'success': False, 'error': 'Too many attempts - please wait and try again'}),
+                        429, {'Retry-After': str(_retry_after)})
+            if not password:
+                return jsonify({'success': False, 'error': 'Password required',
+                                'password_required': True}), 401
+            if not database.verify_profile_password(profile_id, password):
+                _login_limiter.record_failure(_ip, profile['name'], _now)
+                return jsonify({'success': False, 'error': 'Invalid password'}), 401
+            _login_limiter.record_success(_ip, profile['name'])
+        else:
+            # the pin guards switching, so it's only asked for when there is
+            # someone to switch between. a pin that IS sent always gets
+            # checked though: a right admin pin also opens the launch lock.
+            all_profiles = database.get_all_profiles()
+            must_check = len(all_profiles) > 1 and profile['has_pin']
+            if must_check and not pin:
+                return jsonify({'success': False, 'error': 'PIN required', 'pin_required': True}), 401
+            if pin and profile['has_pin']:
+                _pin_key = f"pin:{profile_id}"
+                _locked, _retry_after = _launch_pin_limiter.is_locked(_ip, _pin_key, _now)
+                if _locked:
+                    return (jsonify({'success': False, 'error': 'Too many attempts — please wait and try again'}),
+                            429, {'Retry-After': str(_retry_after)})
+                if not database.verify_profile_pin(profile_id, pin):
+                    _launch_pin_limiter.record_failure(_ip, _pin_key, _now)
+                    return jsonify({'success': False, 'error': 'Invalid PIN'}), 401
+                _launch_pin_limiter.record_success(_ip, _pin_key)
+                pin_checked = True
+
+        session['profile_id'] = profile_id
+        # the epoch this sign-in counts under ("sign out everywhere" moves it)
+        session['profile_epoch'] = profile.get('session_epoch', 0)
+        if session.get('device_owner') != profile_id or not session.get('device_id'):
+            from core.security.devices import start_device
+            start_device(session, database.add_profile_device, profile_id, request.headers.get('User-Agent', ''),
+                         request.remote_addr or '')
+            session['device_owner'] = profile_id
+        # If the admin PIN was just validated, also mark launch PIN as
+        # verified so the subsequent page reload doesn't ask again. only a pin
+        # that was actually checked counts: this used to fire for ANY pin on a
+        # single-profile install, where the check above is skipped. A
+        # non-admin profile PIN must not unlock the admin launch lock.
+        if pin_checked and profile_id == 1:
+            session['launch_pin_verified'] = True
+        return jsonify({'success': True, 'profile': profile})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/current', methods=['GET'])
+def get_current_profile():
+    """Get the currently selected profile from session"""
+    try:
+        # Login mode: when on and the session isn't authenticated, tell the
+        # frontend to show the sign-in screen (this is checked before profile
+        # selection, since there's no profile until you log in).
+        if _require_login_enabled() and not session.get('login_authenticated', False):
+            return jsonify({'success': False, 'login_required': True}), 200
+
+        pid = session.get('profile_id')
+        if not pid:
+            return jsonify({'success': False, 'error': 'No profile selected'}), 200
+
+        database = get_database()
+        profile = database.get_profile(pid)
+        if not profile:
+            session.pop('profile_id', None)
+            return jsonify({'success': False, 'error': 'Profile not found'}), 200
+
+        # Check if launch PIN is required
+        require_pin = config_manager.get('security.require_pin_on_launch', False) if config_manager else False
+        # #832: READ (don't pop) the verified flag — the server-side gate
+        # (_enforce_launch_pin) relies on it persisting for the whole session,
+        # so verified requests keep passing. Verification now lasts the session
+        # (until logout / cookie expiry) instead of one page load — which is
+        # both what an enforced gate requires and the correct security model.
+        pin_verified = session.get('launch_pin_verified', False)
+
+        return jsonify({
+            'success': True,
+            'profile': profile,
+            'launch_pin_required': bool(require_pin) and not pin_verified,
+            'login_mode': _require_login_enabled(),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/verify-launch-pin', methods=['POST'])
+def verify_launch_pin():
+    """Verify PIN for launch lock screen"""
+    try:
+        # Brute-force guard: only a flood of WRONG PINs from one IP trips this; a
+        # correct entry clears it instantly, so normal use is never affected.
+        _ip = request.remote_addr or 'unknown'
+        _now = time.time()
+        _locked, _retry_after = _launch_pin_limiter.is_locked(_ip, "pin:1", _now)
+        if _locked:
+            return (jsonify({'success': False, 'error': 'Too many attempts — please wait and try again'}),
+                    429, {'Retry-After': str(_retry_after)})
+
+        data = request.json or {}
+        pin = data.get('pin', '')
+        if not pin:
+            return jsonify({'success': False, 'error': 'PIN required'}), 401
+
+        database = get_database()
+        # Validate against admin profile (ID 1)
+        if not database.verify_profile_pin(1, pin):
+            _launch_pin_limiter.record_failure(_ip, "pin:1", _now)
+            return jsonify({'success': False, 'error': 'Invalid PIN'}), 401
+
+        _launch_pin_limiter.record_success(_ip, "pin:1")
+        session['launch_pin_verified'] = True
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/<int:profile_id>/set-recovery', methods=['POST'])
+def set_profile_recovery_endpoint(profile_id):
+    """Set or clear a profile's recovery question + answer (admin, or self)."""
+    try:
+        database = get_database()
+        current_pid = get_current_profile_id()
+        current = database.get_profile(current_pid)
+        if not current or not may_manage_profile(current_pid, current['is_admin'], profile_id):
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+        data = request.json or {}
+        ok = database.set_profile_recovery(profile_id, data.get('question', ''), data.get('answer', ''))
+        return jsonify({'success': bool(ok), 'has_recovery': database.profile_has_recovery(profile_id)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/reset-pin-via-credential', methods=['POST'])
+def reset_pin_via_credential():
+    """Reset admin PIN by verifying a known API credential"""
+    try:
+        # this clears a pin and can open the launch lock, so it gets the same
+        # brute-force budget as typing the pin itself
+        _ip = request.remote_addr or 'unknown'
+        _now = time.time()
+        _locked, _retry_after = _launch_pin_limiter.is_locked(_ip, "credential-reset", _now)
+        if _locked:
+            return (jsonify({'success': False, 'error': 'Too many attempts — please wait and try again'}),
+                    429, {'Retry-After': str(_retry_after)})
+
+        data = request.json or {}
+        credential = (data.get('credential') or '').strip()
+        if not credential or len(credential) < 4:
+            return jsonify({'success': False, 'error': 'Enter a valid credential'}), 400
+
+        # Check credential against all stored API secrets/tokens
+        checks = [
+            ('Spotify Client Secret',  config_manager.get('spotify.client_secret', '')),
+            ('Tidal Client Secret',    config_manager.get('tidal.client_secret', '')),
+            ('Plex Token',             config_manager.get('plex.token', '')),
+            ('Jellyfin API Key',       config_manager.get('jellyfin.api_key', '')),
+            ('Navidrome Password',     config_manager.get('navidrome.password', '')),
+            ('ListenBrainz Token',     config_manager.get('listenbrainz.token', '')),
+            ('AcoustID API Key',       config_manager.get('acoustid.api_key', '')),
+            ('Last.fm API Secret',     config_manager.get('lastfm.api_secret', '')),
+            ('Genius Access Token',    config_manager.get('genius.access_token', '')),
+        ]
+
+        import hmac
+        matched = False
+        for _name, stored in checks:
+            if stored and hmac.compare_digest(credential.encode('utf-8'), str(stored).encode('utf-8')):
+                matched = True
+                break
+
+        if not matched:
+            _launch_pin_limiter.record_failure(_ip, "credential-reset", _now)
+            return jsonify({'success': False, 'error': 'Credential does not match any configured service'}), 401
+        _launch_pin_limiter.record_success(_ip, "credential-reset")
+
+        # Credential verified — clear the pin. a member's forgotten pin is the
+        # admin's to reset from Manage Profiles; a service credential only
+        # proves you run the install, so it's only good for the admin's own.
+        database = get_database()
+        try:
+            target_profile = int(data.get('profile_id', 1))
+        except (TypeError, ValueError):
+            target_profile = 1
+        if target_profile != 1:
+            return jsonify({'success': False, 'error': 'Ask an admin to reset this PIN'}), 403
+        database.update_profile(target_profile, pin_hash=None)
+        # If clearing admin PIN, also disable launch lock
+        if target_profile == 1:
+            config_manager.set('security.require_pin_on_launch', False)
+        if target_profile == 1:
+            session['launch_pin_verified'] = True
+
+        return jsonify({'success': True, 'message': 'PIN cleared. You can set a new PIN in Settings.'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/logout', methods=['POST'])
+def logout_profile():
+    """Clear session — back to profile picker. drops the login and launch-pin
+    flags too: popping only the profile left an authenticated session with no
+    profile, which resolved to the admin."""
+    _end_device()
+    session.pop('profile_id', None)
+    session.pop('profile_epoch', None)
+    session.pop('device_id', None)
+    session.pop('login_authenticated', None)
+    session.pop('launch_pin_verified', None)
+    return jsonify({'success': True})
+
+@bp.route('/api/profiles/<int:profile_id>/set-pin', methods=['POST'])
+def set_profile_pin(profile_id):
+    """Set or change PIN for a profile (admin or self)"""
+    try:
+        database = get_database()
+        current_pid = get_current_profile_id()
+        current = database.get_profile(current_pid)
+
+        if not current or not may_manage_profile(current_pid, current['is_admin'], profile_id):
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
+        data = request.json or {}
+        pin = data.get('pin', '')
+
+        if pin:
+            from werkzeug.security import generate_password_hash
+            pin_hash = generate_password_hash(pin, method='pbkdf2:sha256')
+        else:
+            pin_hash = None  # Remove PIN
+
+        success = database.update_profile(profile_id, pin_hash=pin_hash)
+        if success and int(profile_id) != int(current_pid):
+            _audit('pin_reset' if pin_hash else 'pin_removed', profile_id,
+                   (database.get_profile(profile_id) or {}).get('name'))
+        # the launch lock checks the admin's pin, and a profile with no pin
+        # accepts any pin. clearing it with the lock still on left a lock
+        # that anything opened, so the lock goes with it.
+        if success and pin_hash is None and int(profile_id) == 1:
+            config_manager.set('security.require_pin_on_launch', False)
+        return jsonify({'success': success})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/<int:profile_id>/set-password', methods=['POST'])
+def set_profile_password_endpoint(profile_id):
+    """Set or clear a profile's LOGIN password (admin, or the profile itself).
+    Distinct from the quick-switch PIN."""
+    try:
+        database = get_database()
+        current_pid = get_current_profile_id()
+        current = database.get_profile(current_pid)
+        if not current or not may_manage_profile(current_pid, current['is_admin'], profile_id):
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+        data = request.json or {}
+        password = data.get('password', '')
+        # No-gaps: clearing a password while login mode is on would lock that
+        # profile out — refuse it (delete the profile instead if that's intended).
+        from core.security.login_provisioning import removing_password_strands
+        if not (password or '').strip() and removing_password_strands(_require_login_enabled()):
+            return jsonify({'success': False,
+                            'error': "Can't remove this password while login mode is on — "
+                                     "that profile couldn't sign in."}), 400
+        ok = database.set_profile_password(profile_id, password)
+        if ok:
+            # a new password signs out every other browser on that profile;
+            # the one that changed it (if it's the profile's own) stays in
+            epoch = database.bump_profile_session_epoch(profile_id)
+            from core.security.session_epoch import forget
+            forget(profile_id)
+            if int(profile_id) == int(current_pid) and epoch is not None:
+                session['profile_epoch'] = epoch
+            if int(profile_id) != int(current_pid):
+                _audit('password_set', profile_id, (database.get_profile(profile_id) or {}).get('name'))
+        return jsonify({'success': bool(ok), 'has_password': database.profile_has_password(profile_id)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/listenbrainz', methods=['GET'])
+def get_profile_listenbrainz():
+    """Get current profile's ListenBrainz connection status"""
+    try:
+        profile_id = get_current_profile_id()
+        token, base_url, username, source = _get_lb_credentials_for_profile(profile_id)
+        connected = bool(token)
+        return jsonify({
+            'success': True,
+            'connected': connected,
+            'username': username if connected else None,
+            'base_url': base_url or '',
+            'source': source
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/listenbrainz', methods=['POST'])
+def save_profile_listenbrainz():
+    """Save ListenBrainz credentials for current profile"""
+    try:
+        data = request.json or {}
+        token = data.get('token', '').strip()
+        base_url = data.get('base_url', '').strip()
+
+        if not token:
+            return jsonify({'success': False, 'error': 'Token is required'}), 400
+
+        # Validate token first
+        valid, result = _validate_lb_token(token, base_url)
+        if not valid:
+            return jsonify({'success': False, 'error': result}), 400
+
+        username = result
+        profile_id = get_current_profile_id()
+        db = get_database()
+        previous_username = (db.get_profile_listenbrainz(profile_id) or {}).get('username') or ''
+        success = db.set_profile_listenbrainz(profile_id, token, base_url, username)
+
+        if success:
+            _listening_import_connected(profile_id, previous_username, username)
+            return jsonify({'success': True, 'username': username})
+        return jsonify({'success': False, 'error': 'Failed to save credentials'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/listenbrainz', methods=['DELETE'])
+def delete_profile_listenbrainz():
+    """Clear ListenBrainz credentials for current profile"""
+    try:
+        profile_id = get_current_profile_id()
+        db = get_database()
+        db.clear_profile_listenbrainz(profile_id)
+        _listening_import_disconnected(profile_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+# --- Per-Profile Last.fm (#1293) ---
+# just a username. scrobbles are public, the app's api key reads them, so
+# there's no login and nothing secret to store.
+
+def _check_lastfm_user(username):
+    """(ok, canonical name or error). reads one page of their scrobbles, which
+    proves the name exists AND that their listening isn't hidden."""
+    api_key = config_manager.get('lastfm.api_key', '')
+    if not api_key:
+        return False, "Last.fm isn't set up on this server yet, ask the admin to add an API key in Settings."
+    try:
+        from core.lastfm_client import LastFMClient
+        data = LastFMClient(api_key=api_key).get_user_recent_tracks(username, limit=1)
+    except Exception as e:
+        return False, f"Couldn't reach Last.fm: {e}"
+    recent = (data or {}).get('recenttracks')
+    if not isinstance(recent, dict):
+        return False, "Couldn't read that Last.fm user's scrobbles. Check the name, and that recent listening isn't hidden."
+    return True, (recent.get('@attr') or {}).get('user') or username
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['GET'])
+def get_profile_lastfm():
+    try:
+        connected, username = _profile_lastfm_connection(get_current_profile_id())
+        return jsonify({'success': True, 'connected': connected, 'username': username})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['POST'])
+def save_profile_lastfm():
+    try:
+        data = request.json or {}
+        username = str(data.get('username') or data.get('token') or '').strip()
+        if not username:
+            return jsonify({'success': False, 'error': 'Last.fm username is required'}), 400
+        profile_id = get_current_profile_id()
+        if not profile_id or profile_id == 1:
+            return jsonify({'success': False, 'error': 'The admin account is managed in Settings'}), 400
+        ok, result = _check_lastfm_user(username)
+        if not ok:
+            return jsonify({'success': False, 'error': result}), 400
+        db = get_database()
+        previous = (db.get_profile_lastfm(profile_id) or {}).get('username') or ''
+        if not db.set_profile_lastfm(profile_id, result):
+            return jsonify({'success': False, 'error': 'Failed to save'}), 500
+        _listening_import_connected(profile_id, previous, result, 'lastfm')
+        return jsonify({'success': True, 'username': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/lastfm', methods=['DELETE'])
+def delete_profile_lastfm():
+    try:
+        profile_id = get_current_profile_id()
+        if profile_id and profile_id != 1:
+            _disconnect_profile_lastfm(profile_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/listenbrainz/test', methods=['POST'])
+def test_profile_listenbrainz():
+    """Test a ListenBrainz token without saving"""
+    try:
+        data = request.json or {}
+        token = data.get('token', '').strip()
+        base_url = data.get('base_url', '').strip()
+
+        if not token:
+            return jsonify({'success': False, 'error': 'Token is required'}), 400
+
+        valid, result = _validate_lb_token(token, base_url)
+        if valid:
+            return jsonify({'success': True, 'username': result})
+        return jsonify({'success': False, 'error': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/connections', methods=['GET'])
+def get_my_connections():
+    """Per-profile playlist-service connection status for the My Accounts modal.
+    Readable by any profile; reports only this profile's own connections."""
+    try:
+        pid = get_current_profile_id()
+        sp_connected, sp_account = _profile_spotify_connection(pid)
+        td_connected, td_account = _profile_tidal_connection(pid)
+        lb_connected, lb_account = _profile_listenbrainz_connection(pid)
+        fm_connected, fm_account = _profile_lastfm_connection(pid)
+        return jsonify({
+            'success': True,
+            'is_admin': is_admin_request(),
+            # whose listening this profile's stats read (#1293), for the card
+            # at the top of My Account
+            'listening': {
+                'scope': get_database().listening_history_scope(pid),
+                'sources': [s for s, on in (('listenbrainz', lb_connected), ('lastfm', fm_connected)) if on],
+            },
+            'connections': {
+                'spotify': {'connected': sp_connected, 'account': sp_account},
+                'tidal': {'connected': td_connected, 'account': td_account},
+                'listenbrainz': {'connected': lb_connected, 'account': lb_account},
+                'lastfm': {'connected': fm_connected, 'account': fm_account},
+            },
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/connections/<service>/disconnect', methods=['POST'])
+def disconnect_my_connection(service):
+    """Disconnect the current profile's OWN account for a service (clears its
+    per-profile tokens + cached client). The global/admin auth is untouched."""
+    try:
+        pid = get_current_profile_id()
+        fn = _PROFILE_DISCONNECTORS.get(service)
+        if not fn:
+            return jsonify({'success': False, 'error': f'Unsupported service: {service}'}), 400
+        if pid == 1:
+            return jsonify({'success': False, 'error': 'The admin account is managed in Settings'}), 400
+        fn(pid)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/spotify', methods=['GET'])
+def get_profile_spotify_creds():
+    """Get current profile's Spotify credentials (if set)"""
+    try:
+        profile_id = get_current_profile_id()
+        db = get_database()
+        creds = db.get_profile_spotify(profile_id)
+        return jsonify({
+            'success': True,
+            'has_credentials': bool(creds),
+            'client_id': creds.get('client_id', '') if creds else '',
+            'redirect_uri': creds.get('redirect_uri', '') if creds else '',
+            # Never return client_secret or tokens to frontend
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/spotify', methods=['POST'])
+def save_profile_spotify_creds():
+    """Save Spotify API credentials for current profile"""
+    try:
+        data = request.json or {}
+        client_id = data.get('client_id', '').strip()
+        client_secret = data.get('client_secret', '').strip()
+        redirect_uri = data.get('redirect_uri', '').strip()
+
+        if not client_id or not client_secret:
+            return jsonify({'success': False, 'error': 'Client ID and Secret are required'}), 400
+
+        profile_id = get_current_profile_id()
+        db = get_database()
+        success = db.set_profile_spotify(profile_id, client_id, client_secret, redirect_uri)
+
+        if success:
+            metadata_registry.clear_cached_profile_spotify_client(profile_id)
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': 'Failed to save credentials'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/spotify', methods=['DELETE'])
+def delete_profile_spotify_creds():
+    """Clear Spotify credentials for current profile (revert to global)"""
+    try:
+        profile_id = get_current_profile_id()
+        db = get_database()
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE profiles
+                SET spotify_client_id = NULL, spotify_client_secret = NULL,
+                    spotify_redirect_uri = NULL, spotify_access_token = NULL,
+                    spotify_refresh_token = NULL, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            """, (profile_id,))
+            conn.commit()
+        metadata_registry.clear_cached_profile_spotify_client(profile_id)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/server-library', methods=['GET'])
+def get_profile_server_library():
+    """Get current profile's media server library selection"""
+    try:
+        profile_id = get_current_profile_id()
+        db = get_database()
+        libs = db.get_profile_server_library(profile_id)
+        return jsonify({'success': True, **libs})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/profiles/me/server-library', methods=['POST'])
+def save_profile_server_library():
+    """Save media server library/user selection for current profile"""
+    try:
+        data = request.json or {}
+        server_type = data.get('server_type', '')
+        library_id = data.get('library_id')
+        user_id = data.get('user_id')
+
+        if server_type not in ('plex', 'jellyfin', 'navidrome'):
+            return jsonify({'success': False, 'error': 'Invalid server type'}), 400
+
+        profile_id = get_current_profile_id()
+        db = get_database()
+        success = db.set_profile_server_library(profile_id, server_type, library_id, user_id)
+
+        if success:
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': 'Failed to save library selection'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _is_docker() -> bool:
+    return os.path.exists('/.dockerenv')
+
+
+def _own_library_root_hint(name: str = '<name>') -> str:
+    """the folder an own library is prefilled with. in docker that is a mount
+    the compose file has to provide (same rule as /app/Transfer). outside
+    docker the same shape is prefilled and the admin corrects it to a real
+    folder; the save-time check refuses one that is not there."""
+    return f"/app/libraries/{name}"
+
+
+def _same_or_inside(a: str, b: str) -> bool:
+    """a is b or lies under b, after both are resolved"""
+    try:
+        from core.imports.paths import config_root_path
+        ra = os.path.realpath(config_root_path(a))
+        rb = os.path.realpath(config_root_path(b))
+    except Exception:  # noqa: BLE001
+        ra, rb = os.path.realpath(a), os.path.realpath(b)
+    return ra == rb or ra.startswith(rb.rstrip(os.sep) + os.sep)
+
+
+def _own_library_root_overlap(root: str, shared_root: str, database, profile_id):
+    """None when the folder is nobody else's, else why not. a folder inside
+    the shared one (or holding it) is scanned into both libraries, and two
+    profiles on one folder write the same files and race each other's scan."""
+    if shared_root and (_same_or_inside(root, shared_root) or _same_or_inside(shared_root, root)):
+        return 'That folder overlaps the shared library folder; pick one outside it'
+    try:
+        others = database.get_own_library_profiles()
+    except Exception:  # noqa: BLE001
+        others = []
+    for other in others:
+        if int(other.get('id', 0)) == int(profile_id) or not other.get('root'):
+            continue
+        if _same_or_inside(root, other['root']) or _same_or_inside(other['root'], root):
+            return f"That folder is {other.get('name', 'another profile')}'s library; pick a different one"
+    return None
+
+
+def _own_library_root_problem(root: str):
+    """None when the folder is usable, else the message to show. the folder
+    has to exist and be writable HERE, inside the container when there is
+    one: a path that only exists on the host is the usual mistake."""
+    try:
+        from core.imports.paths import config_root_path
+        resolved = config_root_path(root)
+    except Exception:  # noqa: BLE001
+        resolved = root
+    if not os.path.isdir(resolved):
+        if _is_docker():
+            return (f"{root} does not exist inside the container. Mount it in docker-compose.yml "
+                    f"(e.g. - /path/on/host:{root}) and restart, then save again.")
+        return f"{root} does not exist. Create the folder first."
+    if not os.access(resolved, os.W_OK):
+        return f"{root} is not writable by the app."
+    return None
+
+
+@bp.route('/api/profiles/me/navidrome-login', methods=['POST'])
+def save_profile_navidrome_login():
+    """save the current profile's own navidrome login. the login is checked
+    with one ping as that user first, so a wrong password is refused here
+    and not found out by a failing sync. a profile with a login of its own
+    gets its playlists written as that user (#1265)."""
+    try:
+        data = request.json or {}
+        username = str(data.get('username') or '').strip()
+        password = str(data.get('password') or '')
+        if not username or not password:
+            return jsonify({'success': False, 'error': 'Username and password are required'}), 400
+        engine = _media_server_engine()
+        client = engine.client('navidrome') if engine is not None else None
+        if client is None:
+            return jsonify({'success': False, 'error': 'Navidrome is not connected'}), 503
+        ok, error = client.verify_user_login(username, password)
+        if not ok:
+            return jsonify({'success': False, 'error': f'Navidrome refused this login: {error}'}), 400
+        if not get_database().set_profile_navidrome_login(get_current_profile_id(), username, password):
+            return jsonify({'success': False, 'error': 'Failed to save login'}), 500
+        return jsonify({'success': True, 'username': username})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/navidrome-login', methods=['DELETE'])
+def clear_profile_navidrome_login():
+    """back to the app account for this profile."""
+    try:
+        get_database().set_profile_navidrome_login(get_current_profile_id(), None, None)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/plex-home-users', methods=['GET'])
+def list_plex_home_users():
+    """the plex home users a profile can link itself to. names and ids only,
+    and only the flag saying whether one needs a pin."""
+    try:
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        if client is None or not hasattr(client, 'list_home_users'):
+            return jsonify({'success': False, 'error': 'Plex is not connected', 'users': []}), 503
+        return jsonify({'success': True, 'users': client.list_home_users()})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'users': []}), 500
+
+
+@bp.route('/api/profiles/me/plex-home-user', methods=['POST'])
+def link_plex_home_user():
+    """link the current profile to a plex home user (#1265). the admin token
+    switches to that user once (with their profile pin when they have one,
+    which is used for that call and not kept) and the user's own server
+    access token is stored; the profile's playlists are then theirs."""
+    try:
+        data = request.json or {}
+        user_id = str(data.get('user_id') or '').strip()
+        pin = str(data.get('pin') or '').strip() or None
+        if not user_id:
+            return jsonify({'success': False, 'error': 'Pick a Plex user'}), 400
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        if client is None or not hasattr(client, 'mint_home_user_server_token'):
+            return jsonify({'success': False, 'error': 'Plex is not connected'}), 503
+        token, title, error = client.mint_home_user_server_token(user_id, pin)
+        if not token:
+            return jsonify({'success': False, 'error': error or 'Could not link that Plex user'}), 400
+        if not get_database().set_profile_plex_home_user(get_current_profile_id(), user_id, title, token):
+            return jsonify({'success': False, 'error': 'Failed to save the link'}), 500
+        return jsonify({'success': True, 'title': title})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/plex-connect/start', methods=['POST'])
+def plex_connect_start():
+    """connect with plex from my account: anyone, home user or a friend the
+    server is shared with, proves their plex account on plex's own page.
+    the pin lives in this session only, apart from login's"""
+    from api.login import plex_start_limiter
+    ip = request.remote_addr or 'unknown'
+    now = time.time()
+    locked, retry_after = plex_start_limiter.is_locked(ip, '<plex>', now)
+    if locked:
+        return (jsonify({'success': False, 'error': 'Too many attempts — please wait and try again'}),
+                429, {'Retry-After': str(retry_after)})
+    plex_start_limiter.record_failure(ip, '<plex>', now)  # every start counts
+    try:
+        from core.security import plex_signin
+        cid = plex_signin.client_identifier(config_manager)
+        pin = plex_signin.start_pin(cid)
+        session['plex_connect_pin'] = pin['id']
+        session['plex_connect_profile'] = get_current_profile_id()
+        session.pop('plex_connect_checked_at', None)
+        return jsonify({'success': True, 'url': pin['url']})
+    except Exception as e:
+        logger.error(f"Plex connect could not start: {e}")
+        return jsonify({'success': False, 'error': "Couldn't reach Plex. Try again in a moment."}), 502
+
+
+@bp.route('/api/profiles/me/plex-connect/check', methods=['POST'])
+def plex_connect_check():
+    """poll the pin. once approved: who they are on plex links to this
+    profile, for playlists, plex sign-in and their own listening history"""
+    pid = get_current_profile_id()
+    pin_id = session.get('plex_connect_pin')
+    if not pin_id or session.get('plex_connect_profile') != pid:
+        # a pin started under another profile in this browser isn't this one's
+        return jsonify({'success': False, 'error': 'Start connecting with Plex first'}), 400
+    import api.login as login_api
+    now = time.time()
+    if now - float(session.get('plex_connect_checked_at') or 0) < login_api._PLEX_CHECK_MIN_INTERVAL:
+        return jsonify({'success': True, 'pending': True})
+    session['plex_connect_checked_at'] = now
+    try:
+        import requests as _requests
+        from core.security import plex_signin
+        cid = plex_signin.client_identifier(config_manager)
+        try:
+            account_token = plex_signin.check_pin(cid, pin_id)
+        except _requests.HTTPError as e:
+            if getattr(e.response, 'status_code', None) == 404:
+                session.pop('plex_connect_pin', None)
+                return jsonify({'success': False, 'error': 'That Plex link expired. Try again.'}), 410
+            logger.warning(f"Plex connect check failed, will retry: {e}")
+            return jsonify({'success': True, 'pending': True})
+        except _requests.RequestException as e:
+            logger.warning(f"Plex connect check failed, will retry: {e}")
+            return jsonify({'success': True, 'pending': True})
+        if not account_token:
+            return jsonify({'success': True, 'pending': True})
+        session.pop('plex_connect_pin', None)
+        session.pop('plex_connect_profile', None)
+        engine = _media_server_engine()
+        client = engine.client('plex') if engine is not None else None
+        machine = plex_signin.server_machine_id(client)
+        if not machine:
+            return jsonify({'success': False, 'error': "SoulSync isn't connected to a Plex server"}), 503
+        account = plex_signin.resolve_account(account_token, machine)
+        result = plex_signin.connect_profile(get_database(), pid, account)
+        if result.error:
+            return jsonify({'success': False, 'error': result.error}), 403
+        return jsonify({'success': True, 'pending': False, 'title': account.username})
+    except Exception as e:
+        logger.error(f"Plex connect failed: {e}")
+        return jsonify({'success': False, 'error': 'Connecting with Plex failed. Try again.'}), 502
+
+
+@bp.route('/api/profiles/me/plex-home-user', methods=['DELETE'])
+def unlink_plex_home_user():
+    """back to the app account for this profile."""
+    try:
+        get_database().set_profile_plex_home_user(get_current_profile_id(), None, None, None)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/services', methods=['GET'])
+def get_my_service_selections():
+    """For the current profile: the available credential sets per service (id +
+    label, never secrets) and which one this profile has selected. Drives the
+    quick-switch modal's pills. Any profile may read this — it exposes no
+    secrets, only the admin-created set names. Stale-safe: a selection whose set
+    was deleted reports as None (fall back to the global/admin default)."""
+    try:
+        from core.credentials.store import SERVICE_CREDENTIAL_SCHEMA
+        db = get_database()
+        profile_id = get_current_profile_id()
+        out = {}
+        for service in SERVICE_CREDENTIAL_SCHEMA:
+            options = db.list_service_credentials(service)
+            selected = db.get_profile_service_credential_id(profile_id, service)
+            if selected not in {o['id'] for o in options}:
+                selected = None
+            out[service] = {
+                'options': [{'id': o['id'], 'label': o['label']} for o in options],
+                'selected_id': selected,
+            }
+        return jsonify({'success': True, 'services': out})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/services/select', methods=['POST'])
+def select_my_service_credential():
+    """Set which admin-created credential set is active for the current profile
+    on a service. ``credential_id=null`` clears it (fall back to the global/admin
+    default). The caller can only pick an EXISTING set for that service — never
+    create one — so a non-admin can switch their account but not configure new
+    credentials. Not admin-gated by design: it only writes a per-profile pointer
+    and exposes no secrets."""
+    try:
+        from core.credentials.store import is_supported_service
+        data = request.json or {}
+        service = (data.get('service') or '').strip()
+        credential_id = data.get('credential_id')
+
+        if not is_supported_service(service):
+            return jsonify({'success': False, 'error': f'Unsupported service: {service}'}), 400
+
+        db = get_database()
+        if credential_id is not None:
+            cred = db.get_service_credential(credential_id)
+            if not cred or cred['service'] != service:
+                return jsonify({'success': False, 'error': 'No such credential set for this service'}), 400
+
+        ok = db.set_profile_service_credential(get_current_profile_id(), service, credential_id)
+        if ok:
+            return jsonify({'success': True})
+        return jsonify({'success': False, 'error': 'Failed to save selection'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/active-sources', methods=['GET'])
+def get_active_sources():
+    """Current active metadata source / media server / download source + the
+    available options, for the quick-switch modal. Readable by any profile;
+    reflects the global config (per-profile override is a later layer)."""
+    try:
+        mode = config_manager.get('download_source.mode', 'soulseek') or 'soulseek'
+        hybrid_order = config_manager.get('download_source.hybrid_order', []) or []
+        # "Spotify (no auth)" is a COMPOSITE the Settings page uses: it stores
+        # fallback_source='spotify' + metadata.spotify_free=true, NOT a literal
+        # 'spotify_free' fallback value. Mirror that mapping so the modal agrees
+        # with the Settings dropdown (settings.js _metaSel / save logic).
+        _fb = config_manager.get('metadata.fallback_source', 'deezer') or 'deezer'
+        _free = config_manager.get('metadata.spotify_free', False)
+        meta_active = 'spotify_free' if (_fb == 'spotify' and _free) else _fb
+        meta_effective = 'spotify_free' if meta_active == 'spotify_free' else _get_metadata_fallback_source()
+        return jsonify({
+            'success': True,
+            'editable': is_admin_request(),  # admins write the global default, same gate as the POST
+            'metadata': {
+                # `active` = the configured choice (what the user picked / edits).
+                # `effective` = what's actually used after auth/availability
+                # fallback (e.g. configured 'spotify' but not authenticated →
+                # the app falls back). Surfacing both stops the modal disagreeing
+                # with the sidebar/Settings status.
+                'active': meta_active,
+                'effective': meta_effective,
+                'options': [{'id': s, 'available': _qs_metadata_available(s)} for s in _qs_metadata_sources()],
+            },
+            'server': {
+                'active': config_manager.get_active_media_server(),
+                'options': [{'id': s, 'available': _qs_server_available(s)} for s in _QS_MEDIA_SERVERS],
+            },
+            # read-only here (#1301): the chain is edited in settings, where one
+            # source is single mode and two or more is hybrid
+            'download': {
+                'mode': mode,
+                'hybrid_order': hybrid_order,
+                'chain': _qs_download_chain(mode, hybrid_order),
+            },
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/active-sources', methods=['POST'])
+@admin_only
+def set_active_sources():
+    """Set the GLOBAL active metadata source. Admin-only; reuses the same setter
+    the Settings save performs so the change takes effect immediately.
+
+    the media server and the download chain used to be switchable here too, one
+    click with no questions (#1301). switching servers means a fresh library
+    scan, and the download chain has its own editor in settings that this one
+    kept drifting from. both are changed in settings now; asking here says so.
+    """
+    try:
+        data = request.json or {}
+        changed = []
+
+        if 'media_server' in data:
+            return jsonify({'success': False,
+                            'error': 'Change the media server in Settings, under Connections'}), 400
+        if 'download_mode' in data or 'hybrid_order' in data:
+            return jsonify({'success': False,
+                            'error': 'Change download sources in Settings, under Downloads'}), 400
+
+        if 'metadata_source' in data:
+            src = data['metadata_source']
+            if src not in _qs_metadata_sources():
+                return jsonify({'success': False, 'error': 'Unknown metadata source'}), 400
+            from core.metadata.registry import apply_primary_metadata_source
+            _primary_err = apply_primary_metadata_source(
+                src,
+                config_manager.set,
+            )
+            if _primary_err:
+                return jsonify({'success': False, 'error': _primary_err}), 400
+            invalidate_metadata_status_caches()
+            changed.append('metadata')
+
+        return jsonify({'success': True, 'changed': sorted(set(changed))})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+

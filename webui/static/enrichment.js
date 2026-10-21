@@ -30,1108 +30,113 @@ function _enrichmentStatusFetch(id) {
     });
 }
 
-/**
- * Poll MusicBrainz status every 2 seconds and update UI
- */
-async function updateMusicBrainzStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await _enrichmentStatusFetch('musicbrainz');
-        if (!response.ok) { console.warn('MusicBrainz status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateMusicBrainzStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating MusicBrainz status:', error);
-    }
-}
-
 function updateMusicBrainzStatusFromData(data) {
-    const button = document.getElementById('musicbrainz-button');
-    if (!button) return;
-
-    // Update button state classes
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    // Update tooltip content
-    const tooltipStatus = document.getElementById('mb-tooltip-status');
-    const tooltipCurrent = document.getElementById('mb-tooltip-current');
-    const tooltipProgress = document.getElementById('mb-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) {
-            tooltipStatus.textContent = 'Complete';
-        } else if (data.running && !data.paused) {
-            tooltipStatus.textContent = 'Running';
-        } else if (data.paused) {
-            tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused';
-        } else {
-            tooltipStatus.textContent = 'Idle';
-        }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            const type = data.current_item.type || 'item';
-            const name = data.current_item.name;
-            tooltipCurrent.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)}: "${name}"`;
-        } else {
-            tooltipCurrent.textContent = 'No active matches';
-        }
-    }
-
-    if (tooltipProgress && data.progress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-
-        const currentType = data.current_item?.type;
-        let progressText = '';
-
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-
-        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total} (${artists.percent || 0}%)`;
-        } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total} (${albums.percent || 0}%)`;
-        } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total} (${tracks.percent || 0}%)`;
-        } else {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total} (${artists.percent || 0}%)`;
-        }
-
-        tooltipProgress.textContent = progressText;
-    }
-}
-
-/**
- * Toggle MusicBrainz enrichment pause/resume
- */
-async function toggleMusicBrainzEnrichment() {
-    try {
-        const button = document.getElementById('musicbrainz-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/musicbrainz/pause' : '/api/enrichment/musicbrainz/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} MusicBrainz enrichment`);
-        }
-
-        // Immediately update UI
-        await updateMusicBrainzStatus();
-
-        console.log(`✅ MusicBrainz enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling MusicBrainz enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize MusicBrainz UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('musicbrainz-button');
-        if (button) {
-            button.addEventListener('click', toggleMusicBrainzEnrichment);
-            // Start polling
-            updateMusicBrainzStatus();
-            setInterval(updateMusicBrainzStatus, 10000); // fallback only — the websocket push owns live updates
-            console.log('✅ MusicBrainz UI initialized');
-        }
-    });
-} else {
-    const button = document.getElementById('musicbrainz-button');
-    if (button) {
-        button.addEventListener('click', toggleMusicBrainzEnrichment);
-        // Start polling
-        updateMusicBrainzStatus();
-        setInterval(updateMusicBrainzStatus, 10000); // fallback only — the websocket push owns live updates
-        console.log('✅ MusicBrainz UI initialized');
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'musicbrainz', data } }));
 }
 
 // ============================================================================
 // AUDIODB ENRICHMENT UI
 // ============================================================================
 
-/**
- * Poll AudioDB status every 2 seconds and update UI
- */
-async function updateAudioDBStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await _enrichmentStatusFetch('audiodb');
-        if (!response.ok) { console.warn('AudioDB status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateAudioDBStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating AudioDB status:', error);
-    }
-}
-
 function updateAudioDBStatusFromData(data) {
-    const button = document.getElementById('audiodb-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('audiodb-tooltip-status');
-    const tooltipCurrent = document.getElementById('audiodb-tooltip-current');
-    const tooltipProgress = document.getElementById('audiodb-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
-        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            const type = data.current_item.type || 'item';
-            const name = data.current_item.name;
-            tooltipCurrent.textContent = `${type.charAt(0).toUpperCase() + type.slice(1)}: "${name}"`;
-        } else {
-            tooltipCurrent.textContent = 'No active matches';
-        }
-    }
-
-    if (tooltipProgress && data.progress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-
-        const currentType = data.current_item?.type;
-        let progressText = '';
-
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-
-        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        } else {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        }
-
-        tooltipProgress.textContent = progressText;
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'audiodb', data } }));
 }
 
 function updateDiscogsStatusFromData(data) {
-    const button = document.getElementById('discogs-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('discogs-tooltip-status');
-    const tooltipCurrent = document.getElementById('discogs-tooltip-current');
-    const tooltipProgress = document.getElementById('discogs-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) tooltipStatus.textContent = 'Complete';
-        else if (data.running && !data.paused) tooltipStatus.textContent = 'Running';
-        else if (data.paused) tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused';
-        else tooltipStatus.textContent = 'Idle';
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) tooltipCurrent.textContent = 'All items processed';
-        else if (data.current_item) tooltipCurrent.textContent = `Processing: "${data.current_item}"`;
-        else tooltipCurrent.textContent = 'No active matches';
-    }
-
-    if (tooltipProgress && data.stats) {
-        const s = data.stats;
-        tooltipProgress.textContent = `Matched: ${s.matched || 0} | Not found: ${s.not_found || 0} | Pending: ${s.pending || 0}`;
-    }
-}
-
-async function toggleDiscogsEnrichment() {
-    try {
-        const button = document.getElementById('discogs-button');
-        if (!button) return;
-        const isPaused = button.classList.contains('paused') || button.classList.contains('complete');
-        const endpoint = isPaused ? '/api/enrichment/discogs/resume' : '/api/enrichment/discogs/pause';
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (response.ok) {
-            showToast(isPaused ? 'Discogs enrichment resumed' : 'Discogs enrichment paused', 'info');
-        }
-    } catch (e) {
-        showToast('Failed to toggle Discogs enrichment', 'error');
-    }
-}
-
-/**
- * Toggle AudioDB enrichment pause/resume
- */
-async function toggleAudioDBEnrichment() {
-    try {
-        const button = document.getElementById('audiodb-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/audiodb/pause' : '/api/enrichment/audiodb/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} AudioDB enrichment`);
-        }
-
-        // Immediately update UI
-        await updateAudioDBStatus();
-
-        console.log(`✅ AudioDB enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling AudioDB enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize AudioDB UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('audiodb-button');
-        if (button) {
-            button.addEventListener('click', toggleAudioDBEnrichment);
-            updateAudioDBStatus();
-            setInterval(updateAudioDBStatus, 10000); // fallback only — the websocket push owns live updates
-            console.log('✅ AudioDB UI initialized');
-        }
-    });
-} else {
-    const button = document.getElementById('audiodb-button');
-    if (button) {
-        button.addEventListener('click', toggleAudioDBEnrichment);
-        updateAudioDBStatus();
-        setInterval(updateAudioDBStatus, 10000); // fallback only — the websocket push owns live updates
-        console.log('✅ AudioDB UI initialized');
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'discogs', data } }));
 }
 
 // ===================================================================
 // DEEZER ENRICHMENT STATUS
 // ===================================================================
 
-async function updateDeezerStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await _enrichmentStatusFetch('deezer');
-        if (!response.ok) { console.warn('Deezer status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateDeezerStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Deezer status:', error);
-    }
-}
-
 function updateDeezerStatusFromData(data) {
-    const button = document.getElementById('deezer-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('deezer-tooltip-status');
-    const tooltipCurrent = document.getElementById('deezer-tooltip-current');
-    const tooltipProgress = document.getElementById('deezer-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
-        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-
-        const currentType = data.current_item?.type;
-        let progressText = '';
-
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-
-        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        } else {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        }
-
-        tooltipProgress.textContent = progressText;
-    }
-}
-
-async function toggleDeezerEnrichment() {
-    try {
-        const button = document.getElementById('deezer-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/deezer/pause' : '/api/enrichment/deezer/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Deezer enrichment`);
-        }
-
-        // Immediately update UI
-        await updateDeezerStatus();
-
-        console.log(`✅ Deezer enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Deezer enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize Deezer UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('deezer-button');
-        if (button) {
-            button.addEventListener('click', toggleDeezerEnrichment);
-            updateDeezerStatus();
-            setInterval(updateDeezerStatus, 10000); // fallback only — the websocket push owns live updates
-            console.log('✅ Deezer UI initialized');
-        }
-    });
-} else {
-    const button = document.getElementById('deezer-button');
-    if (button) {
-        button.addEventListener('click', toggleDeezerEnrichment);
-        updateDeezerStatus();
-        setInterval(updateDeezerStatus, 10000); // fallback only — the websocket push owns live updates
-        console.log('✅ Deezer UI initialized');
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'deezer', data } }));
 }
 
 // ===================================================================
 // JIOSAAVN ENRICHMENT STATUS
 // ===================================================================
 
-async function updateJioSaavnStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('jiosaavn');
-        if (!response.ok) { console.warn('JioSaavn status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateJioSaavnStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating JioSaavn status:', error);
-    }
-}
-
 function updateJioSaavnStatusFromData(data) {
-    const button = document.getElementById('jiosaavn-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (!data.enabled) {
-        button.classList.add('paused');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('jiosaavn-tooltip-status');
-    const tooltipCurrent = document.getElementById('jiosaavn-tooltip-current');
-    const tooltipProgress = document.getElementById('jiosaavn-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (!data.enabled) { tooltipStatus.textContent = 'Disabled'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
-        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (!data.enabled) {
-            tooltipCurrent.textContent = 'Enable in Settings → Advanced → Experimental';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-        const currentType = data.current_item?.type;
-        let progressText = '';
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        } else {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        }
-        tooltipProgress.textContent = progressText;
-    }
-}
-
-async function toggleJioSaavnEnrichment() {
-    try {
-        const button = document.getElementById('jiosaavn-button');
-        if (!button) return;
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/jiosaavn/pause' : '/api/enrichment/jiosaavn/resume';
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} JioSaavn enrichment`);
-        }
-        await updateJioSaavnStatus();
-    } catch (error) {
-        console.error('Error toggling JioSaavn enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-function initJioSaavnEnrichmentUI() {
-    const button = document.getElementById('jiosaavn-button');
-    if (!button) return;
-    button.addEventListener('click', toggleJioSaavnEnrichment);
-    updateJioSaavnStatus();
-    setInterval(updateJioSaavnStatus, 10000); // fallback only — the websocket push owns live updates
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initJioSaavnEnrichmentUI);
-} else {
-    initJioSaavnEnrichmentUI();
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'jiosaavn', data } }));
 }
 
 // ===================================================================
 // SPOTIFY ENRICHMENT STATUS
 // ===================================================================
 
-async function updateSpotifyEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await _enrichmentStatusFetch('spotify');
-        if (!response.ok) { console.warn('Spotify enrichment status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateSpotifyEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Spotify enrichment status:', error);
-    }
-}
-
 function updateSpotifyEnrichmentStatusFromData(data) {
-    const button = document.getElementById('spotify-enrich-button');
-    if (!button) return;
-
-    const isRateLimited = data.rate_limited === true;
-    // The real API is unauthed/banned but the worker is still matching via the
-    // no-creds Spotify Free source — treat it as running, not stuck (#798/#887).
-    const bridgingFree = data.using_free === true;
-    // #887: a no-auth user whose enrichment runs on Spotify Free is NOT "not
-    // authenticated" for status purposes — the worker IS enriching. Only flag
-    // Not Authenticated when Free isn't carrying it.
-    const notAuthenticated = data.authenticated === false && !bridgingFree;
-    const rateLimitedStuck = isRateLimited && !bridgingFree;
-    // Budget is a real-API cap; when bridging to free it no longer applies, so
-    // only treat the budget as a stop when we're NOT serving via free (#798).
-    const budgetStuck = (data.daily_budget && data.daily_budget.exhausted) && !bridgingFree;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (notAuthenticated) {
-        button.classList.add('no-auth');
-    } else if (rateLimitedStuck || budgetStuck) {
-        button.classList.add('paused');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('spotify-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('spotify-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('spotify-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (notAuthenticated) { tooltipStatus.textContent = 'Not Authenticated'; }
-        else if (rateLimitedStuck) { tooltipStatus.textContent = 'Rate Limited'; }
-        else if (bridgingFree) { tooltipStatus.textContent = 'Running (Spotify Free)'; }
-        else if (budgetStuck) { tooltipStatus.textContent = 'Daily Limit Reached'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.paused) {
-            tooltipCurrent.textContent = notAuthenticated ? 'Connect Spotify in Settings to enrich' : 'Click to resume';
-        } else if (notAuthenticated) {
-            tooltipCurrent.textContent = 'Connect Spotify in Settings to enrich';
-        } else if (rateLimitedStuck) {
-            const info = data.rate_limit || {};
-            const remaining = info.remaining_seconds || 0;
-            tooltipCurrent.textContent = remaining > 0 ? `Waiting ${Math.ceil(remaining / 60)}m for rate limit to clear` : 'Waiting for rate limit to clear';
-        } else if (bridgingFree && data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name} (via Spotify Free)`;
-        } else if (budgetStuck) {
-            const resets = data.daily_budget.resets_in_seconds || 0;
-            const hours = Math.floor(resets / 3600);
-            const mins = Math.floor((resets % 3600) / 60);
-            tooltipCurrent.textContent = `Resets in ${hours}h ${mins}m`;
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        } else {
-            tooltipCurrent.textContent = 'Waiting for next item…';
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (notAuthenticated) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const artists = data.progress.artists || {};
-            const albums = data.progress.albums || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type || '';
-            let progressText = '';
-
-            const artistsComplete = artists.matched >= artists.total;
-            const albumsComplete = albums.matched >= albums.total;
-
-            if (currentType === 'artist') {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else if (currentType.includes('album')) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else if (currentType.includes('track')) {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            } else if (!artistsComplete) {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else if (!albumsComplete) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleSpotifyEnrichment() {
-    try {
-        const button = document.getElementById('spotify-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/spotify/pause' : '/api/enrichment/spotify/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            const data = await response.json().catch(() => ({}));
-            if (data.rate_limited) {
-                showToast('Cannot resume — Spotify is rate limited', 'warning');
-                return;
-            }
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Spotify enrichment`);
-        }
-
-        await updateSpotifyEnrichmentStatus();
-        console.log(`Spotify enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Spotify enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize Spotify Enrichment UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('spotify-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleSpotifyEnrichment);
-            updateSpotifyEnrichmentStatus();
-            setInterval(updateSpotifyEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('spotify-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleSpotifyEnrichment);
-        updateSpotifyEnrichmentStatus();
-        setInterval(updateSpotifyEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'spotify', data } }));
 }
 
 // ===================================================================
 // ITUNES ENRICHMENT STATUS
 // ===================================================================
 
-async function updateiTunesEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await _enrichmentStatusFetch('itunes');
-        if (!response.ok) { console.warn('iTunes enrichment status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateiTunesEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating iTunes enrichment status:', error);
-    }
-}
-
 function updateiTunesEnrichmentStatusFromData(data) {
-    const button = document.getElementById('itunes-enrich-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('itunes-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('itunes-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('itunes-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
-        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-
-        const currentType = data.current_item?.type || '';
-        let progressText = '';
-
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-
-        if (currentType === 'artist') {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (currentType.includes('album')) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else if (currentType.includes('track')) {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        } else if (!artistsComplete) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (!albumsComplete) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        }
-
-        tooltipProgress.textContent = progressText;
-    }
-}
-
-async function toggleiTunesEnrichment() {
-    try {
-        const button = document.getElementById('itunes-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/itunes/pause' : '/api/enrichment/itunes/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} iTunes enrichment`);
-        }
-
-        await updateiTunesEnrichmentStatus();
-        console.log(`iTunes enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling iTunes enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize iTunes Enrichment UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('itunes-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleiTunesEnrichment);
-            updateiTunesEnrichmentStatus();
-            setInterval(updateiTunesEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('itunes-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleiTunesEnrichment);
-        updateiTunesEnrichmentStatus();
-        setInterval(updateiTunesEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'itunes', data } }));
 }
 
 // ===================================================================
 // LAST.FM ENRICHMENT STATUS
 // ===================================================================
 
-async function updateLastFMEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('lastfm');
-        if (!response.ok) { console.warn('Last.fm status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateLastFMEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Last.fm status:', error);
-    }
-}
-
 function updateLastFMEnrichmentStatusFromData(data) {
-    const button = document.getElementById('lastfm-enrich-button');
-    if (!button) return;
-
-    const notAuthenticated = data.authenticated === false;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (notAuthenticated) {
-        button.classList.add('no-auth');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('lastfm-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('lastfm-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('lastfm-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (notAuthenticated) { tooltipStatus.textContent = 'Not Authenticated'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.paused) {
-            tooltipCurrent.textContent = notAuthenticated ? 'Add Last.fm API key in Settings to enrich' : 'Click to resume';
-        } else if (notAuthenticated) {
-            tooltipCurrent.textContent = 'Add Last.fm API key in Settings to enrich';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (notAuthenticated) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const artists = data.progress.artists || {};
-            const albums = data.progress.albums || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type;
-            let progressText = '';
-
-            const artistsComplete = artists.matched >= artists.total;
-            const albumsComplete = albums.matched >= albums.total;
-
-            if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else if (currentType === 'album' || (artistsComplete && !albumsComplete)) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else if (currentType === 'track' || (artistsComplete && albumsComplete)) {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            } else {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleLastFMEnrichment() {
-    try {
-        const button = document.getElementById('lastfm-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/lastfm/pause' : '/api/enrichment/lastfm/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Last.fm enrichment`);
-        }
-
-        await updateLastFMEnrichmentStatus();
-        console.log(`Last.fm enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Last.fm enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('lastfm-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleLastFMEnrichment);
-            updateLastFMEnrichmentStatus();
-            setInterval(updateLastFMEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('lastfm-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleLastFMEnrichment);
-        updateLastFMEnrichmentStatus();
-        setInterval(updateLastFMEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'lastfm', data } }));
 }
 
 // ===================================================================
 // GENIUS ENRICHMENT STATUS
 // ===================================================================
 
-async function updateGeniusEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('genius');
-        if (!response.ok) { console.warn('Genius status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateGeniusEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Genius status:', error);
-    }
-}
-
 function updateGeniusEnrichmentStatusFromData(data) {
-    const button = document.getElementById('genius-enrich-button');
-    if (!button) return;
-
-    const notAuthenticated = data.authenticated === false;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (notAuthenticated) {
-        button.classList.add('no-auth');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('genius-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('genius-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('genius-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (notAuthenticated) { tooltipStatus.textContent = 'Not Authenticated'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.paused) {
-            tooltipCurrent.textContent = notAuthenticated ? 'Add Genius access token in Settings to enrich' : 'Click to resume';
-        } else if (notAuthenticated) {
-            tooltipCurrent.textContent = 'Add Genius access token in Settings to enrich';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (notAuthenticated) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const artists = data.progress.artists || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type;
-            let progressText = '';
-
-            const artistsComplete = artists.matched >= artists.total;
-
-            if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleGeniusEnrichment() {
-    try {
-        const button = document.getElementById('genius-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/genius/pause' : '/api/enrichment/genius/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Genius enrichment`);
-        }
-
-        await updateGeniusEnrichmentStatus();
-        console.log(`Genius enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Genius enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('genius-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleGeniusEnrichment);
-            updateGeniusEnrichmentStatus();
-            setInterval(updateGeniusEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('genius-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleGeniusEnrichment);
-        updateGeniusEnrichmentStatus();
-        setInterval(updateGeniusEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'genius', data } }));
 }
 
 // ===================================================================
@@ -1143,662 +148,78 @@ if (document.readyState === 'loading') {
 // (see core.metadata.registry.is_source_enabled). Progress is keyed by
 // 'albums'/'tracks' (core/bandcamp_worker.py has no artist-level pass).
 
-async function updateBandcampEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('bandcamp');
-        if (!response.ok) { console.warn('Bandcamp status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateBandcampEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Bandcamp status:', error);
-    }
-}
-
 function updateBandcampEnrichmentStatusFromData(data) {
-    const button = document.getElementById('bandcamp-enrich-button');
-    if (!button) return;
-
-    const disabled = data.enabled === false;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (disabled) {
-        button.classList.add('no-auth');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('bandcamp-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('bandcamp-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('bandcamp-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (disabled) { tooltipStatus.textContent = 'Disabled'; }
-        else if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (disabled) {
-            tooltipCurrent.textContent = 'Enable in Settings → Advanced → Experimental';
-        } else if (data.paused) {
-            tooltipCurrent.textContent = 'Click to resume';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (disabled) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const albums = data.progress.albums || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type;
-            let progressText = '';
-
-            const albumsComplete = albums.matched >= albums.total;
-
-            if (currentType === 'album' || (!albumsComplete && !currentType)) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleBandcampEnrichment() {
-    try {
-        const button = document.getElementById('bandcamp-enrich-button');
-        if (!button) return;
-        if (button.classList.contains('no-auth')) return; // disabled — toggle via Settings instead
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/bandcamp/pause' : '/api/enrichment/bandcamp/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Bandcamp enrichment`);
-        }
-
-        await updateBandcampEnrichmentStatus();
-        console.log(`Bandcamp enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Bandcamp enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('bandcamp-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleBandcampEnrichment);
-            updateBandcampEnrichmentStatus();
-            setInterval(updateBandcampEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('bandcamp-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleBandcampEnrichment);
-        updateBandcampEnrichmentStatus();
-        setInterval(updateBandcampEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'bandcamp', data } }));
 }
 
 // ===================================================================
 // TIDAL ENRICHMENT WORKER
 // ===================================================================
 
-async function updateTidalEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('tidal');
-        if (!response.ok) { console.warn('Tidal status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateTidalEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Tidal status:', error);
-    }
-}
-
 function updateTidalEnrichmentStatusFromData(data) {
-    const button = document.getElementById('tidal-enrich-button');
-    if (!button) return;
-
-    const notAuthenticated = data.authenticated === false;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (notAuthenticated) {
-        button.classList.add('no-auth');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('tidal-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('tidal-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('tidal-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (notAuthenticated) { tooltipStatus.textContent = 'Not Authenticated'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.paused) {
-            tooltipCurrent.textContent = notAuthenticated ? 'Connect Tidal in Settings to enrich' : 'Click to resume';
-        } else if (notAuthenticated) {
-            tooltipCurrent.textContent = 'Connect Tidal in Settings to enrich';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (notAuthenticated) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const artists = data.progress.artists || {};
-            const albums = data.progress.albums || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type;
-            let progressText = '';
-
-            const artistsComplete = artists.matched >= artists.total;
-            const albumsComplete = albums.matched >= albums.total;
-
-            if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else if (currentType === 'album' || (!albumsComplete && !currentType)) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleTidalEnrichment() {
-    try {
-        const button = document.getElementById('tidal-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/tidal/pause' : '/api/enrichment/tidal/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Tidal enrichment`);
-        }
-
-        await updateTidalEnrichmentStatus();
-        console.log(`Tidal enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Tidal enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('tidal-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleTidalEnrichment);
-            updateTidalEnrichmentStatus();
-            setInterval(updateTidalEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('tidal-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleTidalEnrichment);
-        updateTidalEnrichmentStatus();
-        setInterval(updateTidalEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'tidal', data } }));
 }
 
 // ===================================================================
 // QOBUZ ENRICHMENT WORKER
 // ===================================================================
 
-async function updateQobuzEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('qobuz');
-        if (!response.ok) { console.warn('Qobuz status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateQobuzEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Qobuz status:', error);
-    }
-}
-
 function updateQobuzEnrichmentStatusFromData(data) {
-    const button = document.getElementById('qobuz-enrich-button');
-    if (!button) return;
-
-    const notAuthenticated = data.authenticated === false;
-
-    button.classList.remove('active', 'paused', 'complete', 'no-auth');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (notAuthenticated) {
-        button.classList.add('no-auth');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('qobuz-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('qobuz-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('qobuz-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = 'Paused'; }
-        else if (notAuthenticated) { tooltipStatus.textContent = 'Not Authenticated'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.paused) {
-            tooltipCurrent.textContent = notAuthenticated ? 'Connect Qobuz in Settings to enrich' : 'Click to resume';
-        } else if (notAuthenticated) {
-            tooltipCurrent.textContent = 'Connect Qobuz in Settings to enrich';
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        if (notAuthenticated) {
-            tooltipProgress.textContent = `Pending: ${data.stats?.pending || 0} items`;
-        } else {
-            const artists = data.progress.artists || {};
-            const albums = data.progress.albums || {};
-            const tracks = data.progress.tracks || {};
-
-            const currentType = data.current_item?.type;
-            let progressText = '';
-
-            const artistsComplete = artists.matched >= artists.total;
-            const albumsComplete = albums.matched >= albums.total;
-
-            if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-                progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-            } else if (currentType === 'album' || (!albumsComplete && !currentType)) {
-                progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-            } else {
-                progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-            }
-
-            tooltipProgress.textContent = progressText;
-        }
-    }
-}
-
-async function toggleQobuzEnrichment() {
-    try {
-        const button = document.getElementById('qobuz-enrich-button');
-        if (!button) return;
-
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/qobuz/pause' : '/api/enrichment/qobuz/resume';
-
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Qobuz enrichment`);
-        }
-
-        await updateQobuzEnrichmentStatus();
-        console.log(`Qobuz enrichment ${isRunning ? 'paused' : 'resumed'}`);
-
-    } catch (error) {
-        console.error('Error toggling Qobuz enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('qobuz-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleQobuzEnrichment);
-            updateQobuzEnrichmentStatus();
-            setInterval(updateQobuzEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('qobuz-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleQobuzEnrichment);
-        updateQobuzEnrichmentStatus();
-        setInterval(updateQobuzEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'qobuz', data } }));
 }
 
 // ===================================================================
 // AMAZON MUSIC ENRICHMENT WORKER
 // ===================================================================
 
-async function updateAmazonEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('amazon');
-        if (!response.ok) { console.warn('Amazon enrichment status endpoint unavailable'); return; }
-        const data = await response.json();
-        updateAmazonEnrichmentStatusFromData(data);
-    } catch (error) {
-        console.error('Error updating Amazon enrichment status:', error);
-    }
-}
-
 function updateAmazonEnrichmentStatusFromData(data) {
-    const button = document.getElementById('amazon-enrich-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.paused) {
-        button.classList.add('paused');
-    } else if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('amazon-enrich-tooltip-status');
-    const tooltipCurrent = document.getElementById('amazon-enrich-tooltip-current');
-    const tooltipProgress = document.getElementById('amazon-enrich-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running) { tooltipStatus.textContent = 'Running'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All items processed';
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Now: ${data.current_item.name}`;
-        } else {
-            tooltipCurrent.textContent = 'No active matches';
-        }
-    }
-
-    if (data.progress && tooltipProgress) {
-        const artists = data.progress.artists || {};
-        const albums = data.progress.albums || {};
-        const tracks = data.progress.tracks || {};
-        const currentType = data.current_item?.type;
-        let progressText = '';
-        const artistsComplete = artists.matched >= artists.total;
-        const albumsComplete = albums.matched >= albums.total;
-        if (currentType === 'artist' || (!artistsComplete && !currentType)) {
-            progressText = `Artists: ${artists.matched || 0} / ${artists.total || 0} (${artists.percent || 0}%)`;
-        } else if (currentType === 'album' || (!albumsComplete && !currentType)) {
-            progressText = `Albums: ${albums.matched || 0} / ${albums.total || 0} (${albums.percent || 0}%)`;
-        } else {
-            progressText = `Tracks: ${tracks.matched || 0} / ${tracks.total || 0} (${tracks.percent || 0}%)`;
-        }
-        tooltipProgress.textContent = progressText;
-    }
-}
-
-async function toggleAmazonEnrichment() {
-    try {
-        const button = document.getElementById('amazon-enrich-button');
-        if (!button) return;
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/amazon/pause' : '/api/enrichment/amazon/resume';
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) {
-            throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Amazon enrichment`);
-        }
-        await updateAmazonEnrichmentStatus();
-        console.log(`Amazon enrichment ${isRunning ? 'paused' : 'resumed'}`);
-    } catch (error) {
-        console.error('Error toggling Amazon enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('amazon-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleAmazonEnrichment);
-            updateAmazonEnrichmentStatus();
-            setInterval(updateAmazonEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('amazon-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleAmazonEnrichment);
-        updateAmazonEnrichmentStatus();
-        setInterval(updateAmazonEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'amazon', data } }));
 }
 
 // ===================================================================
 // SIMILAR ARTISTS (MUSICMAP) WORKER — dashboard bubble
 // ===================================================================
 
-async function updateSimilarArtistsEnrichmentStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return;
-    if (document.hidden) return;
-    try {
-        const response = await _enrichmentStatusFetch('similar_artists');
-        if (!response.ok) return;
-        updateSimilarArtistsEnrichmentStatusFromData(await response.json());
-    } catch (error) {
-        console.error('Error updating Similar Artists enrichment status:', error);
-    }
-}
-
 function updateSimilarArtistsEnrichmentStatusFromData(data) {
-    const button = document.getElementById('similar-artists-enrich-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.paused) button.classList.add('paused');
-    else if (data.idle) button.classList.add('complete');
-    else if (data.running && !data.paused) button.classList.add('active');
-
-    const tStatus = document.getElementById('similar-artists-enrich-tooltip-status');
-    const tCurrent = document.getElementById('similar-artists-enrich-tooltip-current');
-    const tProgress = document.getElementById('similar-artists-enrich-tooltip-progress');
-
-    if (tStatus) {
-        if (data.paused) tStatus.textContent = 'Paused';
-        else if (data.idle) tStatus.textContent = 'Complete';
-        else if (data.running) tStatus.textContent = 'Running';
-        else tStatus.textContent = 'Idle';
-    }
-    if (tCurrent) {
-        if (data.idle) tCurrent.textContent = 'All library artists processed';
-        else if (data.current_item) tCurrent.textContent = `Now: ${data.current_item}`;
-        else tCurrent.textContent = 'No active matches';
-    }
-    // DB-backed artist progress (matches the Manage modal exactly).
-    if (tProgress) {
-        const a = (data.progress && data.progress.artists) || {};
-        tProgress.textContent = `Artists: ${a.matched || 0} / ${a.total || 0} (${a.percent || 0}%)`;
-    }
-}
-
-async function toggleSimilarArtistsEnrichment() {
-    // Identical logic to the other orbs (e.g. toggleAmazonEnrichment): if the orb
-    // is 'active' (running) → pause, otherwise → resume. A paused orb isn't
-    // 'active', so this resumes it.
-    try {
-        const button = document.getElementById('similar-artists-enrich-button');
-        if (!button) return;
-        const isRunning = button.classList.contains('active');
-        const endpoint = isRunning ? '/api/enrichment/similar_artists/pause' : '/api/enrichment/similar_artists/resume';
-        const response = await fetch(endpoint, { method: 'POST' });
-        if (!response.ok) throw new Error(`Failed to ${isRunning ? 'pause' : 'resume'} Similar Artists enrichment`);
-        await updateSimilarArtistsEnrichmentStatus();
-    } catch (error) {
-        console.error('Error toggling Similar Artists enrichment:', error);
-        showToast(`Error: ${error.message}`, 'error');
-    }
-}
-
-// Initialize Similar Artists UI on page load — identical pattern to AudioDB/Deezer
-// (addEventListener for the click; no inline onclick on the button).
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('similar-artists-enrich-button');
-        if (button) {
-            button.addEventListener('click', toggleSimilarArtistsEnrichment);
-            updateSimilarArtistsEnrichmentStatus();
-            setInterval(updateSimilarArtistsEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('similar-artists-enrich-button');
-    if (button) {
-        button.addEventListener('click', toggleSimilarArtistsEnrichment);
-        updateSimilarArtistsEnrichmentStatus();
-        setInterval(updateSimilarArtistsEnrichmentStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'similar_artists', data } }));
 }
 
 // ===================================================================
 // HYDRABASE P2P MIRROR WORKER
 // ===================================================================
 
-async function updateHydrabaseStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
-    if (socketConnected) return; // WebSocket handles this
-    if (document.hidden) return; // Skip polling when tab is not visible
-    try {
-        const response = await fetch('/api/hydrabase-worker/status');
-        if (!response.ok) return;
-        const data = await response.json();
-        updateHydrabaseStatusFromData(data);
-    } catch (error) {
-        // Silently ignore — worker may not be available
-    }
-}
-
 function updateHydrabaseStatusFromData(data) {
-    const button = document.getElementById('hydrabase-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused');
-    if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const statusEl = document.getElementById('hydrabase-tooltip-status');
-    if (statusEl) {
-        if (data.paused) {
-            statusEl.textContent = 'Paused';
-            statusEl.style.color = '#ffc107';
-        } else if (data.running) {
-            statusEl.textContent = 'Active';
-            statusEl.style.color = '#ffffff';
-        } else {
-            statusEl.textContent = 'Stopped';
-            statusEl.style.color = '#ff5252';
-        }
-    }
-}
-
-async function toggleHydrabaseWorker() {
-    const button = document.getElementById('hydrabase-button');
-    if (!button) return;
-    const isRunning = button.classList.contains('active');
-    const endpoint = isRunning ? '/api/hydrabase-worker/pause' : '/api/hydrabase-worker/resume';
-    try {
-        await fetch(endpoint, { method: 'POST' });
-        await updateHydrabaseStatus();
-    } catch (error) {
-        console.error('Error toggling Hydrabase worker:', error);
-    }
-}
-
-// Initialize Hydrabase UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('hydrabase-button');
-        if (button) {
-            button.addEventListener('click', toggleHydrabaseWorker);
-            updateHydrabaseStatus();
-            setInterval(updateHydrabaseStatus, 10000); // fallback only — the websocket push owns live updates
-        }
-    });
-} else {
-    const button = document.getElementById('hydrabase-button');
-    if (button) {
-        button.addEventListener('click', toggleHydrabaseWorker);
-        updateHydrabaseStatus();
-        setInterval(updateHydrabaseStatus, 10000); // fallback only — the websocket push owns live updates
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'hydrabase', data } }));
 }
 
 // ===================================================================
@@ -1806,10 +227,6 @@ if (document.readyState === 'loading') {
 // ===================================================================
 
 async function updateRepairStatus() {
-    // Locked (login / PIN screen): these endpoints are all auth-gated, so
-    // polling here just 401s on a timer and buries real errors in the
-    // console. Resumes on unlock — init.js drops 'app-locked'.
-    if (document.body.classList.contains('app-locked')) return;
     if (socketConnected) return; // WebSocket handles this
     if (document.hidden) return; // Skip polling when tab is not visible
     try {
@@ -1823,211 +240,63 @@ async function updateRepairStatus() {
 }
 
 function updateRepairStatusFromData(data) {
-    const button = document.getElementById('repair-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'paused', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    } else if (data.paused) {
-        button.classList.add('paused');
-    }
-
-    const tooltipStatus = document.getElementById('repair-tooltip-status');
-    const tooltipCurrent = document.getElementById('repair-tooltip-current');
-    const tooltipProgress = document.getElementById('repair-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) { tooltipStatus.textContent = 'Complete'; }
-        else if (data.running && !data.paused) { tooltipStatus.textContent = 'Running'; }
-        else if (data.paused) { tooltipStatus.textContent = data.yield_reason === 'downloads' ? 'Yielding for downloads' : 'Paused'; }
-        else { tooltipStatus.textContent = 'Idle'; }
-    }
-
-    if (tooltipCurrent) {
-        if (data.idle) {
-            tooltipCurrent.textContent = 'All jobs complete — waiting for next schedule';
-        } else if (data.current_job && data.current_job.display_name) {
-            const jobName = data.current_job.display_name;
-            const jobProgress = data.progress && data.progress.current_job;
-            if (jobProgress && jobProgress.total > 0) {
-                tooltipCurrent.textContent = `${jobName}: ${jobProgress.scanned} / ${jobProgress.total} (${jobProgress.percent}%)`;
-            } else {
-                tooltipCurrent.textContent = `Running: ${jobName}`;
-            }
-        } else if (data.current_item && data.current_item.name) {
-            tooltipCurrent.textContent = `Running: ${data.current_item.name}`;
-        } else {
-            tooltipCurrent.textContent = 'No active repairs';
-        }
-    }
-
-    if (tooltipProgress && data.progress) {
-        const tracks = data.progress.tracks || {};
-        const parts = [];
-        if (tracks.total > 0) parts.push(`Checked: ${tracks.checked || 0} / ${tracks.total || 0}`);
-        if (tracks.repaired > 0) parts.push(`Repaired: ${tracks.repaired}`);
-        const pending = data.findings_pending || 0;
-        if (pending > 0) parts.push(`Findings: ${pending}`);
-        tooltipProgress.textContent = parts.length ? parts.join(' · ') : 'No items processed yet';
-    }
-
-    // Update findings badge
-    const badge = document.getElementById('repair-findings-badge');
-    const findingsPending = data.findings_pending || 0;
-    if (badge) {
-        badge.textContent = findingsPending;
-        badge.style.display = findingsPending > 0 ? '' : 'none';
-    }
-    const tabBadge = document.getElementById('repair-findings-tab-badge');
-    if (tabBadge) {
-        tabBadge.textContent = findingsPending;
-        tabBadge.style.display = findingsPending > 0 ? '' : 'none';
-    }
-
-    // Update master toggle in modal if open
-    const masterToggle = document.getElementById('repair-master-toggle');
-    const masterLabel = document.getElementById('repair-master-label');
-    if (masterToggle) masterToggle.checked = data.enabled || false;
-    if (masterLabel) masterLabel.textContent = data.enabled ? 'Enabled' : 'Disabled';
-
-    // Update button state
-    if (!data.enabled) {
-        button.classList.add('paused');
-        button.classList.remove('active', 'complete');
-    }
+    // Dispatch-only since the dashboard flip. Two callers: the socket, and
+    // updateRepairStatus()'s app-wide 5s HTTP poll — the ONLY live source on a
+    // client with no websocket. The dashboard orb, tooltip and findings badge
+    // are React-rendered from this frame, and the tools maintenance hero
+    // consumes the same dispatch.
+    window.dispatchEvent(new CustomEvent('ss:repair-status', { detail: data }));
 }
 
 // ── SoulID Worker Status ──
 
 function updateSoulIDStatusFromData(data) {
-    const button = document.getElementById('soulid-button');
-    if (!button) return;
-
-    button.classList.remove('active', 'complete');
-    if (data.idle) {
-        button.classList.add('complete');
-    } else if (data.running && !data.paused) {
-        button.classList.add('active');
-    }
-
-    const tooltipStatus = document.getElementById('soulid-tooltip-status');
-    const tooltipCurrent = document.getElementById('soulid-tooltip-current');
-    const tooltipProgress = document.getElementById('soulid-tooltip-progress');
-
-    if (tooltipStatus) {
-        if (data.idle) tooltipStatus.textContent = 'Complete';
-        else if (data.running && !data.paused) tooltipStatus.textContent = 'Running';
-        else if (data.paused) tooltipStatus.textContent = 'Paused';
-        else tooltipStatus.textContent = 'Idle';
-    }
-
-    if (tooltipCurrent) {
-        if (data.current_item) {
-            tooltipCurrent.textContent = data.current_item;
-        } else if (data.idle) {
-            tooltipCurrent.textContent = 'All entities have soul IDs';
-        } else {
-            tooltipCurrent.textContent = 'No items processing';
-        }
-    }
-
-    if (tooltipProgress && data.stats) {
-        const s = data.stats;
-        const parts = [];
-        if (s.artists_processed) parts.push(`Artists: ${s.artists_processed}`);
-        if (s.albums_processed) parts.push(`Albums: ${s.albums_processed}`);
-        if (s.tracks_processed) parts.push(`Tracks: ${s.tracks_processed}`);
-        if (s.pending > 0) parts.push(`Pending: ${s.pending}`);
-        tooltipProgress.textContent = parts.length ? parts.join(' · ') : 'No items processed yet';
-    }
+    // Dispatch-only since the dashboard flip: the orb, its tooltip and the
+    // status classes are React-rendered from this frame (-dash.header.ts).
+    // Writing the old ids from here would fight React for its own nodes.
+    // One canonical channel for all providers; the per-provider socket names
+    // are a fifth, inconsistent registry the React side does not inherit.
+    window.dispatchEvent(new CustomEvent('ss:enrich-status', { detail: { id: 'soulid', data } }));
 }
-
-// ── Repair Modal State ──
-let _repairCurrentTab = 'jobs';
-let _repairFindingsPage = 0;
-let _repairSelectedFindings = new Set();
-let _repairFindingsTotal = 0;
-let _repairFindingsAutoSwitched = false;  // Set after auto-switching to "All Statuses" so we don't loop
-// Findings per page — user-adjustable (pertti: 30 was the only option besides
-// Fix All). Persisted per browser.
-let REPAIR_FINDINGS_PAGE_SIZE = (() => {
-    const saved = parseInt(localStorage.getItem('repairFindingsPageSize') || '30', 10);
-    return [30, 60, 100].includes(saved) ? saved : 30;
-})();
-
-function setRepairFindingsPageSize(value) {
-    const size = parseInt(value, 10);
-    REPAIR_FINDINGS_PAGE_SIZE = [30, 60, 100].includes(size) ? size : 30;
-    try { localStorage.setItem('repairFindingsPageSize', String(REPAIR_FINDINGS_PAGE_SIZE)); } catch (e) {}
-    _repairFindingsPage = 0;
-    loadRepairFindings();
-}
-let _repairJobsCache = {}; // Cache job data for help modal
 
 /**
- * Open the Library Maintenance modal
+ * The dashboard worker orb's click target.
+ *
+ * P7: the Tools page is React now, and everything this used to do by hand — the
+ * jobs tab, the master toggle, replaying in-flight progress — the maintenance
+ * hero does for itself on mount. The vanilla tab renderers it used to drive
+ * were UNSCOPED (`.repair-tab`, `.repair-tab-content`, `#repair-jobs-list`)
+ * against selectors React now owns, so this deliberately does none of it; they
+ * have since been deleted outright.
+ *
+ * The scroll survives because the port kept `#tools-page` and
+ * `.tools-maintenance-hero` on the React markup.
  */
-async function openRepairModal() {
+function openRepairModal() {
     navigateToPage('tools');
-    // Scroll to maintenance section
     setTimeout(() => {
-        const section = document.querySelector('.tools-maintenance-section');
+        // Scope it to #tools-page: the VIDEO tools subpage carries the same hero
+        // class and comes first in the document.
+        const section = document.querySelector('#tools-page .tools-maintenance-hero');
         if (section) section.scrollIntoView({ behavior: 'smooth' });
     }, 100);
-    _repairCurrentTab = 'jobs';
-    switchRepairTab('jobs');
-    // Load master toggle state
+}
+
+// The repair fallback poll — app-wide on purpose. updateRepairStatusFromData
+// is dispatch-only since the dashboard flip, and BOTH consumers of
+// ss:repair-status (the React dashboard pill and the tools maintenance hero)
+// rely on this 5s HTTP poll when the websocket is down. The old
+// #repair-button gate could never pass now (the orb renders after load), so
+// the poll starts unconditionally; updateRepairStatus itself already skips
+// ticks while the socket pushes or the tab is hidden.
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => {
+        updateRepairStatus();
+        setInterval(updateRepairStatus, 5000);
+    });
+} else {
     updateRepairStatus();
-    // Load any active job progress
-    try {
-        const resp = await fetch('/api/repair/progress');
-        if (resp.ok) {
-            const data = await resp.json();
-            if (Object.keys(data).length > 0) {
-                // Brief delay so job cards are rendered first
-                setTimeout(() => updateRepairJobProgressFromData(data), 300);
-            }
-        }
-    } catch (e) { /* ignore */ }
-}
-
-function closeRepairModal() {
-    // No-op — repair content now lives on the tools page, no modal to close
-}
-
-async function toggleRepairMaster() {
-    try {
-        const response = await fetch('/api/repair/toggle', { method: 'POST' });
-        if (!response.ok) throw new Error('Failed to toggle');
-        const data = await response.json();
-        const label = document.getElementById('repair-master-label');
-        const toggle = document.getElementById('repair-master-toggle');
-        if (label) label.textContent = data.enabled ? 'Enabled' : 'Disabled';
-        if (toggle) toggle.checked = data.enabled;
-        await updateRepairStatus();
-    } catch (error) {
-        console.error('Error toggling repair master:', error);
-        showToast('Error toggling maintenance worker', 'error');
-    }
-}
-
-function switchRepairTab(tab) {
-    _repairCurrentTab = tab;
-    document.querySelectorAll('.repair-tab').forEach(t => {
-        t.classList.toggle('active', t.dataset.tab === tab);
-    });
-    document.querySelectorAll('.repair-tab-content').forEach(c => {
-        c.style.display = 'none';
-    });
-    const content = document.getElementById(`repair-tab-${tab}`);
-    if (content) content.style.display = '';
-
-    if (tab === 'jobs') loadRepairJobs();
-    else if (tab === 'findings') { loadRepairFindingsDashboard(); loadRepairFindings(); }
-    else if (tab === 'history') loadRepairHistory();
+    setInterval(updateRepairStatus, 5000);
 }
 
 // Turn a snake_case setting key into a human label. Handles acronym fix-ups
@@ -2046,567 +315,19 @@ function _prettifyRepairSettingKey(key) {
     return words.map(w => acronyms[w.toLowerCase()] || (w.charAt(0).toUpperCase() + w.slice(1))).join(' ');
 }
 
-async function loadRepairJobs() {
-    const container = document.getElementById('repair-jobs-list');
-    if (!container) return;
-
-    try {
-        const response = await fetch('/api/repair/jobs');
-        if (!response.ok) throw new Error('Failed to fetch jobs');
-        const data = await response.json();
-        const jobs = data.jobs || [];
-
-        // Cache job data for help modal
-        _repairJobsCache = {};
-        jobs.forEach(j => { _repairJobsCache[j.job_id] = j; });
-
-        if (jobs.length === 0) {
-            container.innerHTML = `<div class="repair-empty-state">
-                <div class="repair-empty-icon">🔧</div>
-                <div class="repair-empty-title">No Maintenance Jobs</div>
-                <div class="repair-empty-text">Library maintenance jobs will appear here once available.</div>
-            </div>`;
-            return;
-        }
-
-        // Populate findings job filter dropdown
-        const jobFilter = document.getElementById('repair-findings-job-filter');
-        if (jobFilter && jobFilter.options.length <= 1) {
-            jobs.forEach(job => {
-                const opt = document.createElement('option');
-                opt.value = job.job_id;
-                opt.textContent = job.display_name;
-                jobFilter.appendChild(opt);
-            });
-        }
-
-        container.innerHTML = jobs.map(job => {
-            const lastRunText = job.last_run ? formatCacheAge(job.last_run.finished_at) : 'Never';
-            const nextRunText = job.next_run ? formatCacheAge(job.next_run) : (job.enabled ? 'Pending' : '-');
-            const statusClass = job.is_running ? 'running' : (job.enabled ? 'idle' : 'disabled');
-            const dotClass = job.is_running ? 'running' : (job.enabled ? 'enabled' : 'disabled');
-            const cardClass = job.is_running ? 'running' : (!job.enabled ? 'disabled' : '');
-
-            // Build flow badges
-            const flowParts = [];
-            flowParts.push(`<span class="repair-flow-badge scan">${job.is_running ? '&#9654; Running' : 'Scan'}</span>`);
-            if (job.auto_fix) {
-                flowParts.push('<span class="repair-flow-arrow">&rarr;</span>');
-                const isDryRun = job.settings && job.settings.dry_run === true;
-                if (isDryRun) {
-                    flowParts.push('<span class="repair-flow-badge dryrun">Dry Run</span>');
-                } else {
-                    flowParts.push('<span class="repair-flow-badge autofix">Auto-fix</span>');
-                }
-            }
-            // Badge: prefer the CURRENT pending count from the API
-            // (matches what the Findings tab actually shows); fall
-            // back to the historical ``findings_created`` from the
-            // last run when pending = 0 but the last scan did find
-            // something — that way users still see a hint that a scan
-            // happened recently. Without this, a scan that finds 372
-            // duplicates and then has them all bulk-fixed shows
-            // "372 findings" on the badge while the Findings tab
-            // Pending filter is empty, which reads as a bug.
-            const pendingCount = job.pending_findings_count || 0;
-            const lastScanCount = job.last_run ? (job.last_run.findings_created || 0) : 0;
-            if (pendingCount > 0) {
-                flowParts.push('<span class="repair-flow-arrow">&rarr;</span>');
-                flowParts.push(`<span class="repair-flow-badge findings">${pendingCount} pending</span>`);
-            } else if (lastScanCount > 0) {
-                // Show historical count with a clear "found in last scan"
-                // qualifier so users don't expect them on the Pending tab.
-                flowParts.push('<span class="repair-flow-arrow">&rarr;</span>');
-                flowParts.push(`<span class="repair-flow-badge findings findings-historical">${lastScanCount} found in last scan</span>`);
-            }
-
-            // Build meta parts
-            const metaParts = [];
-            metaParts.push('Last: ' + lastRunText);
-            metaParts.push('Next: ' + nextRunText);
-            if (job.last_run) {
-                metaParts.push(`Scanned: ${(job.last_run.items_scanned || 0).toLocaleString()}`);
-                if (job.last_run.auto_fixed) metaParts.push(`Fixed: ${job.last_run.auto_fixed}`);
-            }
-            if (job.last_run && job.last_run.duration_seconds) {
-                metaParts.push(`${job.last_run.duration_seconds.toFixed(1)}s`);
-            }
-
-            // Build settings HTML
-            let settingsHtml = '';
-            if (job.settings && Object.keys(job.settings).length > 0) {
-                const settingsRows = Object.entries(job.settings).map(([key, val]) => {
-                    // Section header: keys starting with `_section_` render as a
-                    // group divider + title instead of a setting row. The value
-                    // is the human-readable title.
-                    if (key.startsWith('_section_')) {
-                        return `<div class="repair-setting-section">${val}</div>`;
-                    }
-                    const label = _prettifyRepairSettingKey(key);
-                    // Dropdown when the job declares allowed values for this key.
-                    const opts = job.setting_options && job.setting_options[key];
-                    if (Array.isArray(opts) && opts.length) {
-                        const optionsHtml = opts.map(o =>
-                            `<option value="${o}"${o === val ? ' selected' : ''}>${_prettifyRepairSettingKey(String(o))}</option>`
-                        ).join('');
-                        return `<div class="repair-setting-row">
-                            <label>${label}</label>
-                            <select class="repair-setting-input"
-                                    data-job="${job.job_id}" data-key="${key}">${optionsHtml}</select>
-                        </div>`;
-                    }
-                    const inputType = typeof val === 'boolean' ? 'checkbox' :
-                        typeof val === 'number' ? 'number' : 'text';
-                    const inputVal = inputType === 'checkbox' ?
-                        (val ? ' checked' : '') :
-                        ` value="${val}"`;
-                    return `<div class="repair-setting-row">
-                        <label>${label}</label>
-                        <input type="${inputType}" class="repair-setting-input"
-                               data-job="${job.job_id}" data-key="${key}"${inputVal}
-                               ${inputType === 'number' ? (typeof val === 'number' && val < 0 ? 'step="0.01"' : 'step="0.01" min="0"') : ''}>
-                    </div>`;
-                }).join('');
-
-                settingsHtml = `
-                    <div class="repair-job-settings" id="repair-settings-${job.job_id}" style="display:none;">
-                        <div class="repair-setting-row">
-                            <label>Interval (hours)</label>
-                            <input type="number" class="repair-setting-input"
-                                   data-job="${job.job_id}" data-key="_interval_hours"
-                                   value="${job.interval_hours}" min="1" step="1">
-                        </div>
-                        ${settingsRows}
-                        <button class="repair-save-settings-btn" onclick="saveRepairJobSettings('${job.job_id}')">Save Settings</button>
-                    </div>`;
-            }
-
-            return `<div class="repair-job-card ${cardClass}" data-job-id="${job.job_id}">
-                <div class="repair-job-main">
-                    <div class="repair-job-status ${dotClass}"></div>
-                    <div class="repair-job-info">
-                        <div class="repair-job-name">${job.display_name}</div>
-                        <div class="repair-job-desc">${job.description || ''}</div>
-                        <div class="repair-job-flow">${flowParts.join('')}</div>
-                        <div class="repair-job-meta">${metaParts.join(' &middot; ')}</div>
-                    </div>
-                    <div class="repair-job-actions">
-                        <label class="repair-job-toggle">
-                            <input type="checkbox" ${job.enabled ? 'checked' : ''}
-                                   onchange="toggleRepairJob('${job.job_id}', this.checked)">
-                            <span class="repair-toggle-slider small"></span>
-                        </label>
-                        ${job.is_running
-                    ? `<button class="repair-stop-btn" onclick="stopRepairJobNow('${job.job_id}')"
-                                title="Stop this run">&#9209;</button>`
-                    : `<button class="repair-run-btn" onclick="runRepairJobNow('${job.job_id}')"
-                                title="Run now">&#9654;</button>`}
-                        ${Object.keys(job.settings || {}).length > 0 ?
-                    `<button class="repair-settings-btn" onclick="expandRepairJobSettings('${job.job_id}')"
-                                     title="Settings">&#9881;</button>` : ''}
-                        <button class="repair-help-btn" onclick="event.stopPropagation(); showRepairJobHelp('${job.job_id}')"
-                                title="About this job">?</button>
-                    </div>
-                </div>
-                ${settingsHtml}
-            </div>`;
-        }).join('');
-
-    } catch (error) {
-        console.error('Error loading repair jobs:', error);
-        container.innerHTML = '<div class="repair-empty">Error loading jobs</div>';
-    }
-}
-
-async function toggleRepairJob(jobId, enabled) {
-    try {
-        await fetch(`/api/repair/jobs/${jobId}/toggle`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ enabled })
-        });
-        // Update card visuals immediately
-        const card = document.querySelector(`.repair-job-card[data-job-id="${jobId}"]`);
-        if (card) {
-            card.classList.toggle('disabled', !enabled);
-            const dot = card.querySelector('.repair-job-status');
-            if (dot) dot.className = 'repair-job-status ' + (enabled ? 'enabled' : 'disabled');
-        }
-    } catch (error) {
-        console.error('Error toggling job:', error);
-        showToast('Error toggling job', 'error');
-    }
-}
-
-function expandRepairJobSettings(jobId) {
-    const el = document.getElementById(`repair-settings-${jobId}`);
-    if (el) el.style.display = el.style.display === 'none' ? '' : 'none';
-}
-
-function showRepairJobHelp(jobId) {
-    const job = _repairJobsCache[jobId];
-    if (!job) return;
-
-    // Remove existing overlay if present
-    let overlay = document.getElementById('repair-help-overlay');
-    if (overlay) overlay.remove();
-
-    // Build settings summary (skip `_section_` group-header sentinels)
-    let settingsHtml = '';
-    if (job.settings && Object.keys(job.settings).length > 0) {
-        const rows = Object.entries(job.settings)
-            .filter(([key]) => !key.startsWith('_section_'))
-            .map(([key, val]) => {
-                const label = _prettifyRepairSettingKey(key);
-                const display = typeof val === 'boolean' ? (val ? 'Yes' : 'No') : val;
-                return `<div class="repair-help-setting"><span class="repair-help-setting-key">${label}</span><span class="repair-help-setting-val">${display}</span></div>`;
-            }).join('');
-        settingsHtml = `<div class="repair-help-settings-section">
-            <div class="repair-help-section-title">Current Settings</div>
-            ${rows}
-        </div>`;
-    }
-
-    // Build info badges
-    const badges = [];
-    if (job.auto_fix) {
-        const isDryRun = job.settings && job.settings.dry_run === true;
-        badges.push(isDryRun
-            ? '<span class="repair-flow-badge dryrun">Dry Run</span>'
-            : '<span class="repair-flow-badge autofix">Auto-fix</span>');
-    } else {
-        badges.push('<span class="repair-flow-badge scan">Scan Only</span>');
-    }
-    badges.push(`<span class="repair-flow-badge scan">Every ${job.interval_hours}h</span>`);
-    if (job.enabled) {
-        badges.push('<span class="repair-flow-badge" style="background:rgba(74,222,128,0.12);color:#4ade80;">Enabled</span>');
-    } else {
-        badges.push('<span class="repair-flow-badge" style="background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.4);">Disabled</span>');
-    }
-
-    // Format help text paragraphs
-    const helpBody = (job.help_text || job.description || '').split('\n\n').map(p => {
-        if (p.startsWith('Settings:\n')) {
-            const lines = p.split('\n').slice(1);
-            return '<div class="repair-help-setting-list">' +
-                lines.map(l => `<div class="repair-help-setting-item">${l.replace(/^- /, '')}</div>`).join('') +
-                '</div>';
-        }
-        return `<p>${p.replace(/\n/g, '<br>')}</p>`;
-    }).join('');
-
-    overlay = document.createElement('div');
-    overlay.id = 'repair-help-overlay';
-    overlay.className = 'repair-help-overlay';
-    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
-    overlay.innerHTML = `
-        <div class="repair-help-modal">
-            <div class="repair-help-header">
-                <h3>${job.display_name}</h3>
-                <button class="repair-help-close" onclick="document.getElementById('repair-help-overlay').remove()">&times;</button>
-            </div>
-            <div class="repair-help-badges">${badges.join('')}</div>
-            <div class="repair-help-body">${helpBody}</div>
-            ${settingsHtml}
-        </div>
-    `;
-    document.body.appendChild(overlay);
-}
-
-async function saveRepairJobSettings(jobId) {
-    try {
-        const inputs = document.querySelectorAll(`.repair-setting-input[data-job="${jobId}"]`);
-        let intervalHours = null;
-        const settings = {};
-
-        inputs.forEach(input => {
-            const key = input.dataset.key;
-            if (key === '_interval_hours') {
-                intervalHours = parseInt(input.value) || 24;
-            } else {
-                if (input.type === 'checkbox') settings[key] = input.checked;
-                else if (input.type === 'number') settings[key] = parseFloat(input.value);
-                else {
-                    const v = input.value;
-                    settings[key] = v === 'true' ? true : v === 'false' ? false : v;
-                }
-            }
-        });
-
-        await fetch(`/api/repair/jobs/${jobId}/settings`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ interval_hours: intervalHours, settings })
-        });
-
-        showToast('Settings saved', 'success');
-    } catch (error) {
-        console.error('Error saving job settings:', error);
-        showToast('Error saving settings', 'error');
-    }
-}
-
-async function runRepairJobNow(jobId) {
-    try {
-        await fetch(`/api/repair/jobs/${jobId}/run`, { method: 'POST' });
-        showToast('Job started', 'success');
-        setTimeout(() => loadRepairJobs(), 1000);
-    } catch (error) {
-        console.error('Error running job:', error);
-        showToast('Error starting job', 'error');
-    }
-}
-
-async function stopRepairJobNow(jobId) {
-    // Instant feedback: the scan can't unwind until its current item (e.g. an
-    // in-flight LRClib lookup) returns and it loops back to check_stop(), so the
-    // stop is not truly instant. Show a disabled "Stopping…" button meanwhile —
-    // the live-progress poll flips it back to Run once the run reports finished.
-    const stopBtn = document.querySelector(`.repair-job-card[data-job-id="${jobId}"] .repair-stop-btn`);
-    if (stopBtn) {
-        stopBtn.disabled = true;
-        stopBtn.classList.add('stopping');
-        stopBtn.title = 'Stopping…';
-    }
-    try {
-        const resp = await fetch(`/api/repair/jobs/${jobId}/stop`, { method: 'POST' });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        showToast(data.stopped ? 'Stopping job…' : 'Job is not running', data.stopped ? 'success' : 'info');
-        // Fallback reload in case the job was already idle (nothing to flip the
-        // button) or the poll is between ticks.
-        if (!data.stopped) setTimeout(() => loadRepairJobs(), 600);
-    } catch (error) {
-        console.error('Error stopping job:', error);
-        showToast('Error stopping job', 'error');
-        if (stopBtn) {
-            stopBtn.disabled = false;
-            stopBtn.classList.remove('stopping');
-            stopBtn.title = 'Stop this run';
-        }
-    }
-}
-
 // ── Repair Job Live Progress ──
-const _repairProgressLogCounts = {};
-const _repairProgressHideTimers = {};
 
 function updateRepairJobProgressFromData(data) {
-    for (const [jobId, state] of Object.entries(data)) {
-        const card = document.querySelector(`.repair-job-card[data-job-id="${jobId}"]`);
-        if (!card) continue;
-
-        // Update status dot
-        const statusDot = card.querySelector('.repair-job-status');
-        if (statusDot) {
-            if (state.status === 'running') statusDot.className = 'repair-job-status running';
-            else if (state.status === 'finished') statusDot.className = 'repair-job-status enabled';
-            else if (state.status === 'error') statusDot.className = 'repair-job-status enabled';
-        }
-
-        // Update flow badge to show running state
-        const firstBadge = card.querySelector('.repair-flow-badge.scan');
-        if (firstBadge) {
-            if (state.status === 'running') firstBadge.innerHTML = '&#9654; Running';
-            else if (state.status === 'finished') firstBadge.innerHTML = '&#10003; Complete';
-            else if (state.status === 'error') firstBadge.innerHTML = '&#10007; Error';
-        }
-
-        // Add/update card running class
-        card.classList.toggle('running', state.status === 'running');
-        card.classList.remove('disabled');
-
-        // Create or find progress panel (bar-first layout like automation)
-        let panel = card.querySelector('.repair-job-progress');
-        if (!panel) {
-            panel = document.createElement('div');
-            panel.className = 'repair-job-progress';
-            panel.innerHTML = `
-                <div class="repair-progress-bar-wrap">
-                    <div class="repair-progress-bar" style="width:0%"></div>
-                </div>
-                <div class="repair-progress-phase"></div>
-                <div class="repair-progress-log"></div>
-            `;
-            card.appendChild(panel);
-        }
-
-        // Show panel
-        panel.classList.add('visible');
-        panel.classList.toggle('finished', state.status === 'finished');
-        panel.classList.toggle('error', state.status === 'error');
-
-        if (state.status === 'running') {
-            panel.classList.remove('finished', 'error');
-            if (_repairProgressHideTimers[jobId]) {
-                clearTimeout(_repairProgressHideTimers[jobId]);
-                delete _repairProgressHideTimers[jobId];
-            }
-            // Reset log for re-run
-            if (_repairProgressLogCounts[jobId] > 0 && state.log && state.log.length < _repairProgressLogCounts[jobId]) {
-                const existingLog = panel.querySelector('.repair-progress-log');
-                if (existingLog) existingLog.innerHTML = '';
-                _repairProgressLogCounts[jobId] = 0;
-            }
-        }
-
-        // Update progress bar
-        const bar = panel.querySelector('.repair-progress-bar');
-        if (bar) bar.style.width = (state.progress || 0) + '%';
-
-        // Update phase
-        const phaseEl = panel.querySelector('.repair-progress-phase');
-        if (phaseEl && state.phase) phaseEl.textContent = state.phase;
-
-        // Update log
-        const logEl = panel.querySelector('.repair-progress-log');
-        if (logEl && state.log) {
-            const prevCount = _repairProgressLogCounts[jobId] || 0;
-            if (state.log.length > prevCount) {
-                const newLines = state.log.slice(prevCount);
-                for (const line of newLines) {
-                    const div = document.createElement('div');
-                    div.className = 'repair-log-line ' + (line.type || 'info');
-                    div.textContent = line.text;
-                    logEl.appendChild(div);
-                }
-                logEl.scrollTop = logEl.scrollHeight;
-            }
-            _repairProgressLogCounts[jobId] = state.log.length;
-        }
-
-        // #970: the moment a run ends (finished OR stopped), flip the Stop button
-        // back to Run here — don't wait on the 30s auto-hide reload or the next
-        // poll tick, or a stopped job's button looks stuck on "Stopping…".
-        if (state.status === 'finished' || state.status === 'error') {
-            const stopBtn = card.querySelector('.repair-stop-btn');
-            if (stopBtn) {
-                stopBtn.outerHTML = `<button class="repair-run-btn" onclick="runRepairJobNow('${jobId}')" title="Run now">&#9654;</button>`;
-            }
-        }
-
-        // Auto-hide panel after completion
-        if (state.status === 'finished' || state.status === 'error') {
-            if (!_repairProgressHideTimers[jobId]) {
-                _repairProgressHideTimers[jobId] = setTimeout(() => {
-                    panel.classList.remove('visible');
-                    card.classList.remove('running');
-                    delete _repairProgressHideTimers[jobId];
-                    delete _repairProgressLogCounts[jobId];
-                    // Reload to get updated stats
-                    loadRepairJobs();
-                }, 30000);
-            }
-        } else {
-            // Clear any existing hide timer if job restarts
-            if (_repairProgressHideTimers[jobId]) {
-                clearTimeout(_repairProgressHideTimers[jobId]);
-                delete _repairProgressHideTimers[jobId];
-            }
-        }
-    }
-}
-
-async function loadRepairFindingsDashboard() {
-    const dashboard = document.getElementById('repair-findings-dashboard');
-    if (!dashboard) return;
-
-    _checkBulkFixResume();   // reload mid-Fix-All picks the progress back up
-
-    const pageSizeSelect = document.getElementById('repair-page-size-select');
-    if (pageSizeSelect) pageSizeSelect.value = String(REPAIR_FINDINGS_PAGE_SIZE);
-
-    try {
-        const response = await fetch('/api/repair/findings/counts');
-        if (!response.ok) throw new Error('Failed to fetch counts');
-        const data = await response.json();
-
-        const pending = data.pending || 0;
-        const resolved = data.resolved || 0;
-        const dismissed = data.dismissed || 0;
-        const autoFixed = data.auto_fixed || 0;
-        const byJob = data.by_job || {};
-
-        // Summary stats row
-        let html = '<div class="repair-dashboard-summary">';
-        html += `<div class="repair-dashboard-stat pending">
-            <span class="stat-count">${pending.toLocaleString()}</span> pending
-        </div>`;
-        html += `<div class="repair-dashboard-stat resolved">
-            <span class="stat-count">${resolved.toLocaleString()}</span> resolved
-        </div>`;
-        html += `<div class="repair-dashboard-stat dismissed">
-            <span class="stat-count">${dismissed.toLocaleString()}</span> dismissed
-        </div>`;
-        if (autoFixed > 0) {
-            html += `<div class="repair-dashboard-stat auto-fixed">
-                <span class="stat-count">${autoFixed.toLocaleString()}</span> auto-fixed
-            </div>`;
-        }
-        html += '</div>';
-
-        // Per-job chips (only if there are pending findings)
-        const jobIds = Object.keys(byJob).sort((a, b) => byJob[b].total - byJob[a].total);
-        if (jobIds.length > 0) {
-            html += '<div class="repair-dashboard-jobs">';
-            const jobFilter = document.getElementById('repair-findings-job-filter');
-            const activeJob = jobFilter ? jobFilter.value : '';
-
-            for (const jid of jobIds) {
-                const job = byJob[jid];
-                const isActive = activeJob === jid;
-                const severityDots = [];
-                if (job.warning > 0) severityDots.push(`<span class="repair-dashboard-chip-severity warning" title="${job.warning} warnings"></span>`);
-                if (job.info > 0) severityDots.push(`<span class="repair-dashboard-chip-severity info" title="${job.info} info"></span>`);
-
-                html += `<div class="repair-dashboard-chip ${isActive ? 'active' : ''}" onclick="filterFindingsByJob('${jid}')">
-                    <span class="repair-dashboard-chip-count">${job.total.toLocaleString()}</span>
-                    <span class="repair-dashboard-chip-name">${_escFinding(job.display_name || jid.replace(/_/g, ' '))}</span>
-                    ${severityDots.length ? `<span class="repair-dashboard-chip-bar">${severityDots.join('')}</span>` : ''}
-                </div>`;
-            }
-            html += '</div>';
-        }
-
-        dashboard.innerHTML = html;
-
-        // Load cache health stats
-        _loadCacheHealthStats(dashboard);
-    } catch (error) {
-        console.error('Error loading findings dashboard:', error);
-        dashboard.innerHTML = '';
-    }
-}
-
-async function _loadCacheHealthStats(dashboard) {
-    try {
-        const response = await fetch('/api/repair/cache-health');
-        if (!response.ok) return;
-        const stats = await response.json();
-        if (!stats.total_entities && !stats.total_searches) return;
-
-        const healthScore = stats.junk_entities === 0 && stats.stale_mb_nulls === 0 ? 'healthy' : stats.junk_entities > 50 ? 'poor' : 'fair';
-        const healthLabel = healthScore === 'healthy' ? 'Healthy' : healthScore === 'fair' ? 'Needs Cleanup' : 'Needs Attention';
-
-        // Remove any existing cache-health bar before appending — prevents
-        // stacking when multiple dashboard refreshes race and each resolved
-        // fetch appends its own section.
-        dashboard.querySelectorAll('.repair-cache-health').forEach(el => el.remove());
-
-        const section = document.createElement('div');
-        section.className = 'repair-cache-health';
-        section.innerHTML = `
-            <div class="repair-cache-health-bar" onclick="openCacheHealthModal()">
-                <span class="repair-cache-health-dot ${healthScore}"></span>
-                <span class="repair-cache-health-title">Metadata Cache</span>
-                <span class="repair-cache-health-summary">${stats.total_entities.toLocaleString()} entities · ${healthLabel}</span>
-                <span class="repair-cache-health-action">View Details ›</span>
-            </div>
-        `;
-        dashboard.appendChild(section);
-    } catch (error) {
-        console.error('Error loading cache health:', error);
-    }
+    // Dispatch-only since the P7 flip. The maintenance hero is React and it
+    // renders the SAME selectors this handler used to drive — .repair-job-card
+    // [data-job-id], .repair-job-status, .repair-flow-badge, .repair-stop-btn
+    // and its own .repair-job-progress panel — so the old body was live-mutating
+    // React-managed nodes: appending duplicate log lines into React's log
+    // container, replacing React's Stop button via outerHTML (a node React
+    // still thinks it owns), and 30s after completion innerHTML-wiping
+    // #repair-jobs-list out from under React. The hero renders every one of
+    // those states itself from this same frame.
+    window.dispatchEvent(new CustomEvent('ss:repair-progress', { detail: data }));
 }
 
 async function openCacheHealthModal() {
@@ -2632,7 +353,7 @@ async function openCacheHealthModal() {
             <div class="cache-health-body">
                 <div class="cache-health-loading">
                     <div class="watch-all-loading-spinner"></div>
-                    <div>Loading cache stats…</div>
+                    <div>Loading cache stats...</div>
                 </div>
             </div>
             <div class="cache-health-footer">
@@ -2652,11 +373,61 @@ async function openCacheHealthModal() {
         const healthEmoji = healthScore === 'healthy' ? '&#10003;' : healthScore === 'fair' ? '&#9888;' : '&#10060;';
         const healthLabel = healthScore === 'healthy' ? 'Cache is healthy' : healthScore === 'fair' ? 'Minor issues detected' : 'Cleanup recommended';
 
+        // "Cleanup recommended" told you a verdict and nothing else: not what
+        // was wrong, not that a job already fixes it, not how to trigger it.
+        // Boulder: "it says cleanup recommeneded. but how lol."
+        //
+        // Every one of these IS handled automatically by the Cache Maintenance
+        // job (cache_evictor, every 6h by default) — it calls exactly the
+        // routines that clear the two numbers this verdict is computed from. So
+        // the honest answer is usually "nothing, it cleans itself" — unless the
+        // job is switched off, which is the one case worth shouting about.
+        let cleanupJob = null;
+        try {
+            const jr = await fetch('/api/repair/jobs');
+            if (jr.ok) {
+                const jobs = await jr.json();
+                const list = Array.isArray(jobs) ? jobs : (jobs.jobs || []);
+                cleanupJob = list.find(j => j.job_id === 'cache_evictor') || null;
+            }
+        } catch (_) { /* the panel still works without it */ }
+
+        const problems = [];
+        if (s.junk_entities > 0) {
+            problems.push(`<li><strong>${s.junk_entities.toLocaleString()} junk entries</strong> —
+                cached rows whose name came back empty or as a placeholder like
+                "Unknown Artist". They take up space and can never match anything.</li>`);
+        }
+        if (s.stale_mb_nulls > 0) {
+            problems.push(`<li><strong>${s.stale_mb_nulls.toLocaleString()} failed MusicBrainz lookups</strong> —
+                searches that found nothing, remembered so they are not retried
+                constantly. Ones older than 30 days are dropped so they get another chance.</li>`);
+        }
+
+        const jobOff = cleanupJob && cleanupJob.enabled === false;
+        const explain = healthScore === 'healthy' ? '' : `
+            <div class="cache-health-explain ${jobOff ? 'warn' : ''}">
+                <div class="cache-health-explain-title">What this means</div>
+                <ul class="cache-health-explain-list">${problems.join('')}</ul>
+                <div class="cache-health-explain-fix">
+                    ${jobOff
+                ? `<strong>Cache Maintenance is switched off</strong>, so nothing is clearing these.
+                       Turn it back on under Operations \u203A Jobs, or clean up once now.`
+                : `<strong>Cache Maintenance</strong> clears all of this automatically${
+                    cleanupJob && cleanupJob.interval_hours ? ` every ${cleanupJob.interval_hours}h` : ''}${
+                    cleanupJob && cleanupJob.last_run ? `, last run ${_cacheAgoText(cleanupJob.last_run)}` : ''}.
+                       Nothing is required from you \u2014 run it now if you would rather not wait.`}
+                </div>
+                <button class="watch-all-btn watch-all-btn-primary" id="cache-cleanup-now">Clean up now</button>
+                <div class="cache-health-explain-note" id="cache-cleanup-note"></div>
+            </div>`;
+
         body.innerHTML = `
             <div class="cache-health-status ${healthScore}">
                 <div class="cache-health-status-icon">${healthEmoji}</div>
                 <div class="cache-health-status-text">${healthLabel}</div>
             </div>
+            ${explain}
 
             <div class="cache-health-cards">
                 <div class="cache-health-card">
@@ -2715,9 +486,48 @@ async function openCacheHealthModal() {
                 </div>
             </div>
         `;
+        const cleanupBtn = overlay.querySelector('#cache-cleanup-now');
+        if (cleanupBtn) {
+            cleanupBtn.addEventListener('click', async () => {
+                const note = overlay.querySelector('#cache-cleanup-note');
+                cleanupBtn.disabled = true;
+                cleanupBtn.textContent = 'Cleaning\u2026';
+                try {
+                    // respect_enabled is deliberately NOT sent: this is an
+                    // explicit click, and refusing it because the schedule is
+                    // off would be the least helpful possible answer.
+                    const r = await fetch('/api/repair/jobs/cache_evictor/run', { method: 'POST' });
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    cleanupBtn.textContent = 'Cleanup started';
+                    if (note) note.textContent = 'Running in the background. Reopen this panel in a moment to see the new numbers.';
+                } catch (e) {
+                    cleanupBtn.disabled = false;
+                    cleanupBtn.textContent = 'Clean up now';
+                    if (note) note.textContent = 'Could not start it: ' + e.message;
+                }
+            });
+        }
     } catch (error) {
         const body = overlay.querySelector('.cache-health-body');
         body.innerHTML = '<div class="cache-health-loading">Failed to load cache stats</div>';
+    }
+}
+
+/** "3 hours ago" for a job's last run. Bare timestamps make a reader do the
+ *  subtraction, which is the whole question they are asking. */
+function _cacheAgoText(value) {
+    try {
+        const then = new Date(String(value).replace(' ', 'T'));
+        const mins = Math.floor((Date.now() - then.getTime()) / 60000);
+        if (!isFinite(mins) || mins < 0) return 'recently';
+        if (mins < 2) return 'just now';
+        if (mins < 60) return mins + ' minutes ago';
+        const hrs = Math.floor(mins / 60);
+        if (hrs < 24) return hrs === 1 ? 'an hour ago' : hrs + ' hours ago';
+        const days = Math.floor(hrs / 24);
+        return days === 1 ? 'yesterday' : days + ' days ago';
+    } catch (_) {
+        return 'recently';
     }
 }
 
@@ -2744,12 +554,12 @@ async function openFailedMBLookupsModal() {
             <div class="failed-mb-toolbar">
                 <div class="failed-mb-tabs" id="failed-mb-tabs"></div>
                 <div class="failed-mb-search-row">
-                    <input type="text" id="failed-mb-search" class="failed-mb-search-input" placeholder="Filter by name…">
+                    <input type="text" id="failed-mb-search" class="failed-mb-search-input" placeholder="Filter by name...">
                     <button class="failed-mb-btn failed-mb-btn-danger" onclick="_failedMBClearAll()">Clear All Failed</button>
                 </div>
             </div>
             <div class="failed-mb-body" id="failed-mb-body">
-                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading…</div></div>
+                <div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Loading...</div></div>
             </div>
             <div class="failed-mb-footer" id="failed-mb-footer"></div>
         </div>
@@ -2878,7 +688,12 @@ async function _failedMBDelete(entryId) {
 }
 
 async function _failedMBClearAll() {
-    if (!confirm(`Clear all ${_failedMBState.total} failed lookups? They will be retried on next enrichment run.`)) return;
+    if (!await showConfirmDialog({
+        title: 'Clear Failed Lookups',
+        message: `Clear all ${_failedMBState.total} failed lookups? They will be retried on the next enrichment run.`,
+        confirmText: 'Clear All',
+        destructive: true
+    })) return;
     try {
         const resp = await fetch('/api/metadata-cache/clear-musicbrainz?failed_only=true', { method: 'DELETE' });
         const data = await resp.json();
@@ -2971,8 +786,8 @@ async function _runMBSearch(entryId) {
     if (!query) return;
 
     goBtn.disabled = true;
-    goBtn.textContent = 'Searching…';
-    resultsEl.innerHTML = '<div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Searching MusicBrainz…</div></div>';
+    goBtn.textContent = 'Searching...';
+    resultsEl.innerHTML = '<div class="cache-health-loading"><div class="watch-all-loading-spinner"></div><div>Searching MusicBrainz...</div></div>';
 
     try {
         const params = new URLSearchParams({ type, q: query, limit: 10 });
@@ -3002,7 +817,7 @@ async function _runMBSearch(entryId) {
                         ${r.disambiguation ? `<div class="mb-search-result-disambig">${escapeHtml(r.disambiguation)}</div>` : ''}
                         ${detail ? `<div class="mb-search-result-detail">${escapeHtml(detail)}</div>` : ''}
                     </div>
-                    <div class="mb-search-result-mbid" title="${r.mbid}">${r.mbid.substring(0, 8)}…</div>
+                    <div class="mb-search-result-mbid" title="${r.mbid}">${r.mbid.substring(0, 8)}...</div>
                 </div>
             `;
         }).join('');
@@ -3034,1553 +849,6 @@ async function _selectMBMatch(entryId, mbid, mbName) {
         }
     } catch (err) {
         showToast('Failed to save match', 'error');
-    }
-}
-
-function filterFindingsByJob(jobId) {
-    const jobFilter = document.getElementById('repair-findings-job-filter');
-    if (!jobFilter) return;
-
-    // Toggle: click same chip again to clear filter
-    if (jobFilter.value === jobId) {
-        jobFilter.value = '';
-    } else {
-        jobFilter.value = jobId;
-    }
-    _repairFindingsPage = 0;
-    loadRepairFindingsDashboard();
-    loadRepairFindings();
-}
-
-async function loadRepairFindings() {
-    const container = document.getElementById('repair-findings-list');
-    if (!container) return;
-
-    const jobFilter = document.getElementById('repair-findings-job-filter');
-    const severityFilter = document.getElementById('repair-findings-severity-filter');
-    const statusFilter = document.getElementById('repair-findings-status-filter');
-
-    const params = new URLSearchParams();
-    if (jobFilter && jobFilter.value) params.set('job_id', jobFilter.value);
-    if (severityFilter && severityFilter.value) params.set('severity', severityFilter.value);
-    if (statusFilter && statusFilter.value) params.set('status', statusFilter.value);
-    params.set('page', _repairFindingsPage);
-    params.set('limit', REPAIR_FINDINGS_PAGE_SIZE);
-
-    try {
-        const response = await fetch(`/api/repair/findings?${params}`);
-        if (!response.ok) throw new Error('Failed to fetch findings');
-        const data = await response.json();
-        const items = data.items || [];
-
-        _repairSelectedFindings.clear();
-        _repairFindingsTotal = data.total || 0;
-        const bulkBar = document.getElementById('repair-findings-bulk');
-        if (bulkBar) bulkBar.style.display = 'none';
-        const selectAllCb = document.getElementById('repair-select-all-cb');
-        if (selectAllCb) { selectAllCb.checked = false; selectAllCb.indeterminate = false; }
-
-        if (items.length === 0) {
-            // If the user is on the default "pending" filter and there are
-            // ZERO pending rows but other statuses (dismissed/resolved) do
-            // have rows, auto-switch the filter to "All Statuses" so the user
-            // sees the carry-over findings instead of an empty pane. Common
-            // case: scanner re-found same issues that were dismissed
-            // previously — dedup-skip means no new pending row, so the
-            // default-filtered tab looks empty even though the badge count
-            // referenced existing dismissed rows.
-            if (statusFilter && statusFilter.value === 'pending' && !_repairFindingsAutoSwitched) {
-                try {
-                    const countsResp = await fetch('/api/repair/findings/counts');
-                    if (countsResp.ok) {
-                        const counts = await countsResp.json();
-                        const otherTotal = (counts.resolved || 0) + (counts.dismissed || 0) + (counts.auto_fixed || 0);
-                        if (otherTotal > 0) {
-                            _repairFindingsAutoSwitched = true;
-                            statusFilter.value = '';
-                            _repairFindingsPage = 0;
-                            await loadRepairFindings();
-                            const list = document.getElementById('repair-findings-list');
-                            if (list && !list.querySelector('.repair-auto-switch-notice')) {
-                                const notice = document.createElement('div');
-                                notice.className = 'repair-auto-switch-notice';
-                                notice.style.cssText = 'background:rgba(96,165,250,0.08);border:1px solid rgba(96,165,250,0.25);border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;color:#cbd5e1;';
-                                notice.innerHTML = `No <b>pending</b> findings, but ${otherTotal.toLocaleString()} carry-over (resolved/dismissed/auto-fixed). Showing <b>All Statuses</b> — change the filter above to switch back.`;
-                                list.parentNode.insertBefore(notice, list);
-                            }
-                            return;
-                        }
-                    }
-                } catch (e) { /* fall through to empty state */ }
-            }
-            container.innerHTML = `<div class="repair-empty-state">
-                <div class="repair-empty-icon">&#10003;</div>
-                <div class="repair-empty-title">All Clear</div>
-                <div class="repair-empty-text">No findings match your filters. Your library is looking good!</div>
-            </div>`;
-            document.getElementById('repair-findings-pagination').innerHTML = '';
-            return;
-        }
-
-        const severityIcons = { info: 'ℹ️', warning: '⚠️', critical: '🔴' };
-        const typeLabels = {
-            dead_file: 'Dead File', orphan_file: 'Orphan', acoustid_mismatch: 'Wrong Song',
-            acoustid_no_match: 'No Match', fake_lossless: 'Fake Lossless',
-            duplicate_tracks: 'Duplicate', incomplete_album: 'Incomplete',
-            path_mismatch: 'Path Mismatch', metadata_gap: 'Missing Metadata',
-            missing_cover_art: 'Missing Art', track_number_mismatch: 'Track Number',
-            missing_lyrics: 'Missing Lyrics', expired_download: 'Expired',
-            missing_replaygain: 'No ReplayGain', replaygain_retag: 'RG Re-analyze',
-            empty_folder: 'Empty Folder',
-            missing_lossy_copy: 'No Lossy Copy', library_retag: 'Re-tag',
-            quality_upgrade: 'Low Quality', short_preview_track: 'Preview Clip',
-            genre_cleanup: 'Genres',
-            comma_artist_split: 'Comma Artist'
-        };
-
-        // Finding types that have an automated fix action
-        const fixableTypes = {
-            dead_file: 'Re-download',
-            orphan_file: 'Resolve',
-            track_number_mismatch: 'Fix',
-            missing_cover_art: 'Apply Art',
-            missing_lyrics: 'Apply Lyrics',
-            missing_replaygain: 'Apply RG',
-            replaygain_retag: 'Re-analyze',
-            empty_folder: 'Delete Folder',
-            expired_download: 'Delete',
-            metadata_gap: 'Apply',
-            duplicate_tracks: 'Keep Best',
-            incomplete_album: 'Auto-Fill',
-            missing_lossy_copy: 'Convert',
-            acoustid_mismatch: 'Fix',
-            quality_upgrade: 'Upgrade',
-            missing_discography_track: 'Add to Wishlist',
-            library_retag: 'Apply Tags',
-            short_preview_track: 'Re-download',
-            genre_cleanup: 'Clean Genres',
-            comma_artist_split: 'Split Artists',
-        };
-
-        container.innerHTML = items.map(f => {
-            const icon = severityIcons[f.severity] || 'ℹ️';
-            const age = formatCacheAge(f.created_at);
-            const actionLabels = {
-                removed_db_entry: 'Entry Removed', added_to_wishlist: 'Wishlisted', deleted_file: 'File Deleted',
-                genres_cleaned: 'Genres Cleaned',
-                artists_split: 'Artists Split',
-                already_gone: 'Already Gone', fixed_track_number: 'Track # Fixed',
-                applied_cover_art: 'Art Applied', applied_metadata: 'Metadata Applied',
-                applied_lyrics: 'Lyrics Applied',
-                deleted_expired: 'Deleted',
-                removed_duplicates: 'Duplicates Removed',
-            };
-            let statusBadge = '';
-            if (f.status !== 'pending') {
-                const actionText = actionLabels[f.user_action] || f.status;
-                statusBadge = `<span class="repair-finding-status-badge ${f.status}">${actionText}</span>`;
-            }
-            const typeLabel = typeLabels[f.finding_type] || f.finding_type.replace(/_/g, ' ');
-            const d = f.details || {};
-            const filePath = f.file_path || d.original_path || d.file_path || '';
-            const fixLabel = fixableTypes[f.finding_type];
-
-            return `<div class="repair-finding-card ${f.severity}" data-id="${f.id}" data-job-id="${f.job_id}" data-mass-orphan="${!!(d.mass_orphan)}">
-                <div class="repair-finding-main" onclick="toggleFindingDetail(${f.id})">
-                    <div class="repair-finding-select" onclick="event.stopPropagation()">
-                        <input type="checkbox" onchange="toggleFindingSelect(${f.id}, this.checked)">
-                    </div>
-                    <div class="repair-finding-content">
-                        <div class="repair-finding-title">
-                            <span class="repair-finding-icon">${icon}</span>
-                            ${_escFinding(f.title)}
-                            <span class="repair-finding-type-badge">${typeLabel}</span>
-                            ${statusBadge}
-                        </div>
-                        <div class="repair-finding-desc">${_escFinding(f.description || '')}</div>
-                        ${filePath ? `<div class="repair-finding-path">${_escFinding(filePath)}</div>` : ''}
-                        <div class="repair-finding-meta">
-                            <span>${f.job_id.replace(/_/g, ' ')}</span>
-                            <span>&middot;</span>
-                            <span>${f.entity_type || 'file'}</span>
-                            ${f.entity_id ? `<span>&middot;</span><span>ID: ${f.entity_id}</span>` : ''}
-                            <span>&middot;</span>
-                            <span>${age}</span>
-                        </div>
-                    </div>
-                    <div class="repair-finding-actions" onclick="event.stopPropagation()">
-                        ${f.status === 'pending' ? `
-                            ${fixLabel ? `<button class="repair-finding-btn fix" onclick="fixRepairFinding(${f.id}, '${f.finding_type}')" title="${fixLabel}">${_escFinding(fixLabel)}</button>` : ''}
-                            <button class="repair-finding-btn dismiss" onclick="dismissRepairFinding(${f.id})" title="Dismiss">&times;</button>
-                        ` : ''}
-                        <button class="repair-finding-expand-btn" data-finding="${f.id}" title="Details">&#9660;</button>
-                    </div>
-                </div>
-                <div class="repair-finding-detail" id="repair-detail-${f.id}">
-                    <div class="repair-finding-detail-inner">
-                        ${_renderFindingDetail(f)}
-                    </div>
-                </div>
-            </div>`;
-        }).join('');
-
-        // Pagination
-        renderRepairFindingsPagination(data.total, data.page);
-
-    } catch (error) {
-        console.error('Error loading findings:', error);
-        container.innerHTML = '<div class="repair-empty">Error loading findings</div>';
-    }
-}
-
-function _escFinding(s) {
-    if (!s) return '';
-    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function _renderScoreBar(value, label) {
-    const pct = Math.round((value || 0) * 100);
-    const cls = pct >= 80 ? 'good' : pct >= 50 ? 'warn' : 'bad';
-    return `<div class="repair-score-bar">
-        <span class="repair-detail-key">${label}</span>
-        <div class="repair-score-bar-track"><div class="repair-score-bar-fill ${cls}" style="width:${pct}%"></div></div>
-        <span class="repair-detail-val">${pct}%</span>
-    </div>`;
-}
-
-function _formatFileSize(bytes) {
-    if (!bytes) return '-';
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / 1048576).toFixed(1) + ' MB';
-}
-
-function _renderPlayButton(f) {
-    const d = f.details || {};
-    const filePath = f.file_path || d.file_path || d.original_path;
-    if (!filePath) return '';
-    const title = d.expected_title || d.title || d.file_title || d.matched_title || '';
-    const artist = d.expected_artist || d.artist || d.artist_name || '';
-    const album = d.album || d.album_title || '';
-    const albumArt = d.album_thumb_url || '';
-    return `<button class="repair-finding-play-btn" onclick="event.stopPropagation(); playFindingTrack(this)"
-        data-path="${_escFinding(filePath)}" data-title="${_escFinding(title)}"
-        data-artist="${_escFinding(artist)}" data-album="${_escFinding(album)}"
-        data-art="${_escFinding(albumArt)}" data-entity-id="${_escFinding(f.entity_id || '')}" title="Play this track">
-        <svg viewBox="0 0 24 24"><polygon points="5,3 19,12 5,21"/></svg> Play
-    </button>`;
-}
-
-function playFindingTrack(btn) {
-    const track = {
-        file_path: btn.dataset.path,
-        title: btn.dataset.title || 'Unknown Track',
-        id: btn.dataset.entityId || null
-    };
-    const albumTitle = btn.dataset.album || '';
-    const artistName = btn.dataset.artist || '';
-    playLibraryTrack(track, albumTitle, artistName);
-}
-
-function _renderFindingMedia(d) {
-    const albumUrl = d.album_thumb_url;
-    const artistUrl = d.artist_thumb_url;
-    if (!albumUrl && !artistUrl) return '';
-    let html = '<div class="repair-finding-media">';
-    if (albumUrl) {
-        const albumLabel = d.album_title || 'Album';
-        html += `<div class="repair-finding-media-card">
-            <img class="repair-finding-media-img" src="${_escFinding(albumUrl)}" alt="Album art"
-                 onerror="this.parentElement.style.display='none'" />
-            <span class="repair-finding-media-label">${_escFinding(albumLabel)}</span>
-        </div>`;
-    }
-    if (artistUrl) {
-        const artistLabel = d.artist_name || d.artist || 'Artist';
-        const hasName = !!(d.artist_name || d.artist);
-        // Clickable → the artist's page. New findings store the library
-        // artist_id (exact, ambiguity-proof); older findings predate it and
-        // resolve by exact name at click time instead.
-        // Ids are opaque server keys — numeric on Plex but alphanumeric on
-        // Navidrome/Jellyfin, so never coerce with Number() (→ "NaN").
-        const idAttr = (d.artist_id != null && d.artist_id !== '')
-            ? ` data-artist-id="${_escFinding(String(d.artist_id))}"` : '';
-        const clickAttrs = hasName
-            ? `${idAttr} data-artist-name="${_escFinding(artistLabel)}" onclick="event.stopPropagation(); openFindingArtist(this)"
-                title="Open ${_escFinding(artistLabel)}'s page" role="link"`
-            : '';
-        html += `<div class="repair-finding-media-card${hasName ? ' repair-finding-media-card--link' : ''}"${clickAttrs}>
-            <img class="repair-finding-media-img artist" src="${_escFinding(artistUrl)}" alt="Artist"
-                 onerror="this.parentElement.style.display='none'" />
-            <span class="repair-finding-media-label">${_escFinding(artistLabel)}</span>
-        </div>`;
-    }
-    html += '</div>';
-    return html;
-}
-
-// Findings don't store the library artist id — resolve it by exact name and
-// navigate. Ambiguity rule: exact (case-insensitive) name match wins; without
-// one we DON'T guess a fuzzy result, we say so.
-async function openFindingArtist(el) {
-    const name = el.getAttribute('data-artist-name');
-    if (!name) return;
-    // New findings carry the library artist id — navigate directly, no lookup,
-    // immune to same-name ambiguity.
-    const storedId = el.getAttribute('data-artist-id');
-    if (storedId && typeof navigateToArtistDetail === 'function') {
-        // navigateToArtistDetail treats the id as opaque; only parse when it
-        // really is numeric (Plex) — Navidrome/Jellyfin ids are alphanumeric.
-        navigateToArtistDetail(/^\d+$/.test(storedId) ? parseInt(storedId, 10) : storedId, name);
-        return;
-    }
-    try {
-        // limit=50: the search is a CONTAINS match sorted alphabetically, so a
-        // short name ("Low") can sort after many substring hits ("Below",
-        // "Flower", …) — a small page could push the exact match off page 1.
-        const res = await fetch(`/api/library/artists?search=${encodeURIComponent(name)}&limit=50`);
-        const data = await res.json();
-        const artists = (data && data.artists) || [];
-        const exact = artists.find(a => (a.name || '').toLowerCase() === name.toLowerCase());
-        if (exact && exact.id != null && typeof navigateToArtistDetail === 'function') {
-            navigateToArtistDetail(exact.id, exact.name);
-        } else {
-            showToast(`"${name}" isn't in your library`, 'info');
-        }
-    } catch (err) {
-        showToast('Could not open artist page', 'error');
-    }
-}
-
-function _renderFindingDetail(f) {
-    const d = f.details || {};
-    const rows = [];
-    const media = _renderFindingMedia(d);
-
-    switch (f.finding_type) {
-        case 'genre_cleanup': {
-            // #1057 — show exactly what stays and what goes; the fix applies
-            // kept_genres verbatim, so this IS the contract.
-            const kept = Array.isArray(d.kept_genres) ? d.kept_genres : [];
-            const removed = Array.isArray(d.removed_genres) ? d.removed_genres : [];
-            rows.push(['Kept', kept.length ? kept.join(', ') : '— none (all genres are off your whitelist)']);
-            rows.push(['Removed', removed.join(', ')]);
-            if (d.entity) rows.push(['Applies to', d.entity === 'artist' ? 'Artist genres' : 'Album genres']);
-            return media + _gridRows(rows);
-        }
-
-        case 'comma_artist_split': {
-            // jadux — the contract: exactly what the artist tag becomes.
-            const parts = Array.isArray(d.split_artists) ? d.split_artists : [];
-            const res = Array.isArray(d.parts_resolution) ? d.parts_resolution : [];
-            rows.push(['Current artist tag', d.combined_name || '']);
-            rows.push(['New artist tag', d.new_display_artist || parts.join('; ')]);
-            if (d.primary_artist) rows.push(['Album artist', `becomes "${d.primary_artist}" (only where it was the combined name)`]);
-            if (Array.isArray(d.checked_sources) && d.checked_sources.length) {
-                rows.push(['Checked against', d.checked_sources.join(', ')]);
-            }
-            if (d.track_count != null) rows.push(['Tracks affected', String(d.track_count)]);
-            let html = media + _gridRows(rows);
-            // "Splits into" chips — parts already in the library are clickable
-            // and jump to that artist's page (same resolver as the artist card).
-            const chipSrc = res.length ? res : parts.map(p => ({ name: p }));
-            html += `<div style="margin:8px 0 2px;font-weight:600">Splits into</div>
-                <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:4px">` +
-                chipSrc.map(p => {
-                    const mark = p.in_library ? ' ✓ in your library' : (p.verified_via ? ` ✓ ${p.verified_via}` : '');
-                    const base = `padding:3px 10px;border-radius:12px;background:rgba(255,255,255,.07);font-size:12px`;
-                    if (p.in_library) {
-                        const idAttr = (p.library_artist_id != null && p.library_artist_id !== '')
-                            ? ` data-artist-id="${_escFinding(String(p.library_artist_id))}"` : '';
-                        return `<span style="${base};cursor:pointer;text-decoration:underline"${idAttr}
-                            data-artist-name="${_escFinding(p.name)}" role="link"
-                            title="Open ${_escFinding(p.name)}'s page"
-                            onclick="event.stopPropagation(); openFindingArtist(this)">${_escFinding(p.name)}${mark}</span>`;
-                    }
-                    return `<span style="${base}">${_escFinding(p.name)}${mark}</span>`;
-                }).join('') + '</div>';
-            const tracks = Array.isArray(d.tracks) ? d.tracks : [];
-            if (tracks.length) {
-                html += `<div style="margin:8px 0 2px;font-weight:600">Tracks</div>`;
-                tracks.slice(0, 40).forEach(t => {
-                    const label = [t.title, t.album].filter(Boolean).join(' — ');
-                    html += `<div class="repair-finding-meta" style="margin:0 0 2px">${_escFinding(label || (t.file_path || '').split(/[\\/]/).pop() || 'Unknown')}</div>`;
-                });
-                if ((d.track_count || 0) > tracks.length) {
-                    html += `<div class="repair-finding-meta" style="margin-top:6px">…and ${(d.track_count || 0) - tracks.length} more track(s)</div>`;
-                }
-            }
-            html += `<div class="repair-finding-meta" style="margin-top:8px">Your media server picks up the split on its next scan.</div>`;
-            return html;
-        }
-
-        case 'dead_file':
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album) rows.push(['Album', d.album]);
-            if (d.title) rows.push(['Title', d.title]);
-            if (d.track_id) rows.push(['Track ID', d.track_id]);
-            if (d.original_path) rows.push(['Original Path', d.original_path, 'path']);
-            return media + _gridRows(rows) + _renderPlayButton(f);
-
-        case 'orphan_file':
-            if (d.folder) rows.push(['Folder', d.folder, 'path']);
-            if (d.format) rows.push(['Format', d.format.toUpperCase()]);
-            if (d.file_size) rows.push(['File Size', _formatFileSize(d.file_size)]);
-            if (d.modified) rows.push(['Last Modified', d.modified]);
-            if (f.file_path) rows.push(['Full Path', f.file_path, 'path']);
-            return _gridRows(rows) + _renderPlayButton(f);
-
-        case 'library_retag': {
-            const tracks = Array.isArray(d.tracks) ? d.tracks : [];
-            const changed = tracks.filter(t => t.changes && Object.keys(t.changes).length);
-            const meta = [];
-            if (d.source) meta.push(`Source: ${d.source}`);
-            if (d.mode) meta.push(`Mode: ${d.mode}`);
-            if (d.cover_action) meta.push(`Cover: ${d.cover_action}`);
-            let html = '';
-            if (meta.length) {
-                html += `<div class="repair-finding-meta" style="margin-bottom:8px">${_escFinding(meta.join('  ·  '))}</div>`;
-            }
-            if (!changed.length && d.cover_action) {
-                html += `<div class="repair-finding-desc">Tags already correct — this would refresh cover art only.</div>`;
-            }
-            // Per-track old → new diff (cap the rendered list so huge albums stay sane).
-            changed.slice(0, 40).forEach(t => {
-                const fname = (t.file_path || '').split(/[\\/]/).pop();
-                const label = t.title || fname || 'Unknown';
-                const rows = Object.entries(t.changes).map(([field, c]) => [
-                    field.replace(/_/g, ' '),
-                    `${(c.old === '' || c.old == null) ? '∅' : c.old}   →   ${c.new}`,
-                    'highlight',
-                ]);
-                html += `<div style="margin:8px 0 2px;font-weight:600">${_escFinding(label)}</div>`;
-                // Show the physical filename so a wrong match is easy to spot before
-                // applying (skip when the label already IS the filename, i.e. no title).
-                if (fname && fname !== label) {
-                    html += `<div class="repair-finding-meta" style="margin:0 0 4px;opacity:.7;word-break:break-all">📄 ${_escFinding(fname)}</div>`;
-                }
-                html += _gridRows(rows);
-            });
-            if (changed.length > 40) {
-                html += `<div class="repair-finding-meta" style="margin-top:6px">…and ${changed.length - 40} more track(s)</div>`;
-            }
-            if (Array.isArray(d.unmatched) && d.unmatched.length) {
-                html += `<div class="repair-finding-meta" style="margin-top:8px">Unmatched (left untouched): ${_escFinding(d.unmatched.join(', '))}</div>`;
-            }
-            return html || '<div class="repair-finding-desc">No changes.</div>';
-        }
-
-        case 'acoustid_mismatch': {
-            let html = media + '<div style="margin-bottom:8px">';
-            html += _renderScoreBar(d.fingerprint_score, 'Fingerprint');
-            html += _renderScoreBar(d.title_similarity, 'Title Match');
-            html += _renderScoreBar(d.artist_similarity, 'Artist Match');
-            html += '</div>';
-            rows.push(['Expected Title', d.expected_title || '-']);
-            rows.push(['Expected Artist', d.expected_artist || '-']);
-            rows.push(['AcoustID Title', d.acoustid_title || '-', 'highlight']);
-            rows.push(['AcoustID Artist', d.acoustid_artist || '-', 'highlight']);
-            if (f.file_path) rows.push(['File', f.file_path, 'path']);
-            return html + _gridRows(rows) + _renderPlayButton(f);
-        }
-
-        case 'acoustid_no_match':
-            if (d.expected_title) rows.push(['Expected Title', d.expected_title]);
-            if (d.expected_artist) rows.push(['Expected Artist', d.expected_artist]);
-            if (f.file_path) rows.push(['File', f.file_path, 'path']);
-            return media + _gridRows(rows) + _renderPlayButton(f);
-
-        case 'fake_lossless': {
-            const cutoff = d.detected_cutoff_khz || 0;
-            const expectedMin = d.expected_min_khz || 0;
-            const nyquist = d.nyquist_khz || (d.sample_rate ? d.sample_rate / 2000 : 22.05);
-            let flHtml = '';
-            if (cutoff && expectedMin) {
-                const cutoffPct = Math.min(100, Math.round((cutoff / nyquist) * 100));
-                const expectedPct = Math.min(100, Math.round((expectedMin / nyquist) * 100));
-                flHtml += `<div class="repair-spectrum-bar">
-                    <div class="repair-spectrum-label">Spectral Analysis</div>
-                    <div class="repair-spectrum-track">
-                        <div class="repair-spectrum-detected" style="width:${cutoffPct}%"></div>
-                        <div class="repair-spectrum-expected" style="left:${expectedPct}%"></div>
-                    </div>
-                    <div class="repair-spectrum-legend">
-                        <span class="repair-spectrum-legend-detected">${cutoff} kHz detected</span>
-                        <span class="repair-spectrum-legend-expected">${expectedMin} kHz expected min</span>
-                    </div>
-                </div>`;
-            }
-            if (d.format) rows.push(['Format', d.format.toUpperCase()]);
-            if (d.sample_rate) rows.push(['Sample Rate', `${d.sample_rate} Hz`]);
-            if (d.bit_depth) rows.push(['Bit Depth', `${d.bit_depth}-bit`]);
-            if (d.bitrate) rows.push(['Bitrate', `${d.bitrate} kbps`]);
-            if (d.file_size) rows.push(['File Size', _formatFileSize(d.file_size)]);
-            if (f.file_path) rows.push(['File', f.file_path, 'path']);
-            return flHtml + _gridRows(rows) + _renderPlayButton(f);
-        }
-
-        case 'duplicate_tracks':
-            if (!d.tracks || !d.tracks.length) return _gridRows([['Count', d.count || '?']]);
-            // Determine best copy — same logic as the backend
-            // (core/library/duplicate_keep.py): lossless format first, so a FLAC
-            // beats an MP3 even when the FLAC's bitrate is missing, then bitrate,
-            // duration, track number.
-            const _dupFmtRank = (fp) => {
-                const r = { flac: 10, wav: 9, aiff: 9, aif: 9, ape: 8, m4a: 7, ogg: 6, opus: 6, mp3: 5, aac: 5, wma: 3 };
-                return r[String(fp || '').split('.').pop().toLowerCase()] || 1;
-            };
-            const _dupKey = (t) => [_dupFmtRank(t.file_path), t.bitrate || 0, t.duration || 0, t.track_number || 0];
-            const bestDup = d.tracks.reduce((best, t) => {
-                const bk = _dupKey(best), tk = _dupKey(t);
-                for (let i = 0; i < bk.length; i++) {
-                    if (tk[i] !== bk[i]) return tk[i] > bk[i] ? t : best;
-                }
-                return best;
-            }, d.tracks[0]);
-            const findingId = f.id;
-            return media + `<div class="repair-detail-sublist">${d.tracks.map((t, i) => {
-                const tid = t.track_id || t.id;
-                const isBest = (t.id === bestDup.id);
-                return `<div class="repair-detail-subitem ${isBest ? 'best' : 'removable'}" style="cursor:pointer;" onclick="selectDuplicateToKeep(${findingId}, '${tid}')" title="Click to keep this version">
-                    <strong>
-                        ${isBest ? '<span class="repair-keep-badge">KEEP</span>' : '<span class="repair-remove-badge">REMOVE</span>'}
-                        ${_escFinding(t.title)} by ${_escFinding(t.artist)}
-                    </strong>
-                    <span>Album: ${_escFinding(t.album || 'Unknown')}${t.bitrate ? ` &middot; ${t.bitrate} kbps` : ''}${t.duration ? ` &middot; ${Math.round(t.duration)}s` : ''}${t.track_number ? ` &middot; Track #${t.track_number}` : ''}</span>
-                    ${t.file_path ? `<span class="mono">${_escFinding(t.file_path)}</span>` : ''}
-                </div>`;
-            }).join('')}</div>
-            <div style="color:rgba(255,255,255,0.3);font-size:11px;padding:4px 0;">Click on a version to keep it, or use "Keep Best" for auto-selection</div>`;
-
-        case 'incomplete_album':
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album_title) rows.push(['Album', d.album_title]);
-            if (d.primary_source && d.primary_album_id) {
-                const primaryLabel = d.primary_source.charAt(0).toUpperCase() + d.primary_source.slice(1);
-                rows.push([`${primaryLabel} ID`, d.primary_album_id]);
-                if (d.spotify_album_id && d.primary_source !== 'spotify') {
-                    rows.push(['Spotify ID', d.spotify_album_id]);
-                }
-            } else if (d.spotify_album_id) {
-                rows.push(['Spotify ID', d.spotify_album_id]);
-            }
-            let incHtml = media + _gridRows(rows);
-            const actual = d.actual_tracks || 0, expected = d.expected_tracks || 0;
-            if (expected > 0) {
-                const pct = Math.round((actual / expected) * 100);
-                incHtml += `<div class="repair-completion-bar">
-                    <div class="repair-completion-label">${actual} of ${expected} tracks (${pct}%)</div>
-                    <div class="repair-completion-track"><div class="repair-completion-fill" style="width:${pct}%"></div></div>
-                </div>`;
-            }
-            if (d.missing_tracks && d.missing_tracks.length) {
-                incHtml += `<div class="repair-detail-sublist">${d.missing_tracks.map(t => `
-                    <div class="repair-detail-subitem">
-                        <strong>#${t.track_number || '?'} ${_escFinding(t.name || t.title || 'Unknown')}</strong>
-                        ${t.source && t.source !== 'spotify' ? `<span>Source: ${_escFinding(t.source)}${t.source_track_id ? ` · ID: ${_escFinding(t.source_track_id)}` : ''}</span>` : ''}
-                        ${t.duration_ms ? `<span>Duration: ${Math.round(t.duration_ms / 1000)}s</span>` : ''}
-                    </div>`).join('')}</div>`;
-            }
-            return incHtml;
-
-        case 'path_mismatch':
-            if (d.from) rows.push(['Current Path', d.from, 'path']);
-            if (d.to) rows.push(['Expected Path', d.to, 'success']);
-            return _gridRows(rows);
-
-        case 'metadata_gap':
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album) rows.push(['Album', d.album]);
-            if (d.title) rows.push(['Title', d.title]);
-            if (d.spotify_track_id) rows.push(['Spotify ID', d.spotify_track_id]);
-            if (d.resolved_source) rows.push(['Resolved Source', d.resolved_source]);
-            if (d.resolved_track_id) rows.push(['Resolved Track ID', d.resolved_track_id]);
-            if (d.found_fields && typeof d.found_fields === 'object') {
-                Object.entries(d.found_fields).forEach(([k, v]) => {
-                    rows.push([`Found: ${k}`, String(v), 'success']);
-                });
-            }
-            return media + _gridRows(rows);
-
-        case 'missing_cover_art':
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album_title) rows.push(['Album', d.album_title]);
-            if (d.spotify_album_id) rows.push(['Spotify ID', d.spotify_album_id]);
-            let artHtml = '';
-            // Each found image is independently applyable (Pache711: "fix one,
-            // dismiss the other"). Per-image Apply buttons let the user take the
-            // correct album art and skip a wrong artist image, or vice versa.
-            if (d.artist_thumb_url || d.found_artwork_url || d.found_artist_url) {
-                artHtml += '<div class="repair-finding-media">';
-                if (d.found_artwork_url) {
-                    artHtml += `<div class="repair-finding-media-card">
-                        <img class="repair-finding-media-img" src="${_escFinding(d.found_artwork_url)}" alt="Found album art"
-                             onerror="this.parentElement.style.display='none'" />
-                        <span class="repair-finding-media-label">Found Album Art</span>
-                        <button class="repair-art-apply-btn" onclick="applyCoverArtTarget(${f.id}, 'album')">Use for album</button>
-                    </div>`;
-                }
-                // Current artist image (context) — no apply, it's what's there now.
-                if (d.artist_thumb_url) {
-                    artHtml += `<div class="repair-finding-media-card">
-                        <img class="repair-finding-media-img artist" src="${_escFinding(d.artist_thumb_url)}" alt="Current artist art"
-                             onerror="this.parentElement.style.display='none'" />
-                        <span class="repair-finding-media-label">${_escFinding(d.artist || 'Artist')} (current)</span>
-                    </div>`;
-                }
-                // Found artist image — the applyable replacement.
-                if (d.found_artist_url) {
-                    artHtml += `<div class="repair-finding-media-card">
-                        <img class="repair-finding-media-img artist" src="${_escFinding(d.found_artist_url)}" alt="Found artist art"
-                             onerror="this.parentElement.style.display='none'" />
-                        <span class="repair-finding-media-label">Found Artist Art</span>
-                        <button class="repair-art-apply-btn" onclick="applyCoverArtTarget(${f.id}, 'artist')">Use for artist</button>
-                    </div>`;
-                }
-                artHtml += '</div>';
-            }
-            artHtml += _gridRows(rows);
-            return artHtml;
-
-        case 'missing_lyrics':
-            if (d.track_title) rows.push(['Track', d.track_title]);
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album_title) rows.push(['Album', d.album_title]);
-            return _gridRows(rows);
-
-        case 'missing_replaygain':
-            if (d.track_title) rows.push(['Track', d.track_title]);
-            if (d.artist) rows.push(['Artist', d.artist]);
-            return _gridRows(rows);
-
-        case 'empty_folder':
-            if (d.folder_path) rows.push(['Folder', d.folder_path, 'path']);
-            if (d.junk_files && d.junk_files.length) rows.push(['Junk files', d.junk_files.join(', ')]);
-            return _gridRows(rows);
-
-        case 'expired_download':
-            if (d.title) rows.push(['Track', d.title]);
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.origin) rows.push(['Source', `${d.origin}${d.origin_context ? ' — ' + d.origin_context : ''}`]);
-            if (d.file_path) rows.push(['File', d.file_path.split(/[\\/]/).pop()]);
-            return _gridRows(rows);
-
-        case 'track_number_mismatch':
-            if (d.album_title) rows.push(['Album', d.album_title]);
-            if (d.artist_name) rows.push(['Artist', d.artist_name]);
-            if (d.matched_title) rows.push(['Matched To', d.matched_title]);
-            if (d.file_title) rows.push(['File Title', d.file_title]);
-            if (d.current_track_num !== undefined) rows.push(['Current Track #', String(d.current_track_num)]);
-            if (d.correct_track_num !== undefined) rows.push(['Correct Track #', String(d.correct_track_num), 'success']);
-            if (f.file_path) rows.push(['File', f.file_path, 'path']);
-            let tnHtml = media;
-            if (d.match_score) {
-                tnHtml += '<div style="margin-bottom:8px">';
-                tnHtml += _renderScoreBar(d.match_score, 'Title Match');
-                tnHtml += '</div>';
-            }
-            tnHtml += _gridRows(rows);
-            if (d.changes && d.changes.length) {
-                tnHtml += `<div class="repair-detail-sublist">${d.changes.map(c => `
-                    <div class="repair-detail-subitem"><strong>${_escFinding(c)}</strong></div>`).join('')}</div>`;
-            }
-            tnHtml += _renderPlayButton(f);
-            return tnHtml;
-
-        case 'short_preview_track':
-            if (d.artist) rows.push(['Artist', d.artist]);
-            if (d.album) rows.push(['Album', d.album]);
-            if (d.title) rows.push(['Title', d.title]);
-            if (d.file_duration_s != null) rows.push(['File Length', `${d.file_duration_s}s`, 'warning']);
-            if (d.expected_duration_s != null) rows.push(['Real Length', `${d.expected_duration_s}s`, 'success']);
-            if (d.original_path) rows.push(['Path', d.original_path, 'path']);
-            // Play button lets the user hear the clip and confirm it's a busted ~30s preview
-            // before approving the delete + re-download.
-            return media + _gridRows(rows) + _renderPlayButton(f);
-
-        default:
-            // Generic: render all detail keys
-            Object.entries(d).forEach(([k, v]) => {
-                if (typeof v !== 'object' && !k.endsWith('_thumb_url')) {
-                    rows.push([k.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase()), String(v)]);
-                }
-            });
-            if (f.file_path) rows.push(['File', f.file_path, 'path']);
-            return (media || '') + (rows.length ? _gridRows(rows) : '<span style="color:rgba(255,255,255,0.3);font-size:12px;">No additional details available</span>');
-    }
-}
-
-function _gridRows(rows) {
-    if (!rows.length) return '';
-    return `<div class="repair-detail-grid">${rows.map(([k, v, cls]) =>
-        `<span class="repair-detail-key">${_escFinding(k)}</span><span class="repair-detail-val ${cls || ''}">${_escFinding(v)}</span>`
-    ).join('')}</div>`;
-}
-
-function toggleFindingDetail(id) {
-    const panel = document.getElementById(`repair-detail-${id}`);
-    const btn = document.querySelector(`.repair-finding-expand-btn[data-finding="${id}"]`);
-    if (!panel) return;
-    const isOpen = panel.classList.toggle('open');
-    if (btn) btn.classList.toggle('open', isOpen);
-}
-
-function toggleFindingSelect(id, checked) {
-    if (checked) _repairSelectedFindings.add(id);
-    else _repairSelectedFindings.delete(id);
-
-    _updateFindingsBulkBar();
-}
-
-function _updateFindingsBulkBar() {
-    const bulkBar = document.getElementById('repair-findings-bulk');
-    const count = _repairSelectedFindings.size;
-    if (bulkBar) bulkBar.style.display = count > 0 ? '' : 'none';
-    const countEl = document.getElementById('repair-bulk-count');
-    if (countEl) countEl.textContent = count > 0 ? `${count} selected` : '';
-
-    // Show "Fix All (N)" when all on page are selected and there are more pages
-    const fixAllBtn = document.getElementById('repair-fix-all-btn');
-    if (fixAllBtn && _repairFindingsTotal > 0) {
-        const allPageSelected = count > 0 && count >= document.querySelectorAll('.repair-finding-card').length;
-        fixAllBtn.style.display = (allPageSelected && _repairFindingsTotal > count) ? '' : 'none';
-        fixAllBtn.textContent = `Fix All ${_repairFindingsTotal}`;
-    }
-
-    // Sync "Select All" checkbox
-    const selectAllCb = document.getElementById('repair-select-all-cb');
-    if (selectAllCb) {
-        const totalOnPage = document.querySelectorAll('.repair-finding-card').length;
-        selectAllCb.checked = totalOnPage > 0 && count >= totalOnPage;
-        selectAllCb.indeterminate = count > 0 && count < totalOnPage;
-    }
-}
-
-function toggleSelectAllFindings(checked) {
-    const checkboxes = document.querySelectorAll('.repair-finding-select input[type="checkbox"]');
-    checkboxes.forEach(cb => {
-        cb.checked = checked;
-        const card = cb.closest('.repair-finding-card');
-        if (card) {
-            const id = parseInt(card.dataset.id);
-            if (checked) _repairSelectedFindings.add(id);
-            else _repairSelectedFindings.delete(id);
-        }
-    });
-    _updateFindingsBulkBar();
-}
-
-async function fixAllMatchingFindings() {
-    const jobFilter = document.getElementById('repair-findings-job-filter');
-    const severityFilter = document.getElementById('repair-findings-severity-filter');
-    const jobId = jobFilter ? jobFilter.value : '';
-    const severity = severityFilter ? severityFilter.value : '';
-
-    // If fixing orphan files or dead files, prompt for action FIRST
-    let fixAction = null;
-    // Discography backfill: 3-option prompt (Add to Wishlist / Just Clear / Cancel).
-    // "Just Clear" bypasses bulk-fix entirely and goes through the clear endpoint,
-    // which is why it's handled inline and returns early.
-    if (jobId === 'discography_backfill') {
-        const choice = await _promptDiscographyBackfillAction(_repairFindingsTotal);
-        if (!choice) return;
-        if (choice === 'dismiss') {
-            if (!await showConfirmDialog({
-                title: 'Clear All Discography Findings',
-                message: `Clear all ${_repairFindingsTotal} discography backfill findings without adding any to the wishlist? Tracks can be re-detected next scan.`,
-                confirmText: 'Clear All',
-                destructive: false
-            })) return;
-            showToast(`Clearing ${_repairFindingsTotal} findings…`, 'info');
-            try {
-                const resp = await fetch('/api/repair/findings/clear', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ job_id: 'discography_backfill', status: 'pending' })
-                });
-                const result = await resp.json();
-                if (result.success) {
-                    showToast(`Cleared ${result.deleted} findings`, 'success');
-                } else {
-                    showToast(result.error || 'Clear failed', 'error');
-                }
-            } catch (err) {
-                console.error('Error clearing findings:', err);
-                showToast('Error clearing findings', 'error');
-            }
-            _repairSelectedFindings.clear();
-            loadRepairFindingsDashboard();
-            loadRepairFindings();
-            updateRepairStatus();
-            return;
-        }
-        // 'add_to_wishlist' falls through to bulk-fix. No destructive warning —
-        // the backend handler only adds tracks to the wishlist.
-    } else if (jobId === 'dead_file_cleaner') {
-        fixAction = await _promptDeadFileAction();
-        if (!fixAction) return;
-    } else if (jobId === 'orphan_file_detector' || _isMassOrphanFix(jobId, _repairFindingsTotal)) {
-        fixAction = await _promptOrphanAction();
-        if (!fixAction) return;
-        // Confirm before proceeding
-        if (fixAction === 'delete' && _repairFindingsTotal > 50) {
-            if (!await showWitnessMeDialog(_repairFindingsTotal)) return;
-        } else if (fixAction === 'delete') {
-            if (!await showConfirmDialog({
-                title: 'Delete Orphan Files',
-                message: `Permanently delete ${_repairFindingsTotal} orphan files from disk? This cannot be undone.`,
-                confirmText: 'Delete',
-                destructive: true
-            })) return;
-        } else if (fixAction === 'staging') {
-            if (!await showConfirmDialog({
-                title: 'Move to Staging',
-                message: `Move ${_repairFindingsTotal} orphan files to the import folder? Files are NOT deleted — you can review and import them.`,
-                confirmText: 'Move All to Staging',
-                destructive: false
-            })) return;
-        }
-    } else {
-        const scopeLabel = jobId ? jobId.replace(/_/g, ' ') : 'all jobs';
-        if (!await showConfirmDialog({
-            title: 'Fix All Findings',
-            message: `Apply fixes to all ${_repairFindingsTotal} pending fixable findings for ${scopeLabel}? This may delete files or remove database entries depending on finding type.`,
-            confirmText: 'Fix All',
-            destructive: true
-        })) return;
-    }
-
-    // Fix All runs in the BACKGROUND: at library scale (thousands of tag
-    // writes) a synchronous request outlives every browser/proxy timeout, so
-    // the user was told it failed while the server quietly kept fixing. The
-    // start endpoint returns immediately and we poll for progress instead.
-    try {
-        const body = {};
-        if (jobId) body.job_id = jobId;
-        if (severity) body.severity = severity;
-        if (fixAction) body.fix_action = fixAction;
-
-        const response = await fetch('/api/repair/findings/bulk-fix-start', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        const result = await response.json();
-        if (result.started) {
-            showToast(`Fixing ${result.total} findings in the background…`, 'info');
-            _watchBulkFixRun();
-        } else if (result.already_running) {
-            showToast('A bulk fix is already running — showing its progress', 'info');
-            _watchBulkFixRun();
-        } else {
-            showToast(result.error || 'Bulk fix failed to start', 'error');
-        }
-    } catch (error) {
-        console.error('Error starting bulk fix:', error);
-        showToast('Error starting bulk fix', 'error');
-    }
-
-    _repairSelectedFindings.clear();
-    _updateFindingsBulkBar();
-}
-
-let _bulkFixPollTimer = null;
-
-function _watchBulkFixRun() {
-    if (_bulkFixPollTimer) return;   // already watching
-
-    const poll = async () => {
-        let st;
-        try {
-            const resp = await fetch('/api/repair/bulk-fix/status');
-            st = await resp.json();
-        } catch (e) {
-            return;   // transient — keep polling
-        }
-
-        const bulkBar = document.getElementById('repair-findings-bulk');
-        const countEl = document.getElementById('repair-bulk-count');
-
-        if (st.running) {
-            // Surface live progress in the bulk bar (kept visible for the run)
-            if (bulkBar) bulkBar.style.display = '';
-            if (countEl) {
-                countEl.innerHTML = `Fixing ${st.done} / ${st.total}&hellip; ` +
-                    `<button class="btn btn--sm btn--secondary" onclick="stopBulkFixRun()">Stop</button>`;
-            }
-            return;
-        }
-
-        // Finished (or nothing ever ran on this server)
-        clearInterval(_bulkFixPollTimer);
-        _bulkFixPollTimer = null;
-        if (countEl) countEl.textContent = '';
-        if (st.total) {
-            let msg = `Fixed ${st.fixed}${st.failed ? `, ${st.failed} failed` : ''} of ${st.total}`;
-            if (st.stopped) msg = `Bulk fix stopped — ${msg.charAt(0).toLowerCase()}${msg.slice(1)}`;
-            if (st.errors && st.errors.length > 0) msg += `: ${st.errors[0].error}`;
-            showToast(msg, st.fixed > 0 ? 'success' : 'error');
-        }
-        _repairSelectedFindings.clear();
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    };
-
-    _bulkFixPollTimer = setInterval(poll, 2000);
-    poll();
-}
-
-function stopBulkFixRun() {
-    fetch('/api/repair/bulk-fix/stop', { method: 'POST' }).catch(() => {});
-    showToast('Stopping after the current fix…', 'info');
-}
-
-async function _checkBulkFixResume() {
-    // A reload mid-run should pick the progress display back up.
-    if (_bulkFixPollTimer) return;
-    try {
-        const resp = await fetch('/api/repair/bulk-fix/status');
-        const st = await resp.json();
-        if (st.running) _watchBulkFixRun();
-    } catch (e) { /* not fatal */ }
-}
-
-function renderRepairFindingsPagination(total, currentPage) {
-    const container = document.getElementById('repair-findings-pagination');
-    if (!container) return;
-
-    const totalPages = Math.ceil(total / REPAIR_FINDINGS_PAGE_SIZE);
-    if (totalPages <= 1) { container.innerHTML = ''; return; }
-
-    let html = '';
-    if (currentPage > 0) {
-        html += `<button class="repair-page-btn" onclick="_repairFindingsPage=${currentPage - 1};loadRepairFindings()">&larr;</button>`;
-    }
-
-    // Smart page range
-    let startPage = Math.max(0, currentPage - 3);
-    let endPage = Math.min(totalPages, startPage + 7);
-    if (endPage - startPage < 7) startPage = Math.max(0, endPage - 7);
-
-    if (startPage > 0) {
-        html += `<button class="repair-page-btn" onclick="_repairFindingsPage=0;loadRepairFindings()">1</button>`;
-        if (startPage > 1) html += '<span class="repair-page-info">…</span>';
-    }
-    for (let i = startPage; i < endPage; i++) {
-        html += `<button class="repair-page-btn ${i === currentPage ? 'active' : ''}"
-                         onclick="_repairFindingsPage=${i};loadRepairFindings()">${i + 1}</button>`;
-    }
-    if (endPage < totalPages) {
-        if (endPage < totalPages - 1) html += '<span class="repair-page-info">…</span>';
-        html += `<button class="repair-page-btn" onclick="_repairFindingsPage=${totalPages - 1};loadRepairFindings()">${totalPages}</button>`;
-    }
-
-    if (currentPage < totalPages - 1) {
-        html += `<button class="repair-page-btn" onclick="_repairFindingsPage=${currentPage + 1};loadRepairFindings()">&rarr;</button>`;
-    }
-    html += `<span class="repair-page-info">${total.toLocaleString()} total</span>`;
-    container.innerHTML = html;
-}
-
-async function selectDuplicateToKeep(findingId, keepTrackId) {
-    if (!await showConfirmDialog({ title: 'Keep This Version', message: 'Keep this version and remove the other duplicate(s)?', confirmText: 'Keep', destructive: true })) return;
-    try {
-        const response = await fetch(`/api/repair/findings/${findingId}/fix`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fix_action: keepTrackId }),
-        });
-        const result = await response.json();
-        if (result.success) {
-            showToast(result.message || 'Duplicate resolved', 'success');
-        } else {
-            showToast(result.error || 'Failed to resolve duplicate', 'error');
-        }
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error fixing duplicate:', error);
-        showToast('Error resolving duplicate', 'error');
-    }
-}
-
-async function applyCoverArtTarget(id, target) {
-    // Per-image apply for a cover-art finding (Pache711). target: 'album' |
-    // 'artist'. Applying either resolves the finding, so picking the correct
-    // image and ignoring the wrong one = "fix one, dismiss the other".
-    try {
-        const response = await fetch(`/api/repair/findings/${id}/fix`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ fix_action: target }),
-        });
-        const result = await response.json();
-        if (result.success) {
-            showToast(result.message || `Applied ${target} art`, 'success');
-        } else {
-            showToast(result.error || `Failed to apply ${target} art`, 'error');
-        }
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error applying cover art target:', error);
-        showToast('Error applying art', 'error');
-    }
-}
-
-async function fixRepairFinding(id, findingType) {
-    // Orphan files require user to choose an action
-    let fixAction = null;
-    if (findingType === 'orphan_file') {
-        fixAction = await _promptOrphanAction();
-        if (!fixAction) return; // User cancelled
-    }
-    // Dead files: re-download or just remove from DB
-    if (findingType === 'dead_file') {
-        fixAction = await _promptDeadFileAction();
-        if (!fixAction) return;
-    }
-    // AcoustID mismatch: retag, redownload, or delete
-    if (findingType === 'acoustid_mismatch') {
-        fixAction = await _promptAcoustidAction();
-        if (!fixAction) return;
-    }
-    // Quality upgrade: redownload, delete, or ignore (dismiss)
-    if (findingType === 'quality_upgrade') {
-        fixAction = await _promptQualityUpgradeAction();
-        if (!fixAction) return;  // cancelled
-        if (fixAction === 'ignore') {
-            await dismissRepairFinding(id);
-            return;
-        }
-    }
-    // Discography backfill: add to wishlist or just clear the finding
-    if (findingType === 'missing_discography_track') {
-        const choice = await _promptDiscographyBackfillAction(1);
-        if (!choice) return;  // cancel
-        if (choice === 'dismiss') {
-            // User just wants to remove the finding without adding to wishlist
-            await dismissRepairFinding(id);
-            return;
-        }
-        // 'add_to_wishlist' — fall through to the fix endpoint. The handler
-        // already defaults to adding to wishlist, so no fix_action is needed.
-    }
-
-    const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-    const fixBtn = card ? card.querySelector('.repair-finding-btn.fix') : null;
-    let originalText = '';
-    if (fixBtn) {
-        originalText = fixBtn.textContent;
-        fixBtn.disabled = true;
-        fixBtn.textContent = '…';
-    }
-    try {
-        const body = fixAction ? { fix_action: fixAction } : {};
-        const response = await fetch(`/api/repair/findings/${id}/fix`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        });
-        const result = await response.json();
-        if (result.success) {
-            showToast(result.message || 'Fixed successfully', 'success');
-        } else {
-            showToast(result.error || 'Fix failed', 'error');
-        }
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error fixing finding:', error);
-        showToast('Error applying fix', 'error');
-        if (fixBtn) {
-            fixBtn.disabled = false;
-            fixBtn.textContent = originalText;
-        }
-    }
-}
-
-function _promptOrphanAction() {
-    return new Promise(resolve => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000;';
-        overlay.innerHTML = `
-            <div style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:380px;width:90%;text-align:center;">
-                <div style="font-size:1.1em;font-weight:600;color:#fff;margin-bottom:8px;">Orphan File Action</div>
-                <div style="font-size:0.88em;color:rgba(255,255,255,0.6);margin-bottom:20px;">
-                    Choose how to handle orphan files. Staging is safe and reversible.
-                </div>
-                <div style="display:flex;gap:10px;justify-content:center;">
-                    <button id="_orphan-staging" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(29,185,84,0.4);background:rgba(29,185,84,0.15);color:#1db954;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Move to Staging
-                    </button>
-                    <button id="_orphan-delete" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#ef4444;font-weight:500;cursor:pointer;font-family:inherit;">
-                        Delete
-                    </button>
-                </div>
-                <button id="_orphan-cancel" style="margin-top:12px;padding:6px 16px;border:none;background:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:0.82em;font-family:inherit;">
-                    Cancel
-                </button>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        overlay.querySelector('#_orphan-staging').onclick = () => { overlay.remove(); resolve('staging'); };
-        overlay.querySelector('#_orphan-delete').onclick = () => { overlay.remove(); resolve('delete'); };
-        overlay.querySelector('#_orphan-cancel').onclick = () => { overlay.remove(); resolve(null); };
-        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
-    });
-}
-
-function _promptDeadFileAction() {
-    return new Promise(resolve => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000;';
-        overlay.innerHTML = `
-            <div style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:420px;width:90%;text-align:center;">
-                <div style="font-size:1.1em;font-weight:600;color:#fff;margin-bottom:8px;">Dead File Action</div>
-                <div style="font-size:0.88em;color:rgba(255,255,255,0.6);margin-bottom:20px;">
-                    This track's file no longer exists on disk. Choose how to handle it.
-                </div>
-                <div style="display:flex;gap:10px;justify-content:center;">
-                    <button id="_dead-redownload" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(29,185,84,0.4);background:rgba(29,185,84,0.15);color:#1db954;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Re-download
-                    </button>
-                    <button id="_dead-remove" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#ef4444;font-weight:500;cursor:pointer;font-family:inherit;">
-                        Remove from DB
-                    </button>
-                </div>
-                <button id="_dead-cancel" style="margin-top:12px;padding:6px 16px;border:none;background:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:0.82em;font-family:inherit;">
-                    Cancel
-                </button>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        overlay.querySelector('#_dead-redownload').onclick = () => { overlay.remove(); resolve('redownload'); };
-        overlay.querySelector('#_dead-remove').onclick = () => { overlay.remove(); resolve('remove'); };
-        overlay.querySelector('#_dead-cancel').onclick = () => { overlay.remove(); resolve(null); };
-        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
-    });
-}
-
-function _promptAcoustidAction() {
-    return new Promise(resolve => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000;';
-        overlay.innerHTML = `
-            <div style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:460px;width:90%;text-align:center;">
-                <div style="font-size:1.1em;font-weight:600;color:#fff;margin-bottom:8px;">AcoustID Mismatch</div>
-                <div style="font-size:0.88em;color:rgba(255,255,255,0.6);margin-bottom:20px;">
-                    The audio fingerprint doesn't match the expected track. Choose how to fix it.
-                </div>
-                <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
-                    <button id="_acid-retag" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(102,126,234,0.4);background:rgba(102,126,234,0.15);color:#667eea;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Retag
-                    </button>
-                    <button id="_acid-relocate" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(245,158,11,0.4);background:rgba(245,158,11,0.12);color:#f59e0b;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Relocate
-                    </button>
-                    <button id="_acid-redownload" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(29,185,84,0.4);background:rgba(29,185,84,0.15);color:#1db954;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Re-download
-                    </button>
-                    <button id="_acid-delete" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#ef4444;font-weight:500;cursor:pointer;font-family:inherit;">
-                        Delete
-                    </button>
-                </div>
-                <div style="margin-top:12px;font-size:0.78em;color:rgba(255,255,255,0.35);line-height:1.4;">
-                    Retag = update metadata in place &bull; Relocate = retag + move to Staging so it's re-imported into the correct artist/album &bull; Re-download = add correct track to wishlist &amp; delete wrong file &bull; Delete = remove file and DB entry
-                </div>
-                <button id="_acid-cancel" style="margin-top:12px;padding:6px 16px;border:none;background:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:0.82em;font-family:inherit;">
-                    Cancel
-                </button>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        overlay.querySelector('#_acid-retag').onclick = () => { overlay.remove(); resolve('retag'); };
-        overlay.querySelector('#_acid-relocate').onclick = () => { overlay.remove(); resolve('relocate'); };
-        overlay.querySelector('#_acid-redownload').onclick = () => { overlay.remove(); resolve('redownload'); };
-        overlay.querySelector('#_acid-delete').onclick = () => { overlay.remove(); resolve('delete'); };
-        overlay.querySelector('#_acid-cancel').onclick = () => { overlay.remove(); resolve(null); };
-        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
-    });
-}
-
-function _promptQualityUpgradeAction() {
-    return new Promise(resolve => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000;';
-        overlay.innerHTML = `
-            <div style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:460px;width:90%;text-align:center;">
-                <div style="font-size:1.1em;font-weight:600;color:#fff;margin-bottom:8px;">Low-Quality Track</div>
-                <div style="font-size:0.88em;color:rgba(255,255,255,0.6);margin-bottom:20px;">
-                    This file is below your quality profile. Choose what to do.
-                </div>
-                <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
-                    <button id="_qual-redownload" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(29,185,84,0.4);background:rgba(29,185,84,0.15);color:#1db954;font-weight:600;cursor:pointer;font-family:inherit;">
-                        Re-download
-                    </button>
-                    <button id="_qual-delete" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(239,68,68,0.4);background:rgba(239,68,68,0.1);color:#ef4444;font-weight:500;cursor:pointer;font-family:inherit;">
-                        Delete
-                    </button>
-                    <button id="_qual-ignore" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(255,255,255,0.18);background:rgba(255,255,255,0.05);color:rgba(255,255,255,0.7);font-weight:500;cursor:pointer;font-family:inherit;">
-                        Ignore
-                    </button>
-                </div>
-                <div style="margin-top:12px;font-size:0.78em;color:rgba(255,255,255,0.35);line-height:1.4;">
-                    Re-download = add to wishlist for a better-quality copy &amp; delete this file &bull; Delete = remove file and DB entry &bull; Ignore = keep the file and dismiss this finding
-                </div>
-                <button id="_qual-cancel" style="margin-top:12px;padding:6px 16px;border:none;background:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:0.82em;font-family:inherit;">
-                    Cancel
-                </button>
-            </div>
-        `;
-        document.body.appendChild(overlay);
-
-        overlay.querySelector('#_qual-redownload').onclick = () => { overlay.remove(); resolve('redownload'); };
-        overlay.querySelector('#_qual-delete').onclick = () => { overlay.remove(); resolve('delete'); };
-        overlay.querySelector('#_qual-ignore').onclick = () => { overlay.remove(); resolve('ignore'); };
-        overlay.querySelector('#_qual-cancel').onclick = () => { overlay.remove(); resolve(null); };
-        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
-    });
-}
-
-function _promptDiscographyBackfillAction(count = 1) {
-    const isSingle = count <= 1;
-    const headerText = isSingle ? 'Missing Discography Track' : `Missing Discography Tracks (${count})`;
-    const bodyText = isSingle
-        ? 'Add this track to the wishlist for automatic download, or just clear the finding?'
-        : `Add all ${count} selected tracks to the wishlist for automatic download, or just clear the findings?`;
-    const addLabel = isSingle ? 'Add to Wishlist' : `Add All ${count} to Wishlist`;
-    const clearLabel = isSingle ? 'Just Clear Finding' : 'Just Clear Findings';
-
-    return new Promise(resolve => {
-        const overlay = document.createElement('div');
-        overlay.className = 'modal-overlay';
-        overlay.style.cssText = 'display:flex;align-items:center;justify-content:center;z-index:10000;';
-        overlay.innerHTML = `
-            <div style="background:#1e1e2e;border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:28px;max-width:460px;width:90%;text-align:center;">
-                <div id="_dbf-header" style="font-size:1.1em;font-weight:600;color:#fff;margin-bottom:8px;"></div>
-                <div id="_dbf-body" style="font-size:0.88em;color:rgba(255,255,255,0.6);margin-bottom:20px;"></div>
-                <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;">
-                    <button id="_dbf-add" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(29,185,84,0.4);background:rgba(29,185,84,0.15);color:#1db954;font-weight:600;cursor:pointer;font-family:inherit;"></button>
-                    <button id="_dbf-dismiss" style="padding:10px 20px;border-radius:10px;border:1px solid rgba(102,126,234,0.4);background:rgba(102,126,234,0.15);color:#667eea;font-weight:500;cursor:pointer;font-family:inherit;"></button>
-                </div>
-                <button id="_dbf-cancel" style="margin-top:12px;padding:6px 16px;border:none;background:none;color:rgba(255,255,255,0.4);cursor:pointer;font-size:0.82em;font-family:inherit;">
-                    Cancel
-                </button>
-            </div>
-        `;
-        // Assign text content (avoids HTML-escaping gotchas with dynamic values)
-        overlay.querySelector('#_dbf-header').textContent = headerText;
-        overlay.querySelector('#_dbf-body').textContent = bodyText;
-        overlay.querySelector('#_dbf-add').textContent = addLabel;
-        overlay.querySelector('#_dbf-dismiss').textContent = clearLabel;
-        document.body.appendChild(overlay);
-
-        overlay.querySelector('#_dbf-add').onclick = () => { overlay.remove(); resolve('add_to_wishlist'); };
-        overlay.querySelector('#_dbf-dismiss').onclick = () => { overlay.remove(); resolve('dismiss'); };
-        overlay.querySelector('#_dbf-cancel').onclick = () => { overlay.remove(); resolve(null); };
-        overlay.onclick = (e) => { if (e.target === overlay) { overlay.remove(); resolve(null); } };
-    });
-}
-
-async function resolveRepairFinding(id) {
-    try {
-        await fetch(`/api/repair/findings/${id}/resolve`, { method: 'POST' });
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error resolving finding:', error);
-    }
-}
-
-async function dismissRepairFinding(id) {
-    try {
-        await fetch(`/api/repair/findings/${id}/dismiss`, { method: 'POST' });
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error dismissing finding:', error);
-    }
-}
-
-async function bulkRepairAction(action) {
-    if (_repairSelectedFindings.size === 0) return;
-    try {
-        await fetch('/api/repair/findings/bulk', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ids: Array.from(_repairSelectedFindings), action })
-        });
-        showToast(`${_repairSelectedFindings.size} findings ${action === 'dismiss' ? 'dismissed' : 'resolved'}`, 'success');
-        _repairSelectedFindings.clear();
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error bulk updating findings:', error);
-        showToast('Error updating findings', 'error');
-    }
-}
-
-async function bulkFixFindings() {
-    if (_repairSelectedFindings.size === 0) return;
-    const ids = Array.from(_repairSelectedFindings);
-
-    // If any selected findings are orphan files, prompt for action FIRST
-    const selectedOrphanCards = ids.filter(id => {
-        const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-        return card && card.dataset.jobId === 'orphan_file_detector';
-    });
-    let orphanFixAction = null;
-    if (selectedOrphanCards.length > 0) {
-        orphanFixAction = await _promptOrphanAction();
-        if (!orphanFixAction) return;
-        // Only show scary dialog for mass deletion, not staging
-        if (orphanFixAction === 'delete' && selectedOrphanCards.length > MASS_ORPHAN_THRESHOLD) {
-            const hasMassFlag = ids.some(id => {
-                const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-                return card && card.dataset.massOrphan === 'true';
-            });
-            if (hasMassFlag && !await showWitnessMeDialog(selectedOrphanCards.length)) return;
-        }
-    }
-
-    // If any selected findings are dead files, prompt for action
-    const selectedDeadCards = ids.filter(id => {
-        const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-        return card && card.dataset.jobId === 'dead_file_cleaner';
-    });
-    let deadFixAction = null;
-    if (selectedDeadCards.length > 0) {
-        deadFixAction = await _promptDeadFileAction();
-        if (!deadFixAction) return;
-    }
-
-    // If any selected findings are AcoustID mismatches, prompt for action
-    const selectedAcoustidCards = ids.filter(id => {
-        const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-        return card && card.dataset.jobId === 'acoustid_scanner';
-    });
-    let acoustidFixAction = null;
-    if (selectedAcoustidCards.length > 0) {
-        acoustidFixAction = await _promptAcoustidAction();
-        if (!acoustidFixAction) return;
-    }
-
-    // If any selected findings are discography backfill, prompt once (add-to-wishlist vs clear)
-    const selectedBackfillCards = ids.filter(id => {
-        const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-        return card && card.dataset.jobId === 'discography_backfill';
-    });
-    let backfillAction = null;
-    if (selectedBackfillCards.length > 0) {
-        backfillAction = await _promptDiscographyBackfillAction(selectedBackfillCards.length);
-        if (!backfillAction) return;
-    }
-
-    // If any selected findings are quality upgrades, prompt once (redownload/delete/ignore)
-    const selectedQualityCards = ids.filter(id => {
-        const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-        return card && card.dataset.jobId === 'quality_upgrade_scanner';
-    });
-    let qualityFixAction = null;
-    if (selectedQualityCards.length > 0) {
-        qualityFixAction = await _promptQualityUpgradeAction();
-        if (!qualityFixAction) return;
-    }
-
-    let fixed = 0, failed = 0, lastError = '';
-    showToast(`Fixing ${ids.length} findings…`, 'info');
-
-    for (const id of ids) {
-        try {
-            // Determine if this finding needs a specific action
-            const card = document.querySelector(`.repair-finding-card[data-id="${id}"]`);
-            const isOrphan = card && card.dataset.jobId === 'orphan_file_detector';
-            const isDead = card && card.dataset.jobId === 'dead_file_cleaner';
-            const isAcoustid = card && card.dataset.jobId === 'acoustid_scanner';
-            const isBackfill = card && card.dataset.jobId === 'discography_backfill';
-            const isQuality = card && card.dataset.jobId === 'quality_upgrade_scanner';
-
-            // Discography backfill "Just Clear" path uses the dismiss endpoint,
-            // not the fix endpoint — so handle it inline before the fix call.
-            if (isBackfill && backfillAction === 'dismiss') {
-                try {
-                    const resp = await fetch(`/api/repair/findings/${id}/dismiss`, { method: 'POST' });
-                    if (resp.ok) fixed++;
-                    else { failed++; lastError = 'dismiss failed'; }
-                } catch {
-                    failed++;
-                }
-                continue;
-            }
-
-            // Quality "Ignore" likewise dismisses rather than fixing.
-            if (isQuality && qualityFixAction === 'ignore') {
-                try {
-                    const resp = await fetch(`/api/repair/findings/${id}/dismiss`, { method: 'POST' });
-                    if (resp.ok) fixed++;
-                    else { failed++; lastError = 'dismiss failed'; }
-                } catch {
-                    failed++;
-                }
-                continue;
-            }
-
-            let body = {};
-            if (isOrphan && orphanFixAction) body = { fix_action: orphanFixAction };
-            else if (isDead && deadFixAction) body = { fix_action: deadFixAction };
-            else if (isAcoustid && acoustidFixAction) body = { fix_action: acoustidFixAction };
-            else if (isQuality && qualityFixAction) body = { fix_action: qualityFixAction };
-            // Discography backfill "Add to Wishlist" falls through with empty body
-            // — the fix handler already adds to wishlist by default.
-
-            const response = await fetch(`/api/repair/findings/${id}/fix`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            const result = await response.json();
-            if (result.success) fixed++;
-            else { failed++; lastError = result.error || 'unknown error'; }
-        } catch {
-            failed++;
-        }
-    }
-
-    _repairSelectedFindings.clear();
-    let fixMsg = `Fixed ${fixed}${failed ? `, ${failed} failed` : ''}`;
-    if (failed && lastError) fixMsg += `: ${lastError}`;
-    showToast(fixMsg, fixed > 0 ? 'success' : 'error');
-    loadRepairFindingsDashboard();
-    loadRepairFindings();
-    updateRepairStatus();
-}
-
-async function clearRepairFindings() {
-    const jobFilter = document.getElementById('repair-findings-job-filter');
-    const statusFilter = document.getElementById('repair-findings-status-filter');
-    const jobId = jobFilter ? jobFilter.value : '';
-    const status = statusFilter ? statusFilter.value : '';
-
-    const scopeLabel = jobId ? jobId.replace(/_/g, ' ') : 'all jobs';
-    const statusLabel = status ? ` (${status})` : '';
-    if (!await showConfirmDialog({
-        title: 'Clear Findings',
-        message: `Delete all findings for ${scopeLabel}${statusLabel}? This cannot be undone.`,
-        confirmText: 'Clear',
-        destructive: true
-    })) return;
-
-    try {
-        const body = {};
-        if (jobId) body.job_id = jobId;
-        if (status) body.status = status;
-
-        const response = await fetch('/api/repair/findings/clear', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-        const result = await response.json();
-        if (result.success) {
-            showToast(`Cleared ${result.deleted} findings`, 'success');
-        } else {
-            showToast(result.error || 'Failed to clear findings', 'error');
-        }
-        _repairSelectedFindings.clear();
-        loadRepairFindingsDashboard();
-        loadRepairFindings();
-        updateRepairStatus();
-    } catch (error) {
-        console.error('Error clearing findings:', error);
-        showToast('Error clearing findings', 'error');
-    }
-}
-
-async function loadRepairHistory() {
-    const container = document.getElementById('repair-history-list');
-    if (!container) return;
-
-    try {
-        const response = await fetch('/api/repair/history?limit=50');
-        if (!response.ok) throw new Error('Failed to fetch history');
-        const data = await response.json();
-        const runs = data.runs || [];
-
-        if (runs.length === 0) {
-            container.innerHTML = `<div class="repair-empty-state">
-                <div class="repair-empty-icon">&#128337;</div>
-                <div class="repair-empty-title">No History Yet</div>
-                <div class="repair-empty-text">Job run history will appear here after maintenance jobs complete their first scan.</div>
-            </div>`;
-            return;
-        }
-
-        container.innerHTML = runs.map(run => {
-            const duration = run.duration_seconds ? `${run.duration_seconds.toFixed(1)}s` : '-';
-            const age = formatCacheAge(run.started_at);
-            const statusClass = run.status === 'completed' ? 'success' :
-                run.status === 'failed' ? 'error' : 'running';
-
-            // Build stat pills
-            const stats = [];
-            stats.push(`<span class="repair-history-stat"><strong>${(run.items_scanned || 0).toLocaleString()}</strong> scanned</span>`);
-            if (run.findings_created) stats.push(`<span class="repair-history-stat findings"><strong>${run.findings_created}</strong> findings</span>`);
-            if (run.auto_fixed) stats.push(`<span class="repair-history-stat fixed"><strong>${run.auto_fixed}</strong> fixed</span>`);
-            if (run.errors) stats.push(`<span class="repair-history-stat errors"><strong>${run.errors}</strong> errors</span>`);
-
-            // Format timestamps
-            const startTime = run.started_at ? new Date(run.started_at).toLocaleString() : '-';
-            const endTime = run.finished_at ? new Date(run.finished_at).toLocaleString() : 'In progress';
-
-            return `<div class="repair-history-entry">
-                <div class="repair-history-header">
-                    <div class="repair-history-dot ${statusClass}"></div>
-                    <span class="repair-history-name">${run.display_name || run.job_id}</span>
-                    <span class="repair-history-status ${statusClass}">${run.status}</span>
-                    <span class="repair-history-duration">${duration}</span>
-                </div>
-                <div class="repair-history-stats">${stats.join('')}</div>
-                <div class="repair-history-meta">${age} &middot; ${startTime} &rarr; ${endTime}</div>
-            </div>`;
-        }).join('');
-
-    } catch (error) {
-        console.error('Error loading repair history:', error);
-        container.innerHTML = '<div class="repair-empty">Error loading history</div>';
-    }
-}
-
-// Initialize Repair Worker UI on page load
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => {
-        const button = document.getElementById('repair-button');
-        if (button) {
-            button.addEventListener('click', openRepairModal);
-            updateRepairStatus();
-            setInterval(updateRepairStatus, 5000);
-        }
-    });
-} else {
-    const button = document.getElementById('repair-button');
-    if (button) {
-        button.addEventListener('click', openRepairModal);
-        updateRepairStatus();
-        setInterval(updateRepairStatus, 5000);
     }
 }
 

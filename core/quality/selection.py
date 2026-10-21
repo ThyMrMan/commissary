@@ -73,7 +73,7 @@ def load_profile_by_id(profile_id) -> dict:
     shape as ``MusicDatabase.get_quality_profile()`` (``ranked_targets`` /
     ``fallback_enabled`` / ``search_mode`` / ``rank_candidates_by_quality``
     plus the full settings bundle — AcoustID strictness, downsample,
-    deep-verify, replace-lower, lossy-copy, folder-artist).
+    deep-verify, replace-lower, lossy-copy and release import policy).
 
     Falls back to the app-wide default profile when ``profile_id`` is falsy,
     not found, or on any error. This is THE resolution primitive of the
@@ -139,8 +139,51 @@ def quality_meets_profile(aq, targets: List[QualityTarget]) -> bool:
 _VALID_SEARCH_MODES = ("priority", "best_quality")
 
 
-def load_search_mode() -> str:
-    """Return the download search strategy from the user's quality profile.
+def profile_id_for_library_track(database, track_id, explicit=None):
+    """The Quality Profile a library track belongs to, or None for the default.
+
+    An explicit choice from the caller wins; otherwise the track's own
+    ``tracks.quality_profile_id`` answers. Resolving it server-side matters
+    most for redownload, which replaces a file and then deletes the original:
+    reading a profile only from the request body meant the shipped UI (which
+    sends none) ran that whole path on the app default, so a file the default
+    accepts could replace a track assigned something stricter.
+
+    Never raises. An unknown track, a missing column or an unavailable
+    database all mean "no answer", which is the app default, which is where
+    this lane already was.
+    """
+    if explicit is not None:
+        return explicit
+    if database is None or track_id in (None, ''):
+        return None
+    try:
+        # _get_connection, not get_connection. MusicDatabase has no public
+        # accessor, so the wrong name raised straight into the catch below and
+        # this answered None for every track, on the one lane that deletes the
+        # file it replaces. closing it is ours to do too, same as
+        # load_profile_by_id above.
+        conn = database._get_connection()
+        try:
+            row = conn.execute(
+                "SELECT quality_profile_id FROM tracks WHERE id = ?", (str(track_id),),
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:  # noqa: BLE001 - a lookup must not fail the request
+        logger.debug("track quality profile lookup failed for %s: %s", track_id, exc)
+        return None
+    if row is None:
+        return None
+    try:
+        value = row["quality_profile_id"]
+    except (IndexError, KeyError, TypeError):
+        value = row[0] if len(row) else None
+    return value
+
+
+def load_search_mode(profile_id=None) -> str:
+    """Return the download search strategy from the applicable profile.
 
     ``'priority'`` (default) keeps today's behaviour — the first source in the
     hybrid chain that meets a quality target wins. ``'best_quality'`` pools
@@ -148,10 +191,8 @@ def load_search_mode() -> str:
     quality. Any missing/unknown value resolves to ``'priority'`` so existing
     installs are unaffected.
     """
-    from database.music_database import MusicDatabase
-
     try:
-        profile = MusicDatabase().get_quality_profile()
+        profile = load_profile_by_id(profile_id)
         mode = profile.get("search_mode", "priority")
     except Exception:
         return "priority"

@@ -13,6 +13,7 @@ from __future__ import annotations
 from typing import Any, Callable, Optional
 
 from core.playlists.sources.base import (
+    SOURCE_BEATPORT,
     SOURCE_DEEZER,
     SOURCE_ITUNES_LINK,
     SOURCE_LASTFM,
@@ -23,7 +24,9 @@ from core.playlists.sources.base import (
     SOURCE_SPOTIFY_PUBLIC,
     SOURCE_TIDAL,
     SOURCE_YOUTUBE,
+    SOURCE_YTMUSIC,
 )
+from core.playlists.sources.beatport import BeatportPlaylistSource
 from core.playlists.sources.deezer import DeezerPlaylistSource
 from core.playlists.sources.itunes_link import ITunesLinkPlaylistSource
 from core.playlists.sources.lastfm import LastFMPlaylistSource
@@ -37,6 +40,7 @@ from core.playlists.sources.spotify import SpotifyPlaylistSource
 from core.playlists.sources.spotify_public import SpotifyPublicPlaylistSource
 from core.playlists.sources.tidal import TidalPlaylistSource
 from core.playlists.sources.youtube import YouTubePlaylistSource
+from core.playlists.sources.ytmusic import YTMusicPlaylistSource
 
 
 def build_playlist_source_registry(
@@ -47,6 +51,7 @@ def build_playlist_source_registry(
     deezer_client_getter: Callable[[], Any],
     itunes_link_parser: Optional[Callable[[str], Optional[dict]]] = None,
     youtube_parser: Optional[Callable[[str], Optional[dict]]] = None,
+    ytmusic_auth_getter: Optional[Callable[[], Optional[dict]]] = None,
     listenbrainz_manager_getter: Optional[Callable[[], Any]] = None,
     lastfm_manager_getter: Optional[Callable[[], Any]] = None,
     personalized_manager_getter: Optional[Callable[[], Any]] = None,
@@ -67,6 +72,7 @@ def build_playlist_source_registry(
     reg.register(SOURCE_DEEZER, lambda: DeezerPlaylistSource(deezer_client_getter))
     reg.register(SOURCE_TIDAL, lambda: TidalPlaylistSource(tidal_client_getter))
     reg.register(SOURCE_QOBUZ, lambda: QobuzPlaylistSource(qobuz_client_getter))
+    reg.register(SOURCE_BEATPORT, lambda: BeatportPlaylistSource())
 
     _no_url_parser = lambda url: None
     reg.register(
@@ -76,6 +82,12 @@ def build_playlist_source_registry(
     reg.register(
         SOURCE_ITUNES_LINK,
         lambda: ITunesLinkPlaylistSource(itunes_link_parser or _no_url_parser),
+    )
+
+    _no_auth = lambda: None
+    reg.register(
+        SOURCE_YTMUSIC,
+        lambda: YTMusicPlaylistSource(ytmusic_auth_getter or _no_auth),
     )
 
     _no_manager = lambda: None

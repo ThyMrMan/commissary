@@ -23,7 +23,7 @@ def _enable_login(monkeypatch):
     real_get = web_server.config_manager.get
     monkeypatch.setattr(web_server.config_manager, 'get',
                         lambda k, d=None: True if k == 'security.require_login' else real_get(k, d))
-    web_server._login_limiter.record_success('127.0.0.1')  # clean slate
+    web_server._login_limiter.reset()  # clean slate
 
 
 _GATED = '/api/profiles/me/connections'   # a normal, non-allowlisted endpoint
@@ -45,6 +45,41 @@ def test_login_gate_blocks_then_authenticated_access(client, monkeypatch):
     assert client.post('/api/auth/logout').get_json()['success'] is True
     assert client.get(_GATED).status_code == 401                       # logged out → blocked again
 
+def test_login_mode_profile_switch_requires_target_password(client, monkeypatch):
+    from uuid import uuid4
+    from werkzeug.security import generate_password_hash
+
+    db = web_server.get_database()
+    suffix = uuid4().hex[:8]
+    source = db.create_profile(name=f'SwitchSource{suffix}')
+    target = db.create_profile(
+        name=f'SwitchTarget{suffix}',
+        pin_hash=generate_password_hash('1234', method='pbkdf2:sha256'),
+    )
+    db.set_profile_password(source, 'sourcepw')
+    db.set_profile_password(target, 'targetpw')
+    _enable_login(monkeypatch)
+
+    login = client.post('/api/auth/login', json={'username': f'SwitchSource{suffix}', 'password': 'sourcepw'})
+    assert login.status_code == 200
+
+    missing = client.post('/api/profiles/select', json={'profile_id': target})
+    assert missing.status_code == 401
+    assert missing.get_json()['password_required'] is True
+    assert client.get('/api/profiles/current').get_json()['profile']['id'] == source
+
+    pin_only = client.post('/api/profiles/select', json={'profile_id': target, 'pin': '1234'})
+    assert pin_only.status_code == 401
+    assert pin_only.get_json()['password_required'] is True
+    assert client.get('/api/profiles/current').get_json()['profile']['id'] == source
+
+    wrong = client.post('/api/profiles/select', json={'profile_id': target, 'password': 'wrong'})
+    assert wrong.status_code == 401
+    assert client.get('/api/profiles/current').get_json()['profile']['id'] == source
+
+    ok = client.post('/api/profiles/select', json={'profile_id': target, 'password': 'targetpw'})
+    assert ok.status_code == 200 and ok.get_json()['success'] is True
+    assert client.get('/api/profiles/current').get_json()['profile']['id'] == target
 
 def test_login_is_case_insensitive_on_username(client, monkeypatch):
     db = web_server.get_database()
@@ -165,139 +200,79 @@ def test_set_recovery_endpoint(client):
     assert db.verify_profile_recovery_answer(pid, 'a') is True
 
 
-# ── Sign in with Plex ────────────────────────────────────────────────────────
+# ── GHSA-j7g5-8j44-jqhm security tests ────────────────────────────────────────
 
-def _enable_plex_login(monkeypatch, on=True):
-    real_get = web_server.config_manager.get
-    monkeypatch.setattr(web_server.config_manager, 'get',
-                        lambda k, d=None: on if k == 'security.allow_plex_login' else real_get(k, d))
+def test_unauthenticated_session_never_resolves_to_admin(client, monkeypatch):
+    """GHSA-j7g5-8j44-jqhm: an unauthenticated session must never receive profile 1 or admin rights."""
+    from core.profile_context import is_admin_request, get_current_profile_id
+    from flask import g
 
+    _enable_login(monkeypatch)
 
-class _FakePinLogin:
-    def __init__(self, pin='4242', token='FAKETOKEN', logged_in=True, expired=False):
-        self.pin = pin
-        self.token = token
-        self.expires_at = None
-        self._logged_in = logged_in
-        self.expired = expired
+    # 1. Unauthenticated request to /api/profiles/current (allowlisted GET for login state)
+    res = client.get('/api/profiles/current')
+    assert res.status_code == 200
+    assert res.get_json()['login_required'] is True
 
-    def checkLogin(self):
-        return self._logged_in
+    # 2. Inside an unauthenticated request context, verify is_admin_request() and profile id
+    with web_server.app.test_request_context('/api/profiles/current'):
+        # Simulate hook having run
+        web_server._set_profile_context()
+        assert g.profile_id is None
+        assert g.is_admin is False
+        assert get_current_profile_id() is None
+        assert is_admin_request() is False
 
-
-class _FakeAccount:
-    def __init__(self, id, title=None, username=None, thumb=None):
-        self.id = id
-        self.title = title
-        self.username = username
-        self.thumb = thumb
-
-
-def _start_plex_signin(client, monkeypatch, pinlogin):
-    monkeypatch.setattr(web_server, 'MyPlexPinLogin', lambda oauth=False: pinlogin)
-    r = client.post('/api/auth/plex/start')
-    assert r.status_code == 200 and r.get_json()['success'] is True
-    return r.get_json()['request_id']
+    # 3. Direct admin-only check: unauthenticated session receives 403 on admin-only endpoints
+    # even if outer login gate was bypassed
+    with web_server.app.test_request_context('/api/v1/api-keys-internal'):
+        web_server._set_profile_context()
+        assert is_admin_request() is False
 
 
-def test_plex_signin_disabled_by_default(client):
-    r = client.post('/api/auth/plex/start')
-    assert r.status_code == 403
+def test_require_login_fails_closed_on_config_read_exception(client, monkeypatch):
+    """GHSA-j7g5-8j44-jqhm: transient config read error must fail closed to last known value."""
+    _enable_login(monkeypatch)
+    assert web_server._require_login_enabled() is True
+
+    # Simulate a transient SQLite lock / error reading config
+    def _exploding_get(k, d=None):
+        raise RuntimeError("database is locked (transient lock simulation)")
+
+    monkeypatch.setattr(web_server.config_manager, 'get', _exploding_get)
+
+    # Must return last known value (True), NOT fail open to False
+    assert web_server._require_login_enabled() is True
+
+    # Unauthenticated request is still blocked with 401
+    assert client.get(_GATED).status_code == 401
 
 
-def test_plex_signin_matches_existing_linked_profile(client, monkeypatch):
+def test_ws_gate_fails_closed_on_error(monkeypatch):
+    """GHSA-j7g5-8j44-jqhm: WebSocket gate must fail closed when check encounters an exception."""
+    _enable_login(monkeypatch)
+
+    with web_server.app.test_request_context('/socket.io/'):
+        # Login mode active, unauthenticated session -> blocked
+        assert web_server._ws_connection_blocked() is True
+
+        # Unexpected exception during check -> must fail closed (True), not open (False)
+        monkeypatch.setattr(web_server, '_require_login_enabled', lambda: (_ for _ in ()).throw(RuntimeError("WS gate fault")))
+        assert web_server._ws_connection_blocked() is True
+
+
+def test_authenticated_admin_retains_admin_rights(client, monkeypatch):
+    """GHSA-j7g5-8j44-jqhm: legitimate authenticated admin still gets full admin access."""
     db = web_server.get_database()
-    pid = db.create_profile(name='PlexAlice', plex_account_id=101)
-    _enable_plex_login(monkeypatch)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
-    monkeypatch.setattr(web_server, 'MyPlexAccount',
-                        lambda token: _FakeAccount(101, title='PlexAlice', username='alice'))
+    admin_pid = 1
+    db.set_profile_password(admin_pid, 'adminpass123')
+    _enable_login(monkeypatch)
 
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    body = r.get_json()
-    assert r.status_code == 200 and body['success'] is True
-    assert body['is_new'] is False and body['profile']['id'] == pid
-    with client.session_transaction() as sess:
-        assert sess['login_authenticated'] is True and sess['profile_id'] == pid
-    # Only the one pre-existing profile is linked to this Plex account — no duplicate created.
-    assert sum(1 for p in db.get_all_profiles() if p.get('plex_account_id') == 101) == 1
+    # Login as admin
+    login_res = client.post('/api/auth/login', json={'username': 'Admin', 'password': 'adminpass123'})
+    assert login_res.status_code == 200
 
+    # Authenticated admin can access gated endpoint and admin-only endpoint
+    assert client.get(_GATED).status_code == 200
+    assert client.get('/api/v1/api-keys-internal').status_code == 200
 
-def test_plex_signin_auto_provisions_authorized_new_account(client, monkeypatch):
-    db = web_server.get_database()
-    _enable_plex_login(monkeypatch)
-    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: True)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
-    monkeypatch.setattr(web_server, 'MyPlexAccount',
-                        lambda token: _FakeAccount(202, title='NewPlexUser', username='newuser', thumb='http://t'))
-
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    body = r.get_json()
-    assert r.status_code == 200 and body['success'] is True and body['is_new'] is True
-    new_id = body['profile']['id']
-    created = db.get_profile(new_id)
-    assert created['plex_account_id'] == 202
-    assert created['allowed_sides'] == 'both' and created['can_download'] is False and created['is_admin'] is False
-    with client.session_transaction() as sess:
-        assert sess['profile_id'] == new_id
-
-
-def test_plex_signin_rejects_unauthorized_account_and_creates_no_profile(client, monkeypatch):
-    db = web_server.get_database()
-    before = len(db.get_all_profiles())
-    _enable_plex_login(monkeypatch)
-    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: False)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
-    monkeypatch.setattr(web_server, 'MyPlexAccount',
-                        lambda token: _FakeAccount(303, title='Stranger'))
-
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    assert r.status_code == 403
-    assert db.get_profile_by_plex_id(303) is None
-    assert len(db.get_all_profiles()) == before
-    with client.session_transaction() as sess:
-        assert 'login_authenticated' not in sess
-
-
-def test_plex_signin_name_collision_gets_suffix(client, monkeypatch):
-    db = web_server.get_database()
-    db.create_profile(name='Sam')   # local profile, not Plex-linked, same name as the incoming Plex title
-    _enable_plex_login(monkeypatch)
-    monkeypatch.setattr('core.plex_user_auth.plex_account_has_server_access', lambda pid, admin_token=None: True)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
-    monkeypatch.setattr(web_server, 'MyPlexAccount', lambda token: _FakeAccount(404, title='Sam'))
-
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    body = r.get_json()
-    assert r.status_code == 200 and body['success'] is True
-    assert body['profile']['name'] == 'Sam (Plex)'
-
-
-def test_plex_signin_expired_pin(client, monkeypatch):
-    _enable_plex_login(monkeypatch)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin(expired=True))
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    body = r.get_json()
-    assert body['success'] is False and body['expired'] is True
-
-
-def test_plex_signin_waiting_for_authorization(client, monkeypatch):
-    _enable_plex_login(monkeypatch)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin(logged_in=False))
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    body = r.get_json()
-    assert body['success'] is False and 'status' in body and 'error' not in body
-
-
-def test_plex_signin_status_disabled(client, monkeypatch):
-    _enable_plex_login(monkeypatch, on=True)
-    rid = _start_plex_signin(client, monkeypatch, _FakePinLogin())
-    _enable_plex_login(monkeypatch, on=False)   # disabled between start and poll
-    r = client.get(f'/api/auth/plex/status?request_id={rid}')
-    assert r.status_code == 403
-
-
-def test_profiles_current_reports_plex_login_enabled(client, monkeypatch):
-    _enable_plex_login(monkeypatch, on=True)
-    body = client.get('/api/profiles/current').get_json()
-    assert body.get('plex_login_enabled') is True

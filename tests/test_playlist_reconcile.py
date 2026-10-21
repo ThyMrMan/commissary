@@ -156,6 +156,66 @@ def test_borrow_skipped_when_server_track_has_no_thumb():
     assert not combined[0]["source_track"]["image_url"]
 
 
+# ── #1164: a bare title match is not a 100% match ─────────────────────────
+# nextfinish's screenshot: "XO" by John Mayer (3:34) paired with "XO" by
+# Eden Project (2:40), badge reading 100%. Pass 1 never looked at the artist.
+
+def test_same_title_different_artist_and_duration_is_not_a_match():
+    source = [_src("XO", "John Mayer", "s1", duration_ms=214000)]
+    server = [_svr("XO", "Eden Project", "jf1") | {"duration": 160000}]
+    combined = reconcile_playlist(source, server)
+    statuses = sorted(c["match_status"] for c in combined)
+    assert statuses == ["extra", "missing"], "title alone must not pair them"
+
+
+def test_same_title_different_artist_unknown_duration_is_not_a_match():
+    # No duration on either side -> nothing corroborates the pairing.
+    source = [_src("XO", "John Mayer", "s1")]
+    server = [_svr("XO", "Eden Project", "jf1")]
+    statuses = sorted(c["match_status"] for c in reconcile_playlist(source, server))
+    assert statuses == ["extra", "missing"]
+
+
+def test_alias_artists_with_matching_duration_pair_below_certainty():
+    # "mgk" and "Machine Gun Kelly" share no substring — the equal-length
+    # recording is what says they're the same track. Matched, but the badge
+    # must not read 100% for a corroborated guess.
+    source = [_src("sun to me", "mgk", "s1", duration_ms=180000)]
+    server = [_svr("sun to me", "Machine Gun Kelly", "jf1") | {"duration": 181000}]
+    c = reconcile_playlist(source, server)[0]
+    assert c["match_status"] == "matched"
+    assert c["confidence"] < 1.0
+
+
+def test_agreeing_artist_keeps_full_confidence():
+    source = [_src("XO", "Beyoncé", "s1")]
+    server = [_svr("XO", "Beyonce", "jf1")]
+    c = reconcile_playlist(source, server)[0]
+    assert c["match_status"] == "matched"
+    assert c["confidence"] == 1.0
+
+
+def test_artistless_source_still_title_matches():
+    # File imports often carry no artist — there is nothing to refute with,
+    # so the pre-#1164 behavior stands.
+    source = [_src("XO", "", "s1")]
+    server = [_svr("XO", "Eden Project", "jf1")]
+    assert reconcile_playlist(source, server)[0]["match_status"] == "matched"
+
+
+def test_two_same_title_tracks_pair_with_their_own_artists():
+    # Both XOs in one playlist: pass 1 used to bind each source to the FIRST
+    # unused title hit, crossing the pairs. The artist gate picks the owner.
+    source = [_src("XO", "John Mayer", "s1", duration_ms=214000),
+              _src("XO", "EDEN", "s2", duration_ms=160000)]
+    server = [_svr("XO", "EDEN", "jf-eden") | {"duration": 160000},
+              _svr("XO", "John Mayer", "jf-mayer") | {"duration": 214000}]
+    combined = reconcile_playlist(source, server)
+    pairs = {c["source_track"]["artist"]: c["server_track"]["id"]
+             for c in combined if c["match_status"] == "matched"}
+    assert pairs == {"John Mayer": "jf-mayer", "EDEN": "jf-eden"}
+
+
 def test_norm_title_helper_parity():
     assert norm_title("Stay (feat. X)") == "stay"
     assert norm_title("Song (2019 Remaster)") == "song"
@@ -236,7 +296,7 @@ def test_fast_fuzzy_pass_scores_identically_to_the_naive_matcher():
     from difflib import SequenceMatcher
 
     from core.sync.playlist_reconcile import (
-        _FUZZY_THRESHOLD, canonical_source_track, norm_title, reconcile_playlist,
+        _FUZZY_THRESHOLD, _artists_agree, _durations_agree, canonical_source_track, norm_title, reconcile_playlist,
     )
 
     rng = random.Random(1005)
@@ -269,6 +329,9 @@ def test_fast_fuzzy_pass_scores_identically_to_the_naive_matcher():
         for j, svr in enumerate(servers):
             if j in used:
                 continue
+            if not (_artists_agree(canon_artist, svr.get('artist', ''))
+                    or _durations_agree(src_entry.get('duration_ms'), svr.get('duration'))):
+                continue
             svr_key = f"{svr.get('artist', '')} {norm_title(svr.get('title', ''))}".strip().lower()
             score = SequenceMatcher(None, src_key, svr_key).ratio()
             if score > best and score >= _FUZZY_THRESHOLD:
@@ -292,3 +355,11 @@ def test_fast_fuzzy_pass_scores_identically_to_the_naive_matcher():
             used.add(j)
         else:
             assert j == -1, f"optimized pass missed a naive match: {e['source_track']['name']} -> {j}"
+
+
+def test_fuzzy_pass_cannot_bypass_artist_rejection_with_long_title():
+    title = "The Long Road Back to the Place We Called Home"
+    result = reconcile_playlist(
+        [{"name": title, "artist": "Madonna", "source_track_id": "source"}],
+        [{"title": title, "artist": "Radiohead", "id": "server"}])
+    assert [row["match_status"] for row in result] == ["missing", "extra"]

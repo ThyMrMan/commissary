@@ -1,0 +1,160 @@
+import { queryOptions } from '@tanstack/react-query';
+
+import { apiClient, readJson } from '@/app/api-client';
+
+import type {
+  WishlistBulkAction,
+  WishlistBulkResponse,
+  WishlistBulkResult,
+  WishlistCycleResponse,
+  WishlistRetryProfileResponse,
+  WishlistStatsResponse,
+  WishlistTracksResponse,
+} from './-wishlist.types';
+
+export const WISHLIST_QUERY_KEY = ['wishlist'] as const;
+
+// Like the watchlist endpoints, these resolve the profile from the Flask
+// SESSION rather than an X-Profile-Id header, so no profile header is sent.
+// The profile still keys every query — switching profiles must not serve the
+// previous profile's wishlist out of the cache.
+
+export function wishlistStatsQueryOptions(profileId: number) {
+  return queryOptions({
+    queryKey: [...WISHLIST_QUERY_KEY, 'stats', profileId] as const,
+    queryFn: () => readJson<WishlistStatsResponse>(apiClient.get('wishlist/stats')),
+  });
+}
+
+export function wishlistCycleQueryOptions(profileId: number) {
+  return queryOptions({
+    queryKey: [...WISHLIST_QUERY_KEY, 'cycle', profileId] as const,
+    queryFn: () => readJson<WishlistCycleResponse>(apiClient.get('wishlist/cycle')),
+  });
+}
+
+/**
+ * The wishlist retry profile: how long repeatedly-failing tracks cool down
+ * between scheduled cycles. The profile is global, not per-profile, but the
+ * query is still keyed by profile like every other wishlist query.
+ */
+export function wishlistRetryProfileQueryOptions(profileId: number) {
+  return queryOptions({
+    queryKey: [...WISHLIST_QUERY_KEY, 'retry-profile', profileId] as const,
+    queryFn: () => readJson<WishlistRetryProfileResponse>(apiClient.get('wishlist/retry-profile')),
+  });
+}
+
+/** Set the active retry profile by name; a custom ladder stays API-only. */
+export async function setWishlistRetryProfile(name: string): Promise<WishlistRetryProfileResponse> {
+  const payload = await readJson<WishlistRetryProfileResponse>(
+    apiClient.put('wishlist/retry-profile', { json: { profile: name } }),
+  );
+  assertSuccess(payload, 'Could not change the retry profile.');
+  return payload;
+}
+
+export function wishlistTracksQueryOptions(profileId: number, category: 'albums' | 'singles') {
+  return queryOptions({
+    queryKey: [...WISHLIST_QUERY_KEY, 'tracks', profileId, category] as const,
+    queryFn: () =>
+      readJson<WishlistTracksResponse>(
+        apiClient.get('wishlist/tracks', { searchParams: { category } }),
+      ),
+  });
+}
+
+/**
+ * Watchlist artist photos, used to upgrade the orb art.
+ *
+ * Optional decoration, so a failure resolves to an empty list rather than
+ * taking the page down — the vanilla loader caught this one specifically.
+ */
+export function wishlistArtistPhotosQueryOptions(profileId: number) {
+  return queryOptions({
+    queryKey: [...WISHLIST_QUERY_KEY, 'artist-photos', profileId] as const,
+    queryFn: async () => {
+      try {
+        const payload = await readJson<{
+          success?: boolean;
+          artists?: { artist_name?: string | null; image_url?: string | null }[];
+        }>(apiClient.get('watchlist/artists'));
+        return payload.success ? (payload.artists ?? []) : [];
+      } catch {
+        return [];
+      }
+    },
+  });
+}
+
+interface SuccessResponse {
+  success?: boolean;
+  error?: string;
+}
+
+function assertSuccess(payload: SuccessResponse, fallback: string): void {
+  if (payload.success === false) throw new Error(payload.error || fallback);
+}
+
+export async function removeWishlistAlbum(albumName: string): Promise<void> {
+  const payload = await readJson<SuccessResponse>(
+    apiClient.post('wishlist/remove-album', { json: { album_name: albumName } }),
+  );
+  assertSuccess(payload, 'Failed');
+}
+
+export async function removeWishlistTrack(trackId: string): Promise<void> {
+  const payload = await readJson<SuccessResponse>(
+    apiClient.post('wishlist/remove-track', { json: { spotify_track_id: trackId } }),
+  );
+  assertSuccess(payload, 'Failed');
+}
+
+/**
+ * Bulk queue action on selected wishlist tracks. 207 Multi-Status is NOT an
+ * error here — it carries the per-item results — so only transport errors
+ * (ky rejections on 4xx/5xx) throw. Callers read `results` either way.
+ */
+export async function bulkWishlistAction(
+  action: WishlistBulkAction,
+  trackIds: string[],
+): Promise<WishlistBulkResponse> {
+  return readJson<WishlistBulkResponse>(
+    apiClient.post('wishlist/bulk', { json: { action, track_ids: trackIds } }),
+  );
+}
+
+/**
+ * The bulk endpoint caps a call at 200 ids (400 beyond that), so big
+ * selections — a whole artist, every stuck track — are split into sequential
+ * chunks and the per-item `results` merged back together. A chunk that fails
+ * at the transport level aborts the rest; the error names how far it got so
+ * the toast can stay honest about partial progress.
+ */
+export const BULK_WISHLIST_MAX_IDS = 200;
+
+export async function bulkWishlistActionChunked(
+  action: WishlistBulkAction,
+  trackIds: string[],
+): Promise<WishlistBulkResponse> {
+  const results: WishlistBulkResult[] = [];
+  let batchId: string | undefined;
+  let done = 0;
+  for (let i = 0; i < trackIds.length; i += BULK_WISHLIST_MAX_IDS) {
+    const chunk = trackIds.slice(i, i + BULK_WISHLIST_MAX_IDS);
+    let response: WishlistBulkResponse;
+    try {
+      response = await bulkWishlistAction(action, chunk);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `Bulk ${action} stopped after ${done} of ${trackIds.length} tracks: ${reason}`,
+      );
+    }
+    done += chunk.length;
+    if (response.results) results.push(...response.results);
+    // Each chunk is its own download batch; keep the first id for reference.
+    if (response.batch_id && !batchId) batchId = response.batch_id;
+  }
+  return { success: true, batch_id: batchId, results };
+}

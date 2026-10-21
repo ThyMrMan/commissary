@@ -1,5 +1,5 @@
 /*
- * Commissary — Video settings additions (isolated).
+ * SoulSync — Video settings additions (isolated).
  *
  * The video side shows the real music settings page; this module only drives the
  * VIDEO-specific bits added to it — for now, the Movies/TV library mapping
@@ -23,10 +23,12 @@
     var _videoYtQuality = null;
     // Pretty labels for the source×resolution quality ladder (keys come from the backend).
     var TIER_LABEL = {
-        'remux-2160p': 'Remux · 4K', 'bluray-2160p': 'BluRay · 4K', 'web-2160p': 'WEB · 4K',
+        'remux-2160p': 'Remux · 4K', 'bluray-2160p': 'BluRay · 4K', 'web-2160p': 'WEB-DL · 4K',
+        'webrip-2160p': 'WEBRip · 4K', 'hdtv-2160p': 'HDTV · 4K',
         'remux-1080p': 'Remux · 1080p', 'bluray-1080p': 'BluRay · 1080p', 'web-1080p': 'WEB-DL · 1080p',
         'webrip-1080p': 'WEBRip · 1080p', 'hdtv-1080p': 'HDTV · 1080p',
-        'bluray-720p': 'BluRay · 720p', 'web-720p': 'WEB-DL · 720p', 'hdtv-720p': 'HDTV · 720p',
+        'bluray-720p': 'BluRay · 720p', 'web-720p': 'WEB-DL · 720p', 'webrip-720p': 'WEBRip · 720p',
+        'hdtv-720p': 'HDTV · 720p',
         'dvd': 'DVD', 'sdtv': 'SDTV'
     };
     var REJECT_LABEL = {
@@ -71,24 +73,36 @@
             })
             .catch(function () { showServerConfig('plex'); });
     }
+    // what the note under each server's fields says. a half-filled connection
+    // (url but no key, or key but no url) gets told what's still missing, so a
+    // save that only stored half of it doesn't read as done.
+    function connNote(server, hasUrl, hasSecret, inherited) {
+        var name = server === 'plex' ? 'Plex' : 'Jellyfin';
+        var secret = server === 'plex' ? 'token' : 'API key';
+        if (!hasUrl && !hasSecret) return 'Not connected — add a server URL and ' + secret + '.';
+        if (!hasSecret) return 'Add the ' + secret + ' to finish this connection.';
+        if (!hasUrl) return 'Add the server URL to finish this connection.';
+        if (inherited) return 'Inherited from your Music ' + name + ' connection — edit to use a different server for video.';
+        return 'Custom video connection.';
+    }
+    // never overwrite the field the user is typing in. a save fires on change, so
+    // this refresh can land while they're already filling in the next field.
+    function setConnValue(name, value) {
+        var el = connEl(name);
+        if (el && el !== document.activeElement) el.value = value;
+    }
     function loadConn() {
-        fetch(CONN_URL, { headers: { 'Accept': 'application/json' } })
+        return fetch(CONN_URL, { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d) return;
                 var p = d.plex || {}, j = d.jellyfin || {};
-                var pu = connEl('plex-url'); if (pu) pu.value = p.base_url || '';
-                var pt = connEl('plex-token'); if (pt) pt.value = p.has_token ? p.token : '';
-                var ju = connEl('jellyfin-url'); if (ju) ju.value = j.base_url || '';
-                var jk = connEl('jellyfin-key'); if (jk) jk.value = j.has_key ? j.api_key : '';
-                note('plex', p.base_url
-                    ? (p.inherited ? 'Inherited from your Music Plex connection — edit to use a different server for video.'
-                                   : 'Custom video connection.')
-                    : 'Not connected — add a server URL and token.');
-                note('jellyfin', j.base_url
-                    ? (j.inherited ? 'Inherited from your Music Jellyfin connection — edit to use a different server for video.'
-                                   : 'Custom video connection.')
-                    : 'Not connected — add a server URL and API key.');
+                setConnValue('plex-url', p.base_url || '');
+                setConnValue('plex-token', p.has_token ? p.token : '');
+                setConnValue('jellyfin-url', j.base_url || '');
+                setConnValue('jellyfin-key', j.has_key ? j.api_key : '');
+                note('plex', connNote('plex', !!p.base_url, !!p.has_token, !!p.inherited));
+                note('jellyfin', connNote('jellyfin', !!j.base_url, !!j.has_key, !!j.inherited));
             })
             .catch(function () { /* ignore */ });
     }
@@ -101,8 +115,10 @@
                 plex: { base_url: pu ? pu.value : '', token: pt ? pt.value : '' },
                 jellyfin: { base_url: ju ? ju.value : '', api_key: jk ? jk.value : '' }
             })
-        }).then(function () { loadConn(); if (!silent) toast('Connection saved', 'success'); })
-          .catch(function () { if (!silent) toast('Could not save connection', 'error'); });
+        }).then(function () {
+            if (!silent) toast('Connection saved', 'success');
+            return loadConn();       // refresh the notes once the save has landed
+        }).catch(function () { if (!silent) toast('Could not save connection', 'error'); });
     }
     // Toggle click: reveal that server's config immediately (like the music
     // toggle) and persist it as the active video server pick.
@@ -170,318 +186,25 @@
     }
 
     function status(text) {
-        var n = document.querySelector('[data-video-lib-status]');
+        var n = document.querySelector('[data-video-lib-save-status]');
         if (n) n.textContent = text || '';
     }
 
-    // The global Torrent Client category field (Settings → Connections →
-    // Torrent Client) — read live so a per-library category input can show
-    // it as the "blank = inherits X" placeholder.
-    function _globalTorrentCategory() {
-        var el = document.getElementById('torrent-client-category');
-        return (el && el.value.trim()) || 'soulsync';
-    }
-
-    // Each row = one discovered server section, optionally CONFIGURED as a
-    // Library (checked, with a rename + destination folder + torrent category).
-    // Text inputs stay hidden until checked, and only fire save() on 'change'
-    // (blur), never per keystroke, so typing a path never fights a re-render.
-    function libraryRow(title, configured, kind) {
-        var row = document.createElement('div');
-        row.className = 'library-editor-row';
-        row.dataset.serverTitle = title;
-        row.dataset.libId = (configured && configured.id) || '';
-
-        var top = document.createElement('label');
-        top.className = 'checkbox-label';
-        var box = document.createElement('input');
-        box.type = 'checkbox';
-        box.checked = !!configured;
-        box.setAttribute('data-lib-checkbox', '');
-        top.appendChild(box);
-        top.appendChild(document.createTextNode(title));
-        row.appendChild(top);
-
-        var fields = document.createElement('div');
-        fields.className = 'library-editor-fields';
-        fields.style.display = configured ? '' : 'none';
-
-        var labelInput = document.createElement('input');
-        labelInput.type = 'text';
-        labelInput.placeholder = 'Tab name (default: ' + title + ')';
-        labelInput.value = (configured && configured.label) || '';
-        labelInput.setAttribute('data-lib-label', '');
-        fields.appendChild(labelInput);
-
-        var pathInput = document.createElement('input');
-        pathInput.type = 'text';
-        pathInput.placeholder = 'Destination folder, e.g. /media/movies';
-        pathInput.value = (configured && configured.path) || '';
-        pathInput.setAttribute('data-lib-path', '');
-        fields.appendChild(pathInput);
-
-        var categoryInput = document.createElement('input');
-        categoryInput.type = 'text';
-        categoryInput.placeholder = 'Torrent category (blank = "' + _globalTorrentCategory() + '")';
-        categoryInput.title = 'Overrides the global Torrent Client category for grabs that land in this library.';
-        categoryInput.value = (configured && configured.category) || '';
-        categoryInput.setAttribute('data-lib-category', '');
-        fields.appendChild(categoryInput);
-
-        // Preferred trackers. This is stored as comma-separated Prowlarr indexer
-        // IDS, but the app never showed anyone what those ids were — so the field
-        // used to be a bare text box asking for a number you had no way to look
-        // up, and _norm_indexer_ids silently dropped anything non-numeric. Typing
-        // a tracker's NAME therefore saved as blank, which read as "it doesn't
-        // save". The value is still ids on the wire; the picker just supplies them.
-        var indexerIdsInput = document.createElement('input');
-        indexerIdsInput.type = 'text';
-        indexerIdsInput.placeholder = 'Trackers (blank = search all of them)';
-        indexerIdsInput.title = 'Prowlarr indexer(s) this library may be grabbed from. Blank searches every indexer.';
-        indexerIdsInput.value = (configured && configured.preferred_indexer_ids) || '';
-        indexerIdsInput.setAttribute('data-lib-indexer-ids', '');
-        fields.appendChild(indexerIdsInput);
-
-        // Default series type — TV libraries only (a film has no episode
-        // numbering). series_type decides how a release is SEARCHED for: anime
-        // by absolute number ('Show 1071'), dailies by air date, everything
-        // else by SxxExx. It was per-show and buried, so in practice it went
-        // unset — on the library this was built for, 565 of 571 shows in a
-        // Library called "Anime" had no type, and were all being hunted as
-        // standard SxxExx. A Library that exists to hold anime already knows.
-        // Applies only to shows here that have no type of their OWN.
-        if (kind === 'tv') {
-            var stWrap = document.createElement('label');
-            stWrap.className = 'library-series-type';
-            stWrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;font-size:12px;opacity:.85';
-            stWrap.appendChild(document.createTextNode('Shows here are'));
-            var stSel = document.createElement('select');
-            stSel.setAttribute('data-lib-series-type', '');
-            stSel.title = 'Applied to shows in this Library that have no series type of their own. '
-                        + 'Changes how releases are SEARCHED for, not where they are stored.';
-            [['', 'not assumed to be anything'],
-             ['standard', 'standard (S01E01)'],
-             ['daily', 'daily (by air date)'],
-             ['anime', 'anime (absolute numbering)']].forEach(function (o) {
-                var opt = document.createElement('option');
-                opt.value = o[0]; opt.textContent = o[1];
-                stSel.appendChild(opt);
-            });
-            stSel.value = (configured && configured.default_series_type) || '';
-            stWrap.appendChild(stSel);
-            fields.appendChild(stWrap);
-        }
-
-        // Default quality profile — every kind, unlike series type (a film has
-        // no episode numbering, but it certainly has a resolution). Profiles
-        // were per-TITLE only, so "everything in my 4K Library is judged at 4K"
-        // had to be said one title at a time — and a title not in the library
-        // yet had nowhere to say it at all, so its FIRST grab, the one that
-        // decides what actually lands on disk, was always judged by the global
-        // Default no matter which Library it was headed for.
-        // A title carrying a profile of its own still outranks this.
-        var qpWrap = document.createElement('label');
-        qpWrap.className = 'library-quality-profile';
-        qpWrap.style.cssText = 'display:flex;align-items:center;gap:8px;margin-top:6px;font-size:12px;opacity:.85';
-        qpWrap.appendChild(document.createTextNode('Judge titles here by'));
-        var qpSel = document.createElement('select');
-        qpSel.setAttribute('data-lib-quality-profile', '');
-        qpSel.title = 'The quality profile titles in this Library are grabbed and upgraded '
-                    + 'under. A title with a profile of its own overrides it. Set profiles up '
-                    + 'in the Quality section below.';
-        qpWrap.appendChild(qpSel);
-        fields.appendChild(qpWrap);
-        renderProfilePicker(qpSel, configured && configured.default_quality_profile_id);
-
-        // A VISIBLE label and explanation, not a tooltip on the input. The input
-        // is switched to type=hidden as soon as the checkbox picker renders, and
-        // a hidden input shows neither tooltip nor placeholder — so the previous
-        // wording vanished precisely when the checkboxes appeared, which is how
-        // a list of trackers with no caption came to read as a search filter it
-        // was not. Now it IS a filter, and the caption says so where it is read.
-        var trackerLabel = document.createElement('div');
-        trackerLabel.className = 'library-tracker-label';
-        trackerLabel.setAttribute('data-lib-trackers-label', '');
-        trackerLabel.innerHTML = '<strong>Trackers to search for this library</strong>' +
-            '<span>Tick the trackers this library may be grabbed from. Only those are ' +
-            'searched — automatic searches included. Leave every box unticked to search ' +
-            'all of them.</span>';
-        fields.appendChild(trackerLabel);
-
-        var trackerBox = document.createElement('div');
-        trackerBox.className = 'library-tracker-picker';
-        trackerBox.setAttribute('data-lib-trackers', '');
-        fields.appendChild(trackerBox);
-        renderTrackerPicker(trackerBox, indexerIdsInput);
-
-        row.appendChild(fields);
-        box.addEventListener('change', function () { fields.style.display = box.checked ? '' : 'none'; });
-        return row;
-    }
-
-    // The named quality profiles, fetched once per page and shared by every
-    // Library row's picker. Separate from loadQuality()'s fetch of the same
-    // endpoint: that one drives the profile EDITOR further down the page and
-    // only runs when that section opens, so a Library row cannot wait on it.
-    // null = not fetched yet, [] = unreachable.
-    var _qProfiles = null;
-    var _qProfilesPromise = null;
-
-    function loadQualityProfileList() {
-        if (_qProfiles !== null) return Promise.resolve(_qProfiles);
-        if (_qProfilesPromise) return _qProfilesPromise;
-        _qProfilesPromise = fetch(QUALITY_URL + '/profiles', { headers: { Accept: 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { _qProfiles = (d && d.profiles) || []; return _qProfiles; })
-            .catch(function () { _qProfiles = []; return _qProfiles; });
-        return _qProfilesPromise;
-    }
-
-    function renderProfilePicker(sel, currentId) {
-        // "no Library default" is a real choice, not an absence — it means every
-        // title here falls through to the global Default profile, which is what
-        // this install did before a Library could carry one. Profile id 0 IS that
-        // global Default, so it is dropped from the list rather than offered as a
-        // second option that does the same thing under a different name.
-        var cur = parseInt(currentId, 10) || 0;
-        var head = function (on) {
-            return '<option value="0"' + (on ? ' selected' : '') + '>no Library default</option>';
-        };
-        sel.innerHTML = head(!cur);
-        loadQualityProfileList().then(function (list) {
-            if (!sel.isConnected) return;
-            sel.innerHTML = head(!cur) + list.filter(function (p) { return p.id > 0; })
-                .map(function (p) {
-                    return '<option value="' + p.id + '"' + (p.id === cur ? ' selected' : '') +
-                        '>' + esc(p.name) + '</option>';
-                }).join('');
-        });
-    }
-
-    // Prowlarr's indexer list, fetched once per page and shared by every Library
-    // row's picker. null = not fetched yet, [] = Prowlarr unconfigured/unreachable.
-    var _indexers = null;
-    var _indexersPromise = null;   // in-flight dedupe: every Library row asks at once
-
-    function loadIndexers() {
-        if (_indexers !== null) return Promise.resolve(_indexers);
-        if (_indexersPromise) return _indexersPromise;
-        _indexersPromise = fetch('/api/video/downloads/indexers', { headers: { Accept: 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { _indexers = (d && d.indexers) || []; return _indexers; })
-            .catch(function () { _indexers = []; return _indexers; });
-        return _indexersPromise;
-    }
-
-    function _selectedIds(input) {
-        return String(input.value || '').split(',')
-            .map(function (s) { return s.trim(); })
-            .filter(function (s) { return s; });
-    }
-
-    function renderTrackerPicker(box, input) {
-        loadIndexers().then(function (list) {
-            if (!box.isConnected) return;
-            if (!list.length) {
-                // No Prowlarr, or it couldn't be reached. Keep the text field
-                // usable rather than hiding the setting entirely.
-                box.innerHTML = '<div class="library-tracker-empty">Connect Prowlarr to pick trackers ' +
-                    'by name. Until then this field takes indexer IDs.</div>';
-                input.placeholder = 'Trackers to search (indexer IDs, e.g. 1,3 — blank = all)';
-                return;
-            }
-            // The picker owns the value from here, so the raw id box is redundant.
-            input.type = 'hidden';
-            var sel = _selectedIds(input);
-            box.innerHTML = list.map(function (ix) {
-                var on = sel.indexOf(String(ix.id)) !== -1;
-                return '<label class="library-tracker' + (on ? ' library-tracker--on' : '') + '">' +
-                    '<input type="checkbox" data-lib-tracker="' + ix.id + '"' + (on ? ' checked' : '') + '>' +
-                    '<span>' + esc(ix.name) + '</span>' +
-                    '<em>' + esc(ix.protocol || '') + (ix.enable ? '' : ' · disabled') + '</em></label>';
-            }).join('');
-            box.addEventListener('change', function (e) {
-                var cb = e.target.closest('[data-lib-tracker]');
-                if (!cb) return;
-                var picked = [];
-                box.querySelectorAll('[data-lib-tracker]').forEach(function (c) {
-                    if (c.checked) picked.push(c.getAttribute('data-lib-tracker'));
-                });
-                input.value = picked.join(',');
-                cb.closest('.library-tracker').classList.toggle('library-tracker--on', cb.checked);
-            });
-        });
-    }
-
-    function fill(group, items, configured, kind) {
-        if (!group) return;
-        group.textContent = '';
-        items = items || [];
-        if (!items.length) {
-            group.textContent = 'No libraries found on this server.';
-            return;
-        }
-        var seen = {};
-        (configured || []).forEach(function (c) {
-            group.appendChild(libraryRow(c.server_title, c, kind));
-            seen[c.server_title] = true;
-        });
-        items.forEach(function (it) {
-            if (!seen[it.title]) group.appendChild(libraryRow(it.title, null, kind));
-        });
-    }
-
-    function collectLibraries(group) {
-        if (!group) return [];
-        var rows = group.querySelectorAll('.library-editor-row');
-        var out = [];
-        for (var i = 0; i < rows.length; i++) {
-            var row = rows[i];
-            var box = row.querySelector('[data-lib-checkbox]');
-            if (!box || !box.checked) continue;
-            var labelInput = row.querySelector('[data-lib-label]');
-            var pathInput = row.querySelector('[data-lib-path]');
-            var categoryInput = row.querySelector('[data-lib-category]');
-            var indexerIdsInput = row.querySelector('[data-lib-indexer-ids]');
-            out.push({
-                id: row.dataset.libId ? parseInt(row.dataset.libId, 10) : null,
-                server_title: row.dataset.serverTitle,
-                label: labelInput ? labelInput.value.trim() : '',
-                path: pathInput ? pathInput.value.trim() : '',
-                category: categoryInput ? categoryInput.value.trim() : '',
-                preferred_indexer_ids: indexerIdsInput ? indexerIdsInput.value.trim() : '',
-                default_series_type: (function () {
-                    var el = row.querySelector('[data-lib-series-type]');
-                    return el ? el.value : '';
-                })(),
-                default_quality_profile_id: (function () {
-                    var el = row.querySelector('[data-lib-quality-profile]');
-                    return el ? (parseInt(el.value, 10) || 0) : 0;
-                })()
-            });
-        }
-        return out;
-    }
-
-    // After a save, stamp back the (possibly new) row ids from the response so
-    // a later edit UPDATES instead of creating a duplicate — no DOM rebuild
-    // (would steal focus mid-edit), just a data-attribute patch.
-    function reconcileIds(group, configured) {
-        if (!group || !configured) return;
-        var byTitle = {};
-        configured.forEach(function (c) { byTitle[c.server_title] = c; });
-        var rows = group.querySelectorAll('.library-editor-row');
-        for (var i = 0; i < rows.length; i++) {
-            var match = byTitle[rows[i].dataset.serverTitle];
-            rows[i].dataset.libId = match ? match.id : '';
+    function fill(select, items, selected) {
+        if (!select) return;
+        select.textContent = '';
+        var none = document.createElement('option');
+        none.value = '';
+        none.textContent = '— None —';
+        select.appendChild(none);
+        for (var i = 0; i < items.length; i++) {
+            var opt = document.createElement('option');
+            opt.value = items[i].title;
+            opt.textContent = items[i].title;
+            if (items[i].title === selected) opt.selected = true;
+            select.appendChild(opt);
         }
     }
-
-    // The YouTube Libraries editor lived here. Its rows round-tripped into
-    // root_folders but nothing ever read them back (primary_root_folder maps
-    // only movie/show), so the folder you typed did nothing — the real
-    // destination is the youtube_path scalar (Settings → Downloads). Removed
-    // rather than left half-wired; per-channel routing is its own feature.
 
     function load() {
         status('Loading…');
@@ -489,78 +212,31 @@
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d || d.error) { status('Could not load libraries'); return; }
-                var cfg = d.configured || {};
-                fill(document.querySelector('[data-video-lib-group="movies"]'), d.movies || [], cfg.movies, 'movies');
-                fill(document.querySelector('[data-video-lib-group="tv"]'), d.tv || [], cfg.tv, 'tv');
-                        status('');
-                probeLibraries();
+                var sel = d.selected || {};
+                fill(document.querySelector('[data-video-lib-select="movies"]'), d.movies || [], sel.movies);
+                fill(document.querySelector('[data-video-lib-select="tv"]'), d.tv || [], sel.tv);
+                if (!(d.movies || []).length && !(d.tv || []).length) {
+                    status('No movie or TV libraries found. Check the server connection and that the user above can see them.');
+                } else if (!sel.movies && !sel.tv) {
+                    status('Pick a library or the scan has nothing to read.');
+                } else {
+                    status('');
+                }
             })
             .catch(function () { status('Could not load libraries'); });
     }
 
-    // A destination the server can't write to is the one failure that looks
-    // like nothing at all: the grab succeeds, the import fails, and the folder
-    // just stays empty. Ask the server whether each Library actually works and
-    // say so on the row, rather than leaving it to be found in app.log.
-    function probeLibraries() {
-        fetch('/api/video/libraries/probe', { headers: { 'Accept': 'application/json' } })
-            // Admin-only. A non-admin on this page simply gets no badges
-            // instead of a console error and a page that looks broken.
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                if (!d || !d.success) return;
-                var byPath = {};
-                Object.keys(d.configured || {}).forEach(function (kind) {
-                    (d.configured[kind] || []).forEach(function (e) {
-                        byPath[String(e.path || '')] = e;
-                    });
-                });
-                document.querySelectorAll('[data-video-lib-group] .library-editor-row')
-                    .forEach(function (row) {
-                        var input = row.querySelector('[data-lib-path]');
-                        applyLibraryProbe(row, input ? byPath[input.value.trim()] : null);
-                    });
-            })
-            .catch(function () { /* the probe is advisory; never break the page over it */ });
-    }
-
-    function applyLibraryProbe(row, probe) {
-        var head = row.querySelector('.checkbox-label');
-        if (!head) return;
-        var badge = row.querySelector('.video-lib-write-badge');
-        // An unconfigured row has no path to test, and a writable one is the
-        // expected state — decorating it would bury the row that needs
-        // attention. Only the broken case gets a badge.
-        if (!probe || probe.writable) { if (badge) badge.remove(); return; }
-        if (!badge) {
-            badge = document.createElement('span');
-            badge.className = 'video-lib-write-badge';
-            head.appendChild(badge);
-        }
-        badge.textContent = 'NOT WRITABLE';
-        badge.title = probe.detail || '';
-    }
-
     function save(silent) {
-        var m = document.querySelector('[data-video-lib-group="movies"]');
-        var t = document.querySelector('[data-video-lib-group="tv"]');
+        var m = document.querySelector('[data-video-lib-select="movies"]');
+        var t = document.querySelector('[data-video-lib-select="tv"]');
         status('Saving…');
         return fetch(URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-            body: JSON.stringify({ movies: collectLibraries(m), tv: collectLibraries(t) })
+            body: JSON.stringify({ movies: m ? m.value : '', tv: t ? t.value : '' })
         })
             .then(function (r) { return r.json(); })
-            .then(function (d) {
-                if (d && d.configured) {
-                    reconcileIds(m, d.configured.movies);
-                    reconcileIds(t, d.configured.tv);
-                }
-                // Re-probe: the paths may have just changed, and a stale badge
-                // is worse than none — it would vouch for an untested folder.
-                probeLibraries();
-                status('Saved'); if (!silent) toast('Libraries saved', 'success');
-            })
+            .then(function () { status('Saved'); if (!silent) toast('Library selection saved', 'success'); })
             .catch(function () { status('Save failed'); if (!silent) toast('Could not save libraries', 'error'); });
     }
 
@@ -580,6 +256,10 @@
                 if (fa && d.fanart_api_key != null) fa.value = d.fanart_api_key;
                 var sub = document.getElementById('opensubtitles-api-key');
                 if (sub && d.opensubtitles_api_key != null) sub.value = d.opensubtitles_api_key;
+                var sdl = document.getElementById('subdl-api-key');
+                if (sdl && d.subdl_api_key != null) sdl.value = d.subdl_api_key;
+                var sso = document.getElementById('subsource-api-key');
+                if (sso && d.subsource_api_key != null) sso.value = d.subsource_api_key;
                 var trakt = document.getElementById('trakt-api-key');
                 if (trakt && d.trakt_api_key != null) trakt.value = d.trakt_api_key;
                 var mdbl = document.getElementById('mdblist-api-key');
@@ -623,35 +303,161 @@
     var SRC_DL_EMOJI = { soulseek: '🎵', torrent: '🧲', usenet: '📰' };
     var _videoMode = 'soulseek';
     var _videoHybrid = ['soulseek'];
+    // per indexer seed rules, keyed by prowlarr indexer id. blank field = inherit
+    // the global goal, 0 = exempt this tracker from it. keep those different.
+    var _videoSeedRules = {};
+    var _videoSeedIndexers = null;      // null = not loaded yet
 
-    function loadDownloads() {
-        fetch(DOWNLOADS_URL, { headers: { 'Accept': 'application/json' } })
+    function _seedRuleVal(id, field) {
+        var r = _videoSeedRules[String(id)] || {};
+        return (r[field] === undefined || r[field] === null) ? '' : r[field];
+    }
+
+    function seedIndexerRow(idx) {
+        var e = function (v) {
+            return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) {
+                return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+            });
+        };
+        var num = function (field, ph, step) {
+            return '<input type="number" min="0" step="' + step + '" placeholder="' + ph + '" ' +
+                'data-vseed-idx="' + e(idx.id) + '" data-vseed-field="' + field + '" ' +
+                'value="' + e(_seedRuleVal(idx.id, field)) + '" style="max-width:78px;">';
+        };
+        return '<div class="ind-indexer-card" style="gap:8px; flex-wrap:wrap;">' +
+            '<span class="ind-indexer-card-id">#' + e(idx.id) + '</span>' +
+            '<span class="ind-indexer-card-name">' + e(idx.name) + '</span>' +
+            (idx.privacy ? '<span class="ind-indexer-card-privacy">' + e(idx.privacy) + '</span>' : '') +
+            '<span style="margin-left:auto; display:flex; gap:6px; align-items:center;">' +
+            '<span class="settings-hint">Ratio</span>' + num('ratio', 'inherit', '0.1') +
+            '<span class="settings-hint">Hours</span>' + num('hours', 'inherit', '1') +
+            '<span class="settings-hint">Pack hrs</span>' + num('pack_hours', 'same', '1') +
+            '</span></div>';
+    }
+
+    function renderSeedIndexers() {
+        var host = document.getElementById('video-seed-idx-rows');
+        if (!host) return;
+        if (_videoSeedIndexers === null) return;
+        if (!_videoSeedIndexers.length) {
+            host.innerHTML = '<em class="settings-hint">No torrent indexers in Prowlarr. ' +
+                'Usenet never seeds, so only torrent indexers show here.</em>';
+            return;
+        }
+        host.innerHTML = _videoSeedIndexers.map(seedIndexerRow).join('');
+    }
+
+    function loadSeedIndexers() {
+        var host = document.getElementById('video-seed-idx-rows');
+        if (host) host.innerHTML = '<em class="settings-hint">Loading…</em>';
+        fetch('/api/prowlarr/indexers', { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
-                if (!d) return;
+                if (!d || !d.success) {
+                    if (host) host.innerHTML = '<em class="settings-hint">Prowlarr isn\'t configured yet ' +
+                        '(Settings → Indexers &amp; Downloaders).</em>';
+                    return;
+                }
+                // usenet has no seeding, so don't offer rules that can never fire
+                _videoSeedIndexers = (d.indexers || []).filter(function (i) { return i.protocol !== 'usenet'; });
+                renderSeedIndexers();
+            })
+            .catch(function () {
+                if (host) host.innerHTML = '<em class="settings-hint">Couldn\'t reach Prowlarr.</em>';
+            });
+    }
+
+    function wireSeedIndexers() {
+        var host = document.getElementById('video-seed-idx-rows');
+        if (!host || host._vseedWired) return;
+        host._vseedWired = true;
+        host.addEventListener('change', function (e) {
+            var id = e.target && e.target.getAttribute('data-vseed-idx');
+            if (!id) return;
+            var field = e.target.getAttribute('data-vseed-field');
+            var raw = String(e.target.value || '').trim();
+            var rule = _videoSeedRules[id] || (_videoSeedRules[id] = {});
+            if (raw === '') { delete rule[field]; }          // blank = inherit
+            else { rule[field] = field === 'ratio' ? parseFloat(raw) : parseInt(raw, 10); }
+            if (!Object.keys(rule).length) delete _videoSeedRules[id];
+            saveDownloads(true);
+        });
+        var btn = document.getElementById('video-seed-idx-refresh');
+        if (btn && !btn._vseedWired) { btn._vseedWired = true; btn.addEventListener('click', loadSeedIndexers); }
+    }
+
+    function addVideoPathRow(host, value) {
+        var row = document.createElement('div');
+        row.style.cssText = 'display:flex;gap:8px;align-items:center;margin-bottom:8px';
+        var input = document.createElement('input');
+        input.type = 'text';
+        input.value = value || '';
+        input.placeholder = host.dataset.videoExtraKind === 'movies' ? '/media/movies2' : '/media/tv2';
+        input.setAttribute('aria-label', host.dataset.videoExtraKind === 'movies' ? 'Additional movie library path' : 'Additional TV library path');
+        input.style.cssText = 'flex:1;min-width:0';
+        input.addEventListener('change', function () { saveDownloads(true); });
+        var remove = document.createElement('button');
+        remove.type = 'button';
+        remove.className = 'test-button';
+        remove.textContent = 'Remove';
+        remove.setAttribute('aria-label', 'Remove library path');
+        remove.addEventListener('click', function () { row.remove(); saveDownloads(true); });
+        if (host.closest('[aria-busy="true"]')) {
+            [input, remove].forEach(function (control) {
+                control.setAttribute('data-library-disabled', 'false');
+                control.disabled = true;
+            });
+        }
+        row.appendChild(input);
+        row.appendChild(remove);
+        host.appendChild(row);
+        return input;
+    }
+
+    function loadVideoPaths(kind, paths) {
+        var host = document.getElementById('video-' + kind + '-additional-paths');
+        if (!host) return;
+        host.replaceChildren();
+        (Array.isArray(paths) ? paths : []).forEach(function (path) { addVideoPathRow(host, path); });
+        host.dataset.loaded = 'true';
+    }
+
+    function collectVideoPaths(kind) {
+        var host = document.getElementById('video-' + kind + '-additional-paths');
+        if (!host || host.dataset.loaded !== 'true') return undefined;
+        return Array.from(host.querySelectorAll('input')).map(function (input) { return input.value.trim(); }).filter(Boolean);
+    }
+
+    function loadDownloads() {
+        return fetch(DOWNLOADS_URL, { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!d) return false;
                 var setP = function (id, v) { var el = document.getElementById(id); if (el && v != null) el.value = v; };
                 setP('video-download-path', d.download_path);
                 setP('video-movies-path', d.movies_path);
                 setP('video-tv-path', d.tv_path);
+                loadVideoPaths('movies', d.movies_additional_paths);
+                loadVideoPaths('tv', d.tv_additional_paths);
                 setP('video-youtube-path', d.youtube_path);
-                var sp = document.getElementById('video-season-packs');
-                if (sp && d.season_packs != null) sp.checked = !!d.season_packs;
-                var spMin = document.getElementById('video-season-pack-min');
-                if (spMin && d.season_pack_min_episodes != null) spMin.value = d.season_pack_min_episodes;
-                var spMode = document.getElementById('video-season-pack-mode');
-                if (spMode && d.season_pack_mode) spMode.value = d.season_pack_mode;
-                updateSeasonPackUI();
                 _videoMode = d.download_mode || 'soulseek';
                 _videoHybrid = (d.hybrid_order && d.hybrid_order.length) ? d.hybrid_order : ['soulseek'];
                 var ms = document.getElementById('video-download-mode');
                 if (ms) ms.value = _videoMode;
-                // The seeding goals are SHARED with music (one torrent client, one
-                // set of goals) and are rendered by the data-shared Torrent Client
-                // section, loaded and saved by settings.js. Nothing to do here.
+                setP('video-seed-ratio', d.seed_ratio_goal != null ? d.seed_ratio_goal : 0);
+                setP('video-seed-hours', d.seed_time_goal_hours != null ? d.seed_time_goal_hours : 0);
+                var srd = document.getElementById('video-seed-remove-data');
+                if (srd) srd.checked = d.seed_remove_data !== false;
+                var smd = document.getElementById('video-seed-mode');
+                if (smd) smd.value = d.seed_mode || 'soulsync';
+                _videoSeedRules = d.seed_overrides || {};
+                renderSeedIndexers();
+                wireSeedIndexers();
                 renderVideoHybrid();
                 updateVideoSourceUI();
+                return true;
             })
-            .catch(function () { /* ignore */ });
+            .catch(function () { return false; });
     }
 
     function saveDownloads(silent) {
@@ -662,21 +468,21 @@
                 download_path: val('video-download-path'),
                 movies_path: val('video-movies-path'),
                 tv_path: val('video-tv-path'),
+                movies_additional_paths: collectVideoPaths('movies'),
+                tv_additional_paths: collectVideoPaths('tv'),
                 youtube_path: val('video-youtube-path'),
-                download_mode: _videoMode,
-                hybrid_order: _videoHybrid,
-                season_packs: !!(document.getElementById('video-season-packs') || {}).checked,
-                // Blank/NaN keeps the stored value rather than posting a 0 the
-                // normalizer would floor to 2 — an empty box is "didn't say",
-                // not "every season, however few episodes are missing".
-                season_pack_min_episodes: (function () {
-                    var el = document.getElementById('video-season-pack-min');
-                    var n = el ? parseInt(el.value, 10) : NaN;
-                    return Number.isFinite(n) ? n : undefined;
-                })(),
-                season_pack_mode: (document.getElementById('video-season-pack-mode') || {}).value || 'prefer',
-                // seed_* deliberately omitted — shared with music, saved by the
-                // data-shared Torrent Client section via /api/settings.
+                // download_mode / hybrid_order are NOT sent from here any more.
+                // The shared download-chain widget owns them and writes them
+                // straight to this endpoint. _videoMode/_videoHybrid only refresh
+                // when this file loads, so sending them meant that changing a
+                // folder path or a seed ratio re-posted a stale chain and silently
+                // undid whatever the widget had just saved. The endpoint only
+                // persists keys that are present, so leaving them out is safe.
+                seed_ratio_goal: parseFloat(val('video-seed-ratio')) || 0,
+                seed_time_goal_hours: parseInt(val('video-seed-hours'), 10) || 0,
+                seed_remove_data: !!(document.getElementById('video-seed-remove-data') || {}).checked,
+                seed_mode: val('video-seed-mode') || 'soulsync',
+                seed_overrides: _videoSeedRules,
             })
         }).then(function () { if (!silent) toast('Download folders saved', 'success'); })
           .catch(function () { /* ignore */ });
@@ -790,10 +596,6 @@
         video_download_completed: 'Imported', video_upgrade_completed: 'Upgraded',
         video_import_failed: 'Import failed', video_download_failed: 'Failed',
         video_wishlist_item_added: 'Wishlisted', video_watchlist_added: 'Followed',
-        // The event list itself comes from the server; this map is only labels,
-        // and an unlisted event falls back to its raw key — so a new one has to
-        // be added here or the checkbox reads 'video_request_pending'.
-        video_request_pending: 'Needs approval',
     };
 
     function loadNotify() {
@@ -972,15 +774,6 @@
         if (sc) sc.style.display = soulseekActive() ? 'block' : 'none';
     }
 
-    // The threshold and fallback-mode controls only mean anything while packs
-    // are on, so they stay hidden until they do — same pattern as the hybrid
-    // chain above.
-    function updateSeasonPackUI() {
-        var on = !!(document.getElementById('video-season-packs') || {}).checked;
-        var opts = document.getElementById('video-season-pack-opts');
-        if (opts) opts.style.display = on ? '' : 'none';
-    }
-
     // ── Shared slskd connection (writes the app-wide soulseek.* — affects Music too) ──
     function _byId(id) { return document.getElementById(id); }
     function loadSlskd() {
@@ -1004,6 +797,9 @@
 
     function _num(id, dflt) { var el = _byId(id); var v = el ? parseInt(el.value, 10) : NaN; return Number.isFinite(v) ? v : dflt; }
 
+    // nothing calls this any more, on purpose. the Sources tab's Soulseek card
+    // is the only editor now, and these hidden fields hold a stale copy. left
+    // here so the shape of the retired form stays readable, do not re-wire it.
     function saveSlskd(silent) {
         var url = _byId('video-slskd-url');
         if (!url) return Promise.resolve();   // section not in DOM
@@ -1031,17 +827,20 @@
             'video-slskd-download-timeout', 'video-slskd-auto-clear'];
         ids.forEach(function (id) {
             var el = _byId(id);
-            if (el && !el._vsWired) { el._vsWired = true; el.addEventListener('change', function () { saveSlskd(true); }); }
+            // retired form: the fields are hidden, so a change event can only come
+            // from code, and any write from here races the music panel's own save
+            if (el && !el._vsWired) { el._vsWired = true; }
         });
     }
 
     function wireDownloads() {
-        ['video-season-packs', 'video-season-pack-min', 'video-season-pack-mode'].forEach(function (id) {
-            var el = document.getElementById(id);
-            if (el && !el._vdWired) {
-                el._vdWired = true;
-                el.addEventListener('change', function () { updateSeasonPackUI(); saveDownloads(true); });
-            }
+        document.querySelectorAll('[data-video-add-path]').forEach(function (button) {
+            if (button._vdWired) return;
+            button._vdWired = true;
+            button.addEventListener('click', function () {
+                var host = document.getElementById('video-' + button.dataset.videoAddPath + '-additional-paths');
+                if (host && host.dataset.loaded === 'true') addVideoPathRow(host, '').focus();
+            });
         });
         var ms = document.getElementById('video-download-mode');
         if (ms && !ms._vdWired) {
@@ -1127,9 +926,7 @@
                 if (!d) return;
                 _vqFormats = d.formats || [];
                 renderFormats();
-                renderPreferredGroups();
                 wireFormats();
-                wireGroups();
             })
             .catch(function () { /* ignore */ });
     }
@@ -1140,7 +937,7 @@
         var overrides = (_videoQuality && _videoQuality.format_scores) || {};
         host.innerHTML = _vqFormats.map(function (f) {
             var ov = overrides[String(f.id)];
-            return '<div class="vq-fmt-row" data-vq-fmt="' + f.id + '" data-vq-fmt-kind="' + escA(f.kind || 'custom') + '">' +
+            return '<div class="vq-fmt-row" data-vq-fmt="' + f.id + '">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="name" value="' + escA(f.name) + '" placeholder="Name">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="include" value="' + escA((f.include || []).join(', ')) + '" placeholder="match: term, /regex/">' +
                 '<input class="vq-fmt-in" data-vq-fmt-f="exclude" value="' + escA((f.exclude || []).join(', ')) + '" placeholder="never: term, /regex/">' +
@@ -1160,69 +957,7 @@
         var split = function (s) { return s.split(',').map(function (x) { return x.trim(); }).filter(Boolean); };
         return { id: parseInt(row.getAttribute('data-vq-fmt'), 10),
                  name: val('name'), include: split(val('include')), exclude: split(val('exclude')),
-                 score: parseInt(val('score'), 10) || 0, kind: row.getAttribute('data-vq-fmt-kind') || 'custom' };
-    }
-
-    // ── preferred groups (thin quick-add over custom formats) ────────────────
-    // A 'group' format is a normal custom format tagged kind:'group' — this
-    // panel just filters the SAME _vqFormats list, so add/remove here and
-    // editing the row in the full Custom Formats table below stay in sync.
-    function renderPreferredGroups() {
-        var host = document.getElementById('vq-group-rows');
-        if (!host) return;
-        var groups = _vqFormats.filter(function (f) { return f.kind === 'group'; });
-        host.innerHTML = groups.map(function (f) {
-            return '<div class="vq-fmt-row vq-group-row" data-vq-group="' + f.id + '">' +
-                '<span class="vq-group-name">' + escA((f.include || [])[0] || f.name) + '</span>' +
-                '<button class="vq-fmt-del" type="button" data-vq-group-del="' + f.id + '" title="Remove">✕</button>' +
-                '</div>';
-        }).join('') || '<div class="settings-hint" style="padding:6px 0;">No preferred groups yet.</div>';
-    }
-
-    function wireGroups() {
-        var addBtn = document.querySelector('[data-vq-group-add]');
-        if (addBtn && !addBtn._vqWired) {
-            addBtn._vqWired = true;
-            var doAdd = function () {
-                var input = document.getElementById('vq-group-add-input');
-                var name = input ? input.value.trim() : '';
-                if (!name) return;
-                fetch(QUALITY_URL + '/formats', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ name: 'Prefer ' + name, include: [name], exclude: [], score: 50, kind: 'group' })
-                }).then(function (r) { return r.ok ? r.json() : null; })
-                  .then(function (res) {
-                      if (!res || !res.success) { toast('Couldn’t add that group', 'error'); return; }
-                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude,
-                                        score: res.score, kind: res.kind });
-                      if (input) input.value = '';
-                      renderPreferredGroups();
-                      renderFormats();
-                  })
-                  .catch(function () { toast('Couldn’t add that group', 'error'); });
-            };
-            addBtn.addEventListener('click', doAdd);
-            var input = document.getElementById('vq-group-add-input');
-            if (input) input.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); doAdd(); } });
-        }
-        var groupHost = document.getElementById('vq-group-rows');
-        if (groupHost && !groupHost._vqWired) {
-            groupHost._vqWired = true;
-            groupHost.addEventListener('click', function (e) {
-                var del = e.target.closest('[data-vq-group-del]');
-                if (!del) return;
-                var fid = del.getAttribute('data-vq-group-del');
-                fetch(QUALITY_URL + '/formats/' + fid, { method: 'DELETE' })
-                    .then(function (r) { return r.ok ? r.json() : null; })
-                    .then(function (res) {
-                        if (!res || !res.success) throw new Error();
-                        _vqFormats = _vqFormats.filter(function (f) { return String(f.id) !== fid; });
-                        renderPreferredGroups();
-                        renderFormats();
-                    })
-                    .catch(function () { toast('Couldn’t remove that group', 'error'); });
-            });
-        }
+                 score: parseInt(val('score'), 10) || 0 };
     }
 
     function wireFormats() {
@@ -1250,12 +985,8 @@
               .then(function (res) {
                   if (!res || !res.success) { toast('A format needs a name and at least one term', 'error'); return; }
                   for (var i = 0; i < _vqFormats.length; i++) {
-                      if (_vqFormats[i].id === res.id) {
-                          _vqFormats[i] = { id: res.id, name: res.name, include: res.include, exclude: res.exclude,
-                                            score: res.score, kind: res.kind };
-                      }
+                      if (_vqFormats[i].id === res.id) { _vqFormats[i] = { id: res.id, name: res.name, include: res.include, exclude: res.exclude, score: res.score }; }
                   }
-                  renderPreferredGroups();
               })
               .catch(function () { toast('Couldn’t save the format', 'error'); });
         });
@@ -1269,7 +1000,6 @@
                     if (!res || !res.success) throw new Error();
                     _vqFormats = _vqFormats.filter(function (f) { return String(f.id) !== fid; });
                     renderFormats();
-                    renderPreferredGroups();
                 })
                 .catch(function () { toast('Couldn’t delete the format', 'error'); });
         });
@@ -1283,8 +1013,7 @@
                 }).then(function (r) { return r.ok ? r.json() : null; })
                   .then(function (res) {
                       if (!res || !res.success) throw new Error();
-                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude,
-                                        score: res.score, kind: res.kind });
+                      _vqFormats.push({ id: res.id, name: res.name, include: res.include, exclude: res.exclude, score: res.score });
                       renderFormats();
                   })
                   .catch(function () { toast('Couldn’t add a format', 'error'); });
@@ -1409,6 +1138,22 @@
         var ep = document.getElementById('vq-episode-size'); if (ep) ep.value = p.max_episode_gb || 0;
         _vqSizeLabel('vq-movie-label', p.max_movie_gb || 0);
         _vqSizeLabel('vq-episode-label', p.max_episode_gb || 0);
+
+        // Swarm health floor. Absent from a profile stored before the gate existed
+        // means "use the default", not "no floor" — same rule the normalizer applies,
+        // so the slider never shows 0 for an install that will actually enforce 1.
+        var sd = document.getElementById('vq-min-seeders');
+        var seeders = (p.min_seeders === undefined || p.min_seeders === null) ? 1 : p.min_seeders;
+        if (sd) sd.value = seeders;
+        _vqSeedersLabel(seeders);
+    }
+
+    function _vqSeedersLabel(n) {
+        var el = document.getElementById('vq-seeders-label');
+        if (!el) return;
+        n = parseInt(n, 10) || 0;
+        el.textContent = n <= 0 ? 'No minimum — grab dead swarms too'
+            : ('At least ' + n + ' seeder' + (n === 1 ? '' : 's'));
     }
 
     function moveTier(k, dir) {
@@ -1489,10 +1234,12 @@
             if (e.target.id === 'vq-prefer-repack') { _videoQuality.prefer_repack = e.target.checked; saveQuality(true); return; }
             if (e.target.id === 'vq-movie-size') { _videoQuality.max_movie_gb = parseInt(e.target.value, 10) || 0; saveQuality(true); return; }
             if (e.target.id === 'vq-episode-size') { _videoQuality.max_episode_gb = parseInt(e.target.value, 10) || 0; saveQuality(true); return; }
+            if (e.target.id === 'vq-min-seeders') { _videoQuality.min_seeders = parseInt(e.target.value, 10) || 0; saveQuality(true); return; }
         });
         card.addEventListener('input', function (e) {
             if (e.target.id === 'vq-movie-size') { _vqSizeLabel('vq-movie-label', parseInt(e.target.value, 10) || 0); return; }
             if (e.target.id === 'vq-episode-size') { _vqSizeLabel('vq-episode-label', parseInt(e.target.value, 10) || 0); return; }
+            if (e.target.id === 'vq-min-seeders') { _vqSeedersLabel(e.target.value); return; }
         });
     }
 
@@ -1566,6 +1313,8 @@
                 omdb_api_key: o ? o.value : '',
                 fanart_api_key: fa ? fa.value : '',
                 opensubtitles_api_key: sub ? sub.value : '',
+                subdl_api_key: (document.getElementById('subdl-api-key') || {}).value || '',
+                subsource_api_key: (document.getElementById('subsource-api-key') || {}).value || '',
                 trakt_api_key: trakt ? trakt.value : '',
                 mdblist_api_key: (document.getElementById('mdblist-api-key') || {}).value || '',
                 ryd_enabled: ryd ? ryd.checked : true,
@@ -1585,109 +1334,605 @@
 
     // Mirrors music's testConnection(): save the key, then hit the test
     // endpoint, then toast the result. Isolated -> /api/video/enrichment/<svc>/test.
-    function testConnection(svc) {
-        var name = svc.toUpperCase();
-        toast('Testing ' + name + ' connection…', 'info');
+    var TEST_NAMES = { tmdb: 'TMDB', tvdb: 'TVDB', omdb: 'OMDb', fanart: 'fanart.tv',
+        opensubtitles: 'OpenSubtitles', subdl: 'SubDL', subsource: 'SubSource', trakt: 'Trakt',
+        mdblist: 'MDBList', tvmaze: 'TVmaze', anilist: 'AniList', wikidata: 'Wikidata',
+        ryd: 'Return YouTube Dislike', sponsorblock: 'SponsorBlock', dearrow: 'DeArrow' };
+    function _testOne(svc) {
+        return fetch('/api/video/enrichment/' + svc + '/test',
+            { method: 'POST', headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.json(); })
+            .catch(function () { return { success: false, error: 'request failed' }; });
+    }
+    // the keyless cards hold several services behind one button ("tvmaze,anilist,wikidata").
+    // only the ones switched on get tested, a service you turned off isn't broken.
+    function testConnection(spec) {
+        var svcs = String(spec || '').split(',').filter(Boolean);
+        if (svcs.length > 1) {
+            svcs = svcs.filter(function (s) {
+                var box = document.getElementById('video-' + s + '-enabled');
+                return !box || box.checked;
+            });
+            if (!svcs.length) { toast('Nothing to test, all of these are switched off', 'info'); return; }
+        }
+        var names = svcs.map(function (s) { return TEST_NAMES[s] || s.toUpperCase(); });
+        toast('Testing ' + names.join(', ') + '…', 'info');
         saveKeys(true).then(function () {
-            return fetch('/api/video/enrichment/' + svc + '/test',
-                { method: 'POST', headers: { 'Accept': 'application/json' } });
-        }).then(function (r) { return r.json(); }).then(function (res) {
-            if (res && res.success) toast(res.message || (name + ' connection successful'), 'success');
-            else toast(name + ' connection failed: ' + ((res && res.error) || 'unknown'), 'error');
-        }).catch(function () { toast('Failed to test ' + name + ' connection', 'error'); });
+            return Promise.all(svcs.map(_testOne));
+        }).then(function (results) {
+            if (results.length === 1) {
+                var res = results[0];
+                if (res && res.success) toast(res.message || (names[0] + ' connection successful'), 'success');
+                else toast(names[0] + ' connection failed: ' + ((res && res.error) || 'unknown'), 'error');
+                return;
+            }
+            var bad = [];
+            results.forEach(function (res, i) {
+                if (!(res && res.success)) bad.push(names[i] + ': ' + ((res && res.error) || 'unknown'));
+            });
+            if (!bad.length) toast(names.join(', ') + ' all reachable', 'success');
+            else toast('Failed: ' + bad.join(' · '), 'error');
+        }).catch(function () { toast('Failed to test ' + names.join(', '), 'error'); });
     }
 
     // ── Library Organization (naming templates + post-process toggles) ───────
     var ORG_URL = '/api/video/organization';
     var _videoOrg = null;
-    // TRaSH-recommended schemes (trash-guides.info), offered as a one-click preset.
-    // Not the default: switching an existing library's naming silently would make
-    // every file on disk non-conforming until renamed.
-    var _TRASH_PRESETS = {
-        movie: "{Movie CleanTitle} {(Release Year)} {edition-{Edition Tags}} {[Custom Formats]}"
-             + "{[Quality Full]}{[MediaInfo VideoDynamicRangeType]}"
-             + "{[Mediainfo AudioCodec}{ Mediainfo AudioChannels]}{[Mediainfo VideoCodec]}"
-             + "{-Release Group}",
-        episode: "{Series CleanTitleWithoutYear} {(Series Year)}/Season {season:00}/"
-               + "{Series CleanTitleWithoutYear} {(Series Year)} - S{season:00}E{episode:00} - "
-               + "{Episode CleanTitle:90} {[Custom Formats]}{[Quality Full]}"
-               + "{[Mediainfo AudioCodec}{ Mediainfo AudioChannels]}"
-               + "{[MediaInfo VideoDynamicRangeType]}{[Mediainfo VideoCodec]}{-Release Group}"
-    };
+    // Sample values for the live preview (mirrors what the importer feeds the engine).
+    var _ORG_MOVIE_EG = { title: 'The Matrix', titlefirst: 'T', year: '1999', quality: 'Bluray-1080p',
+        resolution: '1080p', source: 'Bluray', codec: 'HEVC', edition: '', tmdbid: '603', imdbid: 'tt0133093' };
+    var _ORG_EP_EG = { series: 'Breaking Bad', season: '01', seasonraw: '1', episode: '01', episodetitle: 'Pilot',
+        year: '2008', quality: 'WEBDL-1080p', resolution: '1080p', source: 'WEBDL', codec: 'H264', tvdbid: '81189' };
+    var _ORG_YT_EG = { channel: 'Veritasium', title: 'How Electricity Actually Works', year: '2024',
+        date: '2024-03-15', month: '03', day: '15', sxe: 's2024e0315', videoid: 'oI_X2cMHNe0' };
 
-    // The preview renders SERVER-SIDE, through the same code that names files on
-    // import. This used to be a JavaScript re-implementation of the template
-    // engine kept "in lockstep" by hand — which the {Token} scheme's optional
-    // groups, padding and truncation would have made a second engine to maintain
-    // and a second place to be wrong. One renderer, so the preview cannot lie.
-    var _orgPreviewTimer = null;
-    var _orgTokenCache = null;
-
+    function _orgSanitize(v) {
+        return String(v == null ? '' : v).replace(/[\\/:*?"<>|\x00-\x1f]/g, '')
+            .replace(/\s+/g, ' ').trim().replace(/[ .]+$/, '');
+    }
+    // Client-side mirror of core/video/organization.render_template + _tidy_component
+    // (kept in lockstep) so the preview matches what actually lands on disk.
+    function _orgRender(tmpl, vals) {
+        var keys = Object.keys(vals).sort(function (a, b) { return b.length - a.length; });
+        var out = String(tmpl || '');
+        keys.forEach(function (k) { out = out.split('${' + k + '}').join(_orgSanitize(vals[k])); });
+        keys.forEach(function (k) { out = out.split('$' + k).join(_orgSanitize(vals[k])); });
+        return out.split('/').map(function (p) {
+            p = p.replace(/\s+-\s+(?=(\s|$))/g, ' ').replace(/\(\s*\)/g, '').replace(/\[\s*\]/g, '');
+            p = p.replace(/\s+/g, ' ').trim().replace(/^-+|-+$/g, '').trim().replace(/[ .]+$/, '');
+            return p;
+        }).filter(function (p) { return p !== ''; }).join('/');
+    }
     function renderOrgPreview() {
-        if (_orgPreviewTimer) clearTimeout(_orgPreviewTimer);
-        _orgPreviewTimer = setTimeout(_fetchOrgPreview, 250);
+        var mt = document.getElementById('vo-movie-template');
+        var et = document.getElementById('vo-episode-template');
+        var yt = document.getElementById('vo-youtube-template');
+        var mp = document.getElementById('vo-movie-preview');
+        var ep = document.getElementById('vo-episode-preview');
+        var yp = document.getElementById('vo-youtube-preview');
+        if (mp && mt) mp.textContent = _orgRender(mt.value || mt.placeholder, _ORG_MOVIE_EG) + '.mkv';
+        if (ep && et) ep.textContent = _orgRender(et.value || et.placeholder, _ORG_EP_EG) + '.mkv';
+        if (yp && yt) yp.textContent = _orgRender(yt.value || yt.placeholder, _ORG_YT_EG) + '.mp4';
     }
-
-    function _fetchOrgPreview() {
-        var get = function (id) { var el = document.getElementById(id); return el ? (el.value || el.placeholder) : null; };
-        var body = { movie_template: get('vo-movie-template'),
-                     episode_template: get('vo-episode-template'),
-                     youtube_template: get('vo-youtube-template') };
-        fetch(ORG_URL + '/naming/preview', {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        }).then(function (r) { return r.ok ? r.json() : null; }).then(function (d) {
-            if (!d) return;
-            _orgTokenCache = d.tokens || _orgTokenCache;
-            [['movie', 'vo-movie-preview'], ['episode', 'vo-episode-preview'],
-             ['youtube', 'vo-youtube-preview']].forEach(function (pair) {
-                var el = document.getElementById(pair[1]);
-                if (!el) return;
-                // A template the renderer refused is shown as an error rather than
-                // a stale success — a preview that keeps displaying the last good
-                // render while the box holds something broken is worse than none.
-                el.textContent = d[pair[0]] || (d[pair[0] + '_error'] ? 'Invalid template' : '…');
+    // The backend serves `subtitle_provider_order` as a JSON list of provider
+    // ids (parsed by core.video.subtitles.parse_provider_order); the fallback
+    // below covers only garbage/missing values, defaulting to OpenSubtitles.
+    var DEFAULT_SUBTITLE_PROVIDER_ORDER = ['opensubtitles'];
+    function subtitleProviderOrder() {
+        var raw = _videoOrg && _videoOrg.subtitle_provider_order;
+        if (typeof raw === 'string') {
+            try { raw = JSON.parse(raw); } catch (e) { raw = null; }
+        }
+        var list = [];
+        if (Array.isArray(raw)) {
+            raw.forEach(function (p) {
+                p = String(p == null ? '' : p);
+                if (p && list.indexOf(p) === -1) list.push(p);
             });
-        }).catch(function () { /* preview is a nicety; never block the page */ });
+        }
+        return list.length ? list : DEFAULT_SUBTITLE_PROVIDER_ORDER.slice();
     }
-
-    function _toggleTokenList(scope) {
-        var box = document.getElementById('vo-' + scope + '-tokens');
-        if (!box) return;
-        if (!box.hidden) { box.hidden = true; return; }
-        var names = (_orgTokenCache || {})[scope] || [];
-        box.innerHTML = names.length
-            ? names.map(function (n) {
-                return '<code class="vo-token" data-vo-insert="' + escA(scope) + '" title="Click to insert">{'
-                     + esc(n) + '}</code>';
-              }).join(' ')
-            : '<small class="settings-hint">Token list unavailable — check the connection.</small>';
-        box.hidden = false;
+    // Subtitle provider chain: editable, mirroring the download-chain widget's
+    // look and behaviour (dlchain-* CSS): pool tiles + ordered steps (rank,
+    // role, grip, arrows, remove) + the dashed slot. Network providers are
+    // reorderable; Whisper is pinned last by the backend (_iter_configured)
+    // and renders as a locked step when it is enabled, downloaded and the
+    // engine is present.
+    var SUBCHAIN_NETWORK_IDS = ['opensubtitles', 'subdl', 'subsource', 'embedded'];  // hardcoded known providers
+    var SUBCHAIN_BACKGROUND_IDS = ['whisper'];     // pinned last, never reorderable
+    var SUBCHAIN_META = {
+        opensubtitles: { name: 'OpenSubtitles', emoji: '\u{1F4AC}' },
+        subdl: { name: 'SubDL', emoji: '\u{1F4E5}' },
+        subsource: { name: 'SubSource', emoji: '\u{1F310}' },
+        embedded: { name: 'Embedded', emoji: '\u{1F4BD}' },
+        whisper: { name: 'Whisper (local)', emoji: '\u{1F399}' }
+    };
+    var _subchainOrder = [];   // network provider ids, top-first
+    var _subchainDragging = null;
+    function subchainMeta(id) {
+        // Unknown ids show as themselves and never break the widget — a
+        // parallel branch may add providers the hardcoded list predates.
+        return SUBCHAIN_META[id] || { name: String(id), emoji: '\u{1F4AC}' };
     }
-
-    // Bumped by every edit to a template box. A load that was already in flight
-    // when an edit happened must not paint over it — see loadOrganization.
-    var _orgEditSeq = 0;
-    var _orgLoadSeq = 0;
-
-    function fillOrg(keepTemplates) {
+    function _subchainWhisperActive() {
+        var st = _whisperStatus;
+        return !!(st && st.enabled && st.downloaded && st.engine);
+    }
+    // The stored order minus background-only providers. Whisper is managed
+    // by its own toggle below and pinned last by the backend even when the
+    // stored order predates it, so it never lives in the reorderable chain.
+    function subchainLoad() {
+        _subchainOrder = subtitleProviderOrder().filter(function (id) {
+            return SUBCHAIN_BACKGROUND_IDS.indexOf(id) === -1;
+        });
+        renderSubchain();
+    }
+    function _subchainTile(id) {
+        var m = subchainMeta(id);
+        var name = escA(m.name);
+        return '<button type="button" class="dlchain-tile" draggable="true" data-src="' + id + '" '
+            + 'data-action="add" title="Add ' + name + ' to the chain">'
+            + '<span class="dlchain-tile-art"><span class="emoji-icon">' + m.emoji + '</span></span>'
+            + '<span class="dlchain-tile-name">' + name + '</span></button>';
+    }
+    function _subchainStep(id, position, total, locked) {
+        var m = subchainMeta(id);
+        var name = escA(m.name);
+        var role = locked ? 'Last resort' : (position === 1 ? 'Tried first' : 'Fallback ' + (position - 1));
+        var html = '<div class="dlchain-step" data-src="' + id + '" '
+            + 'title="' + name + ' - ' + role + '" aria-label="' + name + ', ' + role + '"'
+            + (locked ? '' : ' draggable="true"') + '>'
+            + (locked ? '' : '<span class="dlchain-grip" aria-hidden="true">&#x283F;</span>')
+            + '<span class="dlchain-step-rank">' + position + '</span>'
+            + '<span class="dlchain-step-art"><span class="emoji-icon">' + m.emoji + '</span></span>'
+            + '<span class="dlchain-step-text">'
+            + '<span class="dlchain-step-name">' + name + '</span>'
+            + '<span class="dlchain-step-role">' + role + '</span></span>';
+        if (!locked) {
+            html += '<span class="dlchain-step-move">'
+                + '<button type="button" class="dlchain-move" title="Move ' + name + ' up" aria-label="Move ' + name + ' up"'
+                + (position === 1 ? ' disabled' : '') + ' data-action="up">&#9650;</button>'
+                + '<button type="button" class="dlchain-move" title="Move ' + name + ' down" aria-label="Move ' + name + ' down"'
+                + (position === total ? ' disabled' : '') + ' data-action="down">&#9660;</button>'
+                + '</span>'
+                + '<button type="button" class="dlchain-btn" title="Remove ' + name + ' from the chain" '
+                + 'aria-label="Remove ' + name + ' from the chain" data-action="remove">&times;</button>';
+        }
+        return html + '</div>';
+    }
+    function renderSubchain() {
+        var pool = document.getElementById('subchain-pool');
+        var list = document.getElementById('subchain-list');
+        if (!pool || !list) return;
+        var order = _subchainOrder.slice();
+        var available = SUBCHAIN_NETWORK_IDS.filter(function (id) { return order.indexOf(id) === -1; });
+        pool.innerHTML = available.length
+            ? available.map(_subchainTile).join('')
+            : '<div class="dlchain-empty">Every provider is in the chain.</div>';
+        var steps = order.map(function (id, i) { return _subchainStep(id, i + 1, order.length, false); });
+        if (_subchainWhisperActive()) steps.push(_subchainStep('whisper', order.length + 1, order.length + 1, true));
+        var lastName = order.length ? escA(subchainMeta(order[order.length - 1]).name) : '';
+        var slotTitle = order.length
+            ? 'Drag a provider here \u2014 tried after ' + lastName
+            : 'Drag a provider here \u2014 this one is tried first';
+        var slotHint = order.length
+            ? 'It only runs if everything above it came up empty.'
+            : 'Subtitles need at least one provider.';
+        list.innerHTML = steps.join('<div class="dlchain-connector"></div>')
+            + (steps.length ? '<div class="dlchain-connector"></div>' : '')
+            + '<div class="dlchain-slot' + (order.length ? '' : ' first') + '" id="subchain-slot">'
+            + '<span class="dlchain-slot-title">' + slotTitle + '</span>'
+            + '<span class="dlchain-slot-hint">' + slotHint + '</span>'
+            + '</div>';
+        var hint = document.getElementById('subchain-mode-hint');
+        if (hint) {
+            hint.textContent = order.length > 1 ? 'chain \u2014 ' + order.length + ' providers'
+                : order.length === 1 ? 'single provider' : 'nothing selected';
+        }
+        _subchainWireDrag();
+        _subchainWireClicks();
+    }
+    function _subchainCommit() {
+        renderSubchain();
+        // Video-side settings save immediately (no page-wide save button).
+        saveOrganization(false);
+    }
+    function subchainAdd(id) {
+        if (_subchainOrder.indexOf(id) === -1) { _subchainOrder.push(id); _subchainCommit(); }
+    }
+    function subchainMove(id, delta) {
+        var i = _subchainOrder.indexOf(id);
+        var j = i + delta;
+        if (i < 0 || j < 0 || j >= _subchainOrder.length) return;
+        var t = _subchainOrder[i]; _subchainOrder[i] = _subchainOrder[j]; _subchainOrder[j] = t;
+        _subchainCommit();
+    }
+    function subchainRemove(id) {
+        // An empty chain means no subtitles can ever be found, with nothing
+        // on screen saying why — same guard as the download chain.
+        if (_subchainOrder.length <= 1) {
+            if (typeof toast === 'function') toast('Keep at least one provider \u2014 subtitles need somewhere to come from', 'info');
+            return;
+        }
+        _subchainOrder = _subchainOrder.filter(function (x) { return x !== id; });
+        _subchainCommit();
+    }
+    // Clicks are delegated from the widget container — this module stays
+    // isolated (no globals exported), so the buttons carry data-action and
+    // the provider id rides on the closest [data-src] ancestor. Attached
+    // once: renderSubchain only rewrites the pool/list innerHTML, never the
+    // container itself.
+    var _subchainClicksWired = false;
+    function _subchainWireClicks() {
+        if (_subchainClicksWired) return;
+        var widget = document.getElementById('subchain-widget');
+        if (!widget) return;
+        _subchainClicksWired = true;
+        widget.addEventListener('click', function (e) {
+            var btn = e.target && e.target.closest ? e.target.closest('[data-action]') : null;
+            if (!btn || !widget.contains(btn)) return;
+            var holder = btn.closest('[data-src]');
+            var id = holder ? holder.dataset.src : null;
+            if (!id) return;
+            var action = btn.getAttribute('data-action');
+            if (action === 'add') subchainAdd(id);
+            else if (action === 'up') subchainMove(id, -1);
+            else if (action === 'down') subchainMove(id, 1);
+            else if (action === 'remove') subchainRemove(id);
+        });
+    }
+    var _subchainDragWired = false;
+    function _subchainWireDrag() {
+        var pool = document.getElementById('subchain-pool');
+        var list = document.getElementById('subchain-list');
+        if (!pool || !list) return;
+        // Pool tiles and chain steps are both draggable and both carry
+        // data-src. The pinned Whisper step has no draggable attribute and
+        // is skipped here and as a drop target.
+        document.querySelectorAll('#subchain-widget [data-src]').forEach(function (item) {
+            if (!item.hasAttribute('draggable')) return;
+            item.addEventListener('dragstart', function (e) {
+                _subchainDragging = item.dataset.src;
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', item.dataset.src);
+                item.classList.add('dragging');
+            });
+            item.addEventListener('dragend', function () {
+                _subchainDragging = null;
+                item.classList.remove('dragging');
+                document.querySelectorAll('#subchain-widget .drag-over').forEach(function (el) {
+                    el.classList.remove('drag-over');
+                });
+            });
+        });
+        // Dropping ON a step inserts before it — that is how you reorder.
+        list.querySelectorAll('.dlchain-step[draggable]').forEach(function (step) {
+            step.addEventListener('dragover', function (e) {
+                e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+                step.classList.add('drag-over');
+            });
+            step.addEventListener('dragleave', function () { step.classList.remove('drag-over'); });
+            step.addEventListener('drop', function (e) {
+                e.preventDefault(); e.stopPropagation();
+                step.classList.remove('drag-over');
+                var src = e.dataTransfer.getData('text/plain') || _subchainDragging;
+                var target = step.dataset.src;
+                if (!src || src === target) return;
+                _subchainOrder = _subchainOrder.filter(function (x) { return x !== src; });
+                var at = _subchainOrder.indexOf(target);
+                _subchainOrder.splice(at < 0 ? _subchainOrder.length : at, 0, src);
+                _subchainCommit();
+            });
+        });
+        // The slot at the end: always append.
+        var slot = document.getElementById('subchain-slot');
+        if (slot) {
+            slot.addEventListener('dragover', function (e) {
+                e.preventDefault(); e.dataTransfer.dropEffect = 'move';
+                slot.classList.add('drag-over');
+            });
+            slot.addEventListener('dragleave', function () { slot.classList.remove('drag-over'); });
+            slot.addEventListener('drop', function (e) {
+                e.preventDefault(); e.stopPropagation();
+                slot.classList.remove('drag-over');
+                var src = e.dataTransfer.getData('text/plain') || _subchainDragging;
+                if (!src) return;
+                _subchainOrder = _subchainOrder.filter(function (x) { return x !== src; });
+                _subchainOrder.push(src);
+                _subchainCommit();
+            });
+        }
+        // Container-level handlers attach ONCE: pool/list are persistent
+        // nodes (only their innerHTML is rewritten per render), so wiring
+        // them on every render would stack duplicate drop handlers.
+        if (_subchainDragWired) return;
+        _subchainDragWired = true;
+        // Anywhere else in the chain column appends too, so a slightly-off
+        // drop still does the obvious thing instead of nothing.
+        list.addEventListener('dragover', function (e) { e.preventDefault(); list.classList.add('drag-over'); });
+        list.addEventListener('dragleave', function () { list.classList.remove('drag-over'); });
+        list.addEventListener('drop', function (e) {
+            e.preventDefault();
+            list.classList.remove('drag-over');
+            var src = e.dataTransfer.getData('text/plain') || _subchainDragging;
+            if (!src || _subchainOrder.indexOf(src) !== -1) return;
+            _subchainOrder.push(src);
+            _subchainCommit();
+        });
+        // Dragging a step back to the pool removes it.
+        pool.addEventListener('dragover', function (e) { e.preventDefault(); pool.classList.add('drag-over'); });
+        pool.addEventListener('dragleave', function () { pool.classList.remove('drag-over'); });
+        pool.addEventListener('drop', function (e) {
+            e.preventDefault();
+            pool.classList.remove('drag-over');
+            var src = e.dataTransfer.getData('text/plain') || _subchainDragging;
+            if (src && _subchainOrder.indexOf(src) !== -1) subchainRemove(src);
+        });
+    }
+    // Light validation for the languages field: 2-3 letter codes, same
+    // separators the backend's parse_langs accepts. Invalid input shows a
+    // hint and reverts to the last saved value instead of saving.
+    var _voLangsLastGood = 'en';
+    function validateSubLangs() {
+        var el = document.getElementById('vo-sub-langs');
+        var err = document.getElementById('vo-sub-langs-error');
+        if (!el) return true;
+        var toks = String(el.value || '').split(/[,\s;]+/).filter(function (t) { return t; });
+        var bad = null;
+        for (var i = 0; i < toks.length; i++) {
+            if (!/^[A-Za-z]{2,3}$/.test(toks[i])) { bad = toks[i]; break; }
+        }
+        if (bad !== null) {
+            if (err) {
+                err.textContent = 'Not a language code: "' + bad + '". Use 2-3 letters per code (e.g. en, es).';
+                err.hidden = false;
+            }
+            return false;
+        }
+        if (err) { err.hidden = true; err.textContent = ''; }
+        _voLangsLastGood = el.value;
+        return true;
+    }
+    // ── Whisper local transcription (Phase 4) ────────────────────────────
+    var WHISPER_URL = '/api/video/subtitles/whisper';
+    var _whisperStatus = null;   // last status payload
+    var _whisperPoll = null;     // polling timer while a download runs
+    // Echoed download-state fields: the org blob is fully replaced on save,
+    // so these must round-trip (same echo pattern as subtitle_provider_order)
+    // or a settings save would wipe the "downloaded" state.
+    var _whisperEcho = { whisper_model_downloaded: false, whisper_model_path: '',
+        whisper_model_size_bytes: 0, whisper_model_downloaded_at: '' };
+    function _whisperFmtBytes(n) {
+        n = Number(n) || 0;
+        if (n >= 1e9) return (n / 1e9).toFixed(1) + ' GB';
+        if (n >= 1e6) return Math.round(n / 1e6) + ' MB';
+        if (n >= 1e3) return Math.round(n / 1e3) + ' KB';
+        return n + ' B';
+    }
+    function _whisperStopPoll() {
+        if (_whisperPoll) { clearInterval(_whisperPoll); _whisperPoll = null; }
+    }
+    function _whisperStartPoll() {
+        if (_whisperPoll) return;
+        _whisperPoll = setInterval(function () { loadWhisperStatus(); }, 2000);
+    }
+    function loadWhisperStatus() {
+        return fetch(WHISPER_URL + '/status', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (d && !d.error) {
+                    _whisperStatus = d;
+                    renderWhisperStatus();
+                    renderSubchain();
+                }
+                return !!d;
+            })
+            .catch(function () { return false; });
+    }
+    function renderWhisperStatus() {
+        var st = _whisperStatus;
+        var picker = document.getElementById('vo-whisper-model');
+        var btn = document.getElementById('vo-whisper-dl');
+        var toggle = document.getElementById('vo-whisper-enabled');
+        var statusEl = document.getElementById('vo-whisper-status');
+        var errEl = document.getElementById('vo-whisper-error');
+        var prog = document.getElementById('vo-whisper-progress');
+        var bar = document.getElementById('vo-whisper-progress-bar');
+        if (!st || !picker || !btn) return;
+        // Keep the echoed state fresh (a download may have finished in another
+        // tab, or just now via the poller).
+        _whisperEcho.whisper_model_downloaded = !!st.downloaded;
+        _whisperEcho.whisper_model_size_bytes = st.size_bytes || 0;
+        _whisperEcho.whisper_model_downloaded_at = st.downloaded_at || '';
+        // Picker options carry the real snapshot sizes from the backend.
+        if (!picker._whisperSized && st.models) {
+            Array.prototype.forEach.call(picker.options, function (opt) {
+                var meta = st.models[opt.value];
+                if (meta) opt.textContent = meta.label + ' — ' + meta.blurb;
+            });
+            picker._whisperSized = true;
+        }
+        var dl = st.download || {};
+        var downloading = dl.state === 'downloading';
+        if (errEl) {
+            if (dl.state === 'error' && dl.error) {
+                errEl.textContent = 'Download failed: ' + dl.error;
+                errEl.hidden = false;
+            } else { errEl.hidden = true; errEl.textContent = ''; }
+        }
+        if (prog && bar) {
+            prog.hidden = !downloading;
+            if (downloading && dl.total_bytes > 0) {
+                bar.style.width = Math.min(100, Math.round(
+                    dl.downloaded_bytes / dl.total_bytes * 100)) + '%';
+            } else { bar.style.width = '0%'; }
+        }
+        var picked = picker.value;
+        // "Ready" = the persisted downloaded flag AND the file on disk, for
+        // the model the settings currently name. Changing the picker to a
+        // model that isn't downloaded flips the button to
+        // "Download <new> model" (downloading replaces the old one).
+        var pickedReady = !!st.downloaded && picked === st.model;
+        if (downloading) {
+            var pct = dl.total_bytes > 0
+                ? Math.round(dl.downloaded_bytes / dl.total_bytes * 100) : 0;
+            btn.textContent = 'Downloading ' + (dl.model || picked) + '… ' + pct + '%';
+            btn.disabled = true;
+        } else if (pickedReady) {
+            btn.textContent = '✓ ' + picked + ' downloaded';
+            btn.disabled = true;
+        } else {
+            btn.textContent = 'Download ' + picked + ' model';
+            btn.disabled = false;
+        }
+        if (statusEl) {
+            var bits = [];
+            if (st.downloaded) {
+                bits.push('Downloaded: ' + st.model + ' (' +
+                    _whisperFmtBytes(st.size_bytes) + ')' +
+                    (st.downloaded_at ? ' on ' + String(st.downloaded_at).slice(0, 10) : '') + '.');
+            } else {
+                bits.push('No model downloaded yet.');
+            }
+            if (st.disk_model && st.disk_model !== picked) {
+                bits.push('Note: ' + st.disk_model + ' is on disk — downloading ' +
+                    picked + ' replaces it.');
+            }
+            if (!st.engine) {
+                bits.push('Transcription engine missing on the server: ' +
+                    (st.engine_hint || 'install faster-whisper') + '.');
+            }
+            statusEl.textContent = bits.join(' ');
+        }
+        // The toggle is only meaningful when the picked model is downloaded
+        // and the engine is present; it stays disabled (never force-unchecked,
+        // so a later settings save doesn't clobber the saved intent).
+        if (toggle) {
+            var usable = pickedReady && !!st.engine;
+            toggle.disabled = !usable;
+            toggle.title = usable ? ''
+                : 'Download a model first (and install faster-whisper on the server).';
+        }
+        if (downloading) _whisperStartPoll(); else _whisperStopPoll();
+    }
+    function startWhisperDownload() {
+        var picker = document.getElementById('vo-whisper-model');
+        var errEl = document.getElementById('vo-whisper-error');
+        var model = picker ? picker.value : 'small';
+        if (errEl) { errEl.hidden = true; errEl.textContent = ''; }
+        // Persist the picked model first so the status/download state names
+        // the model actually being downloaded.
+        saveOrganization(true).then(function () {
+            return fetch(WHISPER_URL + '/download', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+                body: JSON.stringify({ model: model })
+            }).then(function (r) {
+                return r.json().then(function (d) { return { ok: r.ok, status: r.status, body: d || {} }; });
+            });
+        }).then(function (res) {
+            if (!res) return;
+            if (!res.ok) {
+                if (errEl) {
+                    errEl.textContent = 'Could not start download: ' + (res.body.error || res.status);
+                    errEl.hidden = false;
+                }
+                return;
+            }
+            loadWhisperStatus();
+        }).catch(function () {
+            if (errEl) { errEl.textContent = 'Could not start download (network error).'; errEl.hidden = false; }
+        });
+    }
+    // ── Missing Subtitles job (lives on Tools; this is the signpost) ───────
+    var MISSING_SUBS_JOB = 'missing_subtitles';
+    function renderMissingSubsJob(job) {
+        var el = document.getElementById('vo-sub-job-status');
+        if (!el) return;
+        if (!job) { el.textContent = ''; return; }
+        var parts = [job.enabled ? 'On' : 'Off'];
+        if (job.enabled) {
+            var h = job.interval_hours || 168;
+            parts.push(h % 24 === 0 ? 'every ' + (h / 24) + ' day' + (h === 24 ? '' : 's')
+                : 'every ' + h + 'h');
+        }
+        parts.push(job.settings && job.settings.dry_run ? 'dry run: findings only'
+            : 'queues what\u2019s missing');
+        var last = job.last_run;
+        if (last && last.finished_at) {
+            parts.push('last run ' + String(last.finished_at).slice(0, 10) +
+                (last.auto_fixed ? ', queued ' + last.auto_fixed : ''));
+        } else {
+            parts.push('never run');
+        }
+        if (job.pending_findings_count) parts.push(job.pending_findings_count + ' to review');
+        el.textContent = parts.join(' \u00b7 ');
+    }
+    function loadMissingSubsJob() {
+        return fetch('/api/video/repair/jobs', { headers: { 'Accept': 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                var jobs = (d && d.jobs) || [];
+                renderMissingSubsJob(jobs.filter(function (j) {
+                    return j.job_id === MISSING_SUBS_JOB; })[0] || null);
+            })
+            .catch(function () { /* status is best-effort */ });
+    }
+    // Jump to Tools and bring the job's card into view (cards render async).
+    function openMissingSubsJob() {
+        document.dispatchEvent(new CustomEvent('soulsync:video-navigate',
+            { detail: { page: 'video-tools' } }));
+        var tries = 0;
+        var t = setInterval(function () {
+            var card = document.querySelector('.repair-job-card[data-job-id="' + MISSING_SUBS_JOB + '"]');
+            if (card || ++tries > 40) {
+                clearInterval(t);
+                if (!card) return;
+                card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                // a brief accent ring so the eye lands on the right card
+                card.style.transition = 'box-shadow .35s ease';
+                card.style.boxShadow = '0 0 0 2px rgba(var(--accent-rgb), .85)';
+                setTimeout(function () { card.style.boxShadow = ''; }, 2200);
+            }
+        }, 100);
+    }
+    function fillOrg() {
         if (!_videoOrg) return;
         var set = function (id, v) { var el = document.getElementById(id); if (el) el.value = v; };
         var chk = function (id, v) { var el = document.getElementById(id); if (el) el.checked = !!v; };
-        if (!keepTemplates) {
-            set('vo-movie-template', _videoOrg.movie_template || '');
-            set('vo-episode-template', _videoOrg.episode_template || '');
-            set('vo-youtube-template', _videoOrg.youtube_template || '');
-        }
+        set('vo-movie-template', _videoOrg.movie_template || '');
+        set('vo-episode-template', _videoOrg.episode_template || '');
+        set('vo-youtube-template', _videoOrg.youtube_template || '');
         set('vo-transfer-mode', _videoOrg.transfer_mode || 'copy');
         chk('vo-verify', _videoOrg.verify_with_ffprobe);
         chk('vo-replace', _videoOrg.replace_existing);
-        chk('vo-rename-first', _videoOrg.rename_before_import);
         chk('vo-subs', _videoOrg.carry_subtitles);
         chk('vo-artwork', _videoOrg.save_artwork);
         chk('vo-nfo', _videoOrg.write_nfo);
         chk('vo-subs-dl', _videoOrg.download_subtitles);
         set('vo-sub-langs', _videoOrg.subtitle_langs || 'en');
+        _voLangsLastGood = _videoOrg.subtitle_langs || 'en';
+        subchainLoad();
+        set('vo-sub-min-score', _videoOrg.subtitle_min_score == null ? 24 : _videoOrg.subtitle_min_score);
+        set('vo-sub-daily-quota', _videoOrg.subtitle_daily_quota == null ? 20 : _videoOrg.subtitle_daily_quota);
+        set('vo-sub-upgrade-delta', _videoOrg.subtitle_upgrade_min_delta == null ? 15 : _videoOrg.subtitle_upgrade_min_delta);
+        set('vo-sub-worker-interval', _videoOrg.subtitle_worker_interval_min == null ? 30 : _videoOrg.subtitle_worker_interval_min);
+        set('vo-sub-worker-batch', _videoOrg.subtitle_worker_batch == null ? 10 : _videoOrg.subtitle_worker_batch);
+        set('vo-sub-hi-forced', _videoOrg.subtitle_hi_forced || 'off');
+        chk('vo-sub-forced', _videoOrg.subtitle_forced);
+        chk('vo-sub-use-embedded', _videoOrg.subtitle_use_embedded !== false);
+        chk('vo-sub-ignore-pgs', _videoOrg.subtitle_ignore_pgs);
+        chk('vo-sub-ignore-vobsub', _videoOrg.subtitle_ignore_vobsub);
+        chk('vo-sub-ignore-ass', _videoOrg.subtitle_ignore_ass);
+        syncEmbeddedIgnores();
+        chk('vo-sub-autosync', _videoOrg.subtitle_autosync);
+        set('vo-whisper-model', _videoOrg.whisper_model || 'small');
+        chk('vo-whisper-enabled', _videoOrg.whisper_enabled);
+        _whisperEcho.whisper_model_downloaded = !!_videoOrg.whisper_model_downloaded;
+        _whisperEcho.whisper_model_path = _videoOrg.whisper_model_path || '';
+        _whisperEcho.whisper_model_size_bytes = _videoOrg.whisper_model_size_bytes || 0;
+        _whisperEcho.whisper_model_downloaded_at = _videoOrg.whisper_model_downloaded_at || '';
+        loadWhisperStatus();
         chk('vo-recycle', _videoOrg.recycle_deletes);
         set('vo-recycle-days', _videoOrg.recycle_keep_days || 7);
         set('vo-recycle-path', _videoOrg.recycle_path || '');
@@ -1698,22 +1943,10 @@
         renderOrgPreview();
     }
     function loadOrganization() {
-        // Showing this page fires a dozen loads at once, and this GET has been
-        // measured landing ~900ms after the page appears. Anything the user did
-        // in that window used to be painted over by the response — their edit
-        // vanished from the box, which reads as "it didn't save" even when it
-        // did. A response only fills the templates if no edit beat it here, and
-        // a superseded response is dropped entirely.
-        var seq = ++_orgLoadSeq;
-        var editsAtStart = _orgEditSeq;
-        fetch(ORG_URL, { headers: { 'Accept': 'application/json' } })
+        return fetch(ORG_URL, { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                if (!d || seq !== _orgLoadSeq) return;
-                _videoOrg = d;
-                fillOrg(_orgEditSeq !== editsAtStart);
-            })
-            .catch(function () { /* ignore */ });
+            .then(function (d) { if (!d) return false; _videoOrg = d; fillOrg(); return true; })
+            .catch(function () { return false; });
     }
     function collectOrg() {
         var val = function (id) { var el = document.getElementById(id); return el ? el.value : ''; };
@@ -1725,12 +1958,34 @@
             transfer_mode: val('vo-transfer-mode'),
             verify_with_ffprobe: on('vo-verify'),
             replace_existing: on('vo-replace'),
-            rename_before_import: on('vo-rename-first'),
             carry_subtitles: on('vo-subs'),
             save_artwork: on('vo-artwork'),
             write_nfo: on('vo-nfo'),
             download_subtitles: on('vo-subs-dl'),
             subtitle_langs: val('vo-sub-langs'),
+            // the editable chain; the backend normalises via parse_provider_order
+            subtitle_provider_order: _subchainOrder.slice(),
+            // advanced tuning knobs — clamped like the backend normalize()
+            subtitle_min_score: _voClampNum(val('vo-sub-min-score'), 0, 200, 24),
+            subtitle_daily_quota: _voClampInt(val('vo-sub-daily-quota'), 1, 1000, 20),
+            subtitle_upgrade_min_delta: _voClampNum(val('vo-sub-upgrade-delta'), 0, 200, 15),
+            subtitle_worker_interval_min: _voClampInt(val('vo-sub-worker-interval'), 5, 1440, 30),
+            subtitle_worker_batch: _voClampInt(val('vo-sub-worker-batch'), 1, 200, 10),
+            subtitle_hi_forced: val('vo-sub-hi-forced') || 'off',
+            subtitle_forced: on('vo-sub-forced'),
+            subtitle_use_embedded: on('vo-sub-use-embedded'),
+            subtitle_ignore_pgs: on('vo-sub-ignore-pgs'),
+            subtitle_ignore_vobsub: on('vo-sub-ignore-vobsub'),
+            subtitle_ignore_ass: on('vo-sub-ignore-ass'),
+            subtitle_autosync: on('vo-sub-autosync'),
+            whisper_enabled: on('vo-whisper-enabled'),
+            whisper_model: val('vo-whisper-model'),
+            // echoed download state — the blob is fully replaced on save, so
+            // these must round-trip or a save wipes the "downloaded" state
+            whisper_model_downloaded: _whisperEcho.whisper_model_downloaded,
+            whisper_model_path: _whisperEcho.whisper_model_path,
+            whisper_model_size_bytes: _whisperEcho.whisper_model_size_bytes,
+            whisper_model_downloaded_at: _whisperEcho.whisper_model_downloaded_at,
             recycle_deletes: on('vo-recycle'),
             recycle_keep_days: val('vo-recycle-days'),
             recycle_path: val('vo-recycle-path'),
@@ -1740,45 +1995,37 @@
             youtube_embed_subs: on('vo-yt-subs')
         };
     }
+    // the ignore switches only mean something while embedded subs count
+    function syncEmbeddedIgnores() {
+        var use = document.getElementById('vo-sub-use-embedded');
+        var off = !!(use && !use.checked);
+        ['vo-sub-ignore-pgs', 'vo-sub-ignore-vobsub', 'vo-sub-ignore-ass'].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            el.disabled = off;
+            var row = el.closest('label');
+            if (row) row.style.opacity = off ? '0.45' : '';
+        });
+    }
+    // Clamp helpers mirroring the backend normalize() bounds, so the UI never
+    // posts a value the server would silently clamp to something else.
+    function _voClampNum(v, lo, hi, fb) {
+        var n = parseFloat(v);
+        if (!isFinite(n)) return fb;
+        return Math.min(hi, Math.max(lo, n));
+    }
+    function _voClampInt(v, lo, hi, fb) {
+        var n = parseInt(v, 10);
+        if (!isFinite(n)) return fb;
+        return Math.min(hi, Math.max(lo, n));
+    }
     function saveOrganization(silent) {
-        // Resolves true only when the server actually took it. A save that failed
-        // used to toast success anyway, which on this card is the worst possible
-        // lie — the field keeps showing the value while the library keeps naming
-        // files the old way. A FAILED save always speaks, silent or not.
         return fetch(ORG_URL, {
             method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
             body: JSON.stringify(collectOrg())
         }).then(function (r) { return r.ok ? r.json() : null; })
-          .then(function (d) {
-              if (!d) { toast('Could not save library organization', 'error'); return false; }
-              _videoOrg = d;
-              if (!silent) toast('Library organization saved', 'success');
-              return true;
-          })
-          .catch(function () { toast('Could not save library organization', 'error'); return false; });
-    }
-
-    // Commit a template the CODE wrote into the box (a token chip, the TRaSH
-    // preset). Those never fire 'change' — browsers raise it only for edits the
-    // user typed — so the change-listener autosave below never ran for them and
-    // the template was silently lost on the next page load, which is exactly
-    // "the naming template doesn't save after leaving the page". Debounced, so
-    // clicking five tokens in a row is one save rather than five.
-    var _orgSaveTimer = null;
-    function _commitOrgNow(message) {
-        // collectOrg() reads EVERY field, so saving before the initial load has
-        // populated the form would write the markup's blank toggles over real
-        // settings. Wait for it rather than dropping the edit.
-        if (!_videoOrg) { _orgSaveTimer = setTimeout(function () { _commitOrgNow(message); }, 200); return; }
-        saveOrganization(true).then(function (ok) {
-            if (ok) toast(message || 'Library organization saved', 'success');
-        });
-    }
-    function commitTemplateEdit(message) {
-        _orgEditSeq++;
-        renderOrgPreview();
-        if (_orgSaveTimer) clearTimeout(_orgSaveTimer);
-        _orgSaveTimer = setTimeout(function () { _commitOrgNow(message); }, 400);
+          .then(function (d) { if (d) { _videoOrg = d; } if (!silent) toast('Library organization saved', 'success'); })
+          .catch(function () { /* ignore */ });
     }
     function wireOrganization() {
         var anchor = document.getElementById('vo-movie-template');
@@ -1789,69 +2036,104 @@
         ['vo-movie-template', 'vo-episode-template', 'vo-youtube-template'].forEach(function (id) {
             var el = document.getElementById(id);
             if (!el) return;
-            // 'input' marks the box edited so an in-flight load can't paint over
-            // what is being typed; 'change' (blur) commits it.
-            el.addEventListener('input', function () { _orgEditSeq++; renderOrgPreview(); });
-            el.addEventListener('change', function () { commitTemplateEdit(); });
+            el.addEventListener('input', renderOrgPreview);          // live preview while typing
+            el.addEventListener('change', function () { saveOrganization(false); });
         });
         ['vo-transfer-mode', 'vo-verify', 'vo-replace', 'vo-subs', 'vo-artwork', 'vo-nfo',
-            'vo-subs-dl', 'vo-sub-langs', 'vo-recycle', 'vo-recycle-days', 'vo-recycle-path',
-            'vo-sponsorblock', 'vo-yt-subs', 'vo-min-free', 'vo-yt-follow-count'].forEach(function (id) {
+            'vo-subs-dl', 'vo-recycle', 'vo-recycle-days', 'vo-recycle-path',
+            'vo-sponsorblock', 'vo-yt-subs', 'vo-min-free', 'vo-yt-follow-count',
+            'vo-sub-min-score', 'vo-sub-daily-quota', 'vo-sub-upgrade-delta',
+            'vo-sub-worker-interval', 'vo-sub-worker-batch', 'vo-sub-hi-forced',
+            'vo-sub-autosync', 'vo-sub-forced', 'vo-sub-use-embedded', 'vo-sub-ignore-pgs',
+            'vo-sub-ignore-vobsub', 'vo-sub-ignore-ass'].forEach(function (id) {
             var el = document.getElementById(id);
             if (el) el.addEventListener('change', function () { saveOrganization(false); });
         });
-        // Token reference, click-to-insert, and the TRaSH preset. Delegated so the
-        // token chips (rendered on demand) need no wiring of their own.
-        card.addEventListener('click', function (e) {
-            var show = e.target.closest('[data-vo-tokens]');
-            if (show) { _toggleTokenList(show.getAttribute('data-vo-tokens')); return; }
-            var chip = e.target.closest('[data-vo-insert]');
-            if (chip) {
-                var box = document.getElementById('vo-' + chip.getAttribute('data-vo-insert') + '-template');
-                if (box) {
-                    // Insert at the caret, not at the end — a token belongs where
-                    // the user was typing.
-                    var at = box.selectionStart == null ? box.value.length : box.selectionStart;
-                    var end = box.selectionEnd == null ? at : box.selectionEnd;
-                    box.value = box.value.slice(0, at) + chip.textContent + box.value.slice(end);
-                    box.focus();
-                    box.selectionStart = box.selectionEnd = at + chip.textContent.length;
-                    commitTemplateEdit();
-                }
-                return;
-            }
-            var preset = e.target.closest('[data-vo-preset]');
-            if (preset) {
-                var scope = preset.getAttribute('data-vo-preset');
-                var target = document.getElementById('vo-' + scope + '-template');
-                if (target && _TRASH_PRESETS[scope]) {
-                    target.value = _TRASH_PRESETS[scope];
-                    // Saved, like every other edit on this card. It used to be
-                    // left for the user to "commit by clicking away", which was
-                    // advice that could not work: a value the code wrote raises
-                    // no 'change', so clicking away saved nothing and the scheme
-                    // vanished on the next page load.
-                    commitTemplateEdit('TRaSH scheme applied — see the example below');
-                }
-            }
+        var useEmb = document.getElementById('vo-sub-use-embedded');
+        if (useEmb) useEmb.addEventListener('change', syncEmbeddedIgnores);
+        var langsEl = document.getElementById('vo-sub-langs');
+        if (langsEl) langsEl.addEventListener('change', function () {
+            if (validateSubLangs()) { saveOrganization(false); }
+            else { langsEl.value = _voLangsLastGood; }
         });
+        var wModel = document.getElementById('vo-whisper-model');
+        if (wModel) wModel.addEventListener('change', function () { renderWhisperStatus(); });
+        var wDl = document.getElementById('vo-whisper-dl');
+        if (wDl) wDl.addEventListener('click', startWhisperDownload);
+        var wTog = document.getElementById('vo-whisper-enabled');
+        if (wTog) wTog.addEventListener('change', function () {
+            // Refresh the chain afterwards: toggling Whisper pins or unpins
+            // its last-resort step.
+            saveOrganization(false).then(function () { loadWhisperStatus(); });
+        });
+        var jobBtn = document.getElementById('vo-sub-open-job');
+        if (jobBtn) jobBtn.addEventListener('click', openMissingSubsJob);
         var reset = document.getElementById('vo-reset');
         if (reset) reset.addEventListener('click', function () {
-            // POST *only* the blank templates. normalize() starts from DEFAULTS and
-            // overrides solely the keys present in the body, so an absent key IS the
-            // default — restating the toggles here only creates a second copy of the
-            // defaults that drifts (it did: save_artwork/write_nfo were posted false
-            // against a True default, so "reset" silently disabled the sidecars).
-            // min_free_disk_gb is deliberately omitted for a second reason: it is the
-            // app-wide settings.min_free_disk_gb shared with music, and save() rewrites
-            // that shared key whenever the body carries it — resetting the video naming
-            // card must not drop music's disk floor to 0.
+            // POST blank templates + standard toggles; the backend normalises to the
+            // Radarr/Sonarr defaults and echoes them back.
             fetch(ORG_URL, {
                 method: 'POST', headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-                body: JSON.stringify({ movie_template: '', episode_template: '', youtube_template: '' })
+                body: JSON.stringify({ movie_template: '', episode_template: '', youtube_template: '',
+                    transfer_mode: 'copy', verify_with_ffprobe: true, replace_existing: true,
+                    carry_subtitles: true, save_artwork: false, write_nfo: false,
+                    download_subtitles: false, subtitle_langs: 'en',
+                    recycle_deletes: true, recycle_keep_days: 7, recycle_path: '',
+                    youtube_sponsorblock: 'off', youtube_embed_subs: false, min_free_disk_gb: 0,
+                    youtube_follow_count: 5 })
             }).then(function (r) { return r.ok ? r.json() : null; })
               .then(function (d) { if (d) { _videoOrg = d; fillOrg(); toast('Reset to the standard layout', 'success'); } });
         });
+    }
+
+    // Both media sides share these Library panels. Load once per document,
+    // deduplicate requests, and never replace edits on a tab round-trip.
+    var _libraryLoaded = false;
+    var _libraryLoading = null;
+    function loadSharedLibrary() {
+        if (_libraryLoaded || _libraryLoading) return _libraryLoading;
+        var panels = ['folders-video-panel', 'organization-video-panel'].map(function (id) {
+            return document.getElementById(id);
+        }).filter(Boolean);
+        panels.forEach(function (panel) {
+            panel.setAttribute('aria-busy', 'true');
+            panel.querySelectorAll('input, select, textarea, button:not(.stg-library-retry)').forEach(function (input) {
+                if (!input.hasAttribute('data-library-disabled')) input.setAttribute('data-library-disabled', String(input.disabled));
+                input.disabled = true;
+            });
+            var status = panel.querySelector('.stg-library-load-status');
+            if (!status) {
+                status = document.createElement('p');
+                status.className = 'stg-library-load-status settings-hint';
+                status.setAttribute('role', 'status');
+                panel.prepend(status);
+            }
+            status.textContent = 'Loading saved video settings...';
+        });
+        wireDownloads();
+        wireOrganization();
+        _libraryLoading = Promise.all([loadDownloads(), loadOrganization()]).then(function (results) {
+            _libraryLoaded = results.every(Boolean);
+            panels.forEach(function (panel) {
+                panel.setAttribute('aria-busy', 'false');
+                var status = panel.querySelector('.stg-library-load-status');
+                if (_libraryLoaded) {
+                    panel.querySelectorAll('[data-library-disabled]').forEach(function (input) {
+                        input.disabled = input.getAttribute('data-library-disabled') === 'true';
+                        input.removeAttribute('data-library-disabled');
+                    });
+                    status.remove();
+                } else {
+                    status.textContent = 'Could not load saved video settings. ';
+                    var retry = document.createElement('button');
+                    retry.type = 'button'; retry.className = 'stg-library-retry'; retry.textContent = 'Retry';
+                    retry.addEventListener('click', loadSharedLibrary);
+                    status.append(retry);
+                }
+            });
+            if (typeof window.refreshLibrarySummaries === 'function') window.refreshLibrarySummaries();
+        }).finally(function () { _libraryLoading = null; });
+        return _libraryLoading;
     }
 
     function onPageShown(e) {
@@ -1860,34 +2142,34 @@
         loadConn();
         load();
         loadKeys();
-        loadDownloads();
+        loadSharedLibrary();
+        // The job status rides the video page lifecycle, NOT the shared
+        // library load: that load has an exact fetch contract (and a
+        // fail/retry path) the extra status fetch would break.
+        loadMissingSubsJob();
         loadImportLists();
         loadNotify();
-        wireDownloads();
         loadQuality();
         wireQuality();
         loadYtQuality();
         wireYtQuality();
         loadSlskd();
         wireSlskd();
-        loadOrganization();
-        wireOrganization();
     }
 
     function init() {
-        // Save on a checkbox toggle OR a label/path edit committing (text inputs'
-        // native 'change' fires on blur, never per keystroke, so typing a path
-        // never fires a save per character). Delegate from the containers (not
-        // the rows) since they're rebuilt on every load().
-        var groups = document.querySelectorAll('[data-video-lib-group]');
-        for (var i = 0; i < groups.length; i++) {
-            groups[i].addEventListener('change', function (e) {
-                if (e.target && (e.target.type === 'checkbox' || e.target.type === 'text')) save();
-            });
+        // Save the moment a library is picked — same behaviour as the music
+        // 'Music Library' selector above (which saves on change, no button).
+        // NB: wrap each handler so the DOM Event isn't passed as the function's
+        // first arg (which is our `silent` flag — it would suppress the toast).
+        var selects = document.querySelectorAll('select[data-video-lib-select]');
+        for (var i = 0; i < selects.length; i++) {
+            selects[i].addEventListener('change', function () { save(); });
         }
         // Enrichment keys save on blur/change (turns the workers on).
         ['tmdb-api-key', 'tvdb-api-key', 'omdb-api-key',
-            'fanart-api-key', 'opensubtitles-api-key', 'trakt-api-key',
+            'fanart-api-key', 'opensubtitles-api-key', 'subdl-api-key',
+            'subsource-api-key', 'trakt-api-key',
             'video-ryd-enabled', 'video-sponsorblock-enabled', 'video-dearrow-enabled',
             'video-tvmaze-enabled', 'video-anilist-enabled',
             'video-wikidata-enabled'].forEach(function (id) {
@@ -1933,39 +2215,30 @@
             })(testBtns[k]);
         }
         // The shared "Save Settings" button belongs to MUSIC (it runs music's
-        // saveSettings, which would fire a FULL music-config write from the video
-        // page — including active_media_server). On the video side we intercept it
-        // (capture phase, before music's bubble listener), block music's handler,
-        // flush all video settings, and toast. Music side: this does nothing, so
-        // its behaviour is unchanged.
-        //
-        // saveSharedSettings() covers the data-shared sections the video page
-        // legitimately shows (Prowlarr, torrent/usenet client, appearance,
-        // security, db workers). Those are music-config-backed, so before it
-        // existed this intercept silently DISCARDED every edit to them — the
-        // field worked on Music and did nothing on Video. It posts only those
-        // sections, and never active_media_server, so it can't reach into the
-        // music server pointer.
+        // saveSettings, which would fire a music-config write from the video page).
+        // On the video side we intercept it (capture phase, before music's bubble
+        // listener), block music's handler, flush all video settings, and toast —
+        // so the button is real here and can't reach into music. Music side: this
+        // does nothing, so its behaviour is unchanged.
         document.addEventListener('click', function (e) {
             if (document.body.getAttribute('data-side') !== 'video') return;
             if (!e.target.closest('#save-settings')) return;
             e.preventDefault();
             e.stopImmediatePropagation();
-            // Bare identifier, not a global-object lookup: this module attaches
-            // nothing to the global scope and is asserted to stay that way by
-            // test_video_settings_module_referenced_and_isolated. typeof on an
-            // undeclared name is safe, so this degrades quietly if settings.js
-            // ever stops shipping the helper.
-            var shared = (typeof saveSharedSettings === 'function')
-                ? saveSharedSettings(true)
-                : Promise.resolve(true);
+            // saveSlskd is NOT in this list any more. Its form is retired - the
+            // shared Sources tab's Soulseek card is the single editor now - but
+            // the fields are still in the DOM holding whatever they loaded with.
+            // Posting them here overwrote slskd settings that had just been
+            // changed from the music side: edit the URL in Sources, autosave
+            // stores it, then this button writes the stale copy back over it.
+            // The music panel saves through the main settings save.
             Promise.all([saveConn(true), save(true), saveKeys(true), savePrefs(true),
-                         saveDownloads(true), saveQuality(true), saveYtQuality(true), saveSlskd(true),
-                         shared])
+                         saveDownloads(true), saveQuality(true), saveYtQuality(true)])
                 .then(function () { toast('Settings saved', 'success'); })
                 .catch(function () { toast('Some settings could not be saved', 'error'); });
         }, true);
         document.addEventListener('soulsync:video-page-shown', onPageShown);
+        document.addEventListener('soulsync:library-settings-shown', loadSharedLibrary);
     }
 
     if (document.readyState === 'loading') {

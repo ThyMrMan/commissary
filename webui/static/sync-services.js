@@ -5,9 +5,9 @@ async function loadTidalPlaylists() {
     const container = document.getElementById('tidal-playlist-container');
     const refreshBtn = document.getElementById('tidal-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Tidal playlists…</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Tidal playlists...</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading…';
+    refreshBtn.textContent = '🔄 Loading...';
 
     try {
         const response = await fetch('/api/tidal/playlists');
@@ -22,19 +22,45 @@ async function loadTidalPlaylists() {
 
         console.log(`🎵 Loaded ${tidalPlaylists.length} Tidal playlists`);
 
-        // Auto-mirror Tidal playlists: fetch tracks in background then mirror
-        // Cards render instantly from metadata; tracks load per-playlist without blocking UI
-        for (const p of tidalPlaylists) {
+        // Load and apply saved discovery states from backend (like YouTube)
+        await loadTidalPlaylistStatesFromBackend();
+
+        // Auto-mirror: the per-playlist track crawl runs in the BACKGROUND
+        // (no await). It used to run inline, so the Refresh button sat on
+        // "Loading" for the whole crawl — 3-5 minutes on real accounts
+        // (Specialmed's report) even though the cards had long rendered.
+        void _prefetchTidalTracksAndMirror();
+
+    } catch (error) {
+        container.innerHTML = `<div class="playlist-placeholder">❌ Error: ${error.message}</div>`;
+        showToast(`Error loading Tidal playlists: ${error.message}`, 'error');
+    } finally {
+        refreshBtn.disabled = false;
+        refreshBtn.textContent = '🔄 Refresh';
+    }
+}
+
+// The old inline crawl, extracted: fetch each playlist's full tracks and
+// mirror it, three at a time (sequential took minutes; unbounded would
+// hammer Tidal's API).
+async function _prefetchTidalTracksAndMirror() {
+    const queue = tidalPlaylists.slice();
+    const mirrorFromTracks = (p, tracks) => {
+        mirrorPlaylist('tidal', p.id, p.name, tracks.map(t => ({
+            track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
+            album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
+            source_track_id: t.id || ''
+        })), { owner: p.owner, image_url: p.image_url, description: p.description });
+    };
+    const worker = async () => {
+        for (;;) {
+            const p = queue.shift();
+            if (!p) return;
             // Skip if already have tracks from a previous load
             if (p.tracks && p.tracks.length > 0) {
-                mirrorPlaylist('tidal', p.id, p.name, p.tracks.map(t => ({
-                    track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
-                    album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                    source_track_id: t.id || ''
-                })), { owner: p.owner, image_url: p.image_url, description: p.description });
+                mirrorFromTracks(p, p.tracks);
                 continue;
             }
-            // Fetch tracks on-demand for this playlist
             try {
                 const fullResp = await fetch(`/api/tidal/playlist/${p.id}`);
                 if (fullResp.ok) {
@@ -45,29 +71,16 @@ async function loadTidalPlaylists() {
                         // Update card track count in UI
                         const countEl = document.querySelector(`#tidal-card-${p.id} .playlist-card-track-count`);
                         if (countEl) countEl.textContent = `${fullData.tracks.length} tracks`;
-                        // Mirror with full track data
-                        mirrorPlaylist('tidal', p.id, p.name, fullData.tracks.map(t => ({
-                            track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
-                            album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                            source_track_id: t.id || ''
-                        })), { owner: p.owner, image_url: p.image_url, description: p.description });
+                        mirrorFromTracks(p, fullData.tracks);
                     }
                 }
             } catch (e) {
                 console.warn(`Failed to fetch tracks for Tidal playlist ${p.name}: ${e.message}`);
             }
         }
-
-        // Load and apply saved discovery states from backend (like YouTube)
-        await loadTidalPlaylistStatesFromBackend();
-
-    } catch (error) {
-        container.innerHTML = `<div class="playlist-placeholder">❌ Error: ${error.message}</div>`;
-        showToast(`Error loading Tidal playlists: ${error.message}`, 'error');
-    } finally {
-        refreshBtn.disabled = false;
-        refreshBtn.textContent = '🔄 Refresh';
-    }
+    };
+    await Promise.all([worker(), worker(), worker()]);
+    console.log('🎵 Tidal track prefetch + mirroring complete');
 }
 
 function renderTidalPlaylists() {
@@ -379,9 +392,9 @@ function updateCompletedModalResults(playlistId, downloadData) {
             let statusText = '';
             switch (task.status) {
                 case 'pending': statusText = '⏸️ Pending'; break;
-                case 'searching': statusText = '🔍 Searching…'; break;
-                case 'downloading': statusText = `⏬ Downloading… ${Math.round(task.progress || 0)}%`; break;
-                case 'post_processing': statusText = '⌛ Processing…'; break; // NEW VERIFICATION WORKFLOW
+                case 'searching': statusText = '🔍 Searching...'; break;
+                case 'downloading': statusText = `⏬ Downloading... ${Math.round(task.progress || 0)}%`; break;
+                case 'post_processing': statusText = '⌛ Processing...'; break; // NEW VERIFICATION WORKFLOW
                 case 'completed': statusText = '✅ Completed'; completedCount++; break;
                 case 'not_found': statusText = '🔇 Not Found'; notFoundCount++; break;
                 case 'failed': statusText = '❌ Failed'; failedOrCancelledCount++; break;
@@ -569,13 +582,13 @@ async function openTidalDiscoveryModal(playlistId, playlistData) {
 
             if (result.error) {
                 console.error('❌ Error starting Tidal discovery:', result.error);
-                showToast(`Error starting discovery: ${result.error}`, 'error');
-                if (_descEl) _descEl.textContent = 'Could not start discovery.';
+                showToast(`Error starting identification: ${result.error}`, 'error');
+                if (_descEl) _descEl.textContent = 'Could not start identification.';
                 return;
             }
 
             console.log('✅ Tidal discovery started, beginning polling...');
-            if (_descEl) _descEl.textContent = 'Discovering tracks…';
+            if (_descEl) _descEl.textContent = 'Identifying tracks…';
 
             // Update phase to discovering now that backend discovery is actually started
             tidalPlaylistStates[playlistId].phase = 'discovering';
@@ -589,8 +602,8 @@ async function openTidalDiscoveryModal(playlistId, playlistData) {
 
         } catch (error) {
             console.error('❌ Error starting Tidal discovery:', error);
-            showToast(`Error starting discovery: ${error.message}`, 'error');
-            if (_descEl) _descEl.textContent = 'Could not start discovery.';
+            showToast(`Error starting identification: ${error.message}`, 'error');
+            if (_descEl) _descEl.textContent = 'Could not start identification.';
         }
         return;
     } else if (isCurrentlyDiscovering) {
@@ -1177,11 +1190,18 @@ function updateTidalCardSyncProgress(playlistId, progress) {
         const processed = matched + failed;
         const percentage = total > 0 ? Math.round((processed / total) * 100) : 0;
 
+        const matchedText = progress.duplicate_tracks > 0
+            ? `${matched} (${progress.synced_tracks || (matched - progress.duplicate_tracks)} synced)`
+            : `${matched}`;
+        const matchedTitle = progress.duplicate_tracks > 0
+            ? ` title="${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)"`
+            : '';
+
         statusCounterHTML = `
             <div class="playlist-card-sync-status">
                 <span class="sync-stat total-tracks">♪ ${total}</span>
                 <span class="sync-separator">/</span>
-                <span class="sync-stat matched-tracks">✓ ${matched}</span>
+                <span class="sync-stat matched-tracks"${matchedTitle}>✓ ${matchedText}</span>
                 <span class="sync-separator">/</span>
                 <span class="sync-stat failed-tracks">✗ ${failed}</span>
                 <span class="sync-stat percentage">(${percentage}%)</span>
@@ -1214,7 +1234,16 @@ function updateTidalModalSyncProgress(urlHash, progress) {
     const failed = progress.failed_tracks || 0;
 
     if (totalEl) totalEl.textContent = total;
-    if (matchedEl) matchedEl.textContent = matched;
+    if (matchedEl) {
+        if (progress.duplicate_tracks > 0) {
+            const synced = progress.synced_tracks || (matched - progress.duplicate_tracks);
+            matchedEl.textContent = `${matched} (${synced} synced)`;
+            matchedEl.title = `${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)`;
+        } else {
+            matchedEl.textContent = matched;
+            matchedEl.removeAttribute('title');
+        }
+    }
     if (failedEl) failedEl.textContent = failed;
 
     // Calculate percentage like YouTube sync
@@ -1248,7 +1277,7 @@ async function startTidalDownloadMissing(urlHash) {
         const discoveryResults = state.discoveryResults || state.discovery_results;
 
         if (!discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -1310,7 +1339,7 @@ async function startTidalDownloadMissing(urlHash) {
 }
 
 async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName, spotifyTracks, options = {}) {
-    showLoadingOverlay('Loading Tidal playlist…');
+    showLoadingOverlay('Loading Tidal playlist...');
     // Check if a process is already active for this virtual playlist
     if (activeDownloadProcesses[virtualPlaylistId]) {
         console.log(`Modal for ${virtualPlaylistId} already exists. Showing it.`);
@@ -1366,12 +1395,12 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                     virtualPlaylistId.startsWith('spotify_public_') ? 'Spotify' :
                         virtualPlaylistId.startsWith('itunes_link_') ? 'iTunes' :
                             virtualPlaylistId.startsWith('spotify:') ? 'Spotify' :
-                                virtualPlaylistId.startsWith('discover_') ? 'Commissary' :
-                                    virtualPlaylistId.startsWith('seasonal_') ? 'Commissary' :
-                                        virtualPlaylistId.startsWith('spotify_library_') ? 'Commissary' :
-                                            virtualPlaylistId.startsWith('build_playlist_') ? 'Commissary' :
-                                                virtualPlaylistId.startsWith('decade_') ? 'Commissary' :
-                                                    virtualPlaylistId === 'build_playlist_custom' ? 'Commissary' :
+                                virtualPlaylistId.startsWith('discover_') ? 'SoulSync' :
+                                    virtualPlaylistId.startsWith('seasonal_') ? 'SoulSync' :
+                                        virtualPlaylistId.startsWith('spotify_library_') ? 'SoulSync' :
+                                            virtualPlaylistId.startsWith('build_playlist_') ? 'SoulSync' :
+                                                virtualPlaylistId.startsWith('decade_') ? 'SoulSync' :
+                                                    virtualPlaylistId === 'build_playlist_custom' ? 'SoulSync' :
                                                         'YouTube';
 
     const heroContext = {
@@ -1442,7 +1471,7 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                                                    onchange="updateTrackSelectionCount('${virtualPlaylistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(virtualPlaylistId, index)}${renderModalTrackPlaylistButton(virtualPlaylistId, index)}${escapeHtml(track.name)}</td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${virtualPlaylistId}-${index}">🔍 Pending</td>
@@ -1473,14 +1502,8 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
-                    <button class="download-control-btn" id="manual-search-btn-${virtualPlaylistId}"
-                            onclick="openManualSearchForModalSelection('${virtualPlaylistId}')"
-                            title="Pick the file yourself for ONE ticked track — searches every configured source and shows you the candidates."
-                            style="background-color: #0ea5e9; color: white;">
-                        🔎 Manual Search
-                    </button>
                     <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
-                        Add to Wishlist
+                        ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
                         Cancel All
@@ -1523,9 +1546,9 @@ async function loadQobuzPlaylists() {
     const container = document.getElementById('qobuz-playlist-container');
     const refreshBtn = document.getElementById('qobuz-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Qobuz playlists…</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading Qobuz playlists...</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading…';
+    refreshBtn.textContent = '🔄 Loading...';
 
     try {
         const response = await fetch('/api/qobuz/playlists');
@@ -1548,7 +1571,7 @@ async function loadQobuzPlaylists() {
                 mirrorPlaylist('qobuz', p.id, p.name, p.tracks.map(t => ({
                     track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
                     album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                    source_track_id: t.id || '', isrc: t.isrc || ''
+                    source_track_id: t.id || ''
                 })), { owner: p.owner, image_url: p.image_url, description: p.description });
                 continue;
             }
@@ -1564,7 +1587,7 @@ async function loadQobuzPlaylists() {
                         mirrorPlaylist('qobuz', p.id, p.name, fullData.tracks.map(t => ({
                             track_name: t.name || '', artist_name: Array.isArray(t.artists) ? t.artists[0] : (t.artists || ''),
                             album_name: typeof t.album === 'string' ? t.album : '', duration_ms: t.duration_ms || 0,
-                            source_track_id: t.id || '', isrc: t.isrc || ''
+                            source_track_id: t.id || ''
                         })), { owner: p.owner, image_url: p.image_url, description: p.description });
                     }
                 }
@@ -1654,7 +1677,7 @@ async function handleQobuzCardClick(playlistId) {
     if (state.phase === 'fresh') {
         if (!state.playlist.tracks || state.playlist.tracks.length === 0) {
             console.log(`🎵 Fetching tracks for Qobuz playlist: ${state.playlist.name}`);
-            showLoadingOverlay(`Loading ${state.playlist.name}…`);
+            showLoadingOverlay(`Loading ${state.playlist.name}...`);
             try {
                 const resp = await fetch(`/api/qobuz/playlist/${playlistId}`);
                 if (resp.ok) {
@@ -1886,7 +1909,7 @@ async function openQobuzDiscoveryModal(playlistId, playlistData) {
             const response = await fetch(`/api/qobuz/discovery/start/${playlistId}`, { method: 'POST' });
             const result = await response.json();
             if (result.error) {
-                showToast(`Error starting discovery: ${result.error}`, 'error');
+                showToast(`Error starting identification: ${result.error}`, 'error');
                 return;
             }
             qobuzPlaylistStates[playlistId].phase = 'discovering';
@@ -1894,7 +1917,7 @@ async function openQobuzDiscoveryModal(playlistId, playlistData) {
             youtubePlaylistStates[fakeUrlHash].phase = 'discovering';
             startQobuzDiscoveryPolling(fakeUrlHash, playlistId);
         } catch (error) {
-            showToast(`Error starting discovery: ${error.message}`, 'error');
+            showToast(`Error starting identification: ${error.message}`, 'error');
         }
     } else if (isCurrentlyDiscovering) {
         startQobuzDiscoveryPolling(fakeUrlHash, playlistId);
@@ -2336,11 +2359,18 @@ function updateQobuzCardSyncProgress(playlistId, progress) {
         const processed = matched + failed;
         const percentage = total > 0 ? Math.round((processed / total) * 100) : 0;
 
+        const matchedText = progress.duplicate_tracks > 0
+            ? `${matched} (${progress.synced_tracks || (matched - progress.duplicate_tracks)} synced)`
+            : `${matched}`;
+        const matchedTitle = progress.duplicate_tracks > 0
+            ? ` title="${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)"`
+            : '';
+
         statusCounterHTML = `
             <div class="playlist-card-sync-status">
                 <span class="sync-stat total-tracks">♪ ${total}</span>
                 <span class="sync-separator">/</span>
-                <span class="sync-stat matched-tracks">✓ ${matched}</span>
+                <span class="sync-stat matched-tracks"${matchedTitle}>✓ ${matchedText}</span>
                 <span class="sync-separator">/</span>
                 <span class="sync-stat failed-tracks">✗ ${failed}</span>
                 <span class="sync-stat percentage">(${percentage}%)</span>
@@ -2367,7 +2397,16 @@ function updateQobuzModalSyncProgress(urlHash, progress) {
     const failed = progress.failed_tracks || 0;
 
     if (totalEl) totalEl.textContent = total;
-    if (matchedEl) matchedEl.textContent = matched;
+    if (matchedEl) {
+        if (progress.duplicate_tracks > 0) {
+            const synced = progress.synced_tracks || (matched - progress.duplicate_tracks);
+            matchedEl.textContent = `${matched} (${synced} synced)`;
+            matchedEl.title = `${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)`;
+        } else {
+            matchedEl.textContent = matched;
+            matchedEl.removeAttribute('title');
+        }
+    }
     if (failedEl) failedEl.textContent = failed;
 
     if (total > 0) {
@@ -2394,7 +2433,7 @@ async function startQobuzDownloadMissing(urlHash) {
 
         const discoveryResults = state.discoveryResults || state.discovery_results;
         if (!discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -2444,9 +2483,9 @@ async function loadDeezerArlPlaylists() {
     const container = document.getElementById('deezer-arl-playlist-container');
     const refreshBtn = document.getElementById('deezer-arl-refresh-btn');
 
-    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists…</div>`;
+    container.innerHTML = `<div class="playlist-placeholder">🔄 Loading playlists...</div>`;
     refreshBtn.disabled = true;
-    refreshBtn.textContent = '🔄 Loading…';
+    refreshBtn.textContent = '🔄 Loading...';
 
     try {
         const response = await fetch('/api/deezer/arl-playlists');
@@ -2544,7 +2583,7 @@ async function openDeezerArlPlaylistDetailsModal(event, playlistId) {
     if (!playlist) return;
 
     const arlPlaylistId = `deezer_arl_${playlistId}`;
-    showLoadingOverlay(`Loading playlist: ${playlist.name}…`);
+    showLoadingOverlay(`Loading playlist: ${playlist.name}...`);
 
     try {
         const playlistMeta = { ...playlist, track_count: playlist.track_count ?? playlist.tracks?.length };
@@ -2683,7 +2722,7 @@ function updateDeezerArlPlaylistCardUI(playlistId) {
         progressBtn.classList.remove('hidden');
         progressBtn.textContent = 'View Progress';
         progressBtn.style.backgroundColor = '';
-        actionBtn.textContent = '📥 Downloading…';
+        actionBtn.textContent = '📥 Downloading...';
         actionBtn.disabled = true;
         if (card) card.classList.remove('download-complete');
     } else if (process && process.status === 'complete') {
@@ -2720,9 +2759,10 @@ async function loadDeezerPlaylist() {
     }
 
     // Extract playlist ID from URL
-    // Supports: deezer.com/playlist/{id}, deezer.com/{locale}/playlist/{id}, or raw numeric ID
+    // Supports: deezer.com/playlist/{id}, deezer.com/{locale}/playlist/{id}
+    // (locale may carry a region, /en-us/), or raw numeric ID.
     let playlistId = null;
-    const urlMatch = rawUrl.match(/deezer\.com\/(?:[a-z]{2}\/)?playlist\/(\d+)/i);
+    const urlMatch = rawUrl.match(/deezer\.com\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?playlist\/(\d+)/i);
     if (urlMatch) {
         playlistId = urlMatch[1];
     } else if (/^\d+$/.test(rawUrl)) {
@@ -2730,6 +2770,15 @@ async function loadDeezerPlaylist() {
     }
 
     if (!playlistId) {
+        // A share link (link.deezer.com/s/..., deezer.page.link/...) is what
+        // Deezer's own Share button copies. It carries no id until a redirect
+        // is followed, which the browser cannot do cross-origin — so say what
+        // to do rather than implying their share link is malformed.
+        if (/^(?:https?:\/\/)?(?:link\.deezer\.com\/|deezer\.page\.link\/)/i.test(rawUrl.trim())) {
+            showToast('That is a Deezer share link, which hides the playlist id. Open it in a '
+                      + 'browser and paste the deezer.com/playlist/... address it lands on.', 'error');
+            return;
+        }
         showToast('Invalid Deezer playlist URL. Expected format: deezer.com/playlist/{id}', 'error');
         return;
     }
@@ -2744,7 +2793,7 @@ async function loadDeezerPlaylist() {
     const parseBtn = document.getElementById('deezer-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading…';
+        parseBtn.textContent = 'Loading...';
     }
 
     try {
@@ -3015,7 +3064,7 @@ async function openDeezerDiscoveryModal(playlistId, playlistData) {
 
             if (result.error) {
                 console.error('Error starting Deezer discovery:', result.error);
-                showToast(`Error starting discovery: ${result.error}`, 'error');
+                showToast(`Error starting identification: ${result.error}`, 'error');
                 return;
             }
 
@@ -3029,7 +3078,7 @@ async function openDeezerDiscoveryModal(playlistId, playlistData) {
 
         } catch (error) {
             console.error('Error starting Deezer discovery:', error);
-            showToast(`Error starting discovery: ${error.message}`, 'error');
+            showToast(`Error starting identification: ${error.message}`, 'error');
         }
     } else if (isCurrentlyDiscovering) {
         console.log(`🔄 Resuming Deezer discovery polling for: ${playlistData.name}`);
@@ -3579,11 +3628,18 @@ function updateDeezerCardSyncProgress(playlistId, progress) {
         const processed = matched + failed;
         const percentage = total > 0 ? Math.round((processed / total) * 100) : 0;
 
+        const matchedText = progress.duplicate_tracks > 0
+            ? `${matched} (${progress.synced_tracks || (matched - progress.duplicate_tracks)} synced)`
+            : `${matched}`;
+        const matchedTitle = progress.duplicate_tracks > 0
+            ? ` title="${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)"`
+            : '';
+
         statusCounterHTML = `
             <div class="playlist-card-sync-status">
                 <span class="sync-stat total-tracks">♪ ${total}</span>
                 <span class="sync-separator">/</span>
-                <span class="sync-stat matched-tracks">✓ ${matched}</span>
+                <span class="sync-stat matched-tracks"${matchedTitle}>✓ ${matchedText}</span>
                 <span class="sync-separator">/</span>
                 <span class="sync-stat failed-tracks">✗ ${failed}</span>
                 <span class="sync-stat percentage">(${percentage}%)</span>
@@ -3610,7 +3666,16 @@ function updateDeezerModalSyncProgress(urlHash, progress) {
     const failed = progress.failed_tracks || 0;
 
     if (totalEl) totalEl.textContent = total;
-    if (matchedEl) matchedEl.textContent = matched;
+    if (matchedEl) {
+        if (progress.duplicate_tracks > 0) {
+            const synced = progress.synced_tracks || (matched - progress.duplicate_tracks);
+            matchedEl.textContent = `${matched} (${synced} synced)`;
+            matchedEl.title = `${progress.duplicate_tracks} duplicate track${progress.duplicate_tracks === 1 ? '' : 's'} folded (already on playlist)`;
+        } else {
+            matchedEl.textContent = matched;
+            matchedEl.removeAttribute('title');
+        }
+    }
     if (failedEl) failedEl.textContent = failed;
 
     if (total > 0) {
@@ -3643,7 +3708,7 @@ async function startDeezerDownloadMissing(urlHash) {
         const discoveryResults = state.discoveryResults || state.discovery_results;
 
         if (!discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -3699,7 +3764,44 @@ async function startDeezerDownloadMissing(urlHash) {
 // SYNC PAGE FUNCTIONALITY (REDESIGNED)
 // ===============================
 
+// Set once the listener bindings below have run. `initializeSyncPage` is
+// called from TWO places in init.js — once at boot (2885) and again from
+// loadPageData's `case 'sync'` (3290), which fires on every navigation to the
+// page. The sync markup is static in index.html and is never re-created, so
+// the listeners only ever need binding once; binding them per visit stacked a
+// duplicate set each time.
+//
+// That was not merely wasteful. Only four of the 25 bindings guarded
+// themselves with a removeEventListener first (the Spotify/Tidal/Deezer-ARL/
+// Qobuz refresh buttons). One of the other 21 is the Start Sync button, and
+// `startSequentialSync` is a TOGGLE — it cancels when the manager is already
+// running, and `SequentialSyncManager.start` sets `isRunning` synchronously.
+// So after an even number of visits to the page a single click started the
+// sync and immediately cancelled it, and the button looked dead.
+let _syncPageListenersBound = false;
+
 function initializeSyncPage() {
+    // Per-visit work, which must run on EVERY call: all three are idempotent
+    // refreshes rather than bindings.
+    const _activeBeatportTab = document.querySelector('.sync-tab-button.active[data-tab="beatport"]');
+    if (_activeBeatportTab) {
+        ensureBeatportContentLoaded();
+    }
+    if (document.getElementById('beatport-clear-btn')) {
+        updateBeatportClearButtonState();
+    }
+    // MUST stay above the guard. `loadPageData` calls `stopLogPolling()` at the
+    // top of EVERY navigation (init.js), and this is the only thing that ever
+    // restarts it — so leaving it below the early return stopped the activity
+    // feed after the first visit and never brought it back. That only shows
+    // when the socket is down, because `tool:logs` (core.js) writes the same
+    // textarea through `updateLogsFromData` and the HTTP poll is its twin.
+    // It is idempotent: `startLogPolling` returns early when already polling.
+    initializeLiveLogViewer();
+
+    if (_syncPageListenersBound) return;
+    _syncPageListenersBound = true;
+
     // Logic for tab switching
     const tabButtons = document.querySelectorAll('.sync-tab-button');
     const syncSidebar = document.querySelector('.sync-sidebar');
@@ -3795,7 +3897,7 @@ function initializeSyncPage() {
                 }
             }
 
-            // Commissary Discovery Sync tab — personalized_playlists pre-
+            // SoulSync Discovery Sync tab — personalized_playlists pre-
             // matched, no discovery hop needed; click → refresh kind →
             // mirror under synthetic id.
             if (tabId === 'soulsync-discovery-sync') {
@@ -3807,12 +3909,6 @@ function initializeSyncPage() {
             }
         });
     });
-
-    // If the Beatport tab is already active when Sync initializes, load it now.
-    const activeBeatportTab = document.querySelector('.sync-tab-button.active[data-tab="beatport"]');
-    if (activeBeatportTab) {
-        ensureBeatportContentLoaded();
-    }
 
     // Logic for the Spotify refresh button
     const refreshBtn = document.getElementById('spotify-refresh-btn');
@@ -3869,8 +3965,6 @@ function initializeSyncPage() {
     const beatportClearBtn = document.getElementById('beatport-clear-btn');
     if (beatportClearBtn) {
         beatportClearBtn.addEventListener('click', clearBeatportPlaylists);
-        // Set initial clear button state
-        updateBeatportClearButtonState();
     }
 
     // Logic for Beatport nested tabs
@@ -3895,78 +3989,6 @@ function initializeSyncPage() {
             }
         });
     });
-
-    // Logic for Homepage Genre Explorer card
-    const genreExplorerCard = document.querySelector('[data-action="show-genres"]');
-    if (genreExplorerCard) {
-        genreExplorerCard.addEventListener('click', () => {
-            console.log('🎵 Genre Explorer card clicked');
-            showBeatportSubView('genres');
-            loadBeatportGenres();
-        });
-    }
-
-    // Setup homepage chart handlers (following genre page pattern to prevent duplicates)
-    setupHomepageChartTypeHandlers();
-
-    // Load homepage chart collections automatically (disabled since Browse Charts tab is hidden)
-    // loadDJChartsInline();
-    // loadFeaturedChartsInline();
-
-    // Logic for Beatport breadcrumb back buttons
-    const beatportBackButtons = document.querySelectorAll('.breadcrumb-back');
-    beatportBackButtons.forEach(button => {
-        button.addEventListener('click', () => {
-            // Handle different back button types
-            if (button.id === 'genre-detail-back') {
-                showBeatportGenresView();
-            } else if (button.id === 'genre-charts-list-back') {
-                showBeatportGenreDetailViewFromBack();
-            } else {
-                showBeatportMainView();
-            }
-        });
-    });
-
-    // Logic for Beatport chart items
-    const beatportChartItems = document.querySelectorAll('.beatport-chart-item');
-    beatportChartItems.forEach(item => {
-        item.addEventListener('click', () => {
-            const chartType = item.dataset.chartType;
-            const chartId = item.dataset.chartId;
-            const chartName = item.dataset.chartName;
-            const chartEndpoint = item.dataset.chartEndpoint;
-            handleBeatportChartClick(chartType, chartId, chartName, chartEndpoint);
-        });
-    });
-
-    // Logic for Beatport genre items
-    const beatportGenreItems = document.querySelectorAll('.beatport-genre-item');
-    beatportGenreItems.forEach(item => {
-        item.addEventListener('click', () => {
-            const genreSlug = item.dataset.genreSlug;
-            const genreId = item.dataset.genreId;
-            handleBeatportGenreClick(genreSlug, genreId);
-        });
-    });
-
-    // Logic for Rebuild page Top 10 containers - Beatport Top 10
-    const beatportTop10Container = document.getElementById('beatport-top10-list');
-    if (beatportTop10Container) {
-        beatportTop10Container.addEventListener('click', () => {
-            console.log('🎵 Beatport Top 10 container clicked on rebuild page');
-            handleRebuildBeatportTop10Click();
-        });
-    }
-
-    // Logic for Rebuild page Top 10 containers - Hype Top 10
-    const beatportHype10Container = document.getElementById('beatport-hype10-list');
-    if (beatportHype10Container) {
-        beatportHype10Container.addEventListener('click', () => {
-            console.log('🔥 Hype Top 10 container clicked on rebuild page');
-            handleRebuildHypeTop10Click();
-        });
-    }
 
     // Logic for Rebuild page Hero Slider - individual slide click handlers will be set up in populateBeatportSlider
     // Container-level click handler removed to allow individual slide clicks like top 10 releases
@@ -4025,20 +4047,6 @@ function initializeSyncPage() {
         });
     }
 
-    // Logic for Beatport Top 100 button
-    const beatportTop100Btn = document.getElementById('beatport-top100-btn');
-    if (beatportTop100Btn) {
-        beatportTop100Btn.addEventListener('click', handleBeatportTop100Click);
-    }
-
-    // Logic for Hype Top 100 button
-    const hypeTop100Btn = document.getElementById('hype-top100-btn');
-    if (hypeTop100Btn) {
-        hypeTop100Btn.addEventListener('click', handleHypeTop100Click);
-    }
-
-    // Initialize live log viewer
-    initializeLiveLogViewer();
 }
 
 
@@ -4072,7 +4080,7 @@ async function handleDbUpdateButtonClick() {
             // second click reads "Starting..." and falls through to the stop
             // branch below, so there's no double-start risk.
             button.disabled = false;
-            button.textContent = 'Starting…';
+            button.textContent = 'Starting...';
             const response = await fetch('/api/database/update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -4116,75 +4124,6 @@ async function handleDbUpdateButtonClick() {
     }
 }
 
-async function handleWishlistButtonClick() {
-    try {
-        const playlistId = 'wishlist';
-
-        console.log('🎵 [Wishlist Button] User clicked wishlist button - checking server state first');
-
-        // STEP 1: Always check server state first to detect any active wishlist processes
-        const response = await fetch('/api/active-processes');
-        if (!response.ok) {
-            throw new Error(`Failed to fetch active processes: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const processes = data.active_processes || [];
-        const serverWishlistProcess = processes.find(p => p.playlist_id === playlistId);
-
-        // STEP 2: Handle active server process - show current state immediately
-        if (serverWishlistProcess) {
-            console.log('🎯 [Wishlist Button] Server has active wishlist process:', {
-                batch_id: serverWishlistProcess.batch_id,
-                phase: serverWishlistProcess.phase,
-                auto_initiated: serverWishlistProcess.auto_initiated,
-                should_show: serverWishlistProcess.should_show_modal
-            });
-
-            // Clear any user-closed state since user explicitly requested to see modal
-            WishlistModalState.clearUserClosed();
-
-            // Check if we need to create/sync the frontend modal
-            const clientWishlistProcess = activeDownloadProcesses[playlistId];
-            const needsRehydration = !clientWishlistProcess ||
-                clientWishlistProcess.batchId !== serverWishlistProcess.batch_id ||
-                !clientWishlistProcess.modalElement ||
-                !document.body.contains(clientWishlistProcess.modalElement);
-
-            if (needsRehydration) {
-                console.log('🔄 [Wishlist Button] Frontend modal needs sync/creation');
-                await rehydrateModal(serverWishlistProcess, true); // user-requested = true
-            } else {
-                console.log('✅ [Wishlist Button] Frontend modal already synced, showing existing modal');
-                clientWishlistProcess.modalElement.style.display = 'flex';
-                WishlistModalState.setVisible();
-            }
-            return;
-        }
-
-        // STEP 3: No active server process - check wishlist count and create fresh modal
-        console.log('📭 [Wishlist Button] No active server process, checking wishlist content');
-
-        const countResponse = await fetch('/api/wishlist/count');
-        if (!countResponse.ok) {
-            throw new Error(`Failed to fetch wishlist count: ${countResponse.status}`);
-        }
-
-        const countData = await countResponse.json();
-        if (countData.count === 0) {
-            showToast('Wishlist is empty. No tracks to download.', 'info');
-            return;
-        }
-
-        // STEP 4: Open wishlist overview modal (NEW - category selection)
-        console.log(`🆕 [Wishlist Button] Opening wishlist overview for ${countData.count} tracks`);
-        await openWishlistOverviewModal();
-
-    } catch (error) {
-        console.error('❌ [Wishlist Button] Error handling wishlist button click:', error);
-        showToast(`Error opening wishlist: ${error.message}`, 'error');
-    }
-}
 
 async function cleanupWishlist(playlistId) {
     try {
@@ -4202,7 +4141,7 @@ async function cleanupWishlist(playlistId) {
         const cleanupBtn = document.getElementById(`cleanup-wishlist-btn-${playlistId}`);
         if (cleanupBtn) {
             cleanupBtn.disabled = true;
-            cleanupBtn.textContent = '🧹 Cleaning…';
+            cleanupBtn.textContent = '🧹 Cleaning...';
         }
 
         const response = await fetch('/api/wishlist/cleanup', {
@@ -4266,7 +4205,7 @@ async function clearWishlist(playlistId) {
         const clearBtn = document.getElementById(`clear-wishlist-btn-${playlistId}`);
         if (clearBtn) {
             clearBtn.disabled = true;
-            clearBtn.textContent = 'Clearing…';
+            clearBtn.textContent = 'Clearing...';
         }
 
         // Call the clear API endpoint
@@ -4363,13 +4302,13 @@ async function clearBeatportPlaylists() {
 
     if (activeCharts.length > 0) {
         const activeNames = activeCharts.map(state => state.chart?.name || 'Unknown').join(', ');
-        showToast(`Cannot clear: ${activeCharts.length} chart(s) are currently discovering, syncing, or downloading: ${activeNames}`, 'warning');
+        showToast(`Cannot clear: ${activeCharts.length} chart(s) are currently identifying, syncing, or downloading: ${activeNames}`, 'warning');
         return;
     }
 
     // Show loading state
     clearBtn.disabled = true;
-    clearBtn.textContent = '🗑️ Clearing…';
+    clearBtn.textContent = '🗑️ Clearing...';
 
     try {
         // Clear all Beatport chart states
@@ -4435,103 +4374,6 @@ async function clearBeatportPlaylists() {
     }
 }
 
-function handleBeatportCategoryClick(category) {
-    console.log(`🎵 Beatport category clicked: ${category}`);
-
-    // Only handle genres category now - homepage has direct chart buttons
-    switch (category) {
-        case 'genres':
-            showBeatportSubView('genres');
-            loadBeatportGenres(); // Load genres dynamically
-            break;
-        default:
-            showToast(`Unknown category: ${category}`, 'error');
-    }
-}
-
-async function loadBeatportGenres() {
-    console.log('🔍 Loading Beatport genres dynamically...');
-
-    const genreGrid = document.querySelector('#beatport-genres-view .beatport-genre-grid');
-    if (!genreGrid) {
-        console.error('❌ Could not find genre grid element');
-        return;
-    }
-
-    // Show loading state
-    genreGrid.innerHTML = `
-        <div class="genre-loading-placeholder">
-            <div class="loading-spinner"></div>
-            <p>🔍 Discovering current Beatport genres…</p>
-        </div>
-    `;
-
-    try {
-        // First, fetch genres quickly without images
-        console.log('🚀 Fetching genres without images for fast loading...');
-        const fastResponse = await fetch('/api/beatport/genres');
-        if (!fastResponse.ok) {
-            throw new Error(`API returned ${fastResponse.status}: ${fastResponse.statusText}`);
-        }
-
-        const fastData = await fastResponse.json();
-        const genres = fastData.genres || [];
-
-        if (genres.length === 0) {
-            genreGrid.innerHTML = `
-                <div class="genre-error-placeholder">
-                    <p>⚠️ No genres available</p>
-                    <button onclick="loadBeatportGenres()" class="refresh-genres-btn">🔄 Retry</button>
-                </div>
-            `;
-            return;
-        }
-
-        // Generate genre cards dynamically (without images first)
-        const genreCardsHTML = genres.map(genre => `
-            <div class="beatport-genre-item"
-                 data-genre-slug="${genre.slug}"
-                 data-genre-id="${genre.id}"
-                 data-genre-name="${genre.name}">
-                <div class="genre-icon">🎵</div>
-                <h3>${genre.name}</h3>
-                <span class="track-count">Top 100</span>
-            </div>
-        `).join('');
-
-        genreGrid.innerHTML = genreCardsHTML;
-
-        // Add click handlers to dynamically created genre items
-        const genreItems = genreGrid.querySelectorAll('.beatport-genre-item');
-        genreItems.forEach(item => {
-            item.addEventListener('click', () => {
-                const genreSlug = item.dataset.genreSlug;
-                const genreId = item.dataset.genreId;
-                const genreName = item.dataset.genreName;
-                handleBeatportGenreClick(genreSlug, genreId, genreName);
-            });
-        });
-
-        console.log(`✅ Loaded ${genres.length} Beatport genres dynamically (fast mode)`);
-        showToast(`Loaded ${genres.length} current Beatport genres`, 'success');
-
-        // Now fetch images progressively in the background if there are many genres
-        if (genres.length > 10) {
-            console.log('🖼️ Loading genre images progressively...');
-            loadGenreImagesProgressively(genres);
-        }
-
-    } catch (error) {
-        console.error('❌ Error loading Beatport genres:', error);
-        genreGrid.innerHTML = `
-            <div class="genre-error-placeholder">
-                <p>❌ Failed to load genres: ${error.message}</p>
-                <button onclick="loadBeatportGenres()" class="refresh-genres-btn">🔄 Retry</button>
-            </div>
-        `;
-        showToast(`Error loading Beatport genres: ${error.message}`, 'error');
-    }
-}
 
 async function loadGenreImagesProgressively(genres) {
     // Load genre images with 2 concurrent workers for faster loading
@@ -4612,113 +4454,6 @@ async function loadGenreImagesProgressively(genres) {
     console.log(`✅ Progressive image loading complete: ${imagesLoaded}/${genres.length} images loaded`);
 }
 
-function setupHomepageChartTypeHandlers() {
-    console.log('🔧 Setting up homepage chart type handlers...');
-
-    // Select all homepage chart type cards (following genre page pattern)
-    const chartTypeCards = document.querySelectorAll('.homepage-main-charts-section .genre-chart-type-card[data-chart-type], .homepage-releases-section .genre-chart-type-card[data-chart-type], .homepage-hype-section .genre-chart-type-card[data-chart-type]');
-
-    chartTypeCards.forEach(card => {
-        // Remove existing listeners by cloning (following genre page pattern)
-        card.replaceWith(card.cloneNode(true));
-    });
-
-    // Re-select after cloning to ensure clean event listeners (following genre page pattern)
-    const newChartTypeCards = document.querySelectorAll('.homepage-main-charts-section .genre-chart-type-card[data-chart-type], .homepage-releases-section .genre-chart-type-card[data-chart-type], .homepage-hype-section .genre-chart-type-card[data-chart-type]');
-
-    newChartTypeCards.forEach(card => {
-        card.addEventListener('click', () => {
-            const chartType = card.dataset.chartType;
-            const chartEndpoint = card.dataset.chartEndpoint;
-            const chartName = card.querySelector('.chart-type-info h3').textContent;
-            console.log(`🔥 Homepage chart clicked: ${chartName} (${chartType})`);
-            handleHomepageChartTypeClick(chartType, chartEndpoint, chartName);
-        });
-    });
-
-    console.log(`✅ Setup ${newChartTypeCards.length} homepage chart handlers`);
-}
-
-async function handleHomepageChartTypeClick(chartType, chartEndpoint, chartName) {
-    console.log(`🔥 Homepage chart type clicked: ${chartType} (${chartName})`);
-
-    // Map chart types to API endpoints and create descriptive names (following genre page pattern)
-    const chartTypeMap = {
-        'top-10': {
-            endpoint: `/api/beatport/top-100`,  // Use top-100 endpoint and limit to 10
-            name: `Beatport Top 10`,
-            limit: 10
-        },
-        'top-100': {
-            endpoint: `/api/beatport/top-100`,
-            name: `Beatport Top 100`,
-            limit: 100
-        },
-        'releases-top-10': {
-            endpoint: `/api/beatport/homepage/top-10-releases`,  // Working route
-            name: `Top 10 Releases`,
-            limit: 10
-        },
-        'releases-top-100': {
-            endpoint: `/api/beatport/top-100-releases`,
-            name: `Top 100 Releases`,
-            limit: 100
-        },
-        'latest-releases': {
-            endpoint: `/api/beatport/homepage/new-releases`,  // Use new-releases as fallback for now
-            name: `Latest Releases`,
-            limit: 50
-        },
-        'hype-top-10': {
-            endpoint: `/api/beatport/hype-top-100`,  // Use hype-100 endpoint and limit to 10
-            name: `Hype Top 10`,
-            limit: 10
-        },
-        'hype-top-100': {
-            endpoint: `/api/beatport/hype-top-100`,
-            name: `Hype Top 100`,
-            limit: 100
-        },
-        'hype-picks': {
-            endpoint: `/api/beatport/homepage/hype-picks`,  // Working route
-            name: `Hype Picks`,
-            limit: 50
-        }
-    };
-
-    const chartConfig = chartTypeMap[chartType];
-    if (!chartConfig) {
-        console.error(`❌ Unknown homepage chart type: ${chartType}`);
-        showToast(`Unknown chart type: ${chartType}`, 'error');
-        return;
-    }
-
-    try {
-        showToast(`Loading ${chartConfig.name}…`, 'info');
-        showLoadingOverlay(`Loading ${chartConfig.name}…`);
-
-        const response = await fetch(`${chartConfig.endpoint}?limit=${chartConfig.limit}`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch ${chartConfig.name}: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            throw new Error(`No tracks found in ${chartConfig.name}`);
-        }
-
-        console.log(`✅ Fetched ${data.tracks.length} tracks from ${chartConfig.name}`);
-        hideLoadingOverlay();
-        openBeatportChartAsDownloadModal(data.tracks, chartConfig.name, null);
-
-    } catch (error) {
-        console.error(`❌ Error loading ${chartConfig.name}:`, error);
-        hideLoadingOverlay();
-        showToast(`Error loading ${chartConfig.name}: ${error.message}`, 'error');
-    }
-}
-
-
 
 async function openBeatportDiscoveryModal(chartHash, chartData) {
     console.log(`🎵 Opening Beatport discovery modal (reusing YouTube modal): ${chartData.name}`);
@@ -4769,13 +4504,13 @@ async function openBeatportDiscoveryModal(chartHash, chartData) {
             console.log(`✅ Started Beatport discovery for: ${chartData.name}`);
         } else {
             console.error('❌ Error starting Beatport discovery:', result.error);
-            showToast(`Error starting discovery: ${result.error}`, 'error');
+            showToast(`Error starting identification: ${result.error}`, 'error');
             // Revert card phase on error
             updateBeatportCardPhase(chartHash, 'fresh');
         }
     } catch (error) {
         console.error('❌ Error starting Beatport discovery:', error);
-        showToast(`Error starting discovery: ${error.message}`, 'error');
+        showToast(`Error starting identification: ${error.message}`, 'error');
         // Revert card phase on error
         updateBeatportCardPhase(chartHash, 'fresh');
     }
@@ -4965,50 +4700,10 @@ let rebuildPageTrackData = {
     // hero_slider removed - now uses individual slide click handlers
 };
 
-async function handleRebuildBeatportTop10Click() {
-    console.log('🎵 Handling Beatport Top 10 click on rebuild page');
-
-    // Use the existing chart creation pattern from Browse Charts EXACTLY
-    await handleRebuildChartClick('beatport_top10', 'Beatport Top 10', 'rebuild_beatport_top10');
-}
-
-async function handleRebuildHypeTop10Click() {
-    console.log('🔥 Handling Hype Top 10 click on rebuild page');
-
-    // Use the existing chart creation pattern from Browse Charts EXACTLY
-    await handleRebuildChartClick('hype_top10', 'Hype Top 10', 'rebuild_hype_top10');
-}
 
 // Hero slider now uses individual slide click handlers instead of container-level clicking
 // The old handleRebuildHeroSliderClick function has been removed in favor of individual release discovery
 
-async function handleRebuildChartClick(trackDataKey, chartName, chartType) {
-    if (_beatportModalOpening) return;
-    _beatportModalOpening = true;
-    setTimeout(() => { _beatportModalOpening = false; }, 2000);
-
-    try {
-        // Get basic track data from DOM
-        const trackData = await getRebuildPageTrackData(trackDataKey);
-        if (!trackData || trackData.length === 0) {
-            throw new Error(`No track data found for ${chartName}`);
-        }
-
-        console.log(`✅ Got ${trackData.length} tracks from ${chartName}, enriching one-by-one...`);
-        showLoadingOverlay(`Fetching track metadata… (0/${trackData.length})`);
-
-        const enrichedTracks = await _enrichTracksWithProgress(trackData, chartName);
-
-        console.log(`✅ Enriched ${enrichedTracks.length} tracks`);
-        hideLoadingOverlay();
-        openBeatportChartAsDownloadModal(enrichedTracks, chartName, null);
-
-    } catch (error) {
-        hideLoadingOverlay();
-        console.error(`❌ Error handling ${chartName} click:`, error);
-        showToast(`Error loading ${chartName}: ${error.message}`, 'error');
-    }
-}
 
 async function getRebuildPageTrackData(trackDataKey) {
     // First check if we have cached data from when the rebuild page was loaded
@@ -5478,7 +5173,7 @@ async function startBeatportPlaylistSync(urlHash) {
         updateBeatportModalButtons(urlHash, 'syncing');
         startBeatportSyncPolling(urlHash, syncPlaylistId);
 
-        showToast('Starting Beatport playlist sync…', 'success');
+        showToast('Starting Beatport playlist sync...', 'success');
 
     } catch (error) {
         console.error('❌ Error starting Beatport sync:', error);
@@ -5673,7 +5368,7 @@ async function startBeatportDownloadMissing(urlHash) {
         const discoveryResults = state?.discoveryResults || state?.discovery_results;
 
         if (!state || !discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -5803,150 +5498,6 @@ async function startBeatportDownloadMissing(urlHash) {
     }
 }
 
-async function handleBeatportChartClick(chartType, chartId, chartName, chartEndpoint) {
-    console.log(`🎵 Beatport chart clicked: ${chartType} - ${chartId} - ${chartName}`);
-
-    try {
-        showToast(`Loading ${chartName}…`, 'info');
-        showLoadingOverlay(`Loading ${chartName}…`);
-
-        const response = await fetch(`${chartEndpoint}?limit=100`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch ${chartName}: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            throw new Error(`No tracks found in ${chartName}`);
-        }
-
-        console.log(`✅ Fetched ${data.tracks.length} tracks from ${chartName}`);
-        hideLoadingOverlay();
-        openBeatportChartAsDownloadModal(data.tracks, chartName, null);
-
-    } catch (error) {
-        console.error(`❌ Error handling Beatport chart click:`, error);
-        hideLoadingOverlay();
-        showToast(`Error loading ${chartName || chartId}: ${error.message}`, 'error');
-    }
-}
-
-function handleBeatportGenreClick(genreSlug, genreId, genreName) {
-    console.log(`🎵 Beatport genre clicked: ${genreName} (${genreSlug}/${genreId}) - SHOWING GENRE DETAIL VIEW`);
-    console.log(`📝 Debug: Parameters received - Slug: ${genreSlug}, ID: ${genreId}, Name: ${genreName}`);
-
-    // Navigate to genre detail view with proper parameters
-    showBeatportGenreDetailView(genreSlug, genreId, genreName);
-}
-
-function showBeatportGenreDetailView(genreSlug, genreId, genreName) {
-    console.log(`🎯 Showing genre detail view for: ${genreName}`);
-    console.log(`📝 Debug: Function called with - Slug: ${genreSlug}, ID: ${genreId}, Name: ${genreName}`);
-
-    // Hide all other beatport views
-    document.querySelectorAll('.beatport-sub-view').forEach(view => {
-        view.classList.remove('active');
-    });
-    const mainView = document.getElementById('beatport-main-view');
-    if (mainView) {
-        mainView.classList.remove('active');
-    }
-
-    // Show genre detail view
-    const genreDetailView = document.getElementById('beatport-genre-detail-view');
-    if (genreDetailView) {
-        genreDetailView.classList.add('active');
-        console.log(`📝 Debug: Genre detail view element found and activated`);
-
-        // Update view content
-        const titleElement = document.getElementById('genre-detail-title');
-        const breadcrumbElement = document.getElementById('genre-detail-breadcrumb');
-
-        console.log(`📝 Debug: Title element found: ${!!titleElement}, Breadcrumb element found: ${!!breadcrumbElement}`);
-
-        if (titleElement) {
-            titleElement.textContent = genreName;
-            console.log(`📝 Debug: Updated title to: ${genreName}`);
-        }
-        if (breadcrumbElement) {
-            breadcrumbElement.textContent = `Browse Charts > Genre Explorer > ${genreName} Charts`;
-            console.log(`📝 Debug: Updated breadcrumb`);
-        }
-
-        // Update chart type titles with genre name
-        const chartTitles = [
-            'genre-top-10-title',
-            'genre-top-100-title',
-            'genre-releases-top-10-title',
-            'genre-releases-top-100-title',
-            'genre-staff-picks-title',
-            'genre-latest-releases-title',
-            'genre-new-charts-title'
-        ];
-
-        chartTitles.forEach(titleId => {
-            const element = document.getElementById(titleId);
-            if (element) {
-                console.log(`📝 Debug: Found chart title element: ${titleId}`);
-            } else {
-                console.log(`📝 Debug: Missing chart title element: ${titleId}`);
-            }
-        });
-
-        document.getElementById('genre-top-10-title').textContent = `Top 10 ${genreName}`;
-        document.getElementById('genre-top-100-title').textContent = `Top 100 ${genreName}`;
-        document.getElementById('genre-releases-top-10-title').textContent = `Top 10 ${genreName} Releases`;
-        document.getElementById('genre-releases-top-100-title').textContent = `Top 100 ${genreName} Releases`;
-        document.getElementById('genre-staff-picks-title').textContent = `${genreName} Staff Picks`;
-        document.getElementById('genre-latest-releases-title').textContent = `Latest ${genreName} Releases`;
-
-        // Update Hype section titles
-        document.getElementById('genre-hype-top-10-title').textContent = `${genreName} Hype Top 10`;
-        document.getElementById('genre-hype-top-100-title').textContent = `${genreName} Hype Top 100`;
-        document.getElementById('genre-hype-picks-title').textContent = `${genreName} Hype Picks`;
-
-        // Load new charts directly (no expansion needed)
-        console.log(`🔄 Auto-loading new charts for ${genreName}...`);
-        loadNewChartsInline(genreSlug, genreId, genreName);
-
-        // Store current genre data for chart type handlers
-        genreDetailView.dataset.genreSlug = genreSlug;
-        genreDetailView.dataset.genreId = genreId;
-        genreDetailView.dataset.genreName = genreName;
-
-        // Add click handlers to chart type cards
-        setupGenreChartTypeHandlers();
-
-        console.log(`✅ Genre detail view shown for ${genreName}`);
-    } else {
-        console.error('❌ Genre detail view element not found');
-    }
-}
-
-function setupGenreChartTypeHandlers() {
-    const chartTypeCards = document.querySelectorAll('#beatport-genre-detail-view .genre-chart-type-card');
-
-    chartTypeCards.forEach(card => {
-        // Remove existing listeners
-        card.replaceWith(card.cloneNode(true));
-    });
-
-    // Re-select after cloning
-    const newChartTypeCards = document.querySelectorAll('#beatport-genre-detail-view .genre-chart-type-card');
-
-    newChartTypeCards.forEach(card => {
-        card.addEventListener('click', () => {
-            const chartType = card.dataset.chartType;
-            const genreDetailView = document.getElementById('beatport-genre-detail-view');
-            const genreSlug = genreDetailView.dataset.genreSlug;
-            const genreId = genreDetailView.dataset.genreId;
-            const genreName = genreDetailView.dataset.genreName;
-
-            // All chart types now go directly to discovery modal
-            handleGenreChartTypeClick(genreSlug, genreId, genreName, chartType);
-        });
-    });
-}
 
 function showBeatportGenresView() {
     // Hide genre detail view and show genres view
@@ -5960,445 +5511,6 @@ function showBeatportGenresView() {
     }
 }
 
-async function toggleNewChartsExpansion(genreSlug, genreId, genreName) {
-    console.log(`📈 Toggling new charts expansion for: ${genreName}`);
-
-    const expandedContent = document.getElementById('new-charts-expanded');
-    const expandIndicator = document.getElementById('expand-indicator');
-    const chartsCount = document.getElementById('new-charts-count');
-
-    if (!expandedContent || !expandIndicator) {
-        console.error('❌ New charts expansion elements not found');
-        return;
-    }
-
-    // Check if already expanded
-    const isExpanded = expandedContent.style.display !== 'none';
-
-    if (isExpanded) {
-        // Collapse
-        expandedContent.style.display = 'none';
-        expandIndicator.classList.remove('expanded');
-        console.log('📉 Collapsed new charts section');
-    } else {
-        // Expand and load charts
-        expandedContent.style.display = 'block';
-        expandIndicator.classList.add('expanded');
-
-        // Load charts if not already loaded
-        await loadNewChartsInline(genreSlug, genreId, genreName);
-        console.log('📈 Expanded new charts section');
-    }
-}
-
-async function loadNewChartsInline(genreSlug, genreId, genreName) {
-    const chartsGrid = document.getElementById('new-charts-grid');
-    const loadingInline = document.getElementById('charts-loading-inline');
-
-    if (!chartsGrid || !loadingInline) {
-        console.error('❌ Inline charts elements not found');
-        return;
-    }
-
-    // Show loading state
-    loadingInline.style.display = 'block';
-    chartsGrid.style.display = 'none';
-    chartsGrid.innerHTML = '';
-
-    try {
-        console.log(`🔍 Loading inline charts for ${genreName}...`);
-
-        // Fetch charts from the new-charts endpoint
-        const response = await fetch(`/api/beatport/genre/${genreSlug}/${genreId}/new-charts?limit=20`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch charts: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            // Show empty state
-            chartsGrid.innerHTML = `
-                <div class="new-charts-empty">
-                    <h4>No Charts Available</h4>
-                    <p>No curated charts found for ${genreName} at the moment.</p>
-                </div>
-            `;
-        } else {
-            // Populate charts grid
-            const chartsHTML = data.tracks.map((chart, index) => {
-                const chartName = chart.title || 'Untitled Chart';
-                const artistName = chart.artist || 'Various Artists';
-                const chartUrl = chart.url || '';
-
-                return `
-                    <div class="new-chart-item" data-chart-url="${chartUrl}" data-chart-name="${chartName}" data-chart-artist="${artistName}">
-                        <div class="new-chart-header">
-                            <div class="new-chart-icon">📈</div>
-                            <div class="new-chart-title">
-                                <h5>${chartName}</h5>
-                                <p class="new-chart-artist">by ${artistName}</p>
-                            </div>
-                        </div>
-                        <div class="new-chart-description">
-                            Curated ${genreName} chart collection
-                        </div>
-                        <div class="new-chart-footer">
-                            <div class="new-chart-type">Chart</div>
-                            <div class="new-chart-action">Explore →</div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-
-            chartsGrid.innerHTML = chartsHTML;
-
-            // Add click handlers to chart items
-            setupNewChartItemHandlers(genreSlug, genreId, genreName);
-        }
-
-        // Hide loading and show grid
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        console.log(`✅ Loaded ${data.tracks?.length || 0} inline charts for ${genreName}`);
-        showToast(`Found ${data.tracks?.length || 0} chart collections`, 'success');
-
-    } catch (error) {
-        console.error(`❌ Error loading inline charts for ${genreName}:`, error);
-
-        // Show error state
-        chartsGrid.innerHTML = `
-            <div class="new-charts-empty">
-                <h4>Error Loading Charts</h4>
-                <p>Unable to load chart collections for ${genreName}.</p>
-            </div>
-        `;
-
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        showToast(`Error loading charts: ${error.message}`, 'error');
-    }
-}
-
-async function loadDJChartsInline() {
-    const chartsGrid = document.getElementById('dj-charts-grid');
-    const loadingInline = document.getElementById('dj-charts-loading-inline');
-
-    if (!chartsGrid || !loadingInline) {
-        console.error('❌ DJ charts elements not found');
-        return;
-    }
-
-    // Show loading state
-    loadingInline.style.display = 'block';
-    chartsGrid.style.display = 'none';
-    chartsGrid.innerHTML = '';
-
-    try {
-        console.log('🔍 Loading DJ charts...');
-
-        // Fetch charts from the dj-charts-improved endpoint
-        const response = await fetch('/api/beatport/dj-charts-improved?limit=20');
-        if (!response.ok) {
-            throw new Error(`Failed to fetch DJ charts: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.charts || data.charts.length === 0) {
-            // Show empty state
-            chartsGrid.innerHTML = `
-                <div class="new-charts-empty">
-                    <h4>No DJ Charts Available</h4>
-                    <p>No DJ curated charts found at the moment.</p>
-                </div>
-            `;
-            loadingInline.style.display = 'none';
-            chartsGrid.style.display = 'grid';
-            return;
-        }
-
-        // Create chart items using New Charts structure
-        const chartsHTML = data.charts.map(chart => {
-            const chartName = chart.name || chart.title || 'Untitled Chart';
-            const artistName = chart.artist || chart.curator || 'Various Artists';
-            const chartUrl = chart.url || chart.chart_url || '';
-
-            return `
-                <div class="new-chart-item" data-chart-url="${chartUrl}" data-chart-name="${chartName}" data-chart-artist="${artistName}">
-                    <div class="new-chart-header">
-                        <div class="new-chart-icon">🎧</div>
-                        <div class="new-chart-title">
-                            <h5>${chartName}</h5>
-                            <p class="new-chart-artist">by ${artistName}</p>
-                        </div>
-                    </div>
-                    <div class="new-chart-description">
-                        DJ curated chart collection
-                    </div>
-                    <div class="new-chart-footer">
-                        <div class="new-chart-type">DJ Chart</div>
-                        <div class="new-chart-action">Explore →</div>
-                    </div>
-                </div>
-            `;
-        }).join('');
-
-        chartsGrid.innerHTML = chartsHTML;
-
-        // Hide loading, show content
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        // Setup click handlers for chart items
-        setupDJChartItemHandlers();
-
-        console.log(`✅ Loaded ${data.charts.length} DJ charts`);
-
-    } catch (error) {
-        console.error('❌ Error loading DJ charts:', error);
-
-        // Show error state
-        chartsGrid.innerHTML = `
-            <div class="new-charts-empty">
-                <h4>Error Loading DJ Charts</h4>
-                <p>Unable to load DJ chart collections.</p>
-            </div>
-        `;
-
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        showToast(`Error loading DJ charts: ${error.message}`, 'error');
-    }
-}
-
-async function loadFeaturedChartsInline() {
-    const chartsGrid = document.getElementById('featured-charts-grid');
-    const loadingInline = document.getElementById('featured-charts-loading-inline');
-
-    if (!chartsGrid || !loadingInline) {
-        console.error('❌ Featured charts elements not found');
-        return;
-    }
-
-    // Show loading state
-    loadingInline.style.display = 'block';
-    chartsGrid.style.display = 'none';
-    chartsGrid.innerHTML = '';
-
-    try {
-        console.log('🔍 Loading Featured charts...');
-
-        // Fetch charts from the homepage/featured-charts endpoint
-        const response = await fetch('/api/beatport/homepage/featured-charts?limit=20');
-        if (!response.ok) {
-            throw new Error(`Failed to fetch Featured charts: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            // Show empty state
-            chartsGrid.innerHTML = `
-                <div class="new-charts-empty">
-                    <h4>No Featured Charts Available</h4>
-                    <p>No featured curated charts found at the moment.</p>
-                </div>
-            `;
-            loadingInline.style.display = 'none';
-            chartsGrid.style.display = 'grid';
-            return;
-        }
-
-        // Create chart items using New Charts structure
-        const chartsHTML = data.tracks.map(chart => {
-            const chartName = chart.name || chart.title || 'Untitled Chart';
-            const artistName = chart.artist || chart.curator || 'Various Artists';
-            const chartUrl = chart.url || chart.chart_url || '';
-
-            return `
-                <div class="new-chart-item" data-chart-url="${chartUrl}" data-chart-name="${chartName}" data-chart-artist="${artistName}">
-                    <div class="new-chart-header">
-                        <div class="new-chart-icon">⭐</div>
-                        <div class="new-chart-title">
-                            <h5>${chartName}</h5>
-                            <p class="new-chart-artist">by ${artistName}</p>
-                        </div>
-                    </div>
-                    <div class="new-chart-description">
-                        Editor curated chart collection
-                    </div>
-                    <div class="new-chart-footer">
-                        <div class="new-chart-type">Featured Chart</div>
-                        <div class="new-chart-action">Explore →</div>
-                    </div>
-                </div>
-            `;
-        }).join('');
-
-        chartsGrid.innerHTML = chartsHTML;
-
-        // Hide loading, show content
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        // Setup click handlers for chart items
-        setupFeaturedChartItemHandlers();
-
-        console.log(`✅ Loaded ${data.tracks.length} Featured charts`);
-
-    } catch (error) {
-        console.error('❌ Error loading Featured charts:', error);
-
-        // Show error state
-        chartsGrid.innerHTML = `
-            <div class="new-charts-empty">
-                <h4>Error Loading Featured Charts</h4>
-                <p>Unable to load featured chart collections.</p>
-            </div>
-        `;
-
-        loadingInline.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        showToast(`Error loading Featured charts: ${error.message}`, 'error');
-    }
-}
-
-function setupDJChartItemHandlers() {
-    const chartItems = document.querySelectorAll('#dj-charts-grid .new-chart-item');
-
-    chartItems.forEach(item => {
-        item.addEventListener('click', async () => {
-            const chartName = item.dataset.chartName;
-            const chartUrl = item.dataset.chartUrl;
-
-            console.log(`🎧 DJ Chart clicked: ${chartName}`);
-
-            try {
-                showToast(`Loading ${chartName}…`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}…`);
-
-                const response = await fetch('/api/beatport/chart/extract', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chart_url: chartUrl, chart_name: chartName, limit: 100, enrich: false })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Failed to extract chart tracks: ${response.status}`);
-                }
-
-                const data = await response.json();
-                if (!data.success || !data.tracks || data.tracks.length === 0) {
-                    throw new Error('No tracks found in chart');
-                }
-
-                console.log(`✅ Extracted ${data.tracks.length} raw tracks from DJ chart, enriching...`);
-                const enrichedTracks = await _enrichTracksWithProgress(data.tracks, chartName);
-
-                hideLoadingOverlay();
-                openBeatportChartAsDownloadModal(enrichedTracks, chartName, null);
-
-            } catch (error) {
-                console.error('❌ Error extracting DJ chart tracks:', error);
-                hideLoadingOverlay();
-                showToast(`Error loading chart: ${error.message}`, 'error');
-            }
-        });
-    });
-}
-
-function setupFeaturedChartItemHandlers() {
-    const chartItems = document.querySelectorAll('#featured-charts-grid .new-chart-item');
-
-    chartItems.forEach(item => {
-        item.addEventListener('click', async () => {
-            const chartName = item.dataset.chartName;
-            const chartUrl = item.dataset.chartUrl;
-
-            console.log(`⭐ Featured Chart clicked: ${chartName}`);
-
-            try {
-                showToast(`Loading ${chartName}…`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}…`);
-
-                const response = await fetch('/api/beatport/chart/extract', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chart_url: chartUrl, chart_name: chartName, limit: 100, enrich: false })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Failed to extract chart tracks: ${response.status}`);
-                }
-
-                const data = await response.json();
-                if (!data.success || !data.tracks || data.tracks.length === 0) {
-                    throw new Error('No tracks found in chart');
-                }
-
-                console.log(`✅ Extracted ${data.tracks.length} raw tracks from Featured chart, enriching...`);
-                const enrichedTracks = await _enrichTracksWithProgress(data.tracks, chartName);
-
-                hideLoadingOverlay();
-                openBeatportChartAsDownloadModal(enrichedTracks, chartName, null);
-
-            } catch (error) {
-                console.error('❌ Error extracting Featured chart tracks:', error);
-                hideLoadingOverlay();
-                showToast(`Error loading chart: ${error.message}`, 'error');
-            }
-        });
-    });
-}
-
-function setupNewChartItemHandlers(genreSlug, genreId, genreName) {
-    const chartItems = document.querySelectorAll('#new-charts-grid .new-chart-item');
-
-    chartItems.forEach(item => {
-        item.addEventListener('click', async () => {
-            const chartName = item.dataset.chartName;
-            const chartArtist = item.dataset.chartArtist;
-            const chartUrl = item.dataset.chartUrl;
-
-            console.log(`🎵 Chart clicked: ${chartName} by ${chartArtist}`);
-
-            const fullChartName = `${chartName} (${genreName})`;
-
-            try {
-                showToast(`Loading ${chartName}…`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}…`);
-
-                const response = await fetch('/api/beatport/chart/extract', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chart_url: chartUrl, chart_name: chartName, limit: 100, enrich: false })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch chart content: ${response.status}`);
-                }
-
-                const data = await response.json();
-                if (!data.success || !data.tracks || data.tracks.length === 0) {
-                    throw new Error('No tracks found in chart');
-                }
-
-                console.log(`✅ Extracted ${data.tracks.length} raw tracks from ${fullChartName}, enriching...`);
-                const enrichedTracks = await _enrichTracksWithProgress(data.tracks, fullChartName);
-
-                hideLoadingOverlay();
-                openBeatportChartAsDownloadModal(enrichedTracks, fullChartName, null);
-
-            } catch (error) {
-                console.error(`❌ Error loading chart: ${error.message}`);
-                hideLoadingOverlay();
-                showToast(`Error loading chart: ${error.message}`, 'error');
-            }
-        });
-    });
-}
 
 function showBeatportGenreDetailViewFromBack() {
     // Show genre detail view (used by charts list back button)
@@ -6412,269 +5524,6 @@ function showBeatportGenreDetailViewFromBack() {
     }
 }
 
-async function showBeatportGenreChartsListView(genreSlug, genreId, genreName) {
-    console.log(`📈 Showing charts list for: ${genreName}`);
-
-    // Hide all other beatport views
-    document.querySelectorAll('.beatport-sub-view').forEach(view => {
-        view.classList.remove('active');
-    });
-    const mainView = document.getElementById('beatport-main-view');
-    if (mainView) {
-        mainView.classList.remove('active');
-    }
-
-    // Show charts list view
-    const chartsListView = document.getElementById('beatport-genre-charts-list-view');
-    if (chartsListView) {
-        chartsListView.classList.add('active');
-
-        // Update view content
-        document.getElementById('genre-charts-list-title').textContent = `New ${genreName} Charts`;
-        document.getElementById('genre-charts-list-breadcrumb').textContent = `Browse Charts > Genre Explorer > ${genreName} Charts > New Charts`;
-
-        // Store current genre data for individual chart handlers
-        chartsListView.dataset.genreSlug = genreSlug;
-        chartsListView.dataset.genreId = genreId;
-        chartsListView.dataset.genreName = genreName;
-
-        // Load charts for this genre
-        await loadGenreChartsList(genreSlug, genreId, genreName);
-
-        console.log(`✅ Charts list view shown for ${genreName}`);
-    } else {
-        console.error('❌ Charts list view element not found');
-    }
-}
-
-async function loadGenreChartsList(genreSlug, genreId, genreName) {
-    const chartsGrid = document.getElementById('genre-charts-grid');
-    const loadingPlaceholder = document.getElementById('charts-loading-placeholder');
-
-    if (!chartsGrid || !loadingPlaceholder) {
-        console.error('❌ Charts grid or loading placeholder not found');
-        return;
-    }
-
-    // Show loading state
-    loadingPlaceholder.style.display = 'block';
-    chartsGrid.style.display = 'none';
-    chartsGrid.innerHTML = '';
-
-    try {
-        console.log(`🔍 Loading charts for ${genreName}...`);
-
-        // Fetch charts from the new-charts endpoint
-        const response = await fetch(`/api/beatport/genre/${genreSlug}/${genreId}/new-charts?limit=50`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch charts: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            // Show empty state
-            chartsGrid.innerHTML = `
-                <div class="genre-charts-empty">
-                    <h3>No Charts Available</h3>
-                    <p>No curated charts found for ${genreName} at the moment.<br>Check back later for new DJ and artist chart collections.</p>
-                </div>
-            `;
-        } else {
-            // Populate charts grid
-            const chartsHTML = data.tracks.map((chart, index) => {
-                const chartName = chart.title || 'Untitled Chart';
-                const artistName = chart.artist || 'Various Artists';
-                const chartUrl = chart.url || '';
-
-                // Extract chart ID from URL for click handling
-                const chartId = chartUrl.split('/').pop() || `chart_${index}`;
-
-                return `
-                    <div class="genre-chart-item" data-chart-url="${chartUrl}" data-chart-name="${chartName}" data-chart-artist="${artistName}">
-                        <div class="chart-item-header">
-                            <div class="chart-item-icon">📈</div>
-                            <div class="chart-item-title">
-                                <h4>${chartName}</h4>
-                                <p class="chart-item-artist">by ${artistName}</p>
-                            </div>
-                        </div>
-                        <div class="chart-item-description">
-                            Curated chart collection featuring ${genreName} tracks
-                        </div>
-                        <div class="chart-item-footer">
-                            <div class="chart-item-type">Chart</div>
-                            <div class="chart-item-action">Click to explore →</div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-
-            chartsGrid.innerHTML = chartsHTML;
-
-            // Add click handlers to chart items
-            setupGenreChartItemHandlers(genreSlug, genreId, genreName);
-        }
-
-        // Hide loading and show grid
-        loadingPlaceholder.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        console.log(`✅ Loaded ${data.tracks?.length || 0} charts for ${genreName}`);
-        showToast(`Found ${data.tracks?.length || 0} chart collections`, 'success');
-
-    } catch (error) {
-        console.error(`❌ Error loading charts for ${genreName}:`, error);
-
-        // Show error state
-        chartsGrid.innerHTML = `
-            <div class="genre-charts-empty">
-                <h3>Error Loading Charts</h3>
-                <p>Unable to load chart collections for ${genreName}.<br>Please try again later.</p>
-            </div>
-        `;
-
-        loadingPlaceholder.style.display = 'none';
-        chartsGrid.style.display = 'grid';
-
-        showToast(`Error loading charts: ${error.message}`, 'error');
-    }
-}
-
-function setupGenreChartItemHandlers(genreSlug, genreId, genreName) {
-    const chartItems = document.querySelectorAll('#genre-charts-grid .genre-chart-item');
-
-    chartItems.forEach(item => {
-        item.addEventListener('click', async () => {
-            const chartName = item.dataset.chartName;
-            const chartArtist = item.dataset.chartArtist;
-            const chartUrl = item.dataset.chartUrl;
-
-            console.log(`🎵 Chart clicked: ${chartName} by ${chartArtist}`);
-
-            const fullChartName = `${chartName} (${genreName})`;
-
-            try {
-                showToast(`Loading ${chartName}…`, 'info');
-                showLoadingOverlay(`Scraping ${chartName}…`);
-
-                const response = await fetch('/api/beatport/chart/extract', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ chart_url: chartUrl, chart_name: chartName, limit: 100, enrich: false })
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch chart content: ${response.status}`);
-                }
-
-                const data = await response.json();
-                if (!data.success || !data.tracks || data.tracks.length === 0) {
-                    throw new Error('No tracks found in chart');
-                }
-
-                console.log(`✅ Extracted ${data.tracks.length} raw tracks from ${fullChartName}, enriching...`);
-                const enrichedTracks = await _enrichTracksWithProgress(data.tracks, fullChartName);
-
-                hideLoadingOverlay();
-                openBeatportChartAsDownloadModal(enrichedTracks, fullChartName, null);
-
-            } catch (error) {
-                console.error(`❌ Error loading chart: ${error.message}`);
-                hideLoadingOverlay();
-                showToast(`Error loading chart: ${error.message}`, 'error');
-            }
-        });
-    });
-}
-
-async function handleGenreChartTypeClick(genreSlug, genreId, genreName, chartType) {
-    console.log(`🎯 Genre chart type clicked: ${chartType} for ${genreName} (${genreSlug}/${genreId})`);
-
-    // Map chart types to API endpoints and create descriptive names
-    const chartTypeMap = {
-        'top-10': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/top-10`,
-            name: `Top 10 ${genreName}`,
-            limit: 10
-        },
-        'top-100': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/tracks`,
-            name: `Top 100 ${genreName}`,
-            limit: 100
-        },
-        'releases-top-10': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/releases-top-10`,
-            name: `Top 10 ${genreName} Releases`,
-            limit: 10
-        },
-        'releases-top-100': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/releases-top-100`,
-            name: `Top 100 ${genreName} Releases`,
-            limit: 100
-        },
-        'staff-picks': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/staff-picks`,
-            name: `${genreName} Staff Picks`,
-            limit: 50
-        },
-        'latest-releases': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/latest-releases`,
-            name: `Latest ${genreName} Releases`,
-            limit: 50
-        },
-        'hype-top-10': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/hype-top-10`,
-            name: `${genreName} Hype Top 10`,
-            limit: 10
-        },
-        'hype-top-100': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/hype-top-100`,
-            name: `${genreName} Hype Top 100`,
-            limit: 100
-        },
-        'hype-picks': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/hype-picks`,
-            name: `${genreName} Hype Picks`,
-            limit: 50
-        },
-        'new-charts': {
-            endpoint: `/api/beatport/genre/${genreSlug}/${genreId}/new-charts`,
-            name: `New ${genreName} Charts`,
-            limit: 100
-        }
-    };
-
-    const chartConfig = chartTypeMap[chartType];
-    if (!chartConfig) {
-        console.error(`❌ Unknown chart type: ${chartType}`);
-        showToast(`Unknown chart type: ${chartType}`, 'error');
-        return;
-    }
-
-    try {
-        showToast(`Loading ${chartConfig.name}…`, 'info');
-        showLoadingOverlay(`Loading ${chartConfig.name}…`);
-
-        const response = await fetch(`${chartConfig.endpoint}?limit=${chartConfig.limit}`);
-        if (!response.ok) {
-            throw new Error(`Failed to fetch ${chartConfig.name}: ${response.status}`);
-        }
-
-        const data = await response.json();
-        if (!data.success || !data.tracks || data.tracks.length === 0) {
-            throw new Error(`No tracks found in ${chartConfig.name}`);
-        }
-
-        console.log(`✅ Fetched ${data.tracks.length} tracks from ${chartConfig.name}`);
-        hideLoadingOverlay();
-        openBeatportChartAsDownloadModal(data.tracks, chartConfig.name, null);
-
-    } catch (error) {
-        console.error(`❌ Error loading ${chartConfig.name}:`, error);
-        hideLoadingOverlay();
-        showToast(`Error loading ${chartConfig.name}: ${error.message}`, 'error');
-    }
-}
 
 // ===============================
 // SPOTIFY PUBLIC LINK FUNCTIONALITY
@@ -6709,7 +5558,7 @@ async function parseSpotifyPublicUrl() {
     const parseBtn = document.getElementById('spotify-public-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading…';
+        parseBtn.textContent = 'Loading...';
     }
 
     try {
@@ -7010,7 +5859,7 @@ async function openSpotifyPublicDiscoveryModal(urlHash, playlistData) {
 
             if (result.error) {
                 console.error('Error starting Spotify public discovery:', result.error);
-                showToast(`Error starting discovery: ${result.error}`, 'error');
+                showToast(`Error starting identification: ${result.error}`, 'error');
                 return;
             }
 
@@ -7024,7 +5873,7 @@ async function openSpotifyPublicDiscoveryModal(urlHash, playlistData) {
 
         } catch (error) {
             console.error('Error starting Spotify public discovery:', error);
-            showToast(`Error starting discovery: ${error.message}`, 'error');
+            showToast(`Error starting identification: ${error.message}`, 'error');
         }
     } else if (isCurrentlyDiscovering) {
         console.log(`🔄 Resuming Spotify public discovery polling for: ${playlistData.name}`);
@@ -7638,7 +6487,7 @@ async function startSpotifyPublicDownloadMissing(urlHash, forcePlaylistFolder = 
         const discoveryResults = state.discoveryResults || state.discovery_results;
 
         if (!discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -7734,7 +6583,7 @@ async function parseITunesLinkUrl() {
     const parseBtn = document.getElementById('itunes-link-parse-btn');
     if (parseBtn) {
         parseBtn.disabled = true;
-        parseBtn.textContent = 'Loading…';
+        parseBtn.textContent = 'Loading...';
     }
 
     try {
@@ -8036,7 +6885,7 @@ async function openITunesLinkDiscoveryModal(urlHash, playlistData) {
 
             if (result.error) {
                 console.error('Error starting iTunes Link discovery:', result.error);
-                showToast(`Error starting discovery: ${result.error}`, 'error');
+                showToast(`Error starting identification: ${result.error}`, 'error');
                 return;
             }
 
@@ -8050,7 +6899,7 @@ async function openITunesLinkDiscoveryModal(urlHash, playlistData) {
 
         } catch (error) {
             console.error('Error starting iTunes Link discovery:', error);
-            showToast(`Error starting discovery: ${error.message}`, 'error');
+            showToast(`Error starting identification: ${error.message}`, 'error');
         }
     } else if (isCurrentlyDiscovering) {
         console.log(`🔄 Resuming iTunes Link discovery polling for: ${playlistData.name}`);
@@ -8664,7 +7513,7 @@ async function startITunesLinkDownloadMissing(urlHash) {
         const discoveryResults = state.discoveryResults || state.discovery_results;
 
         if (!discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -8780,7 +7629,7 @@ function renderUrlHistory(source) {
     container.style.display = 'flex';
     container.innerHTML = `<span class="url-history-bar-label">Recent</span>` +
         history.map(h => {
-            const rawName = h.name.length > 30 ? h.name.substring(0, 28) + '…' : h.name;
+            const rawName = h.name.length > 30 ? h.name.substring(0, 28) + '...' : h.name;
             const safeName = escapeHtml(rawName);
             const safeTitle = escapeHtml(h.name);
             const safeUrl = h.url.replace(/"/g, '&quot;');
@@ -8967,16 +7816,16 @@ function createYouTubeCard(url, phase = 'fresh') {
         <div class="youtube-playlist-card" id="youtube-card-${tempHash}" data-url="${url}">
             <div class="playlist-card-icon youtube-icon">▶</div>
             <div class="playlist-card-content">
-                <div class="playlist-card-name">Parsing YouTube playlist…</div>
+                <div class="playlist-card-name">Parsing YouTube playlist...</div>
                 <div class="playlist-card-info">
                     <span class="playlist-card-track-count">-- tracks</span>
-                    <span class="playlist-card-phase-text" style="color: #999;">Loading…</span>
+                    <span class="playlist-card-phase-text" style="color: #999;">Loading...</span>
                 </div>
             </div>
             <div class="playlist-card-progress hidden">
                 ♪ 0 / ✓ 0 / ✗ 0 / 0%
             </div>
-            <button class="playlist-card-action-btn" disabled>Parsing…</button>
+            <button class="playlist-card-action-btn" disabled>Parsing...</button>
         </div>
     `;
 
@@ -9056,15 +7905,15 @@ function updateYouTubeCardPhase(urlHash, phase) {
 
     switch (phase) {
         case 'fresh':
-            phaseTextElement.textContent = 'Ready to discover';
+            phaseTextElement.textContent = 'Ready to identify';
             phaseTextElement.style.color = '#999';
-            actionBtn.textContent = 'Start Discovery';
+            actionBtn.textContent = 'Start Identifying';
             actionBtn.disabled = false;
             progressElement.classList.add('hidden');
             break;
 
         case 'discovering':
-            phaseTextElement.textContent = 'Discovering…';
+            phaseTextElement.textContent = 'Identifying...';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Progress';
             actionBtn.disabled = false;
@@ -9072,7 +7921,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'discovered':
-            phaseTextElement.textContent = 'Discovery Complete';
+            phaseTextElement.textContent = 'Identification Complete';
             phaseTextElement.style.color = 'rgb(var(--accent-rgb))'; // Green
             actionBtn.textContent = 'View Details';
             actionBtn.disabled = false;
@@ -9080,7 +7929,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'syncing':
-            phaseTextElement.textContent = 'Syncing…';
+            phaseTextElement.textContent = 'Syncing...';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Progress';
             actionBtn.disabled = false;
@@ -9096,7 +7945,7 @@ function updateYouTubeCardPhase(urlHash, phase) {
             break;
 
         case 'downloading':
-            phaseTextElement.textContent = 'Downloading…';
+            phaseTextElement.textContent = 'Downloading...';
             phaseTextElement.style.color = '#ffa500'; // Orange
             actionBtn.textContent = 'View Downloads';
             actionBtn.disabled = false;
@@ -9162,7 +8011,7 @@ function handleYouTubeCardClick(urlHash) {
                                 openDownloadMissingModalForYouTube(spotifyPlaylistId, playlistName, spotifyTracks);
                             } else {
                                 console.error('❌ No discovery results found for downloads');
-                                showToast('Unable to open download modal - no discovery data', 'error');
+                                showToast('Unable to open download modal - no identification data', 'error');
                             }
                         })
                         .catch(error => {
@@ -9236,7 +8085,7 @@ async function startYouTubeDiscovery(urlHash) {
         const result = await response.json();
 
         if (result.error) {
-            showToast(`Error starting discovery: ${result.error}`, 'error');
+            showToast(`Error starting identification: ${result.error}`, 'error');
             return;
         }
 
@@ -9257,7 +8106,7 @@ async function startYouTubeDiscovery(urlHash) {
 
     } catch (error) {
         console.error('❌ Error starting YouTube discovery:', error);
-        showToast(`Error starting discovery: ${error.message}`, 'error');
+        showToast(`Error starting identification: ${error.message}`, 'error');
     }
 }
 
@@ -9276,7 +8125,7 @@ function _discoveryCompleteToast(urlHash) {
         showToast(msg, found > 0 ? 'success' : 'info');
         return;
     }
-    showToast('Discovery complete!', 'success');
+    showToast('Identification complete!', 'success');
 }
 
 function startYouTubeDiscoveryPolling(urlHash) {
@@ -9428,16 +8277,16 @@ function openYouTubeDiscoveryModal(urlHash) {
         const isListenBrainz = state.is_listenbrainz_playlist;
         const isMirrored = state.is_mirrored_playlist;
         const isLastfmRadio = typeof urlHash === 'string' && urlHash.startsWith('lastfm_radio_');
-        const modalTitle = isMirrored ? '🎵 Mirrored Playlist Discovery' :
-            isSpotifyPublic ? '🎵 Spotify Playlist Discovery' :
+        const modalTitle = isMirrored ? '🎵 Mirrored Playlist Identification' :
+            isSpotifyPublic ? '🎵 Spotify Playlist Identification' :
                 isITunesLink ? '🎵 iTunes Link Discovery' :
-                    isDeezer ? '🎵 Deezer Playlist Discovery' :
-                    isTidal ? '🎵 Tidal Playlist Discovery' :
-                        isQobuz ? '🎵 Qobuz Playlist Discovery' :
-                            isBeatport ? '🎵 Beatport Chart Discovery' :
-                                isLastfmRadio ? '📻 Last.fm Radio Discovery' :
-                                    isListenBrainz ? '🎵 ListenBrainz Playlist Discovery' :
-                                        '🎵 YouTube Playlist Discovery';
+                    isDeezer ? '🎵 Deezer Playlist Identification' :
+                    isTidal ? '🎵 Tidal Playlist Identification' :
+                        isQobuz ? '🎵 Qobuz Playlist Identification' :
+                            isBeatport ? '🎵 Beatport Chart Identification' :
+                                isLastfmRadio ? '📻 Last.fm Radio Identification' :
+                                    isListenBrainz ? '🎵 ListenBrainz Playlist Identification' :
+                                        '🎵 YouTube Playlist Identification';
         const sourceLabel = isMirrored ? (state.mirrored_source ? state.mirrored_source.charAt(0).toUpperCase() + state.mirrored_source.slice(1) : 'Source') :
             isSpotifyPublic ? 'Spotify' :
                 isITunesLink ? 'iTunes' :
@@ -9468,7 +8317,6 @@ function openYouTubeDiscoveryModal(urlHash) {
                             <div class="progress-text" id="youtube-discovery-progress-text-${urlHash}">${getInitialProgressText(state.phase, isTidal, isBeatport, isListenBrainz)}</div>
                         </div>
                         
-                        ${buildDiscoveryFilterBarHtml(state, urlHash)}
                         <div class="discovery-table-container">
                             <table class="discovery-table">
                                 <thead>
@@ -9500,12 +8348,9 @@ function openYouTubeDiscoveryModal(urlHash) {
 
                     <!-- Discovery Fix Modal (nested inside) -->
                     <div class="discovery-fix-modal-overlay hidden" id="discovery-fix-modal-overlay">
-                        <div class="discovery-fix-modal" tabindex="-1">
+                        <div class="discovery-fix-modal">
                             <div class="discovery-fix-modal-header">
-                                <div class="fix-modal-title">
-                                    <h2>Fix Track Match</h2>
-                                    <span class="fix-review-progress" hidden></span>
-                                </div>
+                                <h2>Fix Track Match</h2>
                                 <button class="modal-close-btn" onclick="closeDiscoveryFixModal()">✕</button>
                             </div>
 
@@ -9559,7 +8404,6 @@ function openYouTubeDiscoveryModal(urlHash) {
                                 <!-- Search results -->
                                 <div class="search-results-section">
                                     <h3>Results</h3>
-                                    <div id="fix-modal-source-chips" class="fix-source-chips"></div>
                                     <div id="fix-modal-results" class="fix-modal-results">
                                         <!-- Auto-populated on modal open, updated on search -->
                                     </div>
@@ -9567,14 +8411,7 @@ function openYouTubeDiscoveryModal(urlHash) {
                             </div>
 
                             <div class="discovery-fix-modal-footer">
-                                <span class="fix-review-keys" hidden><kbd>1</kbd>–<kbd>9</kbd> choose · <kbd>Enter</kbd> accept · <kbd>S</kbd> skip · <kbd>Esc</kbd> close</span>
-                                <button class="modal-btn secondary fix-review-unavailable" hidden onclick="markDiscoveryReviewUnavailable()" title="No source has this track: stop it coming back">
-                                    Not available
-                                </button>
-                                <button class="modal-btn secondary fix-review-skip" hidden onclick="skipDiscoveryReviewTrack()">
-                                    Skip (S)
-                                </button>
-                                <button class="modal-btn secondary fix-modal-cancel" onclick="closeDiscoveryFixModal()">
+                                <button class="modal-btn secondary" onclick="closeDiscoveryFixModal()">
                                     Cancel
                                 </button>
                             </div>
@@ -9705,7 +8542,7 @@ function getModalActionButtons(urlHash, phase, state = null) {
                 }
             } else {
                 // Discovering phase - show progress
-                return `<div class="modal-info">🔍 Discovering ${currentMusicSourceName} matches…</div>`;
+                return `<div class="modal-info">🔍 Discovering ${currentMusicSourceName} matches...</div>`;
             }
 
         case 'discovered':
@@ -9721,21 +8558,21 @@ function getModalActionButtons(urlHash, phase, state = null) {
             // Only show sync button if there are Spotify matches (and not standalone mode)
             if (hasSpotifyMatches && !_isSoulsyncStandalone) {
                 if (isListenBrainz) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isTidal) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isQobuz) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isDeezer) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startDeezerPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startDeezerPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isSpotifyPublic) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isITunesLink) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isBeatport) {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else {
-                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    buttons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 }
             }
 
@@ -9765,36 +8602,12 @@ function getModalActionButtons(urlHash, phase, state = null) {
                 }
             }
 
-            // Step through every track still waiting for a decision, in one dialog
-            // (startDiscoveryReview).
-            const reviewCount = discoveryReviewQueue(state).length;
-            if (reviewCount > 0) {
-                buttons += `<button class="modal-btn modal-btn-secondary" onclick="startDiscoveryReview('${discoveryPlatformForState(state)}', '${urlHash}')" title="Step through unmatched and low-confidence tracks: 1–9 choose, Enter accepts, S skips, Esc closes">🎯 Review (${reviewCount})</button>`;
-            }
-
             // Retry Failed button for mirrored playlists
             if (state && state.is_mirrored_playlist) {
                 const results = state.discovery_results || state.discoveryResults || [];
-                const failedCount = results.filter(r => r.status_class !== 'found' && r.status_class !== 'unavailable').length;
+                const failedCount = results.filter(r => r.status_class !== 'found').length;
                 if (failedCount > 0) {
                     buttons += `<button class="modal-btn modal-btn-secondary" onclick="retryFailedMirroredDiscovery('${urlHash}')">🔄 Retry Failed (${failedCount})</button>`;
-                }
-            }
-
-            // Accept every suggested match at or above a chosen confidence -- the near
-            // misses discovery kept for tracks it couldn't match (mirrored and
-            // YouTube playlists keep them).
-            if (state && (state.is_mirrored_playlist
-                || !(isListenBrainz || isTidal || isQobuz || isDeezer || isSpotifyPublic || isITunesLink || isBeatport))) {
-                const suggestionResults = state.discovery_results || state.discoveryResults || [];
-                const suggestedCount = suggestionResults.filter(r => r.status_class !== 'found'
-                    && Array.isArray(r.suggestions) && r.suggestions.length > 0).length;
-                if (suggestedCount > 0) {
-                    const suggestionPlatform = state.is_mirrored_playlist ? 'mirrored' : 'youtube';
-                    buttons += `<span class="accept-suggestions-wrap" title="Accept every suggested match at or above this confidence">
-                        Accept suggestions ≥ <input type="number" class="accept-suggestions-min" id="accept-suggestions-min-${urlHash}" min="1" max="99" step="1" value="80">%
-                        <button class="modal-btn modal-btn-secondary" onclick="acceptAllDiscoverySuggestions('${suggestionPlatform}', '${urlHash}')">✓ Accept all (${suggestedCount})</button>
-                    </span>`;
                 }
             }
 
@@ -9923,19 +8736,19 @@ function getModalActionButtons(urlHash, phase, state = null) {
             // Only show sync button if there are Spotify matches (and not standalone mode)
             if (hasSpotifyMatches && !_isSoulsyncStandalone) {
                 if (isListenBrainz) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isTidal) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isQobuz) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isSpotifyPublic) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isITunesLink) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isBeatport) {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else {
-                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    syncCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 }
             }
 
@@ -9981,21 +8794,21 @@ function getModalActionButtons(urlHash, phase, state = null) {
 
             if (hasSpotifyMatches) {
                 if (isListenBrainz) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startListenBrainzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isTidal) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startTidalPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isQobuz) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startQobuzPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isDeezer) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startDeezerPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startDeezerPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isSpotifyPublic) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startSpotifyPublicPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isITunesLink) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startITunesLinkPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else if (isBeatport) {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startBeatportPlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 } else {
-                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Sync This Playlist</button>`;
+                    dlCompleteButtons += `<button class="modal-btn modal-btn-primary" onclick="startYouTubePlaylistSync('${urlHash}')">🔄 Push to server</button>`;
                 }
             }
 
@@ -10042,139 +8855,31 @@ function getModalDescription(phase, isTidal = false, isBeatport = false, isListe
     const source = isMirrored ? 'mirrored' : (isSpotifyPublic ? 'Spotify' : (isITunesLink ? 'iTunes' : (isDeezer ? 'Deezer' : (isLastfmRadio ? 'Last.fm Radio' : (isListenBrainz ? 'ListenBrainz' : (isBeatport ? 'Beatport' : (isQobuz ? 'Qobuz' : (isTidal ? 'Tidal' : 'YouTube'))))))));
     switch (phase) {
         case 'fresh':
-            return `Ready to discover clean ${currentMusicSourceName} metadata for ${source} tracks…`;
+            return `Ready to identify ${source} tracks with clean ${currentMusicSourceName} metadata...`;
         case 'discovering':
-            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks…`;
+            return `Identifying clean ${currentMusicSourceName} metadata for ${source} tracks...`;
         case 'discovered':
         case 'downloading':
         case 'download_complete':
-            return 'Discovery complete! View the results below.';
+            return 'Identification complete! View the results below.';
         default:
-            return `Discovering clean ${currentMusicSourceName} metadata for ${source} tracks…`;
+            return `Identifying clean ${currentMusicSourceName} metadata for ${source} tracks...`;
     }
 }
 
 function getInitialProgressText(phase, isTidal = false, isBeatport = false, isListenBrainz = false) {
     switch (phase) {
         case 'fresh':
-            return 'Click Start Discovery to begin…';
+            return 'Click Start Identifying to begin...';
         case 'discovering':
-            return 'Starting discovery…';
+            return 'Starting identification...';
         case 'discovered':
         case 'downloading':
         case 'download_complete':
-            return 'Discovery completed!';
+            return 'Identification complete!';
         default:
-            return 'Starting discovery…';
+            return 'Starting identification...';
     }
-}
-
-// ── discovery result filtering ───────────────────────────────────────────────
-// Discovery answers "which library track is this?" for every row, and the
-// answers are not equally trustworthy. A 200-track playlist where 190 matched
-// cleanly buries the 10 that need a human in a wall of green, so the buckets
-// are filterable rather than merely colour-coded.
-//
-// The line between PERFECT and LOW is drawn at the strictest bar any source
-// applies before it will call something a match (Beatport and ListenBrainz
-// both use 0.9; playlist discovery accepts down to 0.7). So "low" means
-// "accepted, but by a looser rule than the strictest source would have used" —
-// exactly the set worth eyeballing.
-const DISCOVERY_PERFECT_CONFIDENCE = 0.9;
-
-const DISCOVERY_BUCKETS = [
-    { id: 'all', label: 'All' },
-    { id: 'perfect', label: 'Perfect' },
-    { id: 'low', label: 'Low confidence' },
-    { id: 'wing-it', label: 'Wing It' },
-    { id: 'not-found', label: 'Not found' },
-    { id: 'error', label: 'Error' },
-    { id: 'unavailable', label: 'Not available' },
-];
-
-// Active bucket per open modal. Module-level rather than on `state` so a
-// re-render from the discovery poller can't wipe the user's selection.
-const _discoveryFilters = {};
-
-function discoveryBucketFor(result) {
-    if (!result) return 'not-found';
-    const cls = result.status_class || '';
-    if (cls === 'unavailable') return 'unavailable';
-    if (cls === 'error' || result.status === 'error') return 'error';
-    if (result.wing_it_fallback || cls === 'wing-it') return 'wing-it';
-
-    const found = cls === 'found' || result.spotify_data || result.spotify_id
-        || (result.spotify_track && result.spotify_track !== '-');
-    if (!found) return 'not-found';
-
-    // A manual match is a human's decision, so it outranks any score.
-    if (result.manual_match) return 'perfect';
-    // Confidence is absent on some transformed shapes; treat a confirmed match
-    // with no score as perfect rather than inventing a doubt we can't support.
-    const conf = result.confidence;
-    if (conf === undefined || conf === null) return 'perfect';
-    return Number(conf) >= DISCOVERY_PERFECT_CONFIDENCE ? 'perfect' : 'low';
-}
-
-function discoveryBucketCounts(results) {
-    const counts = { all: 0, perfect: 0, low: 0, 'wing-it': 0, 'not-found': 0, error: 0, unavailable: 0 };
-    (results || []).forEach(r => {
-        counts.all++;
-        counts[discoveryBucketFor(r)]++;
-    });
-    return counts;
-}
-
-function buildDiscoveryFilterBarHtml(state, urlHash) {
-    const results = state.discoveryResults || state.discovery_results || [];
-    // Nothing to triage before discovery has produced answers.
-    if (!results.length) return '';
-    const counts = discoveryBucketCounts(results);
-    const active = _discoveryFilters[urlHash] || 'all';
-    const chips = DISCOVERY_BUCKETS
-        // Hide empty buckets so the bar stays about THIS playlist — a run with
-        // no errors shouldn't advertise an Error filter that shows nothing.
-        .filter(b => b.id === 'all' || counts[b.id] > 0)
-        .map(b => `<button class="discovery-filter-chip${b.id === active ? ' is-active' : ''}"
-                 data-discovery-filter="${b.id}" data-url-hash="${urlHash}"
-                 onclick="setDiscoveryFilter('${urlHash}', '${b.id}')">${b.label}
-                 <span class="discovery-filter-count">${counts[b.id]}</span></button>`)
-        .join('');
-    return `<div class="discovery-filter-bar" id="discovery-filter-bar-${urlHash}">${chips}</div>`;
-}
-
-function setDiscoveryFilter(urlHash, bucket) {
-    _discoveryFilters[urlHash] = bucket;
-    // Same store the modal's own refresh reads — the YouTube discovery modal
-    // infrastructure is reused for every source, keyed by url hash.
-    const state = youtubePlaylistStates[urlHash];
-    const root = (state && state.modalElement) || document;
-    const tbody = root.querySelector(`#youtube-discovery-table-${urlHash}`);
-    if (tbody && state) tbody.innerHTML = generateTableRowsFromState(state, urlHash);
-    refreshDiscoveryFilterBar(urlHash, state);
-}
-window.setDiscoveryFilter = setDiscoveryFilter;
-
-/** Redraw a discovery modal's filter chips from its rows, after a row changed group. */
-function refreshDiscoveryFilterBar(urlHash, state) {
-    if (!state) return;
-    const root = state.modalElement || document;
-    const bar = root.querySelector(`#discovery-filter-bar-${urlHash}`);
-    if (bar) bar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
-}
-
-/** The platform a discovery modal's rows, Fix and Review pass for this state. */
-function discoveryPlatformForState(state) {
-    if (!state) return 'youtube';
-    if (state.is_mirrored_playlist) return 'mirrored';
-    if (state.is_spotify_public_playlist) return 'spotify_public';
-    if (state.is_itunes_link_playlist) return 'itunes_link';
-    if (state.is_deezer_playlist) return 'deezer';
-    if (state.is_listenbrainz_playlist) return 'listenbrainz';
-    if (state.is_tidal_playlist) return 'tidal';
-    if (state.is_qobuz_playlist) return 'qobuz';
-    if (state.is_beatport_playlist) return 'beatport';
-    return 'youtube';
 }
 
 function generateTableRowsFromState(state, urlHash) {
@@ -10186,24 +8891,14 @@ function generateTableRowsFromState(state, urlHash) {
     const isBeatport = state.is_beatport_playlist;
     const isListenBrainz = state.is_listenbrainz_playlist;
     const isMirrored = state.is_mirrored_playlist;
-    const platform = discoveryPlatformForState(state);
+    const platform = isMirrored ? 'mirrored' : (isSpotifyPublic ? 'spotify_public' : (isITunesLink ? 'itunes_link' : (isDeezer ? 'deezer' : (isListenBrainz ? 'listenbrainz' : (isTidal ? 'tidal' : (isQobuz ? 'qobuz' : (isBeatport ? 'beatport' : 'youtube')))))));
 
     // Support both camelCase and snake_case
     const discoveryResults = state.discoveryResults || state.discovery_results;
 
     if (discoveryResults && discoveryResults.length > 0) {
-        // View-only filter: narrows what is DISPLAYED. Selection and download
-        // still operate on the full result set, so hiding a bucket can never
-        // silently change what a later action does.
-        const _bucket = _discoveryFilters[urlHash] || 'all';
-        const _visible = _bucket === 'all'
-            ? discoveryResults
-            : discoveryResults.filter(r => discoveryBucketFor(r) === _bucket);
-        if (!_visible.length) {
-            return `<tr><td colspan="7" class="discovery-filter-empty">No tracks in this group.</td></tr>`;
-        }
         // Generate rows from existing discovery results
-        return _visible.map((result, index) => {
+        return discoveryResults.map((result, index) => {
             // Handle different field names based on platform
             const trackName = result.lb_track || result.yt_track || result.track_name || '-';
             // YouTube flat extraction often can't give a per-track artist, so the
@@ -10252,7 +8947,7 @@ function generateInitialTableRows(tracks, isTidal = false, urlHash = '', isBeatp
         <tr id="discovery-row-${urlHash}-${index}">
             <td class="yt-track">${trackName}</td>
             <td class="yt-artist">${artistName}</td>
-            <td class="discovery-status">🔍 Pending…</td>
+            <td class="discovery-status">🔍 Pending...</td>
             <td class="spotify-track">-</td>
             <td class="spotify-artist">-</td>
             <td class="spotify-album">-</td>
@@ -10273,20 +8968,6 @@ function formatDuration(durationMs) {
  * Generate action button for discovery table row
  */
 function generateDiscoveryActionButton(result, identifier, platform) {
-    // A track marked "Not available" is left out of review and discovery. Fix can
-    // still find it a match; ↺ puts it back in line.
-    if (result.status_class === 'unavailable') {
-        return `<button class="fix-match-btn"
-                        onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
-                        title="Search for a match anyway">
-                    🔧 Fix
-                </button><button class="rematch-btn" style="margin-left:4px"
-                        onclick="setDiscoveryTrackUnavailable('${platform}', '${identifier}', ${result.index}, false)"
-                        title="Mark as available again">
-                    ↺
-                </button>`;
-    }
-
     // Show fix button for not_found, error, or any non-found status
     const isNotFound = result.status === 'not_found' ||
         result.status_class === 'not-found' ||
@@ -10304,27 +8985,8 @@ function generateDiscoveryActionButton(result, identifier, platform) {
         result.status_class === 'found' ||
         result.status === '✅ Found';
 
-    // A track discovery couldn't match can carry its best near misses: offer the
-    // top one beside Fix, accepted in one click.
-    const topSuggestion = !isError && (isNotFound || isWingIt) && Array.isArray(result.suggestions)
-        ? result.suggestions[0] : null;
-    let suggestionHtml = '';
-    if (topSuggestion) {
-        const pct = Math.round((Number(topSuggestion.confidence) || 0) * 100);
-        const suggestedArtists = Array.isArray(topSuggestion.artists)
-            ? topSuggestion.artists.join(', ') : (topSuggestion.artists || '');
-        const label = escapeHtml(`${topSuggestion.name || 'Unknown Track'}${suggestedArtists ? ` — ${suggestedArtists}` : ''}`);
-        suggestionHtml = `<div class="discovery-suggestion">
-                    <span class="discovery-suggestion-name" title="${label.replace(/"/g, '&quot;')}">${label}</span>
-                    <span class="discovery-suggestion-pct">${pct}%</span>
-                    <button class="discovery-suggestion-accept"
-                            onclick="acceptDiscoverySuggestion('${platform}', '${identifier}', ${result.index})"
-                            title="Accept this suggested match">✓ Accept</button>
-                </div>`;
-    }
-
     if (isNotFound || isError) {
-        return `${suggestionHtml}<button class="fix-match-btn"
+        return `<button class="fix-match-btn"
                         onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
                         title="Manually search for this track">
                     🔧 Fix
@@ -10333,7 +8995,7 @@ function generateDiscoveryActionButton(result, identifier, platform) {
 
     // For wing-it fallbacks, show fix button so user can find a real match
     if (isWingIt) {
-        return `${suggestionHtml}<button class="fix-match-btn"
+        return `<button class="fix-match-btn"
                         onclick="openDiscoveryFixModal('${platform}', '${identifier}', ${result.index})"
                         title="Search for a proper metadata match">
                     🔧 Fix
@@ -10453,7 +9115,7 @@ function updateYouTubeDiscoveryModal(urlHash, status) {
             setDiscoveryModalFooterActions(urlHash, 'discovered', state);
             console.log(`✨ Updated action buttons for completed discovery: ${urlHash}`);
             const descEl = document.querySelector(`#youtube-discovery-modal-${urlHash} .modal-description`);
-            if (descEl) descEl.textContent = 'Discovery complete! View the results below.';
+            if (descEl) descEl.textContent = 'Identification complete! View the results below.';
         } else if (state && state.phase === 'discovered') {
             // Already discovered — ensure buttons are correct (e.g. after rehydration)
             const actionButtonsContainer = document.querySelector(
@@ -10482,17 +9144,6 @@ function refreshYouTubeDiscoveryModalTable(urlHash) {
         console.log(`✅ Modal table refreshed with discovery data`);
     } else {
         console.warn(`⚠️ Could not find table body for modal ${urlHash}`);
-    }
-
-    // Keep the bucket counts honest while discovery streams in, and mount the
-    // bar on the first refresh that has results (it renders empty before then).
-    const _filterBar = state.modalElement.querySelector(`#discovery-filter-bar-${urlHash}`);
-    if (_filterBar) {
-        _filterBar.outerHTML = buildDiscoveryFilterBarHtml(state, urlHash);
-    } else {
-        const _tableWrap = state.modalElement.querySelector('.discovery-table-container');
-        const _barHtml = buildDiscoveryFilterBarHtml(state, urlHash);
-        if (_tableWrap && _barHtml) _tableWrap.insertAdjacentHTML('beforebegin', _barHtml);
     }
 
     // Update the progress bar and footer buttons too
@@ -10986,7 +9637,7 @@ async function startYouTubeDownloadMissing(urlHash) {
         const discoveryResults = state?.discoveryResults || state?.discovery_results;
 
         if (!state || !discoveryResults) {
-            showToast('No discovery results available for download', 'error');
+            showToast('No identification results available for download', 'error');
             return;
         }
 
@@ -11338,7 +9989,7 @@ function startListenBrainzDiscoveryPolling(playlistMbid) {
                 if (listenbrainzPlaylistStates[playlistMbid]) listenbrainzPlaylistStates[playlistMbid].phase = 'discovered';
                 updateYouTubeModalButtons(playlistMbid, 'discovered');
                 const _descElWs = document.querySelector(`#youtube-discovery-modal-${playlistMbid} .modal-description`);
-                if (_descElWs) _descElWs.textContent = 'Discovery complete! View the results below.';
+                if (_descElWs) _descElWs.textContent = 'Identification complete! View the results below.';
                 const playlistIdEl = `discover-lb-playlist-${playlistMbid}`;
                 const syncBtn = document.getElementById(`${playlistIdEl}-sync-btn`);
                 if (syncBtn) syncBtn.style.display = 'inline-block';
@@ -11346,7 +9997,7 @@ function startListenBrainzDiscoveryPolling(playlistMbid) {
                 // playlist participates in Auto-Sync schedules just like
                 // Tidal / Qobuz / Spotify mirrors do.
                 _mirrorListenBrainzAfterDiscovery(playlistMbid);
-                showToast('ListenBrainz discovery complete!', 'success');
+                showToast('ListenBrainz identification complete!', 'success');
             }
         };
     }
@@ -11427,7 +10078,7 @@ function startListenBrainzDiscoveryPolling(playlistMbid) {
 
                 // Update modal description to "Discovery complete!"
                 const descEl = document.querySelector(`#youtube-discovery-modal-${playlistMbid} .modal-description`);
-                if (descEl) descEl.textContent = 'Discovery complete! View the results below.';
+                if (descEl) descEl.textContent = 'Identification complete! View the results below.';
 
                 // Show sync button in playlist listing (hidden by default until discovered)
                 const playlistId = `discover-lb-playlist-${playlistMbid}`;
@@ -11441,7 +10092,7 @@ function startListenBrainzDiscoveryPolling(playlistMbid) {
                 // Mirror matched tracks → mirrored_playlists table so
                 // the playlist participates in Auto-Sync schedules.
                 _mirrorListenBrainzAfterDiscovery(playlistMbid);
-                showToast('ListenBrainz discovery complete!', 'success');
+                showToast('ListenBrainz identification complete!', 'success');
             }
 
         } catch (error) {
@@ -11571,7 +10222,7 @@ async function startListenBrainzDiscovery(playlistMbid) {
             results: []
         });
 
-        showToast('Starting ListenBrainz discovery…', 'info');
+        showToast('Starting ListenBrainz identification...', 'info');
 
     } catch (error) {
         console.error('❌ Error starting ListenBrainz discovery:', error);
@@ -11635,7 +10286,7 @@ async function startListenBrainzPlaylistSync(playlistMbid) {
             updateYouTubeModalButtons(playlistMbid, 'syncing');
         }
 
-        showToast('Starting ListenBrainz sync…', 'info');
+        showToast('Starting ListenBrainz sync...', 'info');
 
     } catch (error) {
         console.error('❌ Error starting ListenBrainz sync:', error);

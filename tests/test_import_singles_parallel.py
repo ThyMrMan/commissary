@@ -66,13 +66,15 @@ def test_worker_returns_error_for_missing_file(tmp_path) -> None:
     """Files whose path doesn't exist must short-circuit with a
     user-readable error, not raise — otherwise the executor's caller
     can't aggregate them cleanly."""
-    from web_server import _process_single_import_file
+    import web_server  # noqa: F401 - wires api.import_routes' deps
+    from api.import_routes import _process_single_import_file
 
     file_info = {
         'full_path': str(tmp_path / "does-not-exist.mp3"),
         'filename': 'does-not-exist.mp3',
     }
-    outcome, payload = _process_single_import_file(file_info)
+    with patch("core.imports.routes._get_staging_path", return_value=str(tmp_path)):
+        outcome, payload = _process_single_import_file(file_info)
     assert outcome == "error"
     assert "File not found" in payload
 
@@ -80,7 +82,8 @@ def test_worker_returns_error_for_missing_file(tmp_path) -> None:
 def test_worker_returns_error_for_malformed_manual_match(tmp_path) -> None:
     """Manual matches missing source or id must be rejected with a
     clear message rather than crashing the resolver downstream."""
-    from web_server import _process_single_import_file
+    import web_server  # noqa: F401 - wires api.import_routes' deps
+    from api.import_routes import _process_single_import_file
 
     audio_file = tmp_path / "track.mp3"
     audio_file.write_bytes(b"fake")
@@ -90,7 +93,8 @@ def test_worker_returns_error_for_malformed_manual_match(tmp_path) -> None:
         'filename': 'track.mp3',
         'manual_match': {'source': '', 'id': ''},
     }
-    outcome, payload = _process_single_import_file(file_info)
+    with patch("core.imports.routes._get_staging_path", return_value=str(tmp_path)):
+        outcome, payload = _process_single_import_file(file_info)
     assert outcome == "error"
     assert "Malformed manual match" in payload
 
@@ -99,7 +103,8 @@ def test_worker_wraps_pipeline_exception_as_error(tmp_path) -> None:
     """If the post-processing pipeline raises, the worker must catch
     it and report ``("error", msg)`` so a single bad file doesn't
     take the whole batch down via the executor's caller path."""
-    from web_server import _process_single_import_file
+    import web_server  # noqa: F401 - wires api.import_routes' deps
+    from api.import_routes import _process_single_import_file
 
     audio_file = tmp_path / "track.mp3"
     audio_file.write_bytes(b"fake")
@@ -111,11 +116,12 @@ def test_worker_wraps_pipeline_exception_as_error(tmp_path) -> None:
         'artist': 'Some Artist',
     }
 
-    with patch(
-        "core.imports.resolution.get_single_track_import_context",
-        side_effect=RuntimeError("metadata service down"),
-    ):
-        outcome, payload = _process_single_import_file(file_info)
+    with patch("core.imports.routes._get_staging_path", return_value=str(tmp_path)):
+        with patch(
+            "core.imports.resolution.get_single_track_import_context",
+            side_effect=RuntimeError("metadata service down"),
+        ):
+            outcome, payload = _process_single_import_file(file_info)
     assert outcome == "error"
     assert "metadata service down" in payload
 
@@ -123,7 +129,8 @@ def test_worker_wraps_pipeline_exception_as_error(tmp_path) -> None:
 def test_worker_returns_ok_with_resolved_title(tmp_path) -> None:
     """Happy path: pipeline succeeds → ``("ok", final_title)`` so the
     route can use it for the activity feed message."""
-    from web_server import _process_single_import_file
+    import web_server  # noqa: F401 - wires api.import_routes' deps
+    from api.import_routes import _process_single_import_file
 
     audio_file = tmp_path / "track.mp3"
     audio_file.write_bytes(b"fake")
@@ -152,13 +159,14 @@ def test_worker_returns_ok_with_resolved_title(tmp_path) -> None:
         'source': 'spotify',
     }
 
-    with patch(
-        "core.imports.resolution.get_single_track_import_context",
-        return_value=fake_resolved,
-    ):
-        with patch("web_server._post_process_matched_download") as ppm:
-            ppm.return_value = None
-            outcome, payload = _process_single_import_file(file_info)
+    with patch("core.imports.routes._get_staging_path", return_value=str(tmp_path)):
+        with patch(
+            "core.imports.resolution.get_single_track_import_context",
+            return_value=fake_resolved,
+        ):
+            with patch("api.import_routes._post_process_matched_download") as ppm:
+                ppm.return_value = None
+                outcome, payload = _process_single_import_file(file_info)
 
     assert outcome == "ok"
     assert payload == "Resolved Title"
@@ -221,7 +229,7 @@ def test_route_processes_multiple_files_in_parallel(tmp_path) -> None:
 
     sleep_per_call = 0.3  # 6 files * 0.3s = 1.8s sequential, <0.7s with 3 workers
 
-    def fake_worker(file_info):
+    def fake_worker(file_info, profile_id=None):
         _time.sleep(sleep_per_call)
         return ("ok", file_info.get('title', '?'))
 
@@ -229,7 +237,7 @@ def test_route_processes_multiple_files_in_parallel(tmp_path) -> None:
     flask_app.config['TESTING'] = True
     client = flask_app.test_client()
 
-    with patch("web_server._process_single_import_file", side_effect=fake_worker), \
+    with patch("api.import_routes._process_single_import_file", side_effect=fake_worker), \
             patch("core.imports.side_effects.is_active_media_server_ready", return_value=(True, "")):
         start = _time.monotonic()
         response = client.post(
@@ -273,7 +281,7 @@ def test_route_aggregates_mixed_success_and_error_outcomes(tmp_path) -> None:
         for i, f in enumerate(audio_files)
     ]
 
-    def mixed_worker(file_info):
+    def mixed_worker(file_info, profile_id=None):
         # Files 0 and 2 succeed, 1 and 3 fail
         idx = int(file_info['filename'].split('_')[1].split('.')[0])
         if idx % 2 == 0:
@@ -284,7 +292,7 @@ def test_route_aggregates_mixed_success_and_error_outcomes(tmp_path) -> None:
     flask_app.config['TESTING'] = True
     client = flask_app.test_client()
 
-    with patch("web_server._process_single_import_file", side_effect=mixed_worker), \
+    with patch("api.import_routes._process_single_import_file", side_effect=mixed_worker), \
             patch("core.imports.side_effects.is_active_media_server_ready", return_value=(True, "")):
         response = client.post(
             "/api/import/singles/process",
@@ -314,7 +322,7 @@ def test_route_recovers_from_worker_crash(tmp_path) -> None:
 
     call_count = {'n': 0}
 
-    def crashing_worker(file_info):
+    def crashing_worker(file_info, profile_id=None):
         call_count['n'] += 1
         if call_count['n'] == 2:
             raise RuntimeError("worker boom")
@@ -324,7 +332,7 @@ def test_route_recovers_from_worker_crash(tmp_path) -> None:
     flask_app.config['TESTING'] = True
     client = flask_app.test_client()
 
-    with patch("web_server._process_single_import_file", side_effect=crashing_worker), \
+    with patch("api.import_routes._process_single_import_file", side_effect=crashing_worker), \
             patch("core.imports.side_effects.is_active_media_server_ready", return_value=(True, "")):
         response = client.post(
             "/api/import/singles/process",

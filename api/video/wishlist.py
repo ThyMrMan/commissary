@@ -10,7 +10,7 @@ Reads/writes only video_library.db via the shared VideoDatabase.
 
 from __future__ import annotations
 
-from flask import g, jsonify, request
+from flask import jsonify, request
 
 from utils.logging_config import get_logger
 
@@ -20,24 +20,6 @@ _KINDS = ("movie", "show")
 _SCOPES = ("movie", "show", "season", "episode")
 
 
-def _me():
-    return int(getattr(g, "profile_id", 1) or 1)
-
-
-def _is_admin():
-    return bool(getattr(g, "is_admin", _me() == 1))
-
-
-def _may_acquire():
-    """Whether this profile's wishes are fetched straight away, or land pending.
-
-    Keyed on can_download ALONE, deliberately not on is_admin — the same rule the
-    watchlist's approval gate uses. The blueprint treats the two as orthogonal (a
-    download-disabled admin is still refused /downloads/grab), so approving on
-    is_admin would hand that admin a way around their own gate."""
-    return bool(getattr(g, "can_download", True))
-
-
 def _server():
     """Active video server_source (stored on rows, informational). None on error."""
     try:
@@ -45,6 +27,16 @@ def _server():
         return resolve_video_server()
     except Exception:
         return None
+
+
+def _profile() -> int:
+    """The requesting profile: the video watchlist/wishlist are per-profile
+    (like the music side) — a non-admin must never see the admin's lists."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
 
 
 def _annotate_live_state(db, kind, items):
@@ -118,19 +110,22 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            counts = db.wishlist_counts()
+            counts = db.wishlist_counts(profile_id=_profile())
             kind = request.args.get("kind")
             if kind in _KINDS:
-                root_folder_id = request.args.get("root_folder_id")
-                try:
-                    root_folder_id = int(root_folder_id) if root_folder_id else None
-                except (TypeError, ValueError):
-                    root_folder_id = None
                 res = db.query_wishlist(
                     kind, search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
                     page=request.args.get("page", 1), limit=request.args.get("limit", 60),
-                    root_folder_id=root_folder_id)
+                    profile_id=_profile(),
+                    library=request.args.get("library") or None)   # Commissary: a Library tab
                 _annotate_live_state(db, kind, res.get("items") or [])
+                from .kids import filter_tmdb_items, video_cap
+                cap = video_cap()
+                if cap is not None:
+                    tagged = [dict(it, kind=it.get("kind") if it.get("kind") in ("movie", "show")
+                                   else ("movie" if kind == "movie" else "show"))
+                              for it in res.get("items") or []]
+                    res = {**res, "items": filter_tmdb_items(db, tagged, cap)}
                 return jsonify({"success": True, "kind": kind, "counts": counts, **res})
             return jsonify({"success": True, "counts": counts})
         except Exception:
@@ -142,8 +137,8 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            counts = db.wishlist_counts()                 # {movie, show, episode, total(movie+ep)}
-            yt = db.youtube_wishlist_counts()             # {channel, video}  (its own table-shape)
+            counts = db.wishlist_counts(profile_id=_profile())  # {movie, show, episode, total(movie+ep)}
+            yt = db.youtube_wishlist_counts(profile_id=_profile())  # {channel, video}  (its own table-shape)
             counts["video"] = yt.get("video", 0)
             counts["channel"] = yt.get("channel", 0)
             # The header/sidebar badge is the WHOLE wishlist — movies + episodes + YouTube
@@ -172,11 +167,73 @@ def register_routes(bp):
             from core.video.wishlist_search import manual_search
             res = manual_search(scope, tmdb_id,
                                 season_number=data.get("season_number"),
-                                episode_number=data.get("episode_number"))
+                                episode_number=data.get("episode_number"),
+                                profile_id=_profile())
             return jsonify({"success": True, **res})
         except Exception:
             logger.exception("wishlist manual search failed")
             return jsonify({"success": False, "error": "Search failed to start"}), 500
+
+    @bp.route("/wishlist/diagnostics", methods=["GET"])
+    def video_wishlist_diagnostics():
+        """Everything known about ONE stuck row, in one call.
+
+        The row's tooltip could say how often it had been searched and the
+        headline refusal. It could not say where the file would land, which
+        external ids the search was keyed on, whether something was already
+        downloading, or WHY any individual release lost - which is what turns
+        "why is this stuck" from a guess into an answer.
+        """
+        from . import get_video_db
+        kind = str(request.args.get("kind") or "").lower()
+        if kind not in ("movie", "episode"):
+            return jsonify({"success": False, "error": "kind must be movie|episode"}), 400
+        try:
+            tmdb_id = int(request.args.get("tmdb_id"))
+        except (TypeError, ValueError):
+            return jsonify({"success": False, "error": "tmdb_id required"}), 400
+
+        def _opt(name):
+            v = request.args.get(name)
+            try:
+                return int(v) if v not in (None, "") else None
+            except (TypeError, ValueError):
+                return None
+
+        data = get_video_db().wishlist_row_diagnostics(
+            kind, tmdb_id, season_number=_opt("season_number"),
+            episode_number=_opt("episode_number"), profile_id=_profile())
+        if not data.get("row"):
+            return jsonify({"success": False, "error": "No such wishlist row."}), 404
+        return jsonify({"success": True, **data})
+
+    @bp.route("/wishlist/retry", methods=["POST"])
+    def video_wishlist_retry_all_sources():
+        """User-forced retry for a stale row: clear backoff/evidence and search every source."""
+        try:
+            data = request.get_json(silent=True) or {}
+            scope = str(data.get("scope") or "").lower()
+            tmdb_id = data.get("tmdb_id")
+            if scope not in _SCOPES or not tmdb_id:
+                return jsonify({"success": False, "error": "scope + tmdb_id required"}), 400
+            from . import get_video_db
+            from core.automation.handlers.video_process_wishlist import reset_source_cooldowns
+            from core.video.wishlist_search import manual_search
+            kind = "movie" if scope == "movie" else "episode"
+            reset = get_video_db().reset_wishlist_search_state(
+                kind, tmdb_id,
+                season_number=data.get("season_number"),
+                episode_number=data.get("episode_number"),
+                profile_id=_profile())
+            reset_source_cooldowns()
+            res = manual_search(scope, tmdb_id,
+                                season_number=data.get("season_number"),
+                                episode_number=data.get("episode_number"),
+                                all_sources=True, profile_id=_profile())
+            return jsonify({"success": True, "reset": reset, **res})
+        except Exception:
+            logger.exception("wishlist retry-all-sources failed")
+            return jsonify({"success": False, "error": "Retry failed to start"}), 500
 
     @bp.route("/wishlist/search-all", methods=["POST"])
     def video_wishlist_search_all():
@@ -190,31 +247,24 @@ def register_routes(bp):
             logger.exception("wishlist search-all failed")
             return jsonify({"success": False, "error": "Search failed to start"}), 500
 
+    @bp.route("/wishlist/search-stop", methods=["POST"])
+    def video_wishlist_search_stop():
+        """Cancel all's other half: stop running wishlist searches so they don't
+        keep grabbing after the download rows are cancelled."""
+        from core.video.wishlist_search import stop_all
+        stop_all()
+        return jsonify({"success": True})
+
     @bp.route("/wishlist/add", methods=["POST"])
     def video_wishlist_add():
         """Add a movie or a set of a show's episodes. Body is one of:
-            {"movie": {tmdb_id, title, year?, poster_url?, library_id?, root_folder_id?}}
-            {"show": {tmdb_id, title, poster_url?, library_id?, root_folder_id?},
-             "episodes": [{season_number, episode_number, title?, air_date?}, …]}
-
-        ``root_folder_id`` is the Library the item should be filed into. Omitted,
-        it's inferred from the title's existing library row when it has one, and
-        finally falls back to the primary Library at drain time — so a NOT-yet-owned
-        Anime show no longer has to land in the standard TV Library."""
-        from . import get_video_db, acting_profile_id
+            {"movie": {tmdb_id, title, year?, poster_url?, library_id?}}
+            {"show": {tmdb_id, title, poster_url?, library_id?},
+             "episodes": [{season_number, episode_number, title?, air_date?}, …]}"""
+        from . import get_video_db
         body = request.get_json(silent=True) or {}
         srv = _server()
         db = get_video_db()
-        # Stamp who asked, so they can take it back later without being able to
-        # remove anyone else's wishes. Automation adds leave this NULL.
-        who = acting_profile_id()
-        # ...and whether it is fetched now or waits for an admin. A pending wish
-        # is written and shown exactly like any other — only the acquisition
-        # paths skip it — so the requester can see that they asked.
-        approved = _may_acquire()
-        req = dict(approved=approved,
-                   requested_by=None if approved else who,
-                   requested_by_name=None if approved else getattr(g, "profile_name", None))
         try:
             movie = body.get("movie")
             if movie and movie.get("tmdb_id") and (movie.get("title") or "").strip():
@@ -222,10 +272,9 @@ def register_routes(bp):
                     int(movie["tmdb_id"]), movie["title"].strip(), year=movie.get("year"),
                     poster_url=movie.get("poster_url") or None,
                     library_id=movie.get("library_id") or None, server_source=srv,
-                    added_by_profile_id=who, **req,
-                    root_folder_id=(movie.get("root_folder_id")
-                                    or db.root_folder_id_for_tmdb("movie", movie["tmdb_id"])))
-                return jsonify({"success": ok, "added": 1 if ok else 0, "counts": db.wishlist_counts()})
+                    profile_id=_profile())
+                return jsonify({"success": ok, "added": 1 if ok else 0,
+                                "counts": db.wishlist_counts(profile_id=_profile())})
 
             show = body.get("show")
             episodes = body.get("episodes") or []
@@ -234,178 +283,110 @@ def register_routes(bp):
                     int(show["tmdb_id"]), show["title"].strip(), episodes,
                     poster_url=show.get("poster_url") or None,
                     library_id=show.get("library_id") or None, server_source=srv,
-                    added_by_profile_id=who, **req,
-                    root_folder_id=(show.get("root_folder_id")
-                                    or db.root_folder_id_for_tmdb("show", show["tmdb_id"])))
-                return jsonify({"success": n > 0, "added": n, "counts": db.wishlist_counts()})
+                    profile_id=_profile())
+                return jsonify({"success": n > 0, "added": n,
+                                "counts": db.wishlist_counts(profile_id=_profile())})
 
             return jsonify({"success": False, "error": "movie or show+episodes required"}), 400
         except Exception:
             logger.exception("Failed to add to video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500
 
-    @bp.route("/wishlist/library", methods=["PUT"])
-    def video_wishlist_set_library():
-        """Direct a wished title at a Library. Body: {kind, tmdb_id, root_folder_id}
-        where kind ∈ movie|show and root_folder_id null = 'default' (inherit from
-        the library row, else the primary Library for the kind).
-
-        Admin-only — the '/library' suffix gate in this blueprint's before_request
-        covers it, same as the detail page's reassignment.
-
-        Metadata only: nothing on disk moves. It's where the NEXT grab lands."""
-        from . import get_video_db
-        body = request.get_json(silent=True) or {}
-        kind, tmdb_id = body.get("kind"), body.get("tmdb_id")
-        if kind not in ("movie", "show") or not tmdb_id:
-            return jsonify({"success": False,
-                            "error": "kind (movie|show) and tmdb_id are required"}), 400
-        try:
-            db = get_video_db()
-            rfid = body.get("root_folder_id")
-            # Reject a bad Library HERE rather than reading it back off the row
-            # count: a title with nothing left on the wishlist also updates 0
-            # rows, and reporting that as "no such Library" would be a lie.
-            if rfid not in (None, "", "null"):
-                row = db.get_root_folder(rfid)
-                if not row or str(row.get("content_kind") or "") != kind:
-                    return jsonify({"success": False,
-                                    "error": "That Library doesn't exist, or isn't for this kind"}), 400
-            return jsonify({"success": True,
-                            "updated": db.set_wishlist_root_folder(kind, int(tmdb_id), rfid)})
-        except Exception:
-            logger.exception("Failed to set wishlist library")
-            return jsonify({"success": False, "error": "Failed"}), 500
-
     @bp.route("/wishlist/remove", methods=["POST"])
     def video_wishlist_remove():
         """Remove at any granularity. Body: {scope, tmdb_id, season_number?, episode_number?}
-        where scope ∈ movie|show|season|episode.
-
-        NOT behind the blanket can_download gate — a member who asked for a title
-        must be able to take that back. Instead the delete is scoped to the rows
-        THEY added (``wishlist_owner_filter``), so the shared wishlist is safe
-        from a profile emptying someone else's requests."""
-        from . import get_video_db, wishlist_owner_filter
+        where scope ∈ movie|show|season|episode."""
+        from . import get_video_db
         body = request.get_json(silent=True) or {}
         scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
         if scope not in _SCOPES or not tmdb_id:
             return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
         try:
             db = get_video_db()
-            owner = wishlist_owner_filter()
-            kw = dict(tmdb_id=int(tmdb_id), season_number=body.get("season_number"),
-                      episode_number=body.get("episode_number"))
-            removed = db.remove_from_wishlist(scope, only_profile_id=owner, **kw)
-            # An ownership-scoped delete reports 0 both for 'not yours' and for
-            # 'nothing there'. Say which — a silent no-op on someone else's title
-            # reads as a broken button.
-            if owner is not None and not removed and db.count_wishlist_rows(scope, **kw):
-                return jsonify({"success": False,
-                                "error": "You can only remove titles you added yourself."}), 403
-            return jsonify({"success": True, "removed": removed, "counts": db.wishlist_counts()})
+            removed = db.remove_from_wishlist(
+                scope, tmdb_id=int(tmdb_id),
+                season_number=body.get("season_number"), episode_number=body.get("episode_number"),
+                profile_id=_profile())
+            return jsonify({"success": True, "removed": removed,
+                            "counts": db.wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("Failed to remove from video wishlist")
             return jsonify({"success": False, "error": "Failed"}), 500
 
+    @bp.route("/wishlist/youtube/download-all", methods=["POST"])
+    def video_wishlist_youtube_download_all():
+        """Queue every waiting YouTube video NOW — the tab's missing bulk action.
+
+        "Search all missing" is hidden on the YouTube tab because there is nothing
+        to search: the video IS the release. But the tab still needs a way to say
+        "stop waiting and fetch these", which is what the hourly drain does. This
+        is that verb, and it is the YouTube twin of search-all: same enqueue path
+        the drain uses, same concurrency cap, and the user's click out-ranks the
+        retry backoff exactly as a manual search out-ranks the release gate.
+
+        Permanently unavailable videos (deleted / private / members-only) are
+        still skipped and reported — the per-row button covers the one case where
+        the user believes a video is back.
+        """
+        from . import get_video_db
+        from core.automation.handlers.video_process_youtube_wishlist import (
+            slots_free, videos_for_manual_run)
+        from core.video.youtube_download import start_next_queued
+        try:
+            db = get_video_db()
+            root = db.get_setting("youtube_path") or ""
+            if not root:
+                return jsonify({"success": False,
+                                "error": "Set the YouTube library folder on Settings → Downloads first."}), 400
+
+            wanted = db.youtube_wishlist_to_download(profile_id=_profile()) or []
+            already = [d.get("media_id") for d in db.get_active_video_downloads()
+                       if d.get("source") == "youtube" and d.get("media_id")]
+            states = db.youtube_retry_state()
+            todo = videos_for_manual_run(wanted, already, states)
+
+            from core.automation.handlers.video_process_youtube_wishlist import _default_enqueue
+            queued = refused = 0
+            for v in todo:
+                try:
+                    if _default_enqueue(v, root) is not None:
+                        queued += 1
+                    else:
+                        refused += 1      # disk guard
+                except Exception:   # noqa: BLE001 - one bad row must not stop the rest
+                    logger.exception("youtube download-all: could not queue %r", v.get("video_id"))
+
+            started = 0
+            for _ in range(slots_free(db.count_active_youtube_downloads(), 3)):
+                if start_next_queued(get_video_db) is None:
+                    break
+                started += 1
+
+            unavailable = sum(1 for v in wanted
+                              if (states.get(v.get("video_id")) or {}).get("permanent"))
+            return jsonify({"success": True, "queued": queued, "started": started,
+                            "refused": refused, "unavailable": unavailable,
+                            "already": len(already), "total": len(wanted)})
+        except Exception:
+            logger.exception("youtube wishlist download-all failed")
+            return jsonify({"success": False, "error": "Could not start the downloads"}), 500
+
     @bp.route("/wishlist/clear", methods=["POST"])
     def video_wishlist_clear():
-        """Empty a wishlist tab. Body: {kind} where kind ∈ movie|show|youtube.
-
-        Ownership-scoped exactly like /wishlist/remove: for a profile that manages
-        the shared wishlist this empties the tab, and for everyone else it clears
-        the titles THEY added and leaves the rest. Returns ``left`` so the page can
-        say so rather than claiming it emptied a list that still has items in it."""
-        from . import get_video_db, wishlist_owner_filter
+        """Empty an entire wishlist tab. Body: {kind} where kind ∈ movie|show|youtube."""
+        from . import get_video_db
         body = request.get_json(silent=True) or {}
         kind = body.get("kind")
         if kind not in ("movie", "show", "youtube"):
             return jsonify({"success": False, "error": "kind must be movie|show|youtube"}), 400
         try:
             db = get_video_db()
-            owner = wishlist_owner_filter()
-            removed = db.clear_wishlist(kind, only_profile_id=owner)
-            counts = db.wishlist_counts()
-            left = counts.get("movie" if kind == "movie" else "episode", 0) \
-                if kind != "youtube" else db.youtube_wishlist_counts().get("video", 0)
+            removed = db.clear_wishlist(kind, profile_id=_profile())
             return jsonify({"success": True, "removed": removed,
-                            # rows other profiles asked for, which this clear left alone
-                            "left": left if owner is not None else 0,
-                            "scoped": owner is not None,
-                            "counts": counts, "youtube_counts": db.youtube_wishlist_counts()})
+                            "counts": db.wishlist_counts(profile_id=_profile()),
+                             "youtube_counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("Failed to clear video wishlist")
-            return jsonify({"success": False, "error": "Failed"}), 500
-
-    @bp.route("/wishlist/pending", methods=["GET"])
-    def video_wishlist_pending():
-        """Wishes awaiting approval. An admin sees the whole queue; anyone else
-        sees only their own asks — the queue is other people's requests, which is
-        not a member's business, but their own pending items are."""
-        from . import get_video_db
-        try:
-            db = get_video_db()
-            scope = None if _is_admin() else _me()
-            return jsonify({"success": True,
-                            "entries": db.pending_wishlist_entries(requested_by=scope),
-                            "count": db.pending_wishlist_count(requested_by=scope)})
-        except Exception:
-            logger.exception("Failed to list pending wishlist entries")
-            return jsonify({"success": False, "error": "Failed", "entries": [], "count": 0}), 500
-
-    @bp.route("/wishlist/approve", methods=["POST"])
-    def video_wishlist_approve():
-        """Admin releases a pending wish to the acquisition paths. Body:
-        {scope, tmdb_id, season_number?, episode_number?} — the same shape as
-        /wishlist/remove, so a whole show or season can be approved at once."""
-        from . import get_video_db
-        if not _is_admin():
-            return jsonify({"success": False, "error": "Admin only."}), 403
-        body = request.get_json(silent=True) or {}
-        scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
-        if scope not in _SCOPES or not tmdb_id:
-            return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
-        try:
-            db = get_video_db()
-            n = db.approve_wishlist(scope, tmdb_id=int(tmdb_id),
-                                    season_number=body.get("season_number"),
-                                    episode_number=body.get("episode_number"))
-            if not n:
-                return jsonify({"success": False,
-                                "error": "Nothing pending there — it may already be approved."}), 404
-            return jsonify({"success": True, "approved": n,
-                            "pending": db.pending_wishlist_count()})
-        except Exception:
-            logger.exception("Failed to approve wishlist entry")
-            return jsonify({"success": False, "error": "Failed"}), 500
-
-    @bp.route("/wishlist/deny", methods=["POST"])
-    def video_wishlist_deny():
-        """Admin rejects a pending wish — it is simply removed. Unlike the
-        watchlist there is no tombstone to leave: nothing re-adds a wish on its
-        own, so a removed row stays gone until somebody asks again."""
-        from . import get_video_db
-        if not _is_admin():
-            return jsonify({"success": False, "error": "Admin only."}), 403
-        body = request.get_json(silent=True) or {}
-        scope, tmdb_id = body.get("scope"), body.get("tmdb_id")
-        if scope not in _SCOPES or not tmdb_id:
-            return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
-        try:
-            db = get_video_db()
-            kw = dict(tmdb_id=int(tmdb_id), season_number=body.get("season_number"),
-                      episode_number=body.get("episode_number"))
-            # Only ever removes rows still awaiting approval, so a mis-aimed deny
-            # can't delete a wish that is already live.
-            if not db.count_pending_wishlist_rows(scope, **kw):
-                return jsonify({"success": False,
-                                "error": "Nothing pending there."}), 404
-            removed = db.deny_wishlist(scope, **kw)
-            return jsonify({"success": True, "removed": removed,
-                            "counts": db.wishlist_counts(),
-                            "pending": db.pending_wishlist_count()})
-        except Exception:
-            logger.exception("Failed to deny wishlist entry")
             return jsonify({"success": False, "error": "Failed"}), 500
 
     @bp.route("/wishlist/backfill-art", methods=["POST"])
@@ -472,11 +453,12 @@ def register_routes(bp):
         try:
             db = get_video_db()
             st = db.wishlist_state(
-                movie_ids=body.get("movie_ids") or [], show_tmdb_id=body.get("show_tmdb_id"))
+                movie_ids=body.get("movie_ids") or [], show_tmdb_id=body.get("show_tmdb_id"),
+                profile_id=_profile())
             out = {"success": True, "movies": sorted(st["movies"]), "episodes": sorted(st["episodes"])}
             shows = body.get("shows")   # multi-show membership for the calendar button
             if shows:
-                keys = db.wishlist_keys_for_shows(shows)
+                keys = db.wishlist_keys_for_shows(shows, profile_id=_profile())
                 out["by_show"] = {str(tid): sorted(ks) for tid, ks in keys.items()}
             return jsonify(out)
         except Exception:

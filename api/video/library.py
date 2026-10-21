@@ -13,13 +13,47 @@ from utils.logging_config import get_logger
 logger = get_logger("video_api.library")
 
 
-def _arg_root_folder_id():
-    """The ?root_folder_id= filter as an int, or None when absent/unparseable —
-    so the filter dropdowns scope to the same Library tab the listing does."""
+def _capped_library(db, cap, server):
+    """the library page for a kids profile: same filters and sort, over-cap
+    and unrated titles left out, paged after the filter so counts and pages
+    stay honest. walks the filtered set in big pages; only restricted
+    profiles ever come through here."""
+    from .kids import filter_library_items
+    kind = request.args.get("kind", "movies")
     try:
-        return int(request.args.get("root_folder_id") or 0) or None
+        page = max(1, int(request.args.get("page", 1) or 1))
+        limit = max(1, min(500, int(request.args.get("limit", 75) or 75)))
     except (TypeError, ValueError):
-        return None
+        page, limit = 1, 75
+    kept, p = [], 1
+    while True:
+        chunk = db.query_library(
+            kind, search=request.args.get("search") or None,
+            letter=request.args.get("letter") or None,
+            sort=request.args.get("sort", "title"),
+            status=request.args.get("status", "all"),
+            genre=request.args.get("genre") or None,
+            resolution=request.args.get("resolution") or None,
+            page=p, limit=500, server_source=server, include_size=False)
+        kept.extend(filter_library_items(db, chunk.get("items") or [], cap, kind))
+        if not (chunk.get("pagination") or {}).get("has_next"):
+            break
+        p += 1
+    total = len(kept)
+    total_pages = max(1, (total + limit - 1) // limit)
+    return {"items": kept[(page - 1) * limit: page * limit],
+            "total_size_bytes": sum(int(it.get("size_bytes") or 0) for it in kept),
+            "pagination": {"page": page, "total_pages": total_pages, "total_count": total,
+                           "has_prev": page > 1, "has_next": page < total_pages}}
+
+
+def _profile() -> int:
+    """The requesting user's profile for per-profile watchlist reads."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
 
 
 def register_routes(bp):
@@ -37,26 +71,14 @@ def register_routes(bp):
                     sort=request.args.get("sort", "title"),
                     page=request.args.get("page", 1),
                     limit=request.args.get("limit", 75),
+                    profile_id=_profile(),
                 ))
-            db = get_video_db()
-            kind = request.args.get("kind", "movies")
-            server = resolve_video_server()
-            root_folder_id = request.args.get("root_folder_id")
-            include_unassigned = False
-            if root_folder_id:
-                try:
-                    root_folder_id = int(root_folder_id)
-                except (TypeError, ValueError):
-                    root_folder_id = None
-            if root_folder_id and server:
-                # Items scanned before Libraries existed have no root_folder_id yet —
-                # bucket them into the PRIMARY tab so nothing vanishes post-upgrade
-                # until a rescan re-attributes them to their real library.
-                content_kind = "movie" if kind == "movies" else "show"
-                primary = db.primary_root_folder(server, content_kind)
-                include_unassigned = bool(primary and primary.get("id") == root_folder_id)
-            return jsonify(db.query_library(
-                kind,
+            from .kids import video_cap
+            cap = video_cap()
+            if cap is not None:
+                return jsonify(_capped_library(get_video_db(), cap, resolve_video_server()))
+            return jsonify(get_video_db().query_library(
+                request.args.get("kind", "movies"),
                 search=request.args.get("search") or None,
                 letter=request.args.get("letter") or None,
                 sort=request.args.get("sort", "title"),
@@ -65,10 +87,8 @@ def register_routes(bp):
                 resolution=request.args.get("resolution") or None,
                 page=request.args.get("page", 1),
                 limit=request.args.get("limit", 75),
-                server_source=server,
-                root_folder_id=root_folder_id,
-                include_unassigned=include_unassigned,
-                air_status=request.args.get("air_status") or None,
+                server_source=resolve_video_server(),
+                library=request.args.get("library") or None,   # Commissary: a Library tab
             ))
         except Exception:
             logger.exception("Failed to query video library")
@@ -82,11 +102,28 @@ def register_routes(bp):
         from core.video.sources import resolve_video_server
         try:
             return jsonify({"resolutions": get_video_db().library_resolutions(
-                server_source=resolve_video_server(),
-                root_folder_id=_arg_root_folder_id())})
+                server_source=resolve_video_server())})
         except Exception:
             logger.exception("Failed to list library resolutions")
             return jsonify({"resolutions": []})
+
+    @bp.route("/library/episode", methods=["GET"])
+    def video_library_episode():
+        """Is a specific episode in the library?
+        ?tmdb_id=<show_tmdb_id>&season=<n>&episode=<n>
+        Returns {in_library: bool}."""
+        from . import get_video_db
+        try:
+            tmdb_id = request.args.get("tmdb_id", type=int)
+            season = request.args.get("season", type=int)
+            episode = request.args.get("episode", type=int)
+            if not tmdb_id or season is None or episode is None:
+                return jsonify({"error": "tmdb_id, season, and episode are required."}), 400
+            in_lib = get_video_db().episode_in_library(tmdb_id, season, episode)
+            return jsonify({"success": True, "in_library": in_lib})
+        except Exception:
+            logger.exception("Failed to check episode library status")
+            return jsonify({"success": False, "error": "Failed to check episode."}), 500
 
     @bp.route("/library/genres", methods=["GET"])
     def video_library_genres():
@@ -96,8 +133,7 @@ def register_routes(bp):
         from core.video.sources import resolve_video_server
         try:
             return jsonify({"genres": get_video_db().library_genres(
-                request.args.get("kind", "movies"), server_source=resolve_video_server(),
-                root_folder_id=_arg_root_folder_id())})
+                request.args.get("kind", "movies"), server_source=resolve_video_server())})
         except Exception:
             logger.exception("Failed to list library genres")
             return jsonify({"genres": []})

@@ -50,37 +50,10 @@ def test_resolve_flow_wired_to_place_and_search():
     # the picker reuses the existing TMDB search, library-owned floated to the top
     assert "/api/video/search?q=" in _JS
     assert "library first" in _JS or "owned" in _JS
-    # movie vs episode placement + the place/dismiss endpoints. Matched on the
-    # URL rather than the exact expression building it: the id was hoisted to a
-    # local so the reconcile/poll closures could share it, and pinning the
-    # spelling of that made a refactor look like an unwired endpoint.
-    assert "'/api/video/import/' + id + '/place'" in _JS
+    # movie vs episode placement + the place/dismiss endpoints
     assert "scope: r.kind" in _JS
+    assert "/api/video/import/' + r.item.id + '/place'" in _JS
     assert "/dismiss'" in _JS
-
-
-def test_a_lost_response_is_reconciled_rather_than_called_a_failure():
-    """A long copy can outlive a proxy timeout while the server finishes it
-    happily, so the request outcome alone cannot tell a failed placement from a
-    placement whose response was lost. Reported as 'couldn't place the file, but
-    the import goes fine'."""
-    assert "/place/status'" in _JS
-    assert "function reconcile" in _JS
-    # every failure route asks what actually happened before saying it failed
-    body = _JS[_JS.index("function place("):]
-    body = body[:body.index("\n    function ", 10)]
-    assert body.count("reconcile(") >= 4, body
-    assert "toast('Couldn’t place the file', 'error')" not in body, \
-        "a failure is still announced without checking the outcome first"
-
-
-def test_the_list_refreshes_even_when_a_placement_reports_failure():
-    """load() used to run only on success, so a placement that actually landed
-    stayed on screen as unplaced — which is what made the false error
-    convincing."""
-    body = _JS[_JS.index("function failed("):]
-    body = body[:body.index("\n        }", 10)]
-    assert "load()" in body
 
 
 def test_endpoints_registered_on_the_blueprint():
@@ -116,53 +89,5 @@ def test_reasons_are_classified_into_chips():
 def test_drawer_offers_delete_file_with_destructive_confirm():
     assert "data-vimp-delete" in _JS
     assert "delete_file: !!del" in _JS
-    assert "destructive: true" in _JS               # Commissary confirm modal, red button
+    assert "destructive: true" in _JS               # SoulSync confirm modal, red button
     assert ".vimp-btn--danger" in _CSS
-
-
-# ── Place dialog: pick which Library the file lands in ───────────────────────
-# The dialog had only Movie/Episode tabs, so the backend always fell back to the
-# PRIMARY Library for the kind — a show from a separate Anime library had no way
-# to reach it.
-
-def _func(name: str) -> str:
-    i = _JS.index("function " + name + "(")
-    nxt = _JS.find("\n    function ", i + 1)
-    return _JS[i:nxt if nxt != -1 else len(_JS)]
-
-
-def test_place_dialog_has_a_library_picker():
-    assert "data-vimp-lib-row" in _JS and "data-vimp-lib" in _JS
-    assert ".vimp-lib" in _CSS
-    assert "function renderLibraryPicker(" in _JS
-
-
-def test_library_picker_reads_the_configured_registry():
-    """d.configured is the Library registry (ids + labels); d.movies/d.tv are the
-    admin-only server-section discovery list, which carries neither."""
-    body = _func("loadLibraries")
-    assert "/api/video/libraries" in body
-    assert "d.configured" in body
-    assert "d.movies" not in body and "d.tv" not in body
-
-
-def test_library_picker_follows_the_kind_tab():
-    body = _func("renderLibraryPicker")
-    # Keyed off the resolve dialog's kind, whatever the expression around it —
-    # a whole-folder import ('season') maps to the TV libraries, so the literal
-    # `LIB_KEY[r.kind]` this once asserted is no longer the only correct form.
-    assert "LIB_KEY[" in body and "r.kind" in body
-    assert "libs.length < 2" in body            # one Library is not a choice
-    assert "renderLibraryPicker()" in _func("renderModal")
-
-
-def test_a_season_pack_uses_the_tv_libraries():
-    """'season' is a show-shaped import. Passed through raw it would miss
-    LIB_KEY entirely and offer no Library picker at all."""
-    body = _func("renderLibraryPicker")
-    assert "'season'" in body and "'episode'" in body
-
-
-def test_place_sends_the_chosen_library():
-    body = _func("place")
-    assert "root_folder_id: r.rootFolderId || null" in body

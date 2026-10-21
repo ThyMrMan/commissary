@@ -9,7 +9,7 @@ Actions:
   content_rating {value}   — set + lock + push (per-item edit_item)
   genre_add      {genre}   — current genres + one; set + lock + push
   genre_remove   {genre}   — current genres - one; set + lock + push
-  monitored      {value}   — Commissary-side follow flag (no server push needed)
+  monitored      {value}   — SoulSync-side follow flag (no server push needed)
   watched        {value}   — local state + server markPlayed/markUnplayed
   refresh_art    {}        — per-item enrichment art refresh (TMDB)
 

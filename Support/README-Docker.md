@@ -1,15 +1,14 @@
-# Commissary WebUI - Docker Deployment Guide
+# SoulSync WebUI - Docker Deployment Guide
 
 ## Release Channels
 
-Commissary publishes **one** image, to the GitHub Container Registry:
+SoulSync publishes two Docker image tracks:
 
-- **`ghcr.io/thymrman/commissary:latest`** — the current release. The default in `docker-compose.yml`.
-- **`ghcr.io/thymrman/commissary:<version>`** — e.g. `:2.1.2`, a permanent tag for pinning.
+- **Stable — `boulderbadgedad/soulsync:latest`** (Docker Hub). Hand-promoted from the `dev` branch when a batch of changes is ready. Default in `docker-compose.yml`.
+- **Nightly — `ghcr.io/nezreka/soulsync:dev`** (GHCR). Rebuilt every night and on every push to `dev`. Faster access to new features at the cost of occasional instability.
+- **Version-tagged — `:2.3`, `:2.4`, etc.** on both registries for pinning to a specific release.
 
-There is no nightly or `:dev` track. Publishing is manual: the workflow only runs
-on `workflow_dispatch`, so an image appears when a release is cut, not on every
-push to `main`. See the [main README](../README.md#install) for the full picture.
+To switch a running install to the nightly channel, edit the `image:` line in `docker-compose.yml` to `ghcr.io/nezreka/soulsync:dev` and run `docker-compose pull && docker-compose up -d`. See the [main README](../README.md#release-channels) for the full channel guide.
 
 ## 🐳 Quick Start
 
@@ -46,7 +45,7 @@ Edit `config/config.json` with your API keys and server settings:
 
 ### 3. Deploy
 ```bash
-# Start Commissary
+# Start SoulSync
 docker-compose up -d
 
 # View logs
@@ -58,7 +57,7 @@ open http://localhost:8008
 
 ## 📁 Volume Mounts
 
-Commissary requires persistent storage for:
+SoulSync requires persistent storage for:
 
 - **`./config`** → `/app/config` - Configuration files
 - **`./data`** → `/app/data` - SQLite database files  

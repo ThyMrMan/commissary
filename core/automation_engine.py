@@ -1,9 +1,9 @@
 """
-Automation Engine — trigger → action → then scheduler for Commissary.
+Automation Engine — trigger → action → then scheduler for SoulSync.
 
 Architecture:
 - Triggers (WHEN): schedule timer, event-based, signal-based (signal_received)
-- Actions (DO): real Commissary operations registered by web_server.py
+- Actions (DO): real SoulSync operations registered by web_server.py
 - Then (THEN): 1–3 post-action steps — notifications (Discord/Pushbullet/Telegram) and/or fire_signal
 - Conditions: optional filters on event data (artist contains, title equals, etc.)
 - Signals: user-named events that chain automations together (fire_signal → signal_received)
@@ -89,6 +89,53 @@ SYSTEM_AUTOMATIONS = [
         'action_type': 'scan_watchlist',
         'initial_delay': 300,  # 5 minutes after startup
     },
+    {
+        'name': 'Auto-Scan Podcasts',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 6, 'unit': 'hours'},
+        'action_type': 'scan_watchlist_podcasts',
+        'initial_delay': 180,  # 3 minutes after startup
+    },
+    # Audiobooks drain their wishlist through the engine like every other side.
+    # Hourly rather than the music wishlist's 30 minutes: each BOOK also carries
+    # its own multi-hour backoff, so a shorter interval would only re-walk rows
+    # that are not due yet. No owned_by — the podcast scan has none either, so
+    # audio-side automations sit on the same page as music.
+    {
+        'name': 'Auto-Process Audiobook Wishlist',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'audiobook_process_wishlist',
+        'initial_delay': 240,  # 4 minutes after startup, after the podcast scan
+    },
+    # Followed authors. Daily, because an audiobook is announced weeks ahead and
+    # published on a date — checking more often spends effort to learn nothing.
+    {
+        'name': 'Auto-Scan Audiobook Authors',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_scan_watchlist',
+        'initial_delay': 420,  # 7 minutes after startup
+    },
+    # Empties the audiobook recycle bin. The schedule is what matters: the
+    # opportunistic pass only fires when something else is deleted, so on a
+    # library nobody prunes the bin would never expire.
+    {
+        'name': 'Empty Audiobook Recycle Bin',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_purge_recycle',
+        'initial_delay': 780,  # 13 minutes after startup
+    },
+    # Index existing audiobook folders and loose files, including external books.
+    # Reuse this system job so existing user schedules and history are preserved.
+    {
+        'name': 'Auto-Scan Audiobook Library',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 24, 'unit': 'hours'},
+        'action_type': 'audiobook_scan_library',
+        'initial_delay': 600,  # 10 minutes after startup, last of the audio jobs
+    },
     # Event-based system automations (no initial_delay/next_run needed)
     {
         'name': 'Auto-Scan After Downloads',
@@ -102,16 +149,22 @@ SYSTEM_AUTOMATIONS = [
         'trigger_config': {},
         'action_type': 'start_database_update',
     },
-    # The tail of that chain. Without it the chain refreshes the library and
-    # stops: a track downloaded FOR a playlist is imported, scanned and read
-    # into the DB, but the server playlist was written back when the track was
-    # still missing, so it stayed missing until someone matched it by hand.
-    # Only playlists whose last sync came up short are touched.
+    # Safety net, and the music twin of 'Auto-Update Video Database (Hourly)'.
+    # The chain above only fires after SoulSync ITSELF downloads something, so
+    # music added to the library any other way — dropped in by hand, ripped,
+    # moved from another box — waited up to seven days for the deep scan even
+    # though Plex/Jellyfin/Navidrome had already indexed it within minutes.
+    #
+    # Cheap enough to run hourly because it is the same smart-incremental read:
+    # newest albums first, stop after 25 consecutive already-known ones, and
+    # return without touching the database at all when nothing is new.
     {
-        'name': 'Auto-Sync Playlists After Database Update',
-        'trigger_type': 'database_update_completed',
-        'trigger_config': {},
-        'action_type': 'resync_incomplete_playlists',
+        'name': 'Auto-Update Database (Hourly)',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'start_database_update_hourly',
+        'action_config': {'full_refresh': False},
+        'initial_delay': 900,  # 15 min after startup, off the boot path
     },
     # Maintenance automations
     {
@@ -150,11 +203,30 @@ SYSTEM_AUTOMATIONS = [
         'initial_delay': 1200,
     },
     {
+        'name': 'ListenBrainz Listening Sync',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'import_listenbrainz_listening',
+        'initial_delay': 1260,
+    },
+    {
         'name': 'Auto-Deep Scan Library',
         'trigger_type': 'schedule',
         'trigger_config': {'interval': 7, 'unit': 'days'},
         'action_type': 'deep_scan_library',
         'initial_delay': 900,  # 15 min after startup
+    },
+    # Quarantine + recycle bin sweep. Seeded SWITCHED OFF: it deletes files
+    # for good, so it is a thing you turn on, not a thing that starts happening
+    # to you after an update. enabled_on_create is honoured on the row's first
+    # creation only, so flipping it on sticks across restarts.
+    {
+        'name': 'Weekly Cleanup',
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 7, 'unit': 'days'},
+        'action_type': 'library_cleanup',
+        'initial_delay': 1500,  # 25 min after startup, once enabled
+        'enabled_on_create': False,
     },
     {
         'name': 'Auto-Backup Database',
@@ -254,7 +326,7 @@ SYSTEM_AUTOMATIONS = [
         'action_type': 'video_apply_overlays',
         'owned_by': 'video',
     },
-    # Daily: keep Commissary-managed collections in sync with the library. Resolves
+    # Daily: keep SoulSync-managed collections in sync with the library. Resolves
     # each enabled collection's members and pushes add/remove to the server,
     # skipping collections whose members + settings are unchanged. Runs at 4:30am,
     # after the overnight scans + overlay pass so it sees fresh library state.
@@ -349,7 +421,6 @@ SYSTEM_AUTOMATIONS = [
         'trigger_type': 'daily_time',                  # daily; catalogs change slowly
         'trigger_config': {'time': '03:30'},           # staggered off the people scan
         'action_type': 'video_scan_watchlist_studios',
-        'initial_delay': 1500,
         'owned_by': 'video',
     },
     {
@@ -399,7 +470,7 @@ SYSTEM_AUTOMATIONS = [
         'owned_by': 'video',
     },
     {
-        'name': 'RSS Sync (Instant Downloads)',        # indexers' newest releases vs the wishlist
+        'name': 'RSS Sync (Instant Grabs)',            # indexers' newest releases vs the wishlist
         'trigger_type': 'schedule',
         'trigger_config': {'interval': 15, 'unit': 'minutes'},
         'action_type': 'video_rss_sync',
@@ -412,6 +483,19 @@ SYSTEM_AUTOMATIONS = [
         'trigger_config': {'interval': 30, 'unit': 'minutes'},
         'action_type': 'video_seeding_sweep',
         'initial_delay': 1080,
+        'owned_by': 'video',
+    },
+    {
+        # Search → Fresh Releases is served from a stored board, so something has to
+        # keep it fresh. Hourly matches the board's own turnover, and because matched
+        # releases are cached by release, the steady-state cost is next to nothing —
+        # only a cold cache is slow. The tab's Refresh button runs the same action.
+        'name': 'Refresh Fresh Releases',              # EXT.to board + per-release match
+        'trigger_type': 'schedule',
+        'trigger_config': {'interval': 1, 'unit': 'hours'},
+        'action_type': 'video_extto_fresh_refresh',
+        'action_config': {'max_new_details': 40},
+        'initial_delay': 1920,                         # after Sync Import Lists (1860)
         'owned_by': 'video',
     },
     {
@@ -429,6 +513,16 @@ SYSTEM_AUTOMATIONS = [
         'trigger_type': 'daily_time',
         'trigger_config': {'time': '04:00'},
         'action_type': 'video_clean_youtube_episodes',
+        'owned_by': 'video',
+    },
+    # Recycle bin retention: delete recycled files past recycle_keep_days. Runs after the
+    # YouTube clean so the files that job just recycled are already in the bin. Safe to
+    # seed, it only ever touches entries the recycle bin itself wrote.
+    {
+        'name': 'Empty Recycle Bin',
+        'trigger_type': 'daily_time',
+        'trigger_config': {'time': '04:30'},
+        'action_type': 'video_purge_recycle_bin',
         'owned_by': 'video',
     },
 ]
@@ -468,7 +562,7 @@ class AutomationEngine:
         # let users override without touching env vars; falls back to
         # the system-detected local tz.
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             self._default_tz = (config_manager.get('automation.default_timezone', '') or _SYSTEM_DEFAULT_TZ)
         except Exception:
             self._default_tz = _SYSTEM_DEFAULT_TZ
@@ -581,11 +675,20 @@ class AutomationEngine:
                 )
                 if aid:
                     self.db.update_automation(aid, is_system=1)
+                    if spec.get('enabled_on_create') is False:
+                        # first creation only: an existing row keeps whatever
+                        # the user set, or turning it on would never stick
+                        self.db.update_automation(aid, enabled=0)
                     logger.info(f"Created system automation: {spec['name']} (id={aid})")
                 existing = self.db.get_system_automation_by_action(spec['action_type'])
 
             if existing:
-                if spec.get('initial_delay') is not None:
+                # The last_run/interval path is for 'schedule' (interval-based)
+                # triggers only. A timed trigger (daily_time etc.) with an
+                # initial_delay must NOT take this path — _calc_delay_seconds
+                # on {'time': '03:30'} yields a meaningless 3600, causing a
+                # duplicate run ~1h after the scheduled one on restart.
+                if spec.get('initial_delay') is not None and spec.get('trigger_type') == 'schedule':
                     # Compute full interval from trigger config
                     full_interval = self._calc_delay_seconds(spec['trigger_config'])
                     initial_delay = spec['initial_delay']
@@ -640,7 +743,46 @@ class AutomationEngine:
         self._fix_airing_automation_schedule()
         self._fix_deep_scan_schedules()
         self._fix_wishlist_processor_rename()
-        self._fix_rss_sync_rename()
+        self._fix_rss_sync_cadence()
+        self._fix_orphaned_system_actions()
+        self._fix_refresh_stale_catchup()
+
+    def _fix_orphaned_system_actions(self):
+        """Delete system rows whose action_type has NO registered handler.
+
+        A system row is created by this seeder and nothing else, and the API
+        refuses to delete one (403 'System automations cannot be deleted'). So
+        when an action is renamed or dropped, its row is STRANDED: it cannot run,
+        the user cannot remove it, and it reports "No handler for action: <type>"
+        on every fire, forever. _fix_wishlist_processor_rename is a hand-written
+        instance of exactly this; this generalises it so the next rename does not
+        need its own cleanup.
+
+        Deliberately narrow: only a MISSING HANDLER counts as orphaned. A row
+        whose action still exists is a live automation — possibly with a schedule
+        the user tuned — and dropping it out of the spec list is not grounds for
+        deleting it. delete_automation refuses system rows, so is_system is
+        cleared first (same two-step as the rename fix).
+
+        No-ops while the registry is empty, so a startup reorder can never be read
+        as "every automation is orphaned" and wipe the table.
+        """
+        try:
+            known = set(self._action_handlers)
+            if not known:
+                return          # cannot judge yet, so judge nothing
+            for auto in (self.db.get_automations() or []):
+                if not auto.get('is_system'):
+                    continue
+                action = auto.get('action_type') or ''
+                if action in known:
+                    continue
+                self.db.update_automation(auto['id'], is_system=0)
+                if self.db.delete_automation(auto['id']):
+                    logger.info("Removed orphaned system automation %r (action %r has no handler)",
+                                auto.get('name'), action)
+        except Exception:
+            logger.exception("orphaned system automation sweep failed")
 
     def _fix_video_scan_default(self):
         """Remove the obsolete standalone 'Scan Video Library' SYSTEM automation — it's
@@ -686,23 +828,32 @@ class AutomationEngine:
         except Exception:
             logger.exception("wishlist processor rename migration failed")
 
-    def _fix_rss_sync_rename(self):
-        """Rename the RSS Sync system automation's 'Grabs' -> 'Downloads' so a DB
-        seeded under the old label doesn't keep showing it forever.
+    def _fix_rss_sync_cadence(self):
+        """Migrate older system RSS rows from hourly to the arr-speed 15 min cadence.
 
-        The seeder only sets ``name`` when it CREATES a row, and
-        ``get_system_automation_by_action`` matches on action_type — so a rename in
-        the spec alone is invisible on every existing install, with no duplicate to
-        hint at it. Guarded on the exact old name, so a row the user renamed
-        themselves is left alone. Idempotent — no-ops once renamed."""
+        Fresh installs already seed 15 minutes. Existing users kept the old
+        trigger_config forever because ensure_system_automations does not clobber
+        a live row. Match only the system row and only the old hourly shape, so a
+        hand-tuned schedule stays hand-tuned."""
         try:
             auto = self.db.get_system_automation_by_action('video_rss_sync')
-            if auto and auto.get('name') == 'RSS Sync (Instant Grabs)':
-                self.db.update_automation(auto['id'], name='RSS Sync (Instant Downloads)')
-                logger.info("Renamed RSS Sync automation -> 'RSS Sync (Instant Downloads)' (id=%s)",
-                            auto.get('id'))
+            if not auto or auto.get('trigger_type') != 'schedule':
+                return
+            try:
+                cfg = json.loads(auto.get('trigger_config') or '{}')
+            except (TypeError, ValueError):
+                cfg = {}
+            if cfg != {'interval': 1, 'unit': 'hours'}:
+                return
+            new_cfg = {'interval': 15, 'unit': 'minutes'}
+            nr_dt = next_run_at('schedule', new_cfg, now_utc=_utcnow(), default_tz=self._default_tz)
+            self.db.update_automation(
+                auto['id'], trigger_config=json.dumps(new_cfg),
+                next_run=_dt_to_db_str(nr_dt) if nr_dt is not None else None)
+            logger.info("Migrated RSS Sync system automation to a 15-minute cadence (id=%s)",
+                        auto.get('id'))
         except Exception:
-            logger.exception("RSS sync rename migration failed")
+            logger.exception("RSS Sync cadence migration failed")
 
     def _fix_airing_automation_schedule(self):
         """Migrate 'Auto-Wishlist Episodes Airing Today' from the old rolling 24h
@@ -713,11 +864,18 @@ class AutomationEngine:
         interval fires reliably but at a time that drifts with every restart (5 min
         after startup, then +24h). Now that the seeder arms timed triggers, rewrite
         the live row to run at a fixed 1am (better for 'today's airings' — queues the
-        day overnight). Matches only the is_system row; idempotent (no-op once the row
-        is already daily_time)."""
+        day overnight). Matches only the is_system row with the OLD 24h-interval
+        shape — a hand-tuned trigger (e.g. weekly_time) is left alone. Idempotent."""
         try:
             auto = self.db.get_system_automation_by_action('video_add_airing_episodes')
-            if not auto or auto.get('trigger_type') == 'daily_time':
+            if not auto or auto.get('trigger_type') != 'schedule':
+                return
+            try:
+                old_cfg = json.loads(auto.get('trigger_config') or '{}')
+            except (TypeError, ValueError):
+                return
+            if old_cfg not in ({'interval': 24, 'unit': 'hours'},
+                               {'interval': 1, 'unit': 'days'}):
                 return
             cfg = {'time': '01:00'}
             nr_dt = next_run_at('daily_time', cfg, now_utc=_utcnow(), default_tz=self._default_tz)
@@ -734,8 +892,8 @@ class AutomationEngine:
         rolling 7-day interval to fixed weekly times — TV Mondays 02:00, Movies
         Tuesdays 02:00 (different days so they never overlap). The seeder only
         creates rows, never updates a drifted trigger; this rewrites the live rows.
-        Only converts the original interval rows (skips once trigger_type is already
-        weekly_time, so a hand-tuned day/time sticks). Idempotent."""
+        Only converts the original 7-day-interval rows — a hand-tuned trigger
+        (e.g. daily_time) is left alone. Idempotent."""
         targets = {
             'video_deep_scan_tv': {'time': '02:00', 'days': ['mon']},
             'video_deep_scan_movies': {'time': '02:00', 'days': ['tue']},
@@ -743,7 +901,13 @@ class AutomationEngine:
         for action_type, cfg in targets.items():
             try:
                 auto = self.db.get_system_automation_by_action(action_type)
-                if not auto or auto.get('trigger_type') == 'weekly_time':
+                if not auto or auto.get('trigger_type') != 'schedule':
+                    continue
+                try:
+                    old_cfg = json.loads(auto.get('trigger_config') or '{}')
+                except (TypeError, ValueError):
+                    continue
+                if old_cfg != {'interval': 7, 'unit': 'days'}:
                     continue
                 nr_dt = next_run_at('weekly_time', cfg, now_utc=_utcnow(), default_tz=self._default_tz)
                 self.db.update_automation(
@@ -766,6 +930,58 @@ class AutomationEngine:
         except (ValueError, TypeError):
             return 0
 
+    def _fix_refresh_stale_catchup(self):
+        """Overdue catch-up for the 23:00 airing-schedule refresh.
+
+        A daily_time slot missed while the box sleeps is discarded, not made up.
+        If the box slept through 23:00 (or the run failed), the 01:00 airing run
+        reads a stale calendar, covers the window, and advances the bookmark past
+        it — episodes announced during the stale window are never offered.
+
+        If the refresh stamp is older than ~24h (or missing), arm a catch-up run
+        soon after boot instead of waiting for the next 23:00 slot. Does not
+        clobber an existing future next_run (manual edit / already scheduled).
+
+        The 24h threshold is INDEPENDENT of the 7-day UI staleness flag: the UI
+        says "distrust the calendar", the catch-up says "missed yesterday's run".
+        """
+        try:
+            auto = self.db.get_system_automation_by_action('video_refresh_airing_schedules')
+            if not auto or not auto.get('enabled'):
+                return
+            # Don't clobber a run that's about to happen anyway (within 60 min).
+            # A *failed* run still advances next_run by a full day, so a distant
+            # future next_run with a stale stamp means the run was missed or
+            # failed — that is exactly when the catch-up must fire.
+            nr = auto.get('next_run')
+            if nr:
+                try:
+                    nr_dt = datetime.strptime(nr, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                    if 0 < (nr_dt - _utcnow()).total_seconds() <= 3600:
+                        return
+                except (ValueError, TypeError):
+                    pass
+            # Check the stamp age via the video DB
+            try:
+                from api.video import get_video_db
+                freshness = get_video_db().calendar_schedule_freshness()
+            except Exception:   # noqa: BLE001 - video DB unavailable; skip catch-up
+                return
+            age_days = freshness.get('age_days')
+            # None = never refreshed (or unreadable) → catch up. >1.0 = missed
+            # the daily run → catch up. <=1.0 = fresh enough → wait for 23:00.
+            if age_days is not None and age_days <= 1.0:
+                return
+            # Stale (or never refreshed): run soon after boot
+            catchup = _utc_after(300)  # 5 min — off the boot path, before the 01:00 airing run
+            self.db.update_automation(auto['id'], next_run=catchup)
+            logger.info("Airing-schedule refresh is stale (last: %s, age %.1f days); "
+                        "catch-up scheduled in 5 min",
+                        freshness.get('refreshed_at'),
+                        age_days if age_days is not None else -1)
+        except Exception:
+            logger.exception("refresh stale catch-up failed")
+
     # --- Lifecycle ---
 
     def start(self):
@@ -773,7 +989,7 @@ class AutomationEngine:
         self._running = True
         self._event_cache_dirty = True
         self.ensure_system_automations()
-        automations = self.db.get_automations()
+        automations = self.db.get_all_automations()
         scheduled = 0
         event_count = 0
         for auto in automations:
@@ -923,7 +1139,7 @@ class AutomationEngine:
         """Cache which automations listen to which event types."""
         new_cache = {}
         try:
-            all_autos = self.db.get_automations()
+            all_autos = self.db.get_all_automations()
             for auto in all_autos:
                 if not auto.get('enabled'):
                     continue
@@ -966,10 +1182,22 @@ class AutomationEngine:
                 results.append(value in event_value)
             elif operator == 'equals':
                 results.append(value == event_value)
+            elif operator == 'not_equals':
+                results.append(value != event_value)
             elif operator == 'starts_with':
                 results.append(event_value.startswith(value))
+            elif operator == 'ends_with':
+                results.append(event_value.endswith(value))
             elif operator == 'not_contains':
                 results.append(value not in event_value)
+            elif operator in ('greater_than', 'less_than'):
+                # Numeric compare — "failed_tracks greater than 0". Either
+                # side not parsing as a number = no match (never a crash).
+                try:
+                    ev, cv = float(event_value), float(value)
+                    results.append(ev > cv if operator == 'greater_than' else ev < cv)
+                except (TypeError, ValueError):
+                    results.append(False)
             else:
                 results.append(False)
 
@@ -998,6 +1226,8 @@ class AutomationEngine:
         # Inject automation identity for progress tracking
         action_config['_automation_id'] = automation_id
         action_config['_automation_name'] = auto.get('name', '')
+        action_config['_manual_run'] = False
+        action_config['_trigger_tz'] = self._default_tz
         # Merge event data so action handlers can access trigger context
         if event_data:
             action_config['_event_data'] = event_data
@@ -1020,6 +1250,23 @@ class AutomationEngine:
             logger.info(f"Event automation '{auto.get('name')}' delaying {delay_minutes}m before action")
             for remaining in range(delay_seconds, 0, -1):
                 if not self._running:
+                    return
+                # Re-check the pause DURING the wait. The gate at the top of
+                # this method ran before the sleep, so a delayed event
+                # automation would otherwise clear the check and still fire
+                # minutes later, after the user paused the side.
+                if not self.master_enabled(side):
+                    logger.info(
+                        f"Event automation '{auto.get('name')}' abandoned mid-delay — "
+                        f"{side} automations were paused")
+                    if _delay_already_inited and self._progress_finish_fn:
+                        try:
+                            self._progress_finish_fn(
+                                automation_id,
+                                {'status': 'skipped',
+                                 'reason': f'{side} automations are paused'})
+                        except Exception as e:
+                            logger.debug("event progress finish (paused mid-delay): %s", e)
                     return
                 if self._progress_update_fn and remaining % 5 == 0:
                     mins, secs = divmod(remaining, 60)
@@ -1105,15 +1352,17 @@ class AutomationEngine:
             return
 
         auto = self.db.get_automation(automation_id)
-        if not auto or not auto.get('enabled'):
+        if not auto or (not auto.get('enabled') and not skip_delay):
+            # A disabled automation never runs on schedule, but an explicit
+            # manual Run Now (skip_delay=True) always executes it.
             return
 
         # Global per-side pause: a scheduled slot is skipped but the schedule
         # stays alive (_finish_run computes the next natural slot), so flipping
         # the master back on resumes at the normal cadence — no restart, no
         # burst of catch-up runs. Manual run_now (skip_delay=True) bypasses.
+        side = self.automation_side(auto)
         if not skip_delay:
-            side = self.automation_side(auto)
             if not self.master_enabled(side):
                 logger.info(f"Automation '{auto.get('name')}' skipped — {side} automations are paused")
                 self._finish_run(auto, automation_id,
@@ -1136,7 +1385,12 @@ class AutomationEngine:
         handler_info = self._action_handlers.get(action_type)
         if not handler_info:
             logger.warning(f"No handler for action '{action_type}' on automation {automation_id}")
-            self.db.update_automation_run(automation_id, error=f"No handler for action: {action_type}")
+            # H18: an unknown action is not "done" — go through _finish_run so
+            # the error is recorded AND the timer is re-armed. Returning here
+            # dropped the schedule silently.
+            self._finish_run(auto, automation_id,
+                             {'status': 'error', 'error': f'No handler for action: {action_type}'},
+                             error=f"No handler for action: {action_type}")
             return
 
         try:
@@ -1147,6 +1401,8 @@ class AutomationEngine:
         # Inject automation identity for progress tracking
         action_config['_automation_id'] = automation_id
         action_config['_automation_name'] = auto.get('name', '')
+        action_config['_manual_run'] = bool(skip_delay)
+        action_config['_trigger_tz'] = self._default_tz
         if profile_id is not None:
             action_config['_profile_id'] = profile_id
         # The profile this run acts AS: an explicit trigger profile, else the
@@ -1171,6 +1427,24 @@ class AutomationEngine:
             logger.info(f"Automation '{auto['name']}' delaying {delay_minutes}m before action")
             for remaining in range(delay_seconds, 0, -1):
                 if not self._running:
+                    return
+                # Re-check the pause DURING the wait, not only before it. The
+                # gate above runs before this sleep, so an automation with a
+                # configured delay would otherwise clear the check at 00:30,
+                # sleep, and still fire at 01:00 despite being paused at 00:35
+                # — the user watches it start while the page says "Paused".
+                if not self.master_enabled(side):
+                    result = {'status': 'skipped',
+                              'reason': f'{side} automations are paused'}
+                    logger.info(
+                        f"Automation '{auto.get('name')}' abandoned mid-delay — "
+                        f"{side} automations were paused")
+                    if _delay_already_inited and self._progress_finish_fn:
+                        try:
+                            self._progress_finish_fn(automation_id, result)
+                        except Exception as e:
+                            logger.debug("scheduled progress finish (paused mid-delay): %s", e)
+                    self._finish_run(auto, automation_id, result, error=None)
                     return
                 if self._progress_update_fn and remaining % 5 == 0:
                     mins, secs = divmod(remaining, 60)
@@ -1314,11 +1588,30 @@ class AutomationEngine:
         multipliers = {'minutes': 60, 'hours': 3600, 'days': 86400}
         return max(int(interval), 1) * multipliers.get(unit, 3600)
 
+    # an interval automation whose slot passed while the app was down (or
+    # while it sat disabled) runs soon after it is armed again, not a full
+    # interval later. before this a past next_run fell through to the full
+    # interval, so a weekly automation on an install that restarts more
+    # often than weekly never ran at all. system rows were always caught
+    # up by ensure_system_automations; this is the same treatment for the
+    # rows users make. the id spreads a startup burst over a few minutes.
+    _OVERDUE_CATCHUP_SECONDS = 120
+    _OVERDUE_STAGGER_SECONDS = 20
+    _OVERDUE_STAGGER_SLOTS = 6
+
+    def _overdue_catchup_seconds(self, automation_id) -> int:
+        try:
+            slot = int(automation_id) % self._OVERDUE_STAGGER_SLOTS
+        except (TypeError, ValueError):
+            slot = 0
+        return self._OVERDUE_CATCHUP_SECONDS + slot * self._OVERDUE_STAGGER_SECONDS
+
     def _setup_schedule_trigger(self, automation_id, config):
         """Config: {"interval": 6, "unit": "hours"}"""
         delay = self._calc_delay_seconds(config)
 
-        # If there's a next_run in the future, use remaining time instead
+        # If there's a next_run in the future, use remaining time instead.
+        # a next_run in the past is a missed slot: catch up soon.
         auto = self.db.get_automation(automation_id)
         if auto and auto.get('next_run'):
             try:
@@ -1326,6 +1619,12 @@ class AutomationEngine:
                 remaining = (next_run - _utcnow()).total_seconds()
                 if remaining > 0:
                     delay = remaining
+                else:
+                    # never later than the interval itself (a 1-minute automation
+                    # is not "caught up" by a 2-minute wait)
+                    delay = min(self._overdue_catchup_seconds(automation_id), delay)
+                    logger.info(f"Automation {automation_id} missed its slot by {-remaining/3600:.1f}h, "
+                                f"running in {delay}s instead of a full interval")
             except (ValueError, TypeError):
                 pass
 
@@ -1456,12 +1755,28 @@ class AutomationEngine:
             try:
                 t = item.get('type', '')
                 c = item.get('config', {})
+                # Per-step conditions — "only ping Discord when status is
+                # error". Absent conditions = always run (every pre-existing
+                # automation). Evaluated against the same variable set the
+                # step's templates see, so anything usable in a message is
+                # usable as a filter.
+                step_conditions = item.get('conditions') or c.get('conditions')
+                if step_conditions:
+                    gate = {'conditions': step_conditions,
+                            'match': item.get('match') or c.get('match', 'all')}
+                    if not self._evaluate_conditions(gate, variables):
+                        logger.debug("Then-action '%s' skipped by its conditions", t)
+                        continue
                 if t == 'discord_webhook':
                     self._send_discord_notification(c, variables)
                 elif t == 'pushbullet':
                     self._send_pushbullet_notification(c, variables)
                 elif t == 'telegram':
                     self._send_telegram_notification(c, variables)
+                elif t == 'ntfy':
+                    self._send_ntfy_notification(c, variables)
+                elif t == 'gotify':
+                    self._send_gotify_notification(c, variables)
                 elif t == 'webhook':
                     self._send_webhook(c, variables)
                 elif t == 'fire_signal':
@@ -1612,6 +1927,97 @@ class AutomationEngine:
         if not data.get('ok'):
             raise RuntimeError(f"Telegram returned {resp.status_code}: {resp.text[:200]}")
 
+    @staticmethod
+    def _fill(text, variables):
+        """Substitute {name} tags. Shared so a new channel cannot quietly
+        invent its own slightly different templating."""
+        for key, value in variables.items():
+            text = text.replace('{' + key + '}', value)
+        return text
+
+    def _send_ntfy_notification(self, config, variables):
+        """Publish to an ntfy topic.
+
+        Self-hosted by most people who use it, so the server is configurable and
+        only DEFAULTS to ntfy.sh. Auth is optional because a private topic on
+        your own box usually has none; a token wins over user/pass when both are
+        filled in, which is the order ntfy itself resolves them.
+
+        Sent as JSON to the server root rather than as POST /<topic> with header
+        metadata: the header form has to ASCII-encode the title, so an album
+        with an accent in its name arrives mangled.
+        """
+        server = (config.get('server') or 'https://ntfy.sh').strip().rstrip('/')
+        topic = (config.get('topic') or '').strip().lstrip('/')
+        if not topic:
+            raise ValueError("An ntfy topic is required")
+        if not server.startswith(('http://', 'https://')):
+            server = 'https://' + server
+
+        payload = {
+            'topic': topic,
+            'title': self._fill(config.get('title', '{name}'), variables),
+            'message': self._fill(
+                config.get('message', 'Completed with status: {status}'), variables),
+        }
+        try:
+            priority = int(config.get('priority') or 3)
+            payload['priority'] = max(1, min(5, priority))
+        except (TypeError, ValueError):
+            pass    # ntfy's own default (3) is fine
+        tags = (config.get('tags') or '').strip()
+        if tags:
+            payload['tags'] = [t.strip() for t in tags.split(',') if t.strip()]
+        click = (config.get('click') or '').strip()
+        if click:
+            payload['click'] = self._fill(click, variables)
+
+        headers = {}
+        token = (config.get('token') or '').strip()
+        username = (config.get('username') or '').strip()
+        password = config.get('password') or ''
+        auth = None
+        if token:
+            headers['Authorization'] = f'Bearer {token}'
+        elif username:
+            auth = (username, password)
+
+        resp = requests.post(server, json=payload, headers=headers, auth=auth, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"ntfy returned {resp.status_code}: {resp.text[:200]}")
+
+    def _send_gotify_notification(self, config, variables):
+        """Send a message to a Gotify server.
+
+        The token is an APPLICATION token, not a client one, and it goes in the
+        query string because that is the only place Gotify's /message endpoint
+        reads it. Priority is 0-10 here, not ntfy's 1-5 - the two look alike and
+        are not, so they get separate clamps rather than one shared field.
+        """
+        server = (config.get('server') or '').strip().rstrip('/')
+        token = (config.get('token') or '').strip()
+        if not server:
+            raise ValueError("A Gotify server URL is required")
+        if not token:
+            raise ValueError("A Gotify application token is required")
+        if not server.startswith(('http://', 'https://')):
+            server = 'http://' + server
+
+        payload = {
+            'title': self._fill(config.get('title', '{name}'), variables),
+            'message': self._fill(
+                config.get('message', 'Completed with status: {status}'), variables),
+        }
+        try:
+            payload['priority'] = max(0, min(10, int(config.get('priority') or 5)))
+        except (TypeError, ValueError):
+            payload['priority'] = 5
+
+        resp = requests.post(f'{server}/message', params={'token': token},
+                             json=payload, timeout=10)
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gotify returned {resp.status_code}: {resp.text[:200]}")
+
     def _send_webhook(self, config, variables):
         """Send a POST request to a user-configured webhook URL with JSON payload."""
         url = config.get('url', '').strip()
@@ -1631,6 +2037,31 @@ class AutomationEngine:
                         value = value.replace('{' + vk + '}', vv)
                     headers[key.strip()] = value.strip()
 
+        # Custom payload template — the "works with anything" mode. The user
+        # writes the exact body (JSON for gotify/ntfy/Slack/Home Assistant, or
+        # any raw text) with {variable} tags. JSON substitution escapes each
+        # value so a title containing quotes can't break the document. A
+        # template that fails to produce anything sendable falls back to the
+        # default payload below — a bad template must degrade, never drop the
+        # notification.
+        template = (config.get('payload_template') or '').strip()
+        if template:
+            try:
+                body, is_json = self._render_webhook_template(template, variables)
+                if is_json:
+                    resp = requests.post(url, json=body, headers=headers, timeout=15)
+                else:
+                    if headers.get('Content-Type') == 'application/json':
+                        headers['Content-Type'] = 'text/plain; charset=utf-8'
+                    resp = requests.post(url, data=body.encode('utf-8'), headers=headers, timeout=15)
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"Webhook returned {resp.status_code}: {resp.text[:200]}")
+                return
+            except RuntimeError:
+                raise                       # HTTP failure is real — surface it
+            except Exception as e:          # template itself broke → default body
+                logger.warning("Webhook payload template failed (%s) — sending default payload", e)
+
         # Build JSON payload with all variables
         payload = dict(variables)
 
@@ -1644,3 +2075,22 @@ class AutomationEngine:
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if resp.status_code >= 400:
             raise RuntimeError(f"Webhook returned {resp.status_code}: {resp.text[:200]}")
+
+    @staticmethod
+    def _render_webhook_template(template, variables):
+        """Render a payload template. Returns ``(body, is_json)``.
+
+        JSON-first: substitute each {var} with its JSON-ESCAPED value and try
+        to parse — valid JSON posts as JSON. Anything unparseable posts as raw
+        text with plain substitution (ntfy's plain-text bodies, form-ish
+        payloads, whatever the receiver wants)."""
+        json_sub = template
+        for k, v in variables.items():
+            json_sub = json_sub.replace('{' + k + '}', json.dumps(str(v))[1:-1])
+        try:
+            return json.loads(json_sub), True
+        except (json.JSONDecodeError, ValueError):
+            plain = template
+            for k, v in variables.items():
+                plain = plain.replace('{' + k + '}', str(v))
+            return plain, False

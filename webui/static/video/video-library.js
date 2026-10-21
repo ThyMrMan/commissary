@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Library page (isolated).
+ * SoulSync — Video Library page (isolated).
  *
  * Reuses the music library's look + paging model: server-side search / A–Z /
  * sort / owned-wanted filter / pagination (75 per page) via /api/video/library,
@@ -13,22 +13,17 @@
     var LIBRARY_URL = '/api/video/library';
     var LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
 
-    // state.tab is a per-LIBRARY tab key (e.g. 'movies:3'), not just a kind —
-    // multiple tabs can share a kind (Movies + Anime Movies both 'movie').
-    // state.libs maps every rendered tab key -> its {kind (plural, the API
-    // param), kindSingular, rootFolderId, label}, (re)built by buildTabs().
-    var state = { tab: '', libs: {}, search: '', letter: 'all', sort: 'title',
-                  status: 'all', airStatus: '', genre: '', resolution: '', page: 1, limit: 75, loaded: false,
+    var state = { tab: 'movies', search: '', letter: 'all', sort: 'title',
+                  status: 'all', genre: '', resolution: '', page: 1, limit: 75, loaded: false,
                   // Bulk select mode: id→true map (persists across pages), the
                   // open action popover, and the running-job poll timer.
                   selecting: false, selected: {}, bulkPop: null, bulkTimer: null };
     var searchTimer = null;
 
     function toast(msg, type) { if (typeof showToast === 'function') showToast(msg, type); }
-    function activeLib() {
-        return state.libs[state.tab] || { kind: 'movies', kindSingular: 'movie', rootFolderId: null, label: 'Movies' };
+    function cardKind() {
+        return state.tab === 'movies' ? 'movie' : state.tab === 'shows' ? 'show' : 'channel';
     }
-    function cardKind() { return activeLib().kindSingular; }
     function selCount() { return Object.keys(state.selected).length; }
 
     function $(sel) { return document.querySelector(sel); }
@@ -229,7 +224,8 @@
         var lbl = $('[data-video-lib-count-label]');
         if (c) c.textContent = n;
         if (lbl) {
-            var name = activeLib().label || 'Library';
+            var name = state.tab === 'movies' ? 'Movies'
+                : state.tab === 'shows' ? 'Shows' : 'Channels';
             // size-on-disk for the current filtered set, right in the header
             var sz = fmtSize(sizeBytes);
             lbl.textContent = sz ? name + ' · ' + sz : name;
@@ -239,24 +235,24 @@
     function load() {
         state.loaded = true;
         showLoading(true);
-        var lib = activeLib();
-        var kind = lib.kindSingular;
+        var apiKind = state.tab;                                     // query param (plural)
+        var cardKind = apiKind === 'movies' ? 'movie' : apiKind === 'shows' ? 'show' : 'channel';
         var params = new URLSearchParams({
-            kind: lib.kind, search: state.search, letter: state.letter, sort: state.sort,
+            kind: apiKind, search: state.search, letter: state.letter, sort: state.sort,
             status: state.status, genre: state.genre, page: state.page, limit: state.limit });
-        if (lib.rootFolderId) params.set('root_folder_id', lib.rootFolderId);
-        if (state.resolution && kind === 'movie') params.set('resolution', state.resolution);
-        if (state.airStatus && kind === 'show') params.set('air_status', state.airStatus);
+        if (state.resolution && apiKind === 'movies') params.set('resolution', state.resolution);
+        // Commissary: the picked video Library tab, if any
+        if (typeof CommissaryLibraryTabs !== 'undefined') CommissaryLibraryTabs.apply(params, apiKind);
         fetch(LIBRARY_URL + '?' + params.toString(), { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 showLoading(false);
-                if (!d || d.error) { renderItems([], kind); updatePagination(null); setCount(0); return; }
-                renderItems(d.items || [], kind);
+                if (!d || d.error) { renderItems([], cardKind); updatePagination(null); setCount(0); return; }
+                renderItems(d.items || [], cardKind);
                 updatePagination(d.pagination);
                 setCount(d.pagination ? d.pagination.total_count : 0, d.total_size_bytes);
             })
-            .catch(function () { showLoading(false); renderItems([], kind); updatePagination(null); setCount(0); });
+            .catch(function () { showLoading(false); renderItems([], cardKind); updatePagination(null); setCount(0); });
     }
 
     function reload() { state.page = 1; load(); }
@@ -265,15 +261,9 @@
     // kind (movies/shows differ). Cached per tab; channels have no genres.
     function loadGenres() {
         var sel = $('[data-video-lib-genre]');
-        if (!sel || cardKind() === 'channel' || sel._for === state.tab) return;
+        if (!sel || state.tab === 'channels' || sel._for === state.tab) return;
         var tab = state.tab;
-        // Scope the facet to the SAME Library the listing is showing, or the Anime
-        // tab offers every genre in the whole TV collection and picking one can
-        // come back empty.
-        var lib = activeLib();
-        var q = '/api/video/library/genres?kind=' + lib.kind +
-            (lib.rootFolderId ? '&root_folder_id=' + encodeURIComponent(lib.rootFolderId) : '');
-        fetch(q, { headers: { 'Accept': 'application/json' } })
+        fetch('/api/video/library/genres?kind=' + tab, { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
                 if (!d || state.tab !== tab) return;
@@ -292,17 +282,12 @@
     // that a page reload picking it up is fine.
     function loadResolutions() {
         var sel = $('[data-video-lib-res]');
-        // Keyed by TAB, not a one-shot _loaded flag — the set of resolutions is
-        // per-Library now, so switching tabs has to refetch.
-        if (!sel || sel._for === state.tab) return;
-        var tab = state.tab, lib = activeLib();
-        fetch('/api/video/library/resolutions' +
-              (lib.rootFolderId ? '?root_folder_id=' + encodeURIComponent(lib.rootFolderId) : ''),
-              { headers: { 'Accept': 'application/json' } })
+        if (!sel || sel._loaded) return;
+        fetch('/api/video/library/resolutions', { headers: { 'Accept': 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
-                if (!d || state.tab !== tab) return;
-                sel._for = tab;
+                if (!d) return;
+                sel._loaded = true;
                 sel.innerHTML = '<option value="">Any Quality</option>' +
                     (d.resolutions || []).map(function (x) {
                         return '<option value="' + esc(x) + '"' +
@@ -310,120 +295,6 @@
                     }).join('');
             })
             .catch(function () { /* stays on Any Quality */ });
-    }
-
-    // One tab per configured Library (webui/index.html no longer hardcodes
-    // Movies/Shows — see Settings → Connections → Libraries), plus the fixed
-    // Channels tab. A kind with zero configured Libraries falls back to a
-    // single generic tab (rootFolderId: null → the API returns everything of
-    // that kind, exactly like before Libraries existed).
-    function tabKey(kindPlural, id) { return kindPlural + ':' + (id || 'none'); }
-
-    function buildTabDefs(configured) {
-        var defs = [];
-        function addKind(entries, kindPlural, kindSingular, fallbackLabel) {
-            if (!entries || !entries.length) {
-                defs.push({ key: tabKey(kindPlural, null), kind: kindPlural, kindSingular: kindSingular,
-                            rootFolderId: null, label: fallbackLabel });
-                return;
-            }
-            entries.forEach(function (e) {
-                defs.push({ key: tabKey(kindPlural, e.id), kind: kindPlural, kindSingular: kindSingular,
-                            rootFolderId: e.id, label: e.label || e.server_title });
-            });
-        }
-        addKind(configured.movies, 'movies', 'movie', 'Movies');
-        addKind(configured.tv, 'shows', 'show', 'Shows');
-        defs.push({ key: 'channels', kind: 'channels', kindSingular: 'channel',
-                    rootFolderId: null, label: 'Channels' });
-        return defs;
-    }
-
-    function onTabClick(key) {
-        if (state.tab !== key && state.selecting) {
-            setSelecting(false);   // ids are per-tab — a tab switch clears the pick
-        }
-        state.tab = key;
-        var all = document.querySelectorAll('[data-video-lib-tab]');
-        for (var j = 0; j < all.length; j++) {
-            all[j].classList.toggle('active', all[j].getAttribute('data-video-lib-tab') === key);
-        }
-        var lib = activeLib();
-        var s = $('[data-video-lib-search]');
-        if (s) s.placeholder = 'Search ' + (lib.label || '') + '...';
-        // Channels have no bulk metadata ops, owned/wanted filter or genres.
-        var isCh = lib.kindSingular === 'channel';
-        var selBtn = $('[data-video-lib-select]');
-        if (selBtn) selBtn.style.display = isCh ? 'none' : '';
-        var status = $('[data-video-lib-status]');
-        if (status) {
-            status.style.display = isCh ? 'none' : '';
-            // 'Missing episodes' only means something on shows
-            var miss = status.querySelector('option[value="missing"]');
-            if (miss) miss.hidden = lib.kindSingular !== 'show';
-            if (state.status === 'missing' && lib.kindSingular !== 'show') {
-                state.status = 'all'; status.value = 'all';
-            }
-        }
-        var genreSel = $('[data-video-lib-genre]');
-        if (genreSel) {
-            genreSel.style.display = isCh ? 'none' : '';
-            // movie/show genre sets differ — reset the pick on a tab switch
-            state.genre = ''; genreSel.value = '';
-        }
-        // resolution filter is a movie-file concept
-        var resSel = $('[data-video-lib-res]');
-        if (resSel) {
-            resSel.style.display = lib.kindSingular === 'movie' ? '' : 'none';
-            if (lib.kindSingular !== 'movie' && state.resolution) {
-                state.resolution = ''; resSel.value = '';
-            }
-        }
-        // airing/ended/upcoming is a show-lifecycle concept — movies have no TMDB status
-        var airingSel = $('[data-video-lib-airing]');
-        if (airingSel) {
-            airingSel.hidden = isCh || lib.kindSingular !== 'show';
-            if (lib.kindSingular !== 'show' && state.airStatus) {
-                state.airStatus = ''; airingSel.value = '';
-            }
-        }
-        loadGenres();
-        if (lib.kindSingular === 'movie') loadResolutions();
-        reload();
-    }
-
-    function renderTabButtons(defs) {
-        var host = $('[data-video-lib-tabs]');
-        if (!host) return;
-        host.innerHTML = '';
-        defs.forEach(function (t) {
-            var b = document.createElement('button');
-            b.className = 'video-lib-tab' + (t.key === state.tab ? ' active' : '');
-            b.type = 'button';
-            b.setAttribute('data-video-lib-tab', t.key);
-            b.textContent = t.label;
-            b.addEventListener('click', function () { onTabClick(t.key); });
-            host.appendChild(b);
-        });
-    }
-
-    function buildTabs() {
-        var host = $('[data-video-lib-tabs]');
-        if (!host) return Promise.resolve();
-        return fetch('/api/video/libraries', { headers: { 'Accept': 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                var configured = (d && d.configured) || { movies: [], tv: [] };
-                var defs = buildTabDefs(configured);
-                state.libs = {};
-                defs.forEach(function (t) { state.libs[t.key] = t; });
-                // Keep the current selection across a rebuild when it still exists
-                // (Libraries can change in Settings while this page stays open);
-                // otherwise land on the first tab, same as the old hardcoded default.
-                if (!state.libs[state.tab]) state.tab = defs[0].key;
-                renderTabButtons(defs);
-            })
-            .catch(function () { /* keep whatever tabs are already rendered */ });
     }
 
     // ── Bulk select mode + action bar ────────────────────────────────────────
@@ -695,6 +566,52 @@
                 }));
             });
         }
+        var tabs = document.querySelectorAll('[data-video-lib-tab]');
+        for (var i = 0; i < tabs.length; i++) {
+            (function (tab) {
+                tab.addEventListener('click', function () {
+                    if (state.tab !== tab.getAttribute('data-video-lib-tab') && state.selecting) {
+                        setSelecting(false);   // ids are per-kind — a tab switch clears the pick
+                    }
+                    state.tab = tab.getAttribute('data-video-lib-tab');
+                    var all = document.querySelectorAll('[data-video-lib-tab]');
+                    for (var j = 0; j < all.length; j++) all[j].classList.toggle('active', all[j] === tab);
+                    var s = $('[data-video-lib-search]');
+                    if (s) s.placeholder = 'Search ' + state.tab + '...';
+                    // Channels have no bulk metadata ops, owned/wanted filter or genres.
+                    var isCh = state.tab === 'channels';
+                    var selBtn = $('[data-video-lib-select]');
+                    if (selBtn) selBtn.style.display = isCh ? 'none' : '';
+                    var status = $('[data-video-lib-status]');
+                    if (status) {
+                        status.style.display = isCh ? 'none' : '';
+                        // 'Missing episodes' only means something on shows
+                        var miss = status.querySelector('option[value="missing"]');
+                        if (miss) miss.hidden = state.tab !== 'shows';
+                        if (state.status === 'missing' && state.tab !== 'shows') {
+                            state.status = 'all'; status.value = 'all';
+                        }
+                    }
+                    var genreSel = $('[data-video-lib-genre]');
+                    if (genreSel) {
+                        genreSel.style.display = isCh ? 'none' : '';
+                        // movie/show genre sets differ — reset the pick on a tab switch
+                        state.genre = ''; genreSel.value = '';
+                    }
+                    // resolution filter is a movie-file concept
+                    var resSel = $('[data-video-lib-res]');
+                    if (resSel) {
+                        resSel.style.display = state.tab === 'movies' ? '' : 'none';
+                        if (state.tab !== 'movies' && state.resolution) {
+                            state.resolution = ''; resSel.value = '';
+                        }
+                    }
+                    loadGenres();
+                    if (state.tab === 'movies') loadResolutions();
+                    reload();
+                });
+            })(tabs[i]);
+        }
         var search = $('[data-video-lib-search]');
         if (search) {
             search.addEventListener('input', function () {
@@ -707,8 +624,6 @@
         if (sort) sort.addEventListener('change', function () { state.sort = sort.value; reload(); });
         var status = $('[data-video-lib-status]');
         if (status) status.addEventListener('change', function () { state.status = status.value; reload(); });
-        var airingSel = $('[data-video-lib-airing]');
-        if (airingSel) airingSel.addEventListener('change', function () { state.airStatus = airingSel.value; reload(); });
         var genreSel = $('[data-video-lib-genre]');
         if (genreSel) genreSel.addEventListener('change', function () { state.genre = genreSel.value; reload(); });
         var resSel = $('[data-video-lib-res]');
@@ -766,11 +681,9 @@
     function onPageShown(e) {
         if (!e || e.detail !== PAGE_ID) return;
         checkServer();
-        buildTabs().then(function () {
-            loadGenres();
-            if (cardKind() === 'movie') loadResolutions();
-            if (!state.loaded) load();
-        });
+        loadGenres();
+        if (state.tab === 'movies') loadResolutions();
+        if (!state.loaded) load();
     }
 
     function init() {

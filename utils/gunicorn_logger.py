@@ -1,4 +1,4 @@
-"""Gunicorn logger tweaks for Commissary."""
+"""Gunicorn logger tweaks for SoulSync."""
 
 from __future__ import annotations
 

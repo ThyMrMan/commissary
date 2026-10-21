@@ -1,10 +1,5 @@
 # Typed Metadata Migration Plan
 
-> **Status: shipped.** Kept as design rationale, not as work outstanding.
-> The dataclasses live in [`core/metadata/types.py`](../core/metadata/types.py)
-> (`Album`, `Track`, `Artist`), and the provider registry that produces them is in
-> [`core/metadata/registry.py`](../core/metadata/registry.py).
-
 ## Why
 
 Right now the metadata pipeline has no real contract about the shape
@@ -69,7 +64,7 @@ Each converter is the SINGLE place that knows that provider's wire
 shape. Adding a new provider = adding one classmethod here and
 nothing else needs to change.
 
-`Album.to_context_dict()` returns the canonical dict shape Commissary's
+`Album.to_context_dict()` returns the canonical dict shape SoulSync's
 existing import / download pipelines expect — the bridge between
 typed data and the current dict-passing internal API.
 

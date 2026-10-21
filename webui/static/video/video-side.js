@@ -1,5 +1,5 @@
 /*
- * Commissary — Video side shell controller.
+ * SoulSync — Video side shell controller.
  *
  * ISOLATION CONTRACT: the music side never imports or references anything here.
  * This file is a self-contained IIFE (no globals) wired entirely via
@@ -19,10 +19,9 @@
     // Captured at SCRIPT-EVAL time — before music's router boots (on
     // DOMContentLoaded) and may rewrite an unknown /video-detail/... URL to
     // /dashboard. This is the real path the user reloaded/deep-linked.
-    var BOOT_PATH = window.location.pathname;
+    var BOOT_PATH = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
 
     var SIDE_KEY = 'soulsync_side';
-    var APP_NAME = 'Commissary';
     var MUSIC_SUBTITLE = 'Music Sync & Manager';
     var VIDEO_SUBTITLE = 'Movies, TV & YouTube';
     var DEFAULT_VIDEO_PAGE = 'video-dashboard';
@@ -124,7 +123,7 @@
     }
 
     function onPopState() {
-        var path = window.location.pathname;
+        var path = (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname);
         var r = parseDetailPath(path);
         if (r) {
             // Synced to the layer depth stamped on the history entry (handles both
@@ -169,6 +168,7 @@
         { id: 'video-requests', label: 'Requests' },
         { id: 'video-calendar', label: 'Calendar' },
         { id: 'video-automations', label: 'Automations' },
+        { id: 'video-chat', label: 'Chat', shared: true },
         { id: 'video-tools', label: 'Tools' },
         { id: 'video-import', label: 'Import' },
         { id: 'video-settings', label: 'Settings' },
@@ -186,7 +186,7 @@
     // reveals the music page; we trigger its loader once shown. Help & Docs is the
     // same docs page as the music side (it'll host video + music docs together);
     // Settings is the shared, per-side-filtered settings page.
-    var SHARED_PAGES = { 'video-settings': 'settings', 'video-help': 'help' };
+    var SHARED_PAGES = { 'video-settings': 'settings', 'video-help': 'help', 'video-chat': 'chat' };
 
     function readSide() {
         try {
@@ -254,7 +254,6 @@
         // Drives the CSS that reveals shared music pages (e.g. Settings) and
         // hides the video host for them.
         document.body.setAttribute('data-video-page', meta.id);
-        updateTitle();
 
         var sharedMusicId = SHARED_PAGES[meta.id];
         if (sharedMusicId) {
@@ -309,17 +308,54 @@
         var ap = cp.allowed_pages;
         return !ap || ap.indexOf(pageId) > -1;
     }
+    // Hand off to the unified React downloads page with its video view
+    // preselected. Downloads is a shared page: the shell stays on the
+    // video side and only the page's media tab is set — no side flip.
+    // Routes in-app, no full reload. mode 'replace' (boot / deep link)
+    // must not leave /video-downloads in history, or Back would bounce
+    // straight back into this redirect.
+    function gotoUnifiedDownloads(mode) {
+        _backStack = [];
+        setActiveNav('video-downloads');
+        // Reveal wiring, same mechanism showPage() drives for the legacy
+        // shared pages: the attribute keys the video-side.css rules that
+        // show #webui-react-root and hide the video host. Without it the
+        // blanket video-side rule keeps the React root display:none and
+        // the routed page renders invisibly under the stale video page.
+        document.body.setAttribute('data-video-page', 'video-downloads');
+        var replace = mode === 'replace' || mode === 'restore';
+        try {
+            var wsr = window.SoulSyncWebRouter;
+            if (wsr && typeof wsr.navigateToPage === 'function') {
+                wsr.navigateToPage('active-downloads', { query: { media: 'video' }, replace: replace });
+                // No side flip here (there was one, in #1651): flipping is
+                // what stranded the side toggle — the toggle resumes the
+                // active-marked page, which is this hand-off, so every
+                // Video click re-ran it and bounced straight back to music
+                // with no way out.
+                return;
+            }
+        } catch (e) { /* fall through to a real redirect */ }
+        try { window.location.assign('/active-downloads?media=video'); }
+        catch (e2) { window.location.href = '/active-downloads?media=video'; }
+    }
+
     function navigate(pageId, mode) {
         // Music-only profile: there is no video page to fall back to — punt the
         // whole navigation back to the music side instead.
         if (!sideAllowed('video')) { switchSide('music', { force: true }); return; }
         if (!videoPageAllowed(pageId)) { pageId = DEFAULT_VIDEO_PAGE; mode = 'replace'; }
+        // The music + video downloads pages are unified into the React
+        // /active-downloads page — the old video shell subpage is gone, so
+        // every in-shell navigation (sidebar, goto links) and every
+        // /video-downloads deep link lands on the unified page's video view.
+        if (pageId === 'video-downloads') { gotoUnifiedDownloads(mode); return; }
         setActiveNav(pageId);
         showPage(pageId);
         if (DETAIL_PAGES[pageId] || mode === 'restore') return;
         var path = buildPagePath(pageId);
         try {
-            if (mode === 'replace' || window.location.pathname === path) {
+            if (mode === 'replace' || (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) === path) {
                 history.replaceState({ videoPage: pageId }, '', path);
             } else {
                 history.pushState({ videoPage: pageId }, '', path);
@@ -327,87 +363,12 @@
         } catch (e) { /* ignore */ }
     }
 
-    // ── Tab title ────────────────────────────────────────────────────────────
-    // "<Page> · Commissary - <side subtitle>". Page first, so a truncated tab
-    // still says WHICH page; the side subtitle then separates the ten names that
-    // exist on BOTH sides (Library, Search, Downloads, Watchlist…). With no page
-    // known yet it falls back to the bare app title, which is byte-identical to
-    // index.html's static <title> — so a music boot never flashes.
-    //
-    // Labels are read out of the sidebar itself rather than a table here, so
-    // renaming a nav item renames its tab title with no second edit.
-    function navTextFor(sel) {
-        var a = document.querySelector(sel);
-        var t = a && a.querySelector('.nav-text');
-        return t ? (t.textContent || '').trim() : '';
-    }
-    function musicPageLabel() {
-        // Read the DOM the observer just saw change, NOT location.pathname:
-        // setActivePageChrome() stamps aria-current before TanStack has swapped
-        // the URL, so deriving from the path leaves every title one page stale.
-        //
-        // Drill-ins come first — they have no nav entry of their own (the sidebar
-        // deliberately stays anchored on Library), and showLegacyPage() marks the
-        // page .active before the chrome update, so this is already correct here.
-        var ad = document.querySelector('#artist-detail-page.active');
-        if (ad) {
-            var an = ad.querySelector('.artist-name');
-            return (an && (an.textContent || '').trim()) || 'Artist';
-        }
-        var ld = document.querySelector('#label-detail-page.active');
-        if (ld) {
-            var ln = ld.querySelector('.label-detail-name');
-            return (ln && (ln.textContent || '').trim()) || 'Label';
-        }
-        return navTextFor('.sidebar-nav:not(.video-nav) .nav-button[aria-current="page"]');
-    }
-    function videoPageLabel() {
-        var vp = document.body.getAttribute('data-video-page');
-        if (!vp) return '';
-        if (DETAIL_PAGES[vp]) return detailTitleOf(vp) || pageMeta(vp).label;
-        return pageMeta(vp).label || '';
-    }
-    function updateTitle() {
-        var side = document.body.getAttribute('data-side') === 'video' ? 'video' : 'music';
-        var base = APP_NAME + ' - ' + (side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE);
-        var label = '';
-        try { label = side === 'video' ? videoPageLabel() : musicPageLabel(); } catch (e) { label = ''; }
-        var next = label ? (label + ' · ' + base) : base;
-        if (document.title !== next) document.title = next;
-    }
-
-    // The music side never calls in here (isolation contract), so watch its DOM
-    // instead: setActivePageChrome() stamps aria-current on the active nav button
-    // on every music navigation, React routes included. Detail names arrive after
-    // their fetch, so the four title nodes are watched for text too.
-    function watchForTitleChanges() {
-        var nav = document.querySelector('.sidebar-nav:not(.video-nav)');
-        if (nav) {
-            new MutationObserver(updateTitle).observe(nav, {
-                attributes: true, subtree: true, attributeFilter: ['aria-current'] });
-        }
-        var names = ['#artist-detail-page .artist-name', '#label-detail-page .label-detail-name',
-            '[data-video-detail] [data-vd-title]', '[data-video-person] [data-vp-name]',
-            '[data-video-studio] [data-vst-name]'];
-        for (var i = 0; i < names.length; i++) {
-            var nodes = document.querySelectorAll(names[i]);
-            for (var j = 0; j < nodes.length; j++) {
-                new MutationObserver(updateTitle).observe(nodes[j], {
-                    childList: true, characterData: true, subtree: true });
-            }
-        }
-        window.addEventListener('popstate', updateTitle);
-    }
-
     // Flip the shell chrome to a side (data-side drives the CSS). Does NOT navigate
     // — callers decide which page to show and whether to push a URL.
     function applySide(side) {
         document.body.setAttribute('data-side', side);
-        var sub = side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE;
         var subtitle = document.querySelector('.sidebar-header .app-subtitle');
-        if (subtitle) subtitle.textContent = sub;
-        // The tab/window title tracks the side as well as the page (see updateTitle).
-        updateTitle();
+        if (subtitle) subtitle.textContent = side === 'video' ? VIDEO_SUBTITLE : MUSIC_SUBTITLE;
         var toggleButtons = document.querySelectorAll('.side-toggle-btn');
         for (var i = 0; i < toggleButtons.length; i++) {
             toggleButtons[i].classList.toggle(
@@ -430,7 +391,7 @@
             // Land on the last-active video page and give it a real URL.
             var active = document.querySelector('.video-nav .nav-button.active');
             navigate(active ? active.getAttribute('data-video-page') : DEFAULT_VIDEO_PAGE);
-        } else if (parseDetailPath(window.location.pathname) || parsePagePath(window.location.pathname)) {
+        } else if (parseDetailPath((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname)) || parsePagePath((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname))) {
             // Back to music from a video URL → drop it so a reload stays on music.
             try { history.replaceState(null, '', '/'); } catch (e) { /* ignore */ }
         }
@@ -513,7 +474,7 @@
                 var state = { videoDetail: { kind: d.kind, id: d.id, source: d.source || 'library',
                                              layer: _backStack.length } };
                 var path = buildDetailPath(d.source, d.kind, d.id);
-                if (window.location.pathname !== path) history.pushState(state, '', path);
+                if ((window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== path) history.pushState(state, '', path);
                 else history.replaceState(state, '', path);
             }
             updateBackLabels();
@@ -539,9 +500,6 @@
             '.video-nav .nav-button[data-video-page="' + DEFAULT_VIDEO_PAGE + '"]');
         if (defaultNav) defaultNav.classList.add('active');
 
-        // Attach before the first applySide() so nothing is missed.
-        watchForTitleChanges();
-
         var bootSide = (bootDetail || bootPage) ? 'video' : readSide();
         // Side access: if the profile is already known at boot (fast path),
         // land straight on the allowed side. When the profile loads later, the
@@ -562,7 +520,7 @@
             var reassertPage = function () {
                 if (bootPage && document.body.getAttribute('data-side') === 'video' &&
                     !DETAIL_PAGES[document.body.getAttribute('data-video-page')] &&
-                    window.location.pathname !== pagePath) {
+                    (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== pagePath) {
                     try { history.replaceState({ videoPage: initialPage }, '', pagePath); } catch (e) { /* ignore */ }
                 }
             };
@@ -585,7 +543,7 @@
                 // late async music redirect can't strand us on /dashboard) — never
                 // fights real navigation away.
                 if (DETAIL_PAGES[document.body.getAttribute('data-video-page')] &&
-                    window.location.pathname !== bootPath) {
+                    (window.SoulSyncURL?.strip(window.location.pathname) ?? window.location.pathname) !== bootPath) {
                     try { history.replaceState({ videoDetail: bootDetail }, '', bootPath); } catch (e) { /* ignore */ }
                 }
             };

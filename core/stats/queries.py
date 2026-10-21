@@ -13,24 +13,31 @@ import logging
 import threading
 import time
 import traceback
+from datetime import date, timedelta
 from typing import Any, Callable, Optional
+
+from core.listening_scope import listening_owner, owner_clause, owner_key, play_duration_sql
 
 logger = logging.getLogger(__name__)
 
 ImageUrlFixer = Callable[[Optional[str]], Optional[str]]
 
 
-def get_cached_stats(database, image_url_fixer: ImageUrlFixer, time_range: str) -> dict:
-    """Read pre-computed stats cache for a time range. Instant response."""
+def get_cached_stats(database, image_url_fixer: ImageUrlFixer, time_range: str,
+                     profile_id: Optional[int] = None) -> dict:
+    """Read pre-computed stats cache for a time range. Instant response.
+
+    the cache for the pile profile_id reads (#1293)."""
+    owner = listening_owner(database, profile_id)
     conn = database._get_connection()
     try:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT value FROM metadata WHERE key = ?", (f'stats_cache_{time_range}',))
+        cursor.execute("SELECT value FROM metadata WHERE key = ?", (owner_key(f'stats_cache_{time_range}', owner),))
         row = cursor.fetchone()
         data = json.loads(row[0]) if row and row[0] else {}
 
-        cursor.execute("SELECT value FROM metadata WHERE key = 'stats_cache_recent'")
+        cursor.execute("SELECT value FROM metadata WHERE key = ?", (owner_key('stats_cache_recent', owner),))
         row = cursor.fetchone()
         recent = json.loads(row[0]) if row and row[0] else []
 
@@ -52,14 +59,114 @@ def get_cached_stats(database, image_url_fixer: ImageUrlFixer, time_range: str) 
     }
 
 
-def get_overview(database, time_range: str) -> dict:
+def get_year_in_listening(database, image_url_fixer: ImageUrlFixer,
+                          profile_id: Optional[int] = None) -> dict:
+    """The Year in Listening story — cached by the worker, computed on miss.
+
+    The miss path is the one that matters: the worker rebuilds every 30
+    minutes, so a fresh install (or one restarted five minutes ago) has no
+    cache yet. Serving an empty year there would look exactly like "you have
+    not listened to anything", which is the wrong answer and unrecoverable
+    from the user's side. Computing it costs one pass over listening_history.
+    """
+    data = None
+    owner = listening_owner(database, profile_id)
+    conn = database._get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM metadata WHERE key = ?", (owner_key('stats_cache_year', owner),))
+        row = cursor.fetchone()
+        if row and row[0]:
+            data = json.loads(row[0])
+    except Exception as e:
+        logger.debug("year cache read failed, computing live: %s", e)
+    finally:
+        conn.close()
+
+    if not data:
+        data = database.get_year_in_listening(profile_id=owner)
+        # The cached copy was enriched by the worker; a live one has to earn
+        # its artwork here or the story renders name-only on exactly the
+        # installs that hit this path.
+        try:
+            from core.stats.enrich import enrich_stats_items
+            enrich_stats_items(database, data)
+        except Exception as e:
+            logger.debug("year enrichment failed, serving unenriched: %s", e)
+        data['cached'] = False
+    else:
+        data['cached'] = True
+
+    for item in ((data.get('top_artists') or []) + (data.get('top_albums') or [])
+                 + (data.get('top_tracks') or []) + (data.get('discoveries') or [])):
+        if item.get('image_url'):
+            item['image_url'] = image_url_fixer(item['image_url'])
+
+    return data
+
+
+def get_album_play_tracks(database, album_id, image_url_fixer: ImageUrlFixer) -> list[dict]:
+    """An owned album's tracks, shaped for ``window.playTrackList``.
+
+    Rows match what ``/api/library/radio`` returns because that is the shape
+    ``npMapRadioTrack`` (media-player.js) maps — anything else silently drops
+    out of the queue.
+
+    Tracks with no ``file_path`` are EXCLUDED here rather than filtered in the
+    player: a row the player would skip is not a track you own, and counting
+    it would make "play album" look like it lost songs. Ordered by track
+    number so the album plays as an album.
+    """
+    conn = None
+    try:
+        conn = database._get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT t.id, t.title, ar.name, al.title, t.file_path, t.bitrate,
+                   t.artist_id, t.album_id, al.thumb_url
+            FROM tracks t
+            JOIN albums al ON al.id = t.album_id
+            JOIN artists ar ON ar.id = t.artist_id
+            WHERE t.album_id = ?
+              AND t.file_path IS NOT NULL AND t.file_path != ''
+            ORDER BY COALESCE(t.track_number, 999999), t.title
+            """,
+            (album_id,),
+        )
+        rows = cursor.fetchall()
+    except Exception as e:
+        logger.error("Error loading album tracks for %s: %s", album_id, e)
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+    return [
+        {
+            'id': r[0],
+            'title': r[1],
+            'artist': r[2],
+            'album': r[3],
+            'file_path': r[4],
+            'bitrate': r[5],
+            'artist_id': r[6],
+            'album_id': r[7],
+            'image_url': image_url_fixer(r[8]) if r[8] else None,
+        }
+        for r in rows
+    ]
+
+
+def get_overview(database, time_range: str, profile_id: Optional[int] = None) -> dict:
     """Aggregate listening stats for a time range."""
-    return database.get_listening_stats(time_range)
+    return database.get_listening_stats(time_range, profile_id=profile_id)
 
 
-def get_top_artists(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int) -> list[dict]:
+def get_top_artists(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int,
+                    profile_id: Optional[int] = None) -> list[dict]:
     """Top artists by play count, enriched with image / Last.fm stats / soul_id."""
-    artists = database.get_top_artists(time_range, limit)
+    artists = database.get_top_artists(time_range, limit, profile_id=profile_id)
 
     for artist in artists:
         try:
@@ -90,9 +197,10 @@ def get_top_artists(database, image_url_fixer: ImageUrlFixer, time_range: str, l
     return artists
 
 
-def get_top_albums(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int) -> list[dict]:
+def get_top_albums(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int,
+                   profile_id: Optional[int] = None) -> list[dict]:
     """Top albums by play count, enriched with album thumb."""
-    albums = database.get_top_albums(time_range, limit)
+    albums = database.get_top_albums(time_range, limit, profile_id=profile_id)
 
     for album in albums:
         try:
@@ -120,9 +228,10 @@ def get_top_albums(database, image_url_fixer: ImageUrlFixer, time_range: str, li
     return albums
 
 
-def get_top_tracks(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int) -> list[dict]:
+def get_top_tracks(database, image_url_fixer: ImageUrlFixer, time_range: str, limit: int,
+                   profile_id: Optional[int] = None) -> list[dict]:
     """Top tracks by play count, enriched with album thumb."""
-    tracks = database.get_top_tracks(time_range, limit)
+    tracks = database.get_top_tracks(time_range, limit, profile_id=profile_id)
 
     for track in tracks:
         try:
@@ -152,14 +261,14 @@ def get_top_tracks(database, image_url_fixer: ImageUrlFixer, time_range: str, li
     return tracks
 
 
-def get_timeline(database, time_range: str, granularity: str) -> Any:
+def get_timeline(database, time_range: str, granularity: str, profile_id: Optional[int] = None) -> Any:
     """Play count per time period for chart rendering."""
-    return database.get_listening_timeline(time_range, granularity)
+    return database.get_listening_timeline(time_range, granularity, profile_id=profile_id)
 
 
-def get_genres(database, time_range: str) -> Any:
+def get_genres(database, time_range: str, profile_id: Optional[int] = None) -> Any:
     """Genre distribution by play count."""
-    return database.get_genre_breakdown(time_range)
+    return database.get_genre_breakdown(time_range, profile_id=profile_id)
 
 
 def get_library_health(database) -> dict:
@@ -178,21 +287,38 @@ def get_library_disk_usage(database) -> dict:
     Backed by `tracks.file_size` populated during the deep scan from
     media-server-reported sizes (Plex MediaPart.size, Jellyfin
     MediaSources[].Size, Navidrome <song size="...">,
-    Commissary standalone os.path.getsize).
+    SoulSync standalone os.path.getsize).
     """
     return database.get_library_disk_usage()
 
 
-def get_recent_tracks(database, limit: int) -> list[dict]:
-    """Recently played tracks from listening_history."""
+def get_recent_tracks(database, limit: int, image_url_fixer: Optional[ImageUrlFixer] = None,
+                      profile_id: Optional[int] = None) -> list[dict]:
+    """Recently played tracks from listening_history.
+
+    Joins album art through db_track_id when the play was matched to a
+    library track (the listening-stats worker sets it; media-server plays it
+    couldn't match leave it NULL, and those rows come back with image_url
+    None). Art passes through ``image_url_fixer`` because server-synced thumb
+    URLs need auth and die in the browser — same treatment as resolve_track.
+    """
+    scope = owner_clause(listening_owner(database, profile_id), 'lh')
     conn = database._get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """
-            SELECT title, artist, album, played_at, duration_ms
-            FROM listening_history
-            ORDER BY played_at DESC
+            f"""
+            SELECT lh.title, lh.artist, lh.album, lh.played_at, lh.duration_ms,
+                   lh.server_source, al.thumb_url, t.artist_id
+            FROM listening_history lh
+            -- CAST or no index: tracks.id is TEXT and db_track_id is INTEGER,
+            -- and sqlite converts the COLUMN side of that comparison, so the
+            -- primary key can't be searched and every history row scanned the
+            -- whole tracks table (54 s per dashboard load on 300k tracks)
+            LEFT JOIN tracks t ON t.id = CAST(lh.db_track_id AS TEXT)
+            LEFT JOIN albums al ON al.id = t.album_id
+            WHERE {scope}
+            ORDER BY lh.played_at DESC
             LIMIT ?
             """,
             (limit,),
@@ -208,10 +334,142 @@ def get_recent_tracks(database, limit: int) -> list[dict]:
             'album': row[2],
             'played_at': row[3],
             'duration_ms': row[4],
+            'server_source': row[5],
+            'image_url': (image_url_fixer(row[6]) if image_url_fixer else row[6]) if row[6] else None,
+            # The library artist PK when the play was matched — lets the
+            # dashboard band jump straight to the artist page, no name lookup.
+            'artist_db_id': row[7],
         }
         for row in rows
     ]
 
+
+def get_listening_events(
+    database,
+    image_url_fixer: Optional[ImageUrlFixer],
+    *,
+    time_range: str,
+    filter_type: str,
+    date: Optional[str] = None,
+    weekday: Optional[int] = None,
+    hour: Optional[int] = None,
+    limit: int = 100,
+    profile_id: Optional[int] = None,
+) -> dict:
+    """Listening-history rows behind a clicked stats chart segment."""
+    limit = max(1, min(int(limit or 100), 250))
+    where = database._listening_time_filter(time_range, alias='lh',
+                                            owner=listening_owner(database, profile_id))
+    clauses: list[str] = []
+    params: list[Any] = []
+    title = 'Listening details'
+
+    if filter_type == 'date':
+        if not date:
+            raise ValueError('date is required')
+        if _is_month_bucket(date):
+            clauses.append("lh.played_at >= date(? || '-01')")
+            clauses.append("lh.played_at < date(? || '-01', '+1 month')")
+            params.extend([date, date])
+            title = date
+        elif _is_day_bucket(date):
+            clauses.append('lh.played_at >= date(?)')
+            clauses.append("lh.played_at < date(?, '+1 day')")
+            params.extend([date, date])
+            title = date
+        else:
+            raise ValueError('date must be YYYY-MM-DD or YYYY-MM')
+    elif filter_type == 'weekday_hour':
+        if weekday is None or hour is None:
+            raise ValueError('weekday and hour are required')
+        weekday_i = int(weekday)
+        hour_i = int(hour)
+        if not (0 <= weekday_i <= 6 and 0 <= hour_i <= 23):
+            raise ValueError('weekday/hour out of range')
+        # local hours, like the clock it drills into (played_at is utc)
+        clauses.append("CAST(strftime('%w', lh.played_at, 'localtime') AS INTEGER) = ?")
+        clauses.append("CAST(strftime('%H', lh.played_at, 'localtime') AS INTEGER) = ?")
+        params.extend([weekday_i, hour_i])
+        title = f"{['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][weekday_i]} {hour_i:02d}:00"
+    elif filter_type == 'hour':
+        if hour is None:
+            raise ValueError('hour is required')
+        hour_i = int(hour)
+        if not (0 <= hour_i <= 23):
+            raise ValueError('hour out of range')
+        clauses.append("CAST(strftime('%H', lh.played_at, 'localtime') AS INTEGER) = ?")
+        params.append(hour_i)
+        title = f"{hour_i:02d}:00"
+    else:
+        raise ValueError('unsupported filter type')
+
+    if clauses:
+        where = f"{where} AND {' AND '.join(clauses)}"
+
+    conn = database._get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"""
+            WITH picked AS (
+                SELECT lh.id
+                FROM listening_history lh
+                {where}
+                ORDER BY lh.played_at DESC
+                LIMIT ?
+            )
+            SELECT lh.title, lh.artist, lh.album, lh.played_at, lh.duration_ms,
+                   lh.server_source, al.thumb_url, t.artist_id, t.id AS db_track_id
+            FROM picked
+            JOIN listening_history lh ON lh.id = picked.id
+            LEFT JOIN tracks t ON t.id = CAST(lh.db_track_id AS TEXT)
+            LEFT JOIN albums al ON al.id = t.album_id
+            ORDER BY lh.played_at DESC
+            """,
+            params + [limit + 1],
+        )
+        rows = cursor.fetchall()
+        has_more = len(rows) > limit
+        if has_more:
+            rows = rows[:limit]
+        total = len(rows)
+    finally:
+        conn.close()
+
+    image_url_cache: dict[str, Optional[str]] = {}
+
+    def _normalize_event_image(url: str | None) -> str | None:
+        if not url:
+            return None
+        if not image_url_fixer:
+            return url
+        if url not in image_url_cache:
+            image_url_cache[url] = image_url_fixer(url)
+        return image_url_cache[url]
+
+    items = [
+        {
+            'title': row[0],
+            'artist': row[1],
+            'album': row[2],
+            'played_at': row[3],
+            'duration_ms': row[4],
+            'server_source': row[5],
+            'image_url': _normalize_event_image(row[6]),
+            'artist_db_id': row[7],
+            'db_track_id': row[8],
+        }
+        for row in rows
+    ]
+    return {'title': title, 'total': total, 'limit': limit, 'has_more': has_more, 'items': items}
+
+
+def _is_day_bucket(value: str) -> bool:
+    return len(value) == 10 and value[4] == '-' and value[7] == '-'
+
+
+def _is_month_bucket(value: str) -> bool:
+    return len(value) == 7 and value[4] == '-'
 
 def resolve_track(database, image_url_fixer: ImageUrlFixer, title: str, artist: str) -> Optional[dict]:
     """Resolve a track by title+artist to its file_path / metadata. Returns None if not found."""
@@ -285,3 +543,144 @@ def get_listening_status(worker) -> dict:
             'stats': {},
         }
     return worker.get_stats()
+
+
+
+_STREAK_FIRST_WINDOW_DAYS = 64
+
+
+def _listening_streak(cursor, scope: str, today: date) -> int:
+    """consecutive days with a play, counting back from today. a streak stays
+    alive through today when yesterday has plays.
+
+    only reads recent days. it used to pull the date of every play ever made
+    to answer a question about the last few. the window doubles until the
+    streak ends inside it, so a years-long streak still counts in full. the
+    2 day margin covers a played_at with a utc offset, where date() lands a
+    day off the text the index range compares."""
+    window = _STREAK_FIRST_WINDOW_DAYS
+    while True:
+        since = (today - timedelta(days=window + 2)).isoformat()
+        cursor.execute(
+            f"""SELECT DISTINCT date(lh.played_at)
+                FROM listening_history lh
+                WHERE lh.played_at >= ? AND {scope}""",
+            (since,),
+        )
+        play_days = {row[0] for row in cursor.fetchall()}
+        streak = 0
+        day = today
+        if day.isoformat() not in play_days:
+            day -= timedelta(days=1)
+        while day.isoformat() in play_days:
+            streak += 1
+            day -= timedelta(days=1)
+        if day > today - timedelta(days=window):
+            return streak
+        # the streak ran to the window's edge, it may go further back
+        cursor.execute(
+            f"""SELECT 1 FROM listening_history lh
+                WHERE lh.played_at < ? AND {scope} LIMIT 1""",
+            (since,),
+        )
+        if cursor.fetchone() is None:
+            return streak
+        window *= 4
+
+
+def get_weekly_digest(database, profile_id: Optional[int] = None) -> dict:
+    """This-week listening digest for the dashboard banner.
+
+    Trailing 7 days, using the same ``datetime('now', '-7 days')`` window the
+    stats page uses for its 7d range — the banner can never disagree with the
+    stats page about what "this week" means. (played_at is stored as local
+    naive wall-clock; the day buckets below read it as-is, which is the local
+    day the user actually listened.)
+
+    Owner-scoped throughout: a profile only ever sees its own pile.
+
+    Returns totals, the top artist, new discoveries (distinct artists whose
+    first-ever play falls inside the window), the listening streak in days,
+    the ISO date range, and 7 daily hour buckets oldest-first for the banner
+    chart. ``tracks_played`` is 0 when there is nothing to show — the banner
+    renders nothing in that case (the calm-page rule).
+    """
+    owner = listening_owner(database, profile_id)
+    scope = owner_clause(owner, 'lh')
+    window = "lh.played_at >= datetime('now', '-7 days')"
+    # the + keeps sqlite off idx_listening_artist. "artist IS NOT NULL" reads
+    # as a range on that index, so without it sqlite walked every play ever
+    # made through the artist index just to find this week's. 23 s on 150k
+    # plays, 8 ms reading the week off the played_at index instead.
+    artist_present = "+lh.artist IS NOT NULL AND TRIM(lh.artist) <> ''"
+
+    conn = database._get_connection()
+    try:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            f"""SELECT COUNT(*), COALESCE(SUM({play_duration_sql('lh')}), 0)
+                FROM listening_history lh WHERE {window} AND {scope}"""
+        )
+        total_row = cursor.fetchone()
+
+        cursor.execute(
+            f"""SELECT lh.artist, COUNT(*) AS c
+                FROM listening_history lh
+                WHERE {window} AND {scope} AND {artist_present}
+                GROUP BY +lh.artist ORDER BY c DESC, lh.artist ASC LIMIT 1"""
+        )
+        top_row = cursor.fetchone()
+
+        # a discovery is an artist played this week and never before it. take
+        # this week's artists off the played_at index, then ask the artist
+        # index once each whether an older play exists. grouping the whole
+        # history by artist to find each one's first play read every row.
+        cursor.execute(
+            f"""WITH week AS MATERIALIZED (
+                    SELECT lh.artist AS artist FROM listening_history lh
+                    WHERE {window} AND {scope} AND {artist_present}
+                    GROUP BY +lh.artist
+                )
+                SELECT COUNT(*) FROM week
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM listening_history o
+                    WHERE o.artist = week.artist AND {owner_clause(owner, 'o')}
+                      AND +o.played_at < datetime('now', '-7 days')
+                )"""
+        )
+        discoveries = cursor.fetchone()[0] or 0
+
+        cursor.execute(
+            f"""SELECT date(lh.played_at) AS d, COALESCE(SUM({play_duration_sql('lh')}), 0)
+                FROM listening_history lh
+                WHERE {window} AND {scope}
+                GROUP BY d"""
+        )
+        day_ms = {row[0]: row[1] for row in cursor.fetchall()}
+
+        today = date.today()
+        streak = _listening_streak(cursor, scope, today)
+    finally:
+        conn.close()
+
+    daily = []
+    for back in range(6, -1, -1):
+        day = today - timedelta(days=back)
+        key = day.isoformat()
+        daily.append({
+            'date': key,
+            'day': 'mtwtfss'[day.weekday()],
+            'hours': round((day_ms.get(key) or 0) / 3_600_000, 1),
+        })
+
+    return {
+        'tracks_played': total_row[0] or 0,
+        'time_ms': total_row[1] or 0,
+        'top_artist': top_row[0] if top_row else None,
+        'discoveries': discoveries,
+        'streak_days': streak,
+        'start_date': (today - timedelta(days=6)).isoformat(),
+        'end_date': today.isoformat(),
+        'daily': daily,
+    }

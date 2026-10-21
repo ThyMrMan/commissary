@@ -1,4 +1,4 @@
-"""Commissary — VIDEO side API package (isolated).
+"""SoulSync — VIDEO side API package (isolated).
 
 A SEPARATE Flask blueprint from the music API (api_v1). It reads only
 database/video_library.db via VideoDatabase and imports nothing from the music
@@ -25,42 +25,20 @@ _video_db_lock = threading.Lock()
 def get_video_db():
     """Return the shared VideoDatabase instance (created on first use)."""
     global _video_db
-    if _video_db is None:
+    db = _video_db
+    if db is None:
         with _video_db_lock:
-            if _video_db is None:
+            db = _video_db
+            if db is None:
                 from database.video_database import VideoDatabase
-                _video_db = VideoDatabase()
-    return _video_db
-
-
-def acting_profile_id():
-    """The profile making this request, stamped onto rows it creates. None when
-    there is no profile context (background/automation callers), which is exactly
-    what marks a row as nobody's personal wish."""
-    from flask import g
-    try:
-        return int(getattr(g, "profile_id", None))
-    except (TypeError, ValueError):
-        return None
-
-
-def wishlist_owner_filter():
-    """Whose wishlist rows this request is allowed to remove.
-
-    None = no restriction (admin, or a profile with can_download): the shared
-    wishlist is theirs to manage. Otherwise the profile id it is limited to, so a
-    member can take back a title they asked for and nothing else. Lives here
-    rather than in each route file because two copies of this rule is how the
-    TMDB and YouTube wishlists end up disagreeing about who owns what."""
-    from flask import g
-    if bool(getattr(g, "is_admin", getattr(g, "profile_id", 1) == 1)):
-        return None
-    if getattr(g, "can_download", True):
-        return None
-    pid = acting_profile_id()
-    # No profile context and no download rights — own nothing rather than
-    # everything. 0 is never a real profile id, so this matches no rows.
-    return 0 if pid is None else pid
+                db = VideoDatabase()
+                # Anyone installing a handle from outside must hold
+                # _video_db_lock, and an installed handle outranks a lazily
+                # built one — publish only if the slot is still empty, and
+                # yield to an install that beat us to it.
+                if _video_db is None:
+                    _video_db = db
+    return db
 
 
 def create_video_blueprint() -> Blueprint:
@@ -96,7 +74,7 @@ def create_video_blueprint() -> Blueprint:
         # Per-profile side access: a music-only profile gets NOTHING from the
         # video blueprint (its whole UI is hidden for them — any request here is
         # a deep link or a probe). Admins always have both sides.
-        if not is_admin and getattr(g, "allowed_sides", "both") == "music":
+        if not is_admin and getattr(g, "allowed_sides", "both") not in ("video", "both"):
             return jsonify({"error": "Video access is disabled for this profile."}), 403
 
         # Management surfaces + credential/settings-only endpoints — admin for ANY
@@ -104,28 +82,15 @@ def create_video_blueprint() -> Blueprint:
         # only ever hit by the admin-only Settings page).
         admin = _p("/api/video/overlays", "/api/video/import", "/api/video/collections",
                    "/api/video/repair",
-                   "/api/video/server-config", "/api/video/jellyfin",
+                   "/api/video/server-config", "/api/video/jellyfin", "/api/video/libraries",
                    "/api/video/organization", "/api/video/downloads/slskd",
-                   # the indexer inventory is Settings-class data (and indexer
-                   # URLs leaking to the browser was a real bug once)
-                   "/api/video/downloads/indexers",
-                   # the write probe returns filesystem paths and touches the
-                   # disk. /libraries itself is admin only on WRITE (its GET is
-                   # the tab bar), so this needs naming here or it would inherit
-                   # that GET's openness — and non-admins are deliberately not
-                   # shown library paths at all.
-                   "/api/video/libraries/probe",
                    "/api/video/enrichment/config", "/api/video/enrichment/priority",
                    "/api/video/notifications",   # P11: GETs return webhook URLs/bot tokens
                    "/api/video/backups")         # P10: restore/download the whole database
         # Config the Settings page WRITES but content views (download modal / grab)
         # legitimately READ — gate the writes, leave the GETs open.
         if writing:
-            # /libraries GET is the Library page's tab bar + the download
-            # destination picker — content views, not settings. Only the POST
-            # (the Settings editor saving the registry) is admin.
-            admin = admin or _p("/api/video/libraries",
-                                 "/api/video/server", "/api/video/downloads/config",
+            admin = admin or _p("/api/video/server", "/api/video/downloads/config",
                                  "/api/video/downloads/quality",
                                  "/api/video/downloads/youtube-quality",
                                  "/api/video/enrichment")   # all enrichment mutations
@@ -133,65 +98,58 @@ def create_video_blueprint() -> Blueprint:
             # (delete/sync/clear-match/delete-batch) + the download blocklist config. Content
             # views only READ metadata (the detail GET stays open); these MUTATE the library.
             admin = admin or _p("/api/video/bulk", "/api/video/monitor",
-                                 "/api/video/poster/set", "/api/video/downloads/blocklist") \
-                or path.endswith(("/metadata", "/lock", "/refresh-art", "/aka", "/library",
-                                  # "Lock automatic edits" — decides whether the
-                                  # unattended importer may write into a title at
-                                  # all. Same class as the other library-management
-                                  # writes; note it does NOT end with "/lock", so
-                                  # it needs naming here in its own right.
-                                  "/import-lock",
-                                  "/rescan-episodes", "/episode-source",
+                                 # single-episode monitor flip from the calendar
+                                 "/api/video/episode/monitor",
+                                 "/api/video/poster/set", "/api/video/downloads/blocklist",
+                                 # manual "I have this" links — library matching
+                                 # management, same as the overrides below. The
+                                 # GETs (search/status) stay open.
+                                 "/api/video/manual-match",
+                                 # per-movie/per-show subtitle language overrides
+                                 # (Phase 3) — per-title management, same as the
+                                 # acquisition overrides. The GET stays open.
+                                 "/api/video/subtitles/overrides",
+                                 # whisper model download (Phase 4): writes to
+                                 # server disk + pulls ~500MB from the net —
+                                 # admin-only. The status GET stays open.
+                                 "/api/video/subtitles/whisper/download") \
+                or path.endswith(("/metadata", "/lock", "/refresh-art",
+                                  # season-wide monitor flip — same library
+                                  # management as /api/video/monitor above
+                                  "/monitor",
                                   # per-title acquisition settings (P2/P8) — management,
                                   # same as the metadata edits above
                                   "/quality-profile", "/series-type",
+                                  # per-title acquisition overrides (sources,
+                                  # release groups, season packs)
+                                  "/overrides",
                                   # per-show Synchronize — mutates library rows
                                   "/sync"))
         if admin and not is_admin:
             return jsonify({"error": "Admin only."}), 403
 
-        # /watchlist/add is deliberately ABSENT here: a profile without download
-        # rights may follow a show, but the follow is filed awaiting approval
-        # (video_watchlist.approved=0) and no acquisition path acts on it until an
-        # admin clears it. The endpoint itself stamps approved from can_download,
-        # so relaxing the gate here cannot start a download.
-        # /wishlist/add and /youtube/wishlist/add are deliberately ABSENT, same
-        # reasoning as /watchlist/add above: asking for something is not
-        # acquiring it. A member adds a title to the shared wishlist and the
-        # ADMIN's automation (or the admin, by hand) decides whether it is
-        # actually fetched. Blocking the add only meant members had no way to
-        # ask, which is the opposite of the point.
-        #
-        # '/wishlist/clear', '/wishlist/remove' and '/youtube/wishlist/remove' are
-        # deliberately absent too, for a different reason: all three enforce
-        # OWNERSHIP in the route instead. A member can take back the titles they
-        # asked for — one at a time or all at once — without being able to touch
-        # anyone else's (or automation's). Gating the bulk one while leaving the
-        # per-item one open would only have meant more clicks for the same result.
         if writing and not getattr(g, "can_download", True) and _p(
-                # '/downloads/grab' also covers '/downloads/grab-pack' by prefix
                 "/api/video/downloads/grab", "/api/video/downloads/retry",
+                # clients-tab match & import: following a download is a grab
+                "/api/video/downloads/adopt",
                 "/api/video/youtube/download",
-                # 'Search now' / 'Search all' on the wishlist START REAL GRABS —
-                # their own docstrings say so ("the downloads page / badge shows
-                # what it grabs"). They were behind no gate at all, so any signed-in
-                # profile with video access could download from the wishlist.
-                # The prefix covers /wishlist/search-all too.
-                "/api/video/wishlist/search",
-                # approving IS acquisition — admin-only, checked in the route too
-                "/api/video/watchlist/approve",
-                # same for the wishlist's queue: releasing a pending wish is what
-                # lets it be fetched. '/wishlist/approve' also covers the deny
-                # sibling by name below.
-                "/api/video/wishlist/approve", "/api/video/wishlist/deny",
-                # Destructive siblings of the above. These were unreachable while
-                # every non-download profile was music-only; now that a Plex sign-in
-                # gets video access by default, an un-gated one would let a member
-                # cancel the admin's downloads or empty the shared wishlist.
-                "/api/video/downloads/cancel", "/api/video/downloads/history",
-                # empties the finished rows off the SHARED queue for everyone —
-                # destructive, and it was sitting behind no gate at all
-                "/api/video/downloads/clear"):
+                # manual subtitle download (Phase 3): an explicit user download
+                # action, same permission as a grab
+                "/api/video/subtitles/manual-download",
+                # the tab's bulk action — spends the same disk and bandwidth as
+                # the per-row grab above, so it takes the same permission
+                "/api/video/wishlist/youtube/download-all",
+                "/api/video/wishlist/add",
+                "/api/video/watchlist/add", "/api/video/youtube/wishlist/add",
+                "/api/video/watch/grab",
+                # the wishlist and watchlist are shared by the household: a
+                # profile that can't add to them can't empty them either (it
+                # used to, and that dropped every approved request with it),
+                # and searching/retrying spends the same indexer budget as a grab
+                "/api/video/wishlist/remove", "/api/video/wishlist/clear",
+                "/api/video/wishlist/search", "/api/video/wishlist/retry",
+                "/api/video/watchlist/remove", "/api/video/watchlist/person",
+                "/api/video/watchlist/studio", "/api/video/youtube/wishlist/remove"):
             return jsonify({"error": "Downloads are disabled for this profile."}), 403
 
     from .dashboard import register_routes as reg_dashboard
@@ -218,10 +176,21 @@ def create_video_blueprint() -> Blueprint:
     from .requests import register_routes as reg_requests
     from .notifications import register_routes as reg_notifications
     from .backups import register_routes as reg_backups
+    from .watch import register_routes as reg_watch
+    from .manual_match import register_routes as reg_manual_match
+    from .subtitles import register_routes as reg_subtitles
     reg_dashboard(bp)
     reg_scan(bp)
     reg_library(bp)
     reg_libraries(bp)
+    from .commissary_libraries import register_routes as reg_commissary_libraries  # Commissary
+    reg_commissary_libraries(bp)
+    from .commissary_titles import register_routes as reg_commissary_titles  # Commissary
+    reg_commissary_titles(bp)
+    from .commissary_episodes import register_routes as reg_commissary_episodes  # Commissary
+    reg_commissary_episodes(bp)
+    from .commissary_import import register_routes as reg_commissary_import  # Commissary
+    reg_commissary_import(bp)
     reg_poster(bp)
     reg_enrichment(bp)
     reg_detail(bp)
@@ -242,5 +211,8 @@ def create_video_blueprint() -> Blueprint:
     reg_requests(bp)
     reg_notifications(bp)
     reg_backups(bp)
+    reg_watch(bp)
+    reg_manual_match(bp)
+    reg_subtitles(bp)
 
     return bp

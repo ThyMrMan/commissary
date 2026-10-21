@@ -1,0 +1,511 @@
+/*
+ * Only the rules that the vanilla page injected at runtime via
+ * `_ensureWatchlistLabelsStyles()` live here.
+ *
+ * Everything else the watchlist renders — cards, pills, source badges, the
+ * toolbar, the scan deck, the empty state — is already class-scoped in
+ * style.css (333 rules, none of them scoped to #watchlist-page), so it applies
+ * unchanged inside #webui-react-root. Those classes are used as-is rather than
+ * duplicated here: this is a port, and re-authoring them would be the only way
+ * to introduce a visual regression.
+ *
+ * The injected block WAS scoped to #watchlist-page, which no longer exists on
+ * a React route, so it is the one part that had to move.
+ */
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin: 4px 0 16px;
+}
+
+.tab {
+  background: var(--white-a05);
+  color: var(--text-secondary);
+  border: 1px solid var(--white-a08);
+  border-radius: var(--radius-pill);
+  padding: 7px 18px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.tab:hover {
+  color: #fff;
+  background: var(--white-a10);
+}
+
+.tabActive {
+  background: linear-gradient(135deg, var(--accent), #12833b);
+  color: #fff;
+  border-color: transparent;
+}
+
+.tabActive:hover {
+  color: #fff;
+  background: linear-gradient(135deg, var(--accent), #12833b);
+}
+
+.labelsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.labelCard {
+  position: relative;
+  background: var(--white-a04);
+  border: 1px solid var(--white-a07);
+  border-radius: var(--radius-lg);
+  padding: 18px;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s;
+}
+
+.labelCard:hover {
+  background: var(--white-a08);
+  border-color: rgba(var(--accent-rgb), 0.4);
+}
+
+.labelIcon {
+  font-size: 30px;
+}
+
+.labelName {
+  font-size: 15px;
+  font-weight: 700;
+  color: #fff;
+  margin-top: 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.labelMeta {
+  font-size: 12px;
+  color: #8a909a;
+  margin-top: 4px;
+}
+
+.labelBacklogBadge {
+  display: inline-block;
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  background: rgba(255, 180, 40, 0.16);
+  color: #ffb84d;
+}
+
+.labelActions {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  display: flex;
+  gap: 6px;
+}
+
+.labelActions button {
+  background: rgba(0, 0, 0, 0.35);
+  border: none;
+  color: #cfd3da;
+  width: 26px;
+  height: 26px;
+  border-radius: 7px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+}
+
+.labelActions button:hover {
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+}
+
+/* ---------------------------------------------------------------------------
+ * Podcasts Tab
+ * --------------------------------------------------------------------------- */
+
+.podcastsTabContainer {
+  margin-top: 8px;
+}
+
+.podcastsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 20px;
+}
+
+.podcastCard {
+  position: relative;
+  background: var(--white-a03);
+  border: 1px solid var(--white-a08);
+  border-radius: 14px;
+  overflow: visible;
+  cursor: pointer;
+  transition:
+    background 0.2s ease,
+    border-color 0.2s ease,
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
+  display: flex;
+  flex-direction: column;
+}
+
+.podcastCard:hover {
+  background: var(--white-a06);
+  border-color: rgba(var(--accent-rgb), 0.45);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.podcastArtWrapper {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: 12px 12px 0 0;
+  overflow: hidden;
+  background: #111419;
+}
+
+.podcastArt {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transition: transform 0.3s ease;
+}
+
+.podcastCard:hover .podcastArt {
+  transform: scale(1.04);
+}
+
+.podcastArtPlaceholder {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+  background: linear-gradient(135deg, rgba(var(--accent-rgb), 0.1), var(--white-a03));
+}
+
+.podcastActions {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  z-index: 10;
+}
+
+.podcastMenuBtn {
+  background: rgba(15, 18, 24, 0.75);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--white-a12);
+  color: #cfd3da;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+
+.podcastMenuBtn:hover {
+  background: rgba(20, 25, 34, 0.95);
+  border-color: var(--white-a25);
+  color: #fff;
+}
+
+.podcastDropdownMenu {
+  position: absolute;
+  top: 38px;
+  right: 0;
+  background: #181d26;
+  border: 1px solid var(--white-a15);
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  min-width: 190px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 50;
+  animation: fadeInDown 0.15s ease-out;
+}
+
+@keyframes fadeInDown {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.podcastDropdownItem {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: #d1d5db;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-align: left;
+  width: 100%;
+  transition:
+    background 0.15s,
+    color 0.15s;
+}
+
+.podcastDropdownItem:hover {
+  background: var(--white-a08);
+  color: #fff;
+}
+
+.podcastDropdownItemDanger:hover {
+  background: rgba(239, 68, 68, 0.15);
+  color: #ef4444;
+}
+
+.podcastContent {
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+}
+
+.podcastTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.podcastAuthor {
+  font-size: 12px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.podcastBadgesRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.podcastBadgeSuccess {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(var(--success-rgb), 0.15);
+  color: #26d462;
+  border: 1px solid rgba(var(--success-rgb), 0.3);
+}
+
+.podcastBadgeMuted {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: var(--white-a06);
+  color: #9aa0aa;
+  border: 1px solid var(--white-a08);
+}
+
+.podcastBadgeRetention {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.28);
+}
+
+.podcastBadgeCount {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  background: rgba(147, 51, 234, 0.14);
+  color: #c084fc;
+  border: 1px solid rgba(147, 51, 234, 0.25);
+}
+
+.podcastFooter {
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid var(--white-a05);
+}
+
+.podcastScanText {
+  font-size: 11px;
+  color: #717682;
+}
+
+/* ---------------------------------------------------------------------------
+ * Podcast Settings Modal
+ * --------------------------------------------------------------------------- */
+
+.podcastModal {
+  max-width: 580px;
+}
+
+.modalShowHeader {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.modalShowArt {
+  width: 52px;
+  height: 52px;
+  border-radius: var(--radius-md);
+  object-fit: cover;
+  flex-shrink: 0;
+  border: 1px solid var(--white-a10);
+}
+
+.modalShowArtPlaceholder {
+  width: 52px;
+  height: 52px;
+  border-radius: var(--radius-md);
+  background: var(--white-a05);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 24px;
+  flex-shrink: 0;
+}
+
+.retentionPresetList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.retentionPresetBtn {
+  background: var(--white-a06);
+  border: 1px solid var(--white-a10);
+  color: #d1d5db;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    border-color 0.15s,
+    color 0.15s;
+}
+
+.retentionPresetBtn:hover {
+  background: var(--white-a12);
+  color: #fff;
+}
+
+.retentionPresetBtnActive {
+  background: rgba(var(--accent-rgb), 0.2);
+  border-color: var(--accent);
+  color: #26d462;
+}
+
+.retentionInputRow {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.retentionInputLabel {
+  font-size: 13px;
+  font-weight: 500;
+  color: #cbd5e1;
+}
+
+.retentionInputWrapper {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.retentionInput {
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid var(--white-a15);
+  border-radius: var(--radius-md);
+  color: #fff;
+  padding: 8px 12px;
+  font-size: 14px;
+  width: 90px;
+}
+
+.retentionInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.retentionInputSuffix {
+  font-size: 13px;
+  color: #9aa0aa;
+}
+
+.retentionHint {
+  font-size: 12px;
+  color: #9aa0aa;
+  font-style: italic;
+}
+
+.dangerZoneRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  background: rgba(239, 68, 68, 0.06);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  padding: 14px 16px;
+  border-radius: 10px;
+  margin-top: 10px;
+}
+
+.dangerTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: #ef4444;
+}
+
+.dangerSub {
+  font-size: 12px;
+  color: #9aa0aa;
+  margin-top: 2px;
+}

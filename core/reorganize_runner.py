@@ -20,6 +20,7 @@ module load. That way a user changing their download path in settings
 takes effect on the next reorganize without needing a server restart.
 """
 
+import json
 import os
 from typing import Callable, Optional
 
@@ -63,17 +64,96 @@ def build_runner(
     from core.library_reorganize import reorganize_album, reorganize_album_rename_only
     from core.reorganize_queue import get_queue
 
-    def _update_track_path(track_id, new_path):
+    def _repoint_findings(conn, old_path, new_path):
+        """Move any pending maintenance findings onto the file's new path.
+
+        A finding stores its OWN snapshot of the path, so a reorganize used to
+        leave every finding on a moved file naming somewhere that no longer
+        exists. Those fixes could never succeed, and because a failed fix keeps
+        the finding pending they were retried on every subsequent run until the
+        user cleared them by hand (#1143).
+
+        Both the column and ``details_json`` are updated: several fix handlers
+        read ``details['file_path']`` in PREFERENCE to the column, so updating
+        only the column would leave the fix still using the stale path while
+        the UI showed the new one.
+
+        Best-effort by design. A reorganize must never fail because of the
+        maintenance tables — the track path update above is the important
+        write, and a finding left behind is merely stale, which the
+        vanished-file retirement already handles.
+        """
+        if not old_path or old_path == new_path:
+            return
         try:
-            db = get_database()
-            with db._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, details_json FROM repair_findings "
+                "WHERE file_path = ? AND status = 'pending'",
+                (old_path,),
+            ).fetchall()
+            for row in rows:
+                finding_id, details_json = row[0], row[1]
+                details_out = details_json
+                if details_json:
+                    try:
+                        parsed = json.loads(details_json)
+                        if isinstance(parsed, dict) and parsed.get('file_path') == old_path:
+                            parsed['file_path'] = new_path
+                            details_out = json.dumps(parsed)
+                    except (ValueError, TypeError):
+                        pass    # unparseable details: still fix the column
                 conn.execute(
-                    "UPDATE tracks SET file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (new_path, str(track_id)),
+                    "UPDATE repair_findings SET file_path = ?, details_json = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (new_path, details_out, finding_id),
                 )
-                conn.commit()
-        except Exception as db_err:
-            logger.warning(f"[Reorganize] DB path update failed for {track_id}: {db_err}")
+            if rows:
+                logger.info("[Reorganize] Re-pointed %d finding(s) onto %s",
+                            len(rows), os.path.basename(new_path))
+        except Exception as e:    # noqa: BLE001 — never break a reorganize
+            logger.debug("[Reorganize] Could not re-point findings: %s", e)
+
+    def _update_track_path(track_id, new_path):
+        """Repoint the catalogue at ``new_path``.
+
+        This MUST raise when the catalogue was not updated. ``_finalize_track``
+        detects a failed path update SOLELY by catching an exception out of this
+        callback, and on success it goes on to ``os.remove`` the original.
+        Swallowing the error here therefore deleted the user's only copy while
+        the catalogue still pointed at the old path — reported as "moved", read
+        by the library as MISSING, and re-downloaded later as if it had never
+        been there.
+
+        The realistic trigger is the SQLite write lock being held elsewhere (an
+        import commit, ``recompute_wanted``): the connection raises ``database
+        is locked``, the whole transaction rolls back, and the file is destroyed
+        anyway. Reported against a fresh library — songs downloaded, Reorganize
+        run straight afterwards, tracks came back missing.
+
+        A 0-row UPDATE is NOT an SQLite error — it is silent success — so the
+        rowcount is checked explicitly: an id the catalogue does not know has to
+        fail just as loudly as a locked database.
+        """
+        db = get_database()
+        with db._get_connection() as conn:
+            # Read the old path BEFORE overwriting it — it is the only key
+            # the findings rows can be matched on.
+            row = conn.execute(
+                "SELECT file_path FROM tracks WHERE id = ?", (str(track_id),)
+            ).fetchone()
+            old_path = row[0] if row else None
+            cursor = conn.execute(
+                "UPDATE tracks SET file_path = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_path, str(track_id)),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"track {track_id} was not repointed — the UPDATE matched "
+                    f"{cursor.rowcount} rows, so the catalogue still names the "
+                    f"old path"
+                )
+            _repoint_findings(conn, old_path, new_path)
+            conn.commit()
 
     def runner(item):
         # Read config per-run so the user changing their download path
@@ -81,6 +161,20 @@ def build_runner(
         # server restart.
         download_dir = get_download_path()
         transfer_dir = get_transfer_path()
+        # #1504: resolve the owning profile so the run targets the right
+        # library root instead of the shared folder.
+        profile_id = None
+        try:
+            from core.library_reorganize import resolve_album_profile_id
+            from core.imports.paths import library_root_for_profile
+            profile_id = resolve_album_profile_id(
+                get_database(), item.album_id,
+                resolve_file_path_fn=resolve_file_path_fn)
+            own_root = library_root_for_profile(profile_id, announce=False)
+            if own_root:
+                transfer_dir = own_root
+        except Exception as e:
+            logger.debug("[Reorganize] profile resolution failed: %s", e)
 
         def _cleanup_empty(src_dir):
             try:
@@ -117,6 +211,7 @@ def build_runner(
                 strict_source=bool(item.source),
                 metadata_source=getattr(item, 'metadata_source', 'api') or 'api',
                 stop_check=is_shutting_down_fn,
+                profile_id=profile_id,
             )
 
         staging_root = os.path.join(download_dir, 'ssync_staging')
@@ -145,6 +240,7 @@ def build_runner(
             strict_source=bool(item.source),
             stop_check=is_shutting_down_fn,
             metadata_source=getattr(item, 'metadata_source', 'api') or 'api',
+            profile_id=profile_id,
         )
 
     return runner

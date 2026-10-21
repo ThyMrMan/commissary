@@ -9,6 +9,133 @@ export const importAutoSearchSchema = z.object({
 
 export type ImportAutoSearch = z.infer<typeof importAutoSearchSchema>;
 
+/** The inbox's filter pills. "attention" is what needs a person. */
+export const IMPORT_INBOX_FILTER_VALUES = ['attention', 'all', 'history'] as const;
+export type ImportInboxFilter = (typeof IMPORT_INBOX_FILTER_VALUES)[number];
+
+export const importInboxSearchSchema = z.object({
+  filter: z.enum(IMPORT_INBOX_FILTER_VALUES).default('attention').catch('attention'),
+});
+
+export type ImportInboxSearch = z.infer<typeof importInboxSearchSchema>;
+
+export type ImportInboxStatus =
+  | 'waiting'
+  | 'identifying'
+  | 'needs_review'
+  | 'needs_identify'
+  | 'queued'
+  | 'importing'
+  | 'imported'
+  | 'partial'
+  | 'failed'
+  | 'dismissed';
+
+export interface ImportInboxFile {
+  filename: string;
+  full_path: string;
+  rel_path: string;
+  title: string;
+  artist: string;
+  album: string;
+  track_number?: number | string | null;
+  disc_number?: number | string | null;
+  extension: string;
+  format: string;
+  duration_ms: number;
+  bitrate: number;
+  size: number;
+}
+
+/** what an import did with one track. 'completed' is a plain import. */
+export type ImportTrackOutcome = 'completed' | 'upgraded' | 'skipped_owned' | 'failed';
+
+export interface ImportOutcomeSummary {
+  imported: number;
+  upgraded: number;
+  skipped_owned: number;
+  failed: number;
+}
+
+export interface ImportInboxMatchLine {
+  track_name: string;
+  track_number?: number | string | null;
+  file: string;
+  file_path: string;
+  confidence: number;
+  /** set once the import ran: what it did with this track, and why */
+  import_status?: ImportTrackOutcome | null;
+  import_reason?: string | null;
+  import_error?: string | null;
+}
+
+export interface ImportInboxMatch {
+  matched_count: number;
+  total_tracks: number;
+  matches: ImportInboxMatchLine[];
+  summary?: ImportOutcomeSummary | null;
+}
+
+/** One staging item: an album folder, a loose-file group, or a single file,
+ * with whatever the worker has done about it folded in. */
+export interface ImportInboxItem {
+  key: string;
+  kind: 'album' | 'single';
+  name: string;
+  /** what the tags/history guessed — shown as a subtitle when it differs from name (#1289) */
+  guessed_name: string | null;
+  artist: string;
+  folder_name: string;
+  folder_path: string;
+  rel_path: string;
+  in_staging: boolean;
+  files: ImportInboxFile[];
+  file_count: number;
+  total_duration_ms: number;
+  total_size: number;
+  formats: string[];
+  status: ImportInboxStatus;
+  confidence: number | null;
+  image_url?: string | null;
+  album_id?: string | null;
+  identification_method?: string | null;
+  error_message?: string | null;
+  match: ImportInboxMatch | null;
+  history_id: number | null;
+  created_at?: string | null;
+  processed_at?: string | null;
+  live: { track_index: number; track_total: number; track_name: string } | null;
+}
+
+export interface ImportInboxSummary {
+  items: number;
+  files: number;
+  size: number;
+  attention: number;
+  by_status: Partial<Record<ImportInboxStatus, number>>;
+}
+
+export interface ImportInboxWorker {
+  available: boolean;
+  running: boolean;
+  paused: boolean;
+  current_status: string;
+  last_scan_time?: string | null;
+  stats: Record<string, number>;
+}
+
+export interface ImportInboxPayload {
+  success: boolean;
+  error?: string;
+  scanning?: boolean;
+  progress?: ImportScanProgress;
+  staging_path?: string;
+  items?: ImportInboxItem[];
+  summary?: ImportInboxSummary;
+  problems?: ImportStagingProblem[];
+  worker?: ImportInboxWorker;
+}
+
 export interface ImportStagingFile {
   filename: string;
   rel_path?: string;
@@ -20,6 +147,8 @@ export interface ImportStagingFile {
   disc_number?: string | number | null;
   extension?: string | null;
   size?: number | null;
+  duration_ms?: number | null;
+  bitrate?: number | null;
   manual_match?: ImportTrackResult;
 }
 
@@ -31,6 +160,12 @@ export interface ImportScanProgress {
   total: number;
 }
 
+/** A folder the scan could not list: files under it are invisible, not absent. */
+export interface ImportStagingProblem {
+  path: string;
+  error: string;
+}
+
 export interface ImportStagingFilesPayload {
   success: boolean;
   files?: ImportStagingFile[];
@@ -38,33 +173,7 @@ export interface ImportStagingFilesPayload {
   error?: string;
   scanning?: boolean;
   progress?: ImportScanProgress;
-}
-
-/** One entry from the server-side folder browser. `size` is only present on files. */
-export interface ImportBrowseEntry {
-  name: string;
-  path: string;
-  size?: number;
-}
-
-/** A shortcut to a configured root (downloads, import folder, libraries). These
- * double as the server's allowlist — a folder outside all of them can't be scanned. */
-export interface ImportBrowseShortcut {
-  label: string;
-  path: string;
-}
-
-export interface ImportBrowsePayload {
-  success: boolean;
-  path: string;
-  /** null when the parent would leave every allowed root, so "up" stops there. */
-  parent?: string | null;
-  dirs?: ImportBrowseEntry[];
-  files?: ImportBrowseEntry[];
-  shortcuts?: ImportBrowseShortcut[];
-  truncated?: boolean;
-  audio_count?: number;
-  error?: string;
+  problems?: ImportStagingProblem[];
 }
 
 export interface ImportStagingGroup {
@@ -170,6 +279,7 @@ export interface ImportAlbumTrack {
   track_number?: string | number | null;
   trackNumber?: string | number | null;
   disc_number?: number | null;
+  duration_ms?: number | null;
 }
 
 export interface ImportAlbumMatch {
@@ -177,27 +287,37 @@ export interface ImportAlbumMatch {
   spotify_track?: ImportAlbumTrack | null;
   staging_file?: ImportStagingFile | null;
   confidence: number;
+  /** How the file was paired: 'mbid' | 'isrc' for exact-ID pairings, null for fuzzy. */
+  match_type?: string | null;
+  /** Existing-library pre-check (see core/imports/library_check.py). */
+  library_status?: ImportLibraryStatus | null;
 }
 
-/** Which files the album matcher was allowed to draw from. */
-export interface ImportAlbumMatchScope {
-  /** 'files' = the Auto-Detected album's own files; 'folder' = the one album
-   * folder that best fit the tracklist; 'all' = nothing fit any single folder,
-   * so every file was considered. */
-  mode: 'files' | 'folder' | 'all';
-  folder?: string | null;
-  folder_label?: string | null;
-  folders_considered?: number;
-  file_count?: number;
+export type ImportLibraryDecision = 'import' | 'skip_owned' | 'upgrade' | 'uncertain';
+
+export interface ImportLibraryStatus {
+  decision: ImportLibraryDecision;
+  reason: string;
+  library_path?: string | null;
+}
+
+export interface ImportTrackDisposition {
+  track_name: string;
+  file_name: string;
+  decision: 'imported' | 'skipped_owned' | 'upgraded' | 'error';
+  reason: string;
+}
+
+export interface ImportDispositionSummary {
+  imported: number;
+  skipped_owned: number;
+  upgraded: number;
 }
 
 export interface ImportAlbumMatchPayload {
   success: boolean;
   album?: ImportAlbum;
   matches?: ImportAlbumMatch[];
-  match_scope?: ImportAlbumMatchScope;
-  /** Full paths the match drew from. The manual-assign pool offers only these. */
-  candidate_paths?: string[] | null;
   error?: string;
 }
 
@@ -207,6 +327,8 @@ export interface ImportProcessPayload {
   total?: number;
   errors?: string[];
   error?: string;
+  dispositions?: ImportTrackDisposition[];
+  summary?: ImportDispositionSummary;
 }
 
 export interface ImportAutoImportActiveItem {
@@ -244,6 +366,8 @@ export interface ImportAutoImportSettingsPayload {
   // app-wide default profile" (Settings -> Quality), same as every other
   // context that doesn't specify its own.
   quality_profile_id?: number | null;
+  /** take a folder out of staging once every track was imported or already owned */
+  clear_finished?: boolean;
   error?: string;
 }
 
@@ -268,7 +392,11 @@ export interface ImportAutoImportMatchData {
     track?: { name?: string | null };
     file?: string | null;
     confidence?: number | null;
+    import_status?: ImportTrackOutcome | null;
+    import_reason?: string | null;
+    import_error?: string | null;
   }>;
+  summary?: ImportOutcomeSummary | null;
 }
 
 export interface ImportAutoImportResult {
@@ -310,6 +438,9 @@ export interface ImportQueueEntry {
    * isn't connected (see `is_active_media_server_ready` in core/imports/side_effects.py).
    * The queue item renders a Settings link instead of the plain error list. */
   blockedByMediaServer?: boolean;
+  /** Per-track import outcomes, accumulated as the job runs (see
+   * core/imports/library_check.py for the decision vocabulary). */
+  dispositions?: ImportTrackDisposition[];
 }
 
 export interface ImportAlbumQueueJob {
@@ -319,6 +450,8 @@ export interface ImportAlbumQueueJob {
   imageUrl?: string | null;
   items: ImportAlbumMatch[];
   albumData: ImportAlbum;
+  /** the auto-import row this job resolves, when it came from the inbox */
+  historyId?: number | null;
 }
 
 export interface ImportSinglesQueueJob {
@@ -327,6 +460,87 @@ export interface ImportSinglesQueueJob {
   sublabel: string;
   imageUrl?: string | null;
   items: ImportStagingFile[];
+  historyId?: number | null;
 }
 
 export type ImportQueueJob = ImportAlbumQueueJob | ImportSinglesQueueJob;
+
+/** One track of the pre-import preview: where it lands and which tags change. */
+export interface ImportPreviewTags {
+  title: string;
+  artist: string;
+  albumartist: string;
+  album: string;
+  track_number: number | string | null;
+  disc_number: number | string | null;
+  year: string;
+}
+
+export interface ImportPreviewTrack {
+  file: string;
+  full_path: string;
+  destination: string | null;
+  path_error: string | null;
+  before: ImportPreviewTags;
+  after: ImportPreviewTags;
+  changed: (keyof ImportPreviewTags)[];
+}
+
+export interface ImportPreviewPayload {
+  success: boolean;
+  tracks?: ImportPreviewTrack[];
+  error?: string;
+}
+
+/** /api/library/check-tracks: per track name, whether the library has it. */
+export interface LibraryOwnedEntry {
+  owned: boolean;
+  track_id?: number | null;
+  title?: string | null;
+  file_path?: string | null;
+  format?: string | null;
+  bitrate?: number | null;
+  album?: string | null;
+}
+
+export interface LibraryCheckPayload {
+  success: boolean;
+  owned_tracks?: Record<string, LibraryOwnedEntry>;
+  error?: string;
+}
+
+export interface ImportUploadChunkPayload {
+  success: boolean;
+  error?: string;
+  received?: number;
+  total?: number;
+  saved?: { file: string; size: number };
+}
+
+export interface ImportUploadPayload {
+  success: boolean;
+  saved?: { file: string; size: number }[];
+  skipped?: { file: string; reason: string }[];
+  staging_path?: string;
+  error?: string;
+}
+
+export interface ImportFingerprintResult {
+  file: string;
+  status: string;
+  error?: string | null;
+  title?: string | null;
+  artist?: string | null;
+  mbid?: string | null;
+  score?: number | null;
+}
+
+export interface ImportFingerprintPayload {
+  success: boolean;
+  error?: string;
+  code?: string;
+  results?: ImportFingerprintResult[];
+  recognised?: number;
+  artist?: string | null;
+  title?: string | null;
+}

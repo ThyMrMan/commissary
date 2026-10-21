@@ -53,73 +53,46 @@ def is_configured() -> bool:
         return False
 
 
-def list_indexers() -> List[dict]:
-    """The configured indexers as ``{id, name, protocol, enable, privacy}``.
-
-    Deliberately NOT the raw Prowlarr payload: that carries each indexer's URL
-    and API key, and leaking indexer URLs to the browser was a real security bug
-    once already. Only the identity fields a picker needs cross the boundary.
-
-    Exists because the per-Library "Preferred trackers" setting stores numeric
-    Prowlarr ids, and nothing in the app ever showed the user what those ids
-    were — so the field asked for something it gave you no way to find out."""
-    try:
-        c = _client()
-        if not c.is_configured():
-            return []
-        return [{"id": ix.id, "name": ix.name, "protocol": ix.protocol,
-                 "enable": bool(ix.enable), "privacy": ix.privacy}
-                for ix in c._get_indexers_sync()]
-    except Exception:   # noqa: BLE001 - an unreachable Prowlarr just means no picker
-        logger.warning("could not list Prowlarr indexers", exc_info=True)
-        return []
-
-
 def _indexer_ids() -> List[int]:
     """The optional Prowlarr indexer allowlist (shared ``prowlarr.indexer_ids``)."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     raw = str(config_manager.get("prowlarr.indexer_ids", "") or "").strip()
     return [int(p) for p in (x.strip() for x in raw.split(",")) if p.isdigit()]
 
 
-# Sentinel for "the caller asked for specific trackers, and none of them survive
-# the global allowlist". Distinct from [] (= no restriction, search everything),
-# which is what an empty list has always meant here.
-_NO_INDEXERS = "no_indexers"
+def _norm_indexer_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
 
-def effective_indexer_ids(restrict_to=None):
-    """Which Prowlarr indexers a search may actually use.
+def _indexer_ids_matching(names: Any, protocol: str) -> Optional[List[int]]:
+    """Resolve a Basic Search provider label (e.g. 1337x) to Prowlarr indexer ids.
 
-    Two independent restrictions, ANDed:
-      * the global ``prowlarr.indexer_ids`` allowlist (Settings → Indexers), and
-      * ``restrict_to`` — the Library's own tracker selection, for grabs filed
-        into that Library.
-
-    Either being empty/None means "that one imposes no restriction", so with
-    neither set the result is ``[]`` and Prowlarr searches every enabled indexer,
-    exactly as before.
-
-    When both are set the result is their INTERSECTION. If that intersection is
-    empty the two settings contradict each other — the Library asks for trackers
-    the global allowlist forbids. Returning ``[]`` there would read as "no
-    restriction" and quietly search EVERY indexer, which is the opposite of what
-    both settings asked for, so this returns the ``_NO_INDEXERS`` sentinel and
-    the caller reports the misconfiguration instead of guessing.
+    ``None`` means no provider filter was requested. ``[]`` means a filter was
+    requested but no enabled matching indexer exists, so callers should show a
+    clear configured-but-missing message rather than widening the search.
     """
-    allowed = [int(i) for i in (_indexer_ids() or [])]
-    wanted = []
-    for i in (restrict_to or []):
-        try:
-            wanted.append(int(i))
-        except (TypeError, ValueError):
-            continue
+    if not names:
+        return None
+    wanted_raw = names if isinstance(names, (list, tuple, set)) else [names]
+    wanted = [_norm_indexer_name(n) for n in wanted_raw if _norm_indexer_name(n)]
     if not wanted:
-        return allowed
-    if not allowed:
-        return wanted
-    both = [i for i in wanted if i in set(allowed)]
-    return both if both else _NO_INDEXERS
+        return None
+    try:
+        known = _client()._get_indexers_sync()
+    except Exception as exc:  # noqa: BLE001 - surface as no concrete source match
+        logger.warning("Prowlarr indexer lookup failed for Basic Search provider %s: %s", wanted, exc)
+        return []
+    protocol = str(protocol or "torrent").lower()
+    matched = []
+    for indexer in known or []:
+        if not getattr(indexer, "enable", False):
+            continue
+        if str(getattr(indexer, "protocol", "") or "").lower() != protocol:
+            continue
+        name = _norm_indexer_name(getattr(indexer, "name", ""))
+        if any(w in name or name in w for w in wanted):
+            matched.append(int(indexer.id))
+    return matched
 
 
 def _imdb_num(imdb_id: Any) -> Optional[str]:
@@ -141,7 +114,7 @@ def _as_int(v: Any) -> Optional[int]:
 def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = None,
                      episode: Any = None, imdb_id: Any = None, tmdb_id: Any = None,
                      tvdb_id: Any = None, air_date: Any = None, absolute: Any = None,
-                     series_type: Any = None) -> List[Tuple[str, str, List[tuple]]]:
+                     series_type: Any = None, alt: Any = None) -> List[Tuple[str, str, List[tuple]]]:
     """The set of Prowlarr searches to run for one request, as ``(type, query, extra)``.
 
     Pure (no I/O) so it's unit-tested. Always includes the scene-formatted text search;
@@ -165,11 +138,24 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
         strat.append(("movie", t, extra))
         strat.append(("search", build_query("movie", t, year=year), []))
     elif scope == "episode":
+        # a tvdbid asks the indexer in TVDB's numbering, so when the scene
+        # (TVDB) numbering differs from TMDB's (``alt``), that's what goes with it
+        alt_s = alt_e = None
+        if alt:
+            try:
+                alt_s, alt_e = int(alt[0]), int(alt[1])
+            except (TypeError, ValueError, IndexError):
+                alt_s = alt_e = None
+        if alt_s is not None and len(alt) > 2 and alt[2]:
+            # exclusive: the TMDB number names another episode in the scene's
+            # numbering, so searching it only finds the wrong one
+            season, episode, s_i, e_i = alt_s, alt_e, alt_s, alt_e
+        q_s, q_e = (alt_s, alt_e) if (tvdb and alt_s is not None) else (s_i, e_i)
         extra = []
-        if s_i is not None:
-            extra.append(("season", s_i))
-        if e_i is not None:
-            extra.append(("ep", e_i))
+        if q_s is not None:
+            extra.append(("season", q_s))
+        if q_e is not None:
+            extra.append(("ep", q_e))
         if tvdb:
             extra.append(("tvdbid", tvdb))
         if imdb:
@@ -184,6 +170,8 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
         q_std = build_query("episode", t, season=season, episode=episode)
         if q_std != q_typed:
             strat.append(("search", q_std, []))
+        if alt_s is not None:
+            strat.append(("search", build_query("episode", t, season=alt_s, episode=alt_e), []))
     elif scope == "season":
         extra = []
         if s_i is not None:
@@ -217,58 +205,16 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
     return out
 
 
-# Prowlarr's per-call result cap. Configurable because "how many releases exist"
-# varies enormously by title and by how many indexers are attached — a long
-# running show across a dozen trackers blows past the old hard-coded 100 before
-# the ranking gets a chance to choose.
-_DEFAULT_SEARCH_LIMIT = 200
-_SEARCH_LIMIT_KEY = "prowlarr.search_limit"
-
-
-# How long to wait for ONE Prowlarr search. Separate from the client's 15s
-# metadata timeout: a cold search fans out to every configured indexer and
-# several authenticate on first use, so it can take a minute even when healthy.
-_DEFAULT_SEARCH_TIMEOUT = 90
-_SEARCH_TIMEOUT_KEY = "prowlarr.search_timeout"
-
-
-def _search_timeout() -> float:
-    try:
-        from config.settings import config_manager
-        n = float(config_manager.get(_SEARCH_TIMEOUT_KEY, _DEFAULT_SEARCH_TIMEOUT)
-                  or _DEFAULT_SEARCH_TIMEOUT)
-    except Exception:   # noqa: BLE001 - config must never break search
-        return _DEFAULT_SEARCH_TIMEOUT
-    # Below ~5s nothing real completes; above a few minutes the user has given up.
-    return max(5.0, min(300.0, n))
-
-
-def _search_limit() -> int:
-    try:
-        from config.settings import config_manager
-        n = int(config_manager.get(_SEARCH_LIMIT_KEY, _DEFAULT_SEARCH_LIMIT)
-                or _DEFAULT_SEARCH_LIMIT)
-    except (TypeError, ValueError, Exception):   # noqa: BLE001 - config must never break search
-        return _DEFAULT_SEARCH_LIMIT
-    # Prowlarr rejects absurd values and a tiny one silently starves the ranker.
-    return max(20, min(1000, n))
-
-
-# Promoted to core.prowlarr_client so the music side shares the exact same
-# scheme check rather than growing a second one. Re-exported under the old
-# private name because this module's callers already use it.
-from core.prowlarr_client import safe_info_url as _safe_info_url
-
-
 def _project(r: Any, url: str, want_proto: str) -> dict:
-    """One Prowlarr result → the slskd-shaped hit ``_evaluate_hits`` consumes."""
+    """One Prowlarr result → the slskd-shaped hit ``_evaluate_hits`` consumes.
+
+    ``magnet_uri`` rides along beside ``download_url`` (#1139, video side). The
+    URL is now preferred so SoulSync can fetch the real .torrent server-side and
+    push the file; the magnet is what ``add_torrent_smart`` falls back to when
+    that fetch fails, so preferring the URL is never a downgrade."""
     size = int(getattr(r, "size", 0) or 0)
     seeders = getattr(r, "seeders", None)
     return {
-        # The indexer's own page for this release, so the title can link to where
-        # it came from. Prowlarr calls it infoUrl; not every indexer supplies one.
-        "info_url": _safe_info_url(getattr(r, "info_url", None)),
-        "publish_date": getattr(r, "publish_date", None),
         "title": r.title,
         "size_bytes": size,
         "seeders": seeders,
@@ -278,15 +224,17 @@ def _project(r: Any, url: str, want_proto: str) -> dict:
         "filename": r.title,                 # the grab uses the URL carriers below, not this
         "files": [], "file_count": 0, "folder_size_bytes": size,
         "download_url": url,
-        # The SAME release's magnet, riding along beside the URL. The URL is
-        # preferred (see the caller) so the real .torrent can be fetched
-        # server-side and pushed as a file; this is what add_torrent_smart falls
-        # back to when that fetch is refused, which is what makes preferring the
-        # URL safe rather than a trade of one failure for another.
         "magnet_uri": getattr(r, "magnet_uri", None),
         "protocol": getattr(r, "protocol", want_proto),
         "indexer_id": getattr(r, "indexer_id", None),
         "guid": getattr(r, "guid", None),
+        # Facts the indexer already stated and this projection used to drop on the
+        # floor. An indexer cannot give a poster or a rating, but it CAN say how old
+        # a release is and how many people have taken it - which is most of what you
+        # judge a release on when there is no artwork to look at.
+        "published_at": getattr(r, "publish_date", None),
+        "grabs": getattr(r, "grabs", None),
+        "info_url": getattr(r, "info_url", None),
     }
 
 
@@ -294,44 +242,55 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
                     episode: Any = None, source: str = "torrent", imdb_id: Any = None,
                     tmdb_id: Any = None, tvdb_id: Any = None, air_date: Any = None,
                     absolute: Any = None, series_type: Any = None,
-                    indexer_ids: Any = None) -> dict:
+                    max_wait_seconds: Any = None, indexer_names: Any = None,
+                    alt: Any = None,
+                    indexer_ids: Any = None) -> dict:  # Commissary: a Library's trackers
     """Search Prowlarr for a video release with the multi-strategy (structured + text)
     approach. ``source`` picks the protocol to keep (``torrent`` | ``usenet``). Returns
     ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes.
 
-    ``indexer_ids`` restricts this ONE search to specific Prowlarr indexers — the
-    Library's own tracker selection. It narrows the global allowlist, never widens
-    it. None/empty leaves the global setting in sole charge."""
+    ``max_wait_seconds`` bounds how long this will sit in the shared Prowlarr
+    budget (core.prowlarr_throttle) before giving up. Pass it from anything a
+    person is waiting on: the background drain is happy to queue, a manual
+    search should say "busy" rather than hold a request worker for a minute."""
     client = _client()
     if not client.is_configured():
         return {"configured": False, "hits": []}
     want_proto = "usenet" if str(source or "").lower() == "usenet" else "torrent"
-    cats = _categories(scope)
-    ids = effective_indexer_ids(indexer_ids)
-    if ids is _NO_INDEXERS:
-        return {"configured": True, "hits": [],
-                "error": "This library's chosen trackers are all excluded by the global "
-                         "'Restrict to indexer IDs' setting, so there is nothing left to "
-                         "search. Widen one of the two."}
+    # Basic Search is intentionally old-school: when the UI targets a named public
+    # tracker, do not send Radarr/Sonarr category filters. Some Jackett/Prowlarr
+    # public tracker adapters either ignore or reject those categories, which made
+    # obvious searches like "interstellar" return zero on The Pirate Bay.
+    cats = [] if indexer_names else _categories(scope)
+    target_ids = _indexer_ids_matching(indexer_names, want_proto)
+    if target_ids == []:
+        label = ", ".join(str(n) for n in (indexer_names if isinstance(indexer_names, (list, tuple, set)) else [indexer_names]))
+        return {"configured": True, "error": "No enabled Prowlarr indexer matches " + label, "hits": []}
+    ids = target_ids if target_ids is not None else _indexer_ids()
+    if indexer_ids and target_ids is None:
+        # Commissary: limit to the video Library's trackers (within the allowlist).
+        # A tracker the user named in Basic Search (target_ids) still wins.
+        from core.commissary.video_libraries import restrict_indexers
+        ids = restrict_indexers(indexer_ids, ids)
+        if not ids:
+            return {"configured": True, "hits": [],
+                    "error": "None of this library's trackers are enabled in Prowlarr"}
     strategies = build_strategies(scope, title, year=year, season=season, episode=episode,
                                   imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
-                                  air_date=air_date, absolute=absolute, series_type=series_type)
+                                  air_date=air_date, absolute=absolute, series_type=series_type,
+                                  alt=alt)
     if not strategies:
         return {"configured": True, "hits": []}
+
+    from core.commissary.search_caps import prowlarr_limit   # Commissary: was 100
+    limit = prowlarr_limit()
 
     def _run(strat):
         st_type, q, extra = strat
         try:
-            # strict=True: a timeout or transport error must RAISE, so _run
-            # records it and the picker says what went wrong. Swallowed into an
-            # empty list it is indistinguishable from "the indexers found
-            # nothing" — the search never ran, and the UI claimed no releases
-            # exist. That is the bug where searching in Prowlarr's own UI first
-            # "fixed" it: the second query hit Prowlarr's cache and came back
-            # inside the timeout.
-            return client._search_sync(q, cats, ids, _search_limit(),
-                                       search_type=st_type, extra_params=extra,
-                                       strict=True, timeout=_search_timeout())
+            return client._search_sync(q, cats, ids, limit, search_type=st_type,
+                                       extra_params=extra,
+                                       max_wait_seconds=max_wait_seconds)
         except Exception as e:   # noqa: BLE001 - one strategy failing shouldn't sink the rest
             logger.warning("prowlarr %s search failed for %r: %s", st_type, q, e)
             return e
@@ -350,11 +309,9 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
         for r in res:
             if getattr(r, "protocol", "") != want_proto:
                 continue
-            # .torrent URL first, magnet second (#1139, video side): a magnet
-            # hands the client an info-hash and nothing else, and one that
-            # cannot reach the swarm parks on "downloading metadata" forever.
-            # add_torrent_smart fetches the real .torrent server-side and pushes
-            # the file — with a magnet it could never be reached at all.
+            # .torrent URL first, magnet second (#1139): a magnet hands the
+            # client an info-hash and nothing else, and one that cannot reach
+            # the swarm parks on "downloading metadata" indefinitely.
             url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
             if not url:
                 continue

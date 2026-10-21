@@ -21,14 +21,14 @@ def register_routes(bp):
     def video_scan_request():
         from . import get_video_db
         from core.video.scanner import get_video_scanner
-        from core.video.sources import get_active_video_source
+        from core.video.sources import scan_video_source
         body = request.get_json(silent=True) or {}
         mode = body.get("mode", "full")
         # Which library to scan — movies and TV are independent libraries, so the
         # UI can target one or both. The scanner normalizes/validates it.
         media_type = body.get("media_type", "all")
         scanner = get_video_scanner(get_video_db())
-        return jsonify(scanner.request_scan(get_active_video_source, mode, media_type))
+        return jsonify(scanner.request_scan(scan_video_source, mode, media_type))
 
     @bp.route("/scan/status", methods=["GET"])
     def video_scan_status():
@@ -42,7 +42,7 @@ def register_routes(bp):
         from core.video.scanner import get_video_scanner
         return jsonify(get_video_scanner(get_video_db()).cancel())
 
-    # ── Server-side scan (distinct from the Commissary-reads-server scan above) ──
+    # ── Server-side scan (distinct from the SoulSync-reads-server scan above) ──
     # This tells the media server (Plex/Jellyfin) to rescan its OWN folders so
     # newly-downloaded files get indexed — the manual twin of the post-download
     # 'Scan Video Server' automation. media_type scopes it to Movies / TV / both.

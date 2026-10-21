@@ -25,21 +25,21 @@ Out of scope for this PR (deferred to the batch-lifecycle lift):
 
 from __future__ import annotations
 
-import logging
+from utils.logging_config import get_logger
 from typing import Callable
 
 from core.runtime_state import (
-    TERMINAL_TASK_STATUSES,
     batch_locks,
     download_batches,
     download_tasks,
     tasks_lock,
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger("downloads.cancel")
 
-# Shared with the post-processing safety net — see core.runtime_state.
-_TERMINAL_STATUSES = TERMINAL_TASK_STATUSES
+_TERMINAL_STATUSES = {
+    'completed', 'failed', 'not_found', 'cancelled', 'skipped', 'already_owned',
+}
 
 
 def cancel_single_download(download_orchestrator, run_async: Callable,

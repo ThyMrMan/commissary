@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for Commissary WebSocket tests.
+"""Shared pytest fixtures for SoulSync WebSocket tests.
 
 Creates a minimal Flask+SocketIO app that replicates the relevant
 endpoints and event handlers without importing the full web_server.py
@@ -28,6 +28,24 @@ import tempfile as _tempfile
 import atexit as _atexit
 import shutil as _shutil
 
+# Under pytest-xdist, workers inherit the controller's environment, so the
+# guards below would see the controller's temp paths and skip: every worker
+# then shares ONE set of temp DBs. That collides at runtime, and a worker
+# that hits the shared DB during collection errors out and collects a
+# different test set, which xdist rejects ("Different tests were collected").
+# A path carrying our test-tmp marker was minted by a parent conftest, never
+# by a user, so a worker discards it and mints its own; explicit user
+# overrides (no marker) are kept.
+_XDIST_WORKER = _os.environ.get('PYTEST_XDIST_WORKER', '')
+if _XDIST_WORKER and 'soulsync-testdb-' in _os.environ.get('DATABASE_PATH', ''):
+    for _var in ('SOULSYNC_TEST_DB_READY', 'DATABASE_PATH',
+                 'VIDEO_DATABASE_PATH', 'SOULSYNC_CONFIG_PATH'):
+        _os.environ.pop(_var, None)
+if _XDIST_WORKER and 'soulsync-test-imagecache-' in _os.environ.get('SOULSYNC_IMAGE_CACHE_DIR', ''):
+    _os.environ.pop('SOULSYNC_IMAGE_CACHE_DIR', None)
+if _XDIST_WORKER and 'soulsync-test-audiobooks-' in _os.environ.get('AUDIOBOOK_DATABASE_PATH', ''):
+    _os.environ.pop('AUDIOBOOK_DATABASE_PATH', None)
+
 if not _os.environ.get('SOULSYNC_TEST_DB_READY'):
     _TEST_DB_DIR = _tempfile.mkdtemp(prefix='soulsync-testdb-')
     _os.environ['DATABASE_PATH'] = _os.path.join(_TEST_DB_DIR, 'test_music_library.db')
@@ -42,6 +60,29 @@ if not _os.environ.get('SOULSYNC_TEST_DB_READY'):
     _os.environ['SOULSYNC_CONFIG_PATH'] = _os.path.join(_TEST_DB_DIR, 'test_config.json')
     _os.environ['SOULSYNC_TEST_DB_READY'] = '1'
     _atexit.register(lambda: _shutil.rmtree(_TEST_DB_DIR, ignore_errors=True))
+
+# The image cache has the same hazard as the DBs, and it sits OUTSIDE the
+# READY block on purpose: a test file that sets DATABASE_PATH + READY itself
+# skips the block above, and it must still not touch storage/image_cache.
+# get_image_cache() resolves that dir from config (the repo), so any test
+# reaching /api/video/img or /api/image-cache/* wrote 1-byte fakes into the
+# developer's live cache — from WSL, a second sqlite writer on a WAL the
+# Windows server had open. That corrupted Boulder's index on Sept 15 2026.
+if not _os.environ.get('SOULSYNC_IMAGE_CACHE_DIR'):
+    _TEST_IMAGE_CACHE_DIR = _tempfile.mkdtemp(prefix='soulsync-test-imagecache-')
+    _os.environ['SOULSYNC_IMAGE_CACHE_DIR'] = _TEST_IMAGE_CACHE_DIR
+    _atexit.register(lambda: _shutil.rmtree(_TEST_IMAGE_CACHE_DIR, ignore_errors=True))
+
+# the audiobook db had the same gap: its own path (AUDIOBOOK_DATABASE_PATH,
+# default database/audiobooks.db) was never redirected, so any test importing
+# web_server started the audiobook download monitor against the real file
+# (seen Oct 1 2026 as "Audiobook download tick failed: disk I/O error", the
+# WSL lock being the only thing in the way). outside the READY block for the
+# same reason as the image cache.
+if not _os.environ.get('AUDIOBOOK_DATABASE_PATH'):
+    _TEST_AUDIOBOOK_DIR = _tempfile.mkdtemp(prefix='soulsync-test-audiobooks-')
+    _os.environ['AUDIOBOOK_DATABASE_PATH'] = _os.path.join(_TEST_AUDIOBOOK_DIR, 'test_audiobooks.db')
+    _atexit.register(lambda: _shutil.rmtree(_TEST_AUDIOBOOK_DIR, ignore_errors=True))
 
 import copy
 import os as _os
@@ -1078,43 +1119,6 @@ def _inert_video_enrichment_engine():
     yield engine
 
 
-def _keep_the_video_download_monitor_inert():
-    """Neutralise the video download monitor for the whole pytest process.
-
-    Called at conftest IMPORT, deliberately not from a fixture. web_server.py
-    calls ensure_started(_get_video_db) at module scope, and
-    tests/blocklist/test_blocklist_api.py imports web_server at module scope
-    via importorskip -- so the real daemon launches during COLLECTION, before
-    the first fixture runs. The session fixture below was consequently setting
-    a flag the real launcher had already set itself, on a thread already in
-    the air.
-
-    That thread then lives for the rest of the run, and its loop calls the LIVE
-    db_provider -- get_video_db() -- which resolves to whichever per-test
-    database is installed at that moment: it re-queues orphans, pumps youtube
-    workers and mutates rows inside other tests' databases. It ticks on its own
-    schedule, so which test it lands in is pure timing; that is the whole of the
-    video suite's order-dependence. Caught by the self-describing assert in
-    test_youtube_episode_parity, where its recovery pass called that test's
-    stubbed start_next_queued three extra times (_MAX_CONCURRENT).
-
-    Replacing the launcher instead of only pre-setting the flag also closes the
-    window test_video_health opens when it clears _started to assert the
-    "monitor is not running" health warning. Production is untouched: this runs
-    only inside pytest.
-    """
-    import core.video.download_monitor as monitor
-
-    def _inert_ensure_started(db_provider=None):
-        return None
-
-    monitor.ensure_started = _inert_ensure_started
-    with monitor._lock:
-        monitor._started = True
-
-
-_keep_the_video_download_monitor_inert()
-
 @pytest.fixture(autouse=True, scope='session')
 def _inert_video_download_monitor():
     """Pre-mark the video download monitor as started so no test can spawn it.
@@ -1138,6 +1142,21 @@ def _inert_video_download_monitor():
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _soulseek_ownership_in_memory():
+    """keep the soulseek ownership registry in memory for the suite.
+
+    production saves it in the metadata table so a restart remembers which
+    slskd transfers are ours. every test client shares one session temp db, so
+    saving would leak one test's "owned" ids into the next. tests of the
+    saved registry turn it back on with their own store.
+    """
+    from core.soulseek_client import SoulseekClient
+    SoulseekClient.PERSIST_OWNERSHIP = False
+    yield
+    SoulseekClient.PERSIST_OWNERSHIP = True
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _inert_music_disk_guard():
     """Pin the music min-free-disk guard OFF for the whole suite.
 
@@ -1149,6 +1168,22 @@ def _inert_music_disk_guard():
     dg._floor_override = 0.0
     yield
     dg._floor_override = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _inert_spotify_second_pass_fetch():
+    """no real spotify fetch from the #1721 second pass, anywhere in the suite.
+
+    a mirrored spotify track that misses its metadata source gets fetched by
+    id through SpotipyFree, which is the network. tests of the second pass
+    monkeypatch _free_track with a fake; everything else gets nothing back and
+    the track stays wing it, same as before the second pass existed.
+    """
+    import core.discovery.spotify_second_pass as ssp
+    original = ssp._free_track
+    ssp._free_track = lambda track_id: None
+    yield
+    ssp._free_track = original
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1198,7 +1233,21 @@ def _video_db_assignment_tripwire():
     the one the test's own fixture just installed, with the lazy-create path
     proven silent — so some test-side code ASSIGNS the global out of turn.
     Modules accept a __class__ swap to a ModuleType subclass, which lets us
-    hook attribute assignment without touching production code."""
+    hook attribute assignment without touching production code.
+
+    NO LONGER DIAGNOSTIC-ONLY — this hook is also THE FIX for the phantom
+    (CI Aug 4 2026 finally caught the mechanism in the act): a daemon thread
+    leaked by an earlier test hits get_video_db() while the global is None and
+    starts the slow VideoDatabase build under _video_db_lock; the next test's
+    fixture then installs its own handle WITHOUT the lock, and the build
+    publishes last — clobbering the install with the session-default db.
+    Taking _video_db_lock here serializes every test-side install/teardown
+    against that critical section: an install that arrives mid-build waits and
+    then overwrites (install wins), and a lazy-create that starts after an
+    install sees a non-None slot and never assigns (get_video_db's
+    publish-only-if-still-empty re-check is the production-side belt). Either
+    way, a running test's handle can no longer be replaced under it.
+    Pinned by tests/test_video_db_install_race.py."""
     import os
     import threading
     import traceback
@@ -1218,6 +1267,13 @@ def _video_db_assignment_tripwire():
                          threading.current_thread().name,
                          os.environ.get("PYTEST_CURRENT_TEST", "?"), caller),
                       flush=True)
+                # Serialize against get_video_db()'s lazy-create critical
+                # section so a slow in-flight build can't publish over this
+                # install (see docstring). The lock is never held by a thread
+                # that assigns through here, so this cannot deadlock.
+                with videoapi._video_db_lock:
+                    super().__setattr__(name, value)
+                return
             super().__setattr__(name, value)
 
     videoapi.__class__ = _TracedModule
@@ -1225,6 +1281,109 @@ def _video_db_assignment_tripwire():
         yield
     finally:
         videoapi.__class__ = base
+
+
+@pytest.fixture()
+def video_wishlist_forensics():
+    """Make the rotating video-wishlist flake name its own cause.
+
+    The family's signature never varies: the endpoint reports it WROTE rows
+    (``wished == 2``, ``success: True``), ``wishlist_counts()`` reads back
+    zero, and the assignment tripwire above is clean — the global pointed at
+    the test's own handle the whole time. Three explanations survive that
+    evidence, and a row count taken after the fact cannot separate them:
+
+      1. the write landed in a DIFFERENT database,
+      2. the rows were inserted and then deleted by something else,
+      3. the rows were never inserted at all.
+
+    ``arm(db)`` hangs an AFTER DELETE trigger on video_wishlist, so a delete
+    from ANY connection — a daemon thread outliving its test, calling the live
+    get_video_db(), is the standing suspect — leaves a permanent record in the
+    file itself. The report then prints that record beside the identity and
+    path of both handles, the WAL, and the live thread list.
+
+    Rows present in the delete log => (2), and the log says what was removed.
+    Log empty with the wishlist empty => (3), or (1) if the paths differ.
+
+    Used by the known family members; add it to the next one that flakes
+    rather than re-rolling a 45-minute suite. Diagnostic only — the trigger
+    lives on a per-test tmp database and no production code is touched.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    class _Forensics:
+        def arm(self, db):
+            """Start recording deletes on this database. Call once, early."""
+            conn = sqlite3.connect(str(db.database_path))
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS _diag_wishlist_deletes (
+                        kind TEXT, tmdb_id INTEGER, season_number INTEGER,
+                        episode_number INTEGER, at TEXT DEFAULT CURRENT_TIMESTAMP);
+                    CREATE TRIGGER IF NOT EXISTS _diag_wishlist_del
+                    AFTER DELETE ON video_wishlist BEGIN
+                        INSERT INTO _diag_wishlist_deletes
+                            (kind, tmdb_id, season_number, episode_number)
+                        VALUES (old.kind, old.tmdb_id, old.season_number, old.episode_number);
+                    END;
+                    """)
+                conn.commit()
+            finally:
+                conn.close()
+
+        def __call__(self, db, note=""):
+            import threading
+
+            import api.video as videoapi
+            import core.video.download_events as events
+            import core.video.download_monitor as monitor
+
+            out = ["[wishlist forensics] %s" % note]
+
+            def describe(label, handle):
+                if handle is None:
+                    out.append("  %-17s: None" % label)
+                    return
+                path = Path(handle.database_path)
+                out.append("  %-17s: id=%s exists=%s size=%s path=%s"
+                           % (label, hex(id(handle)), path.exists(),
+                              path.stat().st_size if path.exists() else "-", path))
+
+            describe("test handle", db)
+            describe("api.video global", videoapi._video_db)
+            out.append("  %-17s: %s" % ("same handle", videoapi._video_db is db))
+
+            conn = sqlite3.connect(str(db.database_path))
+            try:
+                rows = conn.execute(
+                    "SELECT kind, tmdb_id, season_number, episode_number "
+                    "FROM video_wishlist ORDER BY rowid").fetchall()
+                out.append("  %-17s: %s" % ("wishlist rows", rows or "EMPTY"))
+                try:
+                    gone = conn.execute(
+                        "SELECT kind, tmdb_id, season_number, episode_number, at "
+                        "FROM _diag_wishlist_deletes ORDER BY rowid").fetchall()
+                    out.append("  %-17s: %s" % (
+                        "deletes recorded",
+                        gone or "NONE - nothing was ever deleted from THIS file"))
+                except sqlite3.Error:
+                    out.append("  %-17s: (not armed)" % "deletes recorded")
+            finally:
+                conn.close()
+
+            wal = Path(str(db.database_path) + "-wal")
+            out.append("  %-17s: exists=%s size=%s"
+                       % ("wal", wal.exists(), wal.stat().st_size if wal.exists() else "-"))
+            out.append("  %-17s: %s" % ("live threads", [
+                t.name for t in threading.enumerate() if t is not threading.main_thread()]))
+            out.append("  %-17s: forwarders=%d monitor._started=%s"
+                       % ("leak guards", len(events._forwarders), monitor._started))
+            return "\n".join(out)
+
+    return _Forensics()
 
 
 @pytest.fixture(autouse=True)
@@ -1242,6 +1401,32 @@ def reset_state(_inert_video_enrichment_engine, _inert_video_download_monitor):
     # between tests like any other module-global.
     from core.slskd_throttle import _reset_for_tests
     _reset_for_tests()
+    # Deezer API throttle: same shape, same trap. core.deezer_throttle owns one
+    # process-wide 5s window shared by every Deezer caller, and 188 test files
+    # touch a Deezer path. Reservations are FUTURE times, so left to accumulate
+    # they march forward all session — a test several hundred calls in would
+    # sleep a real minute waiting for a slot it was never really queued for.
+    from core.deezer_throttle import _reset_for_tests as _reset_deezer_throttle
+    _reset_deezer_throttle()
+    # Prowlarr search throttle: third one of exactly this shape
+    # (core.prowlarr_throttle). One process-wide window shared by the music
+    # download plugins and the video acquisition paths, reservations are future
+    # times, so left alone they march forward all session and a later test
+    # sleeps for a slot it was never really queued for. It already cost the
+    # #1151 fan-out timing guard a false failure: 1.99s against a 0.15s budget,
+    # every bit of it a previous test's reservation.
+    from core.prowlarr_throttle import _reset_for_tests as _reset_prowlarr_throttle
+    _reset_prowlarr_throttle()
+    # Video download-source cooldowns (core.automation.handlers.
+    # video_process_wishlist): two process-wide dicts keyed by (item, transport).
+    # Two client refusals put that pair on a SIX HOUR cooldown, and the test
+    # items all look alike ('A' on torrent), so one test recording refusals made
+    # every later test in the process find its candidates cooled and grab
+    # nothing. That is how eight refusal-walk tests failed together with an
+    # empty `tried` list while each passed alone. Fourth module-global of this
+    # exact shape; same treatment.
+    from core.automation.handlers.video_process_wishlist import reset_source_cooldowns
+    reset_source_cooldowns()
     # Enrichment status TTL cache (core.enrichment.api): a cached stats dict
     # must never leak into the next test's registry (same service id, new fake).
     from core.enrichment.api import _invalidate_status_cache
@@ -1328,3 +1513,99 @@ def reset_state(_inert_video_enrichment_engine, _inert_video_download_monitor):
     media_scan_state.update(copy.deepcopy(_DEFAULT_MEDIA_SCAN_STATE))
     wishlist_stats_state.clear()
     wishlist_stats_state.update(copy.deepcopy(_DEFAULT_WISHLIST_STATS))
+
+
+# ---------------------------------------------------------------------------
+# Shared async bridge — isolation for tests that tear the loop down
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolated_async_loop():
+    """Swap ``utils.async_helpers``'s process-wide loop for a private one.
+
+    ``run_async`` is a singleton bridge: one loop thread serves every caller in
+    the process. A test that stops that loop to prove the rebuild path also
+    abandons whatever another subsystem has in flight on it — those callers
+    hold a ``concurrent.futures.Future`` that will never resolve and block on
+    the default ``timeout=None``, hanging the pytest session instead of failing
+    one test. Yields the module with a freshly-built private loop installed and
+    restores the original globals afterwards.
+    """
+    import utils.async_helpers as helpers
+
+    with helpers._lock:
+        saved_loop, saved_thread = helpers._loop, helpers._thread
+        helpers._loop = helpers._thread = None
+    try:
+        helpers._get_loop()
+        yield helpers
+    finally:
+        borrowed_loop, borrowed_thread = helpers._loop, helpers._thread
+        with helpers._lock:
+            helpers._loop, helpers._thread = saved_loop, saved_thread
+        if borrowed_loop is not None and not borrowed_loop.is_closed():
+            borrowed_loop.call_soon_threadsafe(borrowed_loop.stop)
+        if borrowed_thread is not None:
+            borrowed_thread.join(timeout=5)
+
+
+@pytest.fixture(autouse=True)
+def _web_server_clients_start_as_the_admin():
+    """a web_server test client starts as the admin who picked their card.
+
+    a browser with no profile in its session is only the admin on a
+    single-profile install (core.security.session_profile). the suite shares
+    one db that gathers many profiles, so a bare test client used to ride the
+    old "no session = admin" fallback. tests that want a browser with nothing
+    picked clear the session themselves (``session_transaction().clear()``).
+    """
+    import sys
+
+    ws = sys.modules.get('web_server')
+    if ws is None or not hasattr(ws, 'app'):
+        yield
+        return
+    from flask.testing import FlaskClient
+
+    class _AdminSessionClient(FlaskClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            with self.session_transaction() as sess:
+                sess.setdefault('profile_id', 1)
+
+    saved = ws.app.test_client_class
+    ws.app.test_client_class = _AdminSessionClient
+    try:
+        yield
+    finally:
+        ws.app.test_client_class = saved
+
+
+@pytest.fixture
+def server_tz(monkeypatch):
+    """set the server's local timezone for one test. played_at is stored
+    utc and hour-of-day charts read it in local time, so a test that seeds
+    hours picks the zone it means. call with a tz name, e.g. server_tz('UTC')"""
+    def _set(name):
+        monkeypatch.setenv('TZ', name)
+        time.tzset()
+    yield _set
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.fixture
+def utc_server(server_tz):
+    """the server's local time is utc: a stored hour is the hour shown"""
+    server_tz('UTC')
+
+
+@pytest.fixture(autouse=True)
+def _no_background_playlist_identify(monkeypatch):
+    """an edit to a user playlist queues a background identify. importing
+    web_server wires that to the real discovery worker, so any test that
+    touches the user-playlist routes afterwards would start real discovery
+    threads. unhooked here; the auto_identify tests hook their own runner."""
+    from core.playlists import auto_identify
+    monkeypatch.setattr(auto_identify, "_runner", None)

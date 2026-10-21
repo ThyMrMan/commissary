@@ -581,6 +581,7 @@ def test_get_album_resolves_release_group_mbid_to_release():
             {'position': 1, 'tracks': [
                 {'id': 't1', 'number': '1', 'position': 1, 'length': 50000,
                  'recording': {'id': 'rec-1', 'title': 'BLOOD.',
+                               'disambiguation': 'live',
                                'artist-credit': [{'name': 'Kendrick Lamar'}], 'length': 50000}},
             ]},
         ],
@@ -597,9 +598,11 @@ def test_get_album_resolves_release_group_mbid_to_release():
     )
     assert album is not None
     assert album['id'] == 'rg-damn'  # Canonical ID stays the release-group MBID.
+    assert album['musicbrainz_release_id'] == 'rel-official'
     assert album['name'] == 'DAMN.'
     assert len(album['tracks']) == 1
     assert album['tracks'][0]['name'] == 'BLOOD.'
+    assert album['tracks'][0]['disambiguation'] == 'live'
     assert 'release-group' in album['external_urls']['musicbrainz']
 
 
@@ -625,6 +628,7 @@ def test_get_album_falls_back_to_release_lookup_on_rg_miss():
     client._client.get_release.assert_called_once()
     assert album is not None
     assert album['id'] == 'rel-abc'  # Falls back to release MBID since rg lookup missed.
+    assert album['musicbrainz_release_id'] == 'rel-abc'
 
 
 # ---------------------------------------------------------------------------
@@ -840,6 +844,17 @@ def test_recording_to_track_no_release_defaults_total_tracks_to_one():
     assert track.total_tracks == 1
 
 
+def test_recording_to_track_keeps_disambiguation_separate():
+    client = MusicBrainzSearchClient()
+    track = client._recording_to_track({
+        'id': 'rec-acoustic', 'title': 'Dear Maria, Count Me In',
+        'disambiguation': ' Connect Sets acoustic ', 'releases': [],
+    }, 'All Time Low')
+
+    assert track.name == 'Dear Maria, Count Me In'
+    assert track.disambiguation == 'Connect Sets acoustic'
+
+
 def test_pick_representative_release_prefers_official_with_media():
     """The release picker should skip stub releases (no media) and pick
     Official over Promotion status."""
@@ -885,6 +900,7 @@ def test_get_recording_flat_happy_path():
     client._client.get_recording.return_value = {
         'id': 'rec-abc',
         'title': 'Army of Me',
+        'disambiguation': 'live',
         'length': 234000,
         'artist-credit': [{'artist': {'name': 'Björk'}}],
         'releases': [{
@@ -902,6 +918,8 @@ def test_get_recording_flat_happy_path():
     assert track is not None
     assert track['id'] == 'rec-abc'
     assert track['name'] == 'Army of Me'
+    assert track['source'] == 'musicbrainz'
+    assert track['disambiguation'] == 'live'
     assert track['artists'] == ['Björk']  # flat list of strings, not Spotify-shaped objects
     assert track['album'] == 'Post'        # flat string, not nested dict
     assert track['duration_ms'] == 234000
@@ -945,6 +963,7 @@ def test_get_recording_flat_recording_without_release():
 
     assert track is not None
     assert track['name'] == 'Untitled Demo'
+    assert track['disambiguation'] == ''
     assert track['album'] == ''
     assert track['image_url'] == ''
     assert track['artists'] == ['Unknown']
@@ -1340,3 +1359,128 @@ def test_release_group_projection_preserves_secondary_types():
 
     assert album.album_type == 'compilation'          # Compilation secondary → compilation bucket
     assert album.secondary_types == ['Live', 'Compilation']
+
+
+# ---------------------------------------------------------------------------
+# #1297 artist + title in one box. MB ranks by text, so the song's words put a
+# jazz act named after the song on top and gotye second. the albums and tracks
+# tabs then browsed the jazz act.
+# ---------------------------------------------------------------------------
+
+from core.musicbrainz_search import _pick_query_artist, _split_on_artist
+
+_GOTYE_QUERY = 'Gotye somebody that i used to know'
+_GOTYE_RAW = [
+    _mk_artist('Somebody That I Used to Know', 'mb-jazz', score=100),
+    _mk_artist('Gotye', 'mb-gotye', score=76),
+    _mk_artist('I Know That You Know', 'mb-other', score=71),
+]
+
+
+def test_split_on_artist_reads_the_title_from_either_end():
+    assert _split_on_artist(_GOTYE_QUERY, 'Gotye') == 'somebody that i used to know'
+    assert _split_on_artist('somebody that i used to know gotye', 'Gotye') == \
+        'somebody that i used to know'
+    assert _split_on_artist('Gotye', 'Gotye') is None
+    # in the middle is not a split, it's a coincidence
+    assert _split_on_artist('the gotye song', 'Gotye') is None
+
+
+def test_split_on_artist_ignores_case_accents_and_punctuation_but_keeps_the_typed_title():
+    assert _split_on_artist("guns n roses don't cry", 'Guns N’ Roses') == "don't cry"
+    assert _split_on_artist('bjork army of me', 'Björk') == 'army of me'
+
+
+def test_pick_query_artist_takes_the_artist_the_query_splits_on():
+    assert _pick_query_artist(_GOTYE_RAW, _GOTYE_QUERY, 80)['id'] == 'mb-gotye'
+
+
+def test_pick_query_artist_keeps_mb_top_for_a_fuzzy_bare_name():
+    # the parody act is named exactly what was typed, but "metalica" means
+    # metallica and MB already says so
+    raw = [_mk_artist('Metallica', 'mb-real', score=100),
+           _mk_artist('Metalica', 'mb-parody', score=94)]
+    assert _pick_query_artist(raw, 'metalica', 80)['id'] == 'mb-real'
+
+
+def test_pick_query_artist_does_not_split_a_band_named_the_whole_query():
+    raw = [_mk_artist('Guns N’ Roses', 'mb-gnr', score=100),
+           _mk_artist('Guns', 'mb-guns', score=90)]
+    assert _pick_query_artist(raw, 'guns n roses', 80)['id'] == 'mb-gnr'
+    # even when a partial name outranks it
+    raw = [_mk_artist('Guns', 'mb-guns', score=100),
+           _mk_artist('Guns N’ Roses', 'mb-gnr', score=95)]
+    assert _pick_query_artist(raw, 'guns n roses', 80)['id'] == 'mb-gnr'
+
+
+def test_pick_query_artist_prefers_the_longer_leading_name():
+    raw = [_mk_artist('The', 'mb-the', score=100),
+           _mk_artist('The Beatles', 'mb-beatles', score=90)]
+    assert _pick_query_artist(raw, 'the beatles abbey road', 80)['id'] == 'mb-beatles'
+
+
+def test_pick_query_artist_split_still_needs_some_score():
+    raw = [_mk_artist('Somebody That I Used to Know', 'mb-jazz', score=100),
+           _mk_artist('Gotye', 'mb-gotye', score=30)]
+    # gotye too weak to trust, the jazz act still splits the query from the end
+    assert _pick_query_artist(raw, _GOTYE_QUERY, 80)['id'] == 'mb-jazz'
+
+
+def test_search_tracks_artist_plus_title_searches_the_song_not_the_discography():
+    client = MusicBrainzSearchClient()
+    client._client = MagicMock()
+    client._client.search_artist.return_value = list(_GOTYE_RAW)
+    client._client.search_recording.return_value = [{
+        'id': 'rec-1', 'title': 'Somebody That I Used to Know', 'score': 100,
+        'artist-credit': [{'artist': {'name': 'Gotye'}}], 'releases': [],
+    }]
+
+    tracks = client.search_tracks(_GOTYE_QUERY, limit=10)
+
+    assert [(t.name, t.artists) for t in tracks] == [('Somebody That I Used to Know', ['Gotye'])]
+    args, kwargs = client._client.search_recording.call_args
+    assert args[0] == 'somebody that i used to know'
+    assert kwargs['artist_name'] == 'Gotye'
+    client._client.search_recordings_by_artist_mbid.assert_not_called()
+
+
+def test_search_albums_artist_plus_title_browses_the_right_artist():
+    client = MusicBrainzSearchClient()
+    client._client = MagicMock()
+    client._client.search_artist.return_value = list(_GOTYE_RAW)
+    client._client.browse_artist_release_groups.return_value = []
+    client._client.search_release.return_value = []
+
+    client.search_albums(_GOTYE_QUERY, limit=10)
+
+    assert client._client.browse_artist_release_groups.call_args[0][0] == 'mb-gotye'
+
+
+def test_search_artists_leads_with_the_artist_the_query_means():
+    client = MusicBrainzSearchClient()
+    client._client = MagicMock()
+    client._client.search_artist.return_value = list(_GOTYE_RAW)
+
+    results = client.search_artists(_GOTYE_QUERY, limit=10)
+
+    # gotye scores 76, under the usual floor, and still leads
+    assert [a.name for a in results] == ['Gotye', 'Somebody That I Used to Know']
+
+
+def test_fix_search_response_includes_recording_disambiguation(monkeypatch):
+    from flask import Flask
+
+    from api.source_playlists import search_musicbrainz_tracks
+    from core.musicbrainz_search import Track
+
+    client = MagicMock()
+    client.search_tracks.return_value = [Track(
+        id='rec-live', name='Song', artists=['Artist'], album='Album',
+        duration_ms=180000, popularity=0, disambiguation='live',
+    )]
+    monkeypatch.setattr('core.musicbrainz_search.MusicBrainzSearchClient', lambda: client)
+
+    with Flask(__name__).test_request_context('/api/musicbrainz/search_tracks?query=Song'):
+        response = search_musicbrainz_tracks()
+
+    assert response.get_json()['tracks'][0]['disambiguation'] == 'live'

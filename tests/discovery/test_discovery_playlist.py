@@ -72,6 +72,7 @@ class _FakeDB:
         self._cache_match = cache_match
         self.extra_data_writes = []
         self.cache_saves = []
+        self.artist_adoptions = []
 
     def get_mirrored_playlist_tracks(self, pl_id):
         return self._tracks.get(pl_id, [])
@@ -81,6 +82,9 @@ class _FakeDB:
 
     def update_mirrored_track_extra_data(self, track_id, extra_data):
         self.extra_data_writes.append((track_id, extra_data))
+
+    def adopt_discovered_artist(self, track_id, artist_name):
+        self.artist_adoptions.append((track_id, artist_name))
 
     def save_discovery_cache_match(self, title, artist, source, conf, data, raw_t, raw_a):
         self.cache_saves.append((title, artist, source, conf))
@@ -104,6 +108,7 @@ def _build_deps(
     score_result=(None, 0.0, 0),
     auto_progress_log=None,
     activity_log=None,
+    lookup_artist_aliases=None,
 ):
     auto_progress_log = auto_progress_log if auto_progress_log is not None else []
     db = _FakeDB(tracks_by_playlist=tracks_by_playlist or {}, cache_match=cache_match)
@@ -130,6 +135,7 @@ def _build_deps(
         build_discovery_wing_it_stub=lambda title, artist, dur: {
             'name': title, 'artists': [artist], 'duration_ms': dur, 'wing_it': True
         },
+        lookup_artist_aliases=lookup_artist_aliases,
     )
     deps._db = db
     deps._spotify = spotify
@@ -538,3 +544,356 @@ def test_canonical_best_score_keeps_original_when_better():
     match, conf = dp._canonical_best_score(
         deps, 'Arctic Monkeys - Do I Wanna Know?', 'Arctic Monkeys', 0, ['r'])
     assert (match, conf) == ('ORIG', 0.9)
+
+
+# ---------------------------------------------------------------------------
+# Artist alias fallback
+# ---------------------------------------------------------------------------
+
+def _alias_deps(*, aliases, results_for, score_for, calls=None):
+    """Deps whose provider only answers for certain queries and whose scorer
+    only pays out for certain source artists — so a test can prove WHICH
+    artist name did the work."""
+    calls = calls if calls is not None else []
+
+    class _Client:
+        def __init__(self):
+            self.search_calls = []
+
+        def is_spotify_authenticated(self):
+            return True
+
+        def search_tracks(self, query, limit=10):
+            self.search_calls.append(query)
+            return results_for(query)
+
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1, name='sun to me', artist='mgk')]},
+        lookup_artist_aliases=lambda name: (calls.append(name) or aliases),
+    )
+    client = _Client()
+    deps.spotify_client = client
+    deps._spotify = client
+    deps.discovery_score_candidates = score_for
+    deps._alias_calls = calls
+    return deps
+
+
+_MGK = _FakeMatch(name='sun to me', artists=['Machine Gun Kelly'])
+
+
+def _only_alias_query(query):
+    return [_MGK] if 'Machine Gun Kelly' in query else []
+
+
+def _score_only_for(expected_artist, conf=0.99):
+    def _score(title, artist, duration_ms, results):
+        if artist == expected_artist and results:
+            return (_MGK, conf, 0)
+        return (None, 0.0, 0)
+    return _score
+
+
+def test_alias_rescues_a_track_the_source_artist_name_cannot_find():
+    """"mgk" and "Machine Gun Kelly" are different names for one artist, so the
+    0.5 artist floor discards a perfect title match. The alias must recover it."""
+    deps = _alias_deps(
+        aliases=['mgk', 'Machine Gun Kelly'],
+        results_for=_only_alias_query,
+        score_for=_score_only_for('Machine Gun Kelly'),
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert len(deps._db.extra_data_writes) == 1
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra.get('discovered') is True
+    assert not extra.get('wing_it_fallback')
+    assert extra['matched_data']['name'] == 'sun to me'
+
+
+def test_alias_lookup_is_skipped_when_the_track_already_matched():
+    """The lookup is a network call — the common path must not pay for it."""
+    match = _FakeMatch()
+    calls = []
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1)]},
+        spotify_results=[match],
+        score_result=(match, 0.95, 0),
+        lookup_artist_aliases=lambda name: calls.append(name) or ['Whoever'],
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert calls == []
+
+
+def test_alias_equal_to_the_source_artist_is_not_re_searched():
+    """MB returns the artist's own name in its alias list; searching it again
+    would just repeat the query that already failed."""
+    deps = _alias_deps(
+        aliases=['mgk', 'MGK', 'Machine Gun Kelly'],
+        results_for=_only_alias_query,
+        score_for=_score_only_for('Machine Gun Kelly'),
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    # 'mgk' and 'MGK' are the same name case-folded — only one extra query.
+    alias_queries = [q for q in deps._spotify.search_calls if 'Machine Gun Kelly' in q]
+    assert len(alias_queries) == 1
+    assert not any(q.startswith('MGK ') for q in deps._spotify.search_calls)
+
+
+def test_alias_does_not_override_a_better_existing_match():
+    """Additive only: a weaker alias hit must not displace a stronger one."""
+    strong = _FakeMatch(name='strong', artists=['mgk'])
+    weak = _FakeMatch(name='weak', artists=['Machine Gun Kelly'])
+
+    def _score(title, artist, duration_ms, results):
+        if artist == 'mgk':
+            return (strong, 0.80, 0)
+        return (weak, 0.75, 0)
+
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1, name='sun to me', artist='mgk')]},
+        spotify_results=[strong, weak],
+        lookup_artist_aliases=lambda name: ['Machine Gun Kelly'],
+    )
+    deps.discovery_score_candidates = _score
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra['matched_data']['name'] == 'strong'
+
+
+def test_alias_lookup_failure_degrades_to_wing_it():
+    """A raising lookup (MB down) must not break discovery."""
+    def _boom(name):
+        raise RuntimeError('musicbrainz unreachable')
+
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1)]},
+        spotify_results=[],
+        lookup_artist_aliases=_boom,
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra.get('wing_it_fallback') is True
+
+
+def test_alias_query_uses_the_canonicalized_title():
+    """A file/CSV import can keep a raw "Artist - Title" source title (#785).
+    Without canonicalizing first, the alias query becomes "Machine Gun Kelly
+    mgk - sun to me" — which the provider has nothing to match — instead of
+    "Machine Gun Kelly sun to me"."""
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1, name='mgk - sun to me', artist='mgk')]},
+        lookup_artist_aliases=lambda name: ['Machine Gun Kelly'],
+    )
+    client = deps.spotify_client
+
+    def _search(query, limit=10):
+        client.search_calls.append(query)
+        return [_MGK] if query == 'Machine Gun Kelly sun to me' else []
+    client.search_tracks = _search
+    deps.discovery_score_candidates = _score_only_for('Machine Gun Kelly')
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra.get('discovered') is True
+    assert extra['matched_data']['name'] == 'sun to me'
+
+
+def test_alias_rescues_a_track_via_itunes_when_spotify_is_not_active():
+    """The alias fallback also has to work on the non-Spotify path — it queries
+    `itunes_client_instance`, a name resolved fresh from
+    `get_metadata_fallback_client()` inside the worker, not `deps.spotify_client`."""
+    calls = []
+
+    class _ITunesClient:
+        def __init__(self):
+            self.search_calls = []
+
+        def search_tracks(self, query, limit=10):
+            self.search_calls.append(query)
+            return [_MGK] if 'Machine Gun Kelly' in query else []
+
+    itunes = _ITunesClient()
+    deps = _build_deps(
+        discovery_source='itunes',
+        tracks_by_playlist={'p1': [_track(track_id=1, name='sun to me', artist='mgk')]},
+        lookup_artist_aliases=lambda name: (calls.append(name) or ['Machine Gun Kelly']),
+    )
+    deps.get_metadata_fallback_client = lambda: itunes
+    deps.discovery_score_candidates = _score_only_for('Machine Gun Kelly')
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert calls == ['mgk']
+    assert any('Machine Gun Kelly' in q for q in itunes.search_calls)
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra.get('discovered') is True
+    assert not extra.get('wing_it_fallback')
+    assert extra['matched_data']['name'] == 'sun to me'
+
+
+def test_no_alias_dep_wired_is_not_an_error():
+    """The dep is optional — older wiring must keep working."""
+    deps = _build_deps(
+        tracks_by_playlist={'p1': [_track(track_id=1)]},
+        spotify_results=[],
+    )
+    assert deps.lookup_artist_aliases is None
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    extra = deps._db.extra_data_writes[0][1]
+    assert extra.get('wing_it_fallback') is True
+
+
+# ---------------------------------------------------------------------------
+# M12: enrichment-attempt marker on fresh matches with unknown track_number
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_match_with_unknown_track_number_persists_attempt_marker():
+    """M12: when a fresh match completes with track_number=None (the provider
+    doesn't know it), the worker must persist
+    'track_number_unknown_enrichment_attempted' so the pipeline pre-scan gate
+    treats the match as complete instead of re-discovering it forever."""
+    match = _FakeMatch()
+    match.track_number = None  # provider genuinely doesn't know it
+    match.disc_number = None
+    tracks = [_track(track_id=1)]
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.95, 0),
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert len(deps._db.extra_data_writes) == 1
+    _, extra = deps._db.extra_data_writes[0]
+    assert extra['matched_data']['track_number'] is None
+    assert extra['track_number_unknown_enrichment_attempted'] is True
+
+
+def test_fresh_match_with_known_track_number_has_no_attempt_marker():
+    """No marker when the track number is known — nothing to excuse."""
+    match = _FakeMatch()
+    match.track_number = 8
+    match.disc_number = 2
+    tracks = [_track(track_id=1)]
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.95, 0),
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert len(deps._db.extra_data_writes) == 1
+    _, extra = deps._db.extra_data_writes[0]
+    assert extra['matched_data']['track_number'] == 8
+    assert 'track_number_unknown_enrichment_attempted' not in extra
+
+
+def test_marked_match_is_not_rediscovered_next_run():
+    """End-to-end M12: a marked match written by run 1 is skipped by run 2's
+    pre-scan (should_rediscover) — the loop terminates."""
+    from core.discovery.manual_match import should_rediscover
+
+    match = _FakeMatch()
+    match.track_number = None
+    match.disc_number = None
+    tracks = [_track(track_id=1)]
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.95, 0),
+    )
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+    _, extra = deps._db.extra_data_writes[0]
+
+    # simulate the next pipeline pre-scan reading the merged extra_data back
+    assert should_rediscover(extra) is False
+
+
+# ---------------------------------------------------------------------------
+# S6: honest discovery counters (Wing It stubs are not "discovered")
+# ---------------------------------------------------------------------------
+
+
+def test_wing_it_rows_reported_separately_from_matched():
+    """S6: an all-miss run must not report its Wing It stubs as discovered —
+    the completion event carries matched/wing-it separately, with
+    discovered_count kept as total rows written for compatibility."""
+    match = _FakeMatch()
+    tracks = [_track(track_id=1), _track(track_id=2)]
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.5, 0),  # below threshold → Wing It for both
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    events = [d for name, d in deps._auto.events if name == 'discovery_completed']
+    assert len(events) == 1
+    payload = events[0]
+    assert payload['wing_it_count'] == '2'
+    assert payload['matched_count'] == '0'
+    assert payload['failed_count'] == '0'
+    # total rows written — preserved for existing consumers
+    assert payload['discovered_count'] == '2'
+
+
+def test_mixed_run_reports_matched_and_wing_it_honestly():
+    """One real match + one Wing It stub → matched_count=1, wing_it_count=1."""
+    match = _FakeMatch()
+    tracks = [_track(track_id=1), _track(track_id=2)]
+    calls = {'n': 0}
+
+    def scorer(title, artist, duration_ms, results):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return (match, 0.95, 0)
+        return (None, 0.0, -1)
+
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.95, 0),
+    )
+    deps.discovery_score_candidates = scorer
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    events = [d for name, d in deps._auto.events if name == 'discovery_completed']
+    assert len(events) == 1
+    payload = events[0]
+    assert payload['matched_count'] == '1', payload
+    assert payload['wing_it_count'] == '1', payload
+    assert payload['discovered_count'] == '2', payload
+
+
+def test_discovery_completed_still_emitted_for_wing_it_only():
+    """S6: downstream triggering is preserved — Wing It rows were written,
+    so discovery_completed must still fire."""
+    match = _FakeMatch()
+    tracks = [_track(track_id=1)]
+    deps = _build_deps(
+        tracks_by_playlist={'p1': tracks},
+        spotify_results=[match],
+        score_result=(match, 0.5, 0),
+    )
+
+    dp.run_playlist_discovery_worker([_playlist('p1')], deps=deps)
+
+    assert any(name == 'discovery_completed' for name, _ in deps._auto.events)

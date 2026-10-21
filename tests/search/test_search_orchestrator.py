@@ -255,20 +255,45 @@ def test_short_query_skips_remote_search():
     db_artist = _Artist('a1', 'Aretha', thumb_url='http://x/a.jpg')
     deps = _build_deps(database=_DB(artists=[db_artist]))
 
-    result = orchestrator.run_enhanced_search('aa', '', deps)
+    result = orchestrator.run_enhanced_search('a', '', deps)
     assert result['db_artists'][0]['name'] == 'Aretha'
     assert result['spotify_artists'] == []
     assert result['spotify_albums'] == []
     assert result['spotify_tracks'] == []
+    assert result['spotify_playlists'] == []
     assert result['primary_source'] == 'spotify'
     assert result['alternate_sources'] == []
 
 
 def test_short_query_with_explicit_source_uses_that_source_label():
     deps = _build_deps()
-    result = orchestrator.run_enhanced_search('aa', 'deezer', deps)
+    result = orchestrator.run_enhanced_search('a', 'deezer', deps)
     assert result['primary_source'] == 'deezer'
     assert result['metadata_source'] == 'deezer'
+    assert result['spotify_playlists'] == []
+
+
+def test_a_two_character_name_reaches_the_remote_search():
+    """#1291: U2 and A1 are real artists. a 3-char floor returned nothing."""
+    spot = _Client(authed=True, artists=[_Artist('s1', 'U2')])
+    deps = _build_deps(spotify_client=spot)
+    result = orchestrator.run_enhanced_search('U2', 'spotify', deps)
+
+    assert [a['name'] for a in result['spotify_artists']] == ['U2']
+
+
+def test_single_source_deezer_includes_playlists():
+    deezer = _Client(name='deezer')
+    deezer.search_playlists = lambda q, limit=10: [
+        {'id': 'p1', 'title': 'Lofi Beats', 'creator': 'ChilledCow', 'nb_tracks': 40, 'image_url': 'http://img', 'link': 'http://link'}
+    ]
+    deps = _build_deps(get_deezer_client=lambda: deezer)
+    result = orchestrator.run_enhanced_search('lofi', 'deezer', deps)
+    assert result['source_available'] is True
+    assert len(result['spotify_playlists']) == 1
+    assert result['spotify_playlists'][0]['name'] == 'Lofi Beats'
+    assert result['spotify_playlists'][0]['creator'] == 'ChilledCow'
+    assert result['spotify_playlists'][0]['track_count'] == 40
 
 
 # ---------------------------------------------------------------------------
@@ -326,13 +351,21 @@ def test_single_source_spotify_unavailable_when_package_missing():
 
 def test_single_source_search_failure_returns_empty():
     spot = _Client(authed=True, fail_search=True)
+    # the _Client fake has no search_playlists: give it a failing one so the
+    # model is a total provider outage, not a client that simply lacks
+    # playlist search (which legitimately returns []).
+    def _boom(q, limit=10):
+        raise RuntimeError("client search boom")
+    spot.search_playlists = _boom
     deps = _build_deps(spotify_client=spot)
-    result = orchestrator.run_enhanced_search('q', 'spotify', deps)
-    # search_source still returns a wrapper because per-kind exceptions are
-    # swallowed inside it, so we get [] for each kind, source_available=True
+    result = orchestrator.run_enhanced_search('pink floyd', 'spotify', deps)
+    # M16: per-kind failures are counted, so a total provider outage is
+    # distinguishable from a healthy empty result — source_available=False
+    # keeps the outage response out of the enhanced-search cache.
     assert result['spotify_artists'] == []
     assert result['spotify_albums'] == []
     assert result['spotify_tracks'] == []
+    assert result['source_available'] is False
 
 
 # ---------------------------------------------------------------------------
@@ -582,6 +615,49 @@ def test_stream_youtube_videos_yields_videos_chunk_and_done():
     assert out[-1]['type'] == 'done'
 
 
+def test_stream_youtube_videos_passes_the_limit_to_yt_dlp():
+    # the artist page's "show more" asks for a bigger pool. the ask has to
+    # reach search_videos, or the page refetches and gets the same 20 back.
+    seen = {}
+
+    class _CountingYT:
+        async def search_videos(self, q, max_results=20):
+            seen['max_results'] = max_results
+            return [_FakeYouTubeVideo(f'v{i}') for i in range(max_results)]
+
+    out = _drain(orchestrator.stream_youtube_videos('q', _CountingYT(), _sync_run_async, max_results=60))
+    assert seen['max_results'] == 60
+    assert len(out[0]['data']) == 60
+
+
+def test_stream_youtube_videos_default_limit_is_unchanged():
+    seen = {}
+
+    class _CountingYT:
+        async def search_videos(self, q, max_results=None):
+            seen['max_results'] = max_results
+            return []
+
+    _drain(orchestrator.stream_youtube_videos('q', _CountingYT(), _sync_run_async))
+    assert seen['max_results'] == orchestrator.YOUTUBE_VIDEO_LIMIT_DEFAULT == 20
+
+
+def test_clamp_youtube_video_limit():
+    clamp = orchestrator.clamp_youtube_video_limit
+    # missing or junk means the old default, so an old client is unchanged
+    assert clamp(None) == 20
+    assert clamp('') == 20
+    assert clamp('abc') == 20
+    # a real ask is honoured up to the ceiling; strings from json are fine
+    assert clamp(60) == 60
+    assert clamp('40') == 40
+    assert clamp(8) == 8
+    # nothing lets a client make yt-dlp page forever, or ask for nothing
+    assert clamp(500) == 60
+    assert clamp(0) == 1
+    assert clamp(-3) == 1
+
+
 def test_stream_youtube_videos_search_failure_yields_empty_videos():
     class _BadYT:
         async def search_videos(self, q, max_results=20):
@@ -590,3 +666,63 @@ def test_stream_youtube_videos_search_failure_yields_empty_videos():
     out = _drain(orchestrator.stream_youtube_videos('q', _BadYT(), _sync_run_async))
     assert out[0] == {'type': 'videos', 'data': []}
     assert out[-1] == {'type': 'done'}
+
+
+def test_single_source_spotify_prefer_free_even_when_resolver_serves_the_client():
+    """REGRESSION (the 'spotify search shows deezer results' report): the
+    request-scoped free opt-in can make is_spotify_metadata_available True for
+    an explicitly-Spotify request, so resolve_client hands the client back —
+    but the actual searches run in ThreadPoolExecutor workers where the Flask
+    request context is invisible. prefer_free must be keyed on AUTH STATE, not
+    on resolve_client failing, or the workers silently serve the Deezer/iTunes
+    fallback under the Spotify label."""
+    spot = _Client(authed=False, meta_available=True, free_installed=True,
+                   artists=[_Artist('s1', 'Free Spot Artist')])
+    deps = _build_deps(spotify_client=spot)
+    result = orchestrator.run_enhanced_search('kendrick lamar', 'spotify', deps)
+
+    assert result['spotify_artists'][0]['name'] == 'Free Spot Artist'
+    assert spot.prefer_free_seen is True
+
+
+def test_single_source_spotify_authed_never_prefers_free():
+    """Authed + healthy stays on the official API — prefer_free must not fire."""
+    spot = _Client(authed=True, meta_available=True, free_installed=True,
+                   artists=[_Artist('s1', 'Official Artist')])
+    deps = _build_deps(spotify_client=spot)
+    result = orchestrator.run_enhanced_search('kendrick lamar', 'spotify', deps)
+
+    assert result['spotify_artists'][0]['name'] == 'Official Artist'
+    assert spot.prefer_free_seen is False
+
+
+def test_fanout_all_kinds_failing_marks_source_unavailable():
+    """M16: when the primary fallback source's provider is down for every
+    kind, the fan-out response must carry source_available=False so the
+    route doesn't cache the outage as a successful empty search."""
+    fb_client = _Client(fail_search=True)
+    # the _Client fake has no search_playlists: give it a failing one so the
+    # model is a total provider outage, not a client that simply lacks
+    # playlist search (which legitimately returns []).
+    def _boom(q, limit=10):
+        raise RuntimeError("client search boom")
+    fb_client.search_playlists = _boom
+    deps = _build_deps(
+        get_metadata_fallback_source=lambda: 'deezer',
+        get_metadata_fallback_client=lambda: fb_client,
+    )
+    result = orchestrator.run_enhanced_search('pink floyd', '', deps)
+
+    assert result['spotify_artists'] == []
+    assert result['source_available'] is False
+
+
+def test_fanout_healthy_primary_marks_source_available():
+    fb_client = _Client(artists=[_Artist('f1', 'Fallback Artist')])
+    deps = _build_deps(
+        get_metadata_fallback_source=lambda: 'deezer',
+        get_metadata_fallback_client=lambda: fb_client,
+    )
+    result = orchestrator.run_enhanced_search('pink floyd', '', deps)
+
+    assert result['source_available'] is True

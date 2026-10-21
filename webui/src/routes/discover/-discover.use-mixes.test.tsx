@@ -1,0 +1,284 @@
+import { QueryClientProvider } from '@tanstack/react-query';
+import { renderHook, waitFor } from '@testing-library/react';
+import { HttpResponse, http } from 'msw';
+import { afterEach, describe, expect, it } from 'vitest';
+
+import { server } from '@/test/msw';
+import { createTestQueryClient } from '@/test/query-client';
+
+import { fetchDiscoveryWeekly, fetchReleaseRadar, fetchSeasonalPlaylist } from './-discover.api';
+import { mixCardsFrom, useDiscoverMixes } from './-discover.use-mixes';
+
+/**
+ * The Your Mixes registry hook.
+ *
+ * The vanilla shelf is arrival-ordered — whatever loader finished first sits
+ * first, so the shelf shuffles with network timing. The documented divergence
+ * here is the point under test: the SAME cards, in feeder-declaration order,
+ * deterministically.
+ */
+
+const track = (name: string) => ({ track_name: name, artist_name: 'A' });
+
+interface StubOptions {
+  radar?: unknown[] | 'error';
+  weekly?: unknown[];
+  seasonalPlaylist?: unknown[];
+  playlistAvailable?: boolean;
+  personalized?: unknown[];
+  decades?: unknown[];
+  daily?: unknown[];
+}
+
+let hits: string[] = [];
+
+function stub({
+  radar = [],
+  weekly = [],
+  seasonalPlaylist = [],
+  playlistAvailable = true,
+  personalized = [],
+  decades = [],
+  daily = [],
+}: StubOptions = {}) {
+  hits = [];
+  const json = (body: Record<string, unknown>) => HttpResponse.json({ success: true, ...body });
+  server.use(
+    http.get('/api/discover/release-radar', () => {
+      hits.push('radar');
+      if (radar === 'error') return HttpResponse.json({}, { status: 500 });
+      return json({ tracks: radar });
+    }),
+    http.get('/api/discover/discovery-weekly', () => json({ tracks: weekly })),
+    http.get('/api/discover/seasonal/current', () => {
+      hits.push('seasonal-current');
+      return json({
+        season: 'winter',
+        name: 'Winter',
+        icon: '❄️',
+        playlist_available: playlistAvailable,
+      });
+    }),
+    http.get('/api/discover/seasonal/winter/playlist', () => {
+      hits.push('seasonal-playlist');
+      return json({ tracks: seasonalPlaylist });
+    }),
+    ...[
+      '/api/discover/personalized/popular-picks',
+      '/api/discover/personalized/hidden-gems',
+      '/api/discover/personalized/discovery-shuffle',
+      '/api/discover/personalized/listening-mix',
+    ].map((path) => http.get(path, () => json({ tracks: personalized }))),
+    http.get('/api/discover/personalized/daily-mixes', () => json({ mixes: daily })),
+    http.get('/api/discover/moods', () => json({ mixes: [] })),
+    http.get('/api/discover/for-you', () => json({ mixes: [] })),
+    http.get('/api/discover/decades/available', () => {
+      hits.push('decades');
+      return json({ decades });
+    }),
+  );
+}
+
+function mount(belowFoldReady = true) {
+  const client = createTestQueryClient();
+  return renderHook(() => useDiscoverMixes(belowFoldReady), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+}
+
+afterEach(() => {
+  server.resetHandlers();
+});
+
+describe('mixCardsFrom (moods, on repeat, blends)', () => {
+  it('turns the moods payload into play-only cards that say what they are', () => {
+    const mixes = mixCardsFrom({
+      mixes: [
+        {
+          key: 'mood_chill',
+          name: 'Chill',
+          subtitle: 'Downtempo, lo-fi and chillout',
+          tracks: [track('c')],
+        },
+        { key: 'mood_empty', name: 'Empty', tracks: [] },
+        { name: 'no key', tracks: [track('x')] },
+      ],
+    });
+    expect(mixes.map((m) => m.key)).toEqual(['mood_chill']);
+    expect(mixes[0]).toMatchObject({ title: 'Chill', blurb: 'Downtempo, lo-fi and chillout' });
+    // owned tracks: no syncKey, so the modal offers Play and nothing else
+    expect(mixes[0].syncKey).toBeUndefined();
+    expect(mixCardsFrom(undefined)).toEqual([]);
+    expect(mixCardsFrom({ mixes: 'nope' })).toEqual([]);
+  });
+});
+
+describe('useDiscoverMixes', () => {
+  it('subtitles a daily mix with the explanation the server wrote', async () => {
+    stub({
+      daily: [
+        {
+          key: 'daily_mix_1',
+          name: 'Daily Mix 1',
+          subtitle: 'Tool, Deftones',
+          explanation: { kind: 'listened', seeds: [{ name: 'Tool' }, { name: 'Deftones' }] },
+          tracks: [track('d')],
+        },
+        // stored before the shape: its own subtitle, as before
+        { key: 'daily_mix_2', name: 'Daily Mix 2', subtitle: 'Soen', tracks: [track('e')] },
+      ],
+    });
+    const { result } = mount();
+    await waitFor(() =>
+      expect(result.current.mixes.filter((m) => m.key.startsWith('daily_mix'))).toHaveLength(2),
+    );
+    const byKey = Object.fromEntries(result.current.mixes.map((m) => [m.key, m.subtitle]));
+    expect(byKey.daily_mix_1).toBe('Because you listen to Tool & Deftones');
+    expect(byKey.daily_mix_2).toBe('Soen');
+    // the card names who's in it; the reason stays for the modal
+    expect(result.current.mixes.find((m) => m.key === 'daily_mix_1')?.blurb).toBe('Tool, Deftones');
+  });
+
+  it('leads the shelf with the daily mixes, ahead of every generic feeder', async () => {
+    stub({
+      radar: [track('r')],
+      personalized: [track('p')],
+      daily: [{ key: 'daily_mix_1', name: 'Daily Mix 1', tracks: [track('d')] }],
+    });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.mixes.map((m) => m.key)).toContain('release_radar'));
+    await waitFor(() => expect(result.current.mixes[0]?.key).toBe('daily_mix_1'));
+    expect(result.current.mixes.map((m) => m.key).slice(0, 2)).toEqual([
+      'daily_mix_1',
+      'release_radar',
+    ]);
+    // no subtitle stored, no blurb invented
+    expect(result.current.mixes[0].blurb).toBeUndefined();
+  });
+
+  it('holds the SHARED below-fold queries until tier 1 settles', async () => {
+    // seasonal + decades share cache keys with useDiscoverPage's gated tier-2
+    // entries; an ungated observer here would fire them at mount and defeat
+    // the tiering. Slow externals (radar) fire regardless — that is their
+    // whole point.
+    stub({ radar: [track('r')], decades: [{ year: 1980, track_count: 1 }] });
+    const { result } = mount(false);
+    await waitFor(() => expect(result.current.mixes.length).toBeGreaterThan(0));
+    expect(hits).toContain('radar');
+    expect(hits).not.toContain('seasonal-current');
+    expect(hits).not.toContain('decades');
+    expect(result.current.decadeMixes).toEqual([]);
+  });
+
+  it('renders every fed mix in DECLARATION order, not arrival order', async () => {
+    stub({
+      radar: [track('r')],
+      weekly: [track('w')],
+      seasonalPlaylist: [track('s')],
+      personalized: [track('p')],
+    });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.mixes).toHaveLength(7));
+    expect(result.current.mixes.map((m) => m.key)).toEqual([
+      'release_radar',
+      'discovery_weekly',
+      'seasonal_playlist',
+      'popular_picks',
+      'hidden_gems',
+      'listening_mix',
+      'discovery_shuffle',
+    ]);
+    // The vanilla's exact card copy (2079-2083, 2108-2112, 4568-4572 …).
+    expect(result.current.mixes[0].title).toBe('Fresh Tape');
+    expect(result.current.mixes[0].subtitle).toBe('New releases from artists you follow');
+    expect(result.current.mixes[1].title).toBe('The Archives');
+    expect(result.current.mixes[3].subtitle).toBe('Popular tracks from artists you love');
+    expect(result.current.mixes[5].title).toBe('Your Listening Mix');
+    // Every card carries its own key as syncKey.
+    expect(result.current.mixes.every((m) => m.syncKey === m.key)).toBe(true);
+  });
+
+  it('omits a feeder that returned nothing — no empty cards', async () => {
+    stub({ personalized: [track('p')] });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.mixes.length).toBeGreaterThan(0));
+    expect(result.current.mixes.map((m) => m.key)).toEqual([
+      'popular_picks',
+      'hidden_gems',
+      'listening_mix',
+      'discovery_shuffle',
+    ]);
+  });
+
+  it('titles the seasonal mix from the season, subtitle lowercased', async () => {
+    stub({ seasonalPlaylist: [track('s')] });
+    const { result } = mount();
+    await waitFor(() =>
+      expect(result.current.mixes.find((m) => m.key === 'seasonal_playlist')).toBeDefined(),
+    );
+    const seasonal = result.current.mixes.find((m) => m.key === 'seasonal_playlist')!;
+    expect(seasonal.title).toBe('❄️ Winter Mix');
+    expect(seasonal.subtitle).toBe('Curated playlist for winter');
+  });
+
+  it('never fetches the playlist of a season that does not advertise one', async () => {
+    // The 4285 guard: playlist_available false → the loader is not even built.
+    stub({ playlistAvailable: false, personalized: [track('p')] });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.mixes.length).toBe(4));
+    expect(hits).not.toContain('seasonal-playlist');
+  });
+
+  it('a dead slow-external feeder costs its own card and nothing else', async () => {
+    stub({ radar: 'error', weekly: [track('w')], personalized: [track('p')] });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.mixes).toHaveLength(5));
+    expect(result.current.mixes.map((m) => m.key)).not.toContain('release_radar');
+    expect(result.current.mixes[0].key).toBe('discovery_weekly');
+  });
+
+  it('builds the Time Machine shelf from the available decades', async () => {
+    stub({
+      decades: [
+        { year: 1980, track_count: 12 },
+        { year: 1990, track_count: 3 },
+      ],
+    });
+    const { result } = mount();
+    await waitFor(() => expect(result.current.decadeMixes).toHaveLength(2));
+    expect(result.current.decadeMixes[0].key).toBe('decade_1980');
+    expect(result.current.decadeMixes[0].title).toBe('1980s');
+    expect(result.current.decadeMixes[0].subtitle).toBe('1980s Classics');
+    expect(result.current.decadeMixes[0].trackCount).toBe(12);
+  });
+
+  it('the registry resolves BOTH shelves by key, for the shared modal', async () => {
+    stub({ personalized: [track('p')], decades: [{ year: 1980, track_count: 1 }] });
+    const { result } = mount();
+    await waitFor(() => expect(Object.keys(result.current.registry).length).toBe(5));
+    expect(result.current.registry['hidden_gems']).toBeDefined();
+    expect(result.current.registry['decade_1980']).toBeDefined();
+  });
+});
+
+describe('the feeder fetchers', () => {
+  it('wrap their endpoints in section outcomes, error included', async () => {
+    stub({ radar: [track('r')], weekly: [] });
+    const radar = await fetchReleaseRadar();
+    expect(radar.kind).toBe('ok');
+    expect((radar as unknown as { data: { tracks: unknown[] } }).data.tracks).toEqual([track('r')]);
+    expect((await fetchDiscoveryWeekly()).kind).toBe('ok');
+
+    stub({ radar: 'error' });
+    expect((await fetchReleaseRadar()).kind).toBe('error');
+  });
+
+  it('keys the seasonal playlist path by the season', async () => {
+    stub({ seasonalPlaylist: [track('s')] });
+    const out = await fetchSeasonalPlaylist('winter');
+    expect(out.kind).toBe('ok');
+    expect(hits).toContain('seasonal-playlist');
+  });
+});

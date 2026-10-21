@@ -17,7 +17,6 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.discovery.fix_pick import fix_pick_album, fix_pick_numbers
 from utils.logging_config import get_logger
 
 logger = get_logger("discovery.endpoints")
@@ -60,19 +59,51 @@ def convert_results_to_spotify_tracks(
                 'album': spotify_data['album'],
                 'duration_ms': spotify_data.get('duration_ms', 0),
             }
+            for k in ('source', 'provider', 'isrc', 'release_date', 'disambiguation'):
+                if spotify_data.get(k) is not None:
+                    track[k] = spotify_data[k]
+                elif result.get(k) is not None:
+                    track[k] = result[k]
             if spotify_data.get('track_number'):
                 track['track_number'] = spotify_data['track_number']
+            elif result.get('track_number'):
+                track['track_number'] = result['track_number']
             if spotify_data.get('disc_number'):
                 track['disc_number'] = spotify_data['disc_number']
+            elif result.get('disc_number'):
+                track['disc_number'] = result['disc_number']
             spotify_tracks.append(track)
-        elif result.get('spotify_track') and result.get('status_class') == 'found':
-            spotify_tracks.append({
+        elif result.get('spotify_track') and (result.get('status_class') == 'found' or result.get('status') in ('found', 'Found', '✅ Found')):
+            dur = result.get('duration_ms', 0)
+            if not dur and result.get('duration'):
+                try:
+                    parts = str(result['duration']).split(':')
+                    if len(parts) == 2:
+                        dur = (int(parts[0]) * 60 + int(parts[1])) * 1000
+                except Exception:
+                    dur = 0
+            track = {
                 'id': result.get('spotify_id', 'unknown'),
                 'name': result.get('spotify_track', 'Unknown Track'),
                 'artists': [result.get('spotify_artist', 'Unknown Artist')] if result.get('spotify_artist') else ['Unknown Artist'],
                 'album': result.get('spotify_album', 'Unknown Album'),
-                'duration_ms': 0,
-            })
+                'duration_ms': dur,
+            }
+            match_data = result.get('match_data') or result.get('matched_data') or {}
+            for k in ('source', 'provider', 'isrc', 'release_date', 'disambiguation'):
+                if result.get(k) is not None:
+                    track[k] = result[k]
+                elif isinstance(match_data, dict) and match_data.get(k) is not None:
+                    track[k] = match_data[k]
+            if result.get('track_number'):
+                track['track_number'] = result['track_number']
+            elif isinstance(match_data, dict) and match_data.get('track_number'):
+                track['track_number'] = match_data['track_number']
+            if result.get('disc_number'):
+                track['disc_number'] = result['disc_number']
+            elif isinstance(match_data, dict) and match_data.get('disc_number'):
+                track['disc_number'] = match_data['disc_number']
+            spotify_tracks.append(track)
 
     logger.info(f"Converted {len(spotify_tracks)} {source_label} matches to Spotify tracks for sync")
     return spotify_tracks
@@ -87,6 +118,7 @@ def cancel_sync(
     sync_lock: Any,
     sync_states: Dict[str, Any],
     active_sync_workers: Dict[str, Any],
+    sync_service: Optional[Any] = None,
 ) -> Tuple[Dict[str, Any], int]:
     """Cancel an in-progress sync for one discovery playlist.
 
@@ -120,8 +152,29 @@ def cancel_sync(
         if sync_playlist_id:
             with sync_lock:
                 sync_states[sync_playlist_id] = {"status": "cancelled"}
-            if sync_playlist_id in active_sync_workers:
-                del active_sync_workers[sync_playlist_id]
+            # Future.cancel() cannot stop running work. Keep its handle so
+            # start_sync refuses a replacement until that worker has exited.
+            worker = active_sync_workers.get(sync_playlist_id)
+            if worker is not None and hasattr(worker, 'cancel'):
+                try:
+                    worker.cancel()
+                except Exception as ce:
+                    logger.debug(f"Error calling worker.cancel(): {ce}")
+
+        if sync_playlist_id and sync_service is not None and hasattr(sync_service, 'cancel_sync'):
+            playlist = state.get('playlist')
+            playlist_name = (
+                state.get('playlist_name')
+                or state.get('name')
+                or (playlist.get('name') if isinstance(playlist, dict) else getattr(playlist, 'name', None))
+            )
+            if not playlist_name:
+                return {'error': 'Cannot identify the playlist to cancel'}, 409
+            try:
+                sync_service.cancel_sync(playlist_name=playlist_name)
+            except Exception as se:
+                logger.error(f"Error calling sync_service.cancel_sync: {se}")
+                return {"error": "Could not signal sync cancellation"}, 500
 
         state['phase'] = 'discovered'
         state['sync_playlist_id'] = None
@@ -206,6 +259,13 @@ def playlist_image_dict(state: Dict[str, Any]) -> str:
     return state['playlist'].get('image_url', '')
 
 
+def mirrored_activity_label(key_or_id: Any, label: str) -> str:
+    """mirrored playlists ride the youtube discovery states (mirrored_<id>
+    keys), so a listenbrainz or spotify mirror posted "YouTube Sync Started"
+    and "YouTube playlist synced" (#1404). they just say playlist."""
+    return 'Playlist' if str(key_or_id or '').startswith('mirrored_') else label
+
+
 def reconcile_sync_phase(
     state: Dict[str, Any],
     sync_state: Dict[str, Any],
@@ -234,6 +294,9 @@ def reconcile_sync_phase(
     """
     if state.get('phase') != 'syncing':
         return None
+    _pl = state.get('playlist')
+    if isinstance(_pl, dict):
+        activity_subject = mirrored_activity_label(_pl.get('id'), activity_subject)
     status = (sync_state or {}).get('status')
     if status == 'finished':
         state['phase'] = 'sync_complete'
@@ -325,6 +388,33 @@ def get_sync_status(
         return {"error": str(e)}, 500
 
 
+def source_skipped_counts(state: Dict[str, Any]) -> Optional[Dict[str, int]]:
+    """Playlist entries the source never handed over, or None if there were none.
+
+    tidal drops videos and tracks outside the account's region before
+    discovery sees them. without this the modal says 364/364 for a 395
+    track playlist and looks like it's lying (#1613).
+    """
+    return playlist_skipped_counts(state.get('playlist'))
+
+
+def playlist_skipped_counts(playlist: Any) -> Optional[Dict[str, int]]:
+    """the same counts off one playlist, a tidal Playlist or a plain dict.
+
+    a mirrored playlist's discovery state carries a dict, so the counts a
+    mirror saved reach the identify window too.
+    """
+    def count(name: str) -> int:
+        value = playlist.get(name) if isinstance(playlist, dict) else getattr(playlist, name, 0)
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    skipped = {'videos': count('skipped_videos'), 'unavailable': count('unavailable_tracks')}
+    return skipped if skipped['videos'] or skipped['unavailable'] else None
+
+
 def get_discovery_status(
     states: Dict[str, Any],
     key: str,
@@ -350,7 +440,7 @@ def get_discovery_status(
         state = states[key]
         state['last_accessed'] = time.time()
 
-        return {
+        body = {
             'phase': state['phase'],
             'status': state['status'],
             'progress': state['discovery_progress'],
@@ -358,7 +448,11 @@ def get_discovery_status(
             'spotify_total': state['spotify_total'],
             'results': state['discovery_results'],
             'complete': state['phase'] == 'discovered',
-        }, 200
+        }
+        skipped = source_skipped_counts(state)
+        if skipped:
+            body['source_skipped'] = skipped
+        return body, 200
     except Exception as e:
         logger.error(f"Error getting {error_label} discovery status: {e}")
         return {"error": str(e)}, 500
@@ -643,9 +737,6 @@ def update_discovery_match(
 
             result = state['discovery_results'][track_index]
             old_status = result.get('status')
-            # Tidal, Deezer, Qobuz and Spotify-link discovery counted a Wing It guess
-            # as a match already.
-            was_guess = bool(result.get('wing_it_fallback')) or result.get('status_class') == 'wing-it'
 
             result['status'] = 'Found'
             result['status_class'] = 'found'
@@ -662,15 +753,47 @@ def update_discovery_match(
             else:
                 result['duration'] = '0:00'
 
-            result['spotify_data'] = build_fix_modal_spotify_data(spotify_track)
+            fixed_data = build_fix_modal_spotify_data(spotify_track)
+            result['spotify_data'] = fixed_data
+            result['match_data'] = fixed_data
+            result['matched_data'] = fixed_data
+            result['confidence'] = 1.0
             result['wing_it_fallback'] = False
             result['manual_match'] = True
 
-            if old_status != 'found' and old_status != 'Found' and not was_guess:
+            # Commissary: a guess the tab already counted is no new match
+            from core.commissary.discovery_fixes import fix_adds_a_match
+            if fix_adds_a_match(old_status, source_log_label):
                 state['spotify_matches'] = state.get('spotify_matches', 0) + 1
 
             logger.info(f"Manual match updated: {source_log_label} - {identifier} - track {track_index}")
             logger.info(f"   → {result['spotify_artist']} - {result['spotify_track']}")
+
+            # Immediate mirrored DB persistence if this is a mirrored playlist
+            if str(identifier).startswith('mirrored_'):
+                try:
+                    db = get_database()
+                    tracks = state.get('tracks') or (state.get('playlist') or {}).get('tracks') or []
+                    if 0 <= track_index < len(tracks):
+                        t = tracks[track_index]
+                        db_track_id = t.get('db_track_id') if isinstance(t, dict) else getattr(t, 'db_track_id', None)
+                        if not db_track_id and isinstance(t, dict):
+                            db_track_id = t.get('id')
+                        if db_track_id:
+                            from core.discovery.manual_match import derive_manual_match_provider
+                            m_provider = derive_manual_match_provider(spotify_track, get_active_discovery_source())
+                            db.update_mirrored_track_extra_data(db_track_id, {
+                                'discovered': True,
+                                'provider': m_provider,
+                                'confidence': 1.0,
+                                'matched_data': fixed_data,
+                                'manual_match': True,
+                                'wing_it_fallback': False,
+                                'unmatched_by_user': False,
+                            })
+                            logger.info(f"Persisted manual fix immediately to mirrored DB for track {db_track_id}")
+                except Exception as db_err:
+                    logger.error(f"Error persisting manual fix to mirrored DB: {db_err}")
 
             original_track = result.get(original_track_key, {})
             original_name = original_track.get('name', spotify_track['name'])
@@ -686,7 +809,7 @@ def update_discovery_match(
             original_name = (data.get('original_name') or '').strip()
             original_artist = (data.get('original_artist') or '').strip()
             if not original_name and not original_artist:
-                return {'error': 'Discovery state not found'}, 404
+                return {'error': 'Identification state not found'}, 404
             if not original_name:
                 original_name = spotify_track['name']
             # Key the cache by the FIRST artist — every in-memory + sync path uses
@@ -706,20 +829,33 @@ def update_discovery_match(
             if isinstance(artists_list, list):
                 artists_list = [a if isinstance(a, str) else a.get('name', '') for a in artists_list]
             image_url = spotify_track.get('image_url') or ''
+            album_raw = spotify_track.get('album', '')
+            if isinstance(album_raw, dict):
+                album_obj = dict(album_raw)
+                if image_url and not album_obj.get('image_url'):
+                    album_obj['image_url'] = image_url
+                if image_url and not album_obj.get('images'):
+                    album_obj['images'] = [{'url': image_url}]
+            else:
+                album_obj = {'name': album_raw or ''}
+                if image_url:
+                    album_obj['image_url'] = image_url
+                    album_obj['images'] = [{'url': image_url}]
 
+            from core.discovery.manual_match import derive_manual_match_provider
+            m_source = derive_manual_match_provider(spotify_track, get_active_discovery_source())
             matched_data = {
                 'id': spotify_track['id'],
                 'name': spotify_track['name'],
                 'artists': artists_list,
-                # A completed pick's album carries the details a download would
-                # otherwise look up (core.discovery.fix_pick).
-                'album': fix_pick_album(spotify_track),
+                'album': album_obj,
                 'duration_ms': spotify_track.get('duration_ms', 0),
                 'image_url': image_url,
-                # Where the pick came from; this said Spotify whatever it was.
-                'source': spotify_track.get('source') or 'spotify',
-                **fix_pick_numbers(spotify_track),
+                'source': m_source,
             }
+            for k in ('provider', 'isrc', 'track_number', 'disc_number', 'release_date'):
+                if spotify_track.get(k) is not None:
+                    matched_data[k] = spotify_track[k]
             cache_db = get_database()
             cache_db.save_discovery_cache_match(
                 cache_key[0], cache_key[1], get_active_discovery_source(), 1.0, matched_data,
@@ -792,27 +928,21 @@ def start_sync(
 
         sync_playlist_id = f"{sync_id_prefix}_{key}"
 
-        # The same guard the card-level /api/sync/start already enforces
-        # (web_server.py). Without it a second "Sync This Playlist" from the
-        # discovery modal starts a second sync over the running one AND
-        # overwrites active_sync_workers[id] — losing the handle to the
-        # in-flight worker, which is what the completion check later asks
-        # `.done()` of. Ported from upstream SoulSync 3.3.1.
-        #
-        # Placed BEFORE the activity item and the state mutation below, so a
-        # refused duplicate leaves no trace: logging "Sync Started" and setting
-        # phase='syncing' for a request that is about to 409 would be worse than
-        # the race it is replacing.
+        # the same guard the card-level /api/sync/start enforces. without it
+        # the discovery modal's "Sync This Playlist" scheduled a second sync
+        # over a running one AND overwrote active_sync_workers[id], losing the
+        # handle to the in-flight worker.
         with sync_lock:
             existing = active_sync_workers.get(sync_playlist_id)
-            # `done` via getattr: only a real in-flight Future blocks. An object
-            # that cannot say (tests stash plain sentinels here) counts as
-            # finished, which is also the pre-guard behaviour for a stale key.
+            # `done` via getattr: only a real in-flight Future blocks - an
+            # object that can't say (tests stash plain sentinels here) counts
+            # as finished, which is also the pre-guard behavior for stale keys
             if existing is not None and not getattr(existing, 'done', lambda: True)():
                 return {"error": "Sync is already in progress for this playlist."}, 409
 
         playlist_name = playlist_name_getter(state)
 
+        activity_label = mirrored_activity_label(key, activity_label)
         add_activity_item("", f"{activity_label} Sync Started", f"'{playlist_name}' - {len(spotify_tracks)} tracks", "Now")
 
         state['phase'] = 'syncing'
@@ -820,7 +950,15 @@ def start_sync(
         state['sync_progress'] = {}
 
         with sync_lock:
-            sync_states[sync_playlist_id] = {"status": "starting", "progress": {}}
+            sync_states[sync_playlist_id] = {
+                "status": "starting",
+                "playlist_name": playlist_name,
+                "progress": {
+                    "playlist_name": playlist_name,
+                    "total_tracks": len(spotify_tracks),
+                    "progress": 0,
+                }
+            }
 
         playlist_image_url = playlist_image_getter(state)
         future = submit_sync_task(sync_playlist_id, playlist_name, spotify_tracks, playlist_image_url)

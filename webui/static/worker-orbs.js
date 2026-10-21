@@ -1,5 +1,5 @@
 // ============================================================
-// Commissary — Worker Orbs
+// SoulSync — Worker Orbs
 // Dashboard header buttons shrink to floating orbs, expand on hover
 // ============================================================
 
@@ -50,6 +50,7 @@
 
     let dashboardHeader = null;
     let headerActions = null;
+    let headerResizeObserver = null;
     let canvas = null;
     let ctx = null;
     let orbs = [];
@@ -83,15 +84,20 @@
     let collapseDelay = null;
     const COLLAPSE_DELAY_MS = 7000;
 
-    // Commissary logo, drawn as the hub/nucleus once loaded
+    // SoulSync logo, drawn as the hub/nucleus once loaded
     let hubImage = null;
     let hubImageReady = false;
 
     // ── Init ──
 
     function init() {
-        dashboardHeader = document.querySelector('#dashboard-page .dashboard-header');
-        headerActions = document.querySelector('#dashboard-page .header-actions');
+        // the orbs live on their own stage in the dashboard hero now: the
+        // canvas, the nucleus at its centre, the hover that opens the worker
+        // grid, all of it measured against the stage, so orbs never drift over
+        // the greeting. the whole header is the fallback (the old layout).
+        dashboardHeader = document.querySelector('#dashboard-page .orb-stage')
+            || document.querySelector('#dashboard-page .dashboard-header');
+        headerActions = dashboardHeader && dashboardHeader.querySelector('.header-actions');
         if (!dashboardHeader || !headerActions) return;
 
         if (!hubImage) {
@@ -181,7 +187,7 @@
         // there on hover). Re-measure the instant the header regains real size.
         if (typeof ResizeObserver !== 'undefined') {
             let hadSize = dashboardHeader.getBoundingClientRect().width > 0;
-            const ro = new ResizeObserver(() => {
+            headerResizeObserver = new ResizeObserver(() => {
                 const hasSize = dashboardHeader.getBoundingClientRect().width > 0;
                 if (hasSize && !hadSize && onDashboard) {
                     computeHomes();
@@ -190,8 +196,66 @@
                 }
                 hadSize = hasSize;
             });
-            ro.observe(dashboardHeader);
+            headerResizeObserver.observe(dashboardHeader);
         }
+    }
+
+    // The React dashboard DESTROYS the header on navigate-away and mounts a
+    // fresh one on return (the vanilla page's header was permanent). Everything
+    // init() anchored — element refs, the canvas, the observer, the window/
+    // document listeners — must be dropped before re-anchoring, or every visit
+    // would stack another set of listeners on stale nodes.
+    function teardown() {
+        stopLoop();
+        state = 'idle';
+        sparks = [];
+        ripples = [];
+        inflows = [];
+        orbs = [];
+        canvas = null;
+        ctx = null;
+        dashboardHeader = null;
+        headerActions = null;
+        window.removeEventListener('resize', onResize);
+        document.removeEventListener('visibilitychange', onVisibility);
+        if (headerResizeObserver) {
+            headerResizeObserver.disconnect();
+            headerResizeObserver = null;
+        }
+    }
+
+    // setPage('dashboard') arrives from the shell bridge BEFORE React has
+    // painted the header, so re-anchoring retries frame by frame until the
+    // nodes exist (bounded — ~2s — in case the page failed to mount at all).
+    let headerRetryHandle = null;
+
+    function cancelHeaderRetry() {
+        if (headerRetryHandle !== null) {
+            cancelAnimationFrame(headerRetryHandle);
+            headerRetryHandle = null;
+        }
+    }
+
+    function awaitDashboardHeader() {
+        cancelHeaderRetry();
+        teardown();
+        const tryInit = (attempt) => {
+            headerRetryHandle = null;
+            init();
+            if (dashboardHeader) {
+                onDashboard = true;
+                computeHomes();
+                resizeCanvas();
+                sparks = [];
+                ripples = [];
+                enterOrbState();
+                return;
+            }
+            if (attempt < 120) {
+                headerRetryHandle = requestAnimationFrame(() => tryInit(attempt + 1));
+            }
+        };
+        tryInit(0);
     }
 
     function computeHomes() {
@@ -915,7 +979,7 @@
                     (0.16 + energy * 0.16 + slow * 0.04 + stress * 0.08) * ember);
 
                 if (hubImageReady) {
-                    // Commissary logo as the nucleus — fit to the pulsing radius while
+                    // SoulSync logo as the nucleus — fit to the pulsing radius while
                     // preserving the image's natural aspect ratio (no stretch)
                     const natW = hubImage.naturalWidth || 1;
                     const natH = hubImage.naturalHeight || 1;
@@ -1146,6 +1210,16 @@
     }
 
     function setPage(pageId) {
+        if (pageId === 'dashboard' && isEnabled()
+            && (!dashboardHeader || !dashboardHeader.isConnected)) {
+            // The header is React-owned now: it does not exist yet (first
+            // navigation after load) or the one we anchored was unmounted.
+            // Re-anchor against the freshly mounted nodes.
+            awaitDashboardHeader();
+            return;
+        }
+        if (pageId !== 'dashboard') cancelHeaderRetry();
+
         const wasDashboard = onDashboard;
         onDashboard = (pageId === 'dashboard') && isEnabled();
 
@@ -1174,10 +1248,15 @@
     // ── Bootstrap ──
 
     function bootstrap() {
+        // The API is published even when the header is absent at load — the
+        // dashboard is React-rendered now, so at script time there is nothing
+        // to anchor to. setPage('dashboard') re-anchors lazily when React has
+        // painted the header; without this, the early return below would leave
+        // window.workerOrbs undefined forever and every shell setPage a no-op.
+        window.workerOrbs = { setPage, onStatus };
+
         init();
         if (!dashboardHeader) return;
-
-        window.workerOrbs = { setPage, onStatus };
 
         const activePage = document.querySelector('.page.active');
         if (activePage && activePage.id === 'dashboard-page' && isEnabled()) {

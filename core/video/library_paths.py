@@ -25,9 +25,6 @@ from core.video.download_pipeline import basename_of
 # Characters illegal on Windows / awkward on most filesystems, plus control chars.
 _ILLEGAL = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _TRAILING_DOTSPACE = re.compile(r"[ .]+$")
-# The Unix counterpart: a LEADING dot hides the entry. Same gap the music
-# sanitiser had (upstream #1129) — trailing dots were handled because Windows
-# rejects them, leading ones were not because Windows does not care.
 _LEADING_DOTSPACE = re.compile(r"^[ .]+")
 
 # Parsed source token → the label used in the Radarr ``{Quality Full}`` tag.
@@ -39,10 +36,11 @@ _SRC_LABEL = {
 
 def sanitize(name: Any) -> str:
     """Filesystem-safe path COMPONENT: strip illegal chars, collapse whitespace, and
-    trim dots/spaces from BOTH ends — trailing because Windows rejects them,
-    leading because a dot-prefixed entry is hidden on Unix (a title like
-    ".hack//SIGN" would land in a folder the scanner never sees). Never contains
-    a separator."""
+    trim leading/trailing dots/spaces. Never contains a separator.
+
+    Windows rejects TRAILING dots/spaces; Unix hides any entry with a LEADING
+    dot, and media servers skip hidden entries outright — so a title like
+    "...And Justice for All" would land in a folder nothing could see (#1129)."""
     s = _ILLEGAL.sub("", str(name or ""))
     s = re.sub(r"\s+", " ", s).strip()
     s = _TRAILING_DOTSPACE.sub("", s)

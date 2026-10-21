@@ -9,8 +9,7 @@ from core.video.download_pipeline import (
     basename_of,
     dest_path_for,
     find_completed_file,
-    resolve_download_root,
-    resolve_torrent_category,
+    target_dir_for,
 )
 from core.video.slskd_download import (
     classify_state,
@@ -61,45 +60,14 @@ def test_find_completed_file_by_basename():
     assert find_completed_file("/dl", "missing.mkv", lambda d: files) is None
 
 
-def test_dest_path_for():
+def test_dest_and_target_resolution():
     assert dest_path_for("/media/movies", "/dl/x/movie.mkv") == "/media/movies/movie.mkv"
-
-
-def test_resolve_download_root_three_tier_fallback():
-    root_folder = {"path": "/library/anime-movies"}
-    primary = {"path": "/library/movies"}
-    paths = {"movies_path": "/m", "tv_path": "/t", "transfer_path": "/transfer"}
-
-    # 1. An explicit pick always wins, even with a primary/legacy also available.
-    assert resolve_download_root("movie", root_folder=root_folder,
-                                 primary_root_folder=primary, paths=paths) == "/library/anime-movies"
-    # 2. No explicit pick -> the primary configured Library.
-    assert resolve_download_root("movie", primary_root_folder=primary, paths=paths) == "/library/movies"
-    # 3. Nothing configured -> the legacy scalar fallback (unchanged pre-multi-library behavior).
-    assert resolve_download_root("movie", paths=paths) == "/m"
-    assert resolve_download_root("show", paths=paths) == "/t"
-    # Movies fall further back to the legacy transfer_path when movies_path is unset.
-    assert resolve_download_root("movie", paths={"transfer_path": "/transfer"}) == "/transfer"
-    # A Library/primary row that exists but has no path set yet doesn't shadow a good fallback.
-    assert resolve_download_root("movie", root_folder={"path": ""}, primary_root_folder=primary,
-                                 paths=paths) == "/library/movies"
-    assert resolve_download_root("weird-kind", paths=paths) == "/t"   # unknown kinds fall to 'show'
-
-
-def test_resolve_torrent_category_tiers():
-    root_folder = {"category": "anime"}
-    primary = {"category": "movies"}
-
-    # 1. An explicit pick's own category always wins.
-    assert resolve_torrent_category(root_folder=root_folder, primary_root_folder=primary) == "anime"
-    # 2. No explicit pick -> the primary Library's category.
-    assert resolve_torrent_category(primary_root_folder=primary) == "movies"
-    # 3. Nothing configured -> None (caller falls back to the global setting).
-    assert resolve_torrent_category() is None
-    # A Library that exists but has no category set (blank) doesn't shadow a good fallback.
-    assert resolve_torrent_category(root_folder={"category": ""}, primary_root_folder=primary) == "movies"
-    assert resolve_torrent_category(root_folder={"category": "  "}, primary_root_folder=primary) == "movies"
-    assert resolve_torrent_category(primary_root_folder={"category": None}) is None
+    paths = {"movies_path": "/m", "tv_path": "/t", "youtube_path": "/y"}
+    assert target_dir_for("movie", paths) == "/m"
+    assert target_dir_for("show", paths) == "/t"
+    assert target_dir_for("season", paths) == "/t"
+    assert target_dir_for("youtube", paths) == "/y"
+    assert target_dir_for("weird", paths) == ""
 
 
 # ── DB CRUD ───────────────────────────────────────────────────────────────────
@@ -157,14 +125,17 @@ class _WlDB:
         self.eps = None
         self.movie = None
         self.removed = None
-    def add_episodes_to_wishlist(self, tmdb_id, title, episodes, *, poster_url=None, library_id=None, server_source=None):
+    def add_episodes_to_wishlist(self, tmdb_id, title, episodes, *, poster_url=None, library_id=None, server_source=None, profile_id=None):
         self.eps = (tmdb_id, title, episodes, library_id)
         return len(episodes)
-    def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None, library_id=None, server_source=None):
+    def add_movie_to_wishlist(self, tmdb_id, title, *, year=None, poster_url=None, library_id=None, server_source=None, profile_id=None):
         self.movie = (tmdb_id, title, library_id)
         return True
-    def remove_from_wishlist(self, scope, *, tmdb_id, season_number=None, episode_number=None):
-        self.removed = (scope, tmdb_id, season_number, episode_number)
+    def remove_from_wishlist(self, scope, *, tmdb_id, season_number=None, episode_number=None, profile_id=None):
+        self.removed = (scope, tmdb_id, season_number, episode_number, profile_id)
+        return 1
+    def remove_youtube_from_wishlist(self, scope, source_id, profile_id=None):
+        self.removed = (scope, source_id, None, None)
         return 1
     def show_tmdb_id(self, show_id):
         return 999
@@ -179,7 +150,7 @@ def test_wishlist_obtained_removes_episode():
     db = _WlDB()
     _wishlist_obtained(db, {"id": 1, "kind": "show", "title": "T", "media_id": "123",
                             "media_source": "tmdb", "search_ctx": json.dumps({"season": 1, "episode": 3})})
-    assert db.removed == ("episode", 123, 1, 3)
+    assert db.removed == ("episode", 123, 1, 3, None)
 
 
 def test_wishlist_obtained_removes_movie_and_resolves_library_tmdb():
@@ -187,8 +158,44 @@ def test_wishlist_obtained_removes_movie_and_resolves_library_tmdb():
     db = _WlDB()
     _wishlist_obtained(db, {"id": 2, "kind": "movie", "title": "M", "media_id": "42",
                             "media_source": "library"})
-    assert db.removed == ("movie", 888, None, None)   # tmdb resolved from the library id
+    assert db.removed == ("movie", 888, None, None, None)   # tmdb resolved from the library id
 
+
+
+def test_wishlist_obtained_removes_client_backed_youtube_video():
+    from core.video.download_monitor import _wishlist_obtained
+    db = _WlDB()
+    _wishlist_obtained(db, {"id": 3, "kind": "youtube", "title": "V", "media_id": "yt1",
+                            "media_source": "youtube", "source": "torrent",
+                            "search_ctx": json.dumps({"scope": "youtube", "youtube_id": "yt1"})})
+    assert db.removed == ("video", "yt1", None, None)
+
+
+def test_plan_import_places_client_backed_youtube_video():
+    from core.video.importer import plan_import
+    dl = _dl(kind="youtube", source="torrent", media_source="youtube", media_id="yt9",
+             release_title="Chan.Deep Dive.2024.1080p", target_dir="/yt",
+             search_ctx=json.dumps({"scope": "youtube", "channel": "Chan",
+                                    "video_title": "Deep Dive", "published_at": "2024-04-05",
+                                    "youtube_id": "yt9"}))
+    plan = plan_import(dl, "/dl/Chan.Deep Dive.2024.1080p.mkv", list_dir=lambda d: [],
+                       settings={"youtube_template": "$channel/Season $year/$channel - $sxe - $title"})
+    assert plan["action"] == "import"
+    assert plan["dest"]["filename"] == "Chan - s2024e0405 - Deep Dive.mkv"
+    assert plan["dest"]["dir"].replace("\\", "/").endswith("/yt/Chan/Season 2024")
+
+
+def test_plan_import_replaces_same_youtube_destination_when_user_initiated():
+    from core.video.importer import plan_import
+    ctx = {"scope": "youtube", "channel": "Chan", "video_title": "Deep Dive",
+           "published_at": "2024-04-05", "youtube_id": "yt9", "import_policy": "user_replace"}
+    dl = _dl(kind="youtube", source="soulseek", media_source="youtube", media_id="yt9",
+             release_title="Chan.Deep Dive.2024.1080p", target_dir="/yt", search_ctx=json.dumps(ctx))
+    filename = "Chan - s2024e0405 - Deep Dive.mkv"
+    plan = plan_import(dl, "/dl/Chan.Deep Dive.2024.1080p.mkv", list_dir=lambda d: [filename],
+                       settings={"youtube_template": "$channel/Season $year/$channel - $sxe - $title"})
+    assert plan["action"] == "upgrade"
+    assert plan["replace_path"].replace("\\", "/").endswith("/yt/Chan/Season 2024/" + filename)
 
 def test_wishlist_failed_episode_tmdb_source():
     """A gave-up TMDB episode grab goes back on the wishlist under the show's tmdb_id."""

@@ -1,7 +1,7 @@
 """Wishlist ignore-list — a TTL'd skip-gate for the wishlist (#874).
 
 When a user removes a track from the wishlist or cancels an in-flight
-wishlist download, Commissary would otherwise re-add it on the next
+wishlist download, SoulSync would otherwise re-add it on the next
 automatic cycle (watchlist scan, failed-track capture, or the cancel
 handler's own re-add), so the same release downloads → fails/cancels →
 re-queues forever. The ignore list records the user's "stop
@@ -35,15 +35,18 @@ def configured_ttl_days() -> int:
     (javiavid: 30 was hardcoded; some users want a weekly re-try window).
     Clamped to [1, 365]; anything unreadable falls back to the default."""
     try:
-        from config.settings import config_manager
+        from core.settings import config_manager
         raw = config_manager.get('wishlist.ignore_ttl_days', IGNORE_TTL_DAYS)
         return max(1, min(int(raw), 365))
     except Exception:
         return IGNORE_TTL_DAYS
 
-# Recognised reasons (free-text tolerated; these are the canonical two).
+# Recognised reasons (free-text tolerated; these are the canonical ones).
 REASON_REMOVED = "removed"
 REASON_CANCELLED = "cancelled"
+# A bulk-skip from the wishlist queue: "not now, stop auto-grabbing this"
+# rather than a user block. Same TTL semantics as a manual remove.
+REASON_SKIPPED = "skipped"
 
 
 def normalize_ignore_id(track_id: Any) -> str:

@@ -26,36 +26,27 @@ all injected via `MasterDeps`.
 from __future__ import annotations
 
 import json
-import logging
-
 from utils.logging_config import get_logger
 import re
 import time
 import uuid
 from dataclasses import dataclass
 from difflib import SequenceMatcher
-from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from core.downloads import album_bundle_dispatch as _album_bundle_dispatch
-from core.edition_preference import (
-    PREFER_DELUXE_KEY,
-    is_smaller_edition,
-    owned_row_is_smaller_edition,
-)
-from core.runtime_state import (
-    download_batches,
-    download_tasks,
-    task_is_active,
-    tasks_lock,
-)
+from core.downloads.soulseek_identity import assign_album_tracks
+from core.runtime_state import download_batches, download_tasks, tasks_lock
 
-# See the note in core/downloads/lifecycle.py: the file handler listens on the
-# `soulsync` logger, so a plain module logger never reaches app.log.
 logger = get_logger("downloads.master")
 
 
 _ALBUM_PREFLIGHT_MIN_SCORE = 0.62
+# Folders this close to the best-scored one (and this close in requested-track
+# coverage) are the same release as far as scoring can tell; peer
+# availability picks between them.
+_ALBUM_PREFLIGHT_BAND_WIDTH = 0.06
+_ALBUM_PREFLIGHT_COVERAGE_TOLERANCE = 0.05
 _EDITION_WORDS = {
     'deluxe', 'expanded', 'anniversary', 'special', 'platinum', 'bonus',
     'remaster', 'remastered', 'edition', 'version',
@@ -87,30 +78,69 @@ def _similarity(left: Any, right: Any) -> float:
     return SequenceMatcher(None, a, b).ratio()
 
 
-def _track_title_from_candidate(candidate: Any) -> str:
-    title = getattr(candidate, 'title', None)
-    if title:
-        return str(title)
-    filename = getattr(candidate, 'filename', '') or ''
-    stem = Path(filename.replace('\\', '/')).stem
-    stem = re.sub(r'^\s*(?:disc\s*)?\d+[-_.\s]+', '', stem, flags=re.IGNORECASE)
-    return stem
+def _album_title_similarity(expected: str, artist: str, year: str,
+                            album_title: str, album_path: str) -> float:
+    """Compare unchanged text, then omit metadata outside one album span."""
+    album = _norm_text(expected)
+    if not album:
+        return 0.0
+    artist = _norm_text(artist)
+    year = _norm_text(year)
+    if len(year) != 4 or not year.isdigit():
+        year = ''
+
+    def spans(text: str, word: str, *, whole_word: bool = True) -> list[tuple[int, int]]:
+        if not word:
+            return []
+        pattern = re.escape(word)
+        if whole_word:
+            pattern = rf'(?<![a-z0-9]){pattern}(?![a-z0-9])'
+        return [match.span() for match in re.finditer(
+            pattern, text)]
+
+    best = 0.0
+    for value in (album_title, album_path):
+        text = _norm_text(value)
+        best = max(best, _similarity(album, text))
+        if best == 1.0:
+            return best
+        album_spans = spans(text, album) or spans(text, album, whole_word=False)
+        if not album_spans:
+            continue
+        album_start, album_end = album_spans[0]
+        removed = sorted(
+            (start, end) for start, end in (*spans(text, artist), *spans(text, year))
+            if end <= album_start or start >= album_end
+        )
+        if not removed:
+            continue
+        pieces = []
+        cursor = 0
+        for start, end in removed:
+            if start > cursor:
+                pieces.append(text[cursor:start])
+            cursor = max(cursor, end)
+        pieces.append(text[cursor:])
+        best = max(best, _similarity(album, ''.join(pieces)))
+        if best == 1.0:
+            return best
+    return best
 
 
-def _track_number_from_track(track_data: dict) -> int:
-    value = track_data.get('track_number') or track_data.get('trackNumber') or 0
-    try:
-        return int(str(value).split('/')[0])
-    except (TypeError, ValueError):
-        return 0
-
-
-def _track_number_from_candidate(candidate: Any) -> int:
-    value = getattr(candidate, 'track_number', None) or 0
-    try:
-        return int(str(value).split('/')[0])
-    except (TypeError, ValueError):
-        return 0
+def _album_search_queries(artist: str, album: str, year: str) -> list[str]:
+    """Avoid repeating the same term for a self-titled Soulseek album."""
+    clean_artist = re.sub(r'\s*\(.*?\)', '', artist).strip()
+    clean_artist = re.sub(
+        r'\s*(feat\.?|ft\.?|featuring)\s+.*$', '', clean_artist,
+        flags=re.IGNORECASE,
+    ).strip()
+    if _norm_text(clean_artist) == _norm_text(album):
+        return [f'{clean_artist} {year}', album] if year else [album]
+    queries = [f'{artist} {album}']
+    if clean_artist != artist:
+        queries.append(f'{clean_artist} {album}')
+    queries.append(album)
+    return queries
 
 
 def _folder_variant_penalty(expected_album_name: str, folder_text: str) -> float:
@@ -169,6 +199,228 @@ def owned_hit_is_rerelease_original(db, requested_album: str, expected_year,
         return False
 
 
+def release_year_of(album_context) -> Optional[str]:
+    """Release year of the album being analyzed, or None.
+
+    powers the re-release gate (5BILLION round 3): owning 'Chaosphere' (1998)
+    must not read as owning 'Chaosphere (25th Anniversary Remastered 2023 Edition)'.
+    """
+    if not album_context:
+        return None
+    year = str(album_context.get('release_date') or album_context.get('year') or '')[:4]
+    return year if year.isdigit() else None
+
+
+def album_tracks_map_for(db, album_context, artist_context, active_server) -> dict:
+    """Album fast path: find the album in the db and map its lowercased track
+    titles to their rows, so tracks match inside the one album instead of N
+    global searches. Empty when the album isn't in the library."""
+    album_tracks_map = {}
+    if not album_context or not artist_context:
+        return album_tracks_map
+    album_name = album_context.get('name', '')
+    artist_name = artist_context.get('name', '')
+    total_tracks = album_context.get('total_tracks', 0) or 0
+    if not album_name or not artist_name:
+        return album_tracks_map
+    try:
+        db_album, album_confidence = db.check_album_exists_with_editions(
+            title=album_name, artist=artist_name,
+            confidence_threshold=0.7,
+            expected_track_count=total_tracks if total_tracks > 0 else None,
+            server_source=active_server,
+            expected_year=release_year_of(album_context),
+        )
+        if db_album and album_confidence >= 0.7:
+            db_album_tracks = db.get_tracks_by_album(db_album.id)
+            for t in db_album_tracks:
+                album_tracks_map[t.title.lower().strip()] = t
+            logger.info(f"[Album Analysis] Found album '{db_album.title}' in DB with {len(db_album_tracks)} tracks (confidence: {album_confidence:.2f})")
+        else:
+            logger.warning(f"[Album Analysis] Album '{album_name}' not found in DB — falling back to per-track search")
+    except Exception as album_err:
+        logger.error(f"[Album Analysis] Album lookup error: {album_err} — falling back to per-track search")
+    return album_tracks_map
+
+
+def live_manual_match(db, profile_id, track_data, source) -> Optional[dict]:
+    """The user's saved manual library match for this track, or None.
+
+    a saved match whose library track no longer exists is not a match, it is
+    a stale row (#1138). trusting it marked the track found, pulled it off the
+    wishlist and skipped the download, so a song whose file the user had
+    deleted silently vanished from every reprocess. dropping it sends the
+    track down the normal path like any other missing track.
+    """
+    from core.library import manual_library_match as _mlm
+    stid = track_data.get('spotify_track_id') or track_data.get('source_track_id') or track_data.get('id', '')
+    if not stid:
+        return None
+    match = _mlm.get_match_for_track(db, profile_id, track_data, default_source=source)
+    if match and not _mlm.match_is_live(db, match):
+        logger.warning(
+            "[Manual Match] '%s' has a saved library match (track %s) whose file is "
+            "no longer in the library — ignoring the stale match and processing the "
+            "track normally. Remove it under Tools -> Manual Library Match to stop "
+            "this warning.",
+            track_data.get('name', ''), match.get('library_track_id'),
+        )
+        return None
+    return match or None
+
+
+def _artist_name_of(artist) -> str:
+    # both string format and Spotify API format {'name': 'Artist Name'}
+    if isinstance(artist, str):
+        return artist
+    if isinstance(artist, dict) and 'name' in artist:
+        return artist['name']
+    return str(artist)
+
+
+def match_track_in_library(db, track_data, *, album_tracks_map, album_context,
+                           expected_year, album_only, active_server):
+    """Is this track already in the library? -> (found, confidence, db_track).
+
+    the one ownership answer the download analysis gives, lifted out so the
+    album modal can show it before anything is downloaded. album_only is the
+    allow-duplicates rule for album downloads: only a copy in THIS album counts.
+    """
+    track_name = track_data.get('name', '')
+    artists = track_data.get('artists', [])
+    if album_tracks_map:
+        # Album-scoped matching: check against known album tracks first
+        track_name_lower = track_name.lower().strip()
+        # Issue #589 — strip suffixes that just repeat the album
+        # context (e.g. "Shy Away (MTV Unplugged Live)" on a
+        # "MTV Unplugged" album → "Shy Away") so album-owned
+        # tracks don't false-miss when the local DB stored the
+        # base title. Only fires inside the album-confirmed
+        # scope; global matching elsewhere is unchanged.
+        from core.matching.album_context_title import strip_redundant_album_suffix
+        album_name = (album_context or {}).get('name', '')
+        normalized_title = strip_redundant_album_suffix(track_name, album_name).lower().strip()
+        # Direct title match (try both raw and normalized)
+        if track_name_lower in album_tracks_map:
+            return True, 1.0, album_tracks_map[track_name_lower]
+        if normalized_title and normalized_title in album_tracks_map:
+            return True, 1.0, album_tracks_map[normalized_title]
+        # Fuzzy match against album tracks using string similarity.
+        # Compare BOTH the raw and normalized source titles —
+        # whichever scores higher wins.
+        best_sim = 0.0
+        best_track = None
+        for db_title_lower, db_track in album_tracks_map.items():
+            sim_raw = db._string_similarity(track_name_lower, db_title_lower)
+            sim_norm = db._string_similarity(normalized_title, db_title_lower) if normalized_title else 0.0
+            sim = max(sim_raw, sim_norm)
+            if sim > best_sim:
+                best_sim = sim
+                best_track = db_track
+        if best_sim >= 0.7:
+            return True, best_sim, best_track
+        # not in THIS album. with allow-duplicates that's missing; otherwise
+        # fall back to a global per-track search
+        if album_only:
+            return False, 0.0, None
+        fallback_album = album_name or None
+        for artist in artists:
+            db_track, track_confidence = db.check_track_exists(
+                track_name, _artist_name_of(artist), confidence_threshold=0.7,
+                server_source=active_server, album=fallback_album,
+                include_downloads=True,
+            )
+            if db_track and track_confidence >= 0.7:
+                # Re-release gate (5BILLION round 3): the hit came from the
+                # ORIGINAL of this re-release → not ownership of THIS edition.
+                if owned_hit_is_rerelease_original(db, fallback_album, expected_year, db_track):
+                    logger.info(
+                        "[Album Analysis] '%s' owned only on the original "
+                        "release of '%s' — re-release stays missing",
+                        track_name, fallback_album)
+                    continue
+                return True, track_confidence, db_track
+        return False, 0.0, None
+    if album_only:
+        # album download, album not in the db yet → all missing
+        return False, 0.0, None
+    # Non-album download (playlist/single track) — always check global
+    for artist in artists:
+        db_track, track_confidence = db.check_track_exists(
+            track_name, _artist_name_of(artist), confidence_threshold=0.7,
+            server_source=active_server, include_downloads=True,
+        )
+        if db_track and track_confidence >= 0.7:
+            return True, track_confidence, db_track
+    return False, 0.0, None
+
+
+def preview_ownership(db, tracks_json, *, album_context, artist_context, is_album,
+                      profile_id, source, active_server, allow_duplicates) -> list:
+    """What Begin Analysis would say is owned, without starting anything.
+
+    same order of questions as the analysis (saved manual match, then the
+    library), read-only: no batch, no wishlist removal, no downloads. the
+    album modal shows it the moment it opens.
+    """
+    album_tracks_map = (
+        album_tracks_map_for(db, album_context, artist_context, active_server)
+        if is_album else {}
+    )
+    expected_year = release_year_of(album_context)
+    results = []
+    for i, track_data in enumerate(tracks_json or []):
+        if not isinstance(track_data, dict):
+            continue
+        track_index = track_data.get('_original_index', i)
+        if live_manual_match(db, profile_id, track_data, source):
+            results.append({'track_index': track_index, 'found': True, 'confidence': 1.0})
+            continue
+        found, confidence, _ = match_track_in_library(
+            db, track_data,
+            album_tracks_map=album_tracks_map,
+            album_context=album_context,
+            expected_year=expected_year,
+            album_only=allow_duplicates and is_album,
+            active_server=active_server,
+        )
+        results.append({'track_index': track_index, 'found': found, 'confidence': confidence})
+    return results
+
+
+def expected_release_duration_seconds(tracks_json) -> Optional[int]:
+    """Total playing time of the requested release, or None if unknown.
+
+    The album-bundle picker refuses a release whose size cannot support the
+    quality its title claims, and that comparison needs a duration. The batch's
+    own track list is the only place it exists before anything is downloaded.
+
+    EVERY track has to be known. A subtotal is not a duration: ten tracks with
+    one known 180 seconds summed to 180, and the size gate then read a
+    legitimate 90 MB MP3 album as 4000 kbit/s and refused it. One missing
+    duration makes the whole answer None, and None keeps the gate silent,
+    which is the safe direction.
+    """
+    entries = [entry for entry in tracks_json or [] if isinstance(entry, dict)]
+    if not entries:
+        return None
+    total_ms = 0
+    for entry in entries:
+        raw = entry.get('duration_ms')
+        if raw is None:
+            nested = entry.get('track')
+            if isinstance(nested, dict):
+                raw = nested.get('duration_ms')
+        try:
+            value = int(raw or 0)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        total_ms += value
+    return round(total_ms / 1000)
+
+
 def _album_context_richness(album_ctx: dict) -> int:
     if not isinstance(album_ctx, dict):
         return 0
@@ -184,7 +436,8 @@ def _album_context_richness(album_ctx: dict) -> int:
 
 
 def _score_album_folder(album_result: Any, album_context: dict, artist_context: dict,
-                        tracks_json: list[dict], filtered_track_count: int) -> float:
+                        tracks_json: list[dict], filtered_tracks: list,
+                        coverage_score: float | None = None) -> float:
     """Score one slskd folder as a whole release, not as isolated tracks."""
     expected_album = str((album_context or {}).get('name') or '')
     expected_artist = str((artist_context or {}).get('name') or '')
@@ -195,14 +448,35 @@ def _score_album_folder(album_result: Any, album_context: dict, artist_context: 
         str(getattr(album_result, attr, '') or '')
         for attr in ('album_title', 'album_path')
     )
-    album_score = max(
-        _similarity(expected_album, getattr(album_result, 'album_title', '')),
-        _similarity(expected_album, getattr(album_result, 'album_path', '')),
+    candidate_tracks = list(filtered_tracks)
+    expected_tracks = [track for track in tracks_json if track.get('name')]
+    if coverage_score is None:
+        coverage_score = assign_album_tracks(
+            expected_tracks, candidate_tracks, album=expected_album,
+        ).coverage
+    # A release's metadata can make a half-album look plausible. Only a
+    # folder with enough distinct, profile-eligible titles is a bundle pick;
+    # partial folders remain available through the per-track path.
+    if expected_tracks and coverage_score < 0.8:
+        return 0.0
+    album_score = _album_title_similarity(
+        expected_album,
+        expected_artist,
+        expected_year,
+        str(getattr(album_result, 'album_title', '') or ''),
+        str(getattr(album_result, 'album_path', '') or ''),
     )
+    # Artist/(Year) Album/ layouts carry the artist one directory up, so
+    # compare against each path segment rather than the whole path.
+    album_path = str(getattr(album_result, 'album_path', '') or '')
     artist_score = max(
         _similarity(expected_artist, getattr(album_result, 'artist', '')),
-        _similarity(expected_artist, getattr(album_result, 'album_path', '')),
+        *(_similarity(expected_artist, segment)
+          for segment in re.split(r'[\\/]+', album_path) if segment.strip()),
+        0.0,
     )
+    if expected_album and album_score < 0.65:
+        return 0.0
 
     actual_count = int(getattr(album_result, 'track_count', 0) or len(getattr(album_result, 'tracks', []) or []))
     if expected_count > 0 and actual_count > 0:
@@ -218,27 +492,6 @@ def _score_album_folder(album_result: Any, album_context: dict, artist_context: 
     else:
         count_score = 0.4
 
-    candidate_tracks = list(getattr(album_result, 'tracks', []) or [])
-    matched = 0
-    expected_tracks = [
-        (track_data, _norm_text(track_data.get('name', '')))
-        for track_data in tracks_json
-        if track_data.get('name')
-    ]
-    for track_data, expected_title in expected_tracks:
-        expected_number = _track_number_from_track(track_data)
-        best = 0.0
-        for candidate in candidate_tracks:
-            cand_title = _norm_text(_track_title_from_candidate(candidate))
-            title_sim = _similarity(expected_title, cand_title)
-            cand_number = _track_number_from_candidate(candidate)
-            if expected_number and cand_number and expected_number == cand_number:
-                title_sim = min(1.0, title_sim + 0.12)
-            best = max(best, title_sim)
-        if best >= 0.72:
-            matched += 1
-    coverage_score = matched / max(1, len(expected_tracks))
-
     year_score = 0.5
     folder_year = str(getattr(album_result, 'year', '') or '')
     if expected_year and folder_year:
@@ -246,7 +499,7 @@ def _score_album_folder(album_result: Any, album_context: dict, artist_context: 
     elif expected_year and expected_year in _norm_text(folder_text):
         year_score = 1.0
 
-    quality_count_score = min(1.0, filtered_track_count / max(1, expected_count or actual_count or 1))
+    quality_count_score = min(1.0, len(filtered_tracks) / max(1, expected_count or actual_count or 1))
     peer_score = _source_quality_score(album_result)
     penalty = _folder_variant_penalty(expected_album, folder_text)
 
@@ -263,74 +516,40 @@ def _score_album_folder(album_result: Any, album_context: dict, artist_context: 
     return max(0.0, min(score, 1.0))
 
 
-def _resolve_soulseek_client(download_orchestrator: Any) -> Any:
-    if hasattr(download_orchestrator, 'client'):
-        try:
-            client = download_orchestrator.client('soulseek')
-            if client:
-                return client
-        except Exception as exc:
-            logger.debug("Soulseek client lookup through orchestrator failed: %s", exc)
-    return getattr(download_orchestrator, 'soulseek', download_orchestrator)
+def _resolve_album_bundle_sources(config_manager: Any) -> list[str]:
+    """Return the ordered album-bundle prefix for this batch.
 
+    In single-source mode, the active source may own the whole album if
+    it supports album bundles. In hybrid mode, consecutive bundle-capable
+    sources at the HEAD of the configured chain may be tried in order. The
+    first non-bundle source ends the prefix: skipping over it would violate
+    the user's priority by letting a later release source jump ahead.
 
-def _soulseek_album_preflight_enabled(config_manager: Any) -> bool:
-    """Preflight only matters when Soulseek is the source that would claim
-    the album — i.e. when it heads the chain."""
-    from core.downloads.source_chain import primary_source
-    return primary_source(config_manager.get) == 'soulseek'
-
-
-def _resolve_album_bundle_source(config_manager: Any) -> str:
-    """Return the album-bundle source for this batch.
-
-    Only the FIRST source in the chain may claim a whole album; later
-    entries stay per-track fallback. Letting a fallback claim the release
-    would hand the album to a source the user ranked below the one that
-    just failed a single track.
-
-    A one-entry chain is the old single-source mode and needs no special
-    case: its only entry is also its first.
+    Keeping the whole prefix matters for a common ``torrent -> usenet``
+    setup. A fallback-eligible miss on torrent must let Usenet try its own
+    complete release instead of dropping directly into a per-track flow that
+    deliberately excludes both release-level sources.
     """
-    from core.downloads.source_chain import primary_source
-    first = primary_source(config_manager.get)
-    return first if first in _ALBUM_BUNDLE_SOURCES else ''
+    mode = (config_manager.get('download_source.mode', 'soulseek') or 'soulseek').lower()
+    if mode in _ALBUM_BUNDLE_SOURCES:
+        return [mode]
+    if mode != 'hybrid':
+        return []
 
+    order = config_manager.get('download_source.hybrid_order', ['hifi', 'youtube', 'soulseek'])
+    if not order:
+        order = [config_manager.get('download_source.hybrid_primary', '')]
 
-def _pinned_album_bundle(pinned) -> tuple:
-    """Translate a user-picked release into ``(source, plugin_kwargs)``.
-
-    ``pinned`` is what the album source picker put on the batch:
-    ``{'source', 'title', 'token'}`` for Prowlarr-backed releases, or
-    ``{'source': 'soulseek', 'username', 'folder_path'}`` for a Soulseek
-    folder. Returns ``('', None)`` for anything unusable so the caller
-    falls straight back to the configured source — a malformed pin must
-    degrade to today's behaviour, never wedge the batch.
-
-    Soulseek deliberately gets no ``preferred_tracks``: given a username
-    and folder_path its album flow browses the folder itself, so the
-    whole track list never has to survive a round trip through the
-    browser.
-    """
-    if not isinstance(pinned, dict):
-        return '', None
-    source = str(pinned.get('source') or '').strip().lower()
-    if source not in _ALBUM_BUNDLE_SOURCES:
-        return '', None
-
-    if source == 'soulseek':
-        username = str(pinned.get('username') or '').strip()
-        folder_path = str(pinned.get('folder_path') or '').strip()
-        if not username or not folder_path:
-            return '', None
-        return source, {'preferred_source': {'username': username,
-                                             'folder_path': folder_path}}
-
-    token = str(pinned.get('token') or '').strip()
-    if not token:
-        return '', None
-    return source, {'preferred_release': {'token': token,
-                                          'title': str(pinned.get('title') or '')}}
+    sources = []
+    seen = set()
+    for raw_source in order:
+        source = str(raw_source or '').lower()
+        if source not in _ALBUM_BUNDLE_SOURCES:
+            break
+        if source and source not in seen:
+            sources.append(source)
+            seen.add(source)
+    return sources
 
 
 @dataclass
@@ -379,10 +598,9 @@ class _BatchStateAccessImpl:
                 row['album_bundle_state'] = 'failed'
 
 
-# "Still has work in flight" now has ONE implementation, in runtime_state.
-# The enumerated list that used to live here happened to be right and the
-# validator's copy in downloads/monitor.py did not — which is the whole argument
-# against keeping two.
+# Task states that mean a batch still has work in flight. While ANY of a batch's
+# tasks is in one of these, a serialized album-pool worker keeps its slot.
+_NON_TERMINAL_TASK_STATUSES = ('pending', 'queued', 'searching', 'downloading', 'post_processing')
 
 
 def _wait_for_batch_drain(batch_id: str, poll_seconds: float = 1.5,
@@ -410,7 +628,7 @@ def _wait_for_batch_drain(batch_id: str, poll_seconds: float = 1.5,
                 return
             queue = list(batch.get('queue', ()) or ())
             still_working = any(
-                task_is_active(download_tasks.get(t, {}).get('status'))
+                download_tasks.get(t, {}).get('status') in _NON_TERMINAL_TASK_STATUSES
                 for t in queue
             )
         if not still_working:
@@ -431,6 +649,20 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
     1. Runs the analysis.
     2. If missing tracks are found, it automatically queues them for download.
     """
+    # the analysis asks "do we already have this" through the batch owner's
+    # library (#1199); this runs on a pool thread with no request context
+    from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
+    with tasks_lock:
+        _batch_profile = (download_batches.get(batch_id) or {}).get('profile_id')
+    _scope_token = set_library_scope(library_scope_for_profile(_batch_profile))
+    try:
+        return _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps, serialize)
+    finally:
+        reset_library_scope(_scope_token)
+
+
+def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: MasterDeps,
+                                     serialize: bool = False):
     try:
         # PHASE 1: ANALYSIS
         with tasks_lock:
@@ -440,7 +672,6 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 download_batches[batch_id]['analysis_processed'] = 0
 
         from database.music_database import MusicDatabase
-        from core.library import manual_library_match as _mlm
         db = MusicDatabase()
         active_server = deps.config_manager.get_active_media_server()
         analysis_results = []
@@ -451,12 +682,8 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         batch_album_context = None
         batch_artist_context = None
         batch_is_album = False
-        # Read up here, not at the download-phase transition where the
-        # dispatch consumes it: the 'nothing missing' branch returns long
-        # before that point, and it has to be able to say that a release
-        # the user personally chose is being dropped on the floor.
-        batch_pinned_release = None
         batch_profile_id = 1
+        batch_quality_profile_id = None
         batch_source = 'spotify'
         batch_playlist_folder_mode = False
         batch_playlist_name = 'Unknown Playlist'
@@ -475,9 +702,9 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 ignore_manual_matches = download_batches[batch_id].get('ignore_manual_matches', False)
                 batch_is_album = download_batches[batch_id].get('is_album_download', False)
                 batch_album_context = download_batches[batch_id].get('album_context')
-                batch_pinned_release = download_batches[batch_id].get('pinned_release')
                 batch_artist_context = download_batches[batch_id].get('artist_context')
                 batch_profile_id = download_batches[batch_id].get('profile_id', 1) or 1
+                batch_quality_profile_id = download_batches[batch_id].get('quality_profile_id')
                 batch_source = download_batches[batch_id].get('batch_source', 'spotify') or 'spotify'
                 batch_playlist_folder_mode = download_batches[batch_id].get('playlist_folder_mode', False)
                 batch_playlist_name = download_batches[batch_id].get('playlist_name', 'Unknown Playlist')
@@ -487,18 +714,31 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 ).strip()
                 batch_skip_acoustid = bool(download_batches[batch_id].get('skip_acoustid', False))
 
+        # Most album requests carry one explicit/mirrored profile on the batch.
+        # For older/internal callers, recover the same intent from the first
+        # stamped track rather than silently reverting the whole-release picker
+        # to the app default.
+        if batch_quality_profile_id is None:
+            for _quality_track in tracks_json or []:
+                if isinstance(_quality_track, dict) and _quality_track.get('quality_profile_id') is not None:
+                    batch_quality_profile_id = _quality_track['quality_profile_id']
+                    break
+
         from core.downloads.playlist_folder import (
             resolve_playlist_folder_mode_for_batch,
             track_exists_in_playlist_folder_from_track_data,
         )
-        effective_playlist_folder_mode, effective_playlist_name = resolve_playlist_folder_mode_for_batch(
-            db,
-            playlist_id=str(batch_playlist_id),
-            playlist_name=batch_playlist_name,
-            batch_playlist_folder_mode=batch_playlist_folder_mode,
-            profile_id=batch_profile_id,
-            source=batch_source,
-        )
+        if batch_id in download_batches and download_batches[batch_id].get("album_completion_only"):
+            effective_playlist_folder_mode, effective_playlist_name = False, batch_playlist_name
+        else:
+            effective_playlist_folder_mode, effective_playlist_name = resolve_playlist_folder_mode_for_batch(
+                db,
+                playlist_id=str(batch_playlist_id),
+                playlist_name=batch_playlist_name,
+                batch_playlist_folder_mode=batch_playlist_folder_mode,
+                profile_id=batch_profile_id,
+                source=batch_source,
+            )
         if effective_playlist_folder_mode and not batch_playlist_folder_mode:
             with tasks_lock:
                 if batch_id in download_batches:
@@ -514,94 +754,68 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         if allow_duplicates and batch_is_album:
             logger.info("[Duplicates] Allow duplicate tracks enabled — only checking ownership within target album")
 
-        # Prefer deluxe editions: an owned SMALLER edition of the album being
-        # downloaded doesn't count as owning its songs. Without it, downloading
-        # "X (Deluxe Edition)" while owning "X" fetched only the bonus tracks and
-        # split the album across two folders (core/edition_preference.py).
-        prefer_deluxe = bool(batch_is_album and deps.config_manager.get(PREFER_DELUXE_KEY, False))
-        _requested_album_name = (batch_album_context or {}).get('name', '') if prefer_deluxe else ''
-        _requested_track_count = (batch_album_context or {}).get('total_tracks') if prefer_deluxe else None
-        _owned_edition_memo: dict = {}
+        # PREFLIGHT, run later: pin ONE MusicBrainz release for the album so every
+        # downloaded track is tagged with the same release MBID (no navidrome
+        # album splits). it used to run HERE, before a single track had been
+        # checked: a search plus up to eight full release fetches against a
+        # 1 req/s service that has been answering 503 with retries. ten to
+        # thirty seconds of nothing on the modal before the first owned /
+        # missing mark, on an album you may already own outright. it only
+        # matters for tagging files that get downloaded, so it runs once the
+        # analysis has found something to download.
+        def _preflight_musicbrainz_release():
+            if batch_is_album and batch_album_context and batch_artist_context:
+                try:
+                    album_name_pf = batch_album_context.get('name', '')
+                    artist_name_pf = batch_artist_context.get('name', '')
+                    if album_name_pf and artist_name_pf:
+                        mb_svc = deps.mb_worker.mb_service if deps.mb_worker else None
+                        if mb_svc:
+                            # the album's pinned release first, then the
+                            # album's count, not this batch's: three late tracks
+                            # re-searched and scored a 2-track single first (#1618)
+                            from core.album_consistency import _album_track_count, _resolve_album_release
+                            from core.metadata.musicbrainz_tags import selected_release_id
+                            selected = selected_release_id(batch_album_context)
+                            barcode_pf = batch_album_context.get('upc') or batch_album_context.get('barcode')
+                            release = (mb_svc.mb_client.get_release(
+                                selected, includes=['release-groups', 'labels', 'media', 'artist-credits', 'recordings'])
+                                if selected else _resolve_album_release(album_name_pf, artist_name_pf,
+                                                                    _album_track_count(batch_album_context.get('total_tracks'), tracks_json),
+                                                                    mb_svc, barcode=barcode_pf))
+                            if release and release.get('id'):
+                                release_mbid = release['id']
+                                _artist_key = artist_name_pf.lower().strip()
+                                _rc_key_norm = (deps.normalize_album_cache_key(album_name_pf), _artist_key)
+                                _rc_key_exact = (album_name_pf.lower().strip(), _artist_key)
+                                if not selected:
+                                    with deps.mb_release_cache_lock:
+                                        deps.mb_release_cache[_rc_key_norm] = release_mbid
+                                        deps.mb_release_cache[_rc_key_exact] = release_mbid
+                                # Also cache the full release detail for tag extraction
+                                with deps.mb_release_detail_cache_lock:
+                                    deps.mb_release_detail_cache[release_mbid] = release
+                                logger.info(f"[Preflight] Pre-cached MB release for '{album_name_pf}': "
+                                      f"'{release.get('title', '')}' ({release_mbid[:8]}...)")
+                            else:
+                                logger.warning(f"[Preflight] No MB release found for '{album_name_pf}' — per-track lookup will be used")
+                except Exception as pf_err:
+                    logger.error(f"[Preflight] MB release preflight failed: {pf_err}")
 
-        # PREFLIGHT: Pre-populate MusicBrainz release cache for album downloads.
-        # This ensures ALL tracks in the album use the same release MBID during
-        # per-track post-processing, preventing Navidrome album splits.
-        if batch_is_album and batch_album_context and batch_artist_context:
-            try:
-                album_name_pf = batch_album_context.get('name', '')
-                artist_name_pf = batch_artist_context.get('name', '')
-                if album_name_pf and artist_name_pf:
-                    mb_svc = deps.mb_worker.mb_service if deps.mb_worker else None
-                    if mb_svc:
-                        from core.album_consistency import _find_best_release
-                        release = _find_best_release(album_name_pf, artist_name_pf, len(tracks_json), mb_svc)
-                        if release and release.get('id'):
-                            release_mbid = release['id']
-                            _artist_key = artist_name_pf.lower().strip()
-                            _rc_key_norm = (deps.normalize_album_cache_key(album_name_pf), _artist_key)
-                            _rc_key_exact = (album_name_pf.lower().strip(), _artist_key)
-                            with deps.mb_release_cache_lock:
-                                deps.mb_release_cache[_rc_key_norm] = release_mbid
-                                deps.mb_release_cache[_rc_key_exact] = release_mbid
-                            # Also cache the full release detail for tag extraction
-                            with deps.mb_release_detail_cache_lock:
-                                deps.mb_release_detail_cache[release_mbid] = release
-                            logger.info(f"[Preflight] Pre-cached MB release for '{album_name_pf}': "
-                                  f"'{release.get('title', '')}' ({release_mbid[:8]}...)")
-                        else:
-                            logger.warning(f"[Preflight] No MB release found for '{album_name_pf}' — per-track lookup will be used")
-            except Exception as pf_err:
-                logger.error(f"[Preflight] MB release preflight failed: {pf_err}")
 
         # ALBUM FAST PATH: If this is an album download, try to find the album in the DB first
         # and match tracks within it — faster and more accurate than N global searches
-        album_tracks_map = {}  # Maps normalized title -> DatabaseTrack for album-scoped matching
-        # Release year of the album being analyzed — powers the re-release gate
-        # (5BILLION round 3): owning 'Chaosphere' (1998) must not read as owning
-        # 'Chaosphere (25th Anniversary Remastered 2023 Edition)'.
-        batch_expected_year = None
-        if batch_album_context:
-            _ry = str(batch_album_context.get('release_date')
-                      or batch_album_context.get('year') or '')[:4]
-            batch_expected_year = _ry if _ry.isdigit() else None
-        if batch_is_album and batch_album_context and batch_artist_context and not force_download_all:
-            album_name = batch_album_context.get('name', '')
-            artist_name = batch_artist_context.get('name', '')
-            total_tracks = batch_album_context.get('total_tracks', 0)
-            if album_name and artist_name:
-                try:
-                    db_album, album_confidence = db.check_album_exists_with_editions(
-                        title=album_name, artist=artist_name,
-                        confidence_threshold=0.7,
-                        expected_track_count=total_tracks if total_tracks > 0 else None,
-                        server_source=active_server,
-                        expected_year=batch_expected_year
-                    )
-                    if (db_album and album_confidence >= 0.7 and prefer_deluxe
-                            and is_smaller_edition(album_name, total_tracks,
-                                                   getattr(db_album, 'title', ''),
-                                                   getattr(db_album, 'track_count', None))):
-                        # Owned album is a smaller edition of this one: its songs
-                        # must not count toward the bigger edition.
-                        logger.info(
-                            f"[Prefer Deluxe] '{db_album.title}' is a smaller edition of "
-                            f"'{album_name}' — its tracks don't count toward this edition")
-                    elif db_album and album_confidence >= 0.7:
-                        db_album_tracks = db.get_tracks_by_album(db_album.id)
-                        for t in db_album_tracks:
-                            album_tracks_map[t.title.lower().strip()] = t
-                        logger.info(f"[Album Analysis] Found album '{db_album.title}' in DB with {len(db_album_tracks)} tracks (confidence: {album_confidence:.2f})")
-                    else:
-                        logger.warning(f"[Album Analysis] Album '{album_name}' not found in DB — falling back to per-track search")
-                except Exception as album_err:
-                    logger.error(f"[Album Analysis] Album lookup error: {album_err} — falling back to per-track search")
+        batch_expected_year = release_year_of(batch_album_context)
+        album_tracks_map = {}
+        if batch_is_album and not force_download_all:
+            album_tracks_map = album_tracks_map_for(
+                db, batch_album_context, batch_artist_context, active_server)
 
         for i, track_data in enumerate(tracks_json):
             # Use original table index if provided (for partial track selection),
             # otherwise fall back to enumeration index
             track_index = track_data.get('_original_index', i)
             track_name = track_data.get('name', '')
-            artists = track_data.get('artists', [])
             found, confidence = False, 0.0
             # Additive payload: the owned library track (DatabaseTrack) when this
             # item is found in the library, so downstream (playlist materialization)
@@ -610,17 +824,10 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
 
             # Manual library matches are authoritative unless the user explicitly
             # requested a force re-download from the normal download modal.
-            _stid = track_data.get('spotify_track_id') or track_data.get('source_track_id') or track_data.get('id', '')
-            # ...and only if the match still points at a track the library HAS.
-            # The row records the user's intent; it is not evidence the file
-            # survived. Without resolve_match, deleting the matched file made
-            # the track report found=True forever — download skipped, wishlist
-            # entry removed, gone (upstream #1138). The sync path has always
-            # verified; this one never did.
-            _manual_match = _mlm.resolve_match(db, (
-                _mlm.get_match_for_track(db, batch_profile_id, track_data, default_source=batch_source)
-                if (not ignore_manual_matches and _stid) else None
-            ))
+            _manual_match = (
+                None if ignore_manual_matches
+                else live_manual_match(db, batch_profile_id, track_data, batch_source)
+            )
             if _manual_match:
                 logger.info(f"[Manual Match] '{track_name}' already matched in library — skipping download")
                 try:
@@ -642,6 +849,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 if track_exists_in_playlist_folder_from_track_data(
                     effective_playlist_name,
                     track_data,
+                    profile_id=batch_profile_id,
                 ):
                     logger.info(
                         f"[Playlist Folder] '{track_name}' already on disk in playlist folder — skipping download"
@@ -663,113 +871,15 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
             if force_download_all:
                 logger.warning(f"[Force Download] Skipping database check for '{track_name}' - treating as missing")
                 found, confidence = False, 0.0
-            elif album_tracks_map:
-                # Album-scoped matching: check against known album tracks first
-                track_name_lower = track_name.lower().strip()
-                # Issue #589 — strip suffixes that just repeat the album
-                # context (e.g. "Shy Away (MTV Unplugged Live)" on a
-                # "MTV Unplugged" album → "Shy Away") so album-owned
-                # tracks don't false-miss when the local DB stored the
-                # base title. Only fires inside the album-confirmed
-                # scope; global matching elsewhere is unchanged.
-                from core.matching.album_context_title import strip_redundant_album_suffix
-                _album_name_for_strip = (batch_album_context or {}).get('name', '')
-                _normalized_source_title = strip_redundant_album_suffix(
-                    track_name, _album_name_for_strip
-                ).lower().strip()
-                # Direct title match (try both raw and normalized)
-                if track_name_lower in album_tracks_map:
-                    found, confidence = True, 1.0
-                    matched_track = album_tracks_map[track_name_lower]
-                elif _normalized_source_title and _normalized_source_title in album_tracks_map:
-                    found, confidence = True, 1.0
-                    matched_track = album_tracks_map[_normalized_source_title]
-                else:
-                    # Fuzzy match against album tracks using string similarity.
-                    # Compare BOTH the raw and normalized source titles —
-                    # whichever scores higher wins. Preserves strict
-                    # matching when the album doesn't imply version
-                    # context (helper returns the input unchanged).
-                    best_sim = 0.0
-                    best_track = None
-                    for db_title_lower, _db_track in album_tracks_map.items():
-                        sim_raw = db._string_similarity(track_name_lower, db_title_lower)
-                        sim_norm = db._string_similarity(_normalized_source_title, db_title_lower) if _normalized_source_title else 0.0
-                        sim = max(sim_raw, sim_norm)
-                        if sim > best_sim:
-                            best_sim = sim
-                            best_track = _db_track
-                    if best_sim >= 0.7:
-                        found, confidence = True, best_sim
-                        matched_track = best_track
-                    else:
-                        # Fall back to global per-track search for this track
-                        # When allow_duplicates is on for album downloads, skip global
-                        # search — the track isn't in THIS album so treat as missing
-                        if allow_duplicates and batch_is_album:
-                            found, confidence = False, 0.0
-                        else:
-                            _fallback_album = batch_album_context.get('name') if batch_album_context else None
-                            for artist in artists:
-                                if isinstance(artist, str):
-                                    artist_name = artist
-                                elif isinstance(artist, dict) and 'name' in artist:
-                                    artist_name = artist['name']
-                                else:
-                                    artist_name = str(artist)
-                                db_track, track_confidence = db.check_track_exists(
-                                    track_name, artist_name, confidence_threshold=0.7, server_source=active_server, album=_fallback_album
-                                )
-                                if db_track and track_confidence >= 0.7:
-                                    # Re-release gate (5BILLION round 3): the hit
-                                    # came from the ORIGINAL of this re-release →
-                                    # not ownership of THIS edition; keep missing.
-                                    if owned_hit_is_rerelease_original(
-                                            db, _fallback_album, batch_expected_year, db_track):
-                                        logger.info(
-                                            "[Album Analysis] '%s' owned only on the original "
-                                            "release of '%s' — re-release stays missing",
-                                            track_name, _fallback_album)
-                                        continue
-                                    if prefer_deluxe and owned_row_is_smaller_edition(
-                                            db, _requested_album_name, _requested_track_count,
-                                            db_track, _owned_edition_memo):
-                                        logger.info(
-                                            "[Prefer Deluxe] '%s' owned only on a smaller edition "
-                                            "of '%s' — stays missing", track_name, _requested_album_name)
-                                        continue
-                                    found, confidence = True, track_confidence
-                                    matched_track = db_track
-                                    break
-            elif allow_duplicates and batch_is_album:
-                # Allow duplicates + album download + album not in DB yet → treat all as missing
-                found, confidence = False, 0.0
             else:
-                # Non-album download (playlist/single track) — always check global
-                for artist in artists:
-                    # Handle both string format and Spotify API format {'name': 'Artist Name'}
-                    if isinstance(artist, str):
-                        artist_name = artist
-                    elif isinstance(artist, dict) and 'name' in artist:
-                        artist_name = artist['name']
-                    else:
-                        artist_name = str(artist)
-                    db_track, track_confidence = db.check_track_exists(
-                        track_name, artist_name, confidence_threshold=0.7, server_source=active_server
-                    )
-                    if db_track and track_confidence >= 0.7:
-                        # An album download lands here with duplicates off and no
-                        # album match; the same prefer-deluxe gate applies.
-                        if prefer_deluxe and owned_row_is_smaller_edition(
-                                db, _requested_album_name, _requested_track_count,
-                                db_track, _owned_edition_memo):
-                            logger.info(
-                                "[Prefer Deluxe] '%s' owned only on a smaller edition "
-                                "of '%s' — stays missing", track_name, _requested_album_name)
-                            continue
-                        found, confidence = True, track_confidence
-                        matched_track = db_track
-                        break
+                found, confidence, matched_track = match_track_in_library(
+                    db, track_data,
+                    album_tracks_map=album_tracks_map,
+                    album_context=batch_album_context,
+                    expected_year=batch_expected_year,
+                    album_only=allow_duplicates and batch_is_album,
+                    active_server=active_server,
+                )
 
             analysis_results.append({
                 'track_index': track_index, 'track': track_data, 'found': found, 'confidence': confidence,
@@ -835,31 +945,10 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                 download_batches[batch_id]['analysis_results'] = analysis_results
 
         # PHASE 2: TRANSITION TO DOWNLOAD (if necessary)
+        if missing_tracks and batch_is_album and batch_album_context and batch_artist_context:
+            _preflight_musicbrainz_release()
         if not missing_tracks:
             logger.warning(f"Analysis for batch {batch_id} complete. No missing tracks.")
-
-            # A user-picked release dies here, and used to die in silence.
-            # The pin is only read at the download-phase transition below,
-            # which this return never reaches — so someone who opened the
-            # album source picker, chose a specific torrent and pressed go
-            # saw a batch complete having grabbed nothing, with nothing in
-            # the log naming their choice. Staging the release here instead
-            # would be worse: the per-track workers that import staged files
-            # are the ones that never run when nothing is missing, so it
-            # would download a whole release and then abandon it. The honest
-            # outcome is to say why, and to point at the answer — replacing
-            # what is already on disk is what the picker asks about, and
-            # what the Force Download All toggle does.
-            if batch_pinned_release:
-                _pin_desc = (batch_pinned_release.get("title") or "").strip() or "(untitled)"
-                logger.warning(
-                    "[Album Bundle] Batch %s carried a user-picked %s release (%s) that "
-                    "was NOT grabbed: every track is already in the library, so the batch "
-                    "ended before the release could be claimed. Choose 'Replace' in the "
-                    "release picker (or tick Force Download All) to download over the "
-                    "existing files.",
-                    batch_id, batch_pinned_release.get("source") or "?", _pin_desc,
-                )
 
             # Record sync history — all tracks found, nothing to download
             tracks_found = sum(1 for r in analysis_results if r.get('found'))
@@ -904,13 +993,24 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                     is_auto_batch = download_batches[batch_id].get('auto_initiated', False)
                     download_batches[batch_id]['phase'] = 'complete'
                     download_batches[batch_id]['completion_time'] = time.time()  # Track for auto-cleanup
-                    if batch_pinned_release:
-                        download_batches[batch_id]['pinned_release_skipped'] = True
-                        download_batches[batch_id]['pinned_release_skipped_reason'] = (
-                            'Every track is already in your library, so the release you picked '
-                            'was not downloaded. Pick it again and choose Replace to download '
-                            'over the files you have.'
-                        )
+
+                    # album_bundle_state is a LIVE MIRROR of the plugin's progress
+                    # (album_bundle_dispatch._emit writes whatever the last payload
+                    # said), and it has no completion value — only 'searching',
+                    # 'fallback', 'staged' and 'failed' are ever assigned. Nothing
+                    # cleared it, so _build_album_bundle_status kept emitting a
+                    # bundle row forever, frozen at the last tick: a finished album
+                    # showed "Soulseek downloading release 42%" on the Downloads
+                    # page indefinitely.
+                    #
+                    # Cleared HERE and not earlier: task_worker reads
+                    # `album_bundle_state == 'staged'` while the per-track flow
+                    # runs, so the field has to survive until the batch is done.
+                    # Only the state is dropped — the source/release details stay
+                    # for anything that reports on how the album arrived.
+                    download_batches[batch_id]['album_bundle_state'] = ''
+                    for _mirrored in ('progress', 'speed', 'downloaded', 'count', 'failed'):
+                        download_batches[batch_id].pop(f'album_bundle_{_mirrored}', None)
 
                     # Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
                     if playlist_id.startswith('youtube_'):
@@ -991,43 +1091,153 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
             batch_album_context = batch.get('album_context')
             batch_artist_context = batch.get('artist_context')
             batch_is_album = batch.get('is_album_download', False)
+            batch_album_completion_only = bool(batch.get('album_completion_only', False))
             batch_private_album_bundle = bool(batch.get('album_bundle_private_staging'))
             batch_playlist_folder_mode = batch.get('playlist_folder_mode', False)
             batch_playlist_name = batch.get('playlist_name', 'Unknown Playlist')
-            batch_pinned_release = batch.get('pinned_release')
 
         # Album-bundle sources download a whole release into private staging,
         # then the normal per-track workers claim those staged files. Run this
         # only after analysis has found missing tracks; otherwise an already
         # owned album would still trigger a release download.
         _bundle_state = _BatchStateAccessImpl()
-        # A release the user picked from the album source picker wins over the
-        # configured source outright. _resolve_album_bundle_source answers
-        # "which source may claim a whole album unattended?" — a question that
-        # stops being relevant once a human has named the release they want.
-        _pin_source, _pin_kwargs = _pinned_album_bundle(batch_pinned_release)
-        _album_bundle_source = _pin_source or _resolve_album_bundle_source(deps.config_manager)
-        if _album_bundle_source and _album_bundle_source != 'soulseek':
-            if _album_bundle_dispatch.try_dispatch(
-                batch_id=batch_id,
-                is_album=batch_is_album,
-                album_context=batch_album_context,
-                artist_context=batch_artist_context,
-                config_get=deps.config_manager.get,
-                plugin_resolver=deps.download_orchestrator.client,
-                state=_bundle_state,
-                source_override=_album_bundle_source,
-                plugin_kwargs=_pin_kwargs,
-            ):
-                return
+        _album_bundle_sources = _resolve_album_bundle_sources(deps.config_manager)
+        # Commissary: a release picked in the album release picker - only its
+        # source, carrying the pick (core/commissary/release_picker.py)
+        from core.commissary.release_picker import bundle_pin as _commissary_bundle_pin
+        _pin_source, _pin_kwargs = _commissary_bundle_pin(batch.get('commissary_pinned_release'))
+        if _pin_source:
+            _album_bundle_sources = [_pin_source]
+        _album_bundle_staged = batch_private_album_bundle
+
+        def _configured_bundle_plugin(source):
+            """Resolve one release source without turning missing setup into
+            a terminal album failure.
+
+            Torrent/Usenet are registered even when Prowlarr or their download
+            client has not been configured. Their bundle methods quite rightly
+            report that as a failure when called directly, but in a hybrid
+            chain an unavailable source means "skip this source", not "abort
+            the album and discard every configured fallback after it".
+            """
+            try:
+                plugin = deps.download_orchestrator.client(source)
+            except Exception as exc:
+                logger.warning(
+                    "[Album Bundle] Could not resolve %s; skipping it: %s",
+                    source, exc,
+                )
+                return None
+            if plugin is None:
+                logger.info("[Album Bundle] %s is unavailable; skipping it", source)
+                return None
+            configured = getattr(plugin, 'is_configured', None)
+            if callable(configured):
+                try:
+                    if not configured():
+                        logger.info(
+                            "[Album Bundle] %s is not configured; skipping it",
+                            source,
+                        )
+                        return None
+                except Exception as exc:
+                    logger.warning(
+                        "[Album Bundle] Could not verify %s configuration; "
+                        "skipping it: %s", source, exc,
+                    )
+                    return None
+            return plugin
+
+        def _bundle_plugin_kwargs():
+            """What the album plugins need beyond album/artist/staging.
+
+            Both dispatch sites send the same thing, and a key is omitted
+            rather than sent as None: the plugins treat a missing duration as
+            "no opinion", and an explicit None would have to mean the same,
+            twice.
+            """
+            kwargs = {}
+            if batch_quality_profile_id is not None:
+                kwargs['quality_profile_id'] = batch_quality_profile_id
+            _duration = expected_release_duration_seconds(tracks_json)
+            if _duration:
+                kwargs['expected_duration_seconds'] = _duration
+            kwargs.update(_pin_kwargs or {})  # Commissary: the picked release
+            return kwargs or None
+
+        def _dispatch_bundle_sources(sources):
+            """Try an ordered segment. Return True only for a terminal result."""
+            nonlocal _album_bundle_staged
+            if batch_album_completion_only:
+                return False
+            for source in sources:
+                if _album_bundle_staged:
+                    break
+                plugin = _configured_bundle_plugin(source)
+                if plugin is None:
+                    continue
+                if _album_bundle_dispatch.try_dispatch(
+                    batch_id=batch_id,
+                    is_album=batch_is_album,
+                    album_context=batch_album_context,
+                    artist_context=batch_artist_context,
+                    config_get=deps.config_manager.get,
+                    plugin_resolver=lambda _name, _plugin=plugin: _plugin,
+                    state=_bundle_state,
+                    source_override=source,
+                    plugin_kwargs=_bundle_plugin_kwargs(),
+                ):
+                    return True
+
+                with tasks_lock:
+                    _bundle_row = download_batches.get(batch_id) or {}
+                    _album_bundle_staged = bool(
+                        _bundle_row.get('album_bundle_private_staging')
+                        and _bundle_row.get('album_bundle_state') == 'staged'
+                    )
+            return False
+
+        # Soulseek has a richer folder preflight, so split the consecutive
+        # release prefix around it. Crucially, the suffix is retained: if
+        # Soulseek has no suitable folder/release, a later Usenet source still
+        # gets its configured turn.
+        try:
+            _soulseek_bundle_index = _album_bundle_sources.index('soulseek')
+        except ValueError:
+            _soulseek_bundle_index = None
+        if _soulseek_bundle_index is None:
+            _pre_soulseek_sources = _album_bundle_sources
+            _post_soulseek_sources = []
+        else:
+            _pre_soulseek_sources = _album_bundle_sources[:_soulseek_bundle_index]
+            _post_soulseek_sources = _album_bundle_sources[_soulseek_bundle_index + 1:]
+
+        if _dispatch_bundle_sources(_pre_soulseek_sources):
+            return
+
+        # A successful Torrent/Usenet bundle owns the batch. Refresh this
+        # local value after dispatch; the copy read before network I/O is stale.
+        batch_private_album_bundle = _album_bundle_staged
 
         # === ALBUM PRE-FLIGHT: Search for complete album folder before track-by-track ===
         # Only run pre-flight when Soulseek is the download source (or hybrid with soulseek)
         preflight_source = None
         preflight_tracks = None
-        soulseek_is_source = _soulseek_album_preflight_enabled(deps.config_manager)
+        scored_albums = []
+        _soulseek_bundle_plugin = (
+            _configured_bundle_plugin('soulseek')
+            if (_soulseek_bundle_index is not None
+                and not batch_private_album_bundle
+                and not batch_album_completion_only)
+            else None
+        )
+        soulseek_is_source = (
+            _soulseek_bundle_plugin is not None
+            and not batch_private_album_bundle
+        )
         if (batch_is_album and batch_album_context and batch_artist_context
-                and soulseek_is_source and not batch_private_album_bundle):
+                and soulseek_is_source and not batch_private_album_bundle
+                and not _pin_source):  # Commissary: a picked folder needs no pre-flight
             artist_name = batch_artist_context.get('name', '')
             album_name = batch_album_context.get('name', '')
             if artist_name and album_name:
@@ -1036,17 +1246,12 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                     _sr.info(f"[Album Pre-flight] Searching for '{artist_name} {album_name}'")
                     logger.info(f"[Album Pre-flight] Searching Soulseek for complete album: '{artist_name} - {album_name}'")
 
-                    slsk = _resolve_soulseek_client(deps.download_orchestrator)
+                    slsk = _soulseek_bundle_plugin
 
-                    # Try multiple query variations (banned keywords in artist/album name can return 0 results)
-                    album_queries = [f"{artist_name} {album_name}"]
-                    # Clean artist name (remove feat., parentheticals)
-                    clean_artist = re.sub(r'\s*\(.*?\)', '', artist_name).strip()
-                    clean_artist = re.sub(r'\s*(feat\.?|ft\.?|featuring)\s+.*$', '', clean_artist, flags=re.IGNORECASE).strip()
-                    if clean_artist != artist_name:
-                        album_queries.append(f"{clean_artist} {album_name}")
-                    # Album name only (some users file by album)
-                    album_queries.append(album_name)
+                    album_queries = _album_search_queries(
+                        artist_name, album_name,
+                        str((batch_album_context or {}).get('release_date') or '')[:4],
+                    )
 
                     album_results = []
                     track_results = []
@@ -1068,16 +1273,29 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         # Score complete folders as releases before falling back to per-track search.
                         scored_albums = []
                         for ar in album_results:
-                            filtered_tracks = slsk.filter_results_by_quality_preference(ar.tracks)
+                            if batch_quality_profile_id is None:
+                                filtered_tracks = slsk.filter_results_by_quality_preference(ar.tracks)
+                            else:
+                                filtered_tracks = slsk.filter_results_by_quality_preference(
+                                    ar.tracks,
+                                    profile_id=batch_quality_profile_id,
+                                )
                             if filtered_tracks:
+                                folder_coverage = assign_album_tracks(
+                                    [track for track in tracks_json if track.get('name')],
+                                    filtered_tracks,
+                                    album=str((batch_album_context or {}).get('name') or ''),
+                                ).coverage
                                 folder_score = _score_album_folder(
                                     ar,
                                     batch_album_context,
                                     batch_artist_context,
                                     tracks_json,
-                                    len(filtered_tracks),
+                                    filtered_tracks,
+                                    coverage_score=folder_coverage,
                                 )
-                                scored_albums.append((ar, len(filtered_tracks), folder_score))
+                                scored_albums.append((ar, len(filtered_tracks), folder_score,
+                                                      folder_coverage))
                                 _sr.info(
                                     f"[Album Pre-flight] Candidate {ar.username}:{ar.album_path} "
                                     f"score={folder_score:.3f}, tracks={ar.track_count}, "
@@ -1088,7 +1306,31 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         best_score = 0.0
                         if scored_albums:
                             scored_albums.sort(key=lambda x: (x[2], x[1], x[0].quality_score), reverse=True)
-                            best_album, _best_filtered_count, best_score = scored_albums[0]
+                            # Within a narrow correctness band, a live peer is
+                            # preferable to a queued crawler. Keep differing
+                            # release variants and coverage outside the band.
+                            leader = scored_albums[0]
+                            leader_variant = _folder_variant_penalty(
+                                str((batch_album_context or {}).get('name') or ''),
+                                f'{leader[0].album_title} {leader[0].album_path}',
+                            )
+                            band = [row for row in scored_albums if
+                                    leader[2] - row[2] <= _ALBUM_PREFLIGHT_BAND_WIDTH
+                                    and abs(leader[3] - row[3]) <= _ALBUM_PREFLIGHT_COVERAGE_TOLERANCE
+                                    and _folder_variant_penalty(
+                                        str((batch_album_context or {}).get('name') or ''),
+                                        f'{row[0].album_title} {row[0].album_path}',
+                                    ) == leader_variant]
+                            if len(band) > 1:
+                                from core.downloads.peer_observation import peer_availability_key, peer_speed
+
+                                band.sort(key=lambda row: peer_availability_key(
+                                    row[0], peer_speed(row[0].username),
+                                ) + (row[2], row[0].username), reverse=True)
+                                band_ids = {id(row) for row in band}
+                                scored_albums = band + [row for row in scored_albums
+                                                         if id(row) not in band_ids]
+                            best_album, _best_filtered_count, best_score, _ = scored_albums[0]
                             if best_score < _ALBUM_PREFLIGHT_MIN_SCORE:
                                 _sr.info(
                                     f"[Album Pre-flight] Best folder score {best_score:.3f} below "
@@ -1110,6 +1352,24 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                                 folder_tracks = slsk.parse_browse_results_to_tracks(
                                     best_album.username, browse_files, directory=best_album.album_path
                                 )
+                                if folder_tracks:
+                                    if batch_quality_profile_id is None:
+                                        eligible_tracks = slsk.filter_results_by_quality_preference(folder_tracks)
+                                    else:
+                                        eligible_tracks = slsk.filter_results_by_quality_preference(
+                                            folder_tracks, profile_id=batch_quality_profile_id,
+                                        )
+                                    browse_coverage = assign_album_tracks(
+                                        [track for track in tracks_json if track.get('name')],
+                                        eligible_tracks,
+                                        album=str((batch_album_context or {}).get('name') or ''),
+                                    ).coverage
+                                    if browse_coverage < 0.8:
+                                        logger.warning(
+                                            '[Album Pre-flight] Browsed folder %s covers only %.0f%% of requested tracks',
+                                            best_album.album_path, browse_coverage * 100,
+                                        )
+                                        folder_tracks = []
                                 if folder_tracks:
                                     preflight_source = {
                                         'username': best_album.username,
@@ -1146,30 +1406,58 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
         # exact source into the bundle downloader so we keep the richer
         # tracklist-aware scoring instead of doing a weaker second pick.
         _bundle_state = _BatchStateAccessImpl()
-        _album_bundle_source = _pin_source or _resolve_album_bundle_source(deps.config_manager)
-        if _album_bundle_source == 'soulseek':
-            # A user-picked folder outranks the pre-flight pick — both express
-            # "use this exact folder", but only one of them was chosen by a
-            # person. Soulseek needs no track list with it: given a username +
-            # folder_path it browses the folder itself.
-            _soulseek_kwargs = _pin_kwargs or (
+        if soulseek_is_source:
+            _album_bundle_source = 'soulseek'
+            _preflight_alternatives = [
                 {
-                    'preferred_source': preflight_source,
-                    'preferred_tracks': preflight_tracks,
-                } if preflight_source and preflight_tracks else None
-            )
+                    'username': album.username,
+                    'folder_path': album.album_path,
+                    'tracks': album.tracks,
+                }
+                for album, _, score, _ in scored_albums[:5]
+                if score >= _ALBUM_PREFLIGHT_MIN_SCORE
+                and (not preflight_source or album.username != preflight_source['username']
+                     or album.album_path != preflight_source['folder_path'])
+            ]
             if _album_bundle_dispatch.try_dispatch(
                 batch_id=batch_id,
                 is_album=batch_is_album,
                 album_context=batch_album_context,
                 artist_context=batch_artist_context,
                 config_get=deps.config_manager.get,
-                plugin_resolver=deps.download_orchestrator.client,
+                plugin_resolver=lambda _name: _soulseek_bundle_plugin,
                 state=_bundle_state,
                 source_override=_album_bundle_source,
-                plugin_kwargs=_soulseek_kwargs,
+                plugin_kwargs={
+                    'expected_tracks': tracks_json,
+                    **(
+                        {
+                            'preferred_source': preflight_source,
+                            'preferred_tracks': preflight_tracks,
+                            'preferred_alternatives': _preflight_alternatives,
+                        }
+                        if preflight_source and preflight_tracks else {}
+                    ),
+                    **(
+                        _bundle_plugin_kwargs() or {}
+                    ),
+                } or None,
             ):
                 return
+
+            with tasks_lock:
+                _bundle_row = download_batches.get(batch_id) or {}
+                _album_bundle_staged = bool(
+                    _bundle_row.get('album_bundle_private_staging')
+                    and _bundle_row.get('album_bundle_state') == 'staged'
+                )
+
+        if not _album_bundle_staged and _dispatch_bundle_sources(_post_soulseek_sources):
+            return
+
+        # Soulseek or a source after it may have staged the release. Refresh
+        # the local copy before deciding whether to preload Soulseek reuse.
+        batch_private_album_bundle = _album_bundle_staged
 
         with tasks_lock:
             if batch_id not in download_batches: return
@@ -1204,6 +1492,7 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
             wishlist_album_disc_counts = {}
             wishlist_album_artist_map = {}  # album_id -> resolved artist context (consistent per album)
             wishlist_album_context_map = {}  # album_id -> richest shared album context
+            wishlist_album_fallback_artist = {}  # album_id -> singer, when the album has no credit (#1616)
             if playlist_id == 'wishlist':
                 import json as _json
                 # First pass: collect disc_number and resolve ONE artist per album
@@ -1250,10 +1539,17 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                                 _fa = _wl_album_artists[0]
                                 wishlist_album_artist_map[album_id] = _fa if isinstance(_fa, dict) else {'name': str(_fa)}
                             else:
+                                # #1616: no album credit stored. the singer is
+                                # NOT the album artist (a VA soundtrack filed
+                                # under whoever sang the first track). the album
+                                # lookup at download time fills the real credit;
+                                # the singer is only its fallback, one per album
+                                # so a failed lookup still keeps one folder
+                                wishlist_album_artist_map[album_id] = {}
                                 _wl_track_artists = sp_data.get('artists', [])
                                 if _wl_track_artists:
                                     _fa = _wl_track_artists[0]
-                                    wishlist_album_artist_map[album_id] = _fa if isinstance(_fa, dict) else {'name': str(_fa)}
+                                    _fallback_name = _fa.get('name', '') if isinstance(_fa, dict) else str(_fa)
                                 else:
                                     # Try top-level 'artists' (wishlist format uses plural)
                                     _tl_artists = t.get('artists', [])
@@ -1262,8 +1558,9 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                                         _fallback_name = _tla.get('name', str(_tla)) if isinstance(_tla, dict) else str(_tla)
                                     else:
                                         _fallback_name = t.get('artist', '')
-                                    wishlist_album_artist_map[album_id] = {'name': _fallback_name or 'Unknown Artist'}
-                            logger.info(f"[Wishlist Album Grouping] Album '{_wl_album.get('name', album_id)}' → artist: '{wishlist_album_artist_map[album_id].get('name', '?')}'")
+                                wishlist_album_fallback_artist[album_id] = _fallback_name or 'Unknown Artist'
+                            logger.info(f"[Wishlist Album Grouping] Album '{_wl_album.get('name', album_id)}' → artist: "
+                                        f"'{wishlist_album_artist_map[album_id].get('name') or '(from the album lookup)'}'")
 
 
 
@@ -1296,6 +1593,15 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         s_album = {'name': s_album}  # Normalize string album to dict
                     s_artists = spotify_data.get('artists', [])
 
+                    # The track's own album artist — ground truth for the #1316
+                    # disagreement check below (album.artists[0] of THIS row).
+                    _own_aa_artists = s_album.get('artists') or []
+                    _own_aa_first = _own_aa_artists[0] if isinstance(_own_aa_artists, list) and _own_aa_artists else None
+                    if isinstance(_own_aa_first, dict):
+                        _own_album_artist_name = str(_own_aa_first.get('name') or '').strip()
+                    else:
+                        _own_album_artist_name = str(_own_aa_first or '').strip()
+
                     # We need at least an album name and artist
                     if s_album and isinstance(s_album, dict) and s_album.get('name'):
                         # Use pre-computed album-level artist for folder consistency.
@@ -1308,15 +1614,29 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                         if not album_id_for_lookup:
                             album_id_for_lookup = 'wishlist_album'
                         artist_ctx = wishlist_album_artist_map.get(album_id_for_lookup, {})
-                        if not artist_ctx or not artist_ctx.get('name'):
-                            # Fallback: per-track resolution from artists array
-                            _fb_artists = track_info.get('artists', [])
-                            if _fb_artists:
-                                _fb_a = _fb_artists[0]
-                                _fb_name = _fb_a.get('name', str(_fb_a)) if isinstance(_fb_a, dict) else str(_fb_a)
-                            else:
-                                _fb_name = track_info.get('artist', '')
-                            artist_ctx = {'name': _fb_name or 'Unknown Artist'}
+                        # #1316 (filing side): the map is first-row-wins, so one
+                        # poisoned row's album artist would be stamped onto every
+                        # other track of the album, and the filing path trusts
+                        # _explicit_artist_context unconditionally. Apply the
+                        # same disagreement check the tag path uses
+                        # (core/metadata/source.py): on disagreement trust this
+                        # track's own album artist, loudly — the map is fallback
+                        # only.
+                        _map_artist_name = str((artist_ctx or {}).get('name') or '').strip()
+                        if (_own_album_artist_name
+                                and _own_album_artist_name.casefold() != 'unknown artist'
+                                and _map_artist_name
+                                and _map_artist_name.casefold() != 'unknown artist'
+                                and _own_album_artist_name.casefold() != _map_artist_name.casefold()):
+                            logger.warning(
+                                "[Wishlist] explicit artist context '%s' disagrees with track '%s' "
+                                "own album artist '%s' — trusting the track data (#1316)",
+                                _map_artist_name, track_info.get('name'), _own_album_artist_name,
+                            )
+                            artist_ctx = {'name': _own_album_artist_name}
+                        if (not (artist_ctx or {}).get('name') and _own_album_artist_name
+                                and _own_album_artist_name.casefold() != 'unknown artist'):
+                            artist_ctx = {'name': _own_album_artist_name}
 
                         # Construct a shared album context from the richest track in
                         # this album group so release_date/year and artwork do not
@@ -1327,15 +1647,24 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
                             'id': album_id,
                             'name': shared_album.get('name') or s_album.get('name'),
                             'release_date': shared_album.get('release_date', ''),
-                            'total_tracks': shared_album.get('total_tracks') or s_album.get('total_tracks', 1),
+                            # 0 = unknown, so the album lookup fills it. 1 read as
+                            # real and every track tagged 4/1 (#1616)
+                            'total_tracks': shared_album.get('total_tracks') or s_album.get('total_tracks') or 0,
                             'total_discs': wishlist_album_disc_counts.get(album_id_for_lookup, 1),
                             'album_type': shared_album.get('album_type') or s_album.get('album_type', 'album'),
+                            'album_type_locked': bool(shared_album.get('album_type_locked') or s_album.get('album_type_locked')),
                             'images': shared_album.get('images') or s_album.get('images', []),
                             'artists': shared_album.get('artists') or s_album.get('artists', []),
                         }
 
                         track_info['_explicit_album_context'] = album_ctx
-                        track_info['_explicit_artist_context'] = artist_ctx
+                        if (artist_ctx or {}).get('name'):
+                            track_info['_explicit_artist_context'] = artist_ctx
+                        else:
+                            # no album credit: leave the folder to the album
+                            # lookup, like download missing does (#1616)
+                            track_info['_fallback_album_artist'] = wishlist_album_fallback_artist.get(
+                                album_id_for_lookup) or ''
                         track_info['_is_explicit_album_download'] = True
                         logger.info(f"[Wishlist] Added album context for: '{track_info.get('name')}' -> '{album_ctx['name']}'")
 

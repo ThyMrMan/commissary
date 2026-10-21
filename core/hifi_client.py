@@ -34,7 +34,8 @@ from urllib.parse import urljoin
 import requests as http_requests
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_blocking
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
 from core.quality.source_map import quality_from_tidal_tier, quality_tier_for_source
 
@@ -198,21 +199,10 @@ def is_short_audio(actual_seconds: float, expected_seconds: float, threshold: fl
     return a < e * threshold
 
 
-def is_fake_lossless_bitrate(size_bytes, claimed_seconds, sample_rate, bits_per_sample,
-                             channels, min_ratio: float = 0.30) -> bool:
-    """True when a 'lossless' file's data is FAR too small for its claimed length — the
-    fingerprint of a ~30s preview whose STREAMINFO/container was faked to the full
-    duration (so every length header reads 'full' and only the bitrate gives it away).
-    Real FLAC is ~40-75% of raw PCM; a preview padded to full length implies single-digit
-    %. Conservative: 0 / bad inputs return False (never reject on unknowns)."""
-    try:
-        sz, secs = float(size_bytes or 0), float(claimed_seconds or 0)
-        sr, bits, ch = int(sample_rate or 0), int(bits_per_sample or 0), int(channels or 0)
-    except (TypeError, ValueError):
-        return False
-    if sz <= 0 or secs <= 0 or sr <= 0 or bits <= 0 or ch <= 0:
-        return False
-    return (sz * 8 / secs) < (sr * bits * ch) * min_ratio
+# The lossless-density predicate lives with the other file-level checks now, so
+# the shared import path and this client cannot drift apart. Re-exported here
+# because that is the name this module (and its tests) already use.
+from core.imports.file_integrity import is_fake_lossless_bitrate   # noqa: E402,F401
 
 
 def parse_ffmpeg_time(stderr_text) -> float:
@@ -247,6 +237,48 @@ _pushed_new_defaults = False
 from core.download_plugins.base import DownloadSourcePlugin
 
 
+class AllInstancesDownBreaker:
+    """fail fast while every hifi instance is down.
+
+    with every server dead each call walked the whole pool, a timeout per
+    instance, and post-processing made three calls per track, about a minute a
+    track (#1606). once a full pass fails the gate shuts for 30s, doubling up to
+    5 min while it keeps failing. any answer, or reloading the instance list,
+    opens it again.
+    """
+
+    FIRST_WAIT = 30.0
+    MAX_WAIT = 300.0
+
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._wait = 0.0
+        self._until = 0.0
+
+    def is_open(self) -> bool:
+        """True while calls should skip the pool entirely."""
+        with self._lock:
+            return self._clock() < self._until
+
+    def remaining(self) -> float:
+        with self._lock:
+            return max(0.0, self._until - self._clock())
+
+    def record_all_down(self) -> float:
+        with self._lock:
+            self._wait = min(self.MAX_WAIT, self._wait * 2 if self._wait else self.FIRST_WAIT)
+            self._until = self._clock() + self._wait
+            return self._wait
+
+    def record_answer(self) -> None:
+        with self._lock:
+            self._wait = 0.0
+            self._until = 0.0
+
+    reset = record_answer
+
+
 class HiFiClient(DownloadSourcePlugin):
     """
     HiFi API client for searching and downloading lossless music.
@@ -270,7 +302,7 @@ class HiFiClient(DownloadSourcePlugin):
 
         self.session = http_requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Commissary/1.0',
+            'User-Agent': 'SoulSync/1.0',
             'Accept': 'application/json',
         })
 
@@ -280,14 +312,6 @@ class HiFiClient(DownloadSourcePlugin):
         self._last_api_call = 0
         self._api_lock = threading.Lock()
         self._min_interval = 0.5
-
-        # Per-instance circuit breaker: url -> {"fails": int, "until": float}.
-        # An instance that just failed is skipped WITHOUT a network call until
-        # its cooldown elapses, and a pool where every instance is cooling fails
-        # instantly instead of walking all seven. See _api_get.
-        self._breaker: dict = {}
-        self._breaker_lock = threading.Lock()
-        self._pool_down_logged_until = 0.0
 
         logger.info(f"HiFi client initialized (instance: {self._current_instance}, "
                      f"download path: {self.download_path})")
@@ -307,7 +331,7 @@ class HiFiClient(DownloadSourcePlugin):
         if _pushed_new_defaults:
             return
         try:
-            from config.settings import config_manager
+            from core.settings import config_manager
             offered = config_manager.get('hifi.offered_defaults', None)
             existing = db.get_all_hifi_instances()
             to_add, new_offered = compute_new_default_pushes(
@@ -344,13 +368,6 @@ class HiFiClient(DownloadSourcePlugin):
             self._instances = list(DEFAULT_INSTANCES)
 
     def reload_instances(self):
-        # Editing the instance list is a deliberate intervention — someone added
-        # a host, removed a dead one, or hit Restore Defaults. Holding old
-        # cooldowns against that would make the change look like it did nothing
-        # for up to fifteen minutes.
-        with self._breaker_lock:
-            self._breaker.clear()
-            self._pool_down_logged_until = 0.0
         with self._instance_lock:
             old_current = self._current_instance
             self._load_instances_from_db()
@@ -359,6 +376,8 @@ class HiFiClient(DownloadSourcePlugin):
                 logger.info(f"HiFi instances reloaded, active: {self._current_instance}")
             else:
                 logger.info("HiFi instances reloaded")
+        # new instance list, worth asking again right away
+        self._breaker().reset()
 
     def _get_instance(self) -> Optional[str]:
         with self._instance_lock:
@@ -375,71 +394,12 @@ class HiFiClient(DownloadSourcePlugin):
             else:
                 self._current_instance = None
 
-    # ── circuit breaker ──────────────────────────────────────────────────────
-    # These are public instances run by volunteers; whole-pool outages are
-    # normal and can last hours. Without a breaker every search re-tried all
-    # seven dead hosts and paid the full timeout on each — a real log shows
-    # 4,094 "exhausted" errors and ~23,500 warnings in twelve hours, and 16
-    # seconds burned on one host AFTER the pool had already been reported dead.
-    #
-    # Cooldown doubles per consecutive failure so a flapping instance backs off
-    # on its own, and is capped so a recovered pool is never locked out for
-    # long. One success clears the record entirely.
-    _BREAKER_BASE_COOLDOWN = 60.0        # after the first failure
-    _BREAKER_MAX_COOLDOWN = 900.0        # 15 minutes, the ceiling
-
-    def _breaker_open(self, url: str, now: float = None) -> bool:
-        """Is this instance in cooldown? A url whose cooldown has elapsed
-        returns False — that is the half-open probe, and whether it closes for
-        good depends on the outcome."""
-        with self._breaker_lock:
-            entry = self._breaker.get(url)
-            return bool(entry and (now or time.time()) < entry["until"])
-
-    def _note_failure(self, url: str) -> None:
-        with self._breaker_lock:
-            entry = self._breaker.get(url) or {"fails": 0, "until": 0.0}
-            entry["fails"] += 1
-            cooldown = min(self._BREAKER_BASE_COOLDOWN * (2 ** (entry["fails"] - 1)),
-                           self._BREAKER_MAX_COOLDOWN)
-            entry["until"] = time.time() + cooldown
-            self._breaker[url] = entry
-
-    def _note_success(self, url: str) -> None:
-        """One good answer clears the record — a host that works is not
-        'less broken', it is working."""
-        with self._breaker_lock:
-            self._breaker.pop(url, None)
-
-    def _pool_cooling(self) -> bool:
-        """True when EVERY configured instance is in cooldown. The fast path:
-        there is nothing to try, so try nothing."""
-        with self._instance_lock:
-            instances = list(self._instances)
-        now = time.time()
-        return bool(instances) and all(self._breaker_open(u, now) for u in instances)
-
-    def _log_pool_down_once(self) -> None:
-        """Say the pool is down ONCE per cooldown window, not once per call.
-        The flood is what made this invisible: 4,094 identical errors bury the
-        one line that would have explained a slow search."""
-        with self._breaker_lock:
-            soonest = min((e["until"] for e in self._breaker.values()), default=0.0)
-            if time.time() < self._pool_down_logged_until:
-                return
-            self._pool_down_logged_until = soonest
-        wait = max(0, int(soonest - time.time()))
-        logger.warning("All HiFi instances are failing — skipping HiFi for ~%ds "
-                       "instead of retrying each one. Searches fall through to "
-                       "your other sources meanwhile.", wait)
-
-    def breaker_status(self) -> dict:
-        """{url: seconds_remaining} for instances currently in cooldown —
-        for the connection panel, so a skipped source can say why."""
-        now = time.time()
-        with self._breaker_lock:
-            return {u: int(e["until"] - now) for u, e in self._breaker.items()
-                    if now < e["until"]}
+    def _breaker(self) -> AllInstancesDownBreaker:
+        # lazy so a client built without __init__ still has one
+        breaker = self.__dict__.get('_down_breaker')
+        if breaker is None:
+            breaker = self.__dict__.setdefault('_down_breaker', AllInstancesDownBreaker())
+        return breaker
 
     def _rate_limit(self):
         with self._api_lock:
@@ -456,28 +416,23 @@ class HiFiClient(DownloadSourcePlugin):
         # fetches) are unaffected.
         if timeout is None:
             timeout = config_manager.get_source_search_timeout() or 15
-        tried = set()
-
-        # Fast path: every instance is in cooldown, so there is nothing to ask.
-        # This is the whole point of the breaker — no sockets, no timeouts, no
-        # 16-second wait before admitting what we already knew.
-        if self._pool_cooling():
-            self._log_pool_down_once()
+        if self._breaker().is_open():
+            logger.debug("HiFi: every instance was down, skipping for another %.0fs",
+                         self._breaker().remaining())
             return None
+        tried = set()
 
         while True:
             instance = self._get_instance()
             if not instance or instance in tried:
-                logger.debug("HiFi: no instance left to try for %s", path)
+                if tried:
+                    wait = self._breaker().record_all_down()
+                    logger.error("All HiFi API instances exhausted, skipping hifi for %.0fs", wait)
+                else:
+                    logger.error("All HiFi API instances exhausted")
                 return None
 
             tried.add(instance)
-            # Skip a cooling instance without opening a connection. Rotating it
-            # keeps _get_instance moving through the pool.
-            if self._breaker_open(instance):
-                self._rotate_instance(instance)
-                continue
-
             url = f"{instance}{path}"
             self._rate_limit()
 
@@ -486,20 +441,19 @@ class HiFiClient(DownloadSourcePlugin):
                 response.raise_for_status()
                 data = response.json()
 
+                # an instance answered, the pool is alive
+                self._breaker().record_answer()
                 if isinstance(data, dict) and data.get('error'):
                     logger.warning(f"HiFi API error from {instance}: {data['error']}")
                     return None
 
-                self._note_success(instance)
                 return data
 
             except http_requests.exceptions.Timeout:
                 logger.warning(f"HiFi API timeout: {instance}")
-                self._note_failure(instance)
                 self._rotate_instance(instance)
             except http_requests.exceptions.ConnectionError:
                 logger.warning(f"HiFi API connection error: {instance}")
-                self._note_failure(instance)
                 self._rotate_instance(instance)
             except http_requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else 0
@@ -512,9 +466,10 @@ class HiFiClient(DownloadSourcePlugin):
                 # instances, but monochrome moves on where we gave up.
                 if status >= 500 or status in (403, 429):
                     logger.warning(f"HiFi API error ({status}) — rotating: {instance}")
-                    self._note_failure(instance)
                     self._rotate_instance(instance)
                 else:
+                    # a 4xx about the request is still an answer
+                    self._breaker().record_answer()
                     logger.error(f"HiFi API HTTP error ({status}): {e}")
                     return None
             except Exception as e:
@@ -533,9 +488,7 @@ class HiFiClient(DownloadSourcePlugin):
 
     async def check_connection(self) -> bool:
         try:
-            import asyncio
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.is_available)
+            return await run_blocking(self.is_available)
         except Exception as e:
             logger.error(f"HiFi connection check failed: {e}")
             return False
@@ -587,7 +540,7 @@ class HiFiClient(DownloadSourcePlugin):
         return fallback
 
     def check_instance_capabilities(self, url: str, timeout: int = 5) -> Dict[str, Any]:
-        """Probe one public HiFi instance using the endpoints Commissary needs."""
+        """Probe one public HiFi instance using the endpoints SoulSync needs."""
         entry = {
             'url': url,
             'status': 'unknown',
@@ -1021,11 +974,8 @@ class HiFiClient(DownloadSourcePlugin):
 
     async def search(self, query: str, timeout: int = None,
                      progress_callback=None) -> Tuple[List[TrackResult], List[AlbumResult]]:
-        import asyncio
-
         try:
-            loop = asyncio.get_event_loop()
-            tracks = await loop.run_in_executor(None, lambda: self.search_raw(query))
+            tracks = await run_blocking(self.search_raw, query)
 
             quality_key = quality_tier_for_source('hifi', default='lossless')
             q_info = HLS_QUALITY_MAP.get(quality_key, HLS_QUALITY_MAP['lossless'])
@@ -1067,9 +1017,6 @@ class HiFiClient(DownloadSourcePlugin):
             title=track.get('title'),
             album=track.get('album'),
             track_number=track.get('track_number'),
-            # Present on some payloads, absent on others — .get gives None for
-            # the latter, which reads as "not reported" rather than "clean".
-            explicit=track.get('explicit'),
             _source_metadata={
                 'source': 'hifi',
                 'track_id': track.get('id'),
@@ -1078,6 +1025,7 @@ class HiFiClient(DownloadSourcePlugin):
                 'isrc': track.get('isrc'),
                 'bpm': track.get('bpm'),
                 'copyright': track.get('copyright'),
+                'explicit': track.get('explicit'),  # Commissary: explicit preference
             },
         )
 
@@ -1347,6 +1295,7 @@ class HiFiClient(DownloadSourcePlugin):
             speed=record.get('speed', 0),
             time_remaining=record.get('time_remaining'),
             file_path=record.get('file_path'),
+            error=record.get('error'),
         )
 
     async def get_all_downloads(self) -> List[DownloadStatus]:

@@ -55,7 +55,13 @@ _JOB_MODULES = [
     'core.repair_jobs.short_preview_track',
     'core.repair_jobs.audio_corruption_detector',
     'core.repair_jobs.genre_cleanup',
+    'core.repair_jobs.genre_enrichment',
     'core.repair_jobs.comma_artist_splitter',
+    'core.repair_jobs.suspect_album_tag',
+    'core.repair_jobs.bpm_backfill',
+    'core.repair_jobs.artist_nfo_backfill',
+    'core.repair_jobs.album_release_year_repair',
+    'core.repair_jobs.untagged_downloads',
 ]
 
 

@@ -42,6 +42,12 @@ class TestBatchForceReplace:
                             {"force_download_all": True})
         assert pipeline._batch_force_replace({"batch_id": "wl"}) is False
 
+    def test_true_for_a_file_the_user_approved_out_of_quarantine(self):
+        # the approve endpoint stamps the trigger; the guard used to delete the
+        # approved file as "redundant" when the wrong file sat at its path
+        assert pipeline._batch_force_replace(
+            {"_approved_quarantine_trigger": "acoustid_unverified"}) is True
+
     def test_false_without_a_batch(self):
         assert pipeline._batch_force_replace({}) is False
         assert pipeline._batch_force_replace({"batch_id": "nope-unknown"}) is False
@@ -75,11 +81,9 @@ def test_force_is_wired_into_the_protection_branch():
 
 def test_force_replace_still_behind_the_length_guard():
     # ordering contract: the short-file replacement guard runs BEFORE any
-    # branch that can os.remove(existing_path) — a forced re-download can never
-    # replace a full track with a preview clip. (``existing_path``, because the
-    # copy being replaced need not sit at the computed destination — a format
-    # upgrade never does.)
+    # branch that can os.remove(final_path) — a forced re-download can never
+    # replace a full track with a preview clip
     src = Path(pipeline.__file__).read_text(encoding="utf-8", errors="replace")
-    guard = src.index("_replacement_length_is_safe(existing_path, file_path)")
+    guard = src.index("_replacement_length_is_safe(final_path, file_path)")
     force_branch = src.index("elif is_enhance_download or force_replace:")
     assert guard < force_branch

@@ -15,7 +15,6 @@ import os
 import re
 import hashlib
 import time
-import asyncio
 import uuid
 import threading
 import base64
@@ -25,8 +24,8 @@ from pathlib import Path
 import requests as http_requests
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
-from core.text.isrc import normalize_isrc
+from core.settings import config_manager
+from core.async_utils import run_blocking
 
 # Import Soulseek data structures for drop-in replacement compatibility
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
@@ -539,7 +538,7 @@ class QobuzClient(DownloadSourcePlugin):
     def reload_credentials(self) -> None:
         """Pull session state from config without making a network probe.
 
-        Commissary runs two ``QobuzClient`` instances side by side — one wired
+        SoulSync runs two ``QobuzClient`` instances side by side — one wired
         through ``download_orchestrator.client('qobuz')`` for the auth-flow endpoints, and a
         second owned by the enrichment worker for thread safety. When the user
         logs in via ``/api/qobuz/auth/login`` or ``/api/qobuz/auth/token`` only
@@ -592,8 +591,7 @@ class QobuzClient(DownloadSourcePlugin):
     async def check_connection(self) -> bool:
         """Test if Qobuz is accessible (async, Soulseek-compatible)."""
         try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.is_available)
+            return await run_blocking(self.is_available)
         except Exception as e:
             logger.error(f"Qobuz connection check failed: {e}")
             return False
@@ -807,8 +805,6 @@ class QobuzClient(DownloadSourcePlugin):
             'image_url': image_url,
             'external_urls': {'qobuz': f"https://play.qobuz.com/track/{t.get('id', '')}"} if t.get('id') else {},
             'explicit': bool(t.get('parental_warning', False)),
-            # The code every release of this recording shares; discovery matches it exactly.
-            'isrc': normalize_isrc(t.get('isrc')),
         }
 
     def get_user_playlists(self) -> List[Dict[str, Any]]:
@@ -1002,15 +998,13 @@ class QobuzClient(DownloadSourcePlugin):
         logger.info(f"Searching Qobuz for: {query}")
 
         try:
-            loop = asyncio.get_event_loop()
-
             def _search():
                 return self._api_request('track/search', {
                     'query': query,
                     'limit': 50,
                 })
 
-            data = await loop.run_in_executor(None, _search)
+            data = await run_blocking(_search)
 
             if not data or 'tracks' not in data:
                 logger.warning(f"No Qobuz results for: {query}")
@@ -1113,7 +1107,8 @@ class QobuzClient(DownloadSourcePlugin):
             # Stamp the Qobuz track id so a pasted-link manual search can float the
             # exact track to the top (#932). Without this the bubble never matched
             # and the linked track stayed buried among fuzzy lookalikes.
-            _source_metadata={'source': 'qobuz', 'track_id': str(track.get('id') or '')},
+            _source_metadata={'source': 'qobuz', 'track_id': str(track.get('id') or ''),
+                              'explicit': track.get('parental_warning')},  # Commissary: explicit preference
         )
 
         # Stamp real API quality so the global ranker sees actual
@@ -1398,6 +1393,7 @@ class QobuzClient(DownloadSourcePlugin):
             speed=record.get('speed', 0),
             time_remaining=record.get('time_remaining'),
             file_path=record.get('file_path'),
+            error=record.get('error'),
         )
 
     async def get_all_downloads(self) -> List[DownloadStatus]:

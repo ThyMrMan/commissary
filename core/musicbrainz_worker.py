@@ -9,10 +9,23 @@ from core.worker_utils import interruptible_sleep, owned_album_titles, source_id
 
 logger = get_logger("musicbrainz_worker")
 
+
+def track_match_artists(track_artist, library_artist):
+    """artist names to try for a track's recording match, in order: the track's
+    own credit, then the library (album) artist. one entry when they're the
+    same, so a normal album asks exactly what it always did."""
+    own = str(track_artist or '').strip()
+    library = str(library_artist or '').strip()
+    if not own or own.casefold() == library.casefold():
+        # same artist, keep the library's spelling so its mbid pin still works
+        return [library_artist]
+    return [own, library_artist] if library else [own]
+
+
 class MusicBrainzWorker:
     """Background worker for enriching library with MusicBrainz IDs"""
 
-    def __init__(self, database: MusicDatabase, app_name: str = "Commissary", app_version: str = "1.0", contact_email: str = ""):
+    def __init__(self, database: MusicDatabase, app_name: str = "SoulSync", app_version: str = "1.0", contact_email: str = ""):
         self.db = database
         self.mb_service = MusicBrainzService(database, app_name, app_version, contact_email)
 
@@ -149,9 +162,8 @@ class MusicBrainzWorker:
                 # Process the item
                 self._process_item(item)
 
-                # Keep current_item set during sleep so UI can see what was just processed
-                # Rate limit: 1 request per second
-                interruptible_sleep(self._stop_event, 1)
+                # MusicBrainzClient paces HTTP requests centrally; no extra
+                # per-item delay for mirrors or cache hits is needed.
 
             except Exception as e:
                 logger.error(f"Error in worker loop: {e}")
@@ -203,7 +215,7 @@ class MusicBrainzWorker:
 
             # Priority 3: Unattempted tracks
             cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
+                SELECT t.id, t.title, ar.name AS artist_name, t.duration, t.track_artist, t.isrc
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
                 WHERE t.musicbrainz_match_status IS NULL AND t.id IS NOT NULL
@@ -212,14 +224,15 @@ class MusicBrainzWorker:
             """)
             row = cursor.fetchone()
             if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2], 'duration': row[3],
+                        'track_artist': row[4], 'isrc': row[5]}
 
             # Priority 4: Retry 'not_found' artists after retry_days
             not_found_cutoff = datetime.now() - timedelta(days=self.retry_days)
             cursor.execute("""
                 SELECT id, name
                 FROM artists
-                WHERE musicbrainz_match_status = 'not_found' AND musicbrainz_last_attempted < ?
+                WHERE musicbrainz_match_status IN ('not_found', 'error') AND musicbrainz_last_attempted < ?
                 ORDER BY musicbrainz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -233,7 +246,7 @@ class MusicBrainzWorker:
                 SELECT a.id, a.title, ar.name AS artist_name
                 FROM albums a
                 JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.musicbrainz_match_status = 'not_found' AND a.musicbrainz_last_attempted < ?
+                WHERE a.musicbrainz_match_status IN ('not_found', 'error') AND a.musicbrainz_last_attempted < ?
                 ORDER BY a.musicbrainz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
@@ -243,16 +256,17 @@ class MusicBrainzWorker:
 
             # Priority 6: Retry 'not_found' tracks
             cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
+                SELECT t.id, t.title, ar.name AS artist_name, t.duration, t.track_artist, t.isrc
                 FROM tracks t
                 JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.musicbrainz_match_status = 'not_found' AND t.musicbrainz_last_attempted < ?
+                WHERE t.musicbrainz_match_status IN ('not_found', 'error') AND t.musicbrainz_last_attempted < ?
                 ORDER BY t.musicbrainz_last_attempted ASC
                 LIMIT 1
             """, (not_found_cutoff,))
             row = cursor.fetchone()
             if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
+                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2], 'duration': row[3],
+                        'track_artist': row[4], 'isrc': row[5]}
 
             return None
 
@@ -423,10 +437,35 @@ class MusicBrainzWorker:
                     logger.debug(f"No match for album '{item_name}'")
 
             elif item_type == 'track':
-                artist_name = item.get('artist')
-                result = self.mb_service.match_recording(item_name, artist_name)
+                # The artist pass runs before tracks (priority 1), so the
+                # catalogue usually already holds this artist's MBID — pass
+                # it in so the recording match is gated on the known identity
+                # (#1509) instead of trusting the printed credit text. The
+                # track's own duration (ms) feeds the length gate the same
+                # way. Both are best-effort: None falls back to the old
+                # name-only behaviour.
+                #
+                # the track's own artist goes first. on a soundtrack the library
+                # artist is the album's (lin-manuel miranda), the recording is
+                # credited to the singer, so asking by the album artist finds
+                # nothing (#1608). the album artist is still the fallback.
+                result = None
+                for artist_name in track_match_artists(item.get('track_artist'), item.get('artist')):
+                    artist_mbid = self.mb_service._artist_row_mbid(artist_name)
+                    result = self.mb_service.match_recording(
+                        item_name, artist_name,
+                        artist_mbid=artist_mbid,
+                        duration_ms=item.get('duration'),
+                        # #1705: the track's stored ISRC, when an earlier
+                        # source pass recorded one — the exact-identifier
+                        # rung inside match_recording.
+                        isrc=item.get('isrc'))
+                    if result and result.get('mbid'):
+                        break
                 if result and result.get('mbid'):
-                    self.mb_service.update_track_mbid(item_id, result['mbid'], 'matched')
+                    self.mb_service.update_track_mbid(
+                        item_id, result['mbid'], 'matched',
+                        recording_disambiguation=result.get('recording_disambiguation'))
                     self.stats['matched'] += 1
                     logger.info(f"Matched track '{item_name}' → MBID: {result['mbid']}")
                 else:

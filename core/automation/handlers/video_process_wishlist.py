@@ -5,10 +5,13 @@ people/airing scans pay off. For wished, RELEASED movies (and aired episodes) it
 Soulseek, picks the best release per the quality profile, and enqueues the download; the
 existing ``download_monitor`` finishes + organises + archives it, exactly like a manual grab.
 
-Shape mirrors the YouTube drain (Boulder: "same standard"): it processes the WHOLE eligible
-wishlist (no total cap), but the slow part — each item needs a ~20s blocking Soulseek search
-— runs only a FEW at a time (``max_concurrent``). A ``guard`` keeps the next hourly tick from
-overlapping a run that's still working, so it can't pile up.
+Shape mirrors the YouTube drain (Boulder: "same standard"): the slow part — each item
+needs a ~20s blocking Soulseek search — runs only a FEW at a time (``max_concurrent``,
+"Max simultaneous searches"), and each run hands at most ``max_simultaneous_downloads``
+items ("Max downloads per run", default 3) to the download clients. The rest stay
+on the wishlist and are picked up on the next tick — no starvation, no loss. A ``guard``
+keeps the next hourly tick from overlapping a run that's still working, so it can't
+pile up.
 
 Movies are gated on ``status='wanted'`` (released; skips 'monitored'/unreleased). Episodes
 are all-wished (the airing scan only adds aired ones). Items already downloading are skipped
@@ -22,7 +25,9 @@ The search + enqueue are injected seams, so selection/pick/record are pure + uni
 from __future__ import annotations
 
 import json
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -33,9 +38,10 @@ logger = get_logger("automation.video_process_wishlist")
 
 
 # ── pure helpers ──────────────────────────────────────────────────────────────
-def pick_best(candidates: List[Dict[str, Any]], min_rank: int = 0) -> Optional[Dict[str, Any]]:
-    """The best ACCEPTED release from a ranked candidate list. ``_evaluate_hits`` already
-    sorts best-first (accepted, score, availability), so the first accepted is the pick.
+def acceptable_candidates(candidates: List[Dict[str, Any]],
+                          min_rank: int = 0) -> List[Dict[str, Any]]:
+    """Every release worth trying, best first. ``_evaluate_hits`` already sorts
+    best-first (accepted, score, availability), so this just filters.
 
     ``min_rank`` > 0 = an UPGRADE pick for an owned item: only releases with a
     resolution STRICTLY better than the current copy qualify (a same-quality
@@ -43,13 +49,123 @@ def pick_best(candidates: List[Dict[str, Any]], min_rank: int = 0) -> Optional[D
     loop). Unknown-resolution releases can't prove they're better, so they
     don't qualify either."""
     from core.video.quality_eval import resolution_rank
+    out = []
     for c in candidates or []:
         if not c.get("accepted"):
             continue
         if min_rank and resolution_rank(c.get("resolution")) <= min_rank:
             continue
-        return c
-    return None
+        out.append(c)
+    return out
+
+
+def pick_best(candidates: List[Dict[str, Any]], min_rank: int = 0) -> Optional[Dict[str, Any]]:
+    """The single best acceptable release, or None. Kept as the one-shot form of
+    :func:`acceptable_candidates` for callers that only ever grab once."""
+    top = acceptable_candidates(candidates, min_rank)
+    return top[0] if top else None
+
+
+# How many releases one drain pass will offer the download client for a single
+# item before giving up on this run. The top pick being refused (already in the
+# client, a magnet it won't parse, a dead tracker) used to abandon the item
+# entirely and re-offer the SAME release an hour later, forever — a live row hit
+# 133 identical refusals that way. Walking a few keeps one bad release from
+# blocking an item without turning a stuck item into an indexer hammer.
+MAX_GRAB_ATTEMPTS = 3
+MIN_SEASON_PACK_EPISODES = 3
+# a season that had an episode this recently is still airing: no pack exists
+# yet, so its episodes are searched one by one (Sonarr only reaches for a
+# season pack once the season has aired)
+SEASON_PACK_QUIET_DAYS = 10
+SOURCE_REFUSAL_LIMIT = 2
+SOURCE_COOLDOWN_SECONDS = 6 * 60 * 60
+_SOURCE_REFUSALS: Dict[tuple, int] = {}
+_SOURCE_COOLDOWNS: Dict[tuple, float] = {}
+_SOURCE_COOLDOWN_LOCK = threading.Lock()
+
+
+def display_name(item: Dict[str, Any], media_type: str) -> str:
+    """The human name for an item in logs and progress lines. Movie rows carry
+    ``title``; episode rows carry ``show_title`` — reading only ``title`` is why
+    every episode grab-refusal in the log said "refused for None"."""
+    name = item.get("title") or item.get("show_title") or "?"
+    if media_type == "episode":
+        season = int(item.get("season_number") or 0)
+        episode = item.get("episode_number")
+        if episode is None:
+            return "%s S%02d" % (name, season)
+        return "%s S%02dE%02d" % (name, season, int(episode or 0))
+    return str(name)
+
+
+def enqueue_outcome(result: Any) -> Dict[str, Any]:
+    """Normalise whatever the enqueue seam returned to ``{ok, error}``.
+
+    The seam used to answer a bare bool and several callers/tests still do, so
+    both shapes are accepted — but a bool cannot say WHY, and 'why' is the whole
+    point: a client refusing a release is not the same event as the quality
+    profile rejecting one, and conflating them is what made a stuck item report
+    "none met your quality profile" about releases it had actually accepted."""
+    if isinstance(result, dict):
+        return {"ok": bool(result.get("ok")), "error": result.get("error")}
+    return {"ok": bool(result), "error": None}
+
+
+def _candidate_source(cand: Dict[str, Any]) -> str:
+    src = str((cand or {}).get("source") or "soulseek").strip().lower()
+    return "torrent" if src == "extto" else (src or "soulseek")
+
+
+def source_refusal_key(item: Dict[str, Any], media_type: str, cand: Dict[str, Any]) -> tuple:
+    """The temporary cooldown identity: this wanted item on this transport."""
+    return item_key(item, media_type), _candidate_source(cand)
+
+
+def source_cooldown_remaining(item: Dict[str, Any], media_type: str, cand: Dict[str, Any],
+                              *, now: Optional[float] = None) -> int:
+    now = time.time() if now is None else float(now)
+    key = source_refusal_key(item, media_type, cand)
+    with _SOURCE_COOLDOWN_LOCK:
+        until = float(_SOURCE_COOLDOWNS.get(key) or 0)
+        if until <= now:
+            _SOURCE_COOLDOWNS.pop(key, None)
+            return 0
+        return int(round(until - now))
+
+
+def note_source_refusal(item: Dict[str, Any], media_type: str, cand: Dict[str, Any],
+                        *, now: Optional[float] = None,
+                        limit: int = SOURCE_REFUSAL_LIMIT,
+                        cooldown_seconds: int = SOURCE_COOLDOWN_SECONDS) -> None:
+    """After repeated client refusals, pause this item/source briefly.
+
+    This is intentionally about the download client refusing an accepted release,
+    not the quality profile rejecting a result. It keeps a bad torrent client/indexer
+    handoff from being offered the same item every drain while other sources can
+    still be tried on later passes.
+    """
+    now = time.time() if now is None else float(now)
+    key = source_refusal_key(item, media_type, cand)
+    with _SOURCE_COOLDOWN_LOCK:
+        strikes = int(_SOURCE_REFUSALS.get(key) or 0) + 1
+        _SOURCE_REFUSALS[key] = strikes
+        if strikes >= max(1, int(limit or 1)):
+            _SOURCE_COOLDOWNS[key] = now + max(1, int(cooldown_seconds or SOURCE_COOLDOWN_SECONDS))
+
+
+def clear_source_refusal(item: Dict[str, Any], media_type: str, cand: Dict[str, Any]) -> None:
+    key = source_refusal_key(item, media_type, cand)
+    with _SOURCE_COOLDOWN_LOCK:
+        _SOURCE_REFUSALS.pop(key, None)
+        _SOURCE_COOLDOWNS.pop(key, None)
+
+
+def reset_source_cooldowns() -> None:
+    """Test/support hook: clear temporary in-process refusal memory."""
+    with _SOURCE_COOLDOWN_LOCK:
+        _SOURCE_REFUSALS.clear()
+        _SOURCE_COOLDOWNS.clear()
 
 
 def annotate_upgrades(items: List[Dict[str, Any]], cutoff_rank: int,
@@ -106,22 +222,90 @@ def _default_cutoff_rank() -> int:
     return resolution_rank((load_profile(get_video_db()) or {}).get("cutoff_resolution"))
 
 
+# Scene names end in the release group: "Show.S01E01.1080p.WEB-DL-NTb". Take the
+# tail after the last '-', minus any container extension. Deliberately blunt —
+# a name we cannot read the group from must never be treated as "group ''",
+# because an allow-list would then reject every unparsable release.
+_GROUP_RE = re.compile(r"-([A-Za-z0-9_.]{2,})$")
+
+
+def release_group(name: str) -> str:
+    text = re.sub(r"\.(mkv|mp4|avi|ts|m2ts|wmv|mov)$", "", str(name or "").strip(), flags=re.I)
+    m = _GROUP_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+
+def title_overrides_for_item(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
+    """This title's per-title acquisition overrides, read once per item.
+
+    Cached on the item the way _source_snapshot is: the drain hands the same
+    dict to search() and record_outcome(), so one db read covers the run.
+    """
+    cached = item.get("_overrides")
+    if cached is not None:
+        return cached
+    blank = {"preferred_sources": [], "release_group_allow": [],
+             "release_group_block": [], "pack_preference": "auto"}
+    try:
+        from api.video import get_video_db
+        kind = "movie" if media_type == "movie" else "show"
+        tmdb = item.get("tmdb_id") if media_type == "movie" else item.get("show_tmdb_id")
+        out = get_video_db().title_overrides_for(
+            kind, tmdb_id=tmdb, library_id=item.get("library_id")) or blank
+    except Exception:   # noqa: BLE001 - an override lookup must never stop a grab
+        logger.exception("title_overrides_for_item failed")
+        out = blank
+    item["_overrides"] = out
+    return out
+
+
+def chain_for(chain: List[str], overrides: Dict[str, Any]) -> List[str]:
+    """The download chain narrowed to this title's preferred sources, in the
+    USER's order. An empty preference, or one naming nothing the global config
+    offers, follows the global chain — never an empty chain, which would search
+    nothing at all and look like 'no releases exist'."""
+    want = [str(s).strip().lower() for s in (overrides or {}).get("preferred_sources") or []]
+    if not want:
+        return list(chain)
+    picked = [s for s in want if s in chain]
+    return picked or list(chain)
+
+
+def apply_group_overrides(candidates: List[Dict[str, Any]],
+                          overrides: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Mark releases this title refuses as rejected, with the reason.
+
+    NOT a silent drop: the drain reports 'hits, none accepted' with each
+    release's rejection note, and "you blocked that group" is exactly the sort
+    of thing a user needs told. Dropping them instead reads as 'no releases
+    exist', which is the lie the refusal work already fixed once.
+    """
+    allow = [str(g).strip().lower() for g in (overrides or {}).get("release_group_allow") or []]
+    block = [str(g).strip().lower() for g in (overrides or {}).get("release_group_block") or []]
+    if not allow and not block:
+        return candidates or []
+    for c in candidates or []:
+        group = release_group(c.get("filename") or c.get("title") or "")
+        low = group.lower()
+        if block and low and low in block:
+            c["accepted"] = False
+            c["rejected"] = "release group %s is blocked for this title" % group
+        elif allow and low not in allow:
+            c["accepted"] = False
+            c["rejected"] = ("release group %s is not on this title's allow list" % group
+                             if group else "release group unknown; this title allows only %s"
+                             % ", ".join(sorted(allow)))
+    return candidates or []
+
+
 def item_key(item: Dict[str, Any], media_type: str) -> tuple:
     """Stable identity for de-duping a wished item against active downloads."""
     if media_type == "movie":
         return ("movie", str(item.get("tmdb_id")))
+    if item.get("episode_number") is None and item.get("season_number") is not None:
+        return ("season", str(item.get("show_tmdb_id")), int(item.get("season_number") or 0))
     return ("episode", str(item.get("show_tmdb_id")),
             int(item.get("season_number") or 0), int(item.get("episode_number") or 0))
-
-
-def season_key(item: Dict[str, Any], media_type: str):
-    """The season an episode belongs to, or None for a movie. A season PACK in
-    flight covers every episode in it, so the drain checks this alongside
-    item_key — otherwise the next tick would grab each episode individually
-    while the pack carrying them is still downloading."""
-    if media_type == "movie":
-        return None
-    return ("season", str(item.get("show_tmdb_id")), int(item.get("season_number") or 0))
 
 
 def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
@@ -132,228 +316,131 @@ def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
         kind = str(d.get("kind") or "").lower()
         if kind == "movie":
             keys.add(("movie", str(d.get("media_id"))))
-            continue
-        ctx = d.get("search_ctx")
-        if isinstance(ctx, str):
-            try:
-                ctx = json.loads(ctx)
-            except (ValueError, TypeError):
-                ctx = {}
-        ctx = ctx if isinstance(ctx, dict) else {}
-        scope = str(ctx.get("scope") or "").lower()
-        # Keyed off the CONTEXT's scope, not the row's kind: the interactive grab
-        # stores kind='season' for a pack while the drain's own packs are
-        # kind='episode', and a kind-only test would miss one of them and let the
-        # drain re-grab every episode of a season already downloading.
-        if scope in ("season", "series"):
-            keys.add(("season", str(d.get("media_id")), int(ctx.get("season") or 0)))
-        elif kind == "episode" or scope == "episode":
-            keys.add(("episode", str(d.get("media_id")),
-                      int(ctx.get("season") or 0), int(ctx.get("episode") or 0)))
+        elif kind in ("episode", "show", "season"):
+            ctx = d.get("search_ctx")
+            if isinstance(ctx, str):
+                try:
+                    ctx = json.loads(ctx)
+                except (ValueError, TypeError):
+                    ctx = {}
+            ctx = ctx if isinstance(ctx, dict) else {}
+            season = int(ctx.get("season") or 0)
+            episode = ctx.get("episode")
+            if episode is None:
+                keys.add(("season", str(d.get("media_id")), season))
+            else:
+                keys.add(("episode", str(d.get("media_id")), season, int(episode or 0)))
     return keys
 
 
-SEASON_PACK_MIN_EPISODES = 4      # video.season_pack_min_episodes
+def _packable_episode(item: Dict[str, Any]) -> bool:
+    """Whether an episode row is safe to fold into an automatic season-pack try."""
+    if item.get("owned") or item.get("_min_rank"):
+        return False
+    if item.get("episode_number") is None or item.get("season_number") is None:
+        return False
+    if str(item.get("series_type") or "").strip().lower() in ("daily", "anime"):
+        return False
+    return bool(item.get("show_tmdb_id") and item.get("show_title"))
 
 
-def season_pack_groups(items: List[Dict[str, Any]], *,
-                       min_episodes: int = SEASON_PACK_MIN_EPISODES,
-                       mode_for=None) -> List[Dict[str, Any]]:
-    """Seasons with enough wanted episodes to be worth one pack instead of N grabs.
+def season_still_airing(rows: List[Dict[str, Any]], today: Optional[str] = None,
+                        quiet_days: int = SEASON_PACK_QUIET_DAYS) -> bool:
+    """Whether a show season is still airing, from its newest known air date
+    (the library's last episode for the season, or the wished episodes' own
+    dates). nothing known at all counts as aired, the pack try still falls back
+    to the episodes."""
+    import datetime as _dt
+    dates = []
+    for r in rows or []:
+        for value in (r.get("season_last_air"), r.get("air_date")):
+            text = str(value or "")[:10]
+            if len(text) == 10:
+                dates.append(text)
+    if not dates:
+        return False
+    today_d = _dt.date.fromisoformat(today) if today else _dt.date.today()
+    try:
+        newest = _dt.date.fromisoformat(max(dates))
+    except ValueError:
+        return False
+    return newest > today_d - _dt.timedelta(days=quiet_days)
 
-    Returns pseudo-items flagged ``_season_pack``, each a copy of a REPRESENTATIVE
-    member so all its routing (Library, category, quality profile, series type)
-    is the season's own — only the scope differs. ``_pack_members`` carries the
-    item keys the pack would satisfy, so the caller can drop them from the
-    per-episode pass.
 
-    Deliberately conservative about what counts:
-      • UPGRADES are excluded (``_min_rank``). Wanting a better copy of two
-        episodes must not pull a whole season; the per-episode upgrade path
-        already handles those, and a pack would mostly re-download what you have.
-      • a season needs ``min_episodes`` genuinely-missing episodes. Below that a
-        pack is usually more bytes than the episodes are worth, and packs are
-        rarer than singles so the search often comes back empty anyway.
-      • season 0 (specials) never packs — 'S00' is not a thing releases ship.
-      • a show whose effective mode is 'never' is skipped entirely.
+def season_pack_requests(items: List[Dict[str, Any]], active: Iterable,
+                         min_missing: int = MIN_SEASON_PACK_EPISODES,
+                         today: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Synthetic season-search rows for shows with many missing episodes.
 
-    ``mode_for(item) -> 'prefer'|'only'|'never'`` supplies the per-show
-    decision. Passed IN rather than looked up here so this stays pure and
-    unit-testable; the caller owns the config and DB reads.
+    The ordinary drain receives one wishlist row per episode. When several rows
+    belong to the same show season, searching each SxxExx first burns indexer
+    budget and misses the release shape Sonarr prefers: one season pack. This
+    groups only straightforward missing standard episodes; upgrades, daily/anime
+    numbering, seasons with an in-flight member, and seasons still airing (no
+    pack can exist yet) stay on the per-episode path. Each pack carries its
+    member rows, so a pack search that finds nothing falls back to them.
     """
     try:
-        min_episodes = max(2, int(min_episodes))
+        floor = max(2, int(min_missing or MIN_SEASON_PACK_EPISODES))
     except (TypeError, ValueError):
-        min_episodes = SEASON_PACK_MIN_EPISODES
+        floor = MIN_SEASON_PACK_EPISODES
+    active_set = set(active or set())
     groups: Dict[tuple, List[Dict[str, Any]]] = {}
     for it in items or []:
-        if it.get("_min_rank"):          # an upgrade, not a hole
+        if not _packable_episode(it):
             continue
-        try:
-            season = int(it.get("season_number") or 0)
-        except (TypeError, ValueError):
+        key = (str(it.get("show_tmdb_id")), int(it.get("season_number") or 0))
+        groups.setdefault(key, []).append(it)
+
+    out: List[Dict[str, Any]] = []
+    for (show_id, season), rows in groups.items():
+        if len(rows) < floor:
             continue
-        if season <= 0:
+        if ("season", show_id, season) in active_set:
             continue
-        if mode_for is not None and mode_for(it) == "never":
+        if any(("episode", show_id, season, int(r.get("episode_number") or 0)) in active_set
+               for r in rows):
             continue
-        groups.setdefault((str(it.get("show_tmdb_id")), season), []).append(it)
-    out = []
-    for (_show, _season), members in groups.items():
-        if len(members) < min_episodes:
+        if season_still_airing(rows, today=today):
             continue
-        rep = dict(members[0])
-        rep["_season_pack"] = True
-        rep["_pack_members"] = [item_key(m, "episode") for m in members]
-        rep["_pack_size"] = len(members)
-        rep["_pack_mode"] = mode_for(rep) if mode_for is not None else "prefer"
-        rep.pop("_min_rank", None)
-        out.append(rep)
+        first = rows[0]
+        pack = dict(first)
+        pack["episode_number"] = None
+        pack["episode_title"] = None
+        pack["_pack_members"] = [
+            (int(r.get("season_number") or 0), int(r.get("episode_number") or 0)) for r in rows]
+        pack["_pack_rows"] = list(rows)
+        out.append(pack)
     return out
 
 
-def _season_pack_settings() -> dict:
-    """The global season-pack settings, through the ONE normalizer that also
-    serves the settings page (core.video.download_config).
-
-    Season packs are OFF by default. One pack can be tens of GB and the drain
-    runs unattended, so an existing install must not start spending disk on this
-    because it updated — the operator turns it on."""
-    try:
-        from core.video.download_config import season_pack_settings
-        return season_pack_settings()
-    except Exception:      # noqa: BLE001 - unreadable config behaves like off
-        logger.debug("season pack settings unreadable; treating as off", exc_info=True)
-        return {"season_packs": False, "season_pack_min_episodes": SEASON_PACK_MIN_EPISODES,
-                "season_pack_mode": "prefer"}
-
-
-def _pack_mode_resolver(settings: Dict[str, Any]):
-    """``item -> 'prefer' | 'only' | 'never'``, memoised per show.
-
-    A per-show override BEATS the global in both directions: a show set to
-    'only' or 'prefer' packs even with the global switch off, and a show set to
-    'never' stays per-episode even with it on. Without that the override would
-    only ever subtract, and "always get this one as packs" — the case someone
-    actually opens the panel for — would be unexpressible.
-    """
-    default = settings["season_pack_mode"] if settings["season_packs"] else "never"
-    try:
-        from api.video import get_video_db
-        overrides = get_video_db().all_season_pack_overrides()
-    except Exception:       # noqa: BLE001 - no overrides readable → everyone follows the global
-        logger.debug("season pack overrides unreadable; using the global for every show",
-                     exc_info=True)
-        overrides = {}
-
-    def resolve(item):
-        try:
-            mode = overrides.get(int(item.get("show_tmdb_id")))
-        except (TypeError, ValueError):
-            mode = None
-        return mode if mode in ("prefer", "only", "never") else default
-
-    return resolve
-
-
-def _season_has_finished_airing(item) -> bool:
-    """Whether a complete pack for this season could exist yet.
-
-    'Packs only' is a preference, not a licence to stop acquiring a show. A
-    season still airing has no full pack to find, so holding its episodes back
-    pack-or-nothing would skip them week after week — the show would simply
-    stop arriving, with nothing in the UI saying why. Not-provably-finished
-    counts as still airing."""
-    try:
-        from api.video import get_video_db
-        return get_video_db().season_fully_aired(
-            item.get("show_tmdb_id"), item.get("season_number")) is True
-    except Exception:       # noqa: BLE001 - unknown → treat as still airing
-        logger.debug("season air state unreadable", exc_info=True)
-        return False
-
-
-def _try_season_packs(todo, *, root, search, enqueue, deps, automation_id,
-                      settings=None, mode_for=None):
-    """Grab a pack per eligible season; return (remaining per-episode todo, grabs).
-
-    Never fatal: a season whose pack search finds nothing — the common case,
-    packs are much rarer than singles — falls through to the per-episode pass
-    with its items untouched, UNLESS that season is in 'only' mode and has
-    finished airing, in which case its episodes are held for a later tick
-    rather than assembled from a dozen unrelated releases.
-    """
-    settings = settings or _season_pack_settings()
-    try:
-        mode_for = mode_for or _pack_mode_resolver(settings)
-        groups = season_pack_groups(todo, min_episodes=settings["season_pack_min_episodes"],
-                                    mode_for=mode_for)
-    except Exception:       # noqa: BLE001 - grouping must never break the normal drain
-        logger.exception("season pack grouping failed")
-        return todo, 0
-    if not groups:
-        return todo, 0
-
-    claimed, held, grabs = set(), set(), 0
-    for pack in groups:
-        name = "%s S%02d" % (pack.get("show_title") or "?", int(pack.get("season_number") or 0))
-        try:
-            found = search(pack, "episode")
-            cands, _err = found if isinstance(found, tuple) else (found, None)
-            best = pick_best(cands or [])
-            if best and enqueue(pack, best, cands or [], "episode",
-                                _item_target_dir(pack, root)):
-                claimed.update(pack.get("_pack_members") or [])
-                grabs += 1
-                deps.update_progress(
-                    automation_id,
-                    log_line="Grabbed the %s season pack — covers %d wanted episode(s)"
-                             % (name, pack.get("_pack_size") or 0),
-                    log_type='success')
-                continue
-            # No pack (or the grab was refused). In 'only' mode a FINISHED
-            # season waits for one instead of being built out of singles; a
-            # season still airing falls through, because pack-or-nothing on
-            # something that cannot have a pack yet is just "never download".
-            if pack.get("_pack_mode") == "only" and _season_has_finished_airing(pack):
-                held.update(pack.get("_pack_members") or [])
-                deps.update_progress(
-                    automation_id,
-                    log_line="No %s season pack yet — holding %d episode(s); this show is "
-                             "set to season packs only" % (name, pack.get("_pack_size") or 0),
-                    log_type='info')
-        except Exception:   # noqa: BLE001 - one season failing must not stop the rest
-            logger.exception("season pack attempt failed for %s", name)
-            continue
-    skip = claimed | held
-    if not skip:
-        return todo, grabs
-    return [it for it in todo if item_key(it, "episode") not in skip], grabs
-
-
 def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
-    """[primary title, *user AKAs, *TMDB alternative titles] — deduped, primary first.
-    The alias set the release-title gate matches against (so a release named by a known
-    aka still matches). Best-effort: just the primary when nothing else is available.
+    """[primary title, *TMDB aliases, *your own] — deduped, primary first. The alias
+    set the release-title gate matches against (so a release named by a known aka still
+    matches). Best-effort: just the primary when TMDB is unavailable.
 
-    User AKAs come FIRST after the primary because they're the deliberate override:
-    someone typed them precisely because TMDB's own aliases didn't cover the release
-    naming they were seeing."""
-    user_akas: List[str] = []
+    Manual aliases are the arr answer to the case TMDB does not cover. Its list
+    carries "Big Brother US" for "Big Brother (US)" and nothing at all for
+    "Password (2022)" — a DATA gap, not a matching-logic one. Radarr and Sonarr
+    both let you add the missing name by hand rather than inferring it, and the
+    reason is exactly what inference costs here: stripping a title's bracket
+    collides "Avatar: The Last Airbender (2024)" with the 2005 series.
+    """
     aliases: List[str] = []
     if tmdb_id:
         try:
-            from api.video import get_video_db
-            user_akas = get_video_db().aka_titles_for_tmdb(kind, tmdb_id) or []
-        except Exception:   # noqa: BLE001 - a matching assist must never break a grab
-            user_akas = []
-        try:
             from core.video.enrichment.engine import get_video_enrichment_engine
             aliases = get_video_enrichment_engine().alt_titles_for(kind, tmdb_id) or []
-        except Exception:   # noqa: BLE001
+        except Exception:   # noqa: BLE001 - a matching assist must never break a grab
             aliases = []
+    try:
+        from api.video import get_video_db
+        aliases = list(aliases) + list(
+            get_video_db().title_overrides_for(kind, tmdb_id=tmdb_id).get("manual_aliases") or [])
+    except Exception:   # noqa: BLE001 - same: an assist never blocks a grab
+        logger.debug("manual aliases unavailable for %s %s", kind, tmdb_id, exc_info=True)
     out, seen = [], set()
-    for t in [primary, *user_akas, *aliases]:
+    for t in [primary, *aliases]:
         t = str(t or "").strip()
         if t and t.lower() not in seen:
             seen.add(t.lower())
@@ -361,49 +448,26 @@ def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
     return out
 
 
-def _absolute_hint(item: Dict[str, Any], stype: str):
-    """The wanted ABSOLUTE episode number, or None — scene anime is numbered
-    'Show - 1071' with no season, and that number is the only episode identity
-    such a release carries. Consumed accept-only downstream, which is what makes
-    a wrong answer here dangerous and a missing one merely unhelpful.
+_TITLE_YEAR = re.compile(r"\((\d{4})\)\s*$")
 
-    Two sources, and which are allowed depends on how confident we are:
 
-    · ANIME — both. The library's own episode list is authoritative and is the
-      only thing that can answer for a later season (S02E01 of a show with 3
-      episodes in season 1 is absolute 4). Falls back to the season-1 identity
-      when the show isn't in the library, which is precisely the state of a show
-      whose FIRST episode is being grabbed.
+def show_year_for(item: Dict[str, Any]) -> Optional[str]:
+    """The SHOW's year (its first-air year) for an episode row, or None.
 
-    · UNTYPED — the season-1 identity ONLY. A brand-new anime has no shows row,
-      so nothing has typed it yet; refusing it a hint is what made the first
-      episode of a new show the one grab that could never match. But 'untyped'
-      is not 'anime', so it does not get the library lookup: for season 1 the
-      absolute number IS the episode number, which is true of every show
-      regardless of type, and that makes this derivation safe by construction
-      rather than by assumption.
-
-    · STANDARD / DAILY — neither. Wanting S02E01 with absolute 4, a release
-      named 'Show - 04' is far more likely season ONE's episode 4. Dailies match
-      on air date instead.
-
-    Season 1 only, in every case: specials sit in season 0 and are excluded, so
-    the identity holds exactly."""
-    if stype in ("standard", "daily"):
-        return None
-    s, e = item.get("season_number"), item.get("episode_number")
-    if stype == "anime":
-        try:
-            from api.video import get_video_db
-            n = get_video_db().episode_absolute_number(item.get("show_tmdb_id"), s, e)
-            if n is not None:
-                return n
-        except Exception:   # noqa: BLE001 - a numbering assist must never break a grab
-            pass
+    never the episode's own air year. that was what this used, so a release
+    named the way the scene names a year-disambiguated show,
+    'Dark.Matter.2024.S02E08', was rejected as "Wrong year (2024, wanted 2026)"
+    by the drain and again by the importer, and the right episode sat on the
+    wishlist forever. the library's show year first, then a "(2024)" in the
+    title, else no year at all (no year means no year judgement)."""
+    year = item.get("show_year")
     try:
-        return int(e) if int(s) == 1 and int(e) >= 1 else None
+        if year:
+            return str(int(str(year)[:4]))
     except (TypeError, ValueError):
-        return None
+        pass
+    m = _TITLE_YEAR.search(str(item.get("show_title") or "").strip())
+    return m.group(1) if m else None
 
 
 def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
@@ -413,47 +477,64 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
     if media_type == "movie":
         ctx = {"scope": "movie", "title": item.get("title"), "year": item.get("year")}
         tmdb_id, kind = item.get("tmdb_id"), "movie"
-    elif item.get("_season_pack"):
-        # One grab for a whole season. Built by season_pack_groups() from a
-        # REPRESENTATIVE member item, so every routing field it carries (Library,
-        # category, quality profile, series type, poster) is the season's own —
-        # only the scope changes. Deliberately no episode/air_date/absolute: those
-        # identify one episode and would make the pack fail its own scope gate.
-        ctx = {"scope": "season", "title": item.get("show_title"),
-               "season": item.get("season_number"),
-               "year": (str(item.get("air_date") or "")[:4] or None)}
-        stype = str(item.get("series_type") or "").strip().lower()
-        if stype in ("daily", "anime"):
-            ctx["series_type"] = stype
-        tmdb_id, kind = item.get("show_tmdb_id"), "show"
-        titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
-        if len(titles) > 1:
-            ctx["titles"] = titles
-        return ctx
     else:
-        ctx = {"scope": "episode", "title": item.get("show_title"),
-               "season": item.get("season_number"), "episode": item.get("episode_number"),
-               "year": (str(item.get("air_date") or "")[:4] or None),
+        scope = "season" if item.get("episode_number") is None and item.get("season_number") is not None else "episode"
+        ctx = {"scope": scope, "title": item.get("show_title"),
+               "season": item.get("season_number"),
+               "episode": item.get("episode_number"),
+               "year": show_year_for(item),
                # full air date — daily series (Daily Show / Kimmel / soaps) release by
                # DATE, not SxxExx; the ranker + retry queries key off this.
                "air_date": (str(item.get("air_date") or "")[:10] or None)}
+        if scope == "season":
+            ctx.pop("episode", None)
+            ctx.pop("air_date", None)
+        elif item.get("alt_season") is not None and item.get("alt_episode") is not None:
+            # the scene (TVDB) numbering, when it differs from TMDB's: queried
+            # and accepted alongside it (core/video/numbering.py)
+            ctx["alt_season"] = int(item["alt_season"])
+            ctx["alt_episode"] = int(item["alt_episode"])
+            if item.get("alt_exclusive"):
+                ctx["alt_exclusive"] = True
         # Series type (P8): daily/anime shows QUERY differently. Anime also carries
         # the wanted ABSOLUTE episode number (scene anime is numbered 'Show - 1071',
         # no season) — derived from the library's episode list, best-effort.
         stype = str(item.get("series_type") or "").strip().lower()
         if stype in ("daily", "anime"):
             ctx["series_type"] = stype
-        # ``series_type`` still decides how we QUERY. It no longer decides
-        # whether the absolute number is carried at all — see _absolute_hint for
-        # what each type is trusted with, and why an untyped show has to be
-        # served (a brand-new anime has no shows row for a type to live on).
-        n = _absolute_hint(item, stype)
-        if n is not None:
-            ctx["absolute"] = n
+        if stype == "anime":
+            try:
+                from api.video import get_video_db
+                ctx["absolute"] = get_video_db().episode_absolute_number(
+                    item.get("show_tmdb_id"), item.get("season_number"),
+                    item.get("episode_number"))
+            except Exception:   # noqa: BLE001 - a numbering assist must never break a grab
+                ctx["absolute"] = None
+        # Commissary: a NEW anime has no shows row to be tagged anime or counted, so
+        # its first grab - the one that decides its library - could never match a
+        # '[Group] Show - 03' release. In season 1 the absolute number IS the
+        # episode number for every show; for anime and untyped shows use that when
+        # the library can't answer. Never for a later season or a standard show:
+        # the hint only accepts, and 'Show - 05' must not satisfy S02E05.
+        if ctx.get("absolute") is None and stype in ("anime", ""):
+            try:
+                if int(item.get("season_number")) == 1 and int(item.get("episode_number")) >= 1:
+                    ctx["absolute"] = int(item.get("episode_number"))
+            except (TypeError, ValueError):
+                pass
         tmdb_id, kind = item.get("show_tmdb_id"), "show"
     titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
     if len(titles) > 1:
         ctx["titles"] = titles
+    # External ids for the indexer search. Prowlarr's structured tvsearch/movie
+    # queries take tvdbid/imdbid/tmdbid and route each to the indexers that can
+    # resolve it — the id-aware path Sonarr/Radarr rely on so they never depend on
+    # a title matching scene spelling. The plumbing accepted these from day one;
+    # nothing ever filled them, so every automated search was free text.
+    ids = {"tmdb_id": tmdb_id, "imdb_id": item.get("imdb_id")}
+    if media_type != "movie":
+        ids["tvdb_id"] = item.get("tvdb_id")
+    ctx.update({k: v for k, v in ids.items() if v})
     return ctx
 
 
@@ -468,10 +549,14 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
     peer = {k: best.get(k) for k in ("slots", "queue", "speed", "availability") if best.get(k) is not None}
     if peer:
         ctx = {**ctx, "peer": peer}
+    if item.get("_user_initiated"):
+        ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
     media_id = str(item.get("tmdb_id") if media_type == "movie" else item.get("show_tmdb_id"))
     source = str(best.get("source") or "soulseek").lower()
+    transport_source = "torrent" if source == "extto" else source
+    row_kind = "show" if media_type == "episode" and ctx.get("scope") == "season" else media_type
     common = {
-        "kind": media_type, "title": ctx["title"],
+        "kind": row_kind, "title": ctx["title"],
         "release_title": best.get("title") or best.get("filename"),
         "size_bytes": int(best.get("size_bytes") or 0), "quality_label": best.get("quality_label"),
         "target_dir": target_dir, "status": "downloading",
@@ -481,34 +566,30 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
         # decisions stay consistent even if the title is reassigned mid-flight
         "quality_profile_id": item.get("quality_profile_id"),
     }
-    if source == "soulseek":
+    if transport_source == "soulseek":
         rest = [c for c in (candidates or []) if c.get("filename") != best.get("filename")]
         return {**common, "source": "soulseek", "username": best.get("username"),
                 "filename": best.get("filename"), "candidates": json.dumps(rest),
                 "tried_queries": json.dumps([query] if query else []),
                 "tried_files": json.dumps([best.get("filename")])}
-    # torrent / usenet — tracked by the client ref the grab returned. The ranked
-    # runners-up are KEPT, same as Soulseek's: they were being discarded here
-    # (`candidates: []`, "no Soulseek requery pool"), so a torrent that failed
-    # had nothing to fall back to and the monitor went looking on Soulseek
-    # instead — for a row whose source says torrent. Prowlarr hits are already
-    # slskd-shaped (username = indexer, filename = release title), so the
-    # existing retry planner works on them unchanged once the grab carriers ride
-    # along (see core/video/retry.merge_candidates).
-    _chosen = best.get("title") or best.get("filename")
-    rest = [c for c in (candidates or [])
-            if (c.get("title") or c.get("filename")) != _chosen]
-    return {**common, "source": source, "username": best.get("username"),   # indexer (display)
-            "filename": _chosen, "client_ref": best.get("_client_ref"),
-            "candidates": json.dumps(rest), "tried_queries": json.dumps([query] if query else []),
-            "tried_files": json.dumps([_chosen] if _chosen else [])}
+    # torrent / usenet — tracked by the client ref the grab returned; no Soulseek requery pool.
+    return {**common, "source": transport_source, "username": best.get("username"),   # indexer (display)
+            # keep the indexer ID too, not just its name. the seeding sweep needs a
+            # stable key to look up that tracker's own seed goal.
+            "indexer_id": best.get("indexer_id"),
+            "filename": best.get("title") or best.get("filename"), "client_ref": best.get("_client_ref"),
+            "candidates": json.dumps([]), "tried_queries": json.dumps([]), "tried_files": json.dumps([])}
 
 
 # ── production seams ──────────────────────────────────────────────────────────
 def _default_fetch_items(media_type: str) -> List[Dict[str, Any]]:
     from api.video import get_video_db
+    from core.commissary.import_lock import unlocked   # Commissary: a lock refuses what it would grab
     db = get_video_db()
-    return db.movie_wishlist_to_download() if media_type == "movie" else db.episode_wishlist_to_download()
+    if media_type == "movie":
+        return unlocked(db.movie_wishlist_to_download(), media_type, db)
+    from core.video.numbering import annotate
+    return annotate(unlocked(db.episode_wishlist_to_download(), media_type, db), db=db)
 
 
 def _backfill_movie_available_dates(limit: int = 25) -> None:
@@ -545,142 +626,59 @@ def _default_active_keys(media_type: str) -> set:
     return active_download_keys(get_video_db().get_active_video_downloads())
 
 
+def _default_db():   # Commissary
+    from api.video import get_video_db
+    return get_video_db()
+
+
 def _default_target_dir(media_type: str) -> str:
-    """The FALLBACK unattended-grab destination when an item isn't already
-    filed under a specific Library (or the caller has no per-item info at
-    all, e.g. the batch-level pre-flight check): the PRIMARY configured
-    Library for this kind, falling back further to the legacy scalar
-    movies_path/tv_path for installs with no Libraries configured yet.
-    ``_item_target_dir`` is the actual per-item resolver — it prefers an
-    item's own Library and only reaches this when it has none. Thin wrapper
-    around the shared resolver so every unattended call site keeps working
-    unmodified."""
     from api.video import get_video_db
-    from core.video.download_pipeline import resolve_download_root
-    from core.video.sources import resolve_video_server
+    from core.commissary.video_libraries import target_dir as _vlib_target  # Commissary
     db = get_video_db()
-    kind = "movie" if media_type == "movie" else "show"
-    server = resolve_video_server(db)
-    primary = db.primary_root_folder(server, kind) if server else None
-    paths = {"movies_path": db.get_setting("movies_path"),
-             "tv_path": db.get_setting("tv_path"),
-             "transfer_path": db.get_setting("transfer_path")}
-    return resolve_download_root(kind, primary_root_folder=primary, paths=paths)
+    if media_type == "movie":
+        return (db.get_setting("movies_path") or db.get_setting("transfer_path")
+                or _vlib_target(db, media_type) or "")
+    return db.get_setting("tv_path") or _vlib_target(db, media_type) or ""
 
 
-def _default_category(media_type: str) -> Optional[str]:
-    """The FALLBACK torrent/usenet category — the PRIMARY configured
-    Library's category for this kind, else None (the client adapter falls
-    back to the global torrent_client.category / usenet_client.category
-    setting). ``_category_for_item`` is the actual per-item resolver and
-    only reaches this when the item has no Library of its own."""
-    from api.video import get_video_db
-    from core.video.download_pipeline import resolve_torrent_category
-    from core.video.sources import resolve_video_server
-    db = get_video_db()
-    kind = "movie" if media_type == "movie" else "show"
-    server = resolve_video_server(db)
-    primary = db.primary_root_folder(server, kind) if server else None
-    return resolve_torrent_category(primary_root_folder=primary)
-
-
-def _root_folder_for_item(item: Dict[str, Any]) -> Optional[dict]:
-    """The specific Library an item is ALREADY filed under, if any —
-    ``root_folder_id`` is joined in by the wishlist queries (from the
-    show's/movie's own row via ``library_id``) or stamped on by a
-    tmdb_id-only caller (repair grabs). None when the item has no Library
-    yet, which callers treat as 'use the primary'."""
-    rfid = item.get("root_folder_id")
-    if not rfid:
-        return None
-    from api.video import get_video_db
-    return get_video_db().get_root_folder(rfid)
-
-
-def _item_label(item: Dict[str, Any]) -> str:
-    """Best human name for an item, for logging. Episode rows carry the show
-    under ``show_title``; movies use ``title``."""
-    for key in ("show_title", "title", "episode_title"):
-        val = (item or {}).get(key)
-        if val:
-            return str(val)
-    return "?"
-
-
-def _item_target_dir(item: Dict[str, Any], fallback: str) -> str:
-    """Per-item grab destination (multi-library #1105): an item already
-    filed under a Library (an existing show/movie's ``root_folder_id``)
-    grabs into THAT Library — e.g. a show cataloged under Anime stays in
-    Anime instead of always landing in the primary TV Library. ``fallback``
-    is whatever the caller already resolved as the batch/primary default
-    (so a test-injected ``target_dir`` fake is respected exactly as before
-    for any item with no Library of its own)."""
-    root_folder = _root_folder_for_item(item)
-    if root_folder and root_folder.get("path"):
-        return root_folder["path"]
-    # Falling back is a DECISION, and it used to be an invisible one. Nothing
-    # said which Library a grab chose or why, so a show landing in the primary
-    # TV Library because no one had ever told it otherwise looked exactly like
-    # a show landing there correctly — and once it imported, the next library
-    # scan stamped that Library onto the show row and made it permanent. Say it
-    # out loud, once, at the moment it happens.
-    logger.info(
-        "[Library] '%s' has no Library of its own — falling back to the primary "
-        "(%s). If that is the wrong shelf, set one on its watchlist/wishlist row "
-        "BEFORE it grabs: the first import decides where the show lives from then on.",
-        _item_label(item), fallback,
-    )
-    return fallback
-
-
-def _category_for_item(item: Dict[str, Any], media_type: str) -> Optional[str]:
-    """Per-item torrent/usenet category, mirroring ``_item_target_dir`` so a
-    grab's destination folder and its category always come from the SAME
-    Library."""
-    root_folder = _root_folder_for_item(item)
-    if root_folder and (root_folder.get("category") or "").strip():
-        return root_folder["category"].strip()
-    return _default_category(media_type)
-
-
-def _preferred_indexer_ids_for_item(item: Dict[str, Any]) -> set:
-    """The trackers this item's Library is RESTRICTED to, if any.
-
-    This used to be a soft +25 ranking nudge while every indexer was still
-    searched, which meant unticking a tracker in Settings → Libraries removed a
-    bonus but never stopped the tracker being used — reported as "it still tries
-    to grab from a tracker I deselected". It is now a search filter: only the
-    ticked trackers are queried for grabs into that Library.
-
-    An item with no Library yet (root_folder_id unset) has no restriction — this
-    deliberately does NOT fall back to the primary Library's selection the way
-    ``_item_target_dir``/``_category_for_item`` fall back for destination and
-    category. Inheriting a RESTRICTION from an unrelated 'primary' Library could
-    silently narrow a search to trackers the user never chose for this item, and
-    an over-narrow search looks identical to "no releases exist"."""
-    root_folder = _root_folder_for_item(item)
-    raw = (root_folder or {}).get("preferred_indexer_ids") or ""
-    out = set()
-    for p in str(raw).split(","):
-        p = p.strip()
-        if p.isdigit():
-            out.add(int(p))
-    return out
+def _extto_hits_for_context(ctx: Dict[str, Any]) -> tuple:
+    from core.video.extto_search import extto_search
+    from core.video.slskd_search import build_query
+    query = build_query(ctx["scope"], ctx["title"], year=ctx.get("year"),
+                        season=ctx.get("alt_season", ctx.get("season")),
+                        episode=ctx.get("alt_episode", ctx.get("episode")),
+                        air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
+                        series_type=ctx.get("series_type"))
+    eres = extto_search(query, limit=30, timeout=35, max_candidates=2,
+                        resolve_magnets=False)
+    if not eres.get("configured"):
+        return None, "EXT.to requires FlareSolverr"
+    if eres.get("error"):
+        return None, eres["error"]
+    return eres.get("hits") or [], None
 
 
 def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
-    """Search ONE source → (ranked candidates tagged with source, error). soulseek via slskd,
-    torrent/usenet via Prowlarr. Returns (None, error) when the search couldn't run."""
+    """Search ONE configured source → (ranked candidates tagged with source, error).
+
+    ``torrent`` is the torrent discovery lane: Prowlarr torrent indexers plus EXT.to
+    when FlareSolverr is configured. EXT.to can still be listed explicitly in a
+    hybrid chain, but normal torrent users should get it automatically."""
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
+    from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
     profile = load_for_item(get_video_db(), item)   # per-title profile (P2)
+    source_notes: List[str] = []
     if source == "soulseek":
         from core.video.download_monitor import _search_for_retry
         from core.video.slskd_search import build_query
+        # one query: the scene's own numbering when it differs (what files
+        # and share folders are named by)
         query = build_query(ctx["scope"], ctx["title"], year=ctx.get("year"),
-                            season=ctx.get("season"), episode=ctx.get("episode"),
+                            season=ctx.get("alt_season", ctx.get("season")),
+                            episode=ctx.get("alt_episode", ctx.get("episode")),
                             air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                             series_type=ctx.get("series_type"))
         res = _search_for_retry(query) or {}
@@ -689,28 +687,125 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
         hits = res.get("hits") or []
     elif source in ("torrent", "usenet"):
         from core.video.prowlarr_search import prowlarr_search
-        # THE unattended path — the wishlist drain. This is where a deselected
-        # tracker was still being searched, because the Library's selection only
-        # ever reached the ranking step.
+        # Commissary: limited to the title's video Library's trackers, if it has any
+        from core.commissary.video_libraries import search_indexer_ids
+        lib_ids = search_indexer_ids(get_video_db(), media_type, item=item)
         pres = prowlarr_search(ctx["scope"], ctx["title"], year=ctx.get("year"),
                                season=ctx.get("season"), episode=ctx.get("episode"), source=source,
                                air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                                series_type=ctx.get("series_type"),
-                               indexer_ids=_preferred_indexer_ids_for_item(item))
+                               imdb_id=ctx.get("imdb_id"), tmdb_id=ctx.get("tmdb_id"),
+                               tvdb_id=ctx.get("tvdb_id"), alt=ctx_alt(ctx),
+                               **({"indexer_ids": lib_ids} if lib_ids else {}))
+        prowlarr_err = None
         if not pres.get("configured"):
-            return None, "Prowlarr not configured"
-        if pres.get("error"):
-            return None, pres["error"]
-        hits = pres["hits"]
+            prowlarr_err = "Prowlarr not configured"
+        elif pres.get("error"):
+            prowlarr_err = pres["error"]
+        hits = [] if prowlarr_err else list(pres.get("hits") or [])
+        if source != "torrent":
+            # usenet is Prowlarr-only; EXT.to is torrents.
+            if prowlarr_err:
+                return None, prowlarr_err
+        else:
+            # EXT.to is the OTHER HALF of the torrent lane, so a Prowlarr that
+            # can't run must not take it down with it. Returning early on
+            # "not configured" meant a user running FlareSolverr without Prowlarr
+            # got nothing from the torrent lane while EXT.to sat there able to
+            # answer — the opposite of "normal torrent users get it
+            # automatically". The lane has only genuinely failed to search when
+            # NEITHER half could run.
+            ehits, eerr = _extto_hits_for_context(ctx)
+            if ehits is None:
+                if prowlarr_err:
+                    return None, "; ".join(
+                        x for x in (prowlarr_err, eerr or "EXT.to search didn't run") if x)
+                source_notes.append("EXT.to skipped — %s" % (eerr or "search didn't run"))
+            else:
+                if prowlarr_err:
+                    # It ran on one leg — say so, same as any other degradation.
+                    source_notes.append("Prowlarr skipped — %s" % prowlarr_err)
+                hits = hits + list(ehits or [])
+    elif source == "extto":
+        hits, err = _extto_hits_for_context(ctx)
+        if hits is None:
+            return None, err
     else:
         return None, "unsupported source %r" % source
+    alt = ctx_alt(ctx)
     cands = _evaluate_hits(hits, profile, ctx["scope"], ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           want_alt=alt)
     for c in cands:
-        c["source"] = source
-    return cands, None
+        if source == "torrent" and str(c.get("indexer_id") or "").lower() == "extto":
+            c["source"] = "extto"
+        else:
+            c["source"] = source
+    # Commissary: a release that just failed on its client isn't grabbed again
+    from core.commissary.client_retry import mark_failed as _mark_failed
+    return _mark_failed(item, media_type, cands), "; ".join(source_notes) or None
+
+
+# How many individual releases a snapshot keeps per source. Enough to answer
+# "why didn't this download" without unbounded growth: a busy search returns 180
+# hits and storing them all, per wishlist row, per hour, would be a database of
+# torrent names. Ten is enough to see a pattern.
+AUDIT_SAMPLE_LIMIT = 10
+
+
+def audit_samples(cands, limit: int = AUDIT_SAMPLE_LIMIT) -> List[Dict[str, Any]]:
+    """The individual releases behind a source's verdict, best-first, bounded.
+
+    The summary line ("15 results, none were this release") could not answer WHY
+    any single release lost - twice in one day that meant searching Boulder's
+    live Prowlarr by hand to find out. These are the receipts that make the
+    stored evidence enough on its own. Pure.
+    """
+    out: List[Dict[str, Any]] = []
+    for c in (cands or [])[:max(0, int(limit))]:
+        if not isinstance(c, dict):
+            continue
+        out.append({
+            "title": str(c.get("title") or c.get("filename") or "")[:200],
+            "accepted": bool(c.get("accepted")),
+            # The rule that turned it down, verbatim, so the drawer can group by it.
+            "rejected": (str(c.get("rejected"))[:200] if c.get("rejected") else None),
+            "quality": str(c.get("quality_label") or "")[:60] or None,
+            "source": str(c.get("source") or "")[:20] or None,
+            # WHICH indexer produced it. The transport ("torrent") cannot tell a
+            # tracker pulling its weight from one that has returned nothing for a
+            # month; Prowlarr puts the indexer's name in `username`.
+            "indexer": str(c.get("indexer") or c.get("username") or "")[:60] or None,
+            "seeders": c.get("seeders"),
+        })
+    return out
+
+
+def source_outcome(cands, err=None) -> Dict[str, Any]:
+    """One source's result for the last search, as a storable fact.
+
+    ``cands is None`` means the source could not SEARCH (slskd down, Prowlarr
+    unconfigured) — which is not evidence about the release and must never read
+    as "found nothing". Everything else is a real answer: how many releases came
+    back, how many the profile accepted, and the rule that turned down the best
+    of the rest. Pure."""
+    if cands is None:
+        return {"ran": False, "results": 0, "accepted": 0, "rejected": 0,
+                "reason": err or "search didn't run", "samples": []}
+    accepted = sum(1 for c in cands if c.get("accepted"))
+    rejected = [c for c in cands if not c.get("accepted")]
+    reason = None
+    if rejected:
+        try:
+            from core.video.wishlist_evidence import refusal_line, summarize_search
+            reason = refusal_line(summarize_search(rejected))
+        except Exception:   # noqa: BLE001 - a snapshot must never break a search
+            reason = None
+    return {"ran": True, "results": len(cands), "accepted": accepted,
+            "rejected": len(rejected), "reason": reason,
+            "samples": audit_samples(cands)}
 
 
 def _default_search(item: Dict[str, Any], media_type: str):
@@ -728,10 +823,19 @@ def _default_search(item: Dict[str, Any], media_type: str):
     cfg = download_config.load(get_video_db())
     mode = str(cfg.get("download_mode") or "soulseek")
     chain = (cfg.get("hybrid_order") or ["soulseek"]) if mode == "hybrid" else [mode]
+    chain = chain_for(chain, title_overrides_for_item(item, media_type))
     skips: List[str] = []
     fallback = None      # hits that didn't pass the profile — kept so the caller can say 'rejected'
+    # Per-source receipt for this search, read back by the recorder. Attached to
+    # the item the way annotate_upgrades attaches _min_rank: the drain hands the
+    # same dict to search() and record_outcome(), and each item is its own.
+    snapshot: Dict[str, Any] = {"chain": list(chain), "sources": {}}
+    item["_source_snapshot"] = snapshot
+    overrides = title_overrides_for_item(item, media_type)
     for src in chain:
         cands, err = _search_one_source(src, item, media_type)
+        cands = apply_group_overrides(cands, overrides) if cands is not None else None
+        snapshot["sources"][src] = source_outcome(cands, err)
         if cands is None:
             skips.append("%s skipped — %s" % (src, err or "search didn't run"))
             continue
@@ -747,44 +851,56 @@ def _default_search(item: Dict[str, Any], media_type: str):
     return [], note                                  # → 'source empty' (+ any skip note)
 
 
+def _pack_preference_for(item: Dict[str, Any]) -> str:
+    """This show's season-pack preference: auto | prefer | never."""
+    return str(title_overrides_for_item(item, "episode").get("pack_preference") or "auto")
+
+
 def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: List[Dict[str, Any]],
-                     media_type: str, target_dir: str) -> bool:
+                     media_type: str, target_dir: str) -> Dict[str, Any]:
     """Start the slskd transfer + write the download row (exactly like the manual flow),
-    then ensure the monitor is running. Returns True if slskd accepted it."""
+    then ensure the monitor is running.
+
+    Returns ``{ok, error}``. The error matters: the caller uses it to tell the
+    user (and the wishlist row) apart a client that refused this release from a
+    search that found nothing — they used to read identically."""
     from api.video import get_video_db
     from core.video import disk_guard, organization
     from core.video.download_monitor import ensure_started
     from core.video.slskd_search import build_query
-    ok_room, free = disk_guard.has_room(target_dir, organization.load(get_video_db()))
-    if not ok_room:
-        logger.warning("disk guard: %.1f GB free on %s — skipping grab of %s",
-                       free or 0, target_dir,
-                       item.get("title") or item.get("show_title") or "?")
-        return False
+    name = display_name(item, media_type)
+    # Commissary: file the grab into the title's video Library, with its category.
+    from core.commissary.video_libraries import category as _vlib_category
+    from core.commissary.video_libraries import target_dir as _vlib_target
+    target_dir = _vlib_target(get_video_db(), media_type, item=item) or target_dir
+    room = disk_guard.check_room(target_dir, organization.load(get_video_db()))
+    if not room["ok"]:
+        msg = disk_guard.shortfall_message(room, target_dir)
+        logger.warning("disk guard: %s — skipping grab of %s", msg, name)
+        return {"ok": False, "error": msg}
     source = str(best.get("source") or "soulseek").lower()
-    if source == "soulseek":
+    transport_source = "torrent" if source == "extto" else source
+    if transport_source == "soulseek":
         from core.video.slskd_download import start_download
         started = start_download(best.get("username"), best.get("filename"), best.get("size_bytes") or 0)
         if not started.get("ok"):
-            return False
+            return {"ok": False, "error": started.get("error") or "Soulseek refused the transfer"}
     else:
         # torrent / usenet — hand off to the shared client; carry the returned ref into the row.
-        # Category comes from the SAME Library target_dir was resolved from — the item's
-        # own Library when it has one, else the primary (multi-library #1105).
-        from core.video.client_grab import grab
-        # The hit carries the magnet beside the URL (#1139) — the automation
-        # grabs unattended, so a dead-magnet stall here is one nobody sees.
-        res = grab(source, best.get("download_url"),
-                   category=_category_for_item(item, media_type),
-                   fallback_magnet=best.get("magnet_uri"))
+        if source == "extto" and not best.get("download_url") and best.get("info_url"):
+            from core.video.extto_search import resolve_magnet
+            resolved = resolve_magnet(best.get("info_url"), magnet_id=best.get("magnet_id"))
+            if not resolved.get("ok"):
+                return {"ok": False, "error": resolved.get("error")
+                        or "EXT.to would not hand over a magnet for this release."}
+            best = {**best, "download_url": resolved["magnet"], "magnet_uri": resolved["magnet"]}
+        from core.video.client_grab import _category_kw, grab
+        res = grab(transport_source, best.get("download_url"),
+                   fallback_magnet=best.get("magnet_uri"),
+                   **_category_kw(_vlib_category(get_video_db(), media_type, item=item)))  # Commissary
         if not res.get("ok"):
-            # Episode items alias the show name as `show_title`; reading only
-            # `title` made every episode refusal log 'refused for None' — the
-            # same aliasing already handled in _default_record_outcome.
-            logger.warning("video hybrid: %s grab refused for %s: %s", source,
-                           item.get("title") or item.get("show_title") or "?",
-                           res.get("error"))
-            return False
+            logger.warning("video hybrid: %s grab refused for %s: %s", source, name, res.get("error"))
+            return {"ok": False, "error": res.get("error") or "the download client refused it"}
         best = {**best, "_client_ref": res["ref"]}
     ctx = search_context(item, media_type)
     query = build_query(ctx["scope"], ctx["title"], year=ctx.get("year"),
@@ -793,32 +909,118 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
         build_download_record(item, best, candidates, media_type=media_type,
                               target_dir=target_dir, query=query))
     ensure_started(get_video_db)
-    return True
+    return {"ok": True, "error": None}
 
 
 # ── guard: keep an in-progress drain from overlapping the next tick ───────────
 _running: Dict[str, bool] = {"movie": False, "episode": False}
+_running_lock = threading.Lock()
 
 
-def _default_record_outcome(item: Dict[str, Any], media_type: str, grabbed: bool) -> None:
+def _try_claim(media_type: str) -> bool:
+    """Atomically check-and-set the per-kind running flag (H14).
+
+    The engine's overlap guard reads is_running() and the handler sets the
+    flag afterwards — a check-then-act race: two triggers landing in the
+    window both entered, and the first finisher cleared the flag while the
+    second still ran. The claim closes it: only the thread that flips
+    False→True under the lock owns the run (same pattern as rss_sync).
+    """
+    with _running_lock:
+        if _running.get(media_type):
+            return False
+        _running[media_type] = True
+        return True
+
+
+def _release(media_type: str) -> None:
+    """Clear the per-kind running flag (lock-protected, for visibility)."""
+    with _running_lock:
+        _running[media_type] = False
+
+
+# ── stop: "cancel all" on the downloads page halts in-flight wishlist searches ──
+# a run snapshots the generation when it starts; a bump means stop. cancelling the
+# download rows alone left a 700-item search-all grinding on and grabbing more.
+_stop_gen = [0]
+
+
+def request_stop() -> None:
+    """Tell every running drain / search-all to stop searching and grabbing."""
+    with _running_lock:
+        _stop_gen[0] += 1
+
+
+def stop_generation() -> int:
+    with _running_lock:
+        return _stop_gen[0]
+
+
+def stop_requested(gen: int) -> bool:
+    return stop_generation() != gen
+
+
+def _default_max_downloads(media_type: str) -> int:
+    """The drain automation's 'Max downloads per run' for this kind (default 3).
+    search-all honours it too, so one click can't hand the clients the whole wishlist."""
+    action = 'video_process_movie_wishlist' if media_type == 'movie' else 'video_process_episode_wishlist'
+    try:
+        from database.music_database import get_database
+        row = get_database().get_system_automation_by_action(action) or {}
+        cfg = json.loads(row.get('action_config') or '{}')
+        return max(1, int(cfg.get('max_simultaneous_downloads', 3) or 3))
+    except Exception:   # noqa: BLE001 - unreadable config fails open to the default
+        return 3
+
+
+def _wishlist_db_key(item: Dict[str, Any], media_type: str) -> tuple:
+    tmdb = item.get('tmdb_id') or item.get('show_tmdb_id')
+    kind = 'movie' if media_type == 'movie' else 'episode'
+    return kind, tmdb, item.get('season_number'), item.get('episode_number')
+
+
+def _default_record_outcome(item: Dict[str, Any], media_type: str, grabbed: bool,
+                            refusal: Optional[Dict[str, Any]] = None) -> None:
     """Persist the drain search outcome on the wishlist row (#liveleak-failing-hub):
     a grab resets search_attempts, a fruitless search increments it. Callers skip
     this entirely when the search never ran (slskd down) — that's not evidence
-    the release doesn't exist. Best-effort: a db hiccup never breaks the drain."""
+    the release doesn't exist. Best-effort: a db hiccup never breaks the drain.
+
+    ``refusal`` is the receipt from :func:`core.video.wishlist_evidence.
+    summarize_refusals` — the best release that WAS found and the rule that turned
+    it down. Without it a row on its fortieth fruitless search is indistinguishable
+    from one waiting for next week's episode."""
     try:
         from api.video import get_video_db
-        # episode drain items alias the show id as show_tmdb_id (movie items
-        # carry plain tmdb_id) — read both or episodes silently never record
-        tmdb = item.get('tmdb_id') or item.get('show_tmdb_id')
+        from core.video.wishlist_evidence import refusal_line
+        kind, tmdb, season, episode = _wishlist_db_key(item, media_type)
         if not tmdb:
             return
         get_video_db().record_wishlist_search_outcome(
-            'movie' if media_type == 'movie' else 'episode',
-            tmdb, grabbed,
-            season_number=item.get('season_number'),
-            episode_number=item.get('episode_number'))
+            kind, tmdb, grabbed,
+            season_number=season,
+            episode_number=episode,
+            refusal=refusal_line(refusal),
+            refusal_quality=(refusal or {}).get('quality_label'),
+            snapshot=item.get("_source_snapshot"))
     except Exception:   # noqa: BLE001 - visibility must never break acquisition
         logger.debug("record_wishlist_search_outcome failed", exc_info=True)
+
+
+def _default_record_note(item: Dict[str, Any], media_type: str, note: str,
+                         refusal_quality: Optional[str] = None) -> None:
+    """Persist a non-fruitless reason on the wishlist row. Used when a release
+    passed matching/profile gates but the download/import side could not land it."""
+    try:
+        from api.video import get_video_db
+        kind, tmdb, season, episode = _wishlist_db_key(item, media_type)
+        if not tmdb:
+            return
+        get_video_db().record_wishlist_search_note(
+            kind, tmdb, note, season_number=season, episode_number=episode,
+            refusal_quality=refusal_quality)
+    except Exception:   # noqa: BLE001 - visibility must never break acquisition
+        logger.debug("record_wishlist_search_note failed", exc_info=True)
 
 
 def is_running(media_type: str) -> bool:
@@ -836,9 +1038,12 @@ def auto_video_process_wishlist(
     search: Optional[Callable[[Dict[str, Any], str], List[Dict[str, Any]]]] = None,
     enqueue: Optional[Callable[..., bool]] = None,
     record_outcome: Optional[Callable[[Dict[str, Any], str, bool], None]] = None,
+    record_note: Optional[Callable[[Dict[str, Any], str, str, Optional[str]], None]] = None,
 ) -> Dict[str, Any]:
     """Auto-grab the wished movies (or episodes): search Soulseek, pick the best release,
-    enqueue. Processes the whole eligible wishlist, a few searches at a time.
+    enqueue — at most ``max_simultaneous_downloads`` grabs per run (default 3); the rest
+    stay on the wishlist for the next tick. Searches run a few at a time
+    (``max_concurrent``).
 
     Returns ``{'status': 'completed', 'searched': int, 'grabbed': int, ...}``."""
     fetch_items = fetch_items or _default_fetch_items
@@ -847,12 +1052,28 @@ def auto_video_process_wishlist(
     search = search or _default_search
     enqueue = enqueue or _default_enqueue
     record_outcome = record_outcome or _default_record_outcome
+    record_note = record_note or _default_record_note
     automation_id = config.get('_automation_id')
     concurrency = max(1, int(config.get('max_concurrent', 3) or 3))
+    # Grab budget ("Max downloads per run", default 3): how many items one
+    # drain run may hand to slskd / the torrent / usenet client. The rest stay
+    # on the wishlist for the next tick — no starvation, no loss. Distinct from
+    # `concurrency` above, which only sizes the search thread pool. A garbage
+    # value fails open to the default — the drain never strands itself on a
+    # mis-typed config.
+    try:
+        max_downloads = max(1, int(config.get('max_simultaneous_downloads', 3) or 3))
+    except (ValueError, TypeError):
+        max_downloads = 3
     label = 'movie' if media_type == 'movie' else 'episode'
 
-    _running[media_type] = True
+    if not _try_claim(media_type):
+        # Lost the race with another trigger that already owns this drain —
+        # the engine guard is check-then-act, the claim is the atomic backstop.
+        return {'status': 'skipped', 'reason': 'already_running',
+                '_manages_own_progress': True}
     try:
+        gen = stop_generation()   # "cancel all" bumps it: stop searching + grabbing
         root = target_dir(media_type)
         if not root:
             where = 'Movie' if media_type == 'movie' else 'TV'
@@ -882,70 +1103,136 @@ def auto_video_process_wishlist(
                 it.get("quality_profile_id") for it in items) else None
             items = annotate_upgrades(items, cutoff_rank, cutoff_for=per_item)
         active = set(active_keys(media_type) or set())
-        # A season pack already downloading claims every episode in it, so those
-        # episodes must not also be grabbed one by one while it lands.
-        todo = [it for it in items
-                if item_key(it, media_type) not in active
-                and season_key(it, media_type) not in active]
-        # Season packs (opt-in): try ONE grab for a season with several holes
-        # before falling back to per-episode. Runs first so a successful pack
-        # removes its episodes from this tick's per-episode work.
-        pack_grabs = 0
+        from core.commissary import season_packs as _season_packs   # Commissary
+        # Commissary: an episode whose season pack is downloading is in flight too
+        todo = [it for it in items if item_key(it, media_type) not in active
+                and not _season_packs.under_active_pack(it, media_type, active)]
         if media_type == "episode":
-            _sp = _season_pack_settings()
-            # The global switch is not the only way in: a show with its OWN
-            # 'prefer'/'only' override packs even while the global is off, so
-            # the pass runs whenever ANY show in this tick opts in.
-            _mode_for = _pack_mode_resolver(_sp)
-            if any(_mode_for(it) != "never" for it in todo):
-                todo, pack_grabs = _try_season_packs(
-                    todo, root=root, search=search, enqueue=enqueue, deps=deps,
-                    automation_id=automation_id, settings=_sp, mode_for=_mode_for)
+            # Global setting, overridable per show: 'never' keeps that show on the
+            # per-episode path even when packs are on, 'prefer' reaches for a pack
+            # even when they are globally off.
+            pack_on = config.get("season_pack_first", True) is not False
+            packable = [it for it in todo   # Commissary: 'only' reaches for a pack too
+                        if _season_packs.wants_pack(_pack_preference_for(it), pack_on)]
+        else:
+            packable = []
+        if packable:
+            packs = season_pack_requests(packable, active, config.get("season_pack_min_missing", MIN_SEASON_PACK_EPISODES))
+            covered = {("episode", str(p.get("show_tmdb_id")), int(s), int(e))
+                       for p in packs for s, e in (p.get("_pack_members") or [])}
+            todo = packs + [it for it in todo if item_key(it, media_type) not in covered]
         if not todo:
-            # A season pack can claim every remaining episode, emptying todo — that
-            # is a fully successful run, not "nothing to grab", so the pack count
-            # has to survive this early return or the tick reports 0 grabbed.
-            done_msg = ('Grabbed %d season pack(s) — nothing else outstanding' % pack_grabs
-                        if pack_grabs else
-                        'Nothing new to grab (%d already in flight)' % len(active))
             deps.update_progress(automation_id, status='finished', progress=100, phase='Complete',
-                                 log_line=done_msg,
-                                 log_type='success' if pack_grabs else 'info')
-            return {'status': 'completed', 'searched': 0, 'grabbed': pack_grabs,
-                    'season_packs': pack_grabs, '_manages_own_progress': True}
+                                 log_line='Nothing new to grab (%d already in flight)' % len(active),
+                                 log_type='info')
+            return {'status': 'completed', 'searched': 0, 'grabbed': 0, '_manages_own_progress': True}
 
         grabbed = [0]
         searched = [0]
         noresults = [0]    # search came back empty (the source had nothing)
         rejected = [0]     # source had hits, but none passed the quality profile
         notrun = [0]       # the search never ran (slskd didn't accept it)
-        total = len(todo)
+        refused = [0]      # releases passed the profile; the download client said no
+        deferred = [0]      # budget spent: left on the wishlist for the next run
+        stopped = [0]       # cancel all hit mid-run: left on the wishlist untouched
+        slots_claimed = [0]  # atomic grab-budget claims this run (never > max_downloads)
+        total = [len(todo)]
         lock = threading.Lock()
 
         def _one(it):
+            # Grab budget: once this run has claimed `max_downloads` slots, the
+            # rest wait for the next tick — no search wasted, no outcome
+            # recorded (this is not a fruitless search), no row lost.
+            with lock:
+                if stop_requested(gen):
+                    stopped[0] += 1
+                    return
+                if slots_claimed[0] >= max_downloads:
+                    deferred[0] += 1
+                    return
             found = search(it, media_type)
             # the seam returns (candidates, error); tolerate a bare list/None too (test fakes)
             cands, err = found if isinstance(found, tuple) else (found, None)
             didnt_run = cands is None       # slskd not configured / errored / rate-limited
             cands = cands or []
-            best = pick_best(cands, it.get("_min_rank") or 0)
-            # multi-library #1105: an item already filed under its own Library
-            # (e.g. Anime) grabs there, not always into the batch's primary `root`.
-            item_target = _item_target_dir(it, root)
-            ok = bool(best) and bool(enqueue(it, best, cands, media_type, item_target))
-            name = it.get('title') or it.get('show_title') or '?'
-            if media_type == 'episode':
-                name = "%s S%02dE%02d" % (name, int(it.get('season_number') or 0),
-                                          int(it.get('episode_number') or 0))
+            # Offer the client more than one release. Abandoning the item the
+            # moment its top pick is refused is what let a single bad release
+            # block an item indefinitely — the next-best one is usually fine.
+            usable_all = acceptable_candidates(cands, it.get("_min_rank") or 0)
+            if it.get("_pack_members"):
+                usable_all = [c for c in usable_all if str(c.get("source") or "").lower() not in ("", "soulseek")]
+            cooled = [(c, source_cooldown_remaining(it, media_type, c)) for c in usable_all]
+            usable = [c for c, remaining in cooled if remaining <= 0]
+            cooldown_wait = max([remaining for _c, remaining in cooled], default=0)
+            ok, refusal = False, None
+            budget_deferred = False
+            if usable:
+                # Atomic claim (YouTube's slots_free() pattern): threads race
+                # here, so the check + increment must be one locked step — at
+                # most `max_downloads` items are ever handed to the clients.
+                with lock:
+                    if stop_requested(gen):
+                        # the search finished after cancel all — grab nothing
+                        stopped[0] += 1
+                        return
+                    slot = slots_claimed[0] < max_downloads
+                    if slot:
+                        slots_claimed[0] += 1
+                if slot:
+                    for cand in usable[:MAX_GRAB_ATTEMPTS]:
+                        out = enqueue_outcome(enqueue(it, cand, cands, media_type, root))
+                        if out["ok"]:
+                            clear_source_refusal(it, media_type, cand)
+                            ok = True
+                            break
+                        note_source_refusal(it, media_type, cand)
+                        refusal = out["error"] or refusal
+                    if not ok:
+                        # A refused grab is not a download — hand the slot back
+                        # so a later item can still use it this run.
+                        with lock:
+                            slots_claimed[0] -= 1
+                else:
+                    # Found releases, but racing threads spent the budget first.
+                    # The item stays on the wishlist for the next tick.
+                    budget_deferred = True
+                    with lock:
+                        deferred[0] += 1
+            name = display_name(it, media_type)
             # tell apart: grabbed / search-didn't-run / source-empty / hits-but-all-rejected.
             # `err` alongside RESULTS is a non-fatal note (a chain source was skipped,
             # e.g. 'torrent skipped — Prowlarr not configured') — always show it, or a
             # mis-configured first source silently degrades every search.
-            if ok:
+            if budget_deferred:
+                msg = ("Found release(s) for '%s' but this run already grabbed %d "
+                       "(Max downloads per run) — deferred to the next run"
+                       % (name, max_downloads))
+                lt = 'info'
+            elif ok:
                 msg, lt = "Grabbed '%s'" % name, 'success'
             elif didnt_run:
                 msg = ("Search didn't run for '%s' — %s" % (name, err)) if err \
                     else ("Search didn't run for '%s' — slskd not responding?" % name)
+                lt = 'warning'
+            elif usable_all and not usable:
+                hours = max(1, int((cooldown_wait + 3599) // 3600))
+                msg = ("Found release(s) for '%s', but that source is cooling down "
+                       "after repeated client refusals — retrying in about %dh" % (name, hours))
+                record_note(it, media_type, "Source cooldown after repeated client refusals")
+                lt = 'warning'
+            elif usable:
+                # Releases PASSED the profile and the download client turned them
+                # down. Saying "none met your quality profile" here (which is what
+                # this branch used to fall through to) points the user at the one
+                # setting that is not the problem, and leaves the real reason —
+                # sitting right there in the client's own error — unsaid.
+                reason = refusal or "no reason given"
+                msg = ("Found %d release(s) for '%s' but the download client "
+                       "refused %s — %s" % (len(usable), name,
+                                            "them" if len(usable) > 1 else "it",
+                                            reason))
+                record_note(it, media_type, "Download client refused: " + str(reason),
+                            usable[0].get("quality_label"))
                 lt = 'warning'
             elif not cands:
                 msg, lt = "No search results for '%s'" % name, 'info'
@@ -961,25 +1248,66 @@ def auto_video_process_wishlist(
                 if err:
                     msg, lt = msg + " · " + str(err), 'warning'
             # Failing visibility (#liveleak-failing-hub): record the outcome on
-            # the wishlist row — but only when the search actually RAN. A search
-            # that never ran (slskd down / rate-limited) says nothing about
-            # whether the release exists and must not push a row toward failing.
-            if not didnt_run:
-                record_outcome(it, media_type, ok)
+            # the wishlist row — but only when the search actually RAN, and only
+            # when its verdict says something about whether the release EXISTS.
+            # A search that never ran (slskd down / rate-limited) says nothing;
+            # neither does a client refusing a release we did find, and counting
+            # that as a fruitless search is how a row reached 133 "attempts"
+            # while its release was available the whole time. A budget-deferred
+            # item is skipped for the same reason: the release exists, it just
+            # waits for the next tick.
+            # A pack try that falls back to its episodes records nothing itself:
+            # each episode's own search is the verdict about that episode.
+            pack_falls_back = bool(it.get("_pack_rows")) and not ok
+            if not didnt_run and not (usable and not ok) and not budget_deferred and not pack_falls_back:
+                # Keep the receipt. Every candidate was just judged and is about to
+                # be discarded; the best one refused for a reason about
+                # AVAILABILITY (not "wrong season", which is only search noise) is
+                # what turns "why is this stuck" into a decision the user can make.
+                from core.video.wishlist_evidence import summarize_search
+                record_outcome(it, media_type, ok, summarize_search(
+                    cands, noun="movie" if media_type == "movie" else "episode"))
             with lock:
                 searched[0] += 1
                 if ok:
                     grabbed[0] += 1
+                elif budget_deferred:
+                    pass   # already tallied in deferred[]; not a client refusal
                 elif didnt_run:
                     notrun[0] += 1
+                elif usable_all:
+                    refused[0] += 1
                 elif not cands:
                     noresults[0] += 1
                 else:
                     rejected[0] += 1
                 deps.update_progress(
                     automation_id, phase='Searching + grabbing…',
-                    progress=10 + int(85 * searched[0] / max(total, 1)),
+                    progress=10 + int(85 * min(searched[0], total[0]) / max(total[0], 1)),
                     log_line=msg, log_type=lt)
+            # A season pack that didn't land: search its episodes one by one,
+            # this run. Before, the pack's "Not a full-season pack" verdict was
+            # stamped on every member and they were never searched on their own,
+            # so a season with plenty of single-episode releases sat untouched.
+            fall_back = (it.get("_pack_rows") and not ok and not didnt_run
+                         and not budget_deferred and not stop_requested(gen))
+            # Commissary: 'Season packs: only' waits for a pack once the season has aired
+            if fall_back and _season_packs.hold(_default_db(), it):
+                fall_back = False
+                for row in it["_pack_rows"]:
+                    record_note(row, media_type, _season_packs.HOLD_NOTE)
+                deps.update_progress(automation_id, log_type='info',
+                                     log_line="No season pack for '%s' yet — holding its %d episode(s) "
+                                              "(Season packs: only)" % (name, len(it["_pack_rows"])))
+            if fall_back:
+                rows = list(it["_pack_rows"])
+                with lock:
+                    total[0] += len(rows)
+                deps.update_progress(automation_id, log_type='info',
+                                     log_line="No season pack for '%s' — searching its %d episode(s) one by one"
+                                              % (name, len(rows)))
+                for row in rows:
+                    _one(row)
 
         with ThreadPoolExecutor(max_workers=concurrency) as ex:
             list(ex.map(_one, todo))
@@ -993,19 +1321,25 @@ def auto_video_process_wishlist(
             tail.append('%d had no results' % noresults[0])
         if rejected[0]:
             tail.append('%d rejected on quality' % rejected[0])
+        if refused[0]:
+            tail.append('%d refused by the download client' % refused[0])
+        if deferred[0]:
+            tail.append('%d deferred to the next run (download cap %d)'
+                        % (deferred[0], max_downloads))
+        if stopped[0]:
+            tail.append('%d skipped (stopped by cancel all)' % stopped[0])
         breakdown = (' · ' + ', '.join(tail)) if tail else ''
         done = ('Grabbed %d %s(s) of %d searched%s' % (grabbed[0], label, searched[0], breakdown)) if grabbed[0] \
             else ('Searched %d %s(s), grabbed 0%s' % (searched[0], label, breakdown))
         deps.update_progress(automation_id, status='finished', progress=100, phase='Complete',
                              log_line=done, log_type='success' if grabbed[0] else 'info')
-        return {'status': 'completed', 'searched': searched[0],
-                # season packs are grabs too — a tick that landed one pack and no
-                # singles must not report 'grabbed 0'
-                'grabbed': grabbed[0] + pack_grabs, 'season_packs': pack_grabs,
+        return {'status': 'completed', 'searched': searched[0], 'grabbed': grabbed[0],
                 'noresults': noresults[0], 'rejected': rejected[0], 'notrun': notrun[0],
+                'refused': refused[0], 'deferred': deferred[0],
                 '_manages_own_progress': True}
     except Exception as e:  # noqa: BLE001
         deps.update_progress(automation_id, status='error', phase='Error', log_line=str(e), log_type='error')
         return {'status': 'error', 'error': str(e), '_manages_own_progress': True}
     finally:
-        _running[media_type] = False
+        _release(media_type)  # H14: under the lock, so a concurrent trigger
+        # cannot read a stale False while the second body still runs.

@@ -1,0 +1,84 @@
+.wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.popup {
+  width: min(640px, 100%);
+}
+
+.current {
+  display: block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--white-a60);
+  font-size: 12px;
+}
+
+.shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.shortcut {
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--white-a10);
+  background: var(--white-a04);
+  color: var(--white-a80);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.shortcut[data-active] {
+  border-color: var(--accent, #1db954);
+  color: #fff;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 50vh;
+  overflow-y: auto;
+  border: 1px solid var(--white-a08);
+  border-radius: 12px;
+}
+
+.row {
+  display: block;
+  width: 100%;
+  padding: 8px 12px;
+  border: 0;
+  background: transparent;
+  color: var(--white-a80);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.row:hover {
+  background: var(--white-a06);
+}
+
+.note {
+  margin: 8px 12px;
+  color: var(--white-a40);
+  font-size: 12px;
+  flex: 1 1 auto;
+}
+
+.error {
+  margin: 8px 0;
+  color: var(--danger, #ef4444);
+  font-size: 13px;
+}

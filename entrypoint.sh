@@ -1,5 +1,5 @@
 #!/bin/bash
-# Commissary Docker Entrypoint Script
+# SoulSync Docker Entrypoint Script
 # Handles PUID/PGID/UMASK configuration for proper file permissions
 
 set -e
@@ -9,7 +9,7 @@ PUID=${PUID:-1000}
 PGID=${PGID:-1000}
 UMASK=${UMASK:-022}
 
-echo "🐳 Commissary Container Starting..."
+echo "🐳 SoulSync Container Starting..."
 echo "📝 User Configuration:"
 echo "   PUID: $PUID"
 echo "   PGID: $PGID"
@@ -63,11 +63,18 @@ else
     echo "   ✅ config.json already exists"
 fi
 
-# Always update settings.py — it's application code, not user configuration.
-# Stale versions from older releases cause startup crashes (missing methods).
-echo "   📄 Updating settings.py to current version..."
-cp /defaults/settings.py /app/config/settings.py
-chown soulsync:soulsync /app/config/settings.py 2>/dev/null || true
+# settings.py used to live HERE, inside the mounted config dir — application
+# code in a folder users persist. When the image updated and their folder did
+# not, the app ran a months-old ConfigManager against current callers, which
+# surfaced as "'ConfigManager' object has no attribute 'batch'" on Save
+# (TheHomeGuy, 3.2.0). Copying a fresh one in every boot was the workaround;
+# the module now lives at core/settings.py, outside any mount, so the class of
+# bug is gone. Sweep the leftover so nobody edits a file that does nothing.
+if [ -f "/app/config/settings.py" ]; then
+    echo "   🧹 Removing obsolete config/settings.py (moved to core/settings.py)"
+    rm -f /app/config/settings.py
+    rm -rf /app/config/__pycache__
+fi
 
 # Ensure all directories exist with correct ownership.
 # Only the directory nodes themselves need chown here — the recursive chown
@@ -104,7 +111,7 @@ echo "👤 Running as:"
 echo "   User: $(id -u soulsync):$(id -g soulsync) ($(id -un soulsync):$(id -gn soulsync))"
 echo "   UMASK: $(umask)"
 echo ""
-echo "🚀 Starting Commissary Web Server..."
+echo "🚀 Starting SoulSync Web Server..."
 
 # Execute the main command as the soulsync user
 # If already running as the correct user (e.g. Podman rootless with keep-id), skip gosu

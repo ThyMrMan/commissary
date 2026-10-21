@@ -36,7 +36,7 @@ def register_routes(bp):
             hydrabase = ctx.get("hydrabase_client")
             if source == "auto" and hydrabase:
                 try:
-                    from web_server import _is_hydrabase_active
+                    from api.hydrabase_routes import _is_hydrabase_active
                     if _is_hydrabase_active():
                         hydra_results = hydrabase.search_tracks(query, limit=limit)
                         if hydra_results:
@@ -57,7 +57,8 @@ def register_routes(bp):
             if source in ("itunes", "deezer", "auto"):
                 fallback = get_primary_client()
                 fallback_source = get_primary_source()
-                results = fallback.search_tracks(query, limit=limit)
+                from core.metadata.song_search import search_typed_query
+                results = search_typed_query(fallback, query, limit=limit)
                 if results:
                     tracks = [_serialize_track(t) for t in results]
                     return api_success({"tracks": tracks, "source": fallback_source})

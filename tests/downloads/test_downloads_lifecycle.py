@@ -14,7 +14,8 @@ from core.runtime_state import (
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
+def reset_state(monkeypatch):
+    monkeypatch.setattr(lc, '_scan_owed', False)
     download_tasks.clear()
     download_batches.clear()
     yield
@@ -85,6 +86,7 @@ def _build_deps(
     tidal_states=None,
     deezer_states=None,
     spotify_states=None,
+    global_max=None,
 ):
     rec = _Recorder()
     return lc.LifecycleDeps(
@@ -108,6 +110,7 @@ def _build_deps(
         tidal_discovery_states=tidal_states or {},
         deezer_discovery_states=deezer_states or {},
         spotify_public_discovery_states=spotify_states or {},
+        get_global_max_concurrent=(lambda: global_max) if global_max is not None else None,
     ), rec
 
 
@@ -306,6 +309,24 @@ def test_on_complete_success_calls_check_and_remove_wishlist():
     assert any(c[0] == 'check_wishlist' for c in rec.calls)
 
 
+def test_on_complete_wishlist_backstop_refuses_quietly():
+    """the import already settled this track's row (or deferred it for the
+    album publish), so the batch-completion re-check must ask for a quiet
+    refusal. otherwise every staged or basic search track logs a warning."""
+    download_tasks['t1'] = {'status': 'completed', 'track_info': {'name': 'X', 'artists': ['A']},
+                            'final_file_path': '/lib/.soulsync_atomic_staging/b1/A/X.flac'}
+    download_batches['b1'] = {
+        'queue': ['t1'], 'queue_index': 1, 'active_count': 1,
+        'max_concurrent': 1, 'permanently_failed_tracks': [],
+        'cancelled_tracks': set(),
+    }
+    deps, rec = _build_deps()
+    lc.on_download_completed('b1', 't1', True, deps)
+    calls = [c for c in rec.calls if c[0] == 'check_wishlist']
+    assert len(calls) == 1
+    assert calls[0][2].get('quiet_refusal') is True
+
+
 # ---------------------------------------------------------------------------
 # Batch completion (via on_download_completed)
 # ---------------------------------------------------------------------------
@@ -325,7 +346,7 @@ def test_batch_completion_emits_batch_complete_when_all_done():
     # Final task completes
     lc.on_download_completed('b1', 't2', True, deps)
     assert download_batches['b1']['phase'] == 'complete'
-    assert ('batch_complete', {'playlist_name': 'PL', 'total_tracks': '2', 'completed_tracks': '2', 'failed_tracks': '0'}) in auto.events
+    assert ('batch_complete', {'playlist_name': 'PL', 'total_tracks': '2', 'completed_tracks': '2', 'failed_tracks': '0', 'more_batches_pending': 'false'}) in auto.events
     assert 'b1' in monitor.stopped
 
 
@@ -600,3 +621,628 @@ def test_check_v2_exception_returns_false():
     deps, _ = _build_deps()
     result = lc.check_batch_completion_v2('b1', deps)
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# The GLOBAL concurrency gate (#1166)
+# ---------------------------------------------------------------------------
+
+class TestGlobalConcurrencyGate:
+    """max_concurrent was per BATCH, and so was the lock guarding it.
+
+    Reported against 3.2.2: a wishlist that groups tracks into album batches ran
+    several Soulseek searches at once against a configured limit of one. The log
+    told the truth from each batch's own point of view and was wrong about the
+    machine:
+
+        [Batch Lock] Started download 1/10 - Active: 1/1
+        [Batch Lock] Started download 1/12 - Active: 1/1
+        [Batch Lock] Started download 1/18 - Active: 1/1
+
+    Three batches, six seconds apart, one configured slot. That is what floods
+    Soulseek and earns a rate-limit or a ban.
+    """
+
+    @staticmethod
+    def _batch(queue, active=0, max_concurrent=1):
+        return {
+            'queue': list(queue),
+            'queue_index': 0,
+            'active_count': active,
+            'max_concurrent': max_concurrent,
+            'phase': 'downloading',
+        }
+
+    def _tasks(self, *ids):
+        for t in ids:
+            download_tasks[t] = {'status': 'pending', 'status_change_time': 0}
+
+    def test_a_second_batch_cannot_start_while_the_first_holds_the_only_slot(self):
+        # The reported bug, at its smallest.
+        self._tasks('a1', 'b1')
+        download_batches['A'] = self._batch(['a1'], active=1)   # already running
+        download_batches['B'] = self._batch(['b1'])
+        deps, rec = _build_deps(global_max=1)
+
+        lc.start_next_batch_of_downloads('B', deps)
+
+        assert [c for c in rec.calls if c[0] == 'submit_dl'] == []
+        assert download_batches['B']['active_count'] == 0
+        # HELD, not dropped: the work is still queued for when a slot frees.
+        assert download_batches['B']['queue_index'] == 0
+
+    def test_the_cap_counts_every_batch_not_just_this_one(self):
+        # Three batches each at 1/1 is exactly the reported log.
+        self._tasks('a1', 'b1', 'c1')
+        download_batches['A'] = self._batch(['a1'], active=1)
+        download_batches['B'] = self._batch(['b1'], active=1)
+        download_batches['C'] = self._batch(['c1'])
+        deps, rec = _build_deps(global_max=2)
+
+        lc.start_next_batch_of_downloads('C', deps)
+        assert [c for c in rec.calls if c[0] == 'submit_dl'] == []
+
+    def test_it_starts_when_the_global_limit_has_room(self):
+        self._tasks('a1', 'b1')
+        download_batches['A'] = self._batch(['a1'], active=1)
+        download_batches['B'] = self._batch(['b1'])
+        deps, rec = _build_deps(global_max=3)
+
+        lc.start_next_batch_of_downloads('B', deps)
+        assert len([c for c in rec.calls if c[0] == 'submit_dl']) == 1
+        assert download_batches['B']['active_count'] == 1
+
+    def test_one_batch_still_fills_up_to_the_global_limit(self):
+        # The gate caps the total; it must not throttle a single batch below
+        # what it is allowed to run.
+        self._tasks('a1', 'a2', 'a3', 'a4')
+        download_batches['A'] = self._batch(['a1', 'a2', 'a3', 'a4'], max_concurrent=5)
+        deps, rec = _build_deps(global_max=3)
+
+        lc.start_next_batch_of_downloads('A', deps)
+        assert len([c for c in rec.calls if c[0] == 'submit_dl']) == 3
+
+    def test_the_per_batch_limit_still_applies_under_a_looser_global_one(self):
+        # An album batch is capped at 1 for source reuse; a roomy global cap
+        # must not override that.
+        self._tasks('a1', 'a2')
+        download_batches['A'] = self._batch(['a1', 'a2'], max_concurrent=1)
+        deps, rec = _build_deps(global_max=10)
+
+        lc.start_next_batch_of_downloads('A', deps)
+        assert len([c for c in rec.calls if c[0] == 'submit_dl']) == 1
+
+    def test_no_gate_configured_leaves_the_old_behaviour_untouched(self):
+        # A source that is not rate-limited the way Soulseek is, and any caller
+        # that has not been updated, must keep its per-batch limit rather than
+        # lose all limiting.
+        self._tasks('a1', 'b1')
+        download_batches['A'] = self._batch(['a1'], active=1)
+        download_batches['B'] = self._batch(['b1'])
+        deps, rec = _build_deps()  # get_global_max_concurrent is None
+
+        lc.start_next_batch_of_downloads('B', deps)
+        assert len([c for c in rec.calls if c[0] == 'submit_dl']) == 1
+
+    def test_a_failing_gate_falls_back_rather_than_halting_downloads(self):
+        # A broken limit lookup must not become a total stop.
+        self._tasks('a1')
+        download_batches['A'] = self._batch(['a1'])
+
+        def _boom():
+            raise RuntimeError('config exploded')
+
+        deps, rec = _build_deps()
+        deps.get_global_max_concurrent = _boom
+
+        lc.start_next_batch_of_downloads('A', deps)
+        assert len([c for c in rec.calls if c[0] == 'submit_dl']) == 1
+
+
+class TestGlobalGateWakesWaitingBatches:
+    """The cap alone would turn a concurrency bug into a stall.
+
+    A freed slot used to be offered back only to the batch that freed it, which
+    was fine when every batch had its own limit. Under a global cap the batches
+    being held have to be woken by whoever frees the slot, or they wait forever
+    — and a wishlist that never finishes is worse than one that searches too
+    hard.
+    """
+
+    def test_a_held_batch_starts_when_another_batch_frees_the_slot(self):
+        download_tasks['a1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+        download_tasks['b1'] = {'status': 'pending', 'status_change_time': 0}
+        # A is finishing its only task; B is held at the global limit.
+        download_batches['A'] = {
+            'queue': ['a1'], 'queue_index': 1, 'active_count': 1, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        download_batches['B'] = {
+            'queue': ['b1'], 'queue_index': 0, 'active_count': 0, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        deps, rec = _build_deps(global_max=1)
+
+        lc.on_download_completed('A', 'a1', True, deps)
+
+        started = [c for c in rec.calls if c[0] == 'submit_dl']
+        assert started, 'the held batch was never woken — it would wait forever'
+        assert download_batches['B']['active_count'] == 1
+
+    def test_a_finished_batch_is_not_woken(self):
+        download_tasks['a1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+        download_tasks['b1'] = {'status': 'pending', 'status_change_time': 0}
+        download_batches['A'] = {
+            'queue': ['a1'], 'queue_index': 1, 'active_count': 1, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        download_batches['B'] = {
+            'queue': ['b1'], 'queue_index': 0, 'active_count': 0, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'cancelled',
+        }
+        deps, rec = _build_deps(global_max=1)
+
+        lc.on_download_completed('A', 'a1', True, deps)
+        assert [c for c in rec.calls if c[0] == 'submit_dl'] == []
+
+    def test_a_batch_with_nothing_queued_is_not_woken(self):
+        download_tasks['a1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+        download_batches['A'] = {
+            'queue': ['a1'], 'queue_index': 1, 'active_count': 1, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        download_batches['B'] = {
+            'queue': ['b1'], 'queue_index': 1, 'active_count': 0, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        deps, rec = _build_deps(global_max=1)
+
+        lc.on_download_completed('A', 'a1', True, deps)
+        assert [c for c in rec.calls if c[0] == 'submit_dl'] == []
+
+    def test_no_gate_means_no_waking_at_all(self):
+        # Unchanged behaviour where no global cap applies: nothing new happens.
+        download_tasks['a1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+        download_tasks['b1'] = {'status': 'pending', 'status_change_time': 0}
+        download_batches['A'] = {
+            'queue': ['a1'], 'queue_index': 1, 'active_count': 1, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        download_batches['B'] = {
+            'queue': ['b1'], 'queue_index': 0, 'active_count': 0, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        deps, rec = _build_deps()
+        lc.on_download_completed('A', 'a1', True, deps)
+        assert [c for c in rec.calls if c[0] == 'submit_dl'] == []
+
+
+class TestGlobalGateDoesNotStampede:
+    """One freed slot should ASK about one batch, not all of them.
+
+    start_next_batch_of_downloads re-checks the cap itself, so the outcome is
+    correct either way — only one batch ever starts. What differs is the work
+    done to get there: without an early stop, every held batch acquires its own
+    lock plus tasks_lock only to discover the limit is full, which is
+    O(all batches) of lock traffic per completion on exactly the large wishlist
+    this bug is about.
+
+    Counted via get_batch_lock, which is asked exactly once per batch consulted.
+    """
+
+    def _setup(self, held=('B', 'C', 'D', 'E')):
+        download_tasks['a1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+        download_batches['A'] = {
+            'queue': ['a1'], 'queue_index': 1, 'active_count': 1, 'max_concurrent': 1,
+            'permanently_failed_tracks': [], 'cancelled_tracks': set(), 'phase': 'downloading',
+        }
+        for name in held:
+            download_tasks[f'{name.lower()}1'] = {'status': 'pending', 'status_change_time': 0}
+            download_batches[name] = {
+                'queue': [f'{name.lower()}1'], 'queue_index': 0, 'active_count': 0,
+                'max_concurrent': 1, 'permanently_failed_tracks': [],
+                'cancelled_tracks': set(), 'phase': 'downloading',
+            }
+
+    def test_stops_consulting_batches_once_the_limit_refills(self):
+        self._setup()
+        consulted = []
+        deps, rec = _build_deps(global_max=1)
+        deps.get_batch_lock = lambda bid: (consulted.append(bid), threading.Lock())[1]
+
+        lc.on_download_completed('A', 'a1', True, deps)
+
+        # A's own restart, then ONE held batch takes the freed slot. The other
+        # three are never consulted at all.
+        held_consulted = [b for b in consulted if b in ('B', 'C', 'D', 'E')]
+        assert len(held_consulted) == 1, f'consulted {held_consulted}, expected to stop after one'
+
+        started = [c for c in rec.calls if c[0] == 'submit_dl']
+        assert len(started) == 1
+
+    def test_two_free_slots_wake_two_batches(self):
+        # The stop is on the LIMIT, not a hardcoded one-per-completion.
+        self._setup()
+        consulted = []
+        deps, rec = _build_deps(global_max=3)
+        deps.get_batch_lock = lambda bid: (consulted.append(bid), threading.Lock())[1]
+
+        lc.on_download_completed('A', 'a1', True, deps)
+
+        started = [c for c in rec.calls if c[0] == 'submit_dl']
+        assert len(started) == 3, f'3 slots free, expected 3 starts, got {len(started)}'
+
+
+# ---------------------------------------------------------------------------
+# L2-002: a failed atomic publish must not produce a Complete batch
+# ---------------------------------------------------------------------------
+
+def _one_task_batch():
+    download_tasks['t1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+    download_batches['b1'] = {
+        'queue': ['t1'], 'queue_index': 1, 'active_count': 1,
+        'max_concurrent': 1, 'permanently_failed_tracks': [],
+        'cancelled_tracks': set(), 'playlist_name': 'P',
+    }
+
+
+def test_a_failed_publish_leaves_the_batch_incomplete(monkeypatch):
+    """The batch used to be stamped complete BEFORE the publish ran, and the
+    publish's result was only logged — so history, scan and completion events
+    all fired for an album that never reached the library."""
+    _one_task_batch()
+    monkeypatch.setattr(lc, '_publish_atomic_album', lambda *a, **kw: False)
+    deps, _ = _build_deps()
+
+    lc.on_download_completed('b1', 't1', True, deps)
+
+    assert download_batches['b1'].get('phase') != 'complete'
+    assert 'completion_time' not in download_batches['b1']
+
+
+def test_a_successful_publish_completes_the_batch_as_before(monkeypatch):
+    _one_task_batch()
+    monkeypatch.setattr(lc, '_publish_atomic_album', lambda *a, **kw: True)
+    deps, _ = _build_deps()
+
+    lc.on_download_completed('b1', 't1', True, deps)
+
+    assert download_batches['b1'].get('phase') == 'complete'
+
+
+def test_completion_check_v2_also_refuses_a_failed_publish(monkeypatch):
+    _one_task_batch()
+    download_batches['b1']['active_count'] = 0
+    monkeypatch.setattr(lc, '_publish_atomic_album', lambda *a, **kw: False)
+    deps, _ = _build_deps()
+
+    result = lc.check_batch_completion_v2('b1', deps)
+
+    assert result is False
+    assert download_batches['b1'].get('phase') != 'complete'
+
+
+def test_atomic_publish_failure_exhaustion_marks_batch_error(monkeypatch):
+    """After _ATOMIC_PUBLISH_MAX_ATTEMPTS publish failures, on_download_completed
+    must force the batch to 'error' phase and stamp completion_time so it never
+    blocks wishlist processing permanently (#1277)."""
+    _one_task_batch()
+    monkeypatch.setattr(lc, '_publish_atomic_album', lambda *a, **kw: False)
+    deps, _ = _build_deps()
+
+    # Attempts 1 and 2: batch stays incomplete for retry
+    lc.on_download_completed('b1', 't1', True, deps)
+    assert download_batches['b1'].get('phase') != 'error'
+    assert 'completion_time' not in download_batches['b1']
+    assert download_batches['b1'].get('_atomic_publish_attempts') == 1
+
+    lc.on_download_completed('b1', 't1', True, deps)
+    assert download_batches['b1'].get('phase') != 'error'
+    assert 'completion_time' not in download_batches['b1']
+    assert download_batches['b1'].get('_atomic_publish_attempts') == 2
+
+    # Attempt 3: max attempts reached, forced to error with completion_time
+    lc.on_download_completed('b1', 't1', True, deps)
+    assert download_batches['b1'].get('phase') == 'error'
+    assert download_batches['b1'].get('completion_time') is not None
+    assert download_batches['b1'].get('_atomic_publish_attempts') == 3
+
+
+def test_completion_check_v2_atomic_publish_failure_exhaustion_marks_batch_error(monkeypatch):
+    """After _ATOMIC_PUBLISH_MAX_ATTEMPTS publish failures, check_batch_completion_v2
+    must force the batch to 'error' phase and stamp completion_time so healing loops
+    clean it up and wishlist is unblocked (#1277)."""
+    _one_task_batch()
+    download_batches['b1']['active_count'] = 0
+    monkeypatch.setattr(lc, '_publish_atomic_album', lambda *a, **kw: False)
+    deps, _ = _build_deps()
+
+    # Attempts 1 and 2: stays incomplete
+    assert lc.check_batch_completion_v2('b1', deps) is False
+    assert download_batches['b1'].get('phase') != 'error'
+    assert 'completion_time' not in download_batches['b1']
+
+    assert lc.check_batch_completion_v2('b1', deps) is False
+    assert download_batches['b1'].get('phase') != 'error'
+    assert 'completion_time' not in download_batches['b1']
+
+    # Attempt 3: max attempts reached, forced to error
+    assert lc.check_batch_completion_v2('b1', deps) is False
+    assert download_batches['b1'].get('phase') == 'error'
+    assert download_batches['b1'].get('completion_time') is not None
+
+
+# ---------------------------------------------------------------------------
+# both completion paths do the same bookkeeping, and the slow half runs with
+# the lock released
+# ---------------------------------------------------------------------------
+#
+# check_batch_completion_v2 (the cancel + batch-healing path) carried its own
+# copy of the completion block, and that copy never recorded sync history or
+# regenerated the m3u: a sync whose last track was cancelled sat in the sync
+# history as "In progress" forever. the album consistency pass (a rate-limited
+# musicbrainz search plus a tag rewrite of every file) also ran INSIDE
+# tasks_lock on both paths, so every status poll waited on it.
+
+def _cancelled_last_track_batch():
+    download_tasks['t1'] = {'status': 'completed', 'track_info': {'name': 'X', 'artists': ['A'], 'duration_ms': 1}}
+    download_tasks['t2'] = {'status': 'cancelled', 'track_info': {'name': 'Y', 'artists': [{'name': 'B'}]}}
+    download_batches['b1'] = {
+        'queue': ['t1', 't2'], 'queue_index': 2, 'active_count': 0,
+        'max_concurrent': 1, 'permanently_failed_tracks': [], 'cancelled_tracks': {1},
+        'playlist_name': 'PL',
+    }
+
+
+def _completion_recorder(monkeypatch, rec):
+    """what the completion bookkeeping touches, and whether tasks_lock was
+    held at the time. a non-reentrant lock answers acquire(blocking=False)
+    False from the thread that already holds it."""
+    def _held():
+        got = lc.tasks_lock.acquire(blocking=False)
+        if got:
+            lc.tasks_lock.release()
+        return not got
+
+    monkeypatch.setattr(lc, 'record_sync_history_completion',
+                        lambda db, bid, b: rec.append(('history', bid, _held())))
+
+    class _Mat:
+        playlist_dir, linked, copied, unchanged, removed_stale, fellback = 'd', 0, 0, 0, 0, False
+
+    import core.playlists.materialize_service as ms
+    monkeypatch.setattr(ms, 'reconcile_batch_playlists',
+                        lambda db, batch, tasks, cfg, **kw: (rec.append(('materialize', dict(tasks), _held())) or [('p', _Mat())]))
+    import core.album_consistency as ac
+    monkeypatch.setattr(ac, 'run_album_consistency',
+                        lambda **kw: (rec.append(('consistency', kw['file_infos'], _held())) or {'success': True, 'tags_written': 2, 'total_files': 2, 'release_mbid': 'x'}))
+    return rec
+
+
+def _album_deps(rec):
+    class _Repair:
+        def process_batch(self, bid):
+            rec.append(('repair', bid))
+    deps, calls = _build_deps(
+        repair=_Repair(),
+        config=_FakeConfig({'m3u_export.enabled': True, 'musicbrainz.embed_tags': True}),
+        submit_failed=lambda bid: rec.append(('wishlist', bid)),
+        process_failed=lambda bid: rec.append(('wishlist', bid)),
+    )
+    deps.mb_worker = type('MB', (), {'mb_service': object()})()
+    deps.regenerate_batch_m3u = lambda batch, tracks: rec.append(('m3u', tracks))
+    return deps
+
+
+def _album_batch_fields():
+    download_batches['b1'].update({
+        'is_album_download': True,
+        'album_context': {'name': 'Album', 'total_discs': 1},
+        'artist_context': {'name': 'Artist'},
+        '_consistency_files': [{'path': '/a/1.flac'}, {'path': '/a/2.flac'}],
+    })
+
+
+@pytest.mark.parametrize('path', ['primary', 'v2'])
+def test_both_completion_paths_record_history_and_regenerate_the_m3u(monkeypatch, path):
+    _cancelled_last_track_batch()
+    rec = _completion_recorder(monkeypatch, [])
+    deps = _album_deps(rec)
+    if path == 'primary':
+        download_batches['b1']['active_count'] = 1
+        lc.on_download_completed('b1', 't2', False, deps)
+    else:
+        assert lc.check_batch_completion_v2('b1', deps) is True
+    assert download_batches['b1']['phase'] == 'complete'
+    kinds = [r[0] for r in rec]
+    assert 'history' in kinds, f"{path}: sync history never closed"
+    assert 'm3u' in kinds, f"{path}: m3u never regenerated"
+    m3u = next(r[1] for r in rec if r[0] == 'm3u')
+    assert m3u == [{'name': 'X', 'artist': 'A', 'duration_ms': 1}]      # completed tracks only
+
+
+@pytest.mark.parametrize('path', ['primary', 'v2'])
+def test_the_slow_half_runs_with_the_lock_released(monkeypatch, path):
+    _cancelled_last_track_batch()
+    _album_batch_fields()
+    rec = _completion_recorder(monkeypatch, [])
+    deps = _album_deps(rec)
+    if path == 'primary':
+        download_batches['b1']['active_count'] = 1
+        lc.on_download_completed('b1', 't2', False, deps)
+    else:
+        lc.check_batch_completion_v2('b1', deps)
+    by_kind = {r[0]: r for r in rec}
+    assert by_kind['history'][2] is True, "history is bookkeeping, it stays under the lock"
+    assert by_kind['consistency'][2] is False, f"{path}: album consistency ran under tasks_lock"
+    assert by_kind['materialize'][2] is False, f"{path}: playlist materialize ran under tasks_lock"
+    assert by_kind['consistency'][1] == [{'path': '/a/1.flac'}, {'path': '/a/2.flac'}]
+    # the materialize reads a snapshot of this batch's tasks, not the live dict
+    assert set(by_kind['materialize'][1]) == {'t1', 't2'}
+    assert 'repair' in by_kind
+
+
+@pytest.mark.parametrize('path', ['primary', 'v2'])
+def test_side_effects_finish_before_the_wishlist_hand_off(monkeypatch, path):
+    """the order the old in-lock code had: consistency, then wishlist"""
+    _cancelled_last_track_batch()
+    _album_batch_fields()
+    rec = _completion_recorder(monkeypatch, [])
+    deps = _album_deps(rec)
+    if path == 'primary':
+        download_batches['b1']['active_count'] = 1
+        lc.on_download_completed('b1', 't2', False, deps)
+    else:
+        lc.check_batch_completion_v2('b1', deps)
+    kinds = [r[0] for r in rec]
+    assert kinds.index('consistency') < kinds.index('wishlist')
+    assert kinds.index('m3u') < kinds.index('wishlist')
+    assert download_batches['b1']['wishlist_processing_started'] is True
+
+
+@pytest.mark.parametrize('path', ['primary', 'v2'])
+def test_a_second_completion_call_does_not_repeat_the_side_effects(monkeypatch, path):
+    _cancelled_last_track_batch()
+    rec = _completion_recorder(monkeypatch, [])
+    deps = _album_deps(rec)
+    if path == 'primary':
+        download_batches['b1']['active_count'] = 1
+        lc.on_download_completed('b1', 't2', False, deps)
+        lc.on_download_completed('b1', 't2', False, deps)
+    else:
+        lc.check_batch_completion_v2('b1', deps)
+        assert lc.check_batch_completion_v2('b1', deps) is True
+    assert [r[0] for r in rec].count('history') == 1
+    assert [r[0] for r in rec].count('m3u') == 1
+
+
+def test_v2_non_music_batch_is_marked_wishlist_complete():
+    download_tasks['t1'] = {'status': 'completed', 'track_info': {'name': 'X'}}
+    download_batches['podcasts'] = {
+        'queue': ['t1'], 'queue_index': 1, 'active_count': 0,
+        'max_concurrent': 1, 'permanently_failed_tracks': [],
+    }
+    deps, rec = _build_deps()
+    assert lc.check_batch_completion_v2('podcasts', deps) is True
+    assert download_batches['podcasts']['wishlist_processing_complete'] is True
+    assert not any(c[0].startswith('process_failed') for c in rec.calls)
+
+
+@pytest.fixture
+def real_batch_healer():
+    """Execute the production healer with isolated dependencies, without server startup."""
+    import ast
+    from pathlib import Path
+    from unittest.mock import Mock
+    tree = ast.parse(Path("web_server.py").read_text(encoding="utf-8"))
+    fn = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+              and node.name == "validate_and_heal_batch_states")
+    namespace = {
+        "tasks_lock": threading.Lock(), "download_batches": download_batches,
+        "download_tasks": download_tasks, "logger": Mock(),
+        "_downloads_lifecycle": lc, "_POST_PROCESSING_STUCK_TIMEOUT": lc._POST_PROCESSING_STUCK_TIMEOUT,
+        "_get_global_max_concurrent": lambda: None,
+        "_start_next_batch_of_downloads": Mock(), "_check_batch_completion_v2": Mock(),
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), "web_server.py", "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+def test_real_healing_passes_retry_publish_to_success_or_exhaustion(monkeypatch, real_batch_healer, recovers):
+    from unittest.mock import Mock
+    _one_task_batch()
+    batch = download_batches['b1']
+    batch['phase'] = 'downloading'
+    publish = Mock(side_effect=[False, False, recovers])
+    monkeypatch.setattr(lc, '_publish_atomic_album', publish)
+    deps, _ = _build_deps()
+    real_batch_healer['_check_batch_completion_v2'] = lambda bid: lc.check_batch_completion_v2(bid, deps)
+    lc.on_download_completed('b1', 't1', True, deps)
+    assert publish.call_count == 1
+    # Old emergency-healer timestamps must not preempt the remaining attempts.
+    import time
+    batch['_heal_stuck_detected_at'] = time.time() - 700
+    real_batch_healer['validate_and_heal_batch_states']()
+    assert publish.call_count == 2
+    # No new orphan on this pass: pending publish must still be retried.
+    real_batch_healer['validate_and_heal_batch_states']()
+    assert publish.call_count == 3
+    assert batch['phase'] == ('complete' if recovers else 'error')
+    assert batch.get('completion_time') is not None
+    real_batch_healer['validate_and_heal_batch_states']()
+    lc.on_download_completed('b1', 't1', True, deps)
+    lc.check_batch_completion_v2('b1', deps)
+    assert publish.call_count == 3
+
+
+@pytest.mark.parametrize("failed_publish", [True, False])
+def test_auto_cleanup_preserves_failed_publish_files(tmp_path, real_batch_healer, failed_publish):
+    import time
+    root = tmp_path / '.soulsync_atomic_staging' / 'b1'
+    root.mkdir(parents=True)
+    audio = root / 'track.flac'
+    audio.write_bytes(b'recoverable audio')
+    download_batches['b1'] = {
+        'queue': [], 'active_count': 0, 'phase': 'error' if failed_publish else 'cancelled',
+        'completion_time': time.time() - 301,
+        '_atomic_active': True, '_atomic_staging_root': str(root),
+        '_atomic_publish_attempts': 3 if failed_publish else 0,
+    }
+    real_batch_healer['validate_and_heal_batch_states']()
+    assert 'b1' not in download_batches
+    assert audio.exists() is failed_publish
+
+
+# ---------------------------------------------------------------------------
+# #1615: one library scan per download run, not one per batch
+# ---------------------------------------------------------------------------
+
+def _finish(batch_id, task_id, ok, deps, other_phase=None):
+    download_tasks[task_id] = {'status': 'completed' if ok else 'failed',
+                               'track_info': {'name': task_id}, 'track_index': 0}
+    download_batches[batch_id] = {
+        'queue': [task_id], 'queue_index': 1, 'active_count': 1,
+        'max_concurrent': 1, 'cancelled_tracks': set(),
+        'permanently_failed_tracks': [] if ok else [{'track_name': task_id}],
+        'playlist_name': batch_id,
+    }
+    lc.on_download_completed(batch_id, task_id, ok, deps)
+
+
+def _pending_flags(auto):
+    return [e[1]['more_batches_pending'] for e in auto.events if e[0] == 'batch_complete']
+
+
+def test_a_batch_with_others_still_queued_says_so():
+    download_batches['later'] = {'queue': ['x'], 'queue_index': 0, 'phase': 'queued'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('first', 't1', True, deps)
+    assert _pending_flags(auto) == ['true']
+
+
+def test_finished_and_non_music_batches_do_not_hold_the_scan():
+    download_batches['old'] = {'queue': [], 'phase': 'complete'}
+    download_batches['podcasts'] = {'queue': [], 'phase': 'downloading'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('only', 't1', True, deps)
+    assert _pending_flags(auto) == ['false']
+
+
+def test_the_last_batch_scans_for_an_earlier_one_even_if_it_got_nothing():
+    download_batches['later'] = {'queue': ['x'], 'queue_index': 0, 'phase': 'queued'}
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('first', 't1', True, deps)
+    del download_batches['later']
+    _finish('last', 't2', False, deps)
+    assert _pending_flags(auto) == ['true', 'false']
+
+
+def test_nothing_downloaded_and_nothing_owed_still_emits_nothing():
+    auto = _FakeAutoEngine()
+    deps, _ = _build_deps(automation=auto)
+    _finish('only', 't1', False, deps)
+    assert _pending_flags(auto) == []

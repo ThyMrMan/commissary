@@ -154,7 +154,7 @@ def test_select_rejects_wrong_service_or_missing_set(client):
 # ── Quick-switch: active source/server/download (admin=global, non-admin read-only) ──
 
 def test_active_sources_read_shape(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     a = client.get('/api/profiles/me/active-sources').get_json()
     assert a['success'] and a['editable'] is True   # default session = admin
     assert a['metadata']['active']
@@ -167,14 +167,56 @@ def test_active_sources_read_shape(client):
 def test_admin_sets_global_active_sources(client):
     assert client.post('/api/profiles/active-sources', json={'metadata_source': 'itunes'}).get_json()['success']
     assert client.get('/api/profiles/me/active-sources').get_json()['metadata']['active'] == 'itunes'
-    # hybrid + order round-trips
-    client.post('/api/profiles/active-sources', json={'download_mode': 'hybrid', 'hybrid_order': ['hifi', 'soulseek']})
-    dl = client.get('/api/profiles/me/active-sources').get_json()['download']
-    assert dl['mode'] == 'hybrid' and dl['hybrid_order'] == ['hifi', 'soulseek']
+
+
+# ── #1301: server + download are shown here, changed in settings ──
+
+def test_server_and_download_can_not_be_switched_from_the_quick_modal(client):
+    from core.settings import config_manager
+    config_manager.set('download_source.mode', 'soulseek')
+    config_manager.set('download_source.hybrid_order', ['soulseek'])
+    server_before = config_manager.get_active_media_server()
+
+    for patch in ({'media_server': 'jellyfin'}, {'download_mode': 'hybrid'},
+                  {'hybrid_order': ['hifi', 'soulseek']},
+                  {'metadata_source': 'itunes', 'media_server': 'jellyfin'}):
+        resp = client.post('/api/profiles/active-sources', json=patch)
+        assert resp.status_code == 400
+        assert 'Settings' in resp.get_json()['error']
+
+    assert config_manager.get_active_media_server() == server_before
+    assert config_manager.get('download_source.mode') == 'soulseek'
+    assert config_manager.get('download_source.hybrid_order') == ['soulseek']
+
+
+def test_download_chain_reads_back_as_settings_saved_it(client):
+    from core.settings import config_manager
+    import api.user_profiles as up
+
+    class _Orch:
+        def get_source_status(self):
+            return {'deezer_dl': True, 'soulseek': False}
+
+    orig = up._download_orchestrator
+    up._download_orchestrator = lambda: _Orch()
+    try:
+        config_manager.set('download_source.mode', 'hybrid')
+        config_manager.set('download_source.hybrid_order', ['deezer_dl', 'soulseek', 'amazon'])
+        chain = client.get('/api/profiles/me/active-sources').get_json()['download']['chain']
+        # deezer and amazon are real chain members now, not missing from the list
+        assert chain == [{'id': 'deezer_dl', 'ready': True},
+                         {'id': 'soulseek', 'ready': False},
+                         {'id': 'amazon', 'ready': None}]
+
+        config_manager.set('download_source.mode', 'deezer_dl')
+        chain = client.get('/api/profiles/me/active-sources').get_json()['download']['chain']
+        assert chain == [{'id': 'deezer_dl', 'ready': True}]
+    finally:
+        up._download_orchestrator = orig
 
 
 def test_admin_can_set_jiosaavn_as_primary_metadata_source(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     config_manager.set('experimental.jiosaavn_enabled', True)
     assert client.post('/api/profiles/active-sources', json={'metadata_source': 'jiosaavn'}).get_json()['success']
     payload = client.get('/api/profiles/me/active-sources').get_json()
@@ -183,7 +225,7 @@ def test_admin_can_set_jiosaavn_as_primary_metadata_source(client):
 
 
 def test_jiosaavn_primary_rejected_when_experimental_disabled(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     config_manager.set('experimental.jiosaavn_enabled', False)
     resp = client.post('/api/profiles/active-sources', json={'metadata_source': 'jiosaavn'})
     assert resp.status_code == 400
@@ -191,7 +233,7 @@ def test_jiosaavn_primary_rejected_when_experimental_disabled(client):
 
 def test_settings_save_jiosaavn_primary_with_experimental_enabled(client):
     """Settings and sidebar must agree: enable + primary in one save sticks."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     resp = client.post('/api/settings', json={
         'experimental': {'jiosaavn_enabled': True},
         'metadata': {'fallback_source': 'jiosaavn', 'spotify_free': False},
@@ -205,7 +247,7 @@ def test_settings_save_jiosaavn_primary_with_experimental_enabled(client):
 
 
 def test_settings_save_jiosaavn_primary_rejected_when_experimental_disabled(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     config_manager.set('experimental.jiosaavn_enabled', False)
     config_manager.set('metadata.fallback_source', 'deezer')
     resp = client.post('/api/settings', json={
@@ -216,7 +258,7 @@ def test_settings_save_jiosaavn_primary_rejected_when_experimental_disabled(clie
 
 
 def test_settings_save_rejected_does_not_persist_other_changes(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     original_client_id = config_manager.get('spotify.client_id')
     config_manager.set('experimental.jiosaavn_enabled', False)
     resp = client.post('/api/settings', json={
@@ -228,7 +270,7 @@ def test_settings_save_rejected_does_not_persist_other_changes(client):
 
 
 def test_settings_disable_jiosaavn_resets_primary(client):
-    from config.settings import config_manager
+    from core.settings import config_manager
     config_manager.set('experimental.jiosaavn_enabled', True)
     config_manager.set('metadata.fallback_source', 'jiosaavn')
     resp = client.post('/api/settings', json={'experimental': {'jiosaavn_enabled': False}})
@@ -254,7 +296,7 @@ def test_spotify_free_composite_roundtrips_like_settings(client):
     # "Spotify (no auth)" is stored as fallback_source=spotify + spotify_free=true
     # (the same composite the Settings page uses) — the modal must report it as
     # active='spotify_free', not raw 'spotify'.
-    from config.settings import config_manager
+    from core.settings import config_manager
     assert client.post('/api/profiles/active-sources', json={'metadata_source': 'spotify_free'}).get_json()['success']
     assert config_manager.get('metadata.fallback_source') == 'spotify'
     assert config_manager.get('metadata.spotify_free') is True
@@ -311,7 +353,7 @@ def test_disconnect_unsupported_service_400(client, nonadmin_profile):
 def test_tidal_token_refresh_redirects_to_profile_not_global(client, nonadmin_profile):
     # THE safety guarantee: a per-profile Tidal client's token save must write to
     # the PROFILE, never the global tidal_tokens slot the app runs on.
-    from config.settings import config_manager
+    from core.settings import config_manager
     db = web_server.get_database()
     config_manager.set('tidal_tokens', {'access_token': 'ADMIN-ACC', 'refresh_token': 'ADMIN-REF'})
     db.set_profile_tidal_tokens(nonadmin_profile, 'p-acc', 'p-ref')
@@ -433,7 +475,7 @@ def test_verify_launch_pin_rate_limited_after_flood(client):
         conn.execute("UPDATE profiles SET pin_hash = ? WHERE id = 1",
                      (generate_password_hash('1234', method='pbkdf2:sha256'),))
         conn.commit()
-    web_server._launch_pin_limiter.record_success('127.0.0.1')  # clean slate
+    web_server._launch_pin_limiter.reset()  # clean slate
     try:
         for _ in range(10):
             assert client.post('/api/profiles/verify-launch-pin',
@@ -442,7 +484,7 @@ def test_verify_launch_pin_rate_limited_after_flood(client):
         assert r.status_code == 429
         assert 'Retry-After' in r.headers
     finally:
-        web_server._launch_pin_limiter.record_success('127.0.0.1')
+        web_server._launch_pin_limiter.reset()
         with db._get_connection() as conn:
             conn.execute("UPDATE profiles SET pin_hash = NULL WHERE id = 1")
             conn.commit()

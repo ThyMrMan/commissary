@@ -67,9 +67,9 @@ def test_guess_quality_from_title() -> None:
     assert _guess_quality_from_title('Album [MP3 320]') == 'mp3'
     assert _guess_quality_from_title('Album [AAC 256]') == 'aac'
     assert _guess_quality_from_title('Album [OGG]') == 'ogg'
-    # Default fallback so quality_score doesn't crash on bare titles.
-    assert _guess_quality_from_title('Just A Title') == 'mp3'
-    assert _guess_quality_from_title('') == 'mp3'
+    # Prowlarr did not supply a codec here; do not invent MP3.
+    assert _guess_quality_from_title('Just A Title') == 'unknown'
+    assert _guess_quality_from_title('') == 'unknown'
 
 
 def test_parse_release_title_splits_artist_dash_title() -> None:
@@ -109,6 +109,263 @@ def test_parse_release_title_rejects_url_prefix() -> None:
     to call it an artist."""
     artist, title = _parse_release_title('https://example.com/x - Album')
     assert artist == ''
+
+
+@pytest.mark.parametrize('release,artist,title', [
+    ('MoTrip-Guten Morgen NSA-16BIT-44-KHZ-WEB-FLAC-2013-WALKMAN', 'MoTrip', 'Guten Morgen NSA'),
+    ('The Weeknd-Starboy-DELUXE EDITION-24BIT-WEB-FLAC-2023-RECTiFY', 'The Weeknd', 'Starboy-DELUXE EDITION'),
+    ('MoTrip-Guten_Morgen_NSA-16BIT-44-KHZ-WEB-FLAC-2013-WALKMAN', 'MoTrip', 'Guten Morgen NSA'),
+    ('Jay-Z - The Blueprint-WEB-FLAC-2001-GROUP', 'Jay-Z', 'The Blueprint'),
+    ('Artist-Song-Live-WEB-FLAC-2024-GROUP', 'Artist', 'Song-Live'),
+])
+def test_scene_release_projection_preserves_music_identity(release, artist, title):
+    """Both Prowlarr sources must expose music identity, not scene packaging."""
+    for plugin, protocol in [(TorrentDownloadPlugin(), 'torrent'), (UsenetDownloadPlugin(), 'usenet')]:
+        tracks, albums = plugin._project_results([
+            _make_torrent_result(title=release, protocol=protocol),
+        ])
+        assert tracks[0].artist == artist
+        assert tracks[0].title == title
+        assert albums[0].artist == artist
+        assert albums[0].album_title == title
+        assert tracks[0]._source_metadata['release_title'] == release
+        assert tracks[0].quality == 'flac'
+
+
+@pytest.mark.parametrize('release', ['Self-Titled', 'Artist-Title', 'Artist - WEB of Lies', 'Artist - MP3 Player'])
+def test_release_parser_does_not_invent_scene_metadata(release):
+    expected = ('Artist', release.split(' - ', 1)[1]) if ' - ' in release else ('', release)
+    assert _parse_release_title(release) == expected
+
+
+@pytest.mark.parametrize('protocol', ['torrent', 'usenet'])
+@pytest.mark.parametrize('release,artist,title', [
+    ('Jay-Z-The Blueprint-WEB-FLAC-2001-GROUP', 'Jay-Z', 'The Blueprint'),
+    ('G-Eazy-Lets Get Lost-16BIT-WEB-FLAC-2014-GROUP', 'G-Eazy', 'Lets Get Lost'),
+    ('Artist-Song-Live-WEB-FLAC-2024-GROUP', 'Artist', 'Song-Live'),
+])
+def test_scene_candidate_validation_uses_expected_artist_as_boundary(monkeypatch, protocol, release, artist, title):
+    from types import SimpleNamespace
+    from core.downloads import validation
+    from core.matching_engine import MusicMatchingEngine
+
+    monkeypatch.setattr(validation, 'matching_engine', MusicMatchingEngine())
+    plugin = TorrentDownloadPlugin() if protocol == 'torrent' else UsenetDownloadPlugin()
+    tracks, _ = plugin._project_results([_make_torrent_result(title=release, protocol=protocol)])
+    expected = SimpleNamespace(name=title, artists=[artist], duration_ms=180_000, album=None)
+
+    assert validation._score_streaming_candidates(tracks, expected) == tracks
+    assert tracks[0].artist == artist
+    assert tracks[0].title == title
+
+
+def test_scene_artist_hint_requires_evidence_in_actual_release():
+    release = 'Other Artist-Song-WEB-FLAC-2024-GROUP'
+    assert _parse_release_title(release, artist_hint='Wanted Artist') == ('Other Artist', 'Song')
+
+
+@pytest.mark.parametrize('release,expected', [
+    ('Adele-30-24BIT-44-1KHZ-WEB-FLAC-2021-OBZEN', ('Adele', '30')),
+    ('Daft_Punk-Random_Access_Memories-24BIT-96KHZ-WEB-FLAC-2013-GROUP', ('Daft Punk', 'Random Access Memories')),
+    ('Artist-Album-24BIT-48KHZ-WEB-FLAC-2020-GROUP', ('Artist', 'Album')),
+])
+def test_scene_sample_rate_spellings_stay_out_of_the_title(release, expected):
+    assert _parse_release_title(release) == expected
+
+
+@pytest.mark.parametrize('hint', [None, 'Linkin Park'])
+def test_scene_album_dash_is_not_the_artist_boundary(hint):
+    release = 'Linkin_Park-Hybrid_Theory_-_20th_Anniversary_Edition-WEB-FLAC-2020-GROUP'
+    assert _parse_release_title(release, artist_hint=hint) == (
+        'Linkin Park', 'Hybrid Theory - 20th Anniversary Edition')
+
+
+@pytest.mark.parametrize('protocol', ['torrent', 'usenet'])
+@pytest.mark.parametrize('release_name,album', [('Shared Song', None), ('Shared Album', 'Shared Album')])
+def test_release_artist_containment_does_not_accept_another_band(monkeypatch, protocol, release_name, album):
+    """An anonymized live cover release must fail even with an exact title."""
+    from types import SimpleNamespace
+    from core.downloads import validation
+    from core.matching_engine import MusicMatchingEngine
+
+    monkeypatch.setattr(validation, 'matching_engine', MusicMatchingEngine())
+    plugin = TorrentDownloadPlugin() if protocol == 'torrent' else UsenetDownloadPlugin()
+    release = f'Signal Duo Experience-{release_name}-16BIT-44-KHZ-WEB-FLAC-2022-GROUP'
+    tracks, _ = plugin._project_results([_make_torrent_result(title=release, protocol=protocol)])
+    expected = SimpleNamespace(name='Shared Song', artists=['Signal Duo'], duration_ms=180_000, album=album)
+    reasons = {}
+
+    assert validation._score_streaming_candidates(tracks, expected, reasons) == []
+    assert reasons[id(tracks[0])][1].code == 'artist_mismatch'
+
+
+@pytest.mark.parametrize('protocol', ['torrent', 'usenet'])
+@pytest.mark.parametrize('artist', ['Signal Duo', 'The Signal Duo', 'Signal Duo feat. Guest Singer', 'Guest Singer & Signal Duo'])
+def test_release_artist_gate_keeps_real_artist_and_featured_credits(monkeypatch, protocol, artist):
+    from types import SimpleNamespace
+    from core.downloads import validation
+    from core.matching_engine import MusicMatchingEngine
+
+    monkeypatch.setattr(validation, 'matching_engine', MusicMatchingEngine())
+    plugin = TorrentDownloadPlugin() if protocol == 'torrent' else UsenetDownloadPlugin()
+    release = f'{artist}-Shared Song-16BIT-44-KHZ-WEB-FLAC-2022-GROUP'
+    tracks, _ = plugin._project_results([_make_torrent_result(title=release, protocol=protocol)])
+    expected = SimpleNamespace(name='Shared Song', artists=['Signal Duo'], duration_ms=180_000, album=None)
+
+    assert validation._score_streaming_candidates(tracks, expected) == tracks
+
+
+@pytest.mark.parametrize('remove', [False, True])
+@pytest.mark.parametrize('clear_after_cancel', [False, True])
+def test_usenet_cancel_during_submission_cleans_up_late_job(monkeypatch, remove, clear_after_cancel):
+    """A remote ID arriving after cancel must not resurrect an orphan download."""
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'job_id': None}
+    removals, polls = [], []
+    stopped = [False]
+    plugin.set_shutdown_check(lambda: stopped[0])
+
+    class Adapter:
+        def is_configured(self): return True
+        async def add_nzb(self, url):
+            await plugin.cancel_download('dl', remove=remove)
+            if clear_after_cancel:
+                await plugin.clear_all_completed_downloads()
+            return 'late-job'
+        async def remove(self, job_id, delete_files=False):
+            removals.append((job_id, delete_files))
+            return True
+        async def get_status(self, job_id):
+            polls.append(job_id)
+            stopped[0] = True
+            return None
+
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    monkeypatch.setattr(module.time, 'sleep', lambda *_: None)
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.nzb')
+
+    assert removals == [('late-job', remove)]
+    assert polls == []
+    if remove or clear_after_cancel:
+        assert 'dl' not in plugin.active_downloads
+    else:
+        assert plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+def test_usenet_cancel_during_status_poll_cannot_restore_downloading(monkeypatch):
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'job_id': None}
+    stopped = [False]
+    plugin.set_shutdown_check(lambda: stopped[0])
+
+    class Adapter:
+        def is_configured(self): return True
+        async def add_nzb(self, url): return 'job'
+        async def remove(self, job_id, delete_files=False): return True
+        async def get_status(self, job_id):
+            await plugin.cancel_download('dl', remove=False)
+            stopped[0] = True
+            return UsenetStatus(id='job', name='Release', state='downloading', progress=0.25,
+                                size=100, downloaded=25, download_speed=1)
+
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    monkeypatch.setattr(module.time, 'sleep', lambda *_: None)
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.nzb')
+    assert plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+def test_usenet_submit_failure_after_cancel_preserves_cancelled_state(monkeypatch):
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'job_id': None}
+
+    class Adapter:
+        def is_configured(self): return True
+        async def add_nzb(self, url):
+            await plugin.cancel_download('dl', remove=False)
+            return None
+
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.nzb')
+    assert plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+def test_usenet_cancel_during_file_collection_cannot_restore_success(monkeypatch, tmp_path):
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'InProgress, Downloading', 'job_id': 'job'}
+
+    class Adapter:
+        async def remove(self, job_id, delete_files=False): return True
+
+    def collect(path):
+        asyncio.run(plugin.cancel_download('dl', remove=False))
+        return [tmp_path / 'Song.flac']
+
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
+    monkeypatch.setattr(module, 'collect_audio_after_extraction', collect)
+    plugin._finalize_download('dl', str(tmp_path))
+    assert plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+@pytest.mark.parametrize('protocol', ['torrent', 'usenet'])
+def test_scene_artist_hint_does_not_override_explicit_artist_boundary(monkeypatch, protocol):
+    from types import SimpleNamespace
+    from core.downloads import validation
+    from core.matching_engine import MusicMatchingEngine
+
+    monkeypatch.setattr(validation, 'matching_engine', MusicMatchingEngine())
+    release = 'G-Eazy - Lets Get Lost-WEB-FLAC-2014-GROUP'
+    plugin = TorrentDownloadPlugin() if protocol == 'torrent' else UsenetDownloadPlugin()
+    tracks, _ = plugin._project_results([_make_torrent_result(title=release, protocol=protocol)])
+    expected = SimpleNamespace(name='Lets Get Lost', artists=['G'], duration_ms=180_000, album=None)
+
+    assert validation._score_streaming_candidates(tracks, expected) == []
+    assert tracks[0].artist == 'G-Eazy'
+
+
+@pytest.mark.parametrize('protocol', ['torrent', 'usenet'])
+@pytest.mark.parametrize('release,name,album', [
+    ('G-Eazy-Lets_Get_Lost-WEB-FLAC-2014-GROUP', 'Lets Get Lost', None),
+    ('G-Eazy-These_Things_Happen-WEB-FLAC-2014-GROUP', "Let's Get Lost", 'These Things Happen'),
+])
+def test_requested_title_marks_the_scene_boundary_of_a_longer_artist(monkeypatch, protocol, release, name, album):
+    from types import SimpleNamespace
+    from core.downloads import validation
+    from core.matching_engine import MusicMatchingEngine
+
+    monkeypatch.setattr(validation, 'matching_engine', MusicMatchingEngine())
+    plugin = TorrentDownloadPlugin() if protocol == 'torrent' else UsenetDownloadPlugin()
+    tracks, _ = plugin._project_results([_make_torrent_result(title=release, protocol=protocol)])
+    expected = SimpleNamespace(name=name, artists=['G'], duration_ms=180_000, album=album)
+
+    assert validation._score_streaming_candidates(tracks, expected) == []
+    assert tracks[0].artist == 'G-Eazy'
+
+
+@pytest.mark.parametrize('release,hints,expected', [
+    ('Jay-Z-The_Blueprint-WEB-FLAC-2001-GROUP', ('The Blueprint',), ('Jay-Z', 'The Blueprint')),
+    ('a-ha-Hunting_High_and_Low-WEB-FLAC-1985-GROUP', ('Take On Me', 'Hunting High and Low'), ('a-ha', 'Hunting High and Low')),
+    ('Artist-Song-Live-WEB-FLAC-2024-GROUP', ('Song',), ('Artist', 'Song-Live')),
+])
+def test_scene_title_hint_needs_the_name_to_end_with_it(release, hints, expected):
+    assert _parse_release_title(release, title_hints=hints) == expected
+
+
+@pytest.mark.parametrize('release,expected', [
+    ('Artist-Album-WEB-2023-GROUP', ('Artist', 'Album')),
+    ('Artist-Album-WEB-FLAC-2023-MOD_ACE', ('Artist', 'Album')),
+    ('Artist-Album-2CD-FLAC-2023-GROUP', ('Artist', 'Album')),
+    ('Artist-Single-CDS-FLAC-2023-GROUP', ('Artist', 'Single')),
+    ('Artist-Album-VLS-FLAC-2023-GROUP', ('Artist', 'Album')),
+])
+def test_more_scene_suffix_forms_stay_out_of_the_title(release, expected):
+    assert _parse_release_title(release) == expected
 
 
 def test_adapter_state_mapping_covers_complete_states() -> None:
@@ -160,39 +417,40 @@ def test_torrent_project_results_drops_releases_without_download_url() -> None:
     assert albums == []
 
 
-def test_torrent_project_results_prefers_the_torrent_url_carrying_the_magnet() -> None:
-    """Reversed deliberately (#1139): this used to assert the MAGNET won.
+def test_torrent_project_results_prefers_the_torrent_url_over_the_magnet() -> None:
+    """#1139 reversed this. A magnet hands the client an info-hash and nothing
+    else — it has to find the swarm itself, and a client without working
+    DHT/PEX (or a release with no live peers) parks on "downloading metadata"
+    indefinitely. The http link lets SoulSync fetch the real .torrent
+    server-side and push the file, which is what Sonarr/Radarr do.
 
-    A magnet hands the client an info-hash and nothing else — it has to find the
-    swarm itself, and one that cannot parks on "downloading metadata" with zero
-    size and zero peers indefinitely. Preferring the URL lets the real .torrent
-    be fetched server-side and pushed as file bytes, which needs no swarm
-    discovery at all.
-
-    The magnet is still carried, which is what makes the flip safe rather than a
-    trade of one failure for another: in a split install where Commissary cannot
-    reach the indexer but the CLIENT can, it is used the moment the URL handoff
-    is refused. So this asserts strictly more than the old test did.
-    """
+    The magnet is not thrown away: it rides along as the fallback for when
+    that fetch fails, which is what the pair encoding below is for."""
     from core.download_plugins.candidate_store import get_candidate_store
+    from core.download_plugins.torrent import _decode_candidate
     plugin = TorrentDownloadPlugin()
     magnet = 'magnet:?xt=urn:btih:abc'
     results = [_make_torrent_result(magnet_uri=magnet, download_url='https://x/y.torrent')]
     tracks, _ = plugin._project_results(results)
     token, _ = _decode_filename(tracks[0].filename)
-    assert get_candidate_store().resolve(token) == 'https://x/y.torrent'
-    assert get_candidate_store().resolve_magnet(token) == magnet
+    url, fallback = _decode_candidate(get_candidate_store().resolve(token))
+    assert url == 'https://x/y.torrent'
+    assert fallback == magnet
 
 
-def test_torrent_project_results_still_uses_a_magnet_only_release() -> None:
-    """A private tracker offering nothing else must keep working."""
+def test_torrent_project_results_still_uses_the_magnet_when_it_is_all_there_is() -> None:
     from core.download_plugins.candidate_store import get_candidate_store
+    from core.download_plugins.torrent import _decode_candidate
     plugin = TorrentDownloadPlugin()
     magnet = 'magnet:?xt=urn:btih:def'
     results = [_make_torrent_result(magnet_uri=magnet, download_url=None)]
     tracks, _ = plugin._project_results(results)
     token, _ = _decode_filename(tracks[0].filename)
-    assert get_candidate_store().resolve(token) == magnet
+    url, fallback = _decode_candidate(get_candidate_store().resolve(token))
+    assert url == magnet
+    # No second link to fall back to, and the magnet must not be its own
+    # fallback — add_torrent_smart would otherwise retry the identical add.
+    assert fallback is None
 
 
 def test_torrent_project_results_encodes_token_and_title_in_filename() -> None:
@@ -204,7 +462,12 @@ def test_torrent_project_results_encodes_token_and_title_in_filename() -> None:
     token, display = _decode_filename(tracks[0].filename)
     assert 'https://x/y.torrent' not in tracks[0].filename
     assert get_candidate_store().is_token(token)
-    assert get_candidate_store().resolve(token) == 'https://x/y.torrent'
+    from core.download_plugins.torrent import _decode_candidate
+    assert _decode_candidate(get_candidate_store().resolve(token))[0] == 'https://x/y.torrent'
+    assert get_candidate_store().resolve_with_metadata(token)[1] == {
+        'categories': [3040],
+        'release_title': 'Danny Brown - Atrocity Exhibition [FLAC]',
+    }
     assert display == 'Danny Brown - Atrocity Exhibition [FLAC]'
 
 
@@ -231,6 +494,21 @@ def test_torrent_project_results_neutralizes_soulseek_specific_fields() -> None:
     # usable. free_upload_slots floors at 1 to avoid the 0-slot
     # penalty applied to dead Soulseek peers.
     assert tracks[0].free_upload_slots >= 1
+
+
+def test_torrent_project_results_carries_rich_title_quality() -> None:
+    plugin = TorrentDownloadPlugin()
+    tracks, _ = plugin._project_results([
+        _make_torrent_result(
+            title='Danny Brown - Atrocity Exhibition [FLAC 24-96]',
+        )
+    ])
+
+    assert tracks[0].quality == 'flac'
+    assert tracks[0].sample_rate == 96_000
+    assert tracks[0].bit_depth == 24
+    assert tracks[0]._source_metadata['release_title'].endswith('[FLAC 24-96]')
+    assert tracks[0]._source_metadata['categories'] == [3040]
 
 
 # ---------------------------------------------------------------------------
@@ -316,6 +594,186 @@ def test_torrent_finalize_single_file_torrent_still_walks_the_save_dir(tmp_path:
     row = plugin.active_downloads['dl-1']
     assert row['state'] == 'Completed, Succeeded'
     assert row['file_path'].endswith('Artist - Song.mp3')
+
+
+def test_torrent_finalize_single_file_torrent_via_remapped_path(tmp_path: Path, monkeypatch) -> None:
+    """Single-file torrent whose client path needs remapping (the audiobook
+    report, Oct 2026): qBittorrent's save dir is a UNC path this container
+    can't read, the file itself is visible under the configured download
+    root. The resolver hands back the file itself, and finalize must take it
+    directly — walking its parent (the shared download root) would donate
+    other torrents' audio, and the directory-only walker finds nothing in a
+    file."""
+    from core.download_plugins import album_bundle as ab
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    mine = real_root / 'Artist - Song.mp3'
+    mine.write_bytes(b'ID3')
+    # Another torrent's file in the same shared root, sorting FIRST: the old
+    # code walked the whole root and would grab this instead of our file.
+    (real_root / 'AAA-other.mp3').write_bytes(b'ID3')
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    plugin = TorrentDownloadPlugin()
+    plugin.active_downloads['dl-1'] = _inflight_row()
+    plugin._finalize_download(
+        'dl-1',
+        r'\\10.10.16.115\Media\Torrents\Incoming\Audiobooks',
+        torrent_name='Artist - Song.mp3',
+    )
+    row = plugin.active_downloads['dl-1']
+    assert row['state'] == 'Completed, Succeeded'
+    assert row['file_path'] == str(mine)
+
+
+def test_torrent_finalize_single_file_archive_via_remapped_path(tmp_path: Path, monkeypatch) -> None:
+    """A single-FILE archive torrent whose client path needs remapping: the
+    archive extracts into its own folder and its audio is collected, never a
+    hard 'No audio files' failure."""
+    import zipfile
+
+    from core.download_plugins import album_bundle as ab
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    archive = real_root / 'Album.zip'
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('track.mp3', b'ID3')
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    plugin = TorrentDownloadPlugin()
+    plugin.active_downloads['dl-1'] = _inflight_row()
+    plugin._finalize_download('dl-1', r'\\NAS\Media\Audiobooks', torrent_name='Album.zip')
+    row = plugin.active_downloads['dl-1']
+    assert row['state'] == 'Completed, Succeeded'
+    assert row['file_path'].endswith('track.mp3')
+
+
+def test_torrent_finalize_single_file_m4b_is_not_music_audio(tmp_path: Path, monkeypatch) -> None:
+    """Documents current scope: the MUSIC track flow does not treat .m4b as
+    audio — parity with the directory walker, which never matched it either.
+    Single-file audiobooks go through the audiobook flow, which keeps its own
+    extension set. Widening .m4b here is a separate product decision."""
+    from core.download_plugins import album_bundle as ab
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    (real_root / 'Book.m4b').write_bytes(b'fake-m4b')
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    plugin = TorrentDownloadPlugin()
+    plugin.active_downloads['dl-1'] = _inflight_row()
+    plugin._finalize_download('dl-1', r'\\NAS\Media\Audiobooks', torrent_name='Book.m4b')
+    row = plugin.active_downloads['dl-1']
+    assert row['state'] == 'Completed, Errored'
+    assert 'No audio files' in row['error']
+
+
+def test_audio_from_single_file_takes_audio_directly_and_absolute(tmp_path: Path, monkeypatch) -> None:
+    """A resolved audio file is taken as-is, always as an absolute path —
+    downstream stages persist these paths and do real file IO on them. The
+    input here is deliberately RELATIVE (relative config roots like
+    './downloads' are supported), so the test fails if the .resolve() ever
+    goes missing."""
+    from core.download_plugins.torrent import _audio_from_single_file
+    monkeypatch.chdir(tmp_path)
+    song = Path('song.mp3')
+    song.write_bytes(b'ID3')
+    out = _audio_from_single_file(song)
+    assert out == [(tmp_path / 'song.mp3').resolve()]
+    assert out[0].is_absolute()
+
+
+def test_audio_from_single_file_extracts_archives(tmp_path: Path) -> None:
+    """A single-file archive extracts into its own folder and the extraction
+    is walked."""
+    import zipfile
+
+    from core.download_plugins.torrent import _audio_from_single_file
+    archive = tmp_path / 'album.zip'
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('track.flac', b'fLaC')
+    out = _audio_from_single_file(archive)
+    assert len(out) == 1
+    assert out[0].name == 'track.flac'
+    assert out[0].is_absolute()
+
+
+def test_audio_from_single_file_rejects_non_audio(tmp_path: Path) -> None:
+    from core.download_plugins.torrent import _audio_from_single_file
+    notes = tmp_path / 'notes.txt'
+    notes.write_bytes(b'not audio')
+    assert _audio_from_single_file(notes) == []
+
+
+def test_collect_album_audio_walks_a_resolved_directory(tmp_path: Path) -> None:
+    """The ordinary multi-file case is unchanged: the resolved folder walks."""
+    from core.download_plugins.torrent import _collect_album_audio
+    release = tmp_path / 'release'
+    release.mkdir()
+    (release / 'track.mp3').write_bytes(b'ID3')
+    files, scope = _collect_album_audio(str(release), 'release', None)
+    assert [p.name for p in files] == ['track.mp3']
+    assert scope == str(release)
+
+
+def test_collect_album_audio_takes_a_resolved_single_file(tmp_path: Path, monkeypatch) -> None:
+    """No content_path from the client (not qBittorrent): the resolver hands
+    back the single file itself, which is taken directly — its parent (the
+    shared root) is never walked."""
+    from core.download_plugins import album_bundle as ab
+    from core.download_plugins.torrent import _collect_album_audio
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    song = real_root / 'Artist - Song.mp3'
+    song.write_bytes(b'ID3')
+    (real_root / 'AAA-other.mp3').write_bytes(b'ID3')  # another torrent's file; never walked
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    files, scope = _collect_album_audio(r'\\NAS\Media\Audiobooks', 'Artist - Song.mp3', None)
+    assert files == [song.resolve()]
+    assert scope == str(song)
+
+
+def test_collect_album_audio_extracts_a_resolved_single_archive(tmp_path: Path, monkeypatch) -> None:
+    """A resolved single-file archive extracts before collecting — the old
+    shared-root walk did this implicitly; the direct-file path must too."""
+    import zipfile
+
+    from core.download_plugins import album_bundle as ab
+    from core.download_plugins.torrent import _collect_album_audio
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    archive = real_root / 'Album.zip'
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('track.mp3', b'ID3')
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    files, _scope = _collect_album_audio(r'\\NAS\Media\Audiobooks', 'Album.zip', None)
+    assert [p.name for p in files] == ['track.mp3']
+
+
+def test_collect_album_audio_content_path_archive_falls_through_to_save_path(tmp_path: Path, monkeypatch) -> None:
+    """A content_path naming an archive (not audio) is NOT taken directly —
+    it falls through to the save_path walk, which extracts before collecting."""
+    import zipfile
+
+    from core.download_plugins import album_bundle as ab
+    from core.download_plugins.torrent import _collect_album_audio
+    real_root = tmp_path / 'real'
+    real_root.mkdir()
+    archive = real_root / 'Album.zip'
+    with zipfile.ZipFile(archive, 'w') as zf:
+        zf.writestr('track.mp3', b'ID3')
+    monkeypatch.setattr(ab, 'config_manager', type('C', (), {
+        'get': staticmethod(lambda key, default=None: str(real_root)
+                            if key == 'download_source.torrent_download_path' else default)})())
+    files, _scope = _collect_album_audio(r'\\NAS\Media\Audiobooks', 'Album.zip',
+                                        r'\\NAS\Media\Audiobooks\Album.zip')
+    assert [p.name for p in files] == ['track.mp3']
 
 
 def test_torrent_finalize_rescues_a_wrong_reported_mount(tmp_path: Path, monkeypatch) -> None:
@@ -434,10 +892,70 @@ def test_usenet_project_encodes_token_in_filename() -> None:
     token, display = _decode_filename(tracks[0].filename)
     assert 'https://x/y.nzb' not in tracks[0].filename
     assert get_candidate_store().resolve(token) == 'https://x/y.nzb'
+    assert get_candidate_store().resolve_with_metadata(token)[1] == {
+        'categories': [3010],
+        'release_title': 'Some Artist - Some Album',
+    }
     assert display == 'Some Artist - Some Album'
     # Artist + title should be parsed out, not auto-extracted from filename.
     assert tracks[0].artist == 'Some Artist'
     assert tracks[0].title == 'Some Album'
+    # The helper's category is Audio/MP3, structured quality evidence even when
+    # the title is bare; bitrate remains unknown until title/file says it.
+    assert tracks[0].quality == 'mp3'
+    assert tracks[0].bitrate is None
+    assert tracks[0]._source_metadata['categories'] == [3010]
+
+
+def test_usenet_project_results_carries_lossy_bitrate() -> None:
+    plugin = UsenetDownloadPlugin()
+    tracks, _ = plugin._project_results([
+        _make_usenet_result(title='Some Artist - Some Album [MP3 320]')
+    ])
+
+    assert tracks[0].quality == 'mp3'
+    assert tracks[0].bitrate == 320
+    assert tracks[0]._source_metadata['release_title'].endswith('[MP3 320]')
+
+
+def test_usenet_download_uses_the_assigned_profile_before_grab() -> None:
+    from core.download_plugins.candidate_store import get_candidate_store
+
+    plugin = UsenetDownloadPlugin()
+    plugin.is_configured = lambda: True
+    token = get_candidate_store().put('https://x/release.nzb')
+    filename = f'{token}{_FILENAME_SEP}Artist - Album [MP3 320]'
+
+    with patch(
+        'core.download_plugins.usenet.profile_allowed_formats',
+        return_value={'flac'},
+    ) as policy:
+        result = _run(plugin.download(
+            'usenet',
+            filename,
+            quality_profile_id=88,
+        ))
+
+    assert result is None
+    policy.assert_called_once_with(88)
+
+
+def test_usenet_download_honors_category_quality_for_a_bare_title() -> None:
+    plugin = UsenetDownloadPlugin()
+    plugin.is_configured = lambda: True
+    tracks, _albums = plugin._project_results([_make_usenet_result()])
+
+    with patch(
+        'core.download_plugins.usenet.profile_allowed_formats',
+        return_value={'mp3'},
+    ), patch.object(plugin, '_download_thread', lambda *args, **kwargs: None):
+        result = _run(plugin.download(
+            'usenet',
+            tracks[0].filename,
+            quality_profile_id=89,
+        ))
+
+    assert result is not None
 
 
 def test_usenet_finalize_picks_first_audio_file(tmp_path: Path) -> None:
@@ -880,3 +1398,85 @@ def test_handle_stalled_survives_adapter_error():
 
     # Download still fails cleanly even when the client call blew up.
     assert plugin.active_downloads['d3']['state'] == 'Completed, Errored'
+
+
+@pytest.mark.parametrize('module, plugin_factory, adapter_patch, make_result', [
+    ('core.download_plugins.torrent', lambda: TorrentDownloadPlugin(),
+     'core.download_plugins.torrent.get_active_torrent_adapter',
+     _make_torrent_result),
+    ('core.download_plugins.usenet', lambda: UsenetDownloadPlugin(),
+     'core.download_plugins.usenet.get_active_usenet_adapter',
+     _make_usenet_result),
+])
+def test_album_duration_reaches_the_release_picker(module, plugin_factory,
+                                                   adapter_patch, make_result,
+                                                   tmp_path: Path) -> None:
+    """The size gate is useless if the duration stops at the plugin boundary.
+
+    Both album plugins must hand ``expected_duration_seconds`` to
+    ``pick_best_album_release``; without it the gate silently has no opinion,
+    which looks identical to "every release was plausible".
+    """
+    plugin = plugin_factory()
+    fake_adapter = MagicMock()
+    fake_adapter.is_configured.return_value = True
+    seen = {}
+
+    def _capture(*_args, **kwargs):
+        seen.update(kwargs)
+        return None
+
+    with patch.object(plugin, 'is_configured', return_value=True), \
+         patch.object(plugin._prowlarr, 'search',
+                      new=AsyncMock(return_value=[make_result()])), \
+         patch(f'{module}.pick_best_album_release', side_effect=_capture), \
+         patch(adapter_patch, return_value=fake_adapter):
+        plugin.download_album_to_staging(
+            'GNX', 'Kendrick Lamar', str(tmp_path),
+            expected_duration_seconds=2700,
+        )
+
+    assert seen.get('expected_duration_seconds') == 2700
+
+
+@pytest.mark.parametrize('title, size, projected', [
+    ('Danny Brown - Atrocity Exhibition [FLAC] (sample)', 15_000_000, False),
+    # "Sample" is only evidence together with a size no album can have.
+    ('Danny Brown - Atrocity Exhibition [FLAC] sample', 500_000_000, True),
+    ('Danny Brown - Sample Text [FLAC]', 500_000_000, True),
+    # A small release that never claims to be a sample is somebody's single.
+    ('Danny Brown - Atrocity Exhibition [FLAC]', 15_000_000, True),
+])
+def test_sample_releases_never_become_candidates(title, size, projected) -> None:
+    """Lidarr's NotSampleSpecification, at the projection boundary.
+
+    The album picker's 40 MB floor already refuses these, but the per-track
+    lane had no floor at all, so a 15 MB "sample" was a candidate like any
+    other — and it passes a FLAC profile, because it really is FLAC.
+    """
+    plugin = TorrentDownloadPlugin()
+    tracks, _albums = plugin._project_results([
+        _make_torrent_result(title=title, size=size),
+    ])
+
+    assert bool(tracks) is projected
+
+
+def test_audio_from_single_file_archive_ignores_neighbours(tmp_path: Path) -> None:
+    """the archive sits in the shared download root next to other downloads.
+    only the archive's own audio comes back, never a neighbour's."""
+    import io
+    import tarfile
+
+    from core.download_plugins.torrent import _audio_from_single_file
+    (tmp_path / 'other_album').mkdir()
+    (tmp_path / 'other_album' / 'x.flac').write_bytes(b'fLaC')
+    (tmp_path / 'loose.mp3').write_bytes(b'ID3')
+    archive = tmp_path / 'Album.tar.gz'
+    with tarfile.open(archive, 'w:gz') as tf:
+        info = tarfile.TarInfo('track.flac')
+        info.size = 4
+        tf.addfile(info, io.BytesIO(b'fLaC'))
+    out = _audio_from_single_file(archive)
+    assert [p.name for p in out] == ['track.flac']
+    assert out[0].parent == tmp_path / 'Album'

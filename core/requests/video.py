@@ -1,0 +1,139 @@
+"""video request rules that don't need flask.
+
+``monitor_for_new_request``: a show request with no season choice used to
+default to 'future', which on an ended show wishes nothing at all, so an
+approved request sat on "Acquiring…" forever. asking for a show means asking
+for the show: 'all' unless the requester picked something.
+
+``sweep_arrivals``: approved requests whose title reached the library get
+stamped and their requesters told, once.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable, Dict, Optional
+
+from core.video.monitor_policy import POLICIES
+
+_TRUSTED_POSTER_PREFIXES = ("https://image.tmdb.org/", "/api/video/")
+
+
+def monitor_for_new_request(kind: str, requested: Optional[str]) -> str:
+    if kind != "show":
+        return "future"
+    value = str(requested or "").lower()
+    return value if value in POLICIES else "all"
+
+
+def trusted_poster(url: Optional[str]) -> Optional[str]:
+    """only tmdb's image host or our own proxy. a request's poster is drawn in
+    the admin's browser; a member-typed url could point anywhere."""
+    url = str(url or "").strip()
+    return url if url.startswith(_TRUSTED_POSTER_PREFIXES) else None
+
+
+def parse_tmdb_id(value: Any) -> Optional[int]:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+_YOUTUBE_ID_RE = None
+
+
+def parse_youtube_id(value: Any) -> Optional[str]:
+    """A plausible YouTube video id (11 chars, [A-Za-z0-9_-]) or None.
+
+    The id is the only member-controlled part of a youtube request — the
+    title/poster are still validated and the poster is built server-side —
+    but a garbage id would file a request that can never resolve, so reject
+    it up front."""
+    global _YOUTUBE_ID_RE
+    if _YOUTUBE_ID_RE is None:
+        import re
+        _YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+    s = str(value or "").strip()
+    return s if _YOUTUBE_ID_RE.match(s) else None
+
+
+def parse_season_episode(value: Any) -> Optional[int]:
+    """A season/episode number (non-negative int) or None.
+
+    Season 0 is the specials season — a real, requestable season, so 0 is
+    valid here (unlike a missing value)."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 0 else None
+
+
+def episode_request_title(show_title: str, season: int, episode: int) -> str:
+    """'Show Name S02E07' — the request row's display title."""
+    return f"{(show_title or 'Unknown show').strip()[:280]} " \
+           f"S{int(season):02d}E{int(episode):02d}"
+
+
+def youtube_poster_url(youtube_id: str) -> str:
+    """The thumbnail, built server-side from the validated id — no
+    member-controlled URL ever reaches the admin's browser."""
+    return f"https://i.ytimg.com/vi/{youtube_id}/hqdefault.jpg"
+
+
+def request_metadata(kind: str, tmdb_id: int, body: Dict[str, Any],
+                     lookup: Callable[[str, int], Optional[Dict[str, Any]]]) -> Dict[str, Any]:
+    """title/year/poster from tmdb when it answers, the body only as a
+    fallback (tmdb off or down). ``owned`` when tmdb says the library already
+    has it (it answers with a redirect to the library item)."""
+    detail = None
+    try:
+        detail = lookup(kind, tmdb_id)
+    except Exception:  # noqa: BLE001 - a lookup failure falls back to the body
+        detail = None
+    if isinstance(detail, dict) and detail.get("redirect"):
+        return {"owned": True, "title": str(body.get("title") or "").strip()[:300],
+                "year": body.get("year"), "poster_url": trusted_poster(body.get("poster_url"))}
+    if isinstance(detail, dict) and detail.get("title"):
+        return {"owned": False, "title": str(detail["title"])[:300], "year": detail.get("year"),
+                "poster_url": trusted_poster(detail.get("poster_url"))}
+    return {"owned": False, "title": str(body.get("title") or "").strip()[:300],
+            "year": body.get("year"), "poster_url": trusted_poster(body.get("poster_url"))}
+
+
+def sweep_arrivals(db, notify: Callable[[int, str, str], Any]) -> int:
+    rows = db.approved_requests_awaiting_arrival()
+    if not rows:
+        return 0
+    db.annotate_requests_in_library(rows)
+    arrived = [r for r in rows if r.get("in_library")]
+    if not arrived:
+        return 0
+    marked = db.mark_video_requests_available([r["id"] for r in arrived])
+    try:      # 'Request Arrived' automation trigger, once per title
+        from core.video.download_events import publish
+        seen = set()
+        for r in arrived:
+            key = (r.get("kind"), r.get("tmdb_id"))
+            if key in seen:
+                continue
+            seen.add(key)
+            publish("video_request_available", {
+                "kind": r.get("kind") or "", "title": r.get("title") or "",
+                "requester": ", ".join(sorted({x.get("requester_name") or "" for x in arrived
+                                               if (x.get("kind"), x.get("tmdb_id")) == key} - {""}))})
+    except Exception:  # noqa: BLE001, S110 - events never undo the stamp
+        pass
+    for r in arrived:
+        what = f"{r.get('title')}" + (f" ({r['year']})" if r.get("year") else "")
+        try:
+            notify(int(r["profile_id"]), f"{what} is in your library now", "success")
+        except Exception:  # noqa: BLE001, S110 - a note never undoes the stamp
+            pass
+    return marked
+
+
+__all__ = ["monitor_for_new_request", "trusted_poster", "parse_tmdb_id",
+           "parse_youtube_id", "parse_season_episode", "episode_request_title",
+           "youtube_poster_url", "request_metadata", "sweep_arrivals"]

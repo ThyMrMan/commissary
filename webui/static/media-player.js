@@ -19,6 +19,7 @@ function initializeMediaPlayer() {
         audioPlayer.addEventListener('timeupdate', npCrossfadeTick);
         audioPlayer.addEventListener('timeupdate', npThrottledPositionState);
         audioPlayer.addEventListener('timeupdate', npMaybeLogPlay);
+        audioPlayer.addEventListener('timeupdate', npMaybeMarkScrobbleEligible);
         audioPlayer.addEventListener('ended', onAudioEnded);
         audioPlayer.addEventListener('error', onAudioError);
         audioPlayer.addEventListener('loadstart', onAudioLoadStart);
@@ -72,6 +73,10 @@ function initializeMediaPlayer() {
     const miniRepeatBtn = document.getElementById('mini-repeat-btn');
     if (miniShuffleBtn) miniShuffleBtn.addEventListener('click', (e) => { e.stopPropagation(); handleNpShuffle(); });
     if (miniRepeatBtn) miniRepeatBtn.addEventListener('click', (e) => { e.stopPropagation(); handleNpRepeat(); });
+
+    // Auto-download is off by default and profile-scoped. A user must enable it
+    // from the queue header before SoulSync starts background acquisitions.
+    try { npAutoDownloadQueue = localStorage.getItem(npAutoDownloadStorageKey()) === '1'; } catch (_) {}
 
     // Restore a previously-saved queue (does not auto-play)
     npRestoreQueue();
@@ -128,7 +133,19 @@ function _stripSourceIdPrefix(value) {
 
 function setTrackInfo(track) {
     currentTrack = track;
+    window.__ssCurrentTrack = track;
+    if (typeof window.getCurrentTrack !== 'function') {
+        window.getCurrentTrack = function () { return currentTrack; };
+    }
     npPlayLogged = false;   // new track — allow one play-log once it's heard a bit
+    npPlayId = null;   // listening_history id for this play (for the scrobble-eligibility ping)
+    npScrobbleEligibleSent = false;
+    npPlayGeneration++;   // invalidate any in-flight log-play response for the previous track
+    // Chat now-playing (opt-in, chat.js owns the gate + throttle). Never let a
+    // chat problem break playback.
+    try {
+        if (typeof window.__ssNowPlaying === 'function') window.__ssNowPlaying(track);
+    } catch (e) { /* chat not loaded / not in a room */ }
 
     const trackTitleElement = document.getElementById('track-title');
     const trackTitle = _stripSourceIdPrefix(track.title) || 'Unknown Track';
@@ -138,6 +155,7 @@ function setTrackInfo(track) {
 
     document.getElementById('artist-name').textContent = _stripSourceIdPrefix(track.artist) || 'Unknown Artist';
     document.getElementById('album-name').textContent = _stripSourceIdPrefix(track.album) || 'Unknown Album';
+    npSetPreviewBadge(!!track.is_preview);
 
     // Check if title needs scrolling (similar to GUI app)
     setTimeout(() => {
@@ -198,6 +216,14 @@ function setTrackInfo(track) {
     });
 }
 
+// a deezer clip (#1312) is 30 seconds of the song, not the song. the mini
+// player says so here and now playing in its format badges, so a clip
+// ending early never reads as a broken stream.
+function npSetPreviewBadge(on) {
+    const badge = document.getElementById('player-preview-badge');
+    if (badge) badge.hidden = !on;
+}
+
 function checkAndEnableScrolling(element, text) {
     // Remove any existing scrolling class and reset styles
     element.classList.remove('scrolling');
@@ -228,7 +254,11 @@ function checkAndEnableScrolling(element, text) {
 function clearTrack() {
     // Clear track state
     currentTrack = null;
+    window.__ssCurrentTrack = null;
     isPlaying = false;
+    try {
+        if (typeof window.__ssNowPlaying === 'function') window.__ssNowPlaying(null);
+    } catch (e) { /* chat not loaded */ }
     npSetPlayContext('');   // hide "Playing from" when nothing's playing
 
     const trackTitleElement = document.getElementById('track-title');
@@ -238,6 +268,7 @@ function clearTrack() {
 
     document.getElementById('artist-name').textContent = 'Unknown Artist';
     document.getElementById('album-name').textContent = 'Unknown Album';
+    npSetPreviewBadge(false);
     // Reset play button SVGs (don't use textContent — it destroys SVG children)
     const clearPlayBtn = document.getElementById('play-button');
     const clearPlayIcon = clearPlayBtn.querySelector('.play-icon');
@@ -447,6 +478,18 @@ async function startStream(searchResult) {
             return;
         }
 
+        // Same track clicked while PAUSED with audio still loaded — resume
+        // instead of tearing the stream down and re-downloading it. readyState
+        // guards the case where the stream never actually became playable, and
+        // !ended keeps a click after natural completion on the restart path
+        // (resuming at the very end would just instantly re-fire 'ended').
+        if (currentTrackId === newTrackId && audioPlayer && audioPlayer.paused
+                && !audioPlayer.ended && audioPlayer.src && audioPlayer.readyState >= 2) {
+            console.log("▶️ Resuming paused stream for same track");
+            togglePlayback();
+            return;
+        }
+
         // Lock to prevent duplicate stream starts
         _streamLock = true;
 
@@ -463,7 +506,8 @@ async function startStream(searchResult) {
             album: searchResult.album || 'Unknown Album',
             username: searchResult.username,
             filename: searchResult.filename,
-            image_url: searchResult.image_url || searchResult.album_cover_url || null
+            image_url: searchResult.image_url || searchResult.album_cover_url || null,
+            is_preview: !!searchResult.preview
         });
 
         showLoadingAnimation();
@@ -543,40 +587,37 @@ function updateDiscoveryProgressFromData(data) {
     if (callback) callback(data);
 }
 
-function updateWatchlistScanFromData(data) {
-    if (!data.success) return;
-    if (_lastWatchlistScanStatus === data.status && data.status !== 'scanning') return;
-    _lastWatchlistScanStatus = data.status;
-    handleWatchlistScanData(data);
-}
-
 function updateMediaScanFromData(data) {
+    // Re-broadcast the frame verbatim, before this function's own guards — the
+    // bridge is a pure transport hop, and the React card applies the same checks
+    // itself. Kept here rather than in core.js so it travels with the handler.
+    window.dispatchEvent(new CustomEvent('ss:media-scan', { detail: data }));
+
     if (!data.success || !data.status) return;
     const status = data.status;
-    const statusKey = status.is_scanning ? 'scanning' : (status.status || 'unknown');
+    // `is_scanning` is a phantom field. Both this socket frame and
+    // /api/scan/status return web_scan_manager.get_scan_status(), which reports
+    // status: 'idle' | 'scheduled' | 'scanning' and has NEVER carried
+    // is_scanning.
+    const statusKey = status.status || 'unknown';
+    const wasScanning = _lastMediaScanStatus === 'scanning';
     if (_lastMediaScanStatus === statusKey && statusKey !== 'scanning') return;
     _lastMediaScanStatus = statusKey;
 
-    const phaseLabel = document.getElementById('media-scan-phase-label');
-    const progressLabel = document.getElementById('media-scan-progress-label');
-    const button = document.getElementById('media-scan-btn');
-    const progressBar = document.getElementById('media-scan-progress-bar');
-    const statusValue = document.getElementById('media-scan-status');
-
-    if (status.is_scanning) {
-        if (phaseLabel) phaseLabel.textContent = 'Media server scanning…';
-        if (progressLabel) progressLabel.textContent = status.progress_message || 'Scan in progress';
-    } else if (status.status === 'idle') {
-        if (button) button.disabled = false;
-        if (phaseLabel) phaseLabel.textContent = 'Scan completed successfully';
-        if (progressBar) progressBar.style.width = '0%';
-        if (progressLabel) progressLabel.textContent = 'Ready for next scan';
-        if (statusValue) {
-            statusValue.textContent = 'Idle';
-            statusValue.style.color = '#b3b3b3';
-        }
-        showToast('✅ Media scan completed', 'success', 3000);
-    }
+    // P7 hardening: every element this handler used to write (#media-scan-*,
+    // #media-scan-button) exists only inside the React tools page now, and the
+    // card renders this same frame itself via ss:media-scan — a second writer
+    // here would be mutating React-owned DOM. What survives app-wide is the
+    // completion toast:
+    if (statusKey !== 'idle') return;
+    // A bare idle frame is not a finished scan — the server pushes scan:media
+    // every 2s regardless of activity, and without this guard every page load
+    // announced a completed scan.
+    if (!wasScanning) return;
+    // On the tools page the React card announces it; everywhere else this is
+    // the only messenger.
+    if (typeof currentPage !== 'undefined' && currentPage === 'tools') return;
+    showToast('✅ Media scan completed', 'success', 3000);
 }
 
 let _wishlistAutoProcessingNotified = false;
@@ -633,7 +674,7 @@ async function updateStreamStatus() {
                 // Update loading text with progress
                 const loadingText = document.querySelector('.loading-text');
                 if (loadingText && data.progress > 0) {
-                    loadingText.textContent = `Downloading… ${Math.round(data.progress)}%`;
+                    loadingText.textContent = `Downloading... ${Math.round(data.progress)}%`;
                 }
                 break;
 
@@ -641,7 +682,7 @@ async function updateStreamStatus() {
                 // Show queue status with better messaging
                 const queueText = document.querySelector('.loading-text');
                 if (queueText) {
-                    queueText.textContent = 'Queuing with uploader…';
+                    queueText.textContent = 'Queuing with uploader...';
                 }
                 setLoadingProgress(0); // Reset progress for queue state
                 break;
@@ -659,6 +700,7 @@ async function updateStreamStatus() {
                         album: ti.album || 'Unknown Album',
                         filename: ti.filename || '',
                         is_library: !!ti.is_library,
+                        is_preview: !!ti.is_preview,
                         image_url: ti.image_url || null,
                         id: ti.id || null,
                         artist_id: ti.artist_id || null,
@@ -719,8 +761,10 @@ async function updateStreamStatus() {
 // everyone "stopped" forever. Stream status is driven by the per-session HTTP
 // poller (updateStreamStatus) exclusively.)
 
-async function startAudioPlayback() {
+async function startAudioPlayback(isCurrent = () => true, signal, handoff = null) {
     // Start HTML5 audio playback of the streamed file with enhanced state management
+    // `handoff` is the crossfade's second audio, still playing the track this
+    // player is about to load; the player joins it where it is, then it stops.
     try {
         if (!audioPlayer) {
             throw new Error('Audio player not initialized');
@@ -729,7 +773,7 @@ async function startAudioPlayback() {
         // Show loading state while preparing audio
         const loadingText = document.querySelector('.loading-text');
         if (loadingText) {
-            loadingText.textContent = 'Preparing playback…';
+            loadingText.textContent = 'Preparing playback...';
         }
 
         // Set audio source with cache-busting timestamp
@@ -748,10 +792,19 @@ async function startAudioPlayback() {
         // Wait for audio to be ready with promise-based approach
         await new Promise((resolve, reject) => {
             const timeout = setTimeout(() => {
+                cleanup();
                 reject(new Error('Audio loading timeout'));
             }, 15000); // 15-second timeout
 
+            const cleanup = () => {
+                clearTimeout(timeout);
+                audioPlayer.removeEventListener('canplay', onCanPlay);
+                audioPlayer.removeEventListener('error', onError);
+                signal?.removeEventListener('abort', onAbort);
+            };
+            const onAbort = () => { cleanup(); reject(new Error('Playback superseded')); };
             const onCanPlay = () => {
+                cleanup();
                 clearTimeout(timeout);
                 audioPlayer.removeEventListener('canplay', onCanPlay);
                 audioPlayer.removeEventListener('error', onError);
@@ -759,6 +812,7 @@ async function startAudioPlayback() {
             };
 
             const onError = (event) => {
+                cleanup();
                 clearTimeout(timeout);
                 audioPlayer.removeEventListener('canplay', onCanPlay);
                 audioPlayer.removeEventListener('error', onError);
@@ -766,6 +820,8 @@ async function startAudioPlayback() {
                 reject(error);
             };
 
+            signal?.addEventListener('abort', onAbort, { once: true });
+            if (signal?.aborted || !isCurrent()) { onAbort(); return; }
             audioPlayer.addEventListener('canplay', onCanPlay);
             audioPlayer.addEventListener('error', onError);
 
@@ -783,7 +839,17 @@ async function startAudioPlayback() {
 
         while (retryCount < maxRetries) {
             try {
+                if (!isCurrent()) return { status: 'superseded' };
+                if (handoff && npXfadeHandoff === handoff) {
+                    // Read the position as late as possible: the second audio
+                    // has kept moving through the whole load. The lead covers
+                    // the seek + start latency so the join lands level.
+                    const at = handoff.currentTime + 0.15;
+                    if (isFinite(at) && at > 0) { try { audioPlayer.currentTime = at; } catch (_) {} }
+                }
                 await audioPlayer.play();
+                if (!isCurrent()) return { status: 'superseded' };
+                if (handoff) npStopHandoff(handoff);
                 console.log('✅ Audio playback started successfully');
 
                 // Update UI to playing state
@@ -808,7 +874,7 @@ async function startAudioPlayback() {
                 if (playButton) playButton.disabled = false;
                 if (stopButton) stopButton.disabled = false;
 
-                return; // Success!
+                return { status: 'played' }; // HTMLMediaElement.play acknowledged playback.
 
             } catch (playError) {
                 retryCount++;
@@ -824,6 +890,7 @@ async function startAudioPlayback() {
         }
 
     } catch (error) {
+        if (!isCurrent()) return { status: 'superseded' };
         console.error('❌ Error starting audio playback:', error);
         hideLoadingAnimation();
 
@@ -849,6 +916,7 @@ async function startAudioPlayback() {
         if (npQueue.length === 0) {
             clearTrack();
         }
+        return { status: 'failed', error: userMessage };
     }
 }
 
@@ -915,9 +983,21 @@ function togglePlayback() {
 // AUDIO EVENT HANDLERS
 // ===============================
 
+// Whether playback is past the 3s "prev restarts the track" threshold — the
+// prev button's enabled state depends on it, but buttons only refresh on
+// track/queue changes, so on queue item 0 prev sat disabled for the whole
+// song. Refresh the buttons exactly when this boolean flips.
+let _npPastRestartThreshold = false;
+
 function updateAudioProgress() {
     // Update progress bar based on audio playback time
     if (!audioPlayer || !audioPlayer.duration) return;
+
+    const pastRestart = audioPlayer.currentTime > 3;
+    if (pastRestart !== _npPastRestartThreshold) {
+        _npPastRestartThreshold = pastRestart;
+        updateNpPrevNextButtons();
+    }
 
     const progress = (audioPlayer.currentTime / audioPlayer.duration) * 100;
 
@@ -1161,6 +1241,9 @@ function onAudioEnded() {
     console.log('🏁 Audio playback ended');
     setPlayingState(false);
 
+    // Sleep timer "end of track": pause instead of advancing to the next track.
+    if (npSleepEndOfTrack) { npFireSleepTimer(); return; }
+
     // Reset progress to beginning
     const progressBar = document.getElementById('progress-bar');
     const progressFill = document.getElementById('progress-fill');
@@ -1370,6 +1453,16 @@ let npMuted = false;
 let npPreMuteVolume = 70;
 let npMediaSessionThrottle = 0;
 let npLoadingQueueItem = false;
+let npPlaybackGeneration = 0;
+let npPlaybackAbort = new AbortController();
+// Serialize server stream mutations; stale requests never start audio afterward.
+let npPlaybackSetup = Promise.resolve();
+window.cancelPendingPlayback = function () {
+    npPlaybackGeneration += 1;
+    npPlaybackAbort.abort();
+    npPlaybackAbort = new AbortController();
+    npLoadingQueueItem = false;
+};
 let npRadioMode = false;
 let npRecentlyPlayedIds = [];
 let npAudioContext = null;
@@ -1380,6 +1473,246 @@ let npVizInitialized = false;
 let npCrossfadeOn = false;
 let npSleepMinutes = 0;       // 0 = off
 let npSleepTimerId = null;
+let npSleepEndOfTrack = false; // sleep when the current track ends
+let npAutoDownloadQueue = false;
+let npQueueRequestCounter = 0;
+let npQueuePrefetchRequest = null;
+let npQueuePrefetchReschedule = false;
+let npQueuePrefetchTimer = null;
+let npQueuePrefetchPoller = null;
+const npQueuePrefetchBatchIds = new Set();
+const NP_QUEUE_PREFETCH_TERMINAL = new Set(['failed', 'not_found', 'cancelled', 'quarantined']);
+
+function npQueueIdentity(track) {
+    const source = String(track?.source || track?.metadata_source || '').trim().toLowerCase();
+    const sourceId = String(track?.source_track_id || track?.spotify_track_id || track?.tidal_track_id ||
+        track?.deezer_id || track?.itunes_track_id || track?.musicbrainz_recording_id || track?.track_id || '').trim();
+    if (source && sourceId) return `source:${source}:${sourceId}`;
+    const title = String(track?.title || track?.name || '').trim().toLowerCase();
+    const artistValues = Array.isArray(track?.artists) ? track.artists : [];
+    const artists = artistValues.map(value => String(typeof value === 'object' ? value?.name : value || '').trim().toLowerCase()).filter(Boolean);
+    if (!artists.length) artists.push(String(track?.artist || track?.artist_name || '').trim().toLowerCase());
+    const rawAlbum = track?.album;
+    const album = String(typeof rawAlbum === 'object' ? (rawAlbum?.name || rawAlbum?.title || '') :
+        (rawAlbum || track?.album_title || '')).trim().toLowerCase();
+    return `metadata:${title}|${artists.join('|')}|${album}`;
+}
+
+function npPrepareQueueTrack(rawTrack) {
+    const track = { ...(rawTrack || {}) };
+    track.title = track.title || track.name || 'Unknown Track';
+    track.name = track.name || track.title;
+    if (!track.artist) {
+        const first = Array.isArray(track.artists) ? track.artists[0] : null;
+        track.artist = typeof first === 'object' ? first?.name : first;
+    }
+    track.artist = track.artist || track.artist_name || 'Unknown Artist';
+    if (!Array.isArray(track.artists) || !track.artists.length) track.artists = [{ name: track.artist }];
+    if (typeof track.album === 'object') track.album = track.album?.name || track.album?.title || '';
+    track.album = track.album || track.album_title || 'Unknown Album';
+    track.file_path = track.file_path || track.filename || '';
+    track.filename = track.file_path;
+    track.is_library = Boolean(track.file_path);
+    track.playback_status = track.file_path ? 'ready' : (track.playback_status || 'missing');
+    track._queue_identity = npQueueIdentity(track);
+    if (!track._queue_request_id) {
+        const existing = npQueue.find(item => item?._queue_identity === track._queue_identity && item?._queue_request_id);
+        track._queue_request_id = existing?._queue_request_id ||
+            `npq-${Date.now().toString(36)}-${(++npQueueRequestCounter).toString(36)}`;
+    }
+    return track;
+}
+
+function npPrepareQueueTracks(rawTracks) {
+    const requestIdByIdentity = new Map();
+    return (rawTracks || []).map(rawTrack => {
+        const track = npPrepareQueueTrack(rawTrack);
+        const sharedRequestId = requestIdByIdentity.get(track._queue_identity);
+        if (sharedRequestId) {
+            track._queue_request_id = sharedRequestId;
+        } else {
+            requestIdByIdentity.set(track._queue_identity, track._queue_request_id);
+        }
+        return track;
+    });
+}
+
+function npQueueTrackNeedsDownload(track) {
+    return Boolean(track && !track.file_path && track.title && track.artist &&
+        !NP_QUEUE_PREFETCH_TERMINAL.has(track.playback_status));
+}
+
+function npAutoDownloadStorageKey() {
+    const profile = String(window._currentProfileName || 'default');
+    return `soulsync-queue-auto-download:${profile}`;
+}
+
+function npQueueStatusLabel(track) {
+    switch (track?.playback_status) {
+        case 'requesting': return 'Preparing…';
+        case 'pending':
+        case 'queued': return 'Queued';
+        case 'searching': return 'Searching…';
+        case 'downloading': return track.download_progress > 0 ? `Downloading ${Math.round(track.download_progress)}%` : 'Downloading…';
+        case 'post_processing': return 'Verifying…';
+        case 'ready': return 'Ready';
+        case 'failed': return 'Download failed';
+        case 'not_found': return 'Not found';
+        case 'cancelled': return 'Cancelled';
+        case 'quarantined': return 'Quarantined';
+        default: return track?.file_path ? '' : 'Missing';
+    }
+}
+
+function npApplyQueuePrefetchState(requestIds, state, finalPath = '', progress = 0, error = '') {
+    const ids = new Set((requestIds || []).map(String));
+    let changed = false;
+    npQueue.forEach(track => {
+        if (!ids.has(String(track?._queue_request_id || ''))) return;
+        if (finalPath) {
+            track.file_path = finalPath;
+            track.filename = finalPath;
+            track.is_library = true;
+            track.playback_status = 'ready';
+            track.playback_error = '';
+        } else {
+            track.playback_status = state || track.playback_status;
+            track.download_progress = Number(progress || 0);
+            track.playback_error = error || '';
+        }
+        changed = true;
+    });
+    return changed;
+}
+
+function npStartQueuePrefetchPolling() {
+    if (npQueuePrefetchPoller || npQueuePrefetchBatchIds.size === 0) return;
+    npQueuePrefetchPoller = setInterval(npPollQueuePrefetch, 2000);
+    npPollQueuePrefetch();
+}
+
+function npStopQueuePrefetchPolling() {
+    if (npQueuePrefetchPoller) clearInterval(npQueuePrefetchPoller);
+    npQueuePrefetchPoller = null;
+}
+
+async function npPollQueuePrefetch() {
+    if (npQueuePrefetchBatchIds.size === 0) {
+        npStopQueuePrefetchPolling();
+        return;
+    }
+    const query = [...npQueuePrefetchBatchIds].map(id => `batch_ids=${encodeURIComponent(id)}`).join('&');
+    try {
+        const response = await fetch(`/api/playback/queue/prefetch/status?${query}`, { cache: 'no-store' });
+        const data = await response.json();
+        if (!response.ok || !data.success) throw new Error(data.error || 'Queue download status unavailable');
+        let changed = false;
+        Object.entries(data.batches || {}).forEach(([batchId, batch]) => {
+            const tasks = Array.isArray(batch?.tasks) ? batch.tasks : [];
+            tasks.forEach(task => {
+                const info = task.track_info || {};
+                const requestIds = Array.isArray(info._queue_request_ids) && info._queue_request_ids.length
+                    ? info._queue_request_ids
+                    : [info._queue_request_id].filter(Boolean);
+                if (!requestIds.length) return;
+                const state = task.quarantine_entry_id ? 'quarantined' : String(task.status || 'queued');
+                const finalPath = state === 'completed' ? String(task.final_file_path || '') : '';
+                changed = npApplyQueuePrefetchState(
+                    requestIds,
+                    finalPath ? 'ready' : state,
+                    finalPath,
+                    task.progress,
+                    task.error_message,
+                ) || changed;
+            });
+            const terminal = ['complete', 'error', 'cancelled'].includes(batch?.phase) &&
+                tasks.every(task => ['completed', 'failed', 'not_found', 'cancelled'].includes(task.status));
+            if (terminal) npQueuePrefetchBatchIds.delete(batchId);
+        });
+        if (changed) renderNpQueue();
+        if (npQueuePrefetchBatchIds.size === 0) npStopQueuePrefetchPolling();
+    } catch (error) {
+        console.warn('Queue prefetch status failed:', error.message);
+    }
+}
+
+async function npPrefetchMissingQueueTracks() {
+    if (!npAutoDownloadQueue) return;
+    if (npQueuePrefetchRequest) return npQueuePrefetchRequest;
+    const missing = npQueue.filter(npQueueTrackNeedsDownload);
+    if (!missing.length) return;
+    missing.forEach(track => { track.playback_status = 'requesting'; });
+    renderNpQueue();
+    npQueuePrefetchRequest = (async () => {
+        try {
+            const response = await fetch('/api/playback/queue/prefetch', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tracks: missing }),
+            });
+            const data = await response.json();
+            if (!response.ok || !data.success) throw new Error(data.error || 'Could not prefetch queue');
+            (data.items || []).forEach(item => {
+                npApplyQueuePrefetchState(
+                    item.request_ids || [],
+                    item.state || 'queued',
+                    item.final_path || '',
+                );
+            });
+            (data.batch_ids || []).forEach(id => npQueuePrefetchBatchIds.add(String(id)));
+            if (data.queued > 0) showToast(`Preloading ${data.queued} missing queue track${data.queued === 1 ? '' : 's'}`, 'info');
+            renderNpQueue();
+            npStartQueuePrefetchPolling();
+        } catch (error) {
+            missing.forEach(track => {
+                if (track.playback_status === 'requesting') {
+                    track.playback_status = 'failed';
+                    track.playback_error = error.message;
+                }
+            });
+            renderNpQueue();
+            showToast(`Queue prefetch failed: ${error.message}`, 'error');
+        } finally {
+            npQueuePrefetchRequest = null;
+            if (npQueuePrefetchReschedule) {
+                npQueuePrefetchReschedule = false;
+                npScheduleQueuePrefetch();
+            }
+        }
+    })();
+    return npQueuePrefetchRequest;
+}
+
+function npScheduleQueuePrefetch() {
+    if (!npAutoDownloadQueue) return;
+    if (npQueuePrefetchRequest) {
+        npQueuePrefetchReschedule = true;
+        return;
+    }
+    if (npQueuePrefetchTimer) clearTimeout(npQueuePrefetchTimer);
+    npQueuePrefetchTimer = setTimeout(() => {
+        npQueuePrefetchTimer = null;
+        npPrefetchMissingQueueTracks();
+    }, 80);
+}
+
+async function npEnsureQueueTrackReady(track, isCurrent = () => true) {
+    if (track?.file_path) return track;
+    if (!npAutoDownloadQueue) throw new Error('Auto-download is disabled for missing queue tracks');
+    await npPrefetchMissingQueueTracks();
+    const deadline = Date.now() + 45 * 60 * 1000;
+    while (!track.file_path && Date.now() < deadline) {
+        if (!isCurrent()) throw new Error('Playback superseded');
+        if (NP_QUEUE_PREFETCH_TERMINAL.has(track.playback_status)) {
+            throw new Error(track.playback_error || npQueueStatusLabel(track));
+        }
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        if (!isCurrent()) throw new Error('Playback superseded');
+        await npPollQueuePrefetch();
+    }
+    if (!track.file_path) throw new Error('Download timed out after 45 minutes');
+    return track;
+}
 
 function npQueueHasNext() {
     if (npQueue.length === 0) return false;
@@ -1421,7 +1754,15 @@ function npSetRadioMode(enabled, options = {}) {
             : 'Radio mode - auto-add similar tracks';
     }
     if (toast) {
-        showToast(npRadioMode ? 'Radio mode on - similar tracks will auto-queue' : 'Radio mode off', 'success');
+        // Radio seeds from the current track's LIBRARY id — a streamed
+        // (non-library) track has none, so promising auto-queue would be a
+        // lie. Mode stays armed either way: it engages on the next library
+        // track that plays.
+        if (npRadioMode && currentTrack && !currentTrack.id) {
+            showToast('Radio armed - it kicks in when a library track plays', 'info');
+        } else {
+            showToast(npRadioMode ? 'Radio mode on - similar tracks will auto-queue' : 'Radio mode off', 'success');
+        }
     }
     // Context label: only set the generic "Radio" if a more specific one (e.g.
     // "<Artist> Radio") wasn't already set by the caller.
@@ -1554,6 +1895,20 @@ function initExpandedPlayer() {
     const queueClearBtn = document.getElementById('np-queue-clear');
     if (queueClearBtn) queueClearBtn.addEventListener('click', () => { clearQueue(); });
 
+    const autoDownloadBtn = document.getElementById('np-autodownload-btn');
+    if (autoDownloadBtn) {
+        autoDownloadBtn.classList.toggle('active', npAutoDownloadQueue);
+        autoDownloadBtn.setAttribute('aria-pressed', npAutoDownloadQueue ? 'true' : 'false');
+        autoDownloadBtn.addEventListener('click', () => {
+            npAutoDownloadQueue = !npAutoDownloadQueue;
+            autoDownloadBtn.classList.toggle('active', npAutoDownloadQueue);
+            autoDownloadBtn.setAttribute('aria-pressed', npAutoDownloadQueue ? 'true' : 'false');
+            try { localStorage.setItem(npAutoDownloadStorageKey(), npAutoDownloadQueue ? '1' : '0'); } catch (_) {}
+            showToast(npAutoDownloadQueue ? 'Queue auto-download enabled' : 'Queue auto-download disabled', 'info');
+            if (npAutoDownloadQueue) npScheduleQueuePrefetch();
+        });
+    }
+
     // Radio mode button
     const radioBtn = document.getElementById('np-radio-btn');
     if (radioBtn) {
@@ -1649,6 +2004,12 @@ function syncExpandedPlayerUI() {
     updateNpPrevNextButtons();
 }
 
+// a library track: played from the library, with its db ids. streams and
+// queued downloads have nothing an issue could point at.
+function npIsReportableTrack(track) {
+    return !!(track && track.is_library && track.id != null && track.id !== '' && track.artist_id != null);
+}
+
 function updateNpTrackInfo() {
     const titleEl = document.getElementById('np-track-title');
     const artistEl = document.getElementById('np-artist-name');
@@ -1713,7 +2074,12 @@ function updateNpTrackInfo() {
         if (badgesEl) {
             badgesEl.innerHTML = '';
             const filename = currentTrack.filename || '';
-            if (filename) {
+            if (currentTrack.is_preview) {
+                const badge = document.createElement('span');
+                badge.className = 'np-format-badge preview';
+                badge.textContent = '30s preview';
+                badgesEl.appendChild(badge);
+            } else if (filename) {
                 const ext = getFileExtension(filename);
                 if (ext) {
                     let label = ext.toUpperCase();
@@ -1735,10 +2101,40 @@ function updateNpTrackInfo() {
             }
         }
 
-        // Action buttons visibility
+        // Action buttons visibility. the row shows for a track with a library
+        // artist OR one that can go on a playlist (a stream has no artist_id)
+        const npPlaylistTrack = npAddToPlaylistTrack(currentTrack);
         if (actionBtns) {
             const hasArtist = currentTrack.artist_id;
-            actionBtns.classList.toggle('hidden', !hasArtist);
+            actionBtns.classList.toggle('hidden', !hasArtist && !npPlaylistTrack);
+            const gotoArtist = document.getElementById('np-goto-artist');
+            if (gotoArtist) gotoArtist.classList.toggle('hidden', !hasArtist);
+        }
+        const addBtn = document.getElementById('np-add-to-playlist');
+        if (addBtn) {
+            addBtn.classList.toggle('hidden', !npPlaylistTrack);
+            if (!addBtn._npAddAttached) {
+                addBtn.addEventListener('click', () => {
+                    const t = npAddToPlaylistTrack(currentTrack);
+                    if (!t || typeof window.openAddToPlaylist !== 'function') return;
+                    window.openAddToPlaylist(t, addBtn);
+                });
+                addBtn._npAddAttached = true;
+            }
+        }
+        // reporting needs a library row to point at
+        const reportBtn = document.getElementById('np-report-issue');
+        if (reportBtn) {
+            reportBtn.classList.toggle('hidden', !npIsReportableTrack(currentTrack));
+            if (!reportBtn._npReportAttached) {
+                reportBtn.addEventListener('click', () => {
+                    const t = currentTrack;
+                    if (!npIsReportableTrack(t) || typeof window.showReportIssueModal !== 'function') return;
+                    try { closeNowPlayingModal(); } catch (e) { /* the report opens either way */ }
+                    window.showReportIssueModal('track', t.id, t.title || 'Track', t.artist || '', t.album || '');
+                });
+                reportBtn._npReportAttached = true;
+            }
         }
 
         // Track recently played for radio mode
@@ -1797,16 +2193,67 @@ function npExtractAmbientColor(imgEl) {
             // Nudge toward vivid: lift saturation/brightness a touch so the
             // glow reads as a color, not a wash.
             [r, g, b] = npPunchUpColor(r, g, b);
-            const modal = document.querySelector('.np-modal');
-            if (modal) {
-                modal.style.setProperty('--np-ambient-r', r);
-                modal.style.setProperty('--np-ambient-g', g);
-                modal.style.setProperty('--np-ambient-b', b);
+            // a real second color from the same cover, so the theater's
+            // accent belongs to the art instead of a channel swap of the first
+            const [r2, g2, b2] = npPunchUpColor(...npPickAccentColor(Array.from(bins.values()), best));
+            // the mini player wears the same colors as the theater
+            for (const el of [document.querySelector('.np-modal'), document.getElementById('media-player')]) {
+                if (!el) continue;
+                el.style.setProperty('--np-ambient-r', r);
+                el.style.setProperty('--np-ambient-g', g);
+                el.style.setProperty('--np-ambient-b', b);
+                el.style.setProperty('--np-ambient2-r', r2);
+                el.style.setProperty('--np-ambient2-g', g2);
+                el.style.setProperty('--np-ambient2-b', b2);
             }
         }
     } catch (e) {
         // Cross-origin or canvas error — ignore silently
     }
+}
+
+// Hue of an rgb color in degrees, or -1 for a grey. Pure.
+function npHue(r, g, b) {
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const d = max - min;
+    if (d < 12) return -1;
+    let h;
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    h *= 60;
+    return h < 0 ? h + 360 : h;
+}
+
+// Second color for the theater: the strongest bin whose hue sits clearly away
+// from the main one (and still carries a real share of the cover). A cover
+// with one color gets a close neighbour of it instead, lighter, so the accent
+// is in harmony with the art, never a random channel swap. Pure.
+function npPickAccentColor(bins, best) {
+    const avg = (bin) => [bin.r / bin.n, bin.g / bin.n, bin.b / bin.n];
+    const [br, bg, bb] = avg(best);
+    const h0 = npHue(br, bg, bb);
+    let pick = null, pickScore = -1;
+    for (const bin of bins) {
+        if (bin === best || bin.w < best.w * 0.12) continue;
+        const [r, g, b] = avg(bin);
+        const h = npHue(r, g, b);
+        if (h < 0 || h0 < 0) continue;
+        const dh = Math.min(Math.abs(h - h0), 360 - Math.abs(h - h0));
+        if (dh < 40) continue;
+        if (bin.w > pickScore) { pickScore = bin.w; pick = [r, g, b]; }
+    }
+    if (pick) return pick.map(Math.round);
+    // analogous fallback: rotate the hue ~35 degrees and lift it a little
+    const t = (35 / 360) * 2 * Math.PI;
+    const cos = Math.cos(t), sin = Math.sin(t);
+    const k = (1 - cos) / 3, q = Math.sqrt(1 / 3) * sin;
+    const rot = [
+        br * (cos + k) + bg * (k - q) + bb * (k + q),
+        br * (k + q) + bg * (cos + k) + bb * (k - q),
+        br * (k - q) + bg * (k + q) + bb * (cos + k),
+    ];
+    return rot.map((v) => Math.max(0, Math.min(255, Math.round(v * 1.12 + 10))));
 }
 
 // Lift a color toward vividness for the ambient glow (boost saturation,
@@ -1833,11 +2280,33 @@ function npPunchUpColor(r, g, b) {
 // dedicated /stream/library-audio endpoint + a second <audio> to play the NEXT
 // library track and ramp volumes. Streamed (non-library) tracks can't crossfade
 // and fall back to the normal hard cut.
-const NP_CROSSFADE_SECONDS = 6;
+//
+// Duration: the player theater (media-player-v2.js) exposes a duration picker;
+// the setting lives in localStorage so the modal and mini player always agree.
+function npCrossfadeSeconds() {
+    const allowed = [0, 2, 4, 6, 10, 15];
+    let v = 6;
+    try {
+        v = parseInt(localStorage.getItem('soulsync-npv2-crossfade-secs') || '6', 10);
+    } catch (e) { /* storage unavailable — keep default */ }
+    return allowed.indexOf(v) >= 0 ? v : 6;
+}
 let npXfadeAudio = null;
 let npXfadeActive = false;
 let npXfadeTimer = null;
 let npXfadeMainVol = null;   // main-player volume to restore if a crossfade is aborted
+// The second audio while the main player catches up to it after a fade. It
+// keeps playing until the main player is at the same spot, so the handoff is
+// heard as nothing at all instead of the song starting over.
+let npXfadeHandoff = null;
+
+function npStopHandoff(xa) {
+    if (!xa) return;
+    if (npXfadeHandoff === xa) npXfadeHandoff = null;
+    try { xa.pause(); } catch (_) {}
+    xa.src = '';
+    xa.volume = 0;
+}
 
 // Abort an in-flight crossfade (manual skip / stop during the fade). Restores
 // the main player's volume and tears down the second audio element. Safe to
@@ -1845,6 +2314,9 @@ let npXfadeMainVol = null;   // main-player volume to restore if a crossfade is 
 function npCancelCrossfade() {
     if (npXfadeTimer) { clearInterval(npXfadeTimer); npXfadeTimer = null; }
     if (npXfadeAudio) { try { npXfadeAudio.pause(); } catch (_) {} npXfadeAudio.src = ''; npXfadeAudio.volume = 0; npXfadeAudio = null; }
+    // A skip while the main player was still catching up: the handed-off
+    // audio would otherwise play on underneath the new track.
+    if (npXfadeHandoff) npStopHandoff(npXfadeHandoff);
     if (npXfadeActive && audioPlayer && npXfadeMainVol !== null) {
         audioPlayer.volume = npXfadeMainVol; // undo any partial fade-down
     }
@@ -1854,12 +2326,20 @@ function npCancelCrossfade() {
 
 function npCrossfadeTick() {
     if (!npCrossfadeOn || npXfadeActive || npRepeatMode === 'one') return;
+    // "Sleep at end of track" means stop at the end of THIS track — don't
+    // start fading the next one in underneath the sleep.
+    if (typeof npSleepEndOfTrack !== 'undefined' && npSleepEndOfTrack) return;
+    // Shuffle picks its next track at 'ended' time; a crossfade preloads the
+    // SEQUENTIAL next and its finish handler advances to that index — with
+    // shuffle on that silently overrode every shuffled pick. Hard cut instead.
+    if (npShuffleOn) return;
     if (!audioPlayer || !audioPlayer.duration || !isFinite(audioPlayer.duration)) return;
     const remaining = audioPlayer.duration - audioPlayer.currentTime;
-    if (remaining > NP_CROSSFADE_SECONDS || remaining <= 0.2) return;
+    const xfSecs = npCrossfadeSeconds();
+    if (xfSecs <= 0 || remaining > xfSecs || remaining <= 0.2) return;
 
-    // Determine the next track (respects shuffle/repeat-all the same way
-    // playNextInQueue does, but we only crossfade plain sequential next).
+    // Determine the sequential next track (crossfade never shuffles — see bail
+    // above; repeat-all's wrap is also a hard cut, next is undefined at tail).
     const nextIdx = npQueueIndex + 1;
     const next = npQueue[nextIdx];
     if (!next || !next.is_library || !next.file_path) return; // only library→library
@@ -1881,7 +2361,7 @@ function npStartCrossfade(nextIdx, next) {
     xa.src = `/stream/library-audio?path=${encodeURIComponent(next.file_path)}${_xfTid}&t=${Date.now()}`;
     xa.volume = 0;
     xa.play().then(() => {
-        const fadeMs = NP_CROSSFADE_SECONDS * 1000;
+        const fadeMs = npCrossfadeSeconds() * 1000;
         const step = 60; // ms between volume steps
         const steps = Math.max(1, Math.floor(fadeMs / step));
         let n = 0;
@@ -1913,24 +2393,30 @@ function npFinishCrossfade(nextIdx, restoreVol) {
     // the normal play path take over so all the usual state (track info, art,
     // visualizer, server stream_state) is set for the now-current track.
     const xa = npXfadeAudio;
-    if (xa) { try { xa.pause(); } catch (_) {} xa.src = ''; xa.volume = 0; }
     npXfadeAudio = null;
     npXfadeActive = false;
     npXfadeMainVol = null;
     if (npXfadeTimer) { clearInterval(npXfadeTimer); npXfadeTimer = null; }
     if (audioPlayer) audioPlayer.volume = restoreVol;
-    // playQueueItem re-points stream_state + reloads audioPlayer for the next
-    // track; there's a brief silent reload, but the perceived crossfade already
-    // happened. Honest trade-off of the single-stream-state design.
-    playQueueItem(nextIdx);
+    // The second audio keeps playing and rides along into playQueueItem: the
+    // main player seeks to wherever it has got to before it starts, then it
+    // stops. Stopping it here and loading from zero played the six seconds
+    // you had just heard a second time, which is what "the song resets"
+    // meant. Any way the load can fail, the second audio goes quiet with it.
+    playQueueItem(nextIdx, { handoff: xa }).then((result) => {
+        if (!result || result.status !== 'played') npStopHandoff(xa);
+    }).catch(() => npStopHandoff(xa));
 }
 
 function npResetAmbientGlow() {
-    const modal = document.querySelector('.np-modal');
-    if (modal) {
-        modal.style.setProperty('--np-ambient-r', '29');
-        modal.style.setProperty('--np-ambient-g', '185');
-        modal.style.setProperty('--np-ambient-b', '84');
+    for (const el of [document.querySelector('.np-modal'), document.getElementById('media-player')]) {
+        if (!el) continue;
+        el.style.setProperty('--np-ambient-r', '29');
+        el.style.setProperty('--np-ambient-g', '185');
+        el.style.setProperty('--np-ambient-b', '84');
+        el.style.setProperty('--np-ambient2-r', '29');
+        el.style.setProperty('--np-ambient2-g', '140');
+        el.style.setProperty('--np-ambient2-b', '185');
     }
 }
 
@@ -2118,10 +2604,11 @@ function npSetPlayContext(text) {
 }
 
 function addToQueue(track) {
-    npQueue.push(track);
+    npQueue.push(npPrepareQueueTrack(track));
     showToast('Added to queue', 'success');
     renderNpQueue();
     updateNpPrevNextButtons();
+    npScheduleQueuePrefetch();
     // If nothing is currently playing, auto-play the first queued track
     if (!currentTrack) {
         playQueueItem(npQueue.length - 1);
@@ -2135,10 +2622,28 @@ function playNext(track) {
         addToQueue(track);
         return;
     }
-    npQueue.splice(npQueueIndex + 1, 0, track);
+    npQueue.splice(npQueueIndex + 1, 0, npPrepareQueueTrack(track));
     showToast('Playing next', 'success');
     renderNpQueue();
     updateNpPrevNextButtons();
+    npScheduleQueuePrefetch();
+}
+
+// a whole album onto the end of the queue: one toast, one render, not one per
+// track the way calling addToQueue in a loop did.
+function addTracksToQueue(tracks) {
+    const list = npPrepareQueueTracks((tracks || []).filter(Boolean));
+    if (!list.length) return;
+    const firstNew = npQueue.length;
+    npQueue.push(...list);
+    showToast(list.length === 1 ? 'Added to queue' : `Added ${list.length} songs to queue`, 'success');
+    renderNpQueue();
+    updateNpPrevNextButtons();
+    npScheduleQueuePrefetch();
+    // same as addToQueue: nothing playing, so start with what was just added
+    if (!currentTrack) {
+        playQueueItem(firstNew);
+    }
 }
 
 function removeFromQueue(index) {
@@ -2160,18 +2665,30 @@ function removeFromQueue(index) {
         playQueueItem(npQueueIndex);
     }
     renderNpQueue();
+    npScheduleQueuePrefetch();
     updateNpPrevNextButtons();
+    if (!npQueue.some(track => !track.file_path)) npStopQueuePrefetchPolling();
 }
 
 function clearQueue() {
     npQueue = [];
     npQueueIndex = -1;
+    npQueuePrefetchBatchIds.clear();
+    npStopQueuePrefetchPolling();
     renderNpQueue();
     updateNpPrevNextButtons();
 }
 
 function playNextInQueue() {
-    if (npQueue.length === 0) return;
+    if (npQueue.length === 0) {
+        // Radio with an empty queue (e.g. cleared mid-session): a skip should
+        // re-seed from the current track, not go dead.
+        if (npRadioMode && currentTrack && currentTrack.id && !npLoadingQueueItem) {
+            npEnsureCurrentTrackInQueue();
+            npFetchRadioTracks(true);
+        }
+        return;
+    }
     if (npShuffleOn) {
         // Pick a random index that is not the current one
         const candidates = [];
@@ -2187,6 +2704,13 @@ function playNextInQueue() {
             // End of queue — repeat-all wraps to start
             if (npRepeatMode === 'all') {
                 playQueueItem(0);
+                return;
+            }
+            // Radio mode: a skip at the tail of the fetched batch used to do
+            // nothing (more tracks only arrived when the song ENDED naturally)
+            // — fetch the next batch now and advance as soon as it lands.
+            if (npRadioMode && currentTrack && currentTrack.id && !npLoadingQueueItem) {
+                npFetchRadioTracks(true);
             }
             return;
         }
@@ -2214,21 +2738,116 @@ function playPreviousInQueue() {
     playQueueItem(prev);
 }
 
-async function playQueueItem(index) {
-    if (index < 0 || index >= npQueue.length) return;
-    if (npLoadingQueueItem) return; // Prevent race condition from double-advance
+// a missing queue song with auto-download off was skipped. with the stream
+// source on deezer previews it plays its 30s clip instead (#1312). null
+// means no clip (another stream source, or deezer doesn't have the song),
+// and the caller skips like before.
+async function npFindQueuePreview(track, signal) {
+    try {
+        const response = await fetch('/api/enhanced-search/stream-track', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                track_name: track.title || '',
+                artist_name: track.artist || '',
+                album_name: track.album || '',
+                preview_only: true,
+            }),
+            signal,
+        });
+        const data = await response.json();
+        return (data && data.success && data.result && data.result.preview) ? data.result : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+async function playQueueItem(index, options = {}) {
+    const generation = npPlaybackGeneration;
+    const signal = npPlaybackAbort.signal;
+    const isCurrent = () => generation === npPlaybackGeneration && !signal.aborted && (!options.isCurrent || options.isCurrent());
+    if (!isCurrent()) return { status: 'superseded' };
+    let releaseSetup;
+    if (index < 0 || index >= npQueue.length) return { status: 'empty' };
+    if (npLoadingQueueItem) return { status: 'busy' }; // Prevent race condition from double-advance
     // Manual skip / row-click during a crossfade: tear down the stray fade so it
     // can't fire npFinishCrossfade on top of this change. No-op for the
     // legitimate handoff (npFinishCrossfade already cleared the flag first).
     npCancelCrossfade();
+    // Registered AFTER the cancel: this load owns the second audio now, and
+    // any later load's cancel is what silences it.
+    if (options.handoff) npXfadeHandoff = options.handoff;
     npLoadingQueueItem = true;
     npQueueIndex = index;
     const track = npQueue[index];
+    let preview = null;
 
     try {
-        if (track.is_library) {
+        if (!track.file_path && !npAutoDownloadQueue) {
+            preview = await npFindQueuePreview(track, signal);
+            if (!isCurrent()) return { status: 'superseded' };
+        }
+        if (!track.file_path && !preview) {
+            setTrackInfo({
+                title: track.title,
+                artist: track.artist,
+                album: track.album || 'Waiting for download',
+                filename: '',
+                is_library: false,
+                image_url: track.image_url,
+                download_pending: true,
+            });
+            showLoadingAnimation();
+            const loadingText = document.querySelector('.loading-text');
+            if (loadingText) loadingText.textContent = 'Downloading queued track…';
+            renderNpQueue();
+            await npEnsureQueueTrackReady(track, isCurrent);
+            if (!isCurrent()) return { status: 'superseded' };
+            track.is_library = true;
+            if (loadingText) loadingText.textContent = 'Loading track…';
+        }
+        if (preview) {
+            const previousSetup = npPlaybackSetup;
+            npPlaybackSetup = new Promise(resolve => { releaseSetup = resolve; });
+            await previousSetup;
+            if (!isCurrent()) return { status: 'superseded' };
+            await stopStream();
+            if (!isCurrent()) return { status: 'superseded' };
+            setTrackInfo({
+                title: track.title,
+                artist: track.artist,
+                album: track.album,
+                username: preview.username,
+                filename: preview.filename,
+                is_library: false,
+                is_preview: true,
+                image_url: track.image_url || preview.image_url || null,
+                artist_id: track.artist_id,
+                album_id: track.album_id,
+            });
+            showLoadingAnimation();
+            const response = await fetch(API.stream.start, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(preview),
+            });
+            const result = await response.json();
+            if (!isCurrent()) return { status: 'superseded' };
+            if (!result.success) throw new Error(result.error || 'Preview unavailable');
+            if (audioPlayer) audioPlayer.loop = (npRepeatMode === 'one');
+            const playback = await startAudioPlayback(isCurrent, signal);
+            if (playback?.status !== 'played') {
+                if (playback?.status === 'superseded') return playback;
+                throw new Error(playback?.error || 'Playback did not start');
+            }
+        } else if (track.is_library) {
+            const previousSetup = npPlaybackSetup;
+            npPlaybackSetup = new Promise(resolve => { releaseSetup = resolve; });
+            await previousSetup;
+            if (!isCurrent()) return { status: 'superseded' };
             // Library track playback flow
             await stopStream();
+            if (!isCurrent()) return { status: 'superseded' };
             setTrackInfo({
                 title: track.title,
                 artist: track.artist,
@@ -2254,15 +2873,20 @@ async function playQueueItem(index) {
                     album: track.album || '',
                     // Server song id (Navidrome/Subsonic) so playback can fall
                     // back to streaming via the server when the file isn't on
-                    // Commissary's disk (#809).
+                    // SoulSync's disk (#809).
                     track_id: track.id || null
                 })
             });
             const result = await response.json();
+            if (!isCurrent()) return { status: 'superseded' };
             if (!result.success) throw new Error(result.error || 'Failed to start playback');
             // Re-apply repeat-one loop property
             if (audioPlayer) audioPlayer.loop = (npRepeatMode === 'one');
-            await startAudioPlayback();
+            const playback = await startAudioPlayback(isCurrent, signal, options.handoff || null);
+            if (playback?.status !== 'played') {
+                if (playback?.status === 'superseded') return playback;
+                throw new Error(playback?.error || 'Playback did not start');
+            }
         } else {
             // Non-library (stream) tracks cannot be queued for auto-advance
             // Just show track info — the stream flow handles its own playback
@@ -2281,22 +2905,50 @@ async function playQueueItem(index) {
             });
         }
     } catch (error) {
+        if (!isCurrent()) return { status: 'superseded' };
         console.error('Queue playback error:', error);
         showToast(`Skipping track: ${error.message}`, 'error');
         hideLoadingAnimation();
         // Auto-skip to next track on failure instead of stopping the queue
         npLoadingQueueItem = false;
         const nextIdx = npQueueIndex + 1;
-        if (nextIdx < npQueue.length) {
-            setTimeout(() => playQueueItem(nextIdx), 500);
+        const skipping = nextIdx < npQueue.length;
+        if (skipping) {
+            setTimeout(() => { if (isCurrent()) void playQueueItem(nextIdx, options); }, 500);
         }
-        return;
+        // A queue that is moving on to the next track has not failed. Saying
+        // 'failed' here made Discover announce "Playback could not start" and
+        // then start playing the next track a moment later.
+        return skipping
+            ? { status: 'skipped', error: error.message }
+            : { status: 'failed', error: error.message };
     } finally {
-        npLoadingQueueItem = false;
+        releaseSetup?.();
+        if (isCurrent()) npLoadingQueueItem = false;
     }
 
     renderNpQueue();
     updateNpPrevNextButtons();
+    return { status: (track.is_library || preview) ? 'played' : 'unsupported' };
+}
+
+function npFocusQueueAction(index, action) {
+    const list = document.getElementById('np-queue-list');
+    const row = list?.querySelectorAll('.np-queue-item')[index];
+    const button = row?.querySelector(`[data-queue-action="${action}"]`);
+    if (button && !button.disabled) button.focus();
+    else if (row) row.querySelector('[data-queue-action="play"]')?.focus();
+    else if (list) { list.tabIndex = -1; list.focus(); }
+}
+
+function npAnnounceQueue(message) {
+    let note = document.getElementById('np-queue-announcement');
+    if (!note) {
+        note = document.createElement('div'); note.id = 'np-queue-announcement';
+        note.className = 'np-queue-announcement'; note.setAttribute('role', 'status');
+        document.getElementById('np-queue-list')?.after(note);
+    }
+    note.textContent = message;
 }
 
 function renderNpQueue() {
@@ -2304,6 +2956,10 @@ function renderNpQueue() {
     const emptyEl = document.getElementById('np-queue-empty');
     const countEl = document.getElementById('np-queue-count');
     if (!listEl) return;
+    listEl.setAttribute('role', 'list');
+    const focused = listEl.contains(document.activeElement) ? document.activeElement : null;
+    const focusedIndex = focused?.closest('.np-queue-item')?.dataset.qindex;
+    const focusedAction = focused?.dataset.queueAction;
 
     if (countEl) countEl.textContent = npQueue.length > 0 ? `(${npQueue.length})` : '';
 
@@ -2319,7 +2975,8 @@ function renderNpQueue() {
     npQueue.forEach((track, i) => {
         const item = document.createElement('div');
         item.className = 'np-queue-item' + (i === npQueueIndex ? ' active' : '');
-        item.onclick = () => playQueueItem(i);
+        item.setAttribute('role', 'listitem');
+        item.setAttribute('aria-label', `${i + 1} of ${npQueue.length}`);
 
         // Drag-to-reorder
         item.draggable = true;
@@ -2341,14 +2998,18 @@ function renderNpQueue() {
         }
         item.appendChild(art);
 
-        const info = document.createElement('div');
-        info.className = 'np-queue-item-info';
+        const info = document.createElement('button');
+        info.type = 'button';
+        info.className = 'np-queue-item-info np-queue-item-play';
+        info.dataset.queueAction = 'play';
+        info.setAttribute('aria-label', `Play ${track.title || 'Unknown track'} by ${track.artist || 'Unknown artist'}`);
+        info.onclick = () => void playQueueItem(i);
 
-        const title = document.createElement('div');
+        const title = document.createElement('span');
         title.className = 'np-queue-item-title';
         title.textContent = track.title || 'Unknown Track';
 
-        const artist = document.createElement('div');
+        const artist = document.createElement('span');
         artist.className = 'np-queue-item-artist';
         artist.textContent = track.artist || 'Unknown Artist';
 
@@ -2356,34 +3017,69 @@ function renderNpQueue() {
         info.appendChild(artist);
         item.appendChild(info);
 
-        // Active row → equalizer animation; others → duration
-        if (i === npQueueIndex) {
+        // Missing rows expose acquisition progress; ready rows keep the normal
+        // equalizer/duration affordance.
+        const meta = document.createElement('div');
+        meta.className = 'np-queue-item-meta';
+        const queueStatus = npQueueStatusLabel(track);
+        if (!track.file_path || (track.playback_status && track.playback_status !== 'ready')) {
+            const status = document.createElement('span');
+            status.className = `np-queue-item-status ${track.playback_status || 'missing'}`;
+            status.textContent = queueStatus || 'Missing';
+            if (track.playback_error) status.title = track.playback_error;
+            meta.appendChild(status);
+        } else if (i === npQueueIndex) {
             const eq = document.createElement('div');
             eq.className = 'np-queue-item-eq';
             eq.innerHTML = '<i></i><i></i><i></i>';
-            item.appendChild(eq);
+            meta.appendChild(eq);
         } else if (track.duration) {
             const dur = document.createElement('span');
             dur.className = 'np-queue-item-duration';
             dur.textContent = formatTime(track.duration);
-            item.appendChild(dur);
+            meta.appendChild(dur);
+        }
+
+        item.appendChild(meta);
+        const actions = document.createElement('div');
+        actions.className = 'np-queue-item-actions';
+        for (const [direction, target, symbol] of [['earlier', i - 1, '↑'], ['later', i + 1, '↓']]) {
+            const move = document.createElement('button');
+            move.type = 'button'; move.className = 'np-queue-item-move';
+            move.dataset.queueAction = direction;
+            move.textContent = symbol;
+            move.setAttribute('aria-label', `Move ${track.title || 'track'} ${direction}`);
+            move.disabled = target < 0 || target >= npQueue.length;
+            move.onclick = () => {
+                npReorderQueue(i, target);
+                npFocusQueueAction(target, direction);
+                npAnnounceQueue(`${track.title || 'Track'} moved to position ${target + 1} of ${npQueue.length}`);
+            };
+            actions.appendChild(move);
         }
 
         const removeBtn = document.createElement('button');
+        removeBtn.type = 'button';
         removeBtn.className = 'np-queue-item-remove';
+        removeBtn.dataset.queueAction = 'remove';
+        removeBtn.setAttribute('aria-label', `Remove ${track.title || 'track'} from queue`);
         removeBtn.innerHTML = '&#10005;';
         removeBtn.title = 'Remove from queue';
         removeBtn.onclick = (e) => {
             e.stopPropagation();
             removeFromQueue(i);
+            npFocusQueueAction(Math.min(i, npQueue.length - 1), 'remove');
+            npAnnounceQueue(`${track.title || 'Track'} removed from queue`);
         };
-        item.appendChild(removeBtn);
+        actions.appendChild(removeBtn);
+        item.appendChild(actions);
 
         listEl.appendChild(item);
     });
 
     npUpdateUpNext();
     npPersistQueue();
+    if (focusedAction && focusedIndex !== undefined) npFocusQueueAction(Number(focusedIndex), focusedAction);
 }
 
 // ── Queue persistence across page reloads (localStorage) ──
@@ -2408,11 +3104,20 @@ function npRestoreQueue() {
         if (!raw) return;
         const data = JSON.parse(raw);
         if (data && Array.isArray(data.queue) && data.queue.length) {
-            npQueue = data.queue;
+            npQueue = npPrepareQueueTracks(data.queue).map(track => {
+                const restored = track;
+                if (!restored.file_path) {
+                    restored.playback_status = 'missing';
+                    restored.playback_error = '';
+                    restored.download_progress = 0;
+                }
+                return restored;
+            });
             // Don't claim a track is "playing" on a fresh load — nothing is.
             npQueueIndex = -1;
             renderNpQueue();
             updateNpPrevNextButtons();
+            npScheduleQueuePrefetch();
         }
     } catch (e) { /* corrupt entry — ignore */ }
 }
@@ -2465,6 +3170,7 @@ function npReorderQueue(from, to) {
     }
     renderNpQueue();
     updateNpPrevNextButtons();
+    npScheduleQueuePrefetch();
 }
 
 // Up-next peek: show the track that plays after the current one.
@@ -2485,31 +3191,58 @@ function npUpdateUpNext() {
     }
 }
 
-// Sleep timer: cycle off → 15 → 30 → 60 → off; stops playback when it fires.
+// Sleep timer: cycle off → 15 → 30 → 45 → 60 → 90 → 120 → end-of-track → off.
+// End-of-track pauses when the current track finishes instead of using a
+// minute timer. Firing always pauses (never stops) — see npFireSleepTimer.
 function npCycleSleepTimer() {
-    const steps = [0, 15, 30, 60];
-    npSleepMinutes = steps[(steps.indexOf(npSleepMinutes) + 1) % steps.length];
+    const steps = [0, 15, 30, 45, 60, 90, 120, 'track'];
+    const cur = npSleepEndOfTrack ? 'track' : npSleepMinutes;
+    const next = steps[(steps.indexOf(cur) + 1) % steps.length];
+    npClearSleepTimer();
     const btn = document.getElementById('np-sleep-btn');
     const label = document.getElementById('np-sleep-label');
-    if (npSleepTimerId) { clearTimeout(npSleepTimerId); npSleepTimerId = null; }
-    if (npSleepMinutes > 0) {
+    if (next === 'track') {
+        npSleepEndOfTrack = true;
+        if (label) label.textContent = 'Sleep: track end';
+        if (btn) btn.classList.add('active');
+    } else if (next > 0) {
+        npSleepMinutes = next;
         if (label) label.textContent = `Sleep ${npSleepMinutes}m`;
         if (btn) btn.classList.add('active');
-        npSleepTimerId = setTimeout(() => {
-            handleStop();
-            npSleepMinutes = 0;
-            if (label) label.textContent = 'Sleep';
-            if (btn) btn.classList.remove('active');
-        }, npSleepMinutes * 60 * 1000);
-    } else {
-        if (label) label.textContent = 'Sleep';
-        if (btn) btn.classList.remove('active');
+        npSleepTimerId = setTimeout(npFireSleepTimer, npSleepMinutes * 60 * 1000);
     }
+    // next === 0 means fully off, already handled by npClearSleepTimer().
+}
+
+function npClearSleepTimer() {
+    if (npSleepTimerId) { clearTimeout(npSleepTimerId); npSleepTimerId = null; }
+    npSleepMinutes = 0;
+    npSleepEndOfTrack = false;
+    const btn = document.getElementById('np-sleep-btn');
+    const label = document.getElementById('np-sleep-label');
+    if (label) label.textContent = 'Sleep';
+    if (btn) btn.classList.remove('active');
+}
+
+function npFireSleepTimer() {
+    // Pause, don't stop: handleStop() runs clearTrack(), which wipes
+    // the queue (including the persisted copy) — falling asleep to a
+    // playlist shouldn't cost the playlist. Pause keeps track + queue
+    // so the morning is one tap to resume.
+    // Tear down any in-flight crossfade first: the second audio element
+    // plays outside audioPlayer, so pausing alone would leave it audible.
+    npCancelCrossfade();
+    if (audioPlayer && !audioPlayer.paused) audioPlayer.pause();
+    setPlayingState(false);
+    npClearSleepTimer();
 }
 
 function updateNpPrevNextButtons() {
     const canPrev = npQueueIndex > 0 || (audioPlayer && audioPlayer.currentTime > 3);
-    const canNext = npQueue.length > 0 && (npShuffleOn ? npQueue.length > 1 : (npQueueIndex < npQueue.length - 1 || npRepeatMode === 'all'));
+    // Radio keeps next alive at the batch tail — a skip there fetches more.
+    const radioCanFetch = npRadioMode && currentTrack && currentTrack.id;
+    const canNext = (npQueue.length > 0 && (npShuffleOn ? npQueue.length > 1 : (npQueueIndex < npQueue.length - 1 || npRepeatMode === 'all')))
+        || Boolean(radioCanFetch);
 
     // Full Now Playing modal buttons
     const prevBtn = document.getElementById('np-prev-btn');
@@ -2524,7 +3257,22 @@ function updateNpPrevNextButtons() {
     if (miniNextBtn) miniNextBtn.disabled = !canNext;
 }
 
+// what the now playing "Add to playlist" hands the picker: artist + title,
+// or null when the track has no artist to identify it by
+function npAddToPlaylistTrack(track) {
+    if (!track) return null;
+    let title = String(track.title || '');
+    const cut = title.indexOf('||');   // some titles are stored "<id>||<title>"
+    if (cut >= 0) title = title.slice(cut + 2);
+    title = title.trim();
+    const artist = String(track.artist || '').trim();
+    if (!title || !artist || artist === 'Unknown Artist') return null;
+    return { track_name: title, artist_name: artist, album_name: String(track.album || '').trim() };
+}
+
 function handlePlayerKeyboardShortcuts(event) {
+    // a popover over the player (add to playlist) owns its own keys
+    if (document.activeElement?.closest?.('[data-popover-layer]')) return;
     // Don't intercept when typing in inputs or when non-player modals are open
     const tag = document.activeElement.tagName.toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select' || document.activeElement.isContentEditable) return;
@@ -3039,7 +3787,93 @@ document.addEventListener('change', (e) => {
 // RADIO MODE
 // ===============================
 
-async function npFetchRadioTracks() {
+// Map a /api/library/radio row into a queue entry (shared by the seeded
+// refill fetch and the Library Radio starter).
+function npMapRadioTrack(t) {
+    return {
+        title: t.title || 'Unknown Track',
+        artist: t.artist || 'Unknown Artist',
+        album: t.album || 'Unknown Album',
+        file_path: t.file_path,
+        filename: t.file_path,
+        is_library: true,
+        image_url: t.image_url || null,
+        id: t.id,
+        artist_id: t.artist_id,
+        album_id: t.album_id,
+        bitrate: t.bitrate,
+        sample_rate: t.sample_rate
+    };
+}
+
+// Library Radio: a seedless station across the WHOLE library (ranked-random
+// server side — popularity nudges, not pure noise). Entry point is the Radio
+// button on the library page. Once the first batch plays, refills go through
+// the normal seeded radio path (each playing track has a library id).
+async function startLibraryRadio() {
+    try {
+        const resp = await fetch('/api/library/radio?library=1&limit=50');
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+        if (!data.success || !data.tracks || data.tracks.length === 0) {
+            showToast('No playable library tracks found for radio', 'error');
+            return;
+        }
+        // Fresh station: replace the queue + any prior radio state, exactly
+        // like startArtistRadioById does.
+        npCancelCrossfade();
+        npRadioMode = false;
+        clearQueue();
+        if (audioPlayer && !audioPlayer.paused) audioPlayer.pause();
+        npQueue = data.tracks.map(npMapRadioTrack);
+        renderNpQueue();
+        // Context BEFORE enabling radio — npSetRadioMode keeps a specific
+        // "<X> Radio" label when one is already set.
+        npSetPlayContext('Library Radio');
+        npSetRadioMode(true, { toast: false });
+        await playQueueItem(0);
+        showToast('Library Radio on - shuffling your whole library', 'success');
+    } catch (e) {
+        console.warn('Library radio failed:', e);
+        showToast(`Failed to start Library Radio: ${e.message}`, 'error');
+    }
+}
+window.startLibraryRadio = startLibraryRadio;
+
+// Play an acquisition-aware track list. Owned rows start immediately; missing
+// rows enter the same queue and are downloaded, verified and imported ahead of
+// playback. Radio mode stays off because a playlist still has a fixed end.
+async function playTrackList(tracks, contextName, options = {}) {
+    if (options.isCurrent && !options.isCurrent()) return { status: 'superseded' };
+    var list = (tracks || []).filter(function (t) {
+        if (!t) return false;
+        if (t.file_path) return true;
+        const title = t.title || t.name;
+        const firstArtist = Array.isArray(t.artists) ? t.artists[0] : null;
+        const artist = t.artist || t.artist_name || (typeof firstArtist === 'object' ? firstArtist?.name : firstArtist);
+        return Boolean(title && artist);
+    });
+    if (!list.length) {
+        showToast('This list has no usable track metadata', 'info');
+        return { status: 'empty' };
+    }
+    window.cancelPendingPlayback();
+    npCancelCrossfade();
+    npRadioMode = false;
+    clearQueue();
+    if (audioPlayer && !audioPlayer.paused) audioPlayer.pause();
+    npQueue = npPrepareQueueTracks(list);
+    renderNpQueue();
+    npSetPlayContext(contextName || 'Playlist');
+    npScheduleQueuePrefetch();
+    return await playQueueItem(0, options);
+}
+window.playTrackList = playTrackList;
+
+async function npFetchRadioTracks(forceAdvance = false) {
+    // forceAdvance: a manual skip at the tail of the fetched batch (next
+    // button / 'n' key) — the user asked for the next track, so advance as
+    // soon as the new batch lands even though something is still playing.
     if (!currentTrack || !currentTrack.id) return;
     try {
         npLoadingQueueItem = true;
@@ -3054,28 +3888,14 @@ async function npFetchRadioTracks() {
         // Bail if radio was toggled off during the fetch
         if (!npRadioMode) { npLoadingQueueItem = false; return; }
         if (data.tracks && data.tracks.length > 0) {
-            data.tracks.forEach(t => {
-                npQueue.push({
-                    title: t.title || 'Unknown Track',
-                    artist: t.artist || 'Unknown Artist',
-                    album: t.album || 'Unknown Album',
-                    file_path: t.file_path,
-                    filename: t.file_path,
-                    is_library: true,
-                    image_url: t.image_url || null,
-                    id: t.id,
-                    artist_id: t.artist_id,
-                    album_id: t.album_id,
-                    bitrate: t.bitrate,
-                    sample_rate: t.sample_rate
-                });
-            });
+            data.tracks.forEach(t => { npQueue.push(npMapRadioTrack(t)); });
             showToast(`Radio: Added ${data.tracks.length} similar tracks`, 'success');
             renderNpQueue();
             updateNpPrevNextButtons();
             npLoadingQueueItem = false;
-            // Only auto-advance if nothing is currently playing (triggered by onAudioEnded)
-            if (!isPlaying) {
+            // Advance when idle (triggered by onAudioEnded) or when the user
+            // explicitly skipped at the batch tail (forceAdvance).
+            if (!isPlaying || forceAdvance) {
                 playNextInQueue();
             }
         } else {
@@ -3136,13 +3956,21 @@ function initMediaSession() {
     } catch (e) { /* some browsers don't support seekto — handlers above still work */ }
 }
 
-// Log a Commissary play once a track has been heard ~10s (the standard "counts
-// as a play" threshold) — feeds 'recently played' + smart-radio recency.
+// Log a SoulSync play once a track has been heard ~10s — feeds 'recently
+// played' + smart-radio recency. 10s is a "play" for SoulSync's own stats,
+// but it is NOT a scrobble: the row only becomes scrobble-eligible via
+// npMaybeMarkScrobbleEligible once the Last.fm threshold is reached.
 let npPlayLogged = false;
+let npPlayId = null;
+let npPlayGeneration = 0;
 function npMaybeLogPlay() {
     if (npPlayLogged || !currentTrack || !audioPlayer) return;
+    // a 30s clip isn't a listen: it would land in recently played and
+    // smart-radio recency for a song nobody heard
+    if (currentTrack.is_preview) return;
     if (!isFinite(audioPlayer.currentTime) || audioPlayer.currentTime < 10) return;
     npPlayLogged = true;   // set first so a slow request can't double-fire
+    const gen = npPlayGeneration;   // a late response for a skipped track must not claim this track's id
     try {
         fetch('/api/library/log-play', {
             method: 'POST',
@@ -3156,7 +3984,32 @@ function npMaybeLogPlay() {
                 },
                 duration_ms: Math.round((audioPlayer.duration || 0) * 1000),
             }),
-        }).catch(() => {});   // fire-and-forget; logging must never affect playback
+        }).then(r => (r && r.ok) ? r.json() : null)
+          .then(d => { if (d && d.play_id != null && gen === npPlayGeneration) npPlayId = d.play_id; })
+          .catch(() => {});   // fire-and-forget; logging must never affect playback
+    } catch (e) { /* non-fatal */ }
+}
+
+// Mark the current play scrobble-eligible once it satisfies the Last.fm rule:
+// played for at least half the track's duration or 4 minutes, whichever comes
+// first (tracks of 30s or less never scrobble). Unknown durations (streams)
+// fall back to the 4-minute cap. Seeking past the threshold counts — this is
+// a heuristic for "actually listened", not an audit.
+let npScrobbleEligibleSent = false;
+function npMaybeMarkScrobbleEligible() {
+    if (npScrobbleEligibleSent || npPlayId == null || !currentTrack || !audioPlayer) return;
+    const dur = audioPlayer.duration;
+    const effectiveDur = (isFinite(dur) && dur > 0) ? dur : Infinity;
+    if (effectiveDur <= 30) return;
+    if (!isFinite(audioPlayer.currentTime)) return;
+    if (audioPlayer.currentTime < Math.min(effectiveDur / 2, 240)) return;
+    npScrobbleEligibleSent = true;   // set first so a slow request can't double-fire
+    try {
+        fetch('/api/library/log-play/eligible', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ play_id: npPlayId }),
+        }).catch(() => {});   // fire-and-forget; scrobbling must never affect playback
     } catch (e) { /* non-fatal */ }
 }
 

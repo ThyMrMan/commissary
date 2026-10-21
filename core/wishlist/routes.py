@@ -80,6 +80,8 @@ def _build_track_data(track: Dict[str, Any], album: Dict[str, Any]) -> Dict[str,
             "artists": album.get("artists", []),
             "images": album_images,
             "album_type": album.get("album_type", "album"),
+            # the artist page's section, when the modal came from there
+            "album_type_locked": bool(album.get("album_type_locked")),
             # release_date stays as whatever the upstream sent
             # (including '' when truly unknown). Path template
             # gracefully omits the year when empty; we don't fake
@@ -175,6 +177,14 @@ def get_wishlist_stats(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], i
         next_run_in_seconds = runtime.get_next_run_seconds("process_wishlist") if runtime.get_next_run_seconds else 0
         is_processing = runtime.is_wishlist_actually_processing()
         current_cycle = _get_wishlist_cycle(runtime.get_music_database)
+        active_batches = 0
+        with runtime.tasks_lock:
+            active_batches = sum(
+                1
+                for batch in runtime.download_batches.values()
+                if batch.get("playlist_id") == "wishlist"
+                and batch.get("phase") not in ["complete", "error", "cancelled"]
+            )
 
         payload = build_wishlist_stats_payload(
             raw_tracks,
@@ -182,6 +192,7 @@ def get_wishlist_stats(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], i
             is_auto_processing=is_processing,
             current_cycle=current_cycle,
         )
+        payload["active_batches"] = active_batches
         return payload, 200
     except Exception as exc:
         runtime.logger.error("Error getting wishlist stats: %s", exc)
@@ -209,6 +220,39 @@ def set_wishlist_cycle(runtime: WishlistRouteRuntime, cycle: str) -> tuple[Dict[
         return {"success": True, "cycle": cycle}, 200
     except Exception as exc:
         runtime.logger.error("Error setting wishlist cycle: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def get_retry_profile(runtime: WishlistRouteRuntime) -> tuple[Dict[str, Any], int]:
+    """The active wishlist retry profile plus every selectable profile."""
+    try:
+        from core.wishlist.retry_backoff import (
+            get_active_retry_profile, list_retry_profiles, profile_to_json)
+        database = runtime.get_music_database()
+        profile = get_active_retry_profile(database)
+        return {
+            "success": True,
+            "profile": profile_to_json(profile),
+            "profiles": [profile_to_json(p) for p in list_retry_profiles(database)],
+        }, 200
+    except Exception as exc:
+        runtime.logger.error("Error getting wishlist retry profile: %s", exc)
+        return {"error": str(exc)}, 500
+
+
+def set_retry_profile(runtime: WishlistRouteRuntime,
+                      payload: Dict[str, Any]) -> tuple[Dict[str, Any], int]:
+    """Set the active wishlist retry profile. An invalid body is a 400."""
+    try:
+        from core.wishlist.retry_backoff import set_active_retry_profile, profile_to_json
+        try:
+            profile = set_active_retry_profile(runtime.get_music_database(), payload or {})
+        except ValueError as exc:
+            return {"error": str(exc)}, 400
+        runtime.logger.info("Wishlist retry profile set to: %s", profile["name"])
+        return {"success": True, "profile": profile_to_json(profile)}, 200
+    except Exception as exc:
+        runtime.logger.error("Error setting wishlist retry profile: %s", exc)
         return {"error": str(exc)}, 500
 
 
@@ -587,6 +631,162 @@ def remove_batch_from_wishlist(
         return {"success": False, "error": str(exc)}, 500
 
 
+# ---------------------------------------------------------------------------
+# Bulk queue actions (grab / skip / retry)
+# ---------------------------------------------------------------------------
+
+BULK_WISHLIST_ACTIONS = ("grab", "skip", "retry")
+BULK_WISHLIST_MAX_IDS = 200
+
+
+def _bulk_ids(track_ids):
+    """Validate a bulk track-id list: dedupe, preserve order, cap 200.
+
+    Returns ``(ids, error)`` — ``ids`` is None when the payload is invalid.
+    """
+    if not isinstance(track_ids, list) or not track_ids:
+        return None, "Missing or invalid track_ids"
+    ids = []
+    for tid in track_ids:
+        s = str(tid).strip() if tid is not None else ""
+        if s and s not in ids:
+            ids.append(s)
+    if not ids:
+        return None, "Missing or invalid track_ids"
+    if len(ids) > BULK_WISHLIST_MAX_IDS:
+        return None, f"Too many track_ids (max {BULK_WISHLIST_MAX_IDS})"
+    return ids, None
+
+
+def _bulk_results(ids, outcomes):
+    """Fold per-item ``(ok, message)`` outcomes into the bulk payload.
+
+    All-ok → 200; anything less → 207 with per-item results.
+    """
+    results = [
+        {"id": tid, "ok": bool(outcomes[tid][0]), "message": outcomes[tid][1]}
+        for tid in ids
+    ]
+    if all(r["ok"] for r in results):
+        return {"success": True, "results": results}, 200
+    return {"success": False, "results": results}, 207
+
+
+def bulk_wishlist_action(runtime: WishlistRouteRuntime, action, track_ids, *,
+                         start_batch=None) -> tuple[Dict[str, Any], int]:
+    """Apply one bulk action to the selected wishlist tracks.
+
+    ``start_batch`` is the download-runner the API layer injects for
+    ``grab`` (it builds the manual-download runtime); the other actions are
+    self-contained. Partial per-item failures return HTTP 207 with
+    ``[{id, ok, message}]``; all-ok returns 200.
+    """
+    if action not in BULK_WISHLIST_ACTIONS:
+        return {"success": False, "error": f"Unknown bulk action '{action}'"}, 400
+    ids, err = _bulk_ids(track_ids)
+    if err:
+        return {"success": False, "error": err}, 400
+    try:
+        if action == "grab":
+            return _bulk_grab(runtime, ids, start_batch=start_batch)
+        if action == "skip":
+            return _bulk_skip(runtime, ids)
+        return _bulk_retry(runtime, ids)
+    except Exception as exc:
+        runtime.logger.error("Error running bulk wishlist action '%s': %s", action, exc)
+        return {"success": False, "error": str(exc)}, 500
+
+
+def _bulk_grab(runtime: WishlistRouteRuntime, ids, *, start_batch):
+    """Queue the selected tracks for download via the normal manual batch.
+
+    ``start_batch(track_ids)`` must return the same ``(payload, status)``
+    shape as ``start_manual_wishlist_download_batch``; it is injected by the
+    API layer, which also enforces the download-permission and 409 guards.
+    """
+    if start_batch is None:
+        raise RuntimeError("bulk grab called without a download runner")
+    payload, status = start_batch(ids)
+    if status != 200 or not (isinstance(payload, dict) and payload.get("success")):
+        error = (payload.get("error") if isinstance(payload, dict)
+                 else None) or "Failed to queue download batch"
+        return {"success": False, "results": [
+            {"id": tid, "ok": False, "message": error} for tid in ids]}, 207
+    batch_id = payload.get("batch_id")
+    runtime.logger.info("Bulk grabbed %s wishlist track(s) (batch %s)", len(ids), batch_id)
+    return {"success": True, "batch_id": batch_id, "results": [
+        {"id": tid, "ok": True, "message": "Queued for download"} for tid in ids]}, 200
+
+
+def _bulk_skip(runtime: WishlistRouteRuntime, ids):
+    """Remove the selected tracks, recording a skip intent per track so the
+    #874 ignore gate blocks automatic re-adds until the TTL ages out.
+
+    Per-item: a track that is already gone fails alone and doesn't take the
+    rest of the selection with it.
+    """
+    from core.wishlist.ignore import ignore_wishlist_track, REASON_SKIPPED
+    service = get_wishlist_service()
+    _db = getattr(service, "database", None)
+    pid = runtime.profile_id
+    outcomes = {}
+    for tid in ids:
+        # Capture label before the row is deleted (#874).
+        _data = None
+        try:
+            if _db is not None:
+                _data = _db.get_wishlist_spotify_data(tid, profile_id=pid)
+        except Exception:
+            _data = None
+        try:
+            removed = service.remove_track_from_wishlist(tid, profile_id=pid)
+        except Exception:
+            removed = False
+        if removed:
+            ignore_wishlist_track(_db, pid, tid, REASON_SKIPPED, spotify_data=_data)
+            outcomes[tid] = (True, "Skipped")
+        else:
+            outcomes[tid] = (False, "Not in wishlist")
+    runtime.logger.info(
+        "Bulk skipped %s of %s wishlist track(s)",
+        sum(1 for ok, _ in outcomes.values() if ok), len(ids))
+    return _bulk_results(ids, outcomes)
+
+
+def _bulk_retry(runtime: WishlistRouteRuntime, ids):
+    """Clear the retry backoff on selected tracks that actually carry one.
+
+    Tracks with no failed attempts are reported, not touched — the DB
+    helper itself only touches failing rows, so the returned count stays
+    honest.
+    """
+    service = get_wishlist_service()
+    _db = getattr(service, "database", None)
+    pid = runtime.profile_id
+    eligible = []
+    outcomes = {}
+    for tid in ids:
+        row = None
+        try:
+            if _db is not None:
+                row = _db.get_wishlist_track(tid, profile_id=pid)
+        except Exception:
+            row = None
+        if row is None:
+            outcomes[tid] = (False, "Not in wishlist")
+        elif (row.get("retry_count") or 0) > 0 or row.get("last_attempted"):
+            eligible.append(tid)
+        else:
+            outcomes[tid] = (False, "No failed attempts to clear")
+    if eligible:
+        changed = _db.reset_wishlist_retry_backoff(eligible, profile_id=pid)
+        for tid in eligible:
+            outcomes[tid] = (True, "Retry clock cleared")
+        runtime.logger.info(
+            "Bulk retry cleared backoff on %s wishlist track(s)", changed)
+    return _bulk_results(ids, outcomes)
+
+
 def add_album_track_to_wishlist(
     runtime: WishlistRouteRuntime,
     *,
@@ -595,13 +795,22 @@ def add_album_track_to_wishlist(
     album: Dict[str, Any] | None,
     source_type: str = "album",
     source_context: Dict[str, Any] | None = None,
+    quality_profile_id: int | None = None,
 ) -> tuple[Dict[str, Any], int]:
-    """Add a single album track to the wishlist."""
+    """Add a single album track to the wishlist.
+
+    ``quality_profile_id`` is the durable acquisition intent chosen in the
+    shared "Tracks to Add to Wishlist" dialog. It travels all the way to the
+    stored row so the same track gets the same rules regardless of which page
+    the user started from (P1-01). ``None`` keeps the app-wide default.
+    """
     try:
         if not track or not artist or not album:
             return {"success": False, "error": "Missing required fields: track, artist, album"}, 400
 
         track_data = _build_track_data(track, album)
+        if quality_profile_id is not None:
+            track_data["quality_profile_id"] = quality_profile_id
 
         # #825: don't add a track that's already in the library, unless the user
         # has opted into duplicates. The manual album "add to wishlist" modal
@@ -611,29 +820,20 @@ def add_album_track_to_wishlist(
         # scan + cleanup use: OFF → skip owned, ON → add anyway. (The quality
         # re-download flow uses a different endpoint, so it's unaffected.)
         try:
-            from config.settings import config_manager as _cfg
-            from core.edition_preference import (
-                PREFER_DELUXE_KEY,
-                owned_row_is_smaller_edition,
-            )
+            from core.settings import config_manager as _cfg
             if not _cfg.get('wishlist.allow_duplicate_tracks', True):
+                # #1289: via find_owned_match, so a library row that still
+                # points into atomic-publish staging does not count as owning
+                # the track. Refusing the add on one would leave the user with
+                # no wishlist entry and a file no media server can see.
+                from core.wishlist.library_match import find_owned_match
                 _db = runtime.get_music_database()
-                _existing, _conf = _db.check_track_exists(
-                    track.get('name', ''), artist.get('name', ''),
-                    confidence_threshold=0.7,
-                    server_source=runtime.active_server,
-                    album=album.get('name', ''),
-                )
-                if _existing and _conf >= 0.7 and _cfg.get(PREFER_DELUXE_KEY, False):
-                    # Prefer deluxe editions: owned only on a smaller edition of
-                    # this album isn't owned for it.
-                    if owned_row_is_smaller_edition(_db, album.get('name', ''),
-                                                    album.get('total_tracks'), _existing):
-                        runtime.logger.info(
-                            "[Wishlist Add] '%s' is owned only on a smaller edition of '%s' "
-                            "— adding it", track.get('name'), album.get('name'))
-                        _existing = None
-                if _existing and _conf >= 0.7:
+                _match = find_owned_match(
+                    _db, track.get('name', ''), [artist], album.get('name', ''),
+                    runtime.active_server,
+                    strict_identity=True, require_album=True,
+                    log=runtime.logger, log_prefix='[Wishlist Add]')
+                if _match:
                     runtime.logger.info(
                         "[Wishlist Add] skipping '%s' by '%s' — already in library "
                         "(allow_duplicate_tracks is off)",
@@ -662,6 +862,7 @@ def add_album_track_to_wishlist(
             # ignore-list, even if the user previously cancelled this track
             # (otherwise the add is silently dropped — carlosjfcasero, #897).
             user_initiated=True,
+            quality_profile_id=quality_profile_id,
         )
 
         if success:
@@ -691,4 +892,7 @@ __all__ = [
     "remove_album_from_wishlist",
     "remove_batch_from_wishlist",
     "add_album_track_to_wishlist",
+    "BULK_WISHLIST_ACTIONS",
+    "BULK_WISHLIST_MAX_IDS",
+    "bulk_wishlist_action",
 ]

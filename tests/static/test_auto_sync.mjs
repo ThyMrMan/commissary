@@ -686,7 +686,7 @@ describe('autoSyncWeeklyLabel', () => {
 });
 
 // =========================================================================
-// Personalized (Commissary Discovery) rows in the Auto-Sync board
+// Personalized (SoulSync Discovery) rows in the Auto-Sync board
 // =========================================================================
 
 describe('autoSyncExpandPersonalizedRows', () => {

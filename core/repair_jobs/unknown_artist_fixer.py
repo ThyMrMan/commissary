@@ -11,13 +11,51 @@ import sys
 import uuid
 
 from core.metadata_service import get_client_for_source, get_primary_source, get_source_priority
+from core.imports.paths import config_root_path
 from core.repair_jobs import register_job
 from core.repair_jobs.base import JobContext, JobResult, RepairJob
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.unknown_artist_fixer")
 
-_UNKNOWN_NAMES = {'unknown artist', 'unknown', ''}
+# every server writes its own placeholder. jellyfin says "Unknown Artist",
+# navidrome and plex bracket theirs ("[Unknown Artist]"), some tag sets say
+# "Unknown Artists" or plain "Unknown". storm (discord): the job found
+# nothing on navidrome because only the first spelling was known. names
+# are folded before comparing (case, whitespace, surrounding brackets), and
+# a user can add their own under the job's `unknown_names` setting.
+_UNKNOWN_NAMES = {'unknown artist', 'unknown artists', 'unknown', ''}
+_BRACKETS = '[](){}<>'
+
+
+def fold_artist_name(name) -> str:
+    """lower, trimmed, surrounding brackets dropped: "[Unknown Artist]" -> "unknown artist"."""
+    value = str(name or '').strip().lower()
+    while value and value[0] in _BRACKETS:
+        value = value[1:].strip()
+    while value and value[-1] in _BRACKETS:
+        value = value[:-1].strip()
+    return value
+
+
+def is_unknown_artist_name(name, extra=()) -> bool:
+    folded = fold_artist_name(name)
+    return folded in _UNKNOWN_NAMES or folded in {fold_artist_name(x) for x in extra}
+
+
+def unknown_name_variants(extra=()) -> list:
+    """every spelling the sql should catch: each known name bare and bracketed.
+
+    sqlite has no bracket-stripping, so the query lists the forms
+    explicitly and the python side (is_unknown_artist_name) does the
+    general fold for anything read back from tags or the catalogue."""
+    bases = {fold_artist_name(x) for x in (*_UNKNOWN_NAMES, *extra)}
+    out = set()
+    for base in bases:
+        out.add(base)
+        if base:
+            out.update({f'[{base}]', f'({base})', f'<{base}>'})
+    return sorted(out)
 _TRACK_ID_SOURCES = {'spotify', 'deezer', 'itunes'}
 _TITLE_SEARCH_SOURCES = {'spotify', 'deezer', 'itunes', 'hydrabase'}
 
@@ -39,10 +77,14 @@ class UnknownArtistFixerJob(RepairJob):
         '3. Searching by track title as a last resort\n\n'
         'When a match is found, the job can re-tag the file, move it to the correct folder, '
         'and update the database.\n\n'
+        'What counts as unknown: "Unknown Artist", "Unknown Artists", "Unknown", an empty name, '
+        'and the bracketed forms servers write ("[Unknown Artist]" on Navidrome and Plex). '
+        'Add your own spellings under Unknown names.\n\n'
         'Settings:\n'
         '- Dry Run: Preview changes without applying them (default: on)\n'
         '- Fix file tags: Write corrected metadata to audio file tags\n'
-        '- Reorganize files: Move files to the correct folder structure'
+        '- Reorganize files: Move files to the correct folder structure\n'
+        '- Unknown names: Extra placeholder names to treat as unknown, comma-separated'
     )
     icon = 'repair-icon-artist'
     default_enabled = False
@@ -51,20 +93,34 @@ class UnknownArtistFixerJob(RepairJob):
         'dry_run': True,
         'fix_tags': True,
         'reorganize_files': True,
+        'unknown_names': '',
     }
     auto_fix = True
+    writes_library_files = True
+
+    def _extra_unknown_names(self, context) -> list:
+        raw = self._get_setting(context, 'unknown_names', '') or ''
+        if isinstance(raw, (list, tuple)):
+            return [str(x) for x in raw if str(x).strip()]
+        return [part for part in (p.strip() for p in str(raw).split(',')) if part]
+
+    def _unknown_sql(self, context):
+        """the IN (...) clause and its params for every unknown spelling."""
+        names = unknown_name_variants(self._extra_unknown_names(context))
+        return ','.join('?' * len(names)), names
 
     def estimate_scope(self, context: JobContext) -> int:
         try:
             conn = context.db._get_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute("""
+                placeholders, names = self._unknown_sql(context)
+                cursor.execute(f"""
                     SELECT COUNT(*) FROM tracks t
                     JOIN artists ar ON ar.id = t.artist_id
-                    WHERE LOWER(TRIM(ar.name)) IN ('unknown artist', 'unknown', '')
+                    WHERE LOWER(TRIM(ar.name)) IN ({placeholders})
                       AND t.file_path IS NOT NULL AND t.file_path != ''
-                """)
+                """, names)
                 return cursor.fetchone()[0]
             finally:
                 conn.close()
@@ -87,8 +143,10 @@ class UnknownArtistFixerJob(RepairJob):
         conn = context.db._get_connection()
         try:
             cursor = conn.cursor()
-            cursor.execute("""
+            placeholders, names = self._unknown_sql(context)
+            cursor.execute(f"""
                 SELECT t.id, t.title, t.file_path, t.track_number, t.duration,
+                       t.owner_profile_id,
                        ar.id as artist_id, ar.name as artist_name,
                        al.id as album_id, al.title as album_title, al.year,
                        al.thumb_url as album_thumb,
@@ -96,11 +154,11 @@ class UnknownArtistFixerJob(RepairJob):
                 FROM tracks t
                 JOIN artists ar ON ar.id = t.artist_id
                 JOIN albums al ON al.id = t.album_id
-                WHERE LOWER(TRIM(ar.name)) IN ('unknown artist', 'unknown', '')
+                WHERE LOWER(TRIM(ar.name)) IN ({placeholders})
                   AND t.file_path IS NOT NULL AND t.file_path != ''
                 ORDER BY al.title, t.track_number
                 LIMIT 500
-            """)
+            """, names)
             tracks = [dict(row) for row in cursor.fetchall()]
         finally:
             conn.close()
@@ -137,11 +195,22 @@ class UnknownArtistFixerJob(RepairJob):
 
             # Resolve actual file on disk via the shared library resolver
             # (picks up library.music_paths + Plex library locations).
+            # #1504: pass the owning library root when known.
             from core.library.path_resolver import resolve_library_file_path
+            _owner_root = None
+            _owner_pid = track.get('owner_profile_id')
+            if _owner_pid:
+                try:
+                    _lib = context.db.get_profile_library(int(_owner_pid))
+                    if _lib.get('mode') == 'own' and _lib.get('root'):
+                        _owner_root = config_root_path(_lib['root'])
+                except Exception as exc:
+                    logger.debug("owner root lookup failed: %s", exc)
             resolved = resolve_library_file_path(
                 file_path,
                 transfer_folder=transfer,
                 config_manager=context.config_manager,
+                library_root=_owner_root,
             )
             if not resolved or not os.path.exists(resolved):
                 result.skipped += 1
@@ -276,7 +345,7 @@ class UnknownArtistFixerJob(RepairJob):
             from core.tag_writer import read_file_tags
             tags = read_file_tags(resolved_path)
             tag_artist = tags.get('artist') or tags.get('album_artist')
-            if tag_artist and tag_artist.strip().lower() not in _UNKNOWN_NAMES:
+            if tag_artist and not is_unknown_artist_name(tag_artist, self._extra_unknown_names(context)):
                 return {
                     'artist': tag_artist.strip(),
                     'album': (tags.get('album') or '').strip() or track.get('album_title', ''),
@@ -410,7 +479,7 @@ class UnknownArtistFixerJob(RepairJob):
                     artist = str(first_artist)
 
         artist = (artist or '').strip()
-        if not artist or artist.lower() in _UNKNOWN_NAMES:
+        if not artist or is_unknown_artist_name(artist):
             return None
 
         album = self._get_track_value(payload, 'album', {}) or {}
@@ -448,6 +517,17 @@ class UnknownArtistFixerJob(RepairJob):
                    expected_rel, transfer, fix_tags, reorganize_files):
         """Apply the fix: re-tag file, move to correct path, update DB."""
         track_id = track['id']
+        # #1504: the fixed file belongs in the owning profile's library,
+        # not necessarily the shared transfer folder.
+        target_root = transfer
+        owner_pid = track.get('owner_profile_id')
+        if owner_pid:
+            try:
+                lib = context.db.get_profile_library(int(owner_pid))
+                if lib.get('mode') == 'own' and lib.get('root'):
+                    target_root = config_root_path(lib['root'])
+            except Exception as exc:
+                logger.debug("own-library root lookup failed: %s", exc)
 
         # Step 1: Write corrected tags to file
         if fix_tags:
@@ -476,7 +556,7 @@ class UnknownArtistFixerJob(RepairJob):
         # Step 2: Move file to correct location
         final_path = resolved_path
         if reorganize_files and expected_rel:
-            expected_abs = os.path.normpath(os.path.join(transfer, expected_rel))
+            expected_abs = os.path.normpath(os.path.join(target_root, expected_rel))
             current_norm = os.path.normpath(resolved_path)
 
             if current_norm.lower() != expected_abs.lower():
@@ -518,12 +598,25 @@ class UnknownArtistFixerJob(RepairJob):
                         except Exception as e:
                             logger.debug("copy cover.jpg: %s", e)
 
-                    # Clean up empty directories
+                    # Clean up empty directories — never a configured root (staging /
+                    # download / transfer), even when nested and empty (#976).
+                    # #1504: also never an own-library root.
+                    try:
+                        from core.imports.file_ops import protected_root_dirs
+                        protected = {os.path.normpath(p) for p in protected_root_dirs() if p}
+                    except Exception:
+                        protected = set()
                     parent = os.path.dirname(current_norm)
                     transfer_norm = os.path.normpath(transfer)
+                    protected.add(transfer_norm)
+                    # #1504: protect the target library root (own or shared) too.
+                    try:
+                        protected.add(os.path.normpath(target_root))
+                    except Exception as exc:
+                        logger.debug("protect target root failed: %s", exc)
                     for _ in range(5):
                         if (parent and os.path.isdir(parent)
-                                and os.path.normpath(parent) != transfer_norm
+                                and os.path.normpath(parent) not in protected
                                 and not os.listdir(parent)):
                             os.rmdir(parent)
                             parent = os.path.dirname(parent)
@@ -554,10 +647,19 @@ class UnknownArtistFixerJob(RepairJob):
                         corrected_artist.strip() or 'unknown'
                     )
                     new_artist_id = f"artist_local_{safe_artist_name}_{uuid.uuid4().hex[:8]}"
-                    cursor.execute(
-                        "INSERT INTO artists (id, name) VALUES (?, ?)",
-                        (new_artist_id, corrected_artist),
-                    )
+                    # #1504: the retagged artist belongs to the same library
+                    # as the track being fixed.
+                    try:
+                        cursor.execute(
+                            "INSERT INTO artists (id, name, owner_profile_id) VALUES (?, ?, ?)",
+                            (new_artist_id, corrected_artist, owner_pid),
+                        )
+                    except Exception:
+                        # older/minimal schemas without the column
+                        cursor.execute(
+                            "INSERT INTO artists (id, name) VALUES (?, ?)",
+                            (new_artist_id, corrected_artist),
+                        )
 
                 # Update track's artist_id and file_path
                 cursor.execute("""
@@ -583,6 +685,18 @@ class UnknownArtistFixerJob(RepairJob):
                 # Update album artist_id to match
                 cursor.execute("UPDATE albums SET artist_id = ? WHERE id = ?",
                                (new_artist_id, track['album_id']))
+
+                # #1504: the retagged album belongs to the same library as
+                # the track being fixed.
+                if owner_pid:
+                    try:
+                        cursor.execute(
+                            "UPDATE albums SET owner_profile_id = ? WHERE id = ?",
+                            (int(owner_pid), track['album_id']),
+                        )
+                    except Exception as exc:
+                        # older/minimal schemas without the column
+                        logger.debug("album owner stamp failed: %s", exc)
 
                 conn.commit()
                 logger.info(f"DB updated: track {track_id} → artist '{corrected_artist}'")

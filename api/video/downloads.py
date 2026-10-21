@@ -28,6 +28,19 @@ from flask import jsonify, request
 
 from utils.logging_config import get_logger
 
+# How long a manual search will wait for a Prowlarr budget slot before giving
+# up. Long enough to ride out a couple of background searches, short enough that
+# nobody thinks the page hung.
+MANUAL_SEARCH_MAX_WAIT_SECONDS = 12.0
+# What one EXT.to page is allowed to cost, end to end. It is a FlareSolverr budget, not
+# a network timeout: the Cloudflare challenge on ext.to's search page is the wait, and
+# it was measured at 4.5s / 12.6s / 15.3s / 17.6s on consecutive runs. The old 20s
+# ceiling sat inside that spread, so the same search failed or succeeded at random with
+# a bare "500 Server Error" (FlareSolverr's way of saying "challenge timed out"). The
+# homepage that Fresh Releases loads is challenged less and had 25s, which is why only
+# Basic Search looked broken.
+EXTTO_PAGE_TIMEOUT_SECONDS = 40
+
 logger = get_logger("video_api.downloads")
 
 # Video-specific OUTPUT library folders (video.db). The INPUT folder is the shared
@@ -54,213 +67,6 @@ _SLSKD_KEYS = {
 }
 
 
-def _resolve_target(db, kind: str, root_folder_id) -> str:
-    """Where a grab of this kind lands (multi-library, P.4): the explicitly
-    picked Library (``root_folder_id``, from the interactive "Get" dropdown)
-    when given, else the PRIMARY configured Library for the active server,
-    else the legacy movies_path/tv_path scalar — unchanged behavior for
-    installs with no Libraries configured yet."""
-    from core.video.download_pipeline import resolve_download_root
-    from core.video.sources import resolve_video_server
-    root_folder = None
-    if root_folder_id:
-        try:
-            root_folder = db.get_root_folder(int(root_folder_id))
-        except (TypeError, ValueError):
-            root_folder = None
-    k = "movie" if str(kind or "").lower() in ("movie", "movies", "film", "films") else "show"
-    server = resolve_video_server(db)
-    primary = db.primary_root_folder(server, k) if server else None
-    paths = {"movies_path": db.get_setting("movies_path"),
-             "tv_path": db.get_setting("tv_path"),
-             "transfer_path": db.get_setting("transfer_path")}
-    return resolve_download_root(kind, root_folder=root_folder,
-                                 primary_root_folder=primary, paths=paths)
-
-
-def _resolve_category(db, kind: str, root_folder_id) -> str | None:
-    """The torrent/usenet category for a grab of this kind (multi-category,
-    P.4): the explicitly picked Library's own category when given, else the
-    PRIMARY configured Library's category, else None (the client adapter
-    falls back to the global torrent_client.category/usenet_client.category
-    setting). Mirrors ``_resolve_target``'s tiers so a grab's destination
-    folder and its category always come from the SAME Library."""
-    from core.video.download_pipeline import resolve_torrent_category
-    from core.video.sources import resolve_video_server
-    root_folder = None
-    if root_folder_id:
-        try:
-            root_folder = db.get_root_folder(int(root_folder_id))
-        except (TypeError, ValueError):
-            root_folder = None
-    k = "movie" if str(kind or "").lower() in ("movie", "movies", "film", "films") else "show"
-    server = resolve_video_server(db)
-    primary = db.primary_root_folder(server, k) if server else None
-    return resolve_torrent_category(root_folder=root_folder, primary_root_folder=primary)
-
-
-def _root_folder_id_for_grab(db, body) -> int | str | None:
-    """The Library a manual grab belongs to.
-
-    An explicit pick from the Library dropdown always wins. With none — the
-    dropdown hides itself when there's only one Library for the kind, and the
-    inline ⬇ buttons on the detail page never render one — fall back to the
-    Library the title is ALREADY filed under. This is the manual twin of
-    ``video_process_wishlist._root_folder_for_item``, which reads root_folder_id
-    straight off the wishlist row; here the payload's media_id/media_source pair
-    is the equivalent handle (same convention as ``download_monitor``: a 'tmdb'
-    media_source means media_id is a tmdb_id, anything else a library row id).
-
-    Returns None only when the title is unknown or unassigned, which leaves the
-    caller's existing primary-Library fallback in charge — unchanged behavior
-    for installs with a single Library per kind."""
-    explicit = (body or {}).get("root_folder_id")
-    if explicit:
-        return explicit
-    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
-        "movie", "movies", "film", "films") else "show"
-    media_id = (body or {}).get("media_id")
-    if not media_id:
-        return None
-    if str((body or {}).get("media_source") or "").lower() == "tmdb":
-        return db.root_folder_id_for_tmdb(kind, media_id)
-    return db.root_folder_id_for_library_row(kind, media_id)
-
-
-def _want_titles(db, body, title=None):
-    """The title(s) a manual search should accept, primary first.
-
-    The unattended paths (wishlist drain, RSS sync, the monitor's requery) have
-    always gated on ``ctx['titles']`` — the primary title PLUS its TMDB aliases —
-    but the interactive search passed a bare ``body['title']``, so a release named
-    by any AKA was rejected as a wrong title only when a human searched for it.
-    That is the wrong way round: the manual path is where a user is watching and
-    expects it to work.
-
-    Falls back to just the primary title whenever the tmdb id can't be resolved or
-    TMDB isn't configured — never fewer titles than before."""
-    primary = title if title is not None else (body or {}).get("title")
-    out = [primary] if primary else []
-    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
-        "movie", "movies", "film", "films") else "show"
-    if str((body or {}).get("scope") or "").lower() in ("episode", "season", "series", "show"):
-        kind = "show"
-    tmdb_id = _tmdb_id_from(db, body)
-    if not tmdb_id:
-        return out or primary
-    # User AKAs first — they're the deliberate override, typed precisely because
-    # TMDB's own aliases didn't cover the release naming being seen.
-    try:
-        for a in (db.aka_titles_for_tmdb(kind, tmdb_id) or []):
-            if a and a not in out:
-                out.append(a)
-    except Exception:   # noqa: BLE001 - a matching assist must never break a search
-        logger.debug("aka lookup failed for %s %s", kind, tmdb_id, exc_info=True)
-    try:
-        from core.video.enrichment.engine import get_video_enrichment_engine
-        for a in (get_video_enrichment_engine().alt_titles_for(kind, tmdb_id) or []):
-            if a and a not in out:
-                out.append(a)
-    except Exception:   # noqa: BLE001
-        logger.debug("alias lookup failed for %s %s", kind, tmdb_id, exc_info=True)
-    return out or primary
-
-
-def _tmdb_id_from(db, body):
-    """The tmdb id behind a search/grab payload — media_id is a tmdb id when
-    media_source says 'tmdb', otherwise a movies/shows row id."""
-    media_id, source = (body or {}).get("media_id"), str((body or {}).get("media_source") or "").lower()
-    if not media_id:
-        return None
-    if source == "tmdb":
-        return media_id
-    kind = "movie" if str((body or {}).get("kind") or "").lower() in (
-        "movie", "movies", "film", "films") else "show"
-    try:
-        return db.tmdb_id_for_library_row(kind, media_id)
-    except Exception:   # noqa: BLE001
-        return None
-
-
-def _episode_hints(db, body, season=None, episode=None):
-    """``(want_date, want_absolute)`` for an episode search — the two ways a
-    release can identify an episode WITHOUT carrying SxxExx.
-
-    Releases named by air date (daily shows: 'The.Daily.Show.2026.07.08') or by
-    ABSOLUTE number (fansub anime: '[SubsPlease] Show - 03') parse to
-    ``episode=None``, and the scope check then has nothing to match on and
-    rejects them. The unattended paths have always supplied both from
-    ``search_context``; the interactive search supplied neither, so searching by
-    hand for an anime episode always failed while the hourly drain grabbed it
-    fine.
-
-    Deliberately NOT gated on ``series_type`` the way ``search_context`` is.
-    Both hints are accept-only — ``has_absolute_episode`` documents that a miss
-    means 'not proven', never a rejection — so computing them for every show is
-    safe, and it removes the dependency on a show being correctly tagged as
-    anime, which is itself a common way for this to go wrong."""
-    body = body or {}
-    scope = str(body.get("scope") or "").lower()
-    if scope and scope not in ("episode",):
-        return None, None
-    s = body.get("season") if season is None else season
-    e = body.get("episode") if episode is None else episode
-    if s is None or e is None:
-        return None, None
-    # The tmdb id is what the DB lookups below need — it is NOT a precondition for
-    # the season-1 derivation, which needs only the season and episode numbers.
-    # Bailing out here on a missing id (a payload that carries none, or a library
-    # row id for a show that isn't in the library) skipped a fallback that would
-    # have answered perfectly well without it.
-    tmdb_id = _tmdb_id_from(db, body)
-    want_date = want_absolute = None
-    if tmdb_id:
-        try:
-            want_date = db.episode_air_date(tmdb_id, s, e)
-        except Exception:   # noqa: BLE001 - a matching assist must never break a search
-            logger.debug("air-date hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
-        try:
-            want_absolute = db.episode_absolute_number(tmdb_id, s, e)
-        except Exception:   # noqa: BLE001
-            logger.debug("absolute hint failed for %s S%sE%s", tmdb_id, s, e, exc_info=True)
-    if want_absolute is None:
-        # episode_absolute_number counts the show's own episode rows, so it can
-        # only answer for a show already IN the library — searching for one you
-        # don't own yet gets nothing, which is exactly when you're searching.
-        #
-        # For SEASON 1 the absolute number IS the episode number, by definition
-        # (specials sit in season 0 and are excluded). Deriving it only for
-        # season 1 is safe; guessing for a later season would be a real risk,
-        # since has_absolute_episode only ever ACCEPTS — wanting S02E05 and
-        # matching a bare "Show - 05" would grab season ONE's episode 5.
-        try:
-            if int(s) == 1 and int(e) >= 1:
-                want_absolute = int(e)
-        except (TypeError, ValueError):
-            pass
-    return want_date, want_absolute
-
-
-def _series_type_for(db, body):
-    """The show's series type for a search payload, or None when untyped.
-
-    Shapes the QUERY only — anime is hunted by absolute number, dailies by air
-    date. It deliberately does NOT gate whether the hints are computed;
-    _episode_hints explains why making a match depend on a hand-applied tag was
-    the wrong lever, and the same reasoning is why an unknown type here still
-    gets the absolute query (build_query suppresses it only for a show
-    explicitly marked standard or daily).
-    """
-    tmdb_id = _tmdb_id_from(db, body)
-    if not tmdb_id:
-        return None
-    try:
-        return db.effective_series_type(tmdb_id)
-    except Exception:   # noqa: BLE001 - a query hint must never break a search
-        logger.debug("series-type hint failed for %s", tmdb_id, exc_info=True)
-        return None
-
-
 def _parse_text(hit) -> str:
     """What the release parser should read for a hit. Soulseek hits are grouped by
     FOLDER — the folder title carries the show/release name, but on library-style
@@ -276,8 +82,137 @@ def _parse_text(hit) -> str:
     return title
 
 
+def _external_ids(body) -> dict:
+    """The tvdb/imdb/tmdb ids a manual search may carry, as prowlarr_search kwargs.
+
+    Prowlarr routes each id to the indexers that can resolve it, which is how the
+    *arr apps stop depending on a title matching scene spelling. Absent keys are
+    dropped rather than passed as None so the strategy builder sees exactly what
+    the caller actually knew."""
+    body = body if isinstance(body, dict) else {}
+    ids = {"imdb_id": body.get("imdb_id"), "tmdb_id": body.get("tmdb_id"),
+           "tvdb_id": body.get("tvdb_id")}
+    return {k: v for k, v in ids.items() if v}
+
+
+def _basic_indexer_names(body) -> list:
+    """Optional Basic Search provider filter for Prowlarr-backed torrent sources."""
+    body = body if isinstance(body, dict) else {}
+    key = str(body.get("indexer") or body.get("provider") or "").strip().lower()
+    aliases = {
+        "thepiratebay": ["the pirate bay", "pirate bay", "tpb"],
+        "tpb": ["the pirate bay", "pirate bay", "tpb"],
+        "1337x": ["1337x"],
+    }
+    return aliases.get(key, [])
+
+
+def _format_strategy_query(search_type: str, query: str, extra: list) -> str:
+    params = " ".join("%s=%s" % (k, v) for k, v in (extra or []) if v is not None)
+    return ("%s: %s %s" % (search_type, query, params)).strip()
+
+
+def _search_queries(body, source: str, scope: str, title: str, season, episode) -> list:
+    """Human-readable queries this manual search request will run/start."""
+    body = body if isinstance(body, dict) else {}
+    source = str(source or "").lower()
+    if source in ("torrent", "usenet"):
+        try:
+            from core.video.prowlarr_search import build_strategies
+            return [_format_strategy_query(t, q, extra) for t, q, extra in build_strategies(
+                scope, title, year=body.get("year"), season=season, episode=episode,
+                air_date=body.get("air_date"), absolute=body.get("absolute"),
+                series_type=body.get("series_type"), **_external_ids(body))]
+        except Exception:   # noqa: BLE001 - query visibility must never break search
+            logger.debug("manual search query summary failed", exc_info=True)
+    if source == "extto":
+        return [str(title or "").strip()] if str(title or "").strip() else []
+    try:
+        from core.video.slskd_search import build_query
+        q = build_query(scope, title, year=body.get("year"), season=season, episode=episode,
+                        air_date=body.get("air_date"), absolute=body.get("absolute"),
+                        series_type=body.get("series_type"))
+        return [q] if q else []
+    except Exception:   # noqa: BLE001
+        logger.debug("manual search text query summary failed", exc_info=True)
+        return []
+
+
+def _search_identity(body, season=None, episode=None):
+    """Commissary: the title's identity for a manual search (aliases, air date,
+    absolute number, series type); see core/commissary/search_identity.py."""
+    from . import get_video_db
+    from core.commissary.search_identity import Identity
+    return Identity(get_video_db(), body, season, episode)
+
+
+def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
+    """The torrent/usenet lane, in ONE place.
+
+    Returns ``(hits, note, hard_error)``. ``hard_error`` is set only when NOTHING
+    could run; ``note`` reports a half that failed while the other answered.
+
+    This exists because there are two manual-search endpoints - /downloads/search
+    and /downloads/search/start - and only the second is reachable from any UI.
+    They each had their own copy of "search the torrent lane", so adding EXT.to
+    to one of them shipped a feature nobody could see. One function now, called
+    by both, and they cannot drift again.
+
+    EXT.to is the OTHER HALF of the torrent lane, the same way the wishlist drain
+    treats it (video_process_wishlist._hits_for_context). Usenet stays
+    Prowlarr-only: EXT.to is torrents.
+    """
+    from core.video.prowlarr_search import prowlarr_search
+    # A person is waiting on this response, so bound the time it will sit in the
+    # shared Prowlarr budget (core.prowlarr_throttle). The background wishlist
+    # drain queues happily; a manual search should say "busy, try again" rather
+    # than hold a request worker while the drain empties the window.
+    # Commissary: limited to the title's video Library's trackers, if it has any
+    from . import get_video_db as _vlib_db
+    from core.commissary.video_libraries import search_indexer_ids
+    lib_ids = search_indexer_ids(_vlib_db(), "movie" if scope == "movie" else "show", body=body)
+    pres = prowlarr_search(scope, title, year=body.get("year"),
+                           season=want_season, episode=want_episode, source=source,
+                           max_wait_seconds=MANUAL_SEARCH_MAX_WAIT_SECONDS,
+                           indexer_names=_basic_indexer_names(body),
+                           **_external_ids(body),
+                           **({"indexer_ids": lib_ids} if lib_ids else {}),
+                           **_search_identity(body, want_season, want_episode).query())  # Commissary
+    prowlarr_error = None
+    if not pres.get("configured"):
+        prowlarr_error = ("Prowlarr isn't configured — set its URL + key on "
+                          "Settings → Downloads.")
+    elif pres.get("error"):
+        prowlarr_error = "Prowlarr: " + str(pres["error"])
+    hits = list(pres.get("hits") or [])
+
+    extto_note = None
+    if source == "torrent":
+        from core.video.extto_search import extto_search
+        try:
+            eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
+                                resolve_magnets=False, max_candidates=1)
+        except Exception as exc:   # noqa: BLE001 - one half must not sink the lane
+            eres = {"configured": True, "error": str(exc), "hits": []}
+        if not eres.get("configured"):
+            extto_note = "EXT.to needs FlareSolverr — set flaresolverr.url."
+        elif eres.get("error"):
+            extto_note = "EXT.to: " + str(eres["error"])
+        else:
+            hits = hits + list(eres.get("hits") or [])
+
+    # The lane has only genuinely FAILED when neither half could run. Returning
+    # Prowlarr's error while EXT.to had results would hide them behind a message
+    # about a service the user may not even run.
+    if prowlarr_error and not hits:
+        return [], None, (prowlarr_error + (" · " + extto_note if extto_note else ""))
+    note = " · ".join(n for n in (prowlarr_error, extto_note) if n) or None
+    return hits, note, None
+
+
 def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None, want_year=None,
-                   want_title=None, blocked_users=None, want_date=None, want_absolute=None) -> list:
+                   want_title=None, blocked_users=None, want_date=None, want_absolute=None,
+                   want_alt=None) -> list:
     """Parse → evaluate → rank a list of raw indexer hits against the quality profile.
     Shared by the mock search and the live slskd start/poll endpoints.
 
@@ -285,18 +220,10 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     = uploaders blocked source-wide (every release from them skipped). Both None = look
     them up. Blocked hits stay VISIBLE in manual search (greyed, with the reason — the
     Sonarr behaviour) but are never `accepted`, so every auto-picker skips them; a manual
-    grab of one is a deliberate user override.
-
-    There is deliberately no tracker signal here. A Library's tracker selection
-    used to arrive as ``preferred_indexer_ids`` and add a score bonus while every
-    indexer was still searched — which is why unticking a tracker changed the
-    ranking but never stopped it being used. It is now a restriction applied at
-    SEARCH time (``prowlarr_search(indexer_ids=…)``, and a pool filter for the
-    RSS pass), so by the time hits reach this function they can only have come
-    from a permitted tracker and a bonus would apply to all of them equally."""
+    grab of one is a deliberate user override."""
     from core.video.custom_formats import format_score, load_formats
     from core.video.quality_eval import evaluate_release
-    from core.video.release_parse import parse_release
+    from core.video.release_parse import parse_release, search_title
     # Custom formats (P3): loaded once per evaluation batch; scored per hit
     # under THIS profile's overrides. Failure = no formats, never a 500.
     try:
@@ -319,10 +246,17 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     for hit in raw:
         parsed = parse_release(_parse_text(hit))
         size_gb = round((hit.get("size_bytes") or 0) / (1024 ** 3), 1)
+        # Swarm health is a TORRENT concept. Usenet and Soulseek hits have no
+        # seeders (Prowlarr leaves the field None for usenet), and a defensive 0
+        # from an indexer must not be read as a dead swarm for them — so the
+        # count only reaches the judge when the hit is actually a torrent.
+        proto = str(hit.get("protocol") or "").lower()
+        seeders = hit.get("seeders") if proto == "torrent" else None
         verdict = evaluate_release(parsed, profile, scope=scope, want_season=want_season,
                                    want_episode=want_episode, size_gb=size_gb, want_year=want_year,
                                    want_title=want_title, want_date=want_date,
-                                   want_absolute=want_absolute)
+                                   want_absolute=want_absolute, seeders=seeders,
+                                   want_alt=want_alt)
         # Custom formats: matched formats ADD their (per-profile) score; a
         # summed score under the profile's floor hard-rejects (Radarr's
         # min custom format score).
@@ -336,12 +270,22 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
                            "rejected": "Format score %d is below your minimum %d" % (fscore, floor)}
         user = hit.get("username")
         is_blocked = bool(user and user in blocked_users) or (user, hit.get("filename")) in blocked
+        # ``rejected`` is a STRING contract everywhere ('rejected says why') —
+        # this branch used to append a LIST onto it, which crashed the whole
+        # wishlist drain with "can only concatenate str (not 'list') to str"
+        # whenever a blocklisted uploader's hit ALSO failed a quality check
+        # (Boulder's Auto-Process Episode Wishlist error), and silently broke
+        # the contract with a bare list when it didn't.
         if user and user in blocked_users:
+            prior = verdict.get("rejected")
             verdict = {**verdict, "accepted": False,
-                       "rejected": (verdict.get("rejected") or []) + ["Uploader blocklisted"]}
+                       "rejected": ("Uploader blocklisted · %s" % prior) if prior
+                       else "Uploader blocklisted"}
         elif (user, hit.get("filename")) in blocked:
+            prior = verdict.get("rejected")
             verdict = {**verdict, "accepted": False,
-                       "rejected": (verdict.get("rejected") or []) + ["Blocklisted release"]}
+                       "rejected": ("Blocklisted release · %s" % prior) if prior
+                       else "Blocklisted release"}
         # Availability = how downloadable the source is (slskd: free slot/queue/speed score
         # from group_video_files; torrents/mock: seeders/peers). Ranks within a quality tier
         # so we grab a free-slot/empty-queue release over one stuck behind a huge queue.
@@ -367,12 +311,33 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
             "repack": parsed.get("repack") or parsed.get("proper"),
             # torrent/usenet grab carriers (present only for Prowlarr hits) — the magnet/NZB
             # URL + protocol the grab hands to the shared torrent/usenet client.
-            "download_url": hit.get("download_url"), "protocol": hit.get("protocol"),
+            "download_url": hit.get("download_url"), "magnet_uri": hit.get("magnet_uri"),
+            "protocol": hit.get("protocol"),
             "indexer_id": hit.get("indexer_id"), "guid": hit.get("guid"),
-            # The indexer's own page for this release — the title links to it so
-            # you can see where a release came from before grabbing it. Already
-            # scheme-checked in prowlarr_search._safe_info_url; None for slskd.
-            "info_url": hit.get("info_url"), "publish_date": hit.get("publish_date"),
+            # Where the release LIVES, for sources whose magnet costs an extra fetch
+            # (EXT.to). Without it every EXT.to hit rendered as "Result only" and had
+            # nothing a grab could resolve from.
+            "info_url": hit.get("info_url"), "magnet_id": hit.get("magnet_id"),
+            # Per-source extras. No source has all of them - an indexer knows the
+            # age and the grab count, Soulseek knows how many peers hold the file
+            # and how contended they are, EXT.to knows what the film IS. The card
+            # shows whichever of them the hit actually carries rather than pretending
+            # every source answers the same questions.
+            # (slots/queue/speed are already projected above for Soulseek)
+            "published_at": hit.get("published_at"), "grabs": hit.get("grabs"),
+            "peer_count": len(hit.get("users") or ()) or None,
+            # Parsed IDENTITY, carried so a manual grab can prefill the identify
+            # modal (Basic Search) instead of making you retype what the release
+            # name already says. `source` above is the release source (WEB/BluRay),
+            # so the release year lives under `year` and the show name under
+            # `search_title` — same field names the Fresh Releases rows use, so one
+            # modal reads both.
+            "search_title": search_title(_parse_text(hit)),
+            "year": parsed.get("year"), "air_date": parsed.get("air_date"),
+            "season": parsed.get("season"), "episode": parsed.get("episode"),
+            "episode_end": parsed.get("episode_end"),
+            "is_season_pack": bool(parsed.get("is_season_pack")),
+            "is_series_pack": bool(parsed.get("is_series_pack")),
         })
     # accepted first, then quality-profile score, then availability, then bigger file.
     results.sort(key=lambda r: (r["accepted"], r["score"], r["_avail"], r["size_bytes"]), reverse=True)
@@ -384,54 +349,9 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     # rejects stay visible (with their reason) for a deliberate manual override.
     accepted = [r for r in results if r["accepted"]]
     rejected = [r for r in results if not r["accepted"]]
-    return (accepted[:_max_accepted()] + rejected[:_max_rejected()])
-
-
-# How many rows a manual search returns. These were hard-coded 40/15, which is
-# what people hit when a popular title "only shows so many torrents" — the
-# ranker had more, the response threw them away. Raised now that the picker can
-# be filtered, and configurable because the right number depends on how many
-# indexers you run.
-_DEF_MAX_ACCEPTED, _DEF_MAX_REJECTED = 100, 40
-
-
-def _capped(key, default, ceiling):
-    try:
-        from config.settings import config_manager
-        n = int(config_manager.get(key, default) or default)
-    except Exception:   # noqa: BLE001 - config must never break a search
-        return default
-    return max(1, min(ceiling, n))
-
-
-def _max_accepted() -> int:
-    return _capped("video.search.max_results", _DEF_MAX_ACCEPTED, 500)
-
-
-def _max_rejected() -> int:
-    """Rejects are capped separately and much lower: the structured tv/movie
-    search casts a wide net, so without a cap the list floods with
-    wrong-episode releases and buries what you actually want."""
-    return _capped("video.search.max_rejected", _DEF_MAX_REJECTED, 200)
-
-
-def _preferred_indexer_ids_for_root_folder(db, root_folder_id) -> set:
-    """The manual-search picker's equivalent of
-    video_process_wishlist._preferred_indexer_ids_for_item — resolves straight
-    from a root_folder_id (the modal's library picker, not a wishlist item)."""
-    if not root_folder_id:
-        return set()
-    try:
-        root = db.get_root_folder(int(root_folder_id))
-    except (TypeError, ValueError):
-        return set()
-    raw = (root or {}).get("preferred_indexer_ids") or ""
-    out = set()
-    for p in str(raw).split(","):
-        p = p.strip()
-        if p.isdigit():
-            out.add(int(p))
-    return out
+    # Commissary: the caps are settings (core.commissary.search_caps), defaults 40/15.
+    from core.commissary.search_caps import max_accepted, max_rejected
+    return (accepted[:max_accepted()] + rejected[:max_rejected()])
 
 
 def _active_episode_keys(db, title) -> set:
@@ -471,12 +391,14 @@ def register_routes(bp):
     def video_downloads_config():
         from . import get_video_db
         from core.video.download_config import load as load_source
-        from config.settings import config_manager
+        from core.settings import config_manager
         db = get_video_db()
         out = {k: db.get_setting(k) or "" for k in _PATH_KEYS}
         if not out["movies_path"]:        # migrate the legacy single transfer folder → Movies
             out["movies_path"] = db.get_setting("transfer_path") or ""
         out["download_path"] = config_manager.get(_SHARED_DOWNLOAD_KEY, "") or ""   # shared w/ music
+        from core.video.library_roots import ADDITIONAL_KEYS, additional_paths
+        out.update({key: additional_paths(db, key) for key in ADDITIONAL_KEYS})
         out.update(load_source(db))   # download_mode + hybrid_order
         return jsonify(out)
 
@@ -486,11 +408,19 @@ def register_routes(bp):
         from core.video.download_config import save as save_source
         db = get_video_db()
         body = request.get_json(silent=True) or {}
+        from core.video.library_roots import ADDITIONAL_KEYS, normalize_paths
+        import json
+        try:
+            extras = {key: normalize_paths(body[key]) for key in ADDITIONAL_KEYS if key in body}
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+        for key, paths in extras.items():
+            db.set_setting(key, json.dumps(paths))
         for key in _PATH_KEYS:
             if key in body:
                 db.set_setting(key, (str(body.get(key) or "")).strip())
         if "download_path" in body:   # SHARED with music — write the same config key
-            from config.settings import config_manager
+            from core.settings import config_manager
             config_manager.set(_SHARED_DOWNLOAD_KEY, (str(body.get("download_path") or "")).strip())
         save_source(db, body)         # download_mode + hybrid_order (validated)
         return jsonify({"status": "saved"})
@@ -569,134 +499,72 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "A rename run is already in progress."}), 409
         return jsonify({"success": True, **res})
 
-    # ── per-title rename (the show/movie page panel) ─────────────────────────
-    # The library-wide job above scans everything on a worker; one title is
-    # small enough to answer inline, and deliberately does NOT touch that job's
-    # shared state — running a preview for one show must not clobber a
-    # library-wide scan someone left open on the Tools page.
-    def _rename_scope(body):
-        """('show'|'movie', id) from a request body, or None if it names nothing."""
-        kind = str((body or {}).get("kind") or "").lower()
-        if kind not in ("show", "movie"):
-            return None
-        try:
-            return (kind, int((body or {}).get("id")))
-        except (TypeError, ValueError):
-            return None
+    # ── the recycle bin, browsable (Aug 27 — parity with the music side's
+    #    deleted-files manager: list / restore / purge / bulk) ──
+    @bp.route("/downloads/recycle", methods=["GET"])
+    def video_downloads_recycle():
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
 
-    @bp.route("/organization/rename/tokens", methods=["GET"])
-    def video_rename_tokens():
-        """The $variables usable in a template, with the value each would take
-        for this title. Also returns the saved template as the starting point."""
-        from core.video import organization
-        from core.video.mass_rename import tokens_for
         from . import get_video_db
         db = get_video_db()
-        kind = str(request.args.get("kind") or "show").lower()
-        if kind not in ("show", "movie"):
-            return jsonify({"success": False, "error": "kind must be show or movie"}), 400
-        try:
-            title_id = int(request.args.get("id"))
-        except (TypeError, ValueError):
-            title_id = None
-        rows = (db.repair_owned_movie_files(movie_id=title_id) if kind == "movie"
-                else db.rename_owned_episode_files(show_id=title_id))
-        settings = organization.load(db)
-        tmpl_key = "movie_template" if kind == "movie" else "episode_template"
+        settings = _org_load(db)
+        items = _recycle.list_entries(settings, db)
         return jsonify({
             "success": True,
-            "kind": kind,
-            "template": settings.get(tmpl_key) or organization.DEFAULTS[tmpl_key],
-            "default_template": organization.DEFAULTS[tmpl_key],
-            "file_count": len(rows),
-            "tokens": tokens_for(kind, rows[0] if rows else None),
+            "items": items,
+            "total_size": sum(i.get("size") or 0 for i in items),
+            "keep_days": int(settings.get("recycle_keep_days") or 7),
+            "recycle_enabled": bool(settings.get("recycle_deletes", True)),
         })
 
-    @bp.route("/organization/naming/preview", methods=["POST"])
-    def video_naming_preview():
-        """Render sample filenames for typed templates, through the REAL renderer.
+    @bp.route("/downloads/recycle/restore", methods=["POST"])
+    def video_downloads_recycle_restore():
+        """Body: {trash_dir, name} for one entry, or {all: true}."""
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
 
-        The settings page used to mirror the template engine in JavaScript to
-        draw this preview, which meant the preview could only be as correct as
-        the copy — and the ``{Token}`` scheme's optional groups and padding are
-        not something worth re-implementing twice. Rendering server-side makes
-        the preview true by construction.
-
-        Body: {movie_template?, episode_template?}. Nothing is saved."""
-        from core.video import organization
+        from . import get_video_db
+        db = get_video_db()
+        settings = _org_load(db)
         body = request.get_json(silent=True) or {}
-        out = {"success": True, "tokens": {
-            "movie": organization.brace_token_names("movie"),
-            "episode": organization.brace_token_names("episode"),
-        }}
-        for scope, key, ext in (("movie", "movie_template", ".mkv"),
-                                ("episode", "episode_template", ".mkv"),
-                                ("youtube", "youtube_template", ".mp4")):
-            tmpl = body.get(key)
-            if tmpl is None:
-                continue
-            try:
-                rendered = organization.render_path(
-                    scope, "", organization.PREVIEW_SAMPLES[scope],
-                    {key: tmpl or organization.DEFAULTS[key]}, ext)
-                out[scope] = rendered["path"].replace("\\", "/").lstrip("/")
-            except Exception as e:   # noqa: BLE001 - a bad template is user input, not a 500
-                out[scope] = None
-                out[scope + "_error"] = str(e)
-        return jsonify(out)
+        if body.get("all"):
+            restored = 0
+            failed = 0
+            for entry in _recycle.list_entries(settings, db):
+                res = _recycle.restore_entry(entry["trash_dir"], entry["name"], settings, db)
+                if res.get("success"):
+                    restored += 1
+                else:
+                    failed += 1
+            return jsonify({"success": failed == 0, "restored": restored, "failed": failed})
+        res = _recycle.restore_entry(body.get("trash_dir"), body.get("name"), settings, db)
+        return jsonify(res), (200 if res.get("success") else 400)
 
-    @bp.route("/organization/rename/preview/title", methods=["POST"])
-    def video_rename_preview_title():
-        """Preview one title's renames against a typed template.
-        Body: {kind: 'show'|'movie', id, template?}. The template is used for
-        this preview only — the saved one is never modified."""
-        from core.video.mass_rename import preview
+    @bp.route("/downloads/recycle/purge", methods=["POST"])
+    def video_downloads_recycle_purge():
+        """Body: {trash_dir, name} for one entry, or {all: true} to empty."""
+        from core.video import recycle as _recycle
+        from core.video.organization import load as _org_load
+
+        from . import get_video_db
+        db = get_video_db()
+        settings = _org_load(db)
         body = request.get_json(silent=True) or {}
-        scope = _rename_scope(body)
-        if scope is None:
-            return jsonify({"success": False, "error": "A show or movie id is required."}), 400
-        res = preview(scope=scope, template=body.get("template"))
-        return jsonify({"success": True, **res})
-
-    @bp.route("/organization/rename/apply/title", methods=["POST"])
-    def video_rename_apply_title():
-        """Apply one title's renames. Body: {kind, id, template?, keys?}.
-
-        The scope and template are re-sent and the plan recomputed here — the
-        client's proposed paths are never trusted, and applying with a template
-        other than the previewed one would rename to names nobody saw."""
-        from core.video.mass_rename import apply as apply_renames
-        body = request.get_json(silent=True) or {}
-        scope = _rename_scope(body)
-        if scope is None:
-            return jsonify({"success": False, "error": "A show or movie id is required."}), 400
-        res = apply_renames(body.get("keys"), scope=scope, template=body.get("template"))
-        if res.get("status") == "skipped":
-            return jsonify({"success": False, "error": "A rename run is already in progress."}), 409
-        return jsonify({"success": True, **res})
+        if body.get("all"):
+            purged = 0
+            for entry in _recycle.list_entries(settings, db):
+                if _recycle.purge_entry(entry["trash_dir"], entry["name"], settings, db).get("success"):
+                    purged += 1
+            return jsonify({"success": True, "purged": purged})
+        res = _recycle.purge_entry(body.get("trash_dir"), body.get("name"), settings, db)
+        return jsonify(res), (200 if res.get("success") else 400)
 
     @bp.route("/downloads/blocklist", methods=["GET"])
     def video_downloads_blocklist():
         """The release blocklist — exact remote files that will never be re-picked."""
         from . import get_video_db
         return jsonify({"success": True, "items": get_video_db().list_video_blocklist()})
-
-    @bp.route("/downloads/indexers", methods=["GET"])
-    def video_downloads_indexers():
-        """The configured Prowlarr indexers, so the Preferred-Trackers setting can
-        offer a pick-list instead of demanding numeric ids the app never showed.
-
-        Identity fields only — never the indexer URL or API key. Admin-gated via
-        the blueprint's prefix list, matching the other indexer/credential
-        surfaces. An unconfigured or unreachable Prowlarr returns an empty list
-        with ``configured`` false, which the UI falls back on rather than
-        pretending there are no trackers."""
-        from core.video.prowlarr_search import is_configured, list_indexers
-        try:
-            return jsonify({"configured": is_configured(), "indexers": list_indexers()})
-        except Exception:
-            logger.exception("failed to list prowlarr indexers")
-            return jsonify({"configured": False, "indexers": []})
 
     @bp.route("/downloads/blocklist", methods=["POST"])
     def video_downloads_blocklist_add():
@@ -761,24 +629,17 @@ def register_routes(bp):
     @bp.route("/downloads/history", methods=["GET"])
     def video_downloads_history():
         """Paged permanent history of grabs (movies + episodes + YouTube). ?kind=
-        movie|show|youtube, ?search=, ?outcome=, ?root_folder_id= (a configured
-        Library — e.g. Anime, not just the movie/show kind split), ?page=, ?limit=.
-        Always returns counts."""
+        movie|show|youtube, ?search=, ?outcome=, ?page=, ?limit=. Always returns counts."""
         from . import get_video_db
         try:
             db = get_video_db()
             kind = request.args.get("kind")
-            root_folder_id = request.args.get("root_folder_id")
-            try:
-                root_folder_id = int(root_folder_id) if root_folder_id else None
-            except (TypeError, ValueError):
-                root_folder_id = None
             res = db.query_download_history(
                 kind=kind if kind in ("movie", "show", "youtube") else None,
                 search=request.args.get("search", ""),
                 outcome=request.args.get("outcome") or None,
-                root_folder_id=root_folder_id,
-                page=request.args.get("page", 1), limit=request.args.get("limit", 40))
+                page=request.args.get("page", 1), limit=request.args.get("limit", 40),
+                library=request.args.get("library") or None)   # Commissary: a Library tab
             return jsonify({"success": True, "counts": db.download_history_counts(), **res})
         except Exception:
             logger.exception("Failed to list video download history")
@@ -951,59 +812,15 @@ def register_routes(bp):
     @bp.route("/detail/show/<int:library_id>/series-type", methods=["PUT"])
     def video_show_series_type(library_id):
         """Set a show's series type (P8): standard | daily | anime. Drives how the
-        drain queries for its episodes (SxxExx vs air date vs absolute number).
-
-        Body may carry ``source: 'tmdb'``, in which case ``library_id`` is a TMDB
-        id for a show NOT in the library and the value is stored as an override
-        keyed by that id. Which matters: series type decides how episodes are
-        HUNTED, so it's most needed while you're still trying to acquire the
-        show — exactly when no library row exists to write it to."""
+        drain queries for its episodes (SxxExx vs air date vs absolute number)."""
         from . import get_video_db
         body = request.get_json(silent=True) or {}
         st = str(body.get("series_type") or "").strip().lower()
         if st not in ("standard", "daily", "anime"):
             return jsonify({"success": False, "error": "series_type must be standard|daily|anime"}), 400
-        db = get_video_db()
-        if str(body.get("source") or "").lower() == "tmdb":
-            if db.set_series_type_override(library_id, st) is None:
-                return jsonify({"success": False, "error": "Could not save."}), 400
-            return jsonify({"success": True})
-        if not db.set_show_series_type(library_id, st):
+        if not get_video_db().set_show_series_type(library_id, st):
             return jsonify({"success": False, "error": "Show not found."}), 404
         return jsonify({"success": True})
-
-    @bp.route("/detail/show/<int:library_id>/season-pack-mode", methods=["PUT"])
-    def video_show_season_pack_mode(library_id):
-        """Set how this show is acquired: as season packs, or episode by episode.
-
-        Body ``{"season_pack_mode": "prefer"|"only"|"never"|""}``; ``""`` clears
-        the override and hands the show back to the global setting.
-
-        A show-level choice BEATS the global in both directions — 'only' packs a
-        show even with season packs switched off globally, 'never' keeps a show
-        on singles with them switched on. A subtractive-only override could not
-        express "always get this one as packs", which is the reason to open this
-        panel at all.
-
-        Like ``series-type``, ``source: 'tmdb'`` addresses a show that is not in
-        the library yet: this decides how a show is HUNTED, so it matters most
-        before you own it."""
-        from . import get_video_db
-        body = request.get_json(silent=True) or {}
-        mode = str(body.get("season_pack_mode") or "").strip().lower()
-        if mode not in ("prefer", "only", "never", ""):
-            return jsonify({"success": False,
-                            "error": "season_pack_mode must be prefer|only|never (or empty to clear)"}), 400
-        db = get_video_db()
-        tmdb_id = library_id
-        if str(body.get("source") or "").lower() != "tmdb":
-            tmdb_id = db.tmdb_id_for_library_row("show", library_id)
-            if not tmdb_id:
-                return jsonify({"success": False,
-                                "error": "This show isn't matched to TMDB yet."}), 404
-        if db.set_season_pack_mode_override(tmdb_id, mode) is None:
-            return jsonify({"success": False, "error": "Could not save."}), 400
-        return jsonify({"success": True, "season_pack_mode": mode or None})
 
     @bp.route("/organization", methods=["GET"])
     def video_organization():
@@ -1033,42 +850,119 @@ def register_routes(bp):
 
     def _profile_for_request(db, src):
         """The quality profile a get-modal search/grab should be judged under:
-        the title's own assignment → the DEFAULT on the Library this grab is
-        destined for → else the global Default profile.
-
-        The Library step is the one that matters for a title the library has
-        never seen. Nothing about such a title carries an assignment yet, so
-        before this it was always judged by the global Default — even when it
-        was explicitly being grabbed INTO a Library that says otherwise, and
-        even though that first grab is the one that decides what lands on disk.
-
-        ``media_source`` follows the convention the rest of the video side uses:
-        'tmdb' means ``media_id`` is a TMDB id, anything else a library row id.
-        Passing the wrong one as ``tmdb_id`` would resolve some other title's
-        profile, so the two are kept apart here rather than guessed at."""
+        the title's own assignment (resolved from tmdb_id when the client sends
+        it) → else the Default profile (P2, per-title profiles)."""
         from core.video.quality_profile import profile_by_id
         pid = src.get("quality_profile_id")
         if pid in (None, "", 0, "0"):
+            tmdb = src.get("tmdb_id") or src.get("media_id")
             scope = str(src.get("scope") or src.get("kind") or "movie").lower()
             kind = "movie" if scope == "movie" else "show"
-            media_id = src.get("media_id")
-            is_tmdb = str(src.get("media_source") or "tmdb") == "tmdb"
-            tmdb = src.get("tmdb_id") or (media_id if is_tmdb else None)
-            rfid = _root_folder_id_for_grab(db, src)
-            try:
-                rfid = int(rfid) if rfid not in (None, "", "null") else None
-            except (TypeError, ValueError):
-                rfid = None
-            try:
-                pid = db.quality_profile_id_for(
-                    kind,
-                    tmdb_id=int(tmdb) if tmdb else None,
-                    library_id=None if is_tmdb else media_id,
-                    root_folder_id=rfid)
-            except (TypeError, ValueError):
-                pid = None
+            if tmdb and str(src.get("media_source") or "tmdb") == "tmdb":
+                try:
+                    pid = db.quality_profile_id_for(kind, tmdb_id=int(tmdb))
+                except (TypeError, ValueError):
+                    pid = None
         return profile_by_id(db, pid), pid
 
+    @bp.route("/downloads/fresh-releases", methods=["GET"])
+    def video_downloads_fresh_releases():
+        """The stored Fresh Releases board for Search -> Fresh Releases.
+
+        Reads the LAST SNAPSHOT rather than the network, so opening the tab is
+        instant. The board (and each release's matched detail facts) is produced
+        by the ``video_extto_fresh_refresh`` automation or the tab's Refresh
+        button — both call core.video.extto_board.refresh_board.
+
+        This used to pull the homepage inline on every open, which meant sitting
+        through a Cloudflare challenge to look at a list, and made per-release
+        matching impossible: each release's detail page is its own challenge, and
+        a bad minute on ext.to costs 40 seconds a page.
+
+        Still browse-only. Grabbing goes through the identify modal, which is
+        where the user says what a release actually is.
+        """
+        from . import get_video_db
+        from core.video.extto_board import load_board
+
+        board = load_board(get_video_db())
+        if not board.get("fetched_at"):
+            from core.video.extto_search import is_configured
+            return jsonify({
+                "success": False, "source": "EXT.to", "sections": {}, "fetched_at": None,
+                "error": ("Fresh Releases requires FlareSolverr — set flaresolverr.url."
+                          if not is_configured() else
+                          "No board yet — hit Refresh, or schedule the "
+                          "'Refresh Fresh Releases' automation."),
+            })
+        return jsonify({"success": True, "source": board.get("source") or "EXT.to",
+                        "sections": board.get("sections") or {},
+                        "total": board.get("total") or 0,
+                        "fetched_at": board.get("fetched_at")})
+
+    @bp.route("/downloads/detail", methods=["GET"])
+    def video_downloads_release_detail():
+        """The facts behind ONE Basic Search hit, for its expanded card.
+
+        Cache-first by default: the hourly Fresh Releases refresh has already
+        matched everything recent, so most EXT.to hits are answered instantly with
+        no network at all. ``fetch=1`` allows a live lookup for a miss - that is one
+        Cloudflare-challenged page, so it happens when a card is actually opened,
+        never while drawing a list of 25.
+
+        Only EXT.to can answer this. A Prowlarr indexer states an age and a grab
+        count and nothing else; Soulseek states peers and queues. Their cards are
+        built from what the search already returned, so they never come here.
+        """
+        from . import get_video_db
+        from core.video.extto_detail import fetch_detail, is_extto_url
+
+        url = request.args.get("url") or ""
+        if not is_extto_url(url):
+            return jsonify({"success": False, "error": "Not an EXT.to release page."}), 400
+
+        from core.video.extto_board import _cached_detail
+        cached = _cached_detail(get_video_db(), url)
+        if cached is not None:
+            return jsonify({"success": True, "detail": cached, "cached": True})
+        if request.args.get("fetch") not in ("1", "true", "yes"):
+            return jsonify({"success": False, "pending": True,
+                            "error": "Not matched yet."}), 200
+
+        res = fetch_detail(url)
+        if not res.get("ok"):
+            return jsonify({"success": False, "error": res.get("error")}), 200
+        try:    # remember it, so the board and every later card get it free
+            get_video_db().extto_detail_store(url, res["detail"])
+        except Exception:   # noqa: BLE001 - failing to cache costs a refetch, nothing more
+            logger.exception("could not cache EXT.to detail for %s", url)
+        return jsonify({"success": True, "detail": res["detail"], "cached": False})
+
+    @bp.route("/downloads/fresh-releases/refresh", methods=["POST"])
+    def video_downloads_fresh_releases_refresh():
+        """Refresh the board NOW — the tab's Refresh button.
+
+        Identical work to the hourly automation (same function), so a manual and
+        a scheduled refresh leave identical state. Matched releases are cached by
+        release, so this is only slow when there is genuinely new material.
+        """
+        from . import get_video_db
+        from core.video.extto_board import load_board, refresh_board
+
+        res = refresh_board(get_video_db())
+        if res.get("status") == "skipped" and res.get("reason") == "already_running":
+            return jsonify({"success": False, "running": True,
+                            "error": "A refresh is already running."}), 409
+        if not res.get("ok"):
+            return jsonify({"success": False,
+                            "error": res.get("error") or "The board could not be refreshed."}), 502
+        board = load_board(get_video_db())
+        return jsonify({"success": True, "source": board.get("source") or "EXT.to",
+                        "sections": board.get("sections") or {},
+                        "total": board.get("total") or 0,
+                        "fetched_at": board.get("fetched_at"),
+                        "stats": {k: res.get(k, 0) for k in
+                                  ("rows", "cached", "fetched", "failed", "skipped")}})
     @bp.route("/downloads/search", methods=["POST"])
     def video_downloads_search():
         """Search a scope (movie / episode / season / series) and return candidates
@@ -1085,46 +979,48 @@ def register_routes(bp):
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
         profile, _pid = _profile_for_request(get_video_db(), body)
-        # Before the search, not after: these shape the QUERY as well as the
-        # ranking. Computing them below the fetch meant an anime episode was
-        # only ever asked for as SxxExx.
-        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
-        _stype = _series_type_for(get_video_db(), body)
+        _ident = _search_identity(body, want_season, want_episode)  # Commissary
         live = False
+        partial_note = None
+        queries = _search_queries(body, source, scope, title, want_season, want_episode)
         if source == "soulseek":
             from core.video.slskd_search import build_query, slskd_search
             sres = slskd_search(build_query(scope, title, year=body.get("year"),
                                             season=want_season, episode=want_episode,
-                                            air_date=_ep_hints[0], absolute=_ep_hints[1],
-                                            series_type=_stype))
+                                            **_ident.query()))  # Commissary
             if not sres.get("configured"):
-                return jsonify({"scope": scope, "results": [], "error": "slskd isn't configured — set its URL on Settings → Downloads."})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if sres.get("error"):
-                return jsonify({"scope": scope, "results": [], "error": "slskd: " + str(sres["error"])})
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "slskd: " + str(sres["error"])})
             raw, live = sres["hits"], True
+        elif source == "extto":
+            from core.video.extto_search import extto_search
+            eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
+                                 resolve_magnets=False, max_candidates=1)
+            if not eres.get("configured"):
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
+            if eres.get("error"):
+                return jsonify({"scope": scope, "results": [], "queries": queries, "error": "EXT.to: " + str(eres["error"])})
+            raw, live = eres["hits"], True
         elif source in ("torrent", "usenet"):
-            from core.video.prowlarr_search import prowlarr_search
-            # Resolved BEFORE the search now, not after: the Library's trackers
-            # restrict which indexers are queried, so a manual search into a
-            # Library honours the same selection the unattended drain does.
-            restrict = _preferred_indexer_ids_for_root_folder(
-                get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
-            pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source,
-                                   air_date=_ep_hints[0], absolute=_ep_hints[1],
-                                   series_type=_stype, indexer_ids=restrict)
-            if not pres.get("configured"):
-                return jsonify({"scope": scope, "results": [],
-                                "error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
-            if pres.get("error"):
-                return jsonify({"scope": scope, "results": [], "error": "Prowlarr: " + str(pres["error"])})
-            raw, live = pres["hits"], True
+            raw, partial_note, hard_error = _torrent_lane_hits(
+                body, scope, title, want_season, want_episode, source)
+            if hard_error:
+                return jsonify({"scope": scope, "results": [], "queries": queries,
+                                "error": hard_error})
+            live = True
         else:
             raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                               episode=want_episode, season_end=season_end, source=source)
-        return jsonify({"scope": scope, "live": live,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
-                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
+        payload = {"scope": scope, "live": live, "queries": queries,
+                   "results": _evaluate_hits(raw, profile, scope, want_season, want_episode,
+                                             want_year=body.get("year"),
+                                             **_ident.judge())}  # Commissary
+        # One half of the lane was down but the other answered: show the results
+        # AND say what is missing, rather than silently returning a short list.
+        if partial_note:
+            payload["note"] = partial_note
+        return jsonify(payload)
 
     @bp.route("/downloads/search/start", methods=["POST"])
     def video_downloads_search_start():
@@ -1138,49 +1034,58 @@ def register_routes(bp):
         title = body.get("title") or ""
         source = str(body.get("source") or "").lower()
         want_season, want_episode, season_end = _search_ints(body)
-        # Air date / absolute number, for releases that carry no SxxExx.
-        _ep_hints = _episode_hints(get_video_db(), body, want_season, want_episode)
-        _stype = _series_type_for(get_video_db(), body)
+        queries = _search_queries(body, source, scope, title, want_season, want_episode)
+        _ident = _search_identity(body, want_season, want_episode)  # Commissary
 
         if source == "soulseek":
             from core.video.slskd_search import (
                 _INTERACTIVE_MAX_WAIT_SECONDS, build_query, search_timeout_ms, start_search)
             res = start_search(build_query(scope, title, year=body.get("year"),
                                            season=want_season, episode=want_episode,
-                                           air_date=_ep_hints[0], absolute=_ep_hints[1],
-                                           series_type=_stype),
+                                           **_ident.query()),  # Commissary
                                max_throttle_wait=_INTERACTIVE_MAX_WAIT_SECONDS)
             if not res.get("configured"):
-                return jsonify({"error": "slskd isn't configured — set its URL on Settings → Downloads."})
+                return jsonify({"queries": queries, "error": "slskd isn't configured — set its URL on Settings → Downloads."})
             if res.get("error"):
-                return jsonify({"error": "slskd: " + str(res["error"])})
+                return jsonify({"queries": queries, "error": "slskd: " + str(res["error"])})
+            # Commissary: the poll carries no identity; remember what this search is for
+            from core.commissary.search_identity import remember
+            remember(res["id"], body)
             # how long the client should keep polling (slskd keeps searching this long).
-            return jsonify({"id": res["id"], "live": True, "complete": False,
+            return jsonify({"id": res["id"], "live": True, "complete": False, "queries": queries,
                             "poll_ms": search_timeout_ms() + 8000})
         profile, _pid = _profile_for_request(get_video_db(), body)
+        if source == "extto":
+            from core.video.extto_search import extto_search
+            eres = extto_search(title, limit=25, timeout=EXTTO_PAGE_TIMEOUT_SECONDS,
+                                 resolve_magnets=False, max_candidates=1)
+            if not eres.get("configured"):
+                return jsonify({"queries": queries, "error": "EXT.to requires FlareSolverr — set flaresolverr.url."})
+            if eres.get("error"):
+                return jsonify({"queries": queries, "error": "EXT.to: " + str(eres["error"])})
+            return jsonify({"id": None, "live": True, "complete": True, "queries": queries,
+                            "results": _evaluate_hits(eres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), **_ident.judge())})  # Commissary
         if source in ("torrent", "usenet"):
             # Prowlarr is synchronous — like the old mock, results come back in one shot
-            # (no polling id), so the client renders immediately.
-            from core.video.prowlarr_search import prowlarr_search
-            restrict = _preferred_indexer_ids_for_root_folder(
-                get_video_db(), _root_folder_id_for_grab(get_video_db(), body))
-            pres = prowlarr_search(scope, title, year=body.get("year"),
-                                   season=want_season, episode=want_episode, source=source,
-                                   air_date=_ep_hints[0], absolute=_ep_hints[1],
-                                   series_type=_stype, indexer_ids=restrict)
-            if not pres.get("configured"):
-                return jsonify({"error": "Prowlarr isn't configured — set its URL + key on Settings → Downloads."})
-            if pres.get("error"):
-                return jsonify({"error": "Prowlarr: " + str(pres["error"])})
-            return jsonify({"id": None, "live": True, "complete": True,
-                            "results": _evaluate_hits(pres["hits"], profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
-                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
+            # (no polling id), so the client renders immediately. Shares the lane
+            # with /downloads/search so EXT.to cannot be wired into one and not
+            # the other; this is the endpoint every UI actually calls.
+            hits, note, hard_error = _torrent_lane_hits(
+                body, scope, title, want_season, want_episode, source)
+            if hard_error:
+                return jsonify({"queries": queries, "error": hard_error})
+            out = {"id": None, "live": True, "complete": True, "queries": queries,
+                   "results": _evaluate_hits(hits, profile, scope, want_season, want_episode,
+                                             want_year=body.get("year"),
+                                             **_ident.judge())}  # Commissary
+            if note:
+                out["note"] = note
+            return jsonify(out)
         # remaining mock sources (e.g. youtube placeholder) resolve in one shot
         raw = mock_search(scope, title, year=body.get("year"), season=want_season,
                           episode=want_episode, season_end=season_end, source=source)
-        return jsonify({"id": None, "live": False, "complete": True,
-                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), want_title=_want_titles(get_video_db(), body),
-                                                 want_date=_ep_hints[0], want_absolute=_ep_hints[1])})
+        return jsonify({"id": None, "live": False, "complete": True, "queries": queries,
+                        "results": _evaluate_hits(raw, profile, scope, want_season, want_episode, want_year=body.get("year"), **_ident.judge())})  # Commissary
 
     @bp.route("/downloads/search/poll", methods=["GET"])
     def video_downloads_search_poll():
@@ -1188,19 +1093,19 @@ def register_routes(bp):
         title, season?, episode?. The client polls until it stops growing or times out."""
         from . import get_video_db
         from core.video.slskd_search import poll_search
+        from core.commissary.search_identity import recall as _recall  # Commissary
         sid = request.args.get("id")
         scope = str(request.args.get("scope") or "movie").lower()
         want_season, want_episode, _ = _search_ints(request.args)
         if not sid:
             return jsonify({"results": [], "live": True, "total_files": 0})
         profile, _pid = _profile_for_request(get_video_db(), request.args)
-        _poll_hints = _episode_hints(get_video_db(), request.args, want_season, want_episode)
         polled = poll_search(sid)
         return jsonify({"live": True, "total_files": polled["total_files"],
                         "results": _evaluate_hits(polled["hits"], profile, scope, want_season, want_episode, want_year=request.args.get("year"),
-                                                 want_title=_want_titles(get_video_db(), request.args,
-                                                                         request.args.get("title")),
-                                                 want_date=_poll_hints[0], want_absolute=_poll_hints[1])})
+                                                  # Commissary: judged by what the search was started for
+                                                  **_search_identity(_recall(sid, request.args),
+                                                                     want_season, want_episode).judge())})
 
     @bp.route("/downloads/grab", methods=["POST"])
     def video_downloads_grab():
@@ -1208,32 +1113,67 @@ def register_routes(bp):
         Body: {kind, title, release_title, source, username, filename, size_bytes,
         quality_label}."""
         from . import get_video_db
-        from config.settings import config_manager
+        from core.settings import config_manager
         from core.video.download_monitor import ensure_started
+        from core.video.download_pipeline import target_dir_for
         from core.video.slskd_download import start_download
 
         body = request.get_json(silent=True) or {}
         source = str(body.get("source") or "soulseek").lower()
-        if source not in ("soulseek", "torrent", "usenet"):
+        if source not in ("soulseek", "torrent", "usenet", "extto"):
             return jsonify({"ok": False, "error": "Unsupported download source."}), 400
+        # EXT.to is a place we FIND releases, not a way we download them - its hits are
+        # magnets that go to the torrent client like any prowlarr hit. The row has to say
+        # 'torrent' or everything downstream keys off source and misses it: the monitor
+        # polls slskd instead of the client (0% forever, then "Trying another release"),
+        # the importer deletes the file out from under the seeding torrent, and the
+        # seeding sweep's source='torrent' query never sees the row. EXT.to keeps its
+        # identity in username/indexer_id, same as thepiratebay and 1337x already do.
+        # Room FIRST, before anything expensive. Resolving an EXT.to magnet is a
+        # Cloudflare challenge that can run half a minute, and a grab that the
+        # disk guard was always going to refuse should not pay for it: Boulder's
+        # 507 took 39.9 seconds to arrive, all of it spent earning a magnet that
+        # was then thrown away.
+        db = get_video_db()
+        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
+        if not paths["movies_path"]:
+            paths["movies_path"] = db.get_setting("transfer_path") or ""
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, body.get("kind"), body) or target_dir_for(body.get("kind"), paths)
+        from core.video import disk_guard, organization
+        room = disk_guard.check_room(
+            target, organization.load(db),
+            # the scratch volume only has to fit THIS release, not the library's
+            # headroom preference
+            needed_gb=(int(body.get("size_bytes") or 0) / (1024 ** 3)) or None)
+        if not room["ok"]:
+            return jsonify({"ok": False,
+                            "error": disk_guard.shortfall_message(room, target)}), 507
+        if not target:
+            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
+
+        if source == "extto":
+            source = "torrent"
+            body["username"] = body.get("username") or "EXT.to"
+            body["indexer_id"] = body.get("indexer_id") or "extto"
+            # Basic Search lists EXT.to releases WITHOUT magnets on purpose: the search
+            # page carries a per-row torrent id but not the tokens the magnet endpoint
+            # is signed with, so every magnet costs its own Cloudflare-challenged detail
+            # fetch. Resolving 25 to draw a result list would take minutes; the one
+            # release you actually picked is resolved here, once, at grab time.
+            if not body.get("download_url") and body.get("info_url"):
+                from core.video.extto_search import resolve_magnet
+                _res = resolve_magnet(body.get("info_url"), magnet_id=body.get("magnet_id"))
+                if not _res.get("ok"):
+                    return jsonify({"ok": False, "error": _res.get("error")
+                                    or "EXT.to would not hand over a magnet for this release."}), 502
+                body["download_url"] = body["magnet_uri"] = _res["magnet"]
         username, filename = body.get("username"), body.get("filename")
         if source == "soulseek" and (not username or not filename):
             return jsonify({"ok": False, "error": "Missing the release's source info."}), 400
         if source in ("torrent", "usenet") and not body.get("download_url"):
             return jsonify({"ok": False, "error": "Missing the release's download URL."}), 400
 
-        db = get_video_db()
-        if str(body.get("kind") or "").lower() == "youtube":
-            target = db.get_setting("youtube_path") or ""
-        else:
-            target = _resolve_target(db, body.get("kind"), _root_folder_id_for_grab(db, body))
-        from core.video import disk_guard, organization
-        ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
-        if not ok_room:
-            return jsonify({"ok": False, "error": "Drive is nearly full (%.1f GB free) — "
-                            "below your minimum free space setting." % (free or 0)}), 507
-        if not target:
-            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
 
         # In-flight dedup — if this exact episode is already downloading/queued, don't
         # start a duplicate (e.g. grabbing an episode that a pack grab already queued).
@@ -1245,31 +1185,7 @@ def register_routes(bp):
 
         import json as _json
         from core.video.slskd_search import build_query
-        ctx = dict(body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {})
-        # The episode hints, filled in HERE rather than trusted from the client.
-        # The unattended paths write air_date + absolute into the context they
-        # build, and the importer's numbering gate reads them back; a grab from
-        # the picker carried neither, so a release named by air date or by the
-        # show's absolute number passed the search and was then turned away at
-        # import as the wrong episode. The client cannot know either number —
-        # the server looks them up from the same episode rows the search used.
-        if str(ctx.get("scope") or "").lower() == "episode":
-            _hint_date, _hint_abs = _episode_hints(db, body, ctx.get("season"), ctx.get("episode"))
-            if _hint_date and not ctx.get("air_date"):
-                ctx["air_date"] = _hint_date
-            if _hint_abs and not ctx.get("absolute"):
-                ctx["absolute"] = _hint_abs
-        _prof, _pid = _profile_for_request(db, body)
-        common = {
-            "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
-            "release_title": body.get("release_title") or body.get("filename") or body.get("title"),
-            "size_bytes": int(body.get("size_bytes") or 0), "quality_label": body.get("quality_label"),
-            "target_dir": target, "status": "downloading",
-            "media_id": (str(body.get("media_id")) if body.get("media_id") is not None else None),
-            "media_source": body.get("media_source"), "year": body.get("year"),
-            "poster_url": body.get("poster_url"), "search_ctx": _json.dumps(ctx), "attempts": 0,
-            "quality_profile_id": _pid,   # the profile this grab is judged under (P2)
-        }
+        common, ctx = _grab_common(db, body, target)
         if source == "soulseek":
             started = start_download(username, filename, body.get("size_bytes") or 0)
             if not started.get("ok"):
@@ -1287,24 +1203,176 @@ def register_routes(bp):
             # torrent / usenet — hand the magnet/NZB to the SHARED download client; the monitor
             # tracks progress + completion by client_ref. No Soulseek-style alternate requery.
             from core.video.client_grab import grab
-            category = None
-            if str(body.get("kind") or "").lower() != "youtube":
-                category = _resolve_category(db, body.get("kind"), _root_folder_id_for_grab(db, body))
-            # magnet_uri rides along from the search hit: the URL is preferred
-            # (#1139) so the real .torrent is fetched server-side, and this is
-            # what the client falls back to if that handoff is refused.
-            res = grab(source, body.get("download_url"), category=category,
-                       fallback_magnet=body.get("magnet_uri"))
+            from core.commissary.video_libraries import manual_category  # Commissary
+            from core.video.client_grab import _category_kw
+            res = grab(source, body.get("download_url"),
+                       fallback_magnet=body.get("magnet_uri"),
+                       **_category_kw(manual_category(db, body.get("kind"), body)))
             if not res.get("ok"):
                 return jsonify({"ok": False, "error": res.get("error") or "The download client refused it."}), 502
-            dl_id = db.add_video_download({**common, "source": source,
-                                           "username": body.get("username"),   # indexer name (display only)
-                                           "filename": body.get("release_title") or body.get("title"),
-                                           "client_ref": res["ref"],
-                                           "candidates": _json.dumps([]), "tried_queries": _json.dumps([]),
-                                           "tried_files": _json.dumps([])})
+            dl_id = _add_client_row(db, common, body, source, res["ref"])
+        _grab_started(common, ctx, source)
         ensure_started(get_video_db)
         return jsonify({"ok": True, "id": dl_id})
+
+    def _grab_common(db, body, target):
+        """The fields every video download row starts with, and its search
+        context. Shared by a grab and a clients-tab match, so a matched download
+        is the same row a grab would have written."""
+        import json as _json
+        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        ctx = {**ctx, "user_initiated": True, "import_policy": "user_replace"}
+        # Commissary: the air date and absolute number the search judged by, so the
+        # importer accepts what the search accepted (and {absolute} naming works).
+        ctx = {**_search_identity({**body, **ctx}, ctx.get("season"), ctx.get("episode")).ctx(),
+               **ctx}
+        _prof, _pid = _profile_for_request(db, body)
+        common = {
+            "kind": str(body.get("kind") or "movie"), "title": body.get("title"),
+            "release_title": body.get("release_title") or body.get("filename") or body.get("title"),
+            "size_bytes": int(body.get("size_bytes") or 0), "quality_label": body.get("quality_label"),
+            "target_dir": target, "status": "downloading",
+            "media_id": (str(body.get("media_id")) if body.get("media_id") is not None else None),
+            "media_source": body.get("media_source"), "year": body.get("year"),
+            "poster_url": body.get("poster_url"), "search_ctx": _json.dumps(ctx), "attempts": 0,
+            "quality_profile_id": _pid,   # the profile this grab is judged under (P2)
+        }
+        return common, ctx
+
+    def _add_client_row(db, common, body, source, client_ref):
+        """A torrent / usenet row: the monitor tracks progress and completion by
+        client_ref. No Soulseek-style alternate requery."""
+        import json as _json
+        return db.add_video_download({**common, "source": source,
+                                      "username": body.get("username"),   # indexer name (display only)
+                                      # the id is the stable key, that's what the seeding
+                                      # sweep looks this tracker's seed goal up by
+                                      "indexer_id": body.get("indexer_id"),
+                                      "filename": body.get("release_title") or body.get("title"),
+                                      "client_ref": client_ref,
+                                      "candidates": _json.dumps([]), "tried_queries": _json.dumps([]),
+                                      "tried_files": _json.dumps([])})
+
+    def _grab_started(common, ctx, source):
+        try:      # 'Release Grabbed' automation trigger (Sonarr's On Grab)
+            from core.video.download_events import publish
+            publish("video_grab_started", {
+                "kind": common["kind"], "title": common["title"] or "",
+                "release_title": common["release_title"] or "",
+                "quality": common["quality_label"] or "", "source": source,
+                "season": ctx.get("season"), "episode": ctx.get("episode")})
+        except Exception:   # noqa: BLE001 - events never disturb the grab
+            logger.exception("grab event publish failed")
+
+    @bp.route("/downloads/adopt", methods=["POST"])
+    def video_downloads_adopt():
+        """Match & import from the clients tab: follow a torrent or usenet job
+        that is already in the client, as if it had been grabbed here.
+
+        Body: {source: torrent|usenet, client_ref, kind: movie|show, title, year,
+        media_id, media_source, poster_url, release_title, size_bytes,
+        search_ctx: {scope: movie|episode|season, title, year, season, episode}}.
+        Writes the same row a grab writes, so the monitor imports it when the
+        client says it is done, and a failure is handled like any grab's.
+        """
+        from . import get_video_db
+        from core.video.download_monitor import ensure_started
+        from core.video.download_pipeline import target_dir_for
+
+        body = request.get_json(silent=True) or {}
+        source = str(body.get("source") or "").lower()
+        client_ref = str(body.get("client_ref") or "").strip()
+        if source == "soulseek":
+            client_ref = str(body.get("username") or "").strip()
+        if source not in ("torrent", "usenet", "soulseek") or not client_ref:
+            return jsonify({"ok": False, "error": "Missing the download to match."}), 400
+        kind = str(body.get("kind") or "").lower()
+        if kind not in ("movie", "show") or not body.get("title"):
+            return jsonify({"ok": False, "error": "Pick what this download is first."}), 400
+
+        db = get_video_db()
+        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
+        if not paths["movies_path"]:
+            paths["movies_path"] = db.get_setting("transfer_path") or ""
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, kind, body) or target_dir_for(kind, paths)
+        if not target:
+            return jsonify({"ok": False, "error": "Set the library folder for this type on Settings → Downloads."}), 400
+
+        if source == "soulseek":
+            return _adopt_soulseek(db, body, kind, target)
+
+        # already followed: a second match would make a second row importing the
+        # same files
+        for existing in db.list_video_downloads(limit=500):
+            if (str(existing.get("client_ref") or "").lower() == client_ref.lower()
+                    and str(existing.get("status") or "").lower()
+                    not in ("failed", "import_failed", "cancelled")):
+                return jsonify({"ok": False, "error": "SoulSync is already following this download."}), 409
+
+        common, ctx = _grab_common(db, body, target)
+        dl_id = _add_client_row(db, common, body, source, client_ref)
+        _grab_started(common, ctx, source)
+        ensure_started(get_video_db)
+        return jsonify({"ok": True, "id": dl_id})
+
+    _VIDEO_EXTS = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".wmv", ".mov", ".webm")
+
+    def _adopt_soulseek(db, body, kind, target):
+        """A folder of slskd transfers. The rows are the ones a soulseek grab
+        (one file) or a pack grab (one row per episode) writes, so the monitor
+        follows each transfer by username + filename the way it always has.
+        Nothing is sent to slskd: the transfers are already there."""
+        import json as _json
+        import os as _os
+        from core.video.download_monitor import ensure_started
+        from core.video.release_parse import parse_release
+        from . import get_video_db
+
+        username = str(body.get("username") or "").strip()
+        files = [f for f in (body.get("files") or []) if isinstance(f, dict) and f.get("filename")
+                 and _os.path.splitext(str(f["filename"]))[1].lower() in _VIDEO_EXTS]
+        if not files:
+            return jsonify({"ok": False, "error": "No video files in that folder."}), 400
+        following = {(str(d.get("username")), str(d.get("filename")))
+                     for d in db.list_video_downloads(limit=500)
+                     if d.get("source") == "soulseek"
+                     and str(d.get("status") or "").lower() not in ("failed", "import_failed", "cancelled")}
+        if any((username, str(f["filename"])) in following for f in files):
+            return jsonify({"ok": False, "error": "SoulSync is already following this download."}), 409
+
+        ctx = body.get("search_ctx") if isinstance(body.get("search_ctx"), dict) else {}
+        picks = []
+        if kind == "show" and ctx.get("scope") == "season":
+            # one row per episode, like a pack grab; files that aren't an
+            # episode (samples, extras) are left alone
+            for f in files:
+                parsed = parse_release(_os.path.basename(str(f["filename"]).replace("\\", "/")))
+                if parsed.get("season") is None or parsed.get("episode") is None:
+                    continue
+                picks.append((f, {**ctx, "scope": "episode", "season": parsed["season"],
+                                  "episode": parsed["episode"]}))
+            if not picks:
+                return jsonify({"ok": False, "error": "Nothing in that folder looked like an episode."}), 400
+        else:
+            biggest = max(files, key=lambda f: int(f.get("size") or 0))
+            picks.append((biggest, ctx))
+
+        ids = []
+        for f, file_ctx in picks:
+            filename = str(f["filename"])
+            row_body = {**body, "search_ctx": file_ctx,
+                        "release_title": _os.path.basename(filename.replace("\\", "/")),
+                        "size_bytes": int(f.get("size") or 0)}
+            common, row_ctx = _grab_common(db, row_body, target)
+            ids.append(db.add_video_download({**common, "source": "soulseek", "username": username,
+                                              "filename": filename,
+                                              "candidates": _json.dumps([]),
+                                              "tried_queries": _json.dumps([]),
+                                              "tried_files": _json.dumps([filename])}))
+            _grab_started(common, row_ctx, "soulseek")
+        ensure_started(get_video_db)
+        return jsonify({"ok": True, "id": ids[0], "ids": ids})
 
     @bp.route("/downloads/grab-pack", methods=["POST"])
     def video_downloads_grab_pack():
@@ -1315,6 +1383,7 @@ def register_routes(bp):
         media_source, year, poster_url, quality_label}."""
         from . import get_video_db
         from core.video.download_monitor import ensure_started
+        from core.video.download_pipeline import target_dir_for
         from core.video.slskd_download import start_download
         from core.video.release_parse import parse_release
         from core.video.slskd_search import build_query
@@ -1328,12 +1397,14 @@ def register_routes(bp):
             return jsonify({"ok": False, "error": "Missing the pack's source info."}), 400
 
         db = get_video_db()
-        target = _resolve_target(db, "show", _root_folder_id_for_grab(db, body))
+        paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
+        from core.commissary.video_libraries import manual_target as _vlib_target  # Commissary
+        target = _vlib_target(db, "show", body) or target_dir_for("show", paths)
         from core.video import disk_guard, organization
-        ok_room, free = disk_guard.has_room(target, organization.load(get_video_db()))
-        if not ok_room:
-            return jsonify({"ok": False, "error": "Drive is nearly full (%.1f GB free) — "
-                            "below your minimum free space setting." % (free or 0)}), 507
+        room = disk_guard.check_room(target, organization.load(get_video_db()))
+        if not room["ok"]:
+            return jsonify({"ok": False,
+                            "error": disk_guard.shortfall_message(room, target)}), 507
         if not target:
             return jsonify({"ok": False, "error": "Set the TV library folder on Settings → Downloads."}), 400
 
@@ -1363,7 +1434,8 @@ def register_routes(bp):
             if not res.get("ok"):
                 skipped += 1
                 continue
-            ctx = {"scope": "episode", "title": title, "season": sn, "episode": en, "year": body.get("year")}
+            ctx = {"scope": "episode", "title": title, "season": sn, "episode": en, "year": body.get("year"),
+                   "user_initiated": True, "import_policy": "user_replace"}
             first_query = build_query("episode", title, season=sn, episode=en)
             dl_id = db.add_video_download({
                 "kind": "show", "title": title, "release_title": _os.path.basename(str(fn)),
@@ -1383,11 +1455,44 @@ def register_routes(bp):
             ensure_started(get_video_db)
         return jsonify({"ok": started > 0, "started": started, "skipped": skipped, "ids": ids})
 
-    def _annotate_upgrade_watches(db, rows) -> None:
+    def _annotate_packs(rows) -> None:
+        """Mark the season-pack BATCH rows for the Downloads page.
+
+        The page groups a show's episodes into one card, keyed on show + season,
+        and it did that by reading ``search_ctx`` itself — which meant a pack row
+        (a season, no episode) matched nothing and rendered as a lonely card
+        beside the very episodes it produced. Live: pack #3911 sat outside the
+        group holding its own #3912–3919.
+
+        The verdict comes from ``core.video.season_pack.is_pack_download`` — the
+        same function the monitor uses to decide whether to map a finished folder.
+        Re-deriving it in JavaScript would be a second answer to one question, and
+        the two would drift the first time the shape changed."""
+        try:
+            from core.video.season_pack import is_pack_download
+        except Exception:   # noqa: BLE001 - the page must render even if this import breaks
+            logger.exception("pack annotation unavailable")
+            return
+        for r in rows or []:
+            try:
+                r["is_pack"] = bool(is_pack_download(r))
+            except Exception:   # noqa: BLE001 - one odd row must not blank the page
+                r["is_pack"] = False
+
+    def _request_profile() -> int:
+        """The requesting user's profile for per-profile wishlist reads."""
+        try:
+            from core.profile_context import get_current_profile_id
+            return int(get_current_profile_id() or 1)
+        except Exception:
+            return 1
+
+    def _annotate_upgrade_watches(db, rows, profile_id) -> None:
         """Mark COMPLETED movie/episode rows that still hold a wishlist row —
         the upgrade-until-cutoff watches. Without this, a below-cutoff grab
         looks identical to a final one on the Downloads page. Identity comes
-        from the same resolver the monitor uses; two set queries total."""
+        from the same resolver the monitor uses; two set queries total.
+        Scoped to the viewer's profile (the wishlist is per-profile)."""
         try:
             from core.video.download_monitor import _as_int, _wishlist_ids
             completed = [r for r in rows if r.get("status") == "completed"
@@ -1397,10 +1502,12 @@ def register_routes(bp):
             conn = db._get_connection()
             try:
                 movie_watches = {r[0] for r in conn.execute(
-                    "SELECT tmdb_id FROM video_wishlist WHERE kind='movie'")}
+                    "SELECT tmdb_id FROM video_wishlist WHERE kind='movie' AND profile_id=?",
+                    (int(profile_id),))}
                 ep_watches = {(r[0], r[1], r[2]) for r in conn.execute(
                     "SELECT tmdb_id, season_number, episode_number "
-                    "FROM video_wishlist WHERE kind='episode'")}
+                    "FROM video_wishlist WHERE kind='episode' AND profile_id=?",
+                    (int(profile_id),))}
             finally:
                 conn.close()
             for r in completed:
@@ -1421,7 +1528,8 @@ def register_routes(bp):
         db = get_video_db()
         ensure_started(get_video_db)   # also (re)start the monitor when the page is open
         rows = db.list_video_downloads()
-        _annotate_upgrade_watches(db, rows)
+        _annotate_upgrade_watches(db, rows, _request_profile())
+        _annotate_packs(rows)
         return jsonify({"downloads": rows})
 
     @bp.route("/downloads/status", methods=["GET"])
@@ -1463,9 +1571,9 @@ def register_routes(bp):
         if dl["status"] in ("completed", "failed", "cancelled"):
             return jsonify({"ok": True, "already": True})
         cancel_download(dl.get("username"), dl.get("filename"))   # best-effort; mark regardless
-        from core.video.timestamps import now_str
+        import time
         db.update_video_download(dl["id"], status="cancelled", error="Cancelled",
-                                 completed_at=now_str())
+                                 completed_at=time.strftime("%Y-%m-%d %H:%M:%S"))
         return jsonify({"ok": True})
 
     @bp.route("/downloads/retry", methods=["POST"])
@@ -1530,13 +1638,13 @@ def register_routes(bp):
     @bp.route("/downloads/slskd", methods=["GET"])
     def video_slskd_config():
         # SHARED with music — same slskd instance. Reads the app-wide config_manager.
-        from config.settings import config_manager
+        from core.settings import config_manager
         return jsonify({k: config_manager.get(cfg, default)
                         for k, (cfg, default) in _SLSKD_KEYS.items()})
 
     @bp.route("/downloads/slskd", methods=["POST"])
     def video_slskd_config_save():
-        from config.settings import config_manager
+        from core.settings import config_manager
         body = request.get_json(silent=True) or {}
         for k, (cfg, _default) in _SLSKD_KEYS.items():
             if k in body:

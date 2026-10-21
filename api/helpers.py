@@ -1,5 +1,5 @@
 """
-Shared response helpers for the Commissary public API.
+Shared response helpers for the SoulSync public API.
 """
 
 from typing import Optional, Set
@@ -72,3 +72,63 @@ def parse_profile_id(request, default: int = 1) -> int:
     except (ValueError, TypeError):
         pass
     return default
+
+
+def acting_profile_id(request, requested=None) -> int:
+    """whose data a session-ui call reads and writes.
+
+    the session's profile, always, for a plain member: a header, query or
+    body profile_id from them is ignored, so they can't read or edit another
+    profile's lists by naming it. an admin (who may look after anyone) and a
+    key-authed /api/v1 caller may name one, via ``requested`` or the
+    X-Profile-Id header / ?profile_id param.
+    """
+    from core.profile_context import get_current_profile_id, is_admin_request
+
+    session_pid = get_current_profile_id()
+    try:
+        path = request.path or ''
+    except RuntimeError:
+        path = ''
+    if path.startswith('/api/v1/') or is_admin_request():
+        if requested not in (None, ''):
+            try:
+                return max(1, int(requested))
+            except (TypeError, ValueError):
+                pass
+        return parse_profile_id(request, default=session_pid or 1)
+    return session_pid
+
+
+def download_permission_error():
+    """A 403 response when the current profile may not download, else ``None``.
+
+    "Can download" is one switch per profile, not one per media type, so
+    podcasts and audiobooks answer to the same checkbox music and video
+    already answer to. Profile 1 is the admin and is always allowed.
+
+    The profile is resolved from the SESSION, never from the request. There is
+    a parse_profile_id() helper that reads an X-Profile-Id header, and it is
+    the right tool for scoping data (whose wishlist am I reading) — but it is
+    caller-supplied, so using it to authorise an action means the caller votes
+    on its own permissions: omit the header and the check reads profile 1 and
+    waves everything through. It takes no argument for that reason. Tests
+    patch get_current_profile_id, not an override parameter.
+
+    Mirrors the music side's ``check_download_permission``, which resolves the
+    same way, so callers read the same: ``err = download_permission_error()``
+    then ``if err: return err``. It lives here rather than in web_server so the
+    isolated blueprints can use it without importing the app.
+    """
+    from core.permissions import download_denied_reason
+    from core.profile_context import get_current_profile_id
+
+    def _get_profile(pid):
+        from database.music_database import get_database
+
+        return get_database().get_profile(pid)
+
+    reason = download_denied_reason(get_current_profile_id(), _get_profile)
+    if reason:
+        return jsonify({"success": False, "error": reason}), 403
+    return None

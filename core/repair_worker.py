@@ -7,8 +7,8 @@ is independently configurable and can be enabled/disabled by the user.
 The worker is deactivated by default — the user must explicitly enable it.
 """
 
-import json
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -34,6 +34,166 @@ from utils.logging_config import get_logger
 logger = get_logger("repair_worker")
 
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif'}
+
+# How long a RESOLVED finding keeps suppressing its own recurrence. See
+# RepairWorker._within_recurrence_grace for why the window exists at all.
+RESOLVED_RECURRENCE_GRACE_DAYS = 7
+
+# Fixing these MOVES OR DELETES files, or throws away a copy the user may
+# still want. Membership is judged by a type's DEFAULT action — the one a
+# bulk run takes when nobody chose anything — not by its worst-case action.
+# The UI never one-clicks these: they go through the preview + confirm path,
+# and "Fix all safe" skips them entirely.
+# Finding types whose subject IS a path that is not there. The sweep below runs
+# right after the scan that raised them, scoped to that same job, so without this
+# exclusion both would be retired the instant they were created and their jobs
+# would report "N findings created" over an empty list.
+#
+#   dead_file    names the missing file of a track that still has a catalogue row
+#   empty_folder names a directory that is empty by definition
+_ABSENCE_IS_THE_FINDING = frozenset({'dead_file', 'empty_folder'})
+
+
+DESTRUCTIVE_FINDING_TYPES = frozenset({
+    'orphan_file',            # default 'staging' MOVES the file; 'delete' removes it
+    'dead_file',              # 'remove' drops the library row + file
+    'corrupt_audio',          # moves to the deleted-files folder, re-wishlists
+    'unwanted_content',       # deletes/quarantines live + spoken content
+    'short_preview_track',    # deletes the clip, re-wishlists the real track
+    'expired_download',       # deletes the aged download
+    'empty_folder',           # removes the folder
+    'duplicate_tracks',       # keeps one copy, deletes the others
+    'single_album_redundant', # deletes the redundant single
+    'quality_upgrade',        # 'delete' variant removes the below-profile file
+    'acoustid_mismatch',      # 'delete'/'relocate' both touch files
+})
+
+# Display metadata for every finding type the jobs can emit. The UI used to
+# keep its own copy of this (20 types) while the backend had 29 handlers, so
+# nine working fixes had no button and two dead-end types had one that could
+# never succeed. Served by /api/repair/finding-types; the client copy is now
+# only an offline fallback.
+#   verb: the button label — say what will HAPPEN, not "Fix"
+#   dry_run_capable: the owning job supports a dry-run/preview mode
+FINDING_TYPE_META = {
+    'dead_file':                {'label': 'Dead Files', 'verb': 'Re-download'},
+    'orphan_file':              {'label': 'Orphan Files', 'verb': 'Review & Move'},
+    'track_number_mismatch':    {'label': 'Track Number Mismatch', 'verb': 'Apply'},
+    'missing_cover_art':        {'label': 'Missing Cover Art', 'verb': 'Apply Art'},
+    'missing_lyrics':           {'label': 'Missing Lyrics', 'verb': 'Apply Lyrics'},
+    'missing_replaygain':       {'label': 'Missing ReplayGain', 'verb': 'Apply RG'},
+    'replaygain_retag':         {'label': 'ReplayGain Retag', 'verb': 'Apply RG'},
+    'untagged_download':        {'label': 'Untagged Downloads', 'verb': 'Write Tags'},
+    'empty_folder':             {'label': 'Empty Folders', 'verb': 'Delete Folder'},
+    'expired_download':         {'label': 'Expired Downloads', 'verb': 'Delete'},
+    'metadata_gap':             {'label': 'Metadata Gaps', 'verb': 'Auto-Fill'},
+    'bpm_backfill':             {'label': 'Missing BPM', 'verb': 'Apply BPM'},
+    'duplicate_tracks':         {'label': 'Duplicate Tracks', 'verb': 'Keep Best'},
+    'single_album_redundant':   {'label': 'Redundant Singles', 'verb': 'Remove Single'},
+    'mbid_mismatch':            {'label': 'MBID Mismatch', 'verb': 'Apply Tags'},
+    'album_mbid_mismatch':      {'label': 'Album MBID Mismatch', 'verb': 'Apply Tags'},
+    'album_tag_inconsistency':  {'label': 'Album Tag Drift', 'verb': 'Unify Tags'},
+    'incomplete_album':         {'label': 'Incomplete Albums', 'verb': 'Fill Album'},
+    'path_mismatch':            {'label': 'Path Mismatch', 'verb': 'Reorganize'},
+    'missing_lossy_copy':       {'label': 'Missing Lossy Copy', 'verb': 'Convert'},
+    'unwanted_content':         {'label': 'Unwanted Content', 'verb': 'Remove'},
+    'unknown_artist':           {'label': 'Unknown Artist', 'verb': 'Identify'},
+    'suspect_album_tag':        {'label': 'Suspect Album Tags', 'verb': 'Re-identify'},
+    'acoustid_mismatch':        {'label': 'AcoustID Mismatch', 'verb': 'Re-tag'},
+    'quality_upgrade':          {'label': 'Quality Upgrades', 'verb': 'Upgrade'},
+    'missing_discography_track':{'label': 'Missing Discography', 'verb': 'Add to Wishlist'},
+    'library_retag':            {'label': 'Library Re-tag', 'verb': 'Apply Tags'},
+    'short_preview_track':      {'label': 'Preview Clips', 'verb': 'Re-download'},
+    'corrupt_audio':            {'label': 'Corrupt Audio', 'verb': 'Re-download',
+                                 'confirm': ('The damaged files move to the deleted-files folder, where they '
+                                             'can be restored until retention clears them, and the tracks '
+                                             'are re-downloaded.')},
+    'canonical_version':        {'label': 'Canonical Version', 'verb': 'Pin Version'},
+    'genre_cleanup':            {'label': 'Genre Cleanup', 'verb': 'Clean Genres'},
+    'comma_artist_split':       {'label': 'Combined Artists', 'verb': 'Split Artists'},
+    'fake_lossless':            {'label': 'Fake Lossless', 'verb': 'Re-download FLAC'},
+    'album_needs_enrichment':   {'label': 'Needs Enrichment', 'verb': None},
+    'album_release_year_mismatch': {'label': 'Album Release Year Mismatch', 'verb': 'Fix Release Year'},
+}
+
+
+# Which family each job belongs to, and the order the families are shown in.
+#
+# Thirty jobs rendered as thirty identical stacked cards is a wall: no order,
+# no organisation, and no way to answer "what looks after my files" without
+# reading every title. Grouped, the page has a shape.
+#
+# ONE table on purpose. The alternative — a `category` attribute on each of
+# the 29 job classes — spreads the taxonomy across 29 files where nobody can
+# see whether it still hangs together. A job missing from here lands in the
+# trailing bucket, which is visible rather than silent.
+JOB_CATEGORY_ORDER = [
+    'Files & storage',
+    'Audio quality',
+    'Tags & metadata',
+    'Artwork & lyrics',
+    'Collection gaps',
+    'System',
+    'Other',
+]
+
+JOB_CATEGORY_FALLBACK = 'Other'
+
+JOB_CATEGORIES = {
+    # Anything whose fix moves, converts or removes a file on disk.
+    'orphan_file_detector': 'Files & storage',
+    'dead_file_cleaner': 'Files & storage',
+    'empty_folder_cleaner': 'Files & storage',
+    'expired_download_cleaner': 'Files & storage',
+    'duplicate_detector': 'Files & storage',
+    'single_album_dedup': 'Files & storage',
+    'library_reorganize': 'Files & storage',
+    'lossy_converter': 'Files & storage',
+    'live_commentary_cleaner': 'Files & storage',
+    # Is the audio itself what it claims to be, and good enough.
+    'audio_corruption_detector': 'Audio quality',
+    'fake_lossless_detector': 'Audio quality',
+    'acoustid_scanner': 'Audio quality',
+    'quality_upgrade': 'Audio quality',
+    'quality_upgrade_scanner': 'Audio quality',
+    'replaygain_filler': 'Audio quality',
+    # What is written on and about the tracks.
+    'library_retag': 'Tags & metadata',
+    'untagged_downloads': 'Tags & metadata',
+    'track_number_repair': 'Tags & metadata',
+    'album_tag_consistency': 'Tags & metadata',
+    'mbid_mismatch_detector': 'Tags & metadata',
+    'genre_cleanup': 'Tags & metadata',
+    'genre_enrichment': 'Tags & metadata',
+    'comma_artist_splitter': 'Tags & metadata',
+    'unknown_artist_fixer': 'Tags & metadata',
+    'suspect_album_tag_detector': 'Tags & metadata',
+    'metadata_gap_filler': 'Tags & metadata',
+    'bpm_backfill': 'Tags & metadata',
+    'artist_nfo_backfill': 'Tags & metadata',
+    'canonical_version_resolve': 'Tags & metadata',
+    'album_release_year_repair': 'Tags & metadata',
+    'missing_cover_art': 'Artwork & lyrics',
+    'missing_lyrics': 'Artwork & lyrics',
+    # Filling gaps in what you own, rather than repairing what you have.
+    'album_completeness': 'Collection gaps',
+    'discography_backfill': 'Collection gaps',
+    'cache_evictor': 'System',
+}
+
+
+def _lock_genres(cursor, table: str, entity_id) -> None:
+    """mark genres a genre job just settled, so the next media server scan
+    keeps them instead of putting back what the files said (Cremonies).
+    an older db without the column just doesn't get the lock."""
+    cols = {c[1] for c in cursor.execute(f"PRAGMA table_info({table})").fetchall()}  # noqa: S608 - fixed table
+    if 'genres_locked' in cols:
+        cursor.execute(f"UPDATE {table} SET genres_locked = 1 WHERE id = ?", (entity_id,))  # noqa: S608
+
+
+def job_category(job_id: str) -> str:
+    """The family a job belongs to. Unknown jobs are grouped, not hidden."""
+    return JOB_CATEGORIES.get(job_id, JOB_CATEGORY_FALLBACK)
 
 
 def _album_fill_artist_names_match(expected_artist: str, candidate_artist: str) -> bool:
@@ -111,6 +271,12 @@ def _split_acoustid_credit(credit: str) -> List[str]:
         return [credit] if credit else []
 
 
+def _server_playlist_membership():
+    """{track_id: [playlist titles]} on the active media server (cached)."""
+    from core.library import playlist_membership
+    return playlist_membership.server_playlist_membership()
+
+
 def _resolve_file_path(file_path, transfer_folder, download_folder=None,
                        config_manager=None, plex_client=None):
     """Resolve a stored DB path to an actual file on disk.
@@ -131,6 +297,97 @@ def _resolve_file_path(file_path, transfer_folder, download_folder=None,
         config_manager=config_manager,
         plex_client=plex_client,
     )
+
+
+def _path_mapping_hint(config_manager) -> str:
+    try:
+        active = config_manager.get_active_media_server()
+    except Exception:
+        active = None
+    if str(active or '').lower() == 'navidrome':
+        return (
+            'Navidrome may be reporting virtual paths. Enable "Report Real Path" '
+            'for the SoulSync player, then run a full database refresh.'
+        )
+    return 'Check Settings -> Library -> Music Paths so SoulSync can map this path.'
+
+
+def _delete_file_if_present(file_path, transfer_folder, config_manager=None, download_folder=None):
+    """Best-effort delete with an explicit reason when the path cannot be mapped."""
+    if not file_path:
+        return False, None
+    resolved = _resolve_file_path(
+        file_path, transfer_folder,
+        download_folder=download_folder,
+        config_manager=config_manager)
+    if resolved and os.path.exists(resolved):
+        try:
+            os.remove(resolved)
+            return True, None
+        except Exception as e:
+            logger.warning("Could not delete file %s: %s", resolved, e)
+            return False, str(e)
+    if resolved is None:
+        return False, f'file could not be located ({_path_mapping_hint(config_manager)})'
+    return False, 'file was already gone'
+
+
+def _file_removal_failed(removed: bool, note) -> bool:
+    """True when a best-effort file removal/quarantine actually failed on a file
+    that was there — the approved action didn't happen, so the finding must stay
+    actionable. 'already gone', unlocatable, and no-path are benign: nothing was
+    left behind on disk."""
+    if removed or not note:
+        return False
+    if note == 'file was already gone':
+        return False
+    if 'could not be located' in note:
+        return False
+    return True
+
+
+def _quarantine_file_if_present(file_path, transfer_folder, source,
+                                config_manager=None, download_folder=None):
+    """Move a library file into the deleted-files quarantine instead of deleting it.
+
+    Returns ``(moved, note, dest)``. The file keeps its path relative to the
+    transfer folder (or its name, for files outside it) and is recorded in the
+    quarantine manifest, so the deleted-files manager can restore it and the
+    library.deleted_keep_days retention ages it out like any other removal.
+    """
+    if not file_path:
+        return False, None, None
+    resolved = _resolve_file_path(
+        file_path, transfer_folder,
+        download_folder=download_folder,
+        config_manager=config_manager)
+    if resolved is None:
+        return False, f'file could not be located ({_path_mapping_hint(config_manager)})', None
+    if not os.path.exists(resolved):
+        return False, 'file was already gone', None
+    from core.repair_jobs.base import deleted_quarantine_root
+    from core.library.deleted_quarantine import record_deleted_entry
+    deleted_root = deleted_quarantine_root(transfer_folder)
+    try:
+        rel = os.path.relpath(resolved, transfer_folder)
+    except ValueError:
+        rel = os.path.basename(resolved)
+    if rel.startswith('..') or os.path.isabs(rel):
+        rel = os.path.basename(resolved)
+    dest = os.path.join(deleted_root, rel)
+    base, ext = os.path.splitext(dest)
+    n = 1
+    while os.path.exists(dest):
+        dest = f"{base}_{n}{ext}"
+        n += 1
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.move(resolved, dest)
+    except OSError as e:
+        logger.warning("Could not move %s to the deleted folder: %s", resolved, e)
+        return False, str(e), None
+    record_deleted_entry(deleted_root, dest, resolved, source)
+    return True, None, dest
 
 
 class RepairWorker:
@@ -179,6 +436,12 @@ class RepairWorker:
         # Forced job queue (for "Run Now" button — processed by main loop)
         self._force_run_queue: List[str] = []
         self._force_run_lock = threading.Lock()
+
+        # Automation-engine emit hook (set by web_server to engine.emit).
+        # Fire-and-forget: repair events power the 'Maintenance Finding
+        # Raised' / 'Maintenance Scan Done' music triggers, same as the
+        # video repair worker's publish() bridge. None = no engine, no-op.
+        self._event_emit = None
 
         # Background bulk fix ("Fix All" at library scale runs on its own
         # thread so the HTTP request that starts it returns immediately)
@@ -278,6 +541,14 @@ class RepairWorker:
                 logger.error("Failed to initialize AcoustIDClient: %s", e)
         return self._acoustid_client
 
+    def refresh_acoustid_config(self):
+        """Refresh AcoustID client configuration after settings update."""
+        if self._acoustid_client is not None:
+            try:
+                self._acoustid_client.refresh_config()
+            except Exception as e:
+                logger.debug("Failed to refresh AcoustID client config: %s", e)
+
     @property
     def metadata_cache(self):
         if self._metadata_cache is None:
@@ -350,6 +621,16 @@ class RepairWorker:
         """Enable or disable a specific job."""
         if self._config_manager:
             self._config_manager.set(f'repair.jobs.{job_id}.enabled', enabled)
+        # #1289 item 12: bridge to the system automation row so the engine's
+        # scheduler honors the toggle. The row's enabled flag is the source of
+        # truth for scheduling; the legacy config remains for the worker's
+        # respect_enabled check on manual/Run Now paths.
+        try:
+            from core.automation.migrate_repair_jobs import set_system_job_enabled
+            set_system_job_enabled(self.db, getattr(self, '_automation_engine', None),
+                                   job_id, enabled)
+        except Exception as e:
+            logger.debug("Could not bridge job toggle to automation for %s: %s", job_id, e)
         # Turning a job OFF must also stop it if it's mid-run — otherwise the toggle
         # only affects the NEXT scheduled run and the current scan keeps going (#970).
         if not enabled:
@@ -362,11 +643,20 @@ class RepairWorker:
         if interval_hours is not None:
             self._config_manager.set(f'repair.jobs.{job_id}.interval_hours', interval_hours)
         if settings is not None:
+            if not isinstance(settings, dict):
+                settings = {}
             current = self._config_manager.get(f'repair.jobs.{job_id}.settings', {})
             if isinstance(current, dict):
                 current.update(settings)
             else:
                 current = settings
+            if job_id == 'genre_enrichment':
+                defaults = self._jobs.get(job_id).default_settings if self._jobs.get(job_id) else {
+                    'max_genres': 5, 'include_artists': True, 'include_albums': True, 'allow_live_calls': False}
+                value = current.get('max_genres')
+                current['max_genres'] = value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 20 else defaults['max_genres']
+                for key in ('include_artists', 'include_albums', 'allow_live_calls'):
+                    if not isinstance(current.get(key), bool): current[key] = defaults[key]
             self._config_manager.set(f'repair.jobs.{job_id}.settings', current)
 
     def get_all_job_info(self) -> List[dict]:
@@ -386,16 +676,31 @@ class RepairWorker:
         # job instead of N round trips.
         pending_by_job = self._get_pending_count_by_job()
 
+        # #1289 item 12: single scan of system automations for all jobs
+        # (not N+1). Maps job_id -> (automation_id, interval_hours, next_run).
+        auto_by_job = self._get_system_automations_by_job()
+
         jobs_info = []
         for job_id, job in self._jobs.items():
             config = self.get_job_config(job_id)
             last_run = self._get_last_run(job_id)
-            next_run = None
-            if last_run and config['enabled']:
-                last_dt = datetime.fromisoformat(last_run['finished_at']) if last_run.get('finished_at') else None
-                if last_dt:
-                    next_dt = last_dt + timedelta(hours=config['interval_hours'])
-                    next_run = next_dt.isoformat()
+
+            # Prefer the automation's schedule; fall back to legacy config
+            # if the migration hasn't run yet.
+            auto = auto_by_job.get(job_id)
+            if auto:
+                interval_hours = auto["interval_hours"]
+                automation_id = auto["automation_id"]
+                next_run = auto["next_run"]
+            else:
+                interval_hours = config['interval_hours']
+                automation_id = None
+                next_run = None
+                if last_run and config['enabled']:
+                    last_dt = datetime.fromisoformat(last_run['finished_at']) if last_run.get('finished_at') else None
+                    if last_dt:
+                        next_dt = last_dt + timedelta(hours=config['interval_hours'])
+                        next_run = next_dt.isoformat()
 
             jobs_info.append({
                 'job_id': job_id,
@@ -403,20 +708,74 @@ class RepairWorker:
                 'description': job.description,
                 'help_text': job.help_text,
                 'icon': job.icon,
+                # The family this job is filed under. Served rather than
+                # guessed client-side, so a new job cannot quietly acquire a
+                # different grouping in the UI than it has here.
+                'category': job_category(job_id),
                 'auto_fix': job.auto_fix,
                 'enabled': config['enabled'],
-                'interval_hours': config['interval_hours'],
+                'interval_hours': interval_hours,
                 'settings': config['settings'],
                 'default_settings': job.default_settings.copy(),
                 # Per-setting choice lists so the UI can render a dropdown
                 # instead of a free-text box (e.g. canonical source_selection).
                 'setting_options': dict(getattr(job, 'setting_options', {}) or {}),
+                # Whether this job MOVES or REWRITES real library files when it
+                # runs live (dry_run off). The UI shows its strongest dry-run
+                # warning on exactly these jobs — finding-only jobs get a
+                # lighter note.
+                'writes_library_files': bool(getattr(job, 'writes_library_files', False)),
                 'last_run': last_run,
                 'next_run': next_run,
                 'is_running': self._current_job_id == job_id,
                 'pending_findings_count': pending_by_job.get(job_id, 0),
+                # #1289 item 12: the system automation row driving this job's
+                # schedule (if the migration has run). The Tools UI edits the
+                # automation's trigger instead of the legacy interval_hours.
+                'automation_id': automation_id,
             })
         return jobs_info
+
+    def _get_system_automations_by_job(self) -> dict:
+        """Single scan of system automations, keyed by job_id.
+
+        Returns {job_id: {'automation_id': int, 'interval_hours': float,
+        'next_run': str|None}}. Used by get_all_job_info to avoid N+1 queries.
+        """
+        result = {}
+        try:
+            from core.automation.migrate_repair_jobs import _SYSTEM_OWNER
+            import json
+            automations = self.db.get_automations(1)
+            for a in automations or []:
+                if a.get("owned_by") != _SYSTEM_OWNER:
+                    continue
+                if a.get("action_type") != "run_repair_job":
+                    continue
+                try:
+                    cfg = a.get("action_config") or "{}"
+                    if isinstance(cfg, str):
+                        cfg = json.loads(cfg)
+                    job_id = cfg.get("job_id")
+                    if not job_id or job_id in result:
+                        continue  # Skip duplicates; migration logs them.
+                    # Extract interval from trigger_config if it's a schedule trigger.
+                    interval_hours = None
+                    if a.get("trigger_type") == "schedule":
+                        tcfg = a.get("trigger_config") or "{}"
+                        if isinstance(tcfg, str):
+                            tcfg = json.loads(tcfg)
+                        interval_hours = tcfg.get("interval")
+                    result[job_id] = {
+                        "automation_id": a.get("id"),
+                        "interval_hours": interval_hours,
+                        "next_run": a.get("next_run"),
+                    }
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("Could not scan system automations: %s", e)
+        return result
 
     def _get_pending_count_by_job(self) -> dict:
         """Return ``{job_id: pending_count}`` for every job that has
@@ -448,6 +807,9 @@ class RepairWorker:
         self.running = True
         self.should_stop = False
         self._stop_event.clear()
+        # Before the loop picks anything: close out runs a previous process
+        # left mid-scan, or their NULL finished_at reads as "never run".
+        self._heal_stuck_runs()
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         logger.info("Repair worker started")
@@ -466,9 +828,7 @@ class RepairWorker:
 
     def toggle(self) -> bool:
         """Toggle master enabled state. Returns new state."""
-        self.enabled = not self.enabled
-        if self._config_manager:
-            self._config_manager.set('repair.master_enabled', self.enabled)
+        self.set_enabled(not self.enabled)
         logger.info("Repair worker %s", "enabled" if self.enabled else "disabled")
         return self.enabled
 
@@ -477,6 +837,13 @@ class RepairWorker:
         self.enabled = enabled
         if self._config_manager:
             self._config_manager.set('repair.master_enabled', enabled)
+        # #1289 item 12: bridge to the automation engine's metadata so
+        # pause()/resume() (which call this) keep stopping scheduled jobs.
+        try:
+            self.db.set_metadata('automation_master_music_enabled',
+                                 '1' if enabled else '0')
+        except Exception as e:
+            logger.debug("Could not bridge master toggle to engine metadata: %s", e)
 
     # Backward compatibility
     def pause(self):
@@ -572,6 +939,10 @@ class RepairWorker:
     # Main loop
     # ------------------------------------------------------------------
     def _run(self):
+        # #1289 item 12: the worker no longer picks jobs by staleness —
+        # scheduling lives in the automation engine now. This loop is a pure
+        # executor: it drains the force-run queue (Run Now clicks + automation
+        # triggers) and sleeps otherwise.
         logger.info("Repair worker thread started")
         self._ensure_jobs_loaded()
 
@@ -589,28 +960,11 @@ class RepairWorker:
                         break
                     continue
 
-                if not self.enabled:
-                    self._current_job_id = None
-                    self._current_job_name = None
-                    if self._sleep_or_stop(2):
-                        break
-                    continue
-
-                # Find the next job to run based on staleness
-                next_job = self._pick_next_job()
-
-                if not next_job:
-                    # Nothing due — sleep and re-check
-                    self._current_job_id = None
-                    self._current_job_name = None
-                    if self._sleep_or_stop(10):
-                        break
-                    continue
-
-                # Run the selected job
-                self._run_job(next_job)
-
-                # Brief pause between jobs
+                # Nothing queued — sleep until the next check or a wakeup.
+                # Automation timers queue jobs via run_job_now(); there is no
+                # staleness picker anymore.
+                self._current_job_id = None
+                self._current_job_name = None
                 if self._sleep_or_stop(5):
                     break
 
@@ -622,66 +976,6 @@ class RepairWorker:
                     break
 
         logger.info("Repair worker thread finished")
-
-    @staticmethod
-    def _hours_since(finished_at_iso: str, now_utc: datetime) -> float:
-        """Hours between a stored ``finished_at`` and ``now_utc``, both in UTC.
-
-        ``finished_at`` is written by SQLite's CURRENT_TIMESTAMP, which is ALWAYS
-        UTC (and naive). #885: the scheduler compared it against ``datetime.now()``
-        (naive LOCAL), so the local↔UTC offset leaked into the elapsed time. For a
-        zone AHEAD of UTC (Australia/Sydney = +11) every job looked ~11h stale and
-        fired every poll; behind UTC (the Americas) it just waited too long. Parse
-        the naive timestamp AS UTC and subtract a UTC ``now`` so scheduling is
-        timezone-independent."""
-        dt = datetime.fromisoformat(finished_at_iso)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return (now_utc - dt).total_seconds() / 3600
-
-    def _pick_next_job(self) -> Optional[str]:
-        """Pick the next job to run based on staleness priority.
-
-        Returns job_id of the stalest job whose interval has elapsed,
-        or None if nothing is due.
-        """
-        now = datetime.now(timezone.utc)
-        best_job_id = None
-        best_staleness = -1
-
-        for job_id, _job in self._jobs.items():
-            config = self.get_job_config(job_id)
-            if not config['enabled']:
-                continue
-
-            interval_hours = config['interval_hours']
-            if not interval_hours or interval_hours <= 0:
-                continue  # Skip jobs with invalid interval
-
-            last_run = self._get_last_run(job_id)
-
-            if not last_run or not last_run.get('finished_at'):
-                # Never run — highest staleness
-                best_job_id = job_id
-                best_staleness = float('inf')
-                continue
-
-            try:
-                elapsed_hours = self._hours_since(last_run['finished_at'], now)
-
-                if elapsed_hours < interval_hours:
-                    continue  # Not due yet
-
-                staleness = elapsed_hours / interval_hours
-                if staleness > best_staleness:
-                    best_staleness = staleness
-                    best_job_id = job_id
-            except (ValueError, TypeError):
-                # Malformed timestamp — treat as never run
-                best_job_id = job_id
-                best_staleness = float('inf')
-
-        return best_job_id
 
     def _run_job(self, job_id: str, forced: bool = False):
         """Execute a single job and record the run.
@@ -740,18 +1034,71 @@ class RepairWorker:
             should_stop=lambda: self.should_stop or self._cancel_current_job.is_set(),
             stop_event=self._stop_event,
             is_paused=(lambda: False) if forced else (lambda: not self.enabled),
-            update_progress=self._update_progress,
+            # update_progress feeds the Tools page; report_progress feeds
+            # the notification centre's card. They were two separate calls a
+            # job had to remember to make BOTH of, and three jobs only ever
+            # made the first — so Library Re-tag showed a live count on one
+            # screen and a bar frozen at 0% on the other (#1231). Reporting
+            # one now feeds the other, so a job cannot tell them different
+            # stories and a new job gets a working bar for free.
+            update_progress=lambda scanned, total: self._update_progress(
+                scanned, total, report=_report_progress),
             report_progress=_report_progress,
+            playlist_membership=_server_playlist_membership,
         )
 
         start_time = time.time()
         result = JobResult()
+        run_status = 'completed'
+        run_error = None
+
+        # The dialog Boulder promised on Discord, enforced where it protects
+        # every caller (UI, automations, Run Now alike): a job that moves or
+        # rewrites library files may not run LIVE against a library this
+        # process cannot see. Dry runs still work — findings are reviewable.
+        if getattr(job, 'writes_library_files', False) and self._job_runs_live(job):
+            ok, detail = self.library_visibility_preflight()
+            if not ok:
+                logger.error("%s refused to run live: %s", job.display_name, detail)
+                _report_progress(phase='Refused — library not visible',
+                                 log_line=detail, log_type='error')
+                result.errors += 1
+                run_status = 'failed'
+                run_error = detail[:500]
 
         try:
-            result = job.scan(context)
+            if run_status != 'failed':
+                result = job.scan(context)
         except Exception as e:
             logger.error("Job %s failed: %s", job_id, e, exc_info=True)
             result.errors += 1
+            run_status = 'failed'
+            run_error = f"{type(e).__name__}: {e}"[:500]
+
+        # A user-requested stop is not a failure — record it as its own state
+        # so history can say "you stopped this" instead of implying a crash.
+        if run_status == 'completed' and self._cancel_current_job.is_set():
+            run_status = 'cancelled'
+        # the worker itself was stopped (master switch off, shutdown) while the
+        # job ran. every job's check_stop() sees that flag and returns what it
+        # has, so the run reads as finished unless it is marked here, once,
+        # instead of in each job. not 'cancelled': nobody stopped this job.
+        if run_status == 'completed' and self.should_stop:
+            run_status = 'stopped'
+            run_error = 'Repair worker stopped before the job finished'
+        # the job quit on its own before the end. not a crash and not done:
+        # say so, with the job's reason, instead of a clean 'completed'
+        if run_status == 'completed' and getattr(result, 'stopped_early', ''):
+            run_status = 'stopped'
+            run_error = str(result.stopped_early)[:500]
+
+        # A completed sweep is the moment we know the library's real state, so
+        # it is also the moment to close findings whose file has since gone.
+        # Skipped after a failure or a user stop: a partial view is not evidence.
+        if run_status == 'completed':
+            self.retire_vanished_findings(job_id)
+            if job_id == 'orphan_file_detector':
+                self.retire_tracked_orphan_findings()
 
         duration = time.time() - start_time
 
@@ -762,7 +1109,21 @@ class RepairWorker:
         self.stats['errors'] += result.errors
 
         # Record job completion
-        self._record_job_finish(run_id, job_id, result, duration)
+        self._record_job_finish(run_id, job_id, result, duration,
+                                status=run_status, error_text=run_error)
+
+        _emit = getattr(self, '_event_emit', None)
+        if _emit:
+            try:      # 'Maintenance Scan Done' automation trigger
+                _emit('music_repair_scan_completed', {
+                    'job_id': job_id, 'job_name': job.display_name,
+                    'status': 'error' if result.errors > 0 and result.auto_fixed == 0 else 'finished',
+                    'scanned': result.scanned,
+                    'findings_created': result.findings_created,
+                    'run_status': run_status,
+                    'errors': result.errors})
+            except Exception:   # noqa: BLE001 - events never disturb the scan
+                logger.debug("repair scan event emit failed", exc_info=True)
 
         # Notify rich progress system of completion
         if self._on_job_finish:
@@ -793,64 +1154,178 @@ class RepairWorker:
             remaining -= chunk
         return self._stop_event.is_set()
 
-    def run_job_now(self, job_id: str):
+    def run_job_now(self, job_id: str, respect_enabled: bool = False) -> bool:
         """Queue a job for immediate execution by the main worker loop.
 
         Uses a thread-safe queue instead of spawning a separate thread
         to avoid race conditions with the main loop's _run_job().
+
+        Returns True when the job is queued (or already waiting), the same
+        contract as the video worker's run_job_now. it never returned
+        ANYTHING, so the quality-check automation read None as "library
+        worker unavailable" on every run while the scan it triggered ran
+        fine behind its back (#1192).
+
+        respect_enabled is for NON-HUMAN callers. a person clicking Run Now
+        means it, toggle or not, so that stays the default. an automation is
+        different: wishx turned Quality Upgrade Finder off to free up
+        resources and it kept running anyway, because his import automation
+        force-queued it on every scan. a weekly job ran 12 times in two days
+        (#1207). the toggle is the user's statement about resources, so a
+        background trigger has to honour it.
         """
         self._ensure_jobs_loaded()
         if job_id not in self._jobs:
             logger.warning("Unknown job: %s", job_id)
-            return
+            return False
+
+        if respect_enabled:
+            try:
+                if not self.get_job_config(job_id).get('enabled', True):
+                    logger.info("Job %s is disabled, not running it for a background trigger", job_id)
+                    return False
+            except Exception:
+                # config unreadable, fall through and run. refusing on a bad
+                # read would silently stop scheduled work.
+                logger.debug("Could not read config for %s, allowing the run", job_id, exc_info=True)
 
         with self._force_run_lock:
             if job_id not in self._force_run_queue:
                 self._force_run_queue.append(job_id)
                 logger.info("Job %s queued for immediate run", job_id)
+        return True
 
-    def _update_progress(self, scanned: int, total: int):
-        """Callback for jobs to report progress."""
+    def _update_progress(self, scanned: int, total: int, report=None):
+        """Callback for jobs to report progress.
+
+        ``report`` is the same job's rich callback. Forwarding here means a job
+        that calls update_progress in its loop gets the notification card moving
+        too, without having to remember a second call — which is exactly what
+        three jobs forgot (#1231).
+        """
         percent = round(scanned / total * 100) if total > 0 else 0
         self._current_progress = {
             'scanned': scanned,
             'total': total,
             'percent': percent,
         }
+        if report is not None:
+            try:
+                report(scanned=scanned, total=total)
+            except Exception as e:
+                # Progress reporting must never be able to fail a job.
+                logger.debug("progress forward failed: %s", e)
 
     # ------------------------------------------------------------------
     # Findings
     # ------------------------------------------------------------------
+    @staticmethod
+    def _has_column(cursor, table: str, column: str) -> bool:
+        """Is ``column`` present on ``table``?
+
+        Columns added after a table shipped can be absent on a database the
+        migration has not reached yet (or in a test that builds the old
+        shape). Statements that name them must ASK rather than assume — the
+        surrounding handlers turn a raise into "no findings" / "no run
+        recorded", which reads as good news and is the worst possible lie.
+        """
+        try:
+            cursor.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == column for row in cursor.fetchall())
+        except Exception:
+            return False
+
+    def _within_recurrence_grace(self, resolved_at) -> bool:
+        """Is a resolved finding recent enough that re-raising it would be noise?
+
+        A fix often lands asynchronously — a re-download is queued, a wishlist
+        entry is added, a retag waits on the next media-server scan — so the
+        very next sweep would legitimately still see the problem and re-raise
+        the row the user just cleared. The grace window covers that gap; past
+        it, a problem that is STILL there is real news and deserves a fresh
+        pending row.
+
+        Unparseable or missing timestamps count as INSIDE the window: the
+        conservative direction is silence, not a flood of re-raised findings
+        on the first scan after an upgrade.
+        """
+        if not resolved_at:
+            return True
+        try:
+            dt = datetime.fromisoformat(str(resolved_at))
+        except (TypeError, ValueError):
+            return True
+        if dt.tzinfo is None:      # SQLite CURRENT_TIMESTAMP is naive UTC
+            dt = dt.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - dt).total_seconds() / 86400
+        return age_days < RESOLVED_RECURRENCE_GRACE_DAYS
+
     def _create_finding(self, job_id: str, finding_type: str, severity: str,
                         entity_type: str, entity_id: str, file_path: str,
-                        title: str, description: str, details: dict = None) -> bool:
+                        title: str, description: str, details: dict = None,
+                        supersede: bool = False) -> bool:
         """Create a repair finding in the database.
+
+        Recurrence contract (the dedup used to be "any row in pending,
+        resolved OR dismissed suppresses forever", which meant a problem you
+        acted on could never be reported again even when it came BACK, and a
+        pending row's snapshot could never be refreshed):
+
+          * pending row exists   → REFRESH it in place (severity, title,
+            description, details) and report no new finding. Acting on a
+            weeks-stale snapshot was its own class of bug.
+          * dismissed row exists → stay silent, permanently. Dismiss means
+            "never tell me about this again" and the UI now says exactly that.
+          * resolved row exists  → silent inside the grace window
+            (``_within_recurrence_grace``), a NEW pending row after it. The
+            resolved row is left alone as history.
+          * ``supersede=True``   → the caller KNOWS the world changed (e.g. a
+            quality profile was edited) and asks for the finding to be raised
+            again regardless. Replaces the raw DELETEs two jobs used to run
+            against this table behind the worker's back.
 
         Returns:
             True  — a NEW pending row was inserted.
-            False — dedup-skipped (an equivalent row already exists with
-                    status pending/resolved/dismissed) OR a DB error
-                    occurred. Callers should only increment their
-                    ``findings_created`` counter when this returns True
-                    so the badge / scan log reports REAL new findings,
-                    not silently-skipped duplicates.
+            False — refreshed / suppressed / DB error. Callers only increment
+                    ``findings_created`` on True, so the badge and scan log
+                    report REAL new findings.
         """
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
 
-            # Dedup check: skip if same finding already exists (pending, resolved, OR dismissed)
+            # Prefer a pending row when several exist for one entity (a
+            # superseded finding leaves its resolved/dismissed ancestor
+            # behind), so the refresh path always lands on the live row.
             cursor.execute("""
-                SELECT id FROM repair_findings
+                SELECT id, status, resolved_at FROM repair_findings
                 WHERE job_id = ? AND finding_type = ?
                   AND status IN ('pending', 'resolved', 'dismissed')
                   AND ((entity_type = ? AND entity_id = ?) OR (file_path = ? AND file_path IS NOT NULL))
+                ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'resolved' THEN 1 ELSE 2 END,
+                         id DESC
                 LIMIT 1
             """, (job_id, finding_type, entity_type, entity_id, file_path))
 
-            if cursor.fetchone():
-                return False  # Already exists or was already fixed
+            existing = cursor.fetchone()
+            if existing:
+                existing_id, existing_status, resolved_at = existing[0], existing[1], existing[2]
+                if existing_status == 'pending':
+                    cursor.execute("""
+                        UPDATE repair_findings
+                        SET severity = ?, title = ?, description = ?, details_json = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ?
+                    """, (severity, title, description,
+                          json.dumps(details) if details else '{}', existing_id))
+                    conn.commit()
+                    return False
+                if not supersede:
+                    if existing_status == 'dismissed':
+                        return False
+                    if self._within_recurrence_grace(resolved_at):
+                        return False
 
             cursor.execute("""
                 INSERT INTO repair_findings
@@ -863,6 +1338,16 @@ class RepairWorker:
                 json.dumps(details) if details else '{}'
             ))
             conn.commit()
+            # getattr, not attribute access: tests build workers via __new__
+            # (no __init__), and the emit must NEVER break a finding write.
+            _emit = getattr(self, '_event_emit', None)
+            if _emit:
+                try:      # 'Maintenance Finding Raised' automation trigger
+                    _emit('music_repair_finding_created', {
+                        'job_id': job_id, 'finding_type': finding_type,
+                        'severity': severity or 'info', 'title': title or ''})
+                except Exception:   # noqa: BLE001 - events never disturb the scan
+                    logger.debug("repair finding event emit failed", exc_info=True)
             return True
         except Exception as e:
             logger.debug("Error creating finding: %s", e)
@@ -871,47 +1356,167 @@ class RepairWorker:
             if conn:
                 conn.close()
 
+    # Sort keys the inbox offers. Severity-first is the triage default; a flat
+    # newest-first list buries three corrupt files under four hundred missing
+    # lyrics. Whitelisted rather than interpolated — this lands in ORDER BY.
+    # How bad a file actually is, as a number, straight off the finding.
+    #
+    # Severity cannot answer this: the quality scanner only ever emits
+    # 'warning' (broken audio) or 'info' (below profile), so EVERY upgradeable
+    # track tied at 'info' and the sort fell through to created_at. That is why
+    # sorting by severity handed back 320, then 192, then 256 - it was showing
+    # scan order and calling it severity.
+    #
+    # This is AudioQuality.tier_score() transcribed into SQL, branch for branch,
+    # and a test asserts the two order an identical set identically. tier_score
+    # has TWO branches and an earlier flat formula here matched neither: lossless
+    # (flac/wav) scores on sample rate and bit depth and ignores bitrate, while
+    # everything else scores on bitrate capped at 320kbps. Inventing a second
+    # definition of "better audio" put ALAC on the wrong side of FLAC and sent
+    # DSD to the top of the list.
+    #
+    # Computed from current_format/current_bitrate, which every quality finding
+    # has already stored, so old findings sort correctly without a rescan.
+    _QUALITY_SCORE_SQL = (
+        "(CASE WHEN lower(COALESCE(json_extract(details_json, '$.current_format'), '')) "
+        "        IN ('flac', 'alac', 'wav') THEN "
+        "   (CASE lower(json_extract(details_json, '$.current_format')) "
+        "      WHEN 'flac' THEN 100 WHEN 'alac' THEN 98 ELSE 95 END) "
+        "   + MIN(COALESCE(json_extract(details_json, '$.current_sample_rate'), 44100) "
+        "         / 192000.0, 1.0) * 20 "
+        "   + MAX(COALESCE(json_extract(details_json, '$.current_bit_depth'), 16) - 16, 0) "
+        "         / 8.0 * 10 "
+        "ELSE "
+        "   (CASE lower(COALESCE(json_extract(details_json, '$.current_format'), '')) "
+        "      WHEN 'dsf' THEN 102 WHEN 'ogg' THEN 70 "
+        "      WHEN 'opus' THEN 65 WHEN 'aac' THEN 60 WHEN 'mp3' THEN 50 "
+        "      WHEN 'wma' THEN 30 ELSE 10 END) "
+        "   + MIN(COALESCE(json_extract(details_json, '$.current_bitrate'), 0) / 320.0, 1.0) * 10 "
+        "END)"
+    )
+
+    _FINDING_SORTS = {
+        'newest': 'created_at DESC',
+        'oldest': 'created_at ASC',
+        # Severity still leads - a broken file outranks a merely-lossy one - but
+        # within a band the worst quality now comes first instead of scan order.
+        'severity': ("CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 "
+                     "ELSE 2 END, " + _QUALITY_SCORE_SQL + " ASC, created_at DESC"),
+        # Worst audio first, ignoring severity entirely. What someone working
+        # through an upgrade backlog actually wants: fix the 128s before the 320s.
+        'quality': (_QUALITY_SCORE_SQL + " ASC, created_at DESC"),
+        'quality_desc': (_QUALITY_SCORE_SQL + " DESC, created_at DESC"),
+        'path': 'file_path IS NULL, file_path ASC, created_at DESC',
+    }
+
+    @staticmethod
+    def _findings_filter(job_id: str = None, status: str = None,
+                         severity: str = None, finding_type: str = None,
+                         q: str = None):
+        """Build the WHERE clause shared by listing and clearing findings.
+
+        This is ONE function on purpose. "Clear findings matching current
+        filters" used to build its own clause supporting only job_id and
+        status, so a user who narrowed by severity or typed in the search box
+        and hit Clear destroyed every finding the WIDER filter matched — the
+        button deleted rows that were never on screen (#1142). Two hand-rolled
+        clauses for one concept will drift again; a caller that forgets an
+        argument here degrades to a broader match, so new filters must be
+        added in this one place and passed by both callers.
+
+        Returns ``(where_sql, params)`` — ``where_sql`` is '' when unfiltered.
+        """
+        where_parts = []
+        params = []
+
+        if job_id:
+            where_parts.append("job_id = ?")
+            params.append(job_id)
+        if status:
+            where_parts.append("status = ?")
+            params.append(status)
+        if severity:
+            where_parts.append("severity = ?")
+            params.append(severity)
+        if finding_type:
+            where_parts.append("finding_type = ?")
+            params.append(finding_type)
+        if q and str(q).strip():
+            needle = f"%{str(q).strip()}%"
+            # details_json too: a duplicate group is titled after ONE member,
+            # so the other copies' names lived only in details and the
+            # search box could not see them
+            where_parts.append("(title LIKE ? OR file_path LIKE ? OR details_json LIKE ?)")
+            params.extend([needle, needle, needle])
+
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        return where, params
+
     def get_findings(self, job_id: str = None, status: str = None,
-                     severity: str = None, page: int = 0, limit: int = 50) -> dict:
-        """Get paginated findings with optional filters."""
+                     severity: str = None, page: int = 0, limit: int = 50,
+                     finding_type: str = None, sort: str = None,
+                     q: str = None) -> dict:
+        """Get paginated findings with optional filters.
+
+        ``finding_type`` is what the grouped inbox pages through: one type at
+        a time, so the user acts on a coherent set instead of a flat list
+        that interleaves "delete this file" with "add cover art". ``q``
+        searches title and path — with thousands of rows, "where is that one
+        album" had no answer but paging.
+        """
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
 
-            where_parts = []
-            params = []
-
-            if job_id:
-                where_parts.append("job_id = ?")
-                params.append(job_id)
-            if status:
-                where_parts.append("status = ?")
-                params.append(status)
-            if severity:
-                where_parts.append("severity = ?")
-                params.append(severity)
-
-            where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+            where, params = self._findings_filter(
+                job_id=job_id, status=status, severity=severity,
+                finding_type=finding_type, q=q)
+            order_by = self._FINDING_SORTS.get(sort or 'newest',
+                                               self._FINDING_SORTS['newest'])
 
             # Count total
             cursor.execute(f"SELECT COUNT(*) FROM repair_findings {where}", params)
             total = cursor.fetchone()[0]
+
+            # last_error arrived after this table shipped. Selecting it blindly
+            # would raise on a database the migration hasn't reached, and the
+            # handler below turns ANY raise into an empty page — i.e. one
+            # missing column would tell the user their library is spotless.
+            # Ask, then substitute a NULL so the row shape never changes.
+            error_col = 'last_error' if self._has_column(
+                cursor, 'repair_findings', 'last_error') else 'NULL'
 
             # Fetch page
             offset = page * limit
             cursor.execute(f"""
                 SELECT id, job_id, finding_type, severity, status, entity_type,
                        entity_id, file_path, title, description, details_json,
-                       user_action, resolved_at, created_at, updated_at
+                       user_action, resolved_at, created_at, updated_at, {error_col}
                 FROM repair_findings
                 {where}
-                ORDER BY created_at DESC
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
             """, params + [limit, offset])
 
             items = []
             for row in cursor.fetchall():
+                # One unreadable details_json must not cost the whole page. This
+                # loop used to json.loads() straight into the dict, so a single
+                # malformed row raised and the outer handler returned an EMPTY
+                # page — the user saw "All Clear" over findings that were really
+                # there, or an error they could neither read nor act on. Degrade
+                # the one row instead, and say which id was bad.
+                try:
+                    details = json.loads(row[10]) if row[10] else {}
+                    if not isinstance(details, dict):
+                        raise ValueError(f"details_json is {type(details).__name__}, not an object")
+                except Exception as exc:  # noqa: BLE001 - one row, not the page
+                    logger.warning(
+                        "Finding %s has unreadable details_json (%s); showing it without details",
+                        row[0], exc)
+                    details = {'_details_error': str(exc)}
+
                 items.append({
                     'id': row[0],
                     'job_id': row[1],
@@ -923,11 +1528,15 @@ class RepairWorker:
                     'file_path': row[7],
                     'title': row[8],
                     'description': row[9],
-                    'details': json.loads(row[10]) if row[10] else {},
+                    'details': details,
                     'user_action': row[11],
                     'resolved_at': row[12],
                     'created_at': row[13],
                     'updated_at': row[14],
+                    # Why the last fix attempt failed. A finding that refuses
+                    # to fix used to sit pending with the reason living only
+                    # in a log line and a capped in-memory bulk list.
+                    'last_error': row[15],
                 })
 
             return {'items': items, 'total': total, 'page': page, 'limit': limit}
@@ -938,6 +1547,458 @@ class RepairWorker:
         finally:
             if conn:
                 conn.close()
+
+    # Which details field names the album / artist for a grouped view. Only
+    # the quality jobs write these today, so a type that has never heard of an
+    # album simply produces no groups rather than one giant "Unknown" bucket.
+    # Jobs did not agree on a spelling: 'artist' (34 uses), 'artist_name' (7)
+    # and 'expected_artist' (2); 'album' (29), 'album_title' (15), 'album_name'
+    # (1). Reading only the quality scanner's pair would have made this view
+    # quality-only by accident, when fourteen job types record the same thing.
+    _ARTIST_KEY = ("COALESCE(json_extract(details_json, '$.expected_artist'), "
+                   "json_extract(details_json, '$.artist'), "
+                   "json_extract(details_json, '$.artist_name'))")
+    _ALBUM_KEY = ("COALESCE(json_extract(details_json, '$.album_title'), "
+                  "json_extract(details_json, '$.album'), "
+                  "json_extract(details_json, '$.album_name'))")
+
+    _GROUP_KEYS = {
+        'album': (_ARTIST_KEY, _ALBUM_KEY),
+        'artist': (_ARTIST_KEY, "NULL"),
+    }
+
+    def get_finding_albums(self, group_by: str = 'album', job_id: str = None,
+                           status: str = 'pending', finding_type: str = None,
+                           q: str = None, limit: int = 200) -> List[dict]:
+        """Findings folded to one row per ALBUM (or per ARTIST), with artwork.
+
+        A flat list of 40,000 upgradeable tracks is not reviewable. Nobody
+        decides one track at a time whether to re-acquire it; they decide per
+        album ("re-rip this one properly") or per artist ("everything by them
+        is a bad rip"). This returns that unit, with the counts and the artwork
+        already on the finding, so the UI never has to fan out per row.
+
+        Ordered worst-audio-first: the album carrying the lowest-quality file
+        leads, because that is the one most worth fixing. Ties break on size,
+        so a 12-track 128kbps album outranks a single stray.
+
+        Rows with no album/artist recorded are dropped rather than collected
+        into an "Unknown" pile - they would be the biggest group on the page
+        and mean nothing.
+        """
+        artist_expr, album_expr = self._GROUP_KEYS.get(
+            group_by, self._GROUP_KEYS['album'])
+        where, params = self._findings_filter(
+            job_id=job_id, status=status, finding_type=finding_type, q=q)
+        # the group key itself must exist, or the row is not groupable
+        guard = f"{artist_expr} IS NOT NULL AND {artist_expr} <> ''"
+        if group_by == 'album':
+            guard += f" AND {album_expr} IS NOT NULL AND {album_expr} <> ''"
+        where = f"{where} AND {guard}" if where else f"WHERE {guard}"
+
+        score = self._QUALITY_SCORE_SQL
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            has_error_col = self._has_column(conn.cursor(), 'repair_findings', 'last_error')
+            error_count_expr = "SUM(CASE WHEN last_error IS NOT NULL AND last_error != '' THEN 1 ELSE 0 END)" if has_error_col else "0"
+            rows = conn.execute(f"""
+                SELECT {artist_expr}                        AS artist,
+                       {album_expr}                         AS album,
+                       COUNT(*)                             AS count,
+                       MIN({score})                         AS worst_score,
+                       MAX({score})                         AS best_score,
+                       MIN(printf('%012.4f', {score}) || '|' ||
+                           COALESCE(json_extract(details_json, '$.current_quality'), ''))
+                                                            AS _worst_label,
+                       MAX(printf('%012.4f', {score}) || '|' ||
+                           COALESCE(json_extract(details_json, '$.current_quality'), ''))
+                                                            AS _best_label,
+                       MAX(json_extract(details_json, '$.album_thumb_url'))  AS album_thumb_url,
+                       MAX(json_extract(details_json, '$.artist_thumb_url')) AS artist_thumb_url,
+                       MAX(json_extract(details_json, '$.artist_id'))        AS artist_id,
+                       GROUP_CONCAT(DISTINCT finding_type)  AS finding_types_raw,
+                       {error_count_expr}                   AS error_count,
+                       MIN(created_at)                      AS first_seen,
+                       MAX(created_at)                      AS last_seen
+                FROM repair_findings
+                {where}
+                GROUP BY artist, album
+                ORDER BY worst_score ASC, count DESC, artist ASC
+                LIMIT ?
+            """, (*params, max(1, int(limit)))).fetchall()
+        except Exception as e:
+            logger.error("Error grouping findings by %s: %s", group_by, e, exc_info=True)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+        out = []
+        for r in rows:
+            d = dict(r)
+            # The label the user reads comes from the worst member, resolved
+            # separately so the SQL stays a pure aggregate.
+            d['group_by'] = group_by
+            d['key'] = f"{d.get('artist') or ''}\u0000{d.get('album') or ''}"
+            # printf-padded so the string MIN/MAX above order numerically; the
+            # label rides along so the worst member names itself without a
+            # second query per group.
+            for src, dest in (('_worst_label', 'worst_quality'),
+                              ('_best_label', 'best_quality')):
+                raw_label = d.pop(src, None) or ''
+                d[dest] = raw_label.split('|', 1)[1] if '|' in raw_label else ''
+            d['finding_types'] = [t.strip() for t in (d.pop('finding_types_raw', '') or '').split(',') if t.strip()]
+            d['error_count'] = int(d.get('error_count') or 0)
+            out.append(d)
+
+        # Look up missing album cover art from albums table if not in details_json
+        missing_albums = [d['album'] for d in out if not d.get('album_thumb_url') and d.get('album')]
+        if missing_albums:
+            try:
+                conn = self.db._get_connection()
+                cur = conn.cursor()
+                if self._has_column(cur, 'albums', 'thumb_url'):
+                    placeholders = ','.join('?' for _ in missing_albums)
+                    cur.execute(f"SELECT title, thumb_url FROM albums WHERE title IN ({placeholders}) AND thumb_url IS NOT NULL AND thumb_url != ''", missing_albums)
+                    album_map = {row[0]: row[1] for row in cur.fetchall()}
+                    for d in out:
+                        if not d.get('album_thumb_url') and d.get('album') in album_map:
+                            d['album_thumb_url'] = album_map[d['album']]
+            except Exception as e:
+                logger.debug("Failed to enrich album thumbnails for findings: %s", e)
+            finally:
+                if conn:
+                    conn.close()
+
+        # Look up missing artist thumbs from artists table
+        missing_artists = [d['artist'] for d in out if not d.get('artist_thumb_url') and d.get('artist')]
+        if missing_artists:
+            try:
+                conn = self.db._get_connection()
+                cur = conn.cursor()
+                col = 'thumb_url' if self._has_column(cur, 'artists', 'thumb_url') else 'image_url' if self._has_column(cur, 'artists', 'image_url') else None
+                if col:
+                    placeholders = ','.join('?' for _ in missing_artists)
+                    cur.execute(f"SELECT name, {col} FROM artists WHERE name IN ({placeholders}) AND {col} IS NOT NULL AND {col} != ''", missing_artists)
+                    artist_map = {row[0]: row[1] for row in cur.fetchall()}
+                    for d in out:
+                        if not d.get('artist_thumb_url') and d.get('artist') in artist_map:
+                            d['artist_thumb_url'] = artist_map[d['artist']]
+            except Exception as e:
+                logger.debug("Failed to enrich artist thumbnails for findings: %s", e)
+            finally:
+                if conn:
+                    conn.close()
+
+        return out
+
+    def get_finding_groups(self) -> List[dict]:
+        """One row per finding TYPE — the unit the inbox works in.
+
+        The flat list made a user page 30-at-a-time through thousands of rows
+        with no way to see that 90% of them were one boring, safe, one-click
+        type. Grouping is what turns "3,000 findings" into "four decisions".
+
+        Counts every status in one GROUP BY (the type/status index carries
+        it), so a group can show what is left AND what has already been dealt
+        with without a second round trip.
+        """
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT finding_type, status, severity, COUNT(*), MAX(created_at)
+                FROM repair_findings
+                GROUP BY finding_type, status, severity
+            """)
+            rows = cursor.fetchall()
+
+            # Which jobs feed each type — a group shows its source without
+            # the user having to cross-reference the jobs list.
+            cursor.execute(
+                "SELECT DISTINCT finding_type, job_id FROM repair_findings")
+            jobs_by_type: Dict[str, set] = {}
+            for finding_type, job_id in cursor.fetchall():
+                jobs_by_type.setdefault(finding_type, set()).add(job_id)
+        except Exception as e:
+            logger.error("Error grouping findings: %s", e, exc_info=True)
+            return []
+        finally:
+            if conn:
+                conn.close()
+
+        rank = {'error': 0, 'warning': 1, 'info': 2}
+        groups: Dict[str, dict] = {}
+        for finding_type, status, severity, count, last_seen in rows:
+            group = groups.setdefault(finding_type, {
+                'finding_type': finding_type,
+                'pending': 0, 'resolved': 0, 'dismissed': 0, 'auto_fixed': 0,
+                'total': 0,
+                'severity_max': 'info', 'last_seen': None, 'job_ids': [],
+            })
+            # auto_fixed is its own STATUS, not a flavour of resolved — leaving
+            # it out of the buckets made the inbox render an empty group for
+            # every finding the worker had already dealt with itself.
+            if status in ('pending', 'resolved', 'dismissed', 'auto_fixed'):
+                group[status] += count
+            group['total'] += count
+            # Severity of the group = the worst PENDING row in it. A cleared
+            # error must not keep a group flagged red forever.
+            if status == 'pending' and rank.get(severity, 2) < rank.get(group['severity_max'], 2):
+                group['severity_max'] = severity or 'info'
+            if last_seen and (group['last_seen'] is None or last_seen > group['last_seen']):
+                group['last_seen'] = last_seen
+
+        for finding_type, group in groups.items():
+            group['job_ids'] = sorted(jobs_by_type.get(finding_type, ()))
+
+        # Worst first, then biggest — the order you would actually work in.
+        return sorted(
+            groups.values(),
+            key=lambda g: (rank.get(g['severity_max'], 2), -g['pending'], g['finding_type']),
+        )
+
+    def reopen_finding(self, finding_id: int) -> bool:
+        """Put a resolved/dismissed finding back to pending.
+
+        The undo half of dismiss. Dismiss is permanent by design (the dedup
+        never raises that finding again), which is only safe to offer freely
+        if it can be taken back. Clears resolved_at so the recurrence grace
+        does not then suppress the very row we just revived.
+        """
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE repair_findings
+                SET status = 'pending', user_action = NULL, resolved_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status IN ('resolved', 'dismissed')
+            """, (finding_id,))
+            conn.commit()
+            return cursor.rowcount > 0
+        except Exception as e:
+            logger.error("Error reopening finding %s: %s", finding_id, e)
+            return False
+        finally:
+            if conn:
+                conn.close()
+
+    def reopen_findings_bulk(self, job_id: str = None, finding_type: str = None) -> int:
+        """Reopen all dismissed findings, optionally filtered.
+
+        The bulk undo for dismiss — e.g. reopening 10k+ dismissed BPM
+        findings at once. Only touches dismissed rows; resolved findings
+        represent completed work and are never reopened in bulk.
+        Returns the number of findings reopened.
+        """
+        # Guard against empty-string filters silently becoming unfiltered
+        if job_id == "" or finding_type == "":
+            logger.warning("Bulk reopen called with empty filter, refusing")
+            return 0
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            query = """
+                UPDATE repair_findings
+                SET status = 'pending', user_action = NULL, resolved_at = NULL,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'dismissed'
+            """
+            params = []
+            if job_id:
+                query += " AND job_id = ?"
+                params.append(job_id)
+            if finding_type:
+                query += " AND finding_type = ?"
+                params.append(finding_type)
+            cursor.execute(query, params)
+            conn.commit()
+            count = cursor.rowcount
+            logger.info("Reopened %d dismissed findings (job_id=%s, finding_type=%s)",
+                        count, job_id, finding_type)
+            return count
+        except Exception as e:
+            logger.error("Error bulk reopening findings: %s", e)
+            return 0
+        finally:
+            if conn:
+                conn.close()
+
+    def library_visibility_preflight(self, sample_size: int = 200) -> tuple:
+        """Can this process actually SEE the library the catalogue describes?
+
+        Samples stored track paths and resolves them the same way every repair
+        job does. When almost none resolve, the catalogue and the filesystem are
+        different worlds — Navidrome with "Report Real Path" off, or a Docker
+        mount that isn't there — and a LIVE file-writing job must not run: it
+        would rearrange (or quarantine) a library it is blind to. Same idea as
+        the dead-file cleaner's mass-false-positive guard, applied BEFORE a job
+        that moves files instead of after one that only reports.
+
+        Returns ``(ok, detail)``. Errs on the side of running: an unreadable DB
+        or a tiny library never blocks a job the user asked for.
+        """
+        try:
+            conn = self.db._get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT file_path FROM tracks WHERE file_path IS NOT NULL "
+                    "AND file_path != '' ORDER BY RANDOM() LIMIT ?",
+                    (int(sample_size),)).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("Visibility preflight skipped (db read failed): %s", e)
+            return True, ''
+        # Below this size a poor resolve rate can be real (a hand-broken library),
+        # and the stakes are small anyway. Mirrors the dead-file cleaner's floor.
+        if len(rows) < 25:
+            return True, ''
+        download_folder = None
+        if self._config_manager:
+            download_folder = self._config_manager.get('soulseek.download_path', '')
+        resolved = 0
+        for row in rows:
+            raw = row['file_path'] if not isinstance(row, tuple) else row[0]
+            hit = _resolve_file_path(raw, self.transfer_folder, download_folder,
+                                     config_manager=self._config_manager)
+            if hit and os.path.exists(hit):
+                resolved += 1
+        fraction = resolved / len(rows)
+        if fraction >= 0.5:
+            return True, ''
+        from core.repair_jobs.dead_file_cleaner import _path_mapping_hint
+        return False, (
+            f"Refused to run live: only {resolved} of {len(rows)} sampled tracks "
+            f"resolve to files on disk, so SoulSync cannot see the library the "
+            f"catalogue describes and a live run would move or rewrite the wrong "
+            f"files. Fix the path mapping, run a deep scan, then try again. "
+            f"{_path_mapping_hint(self._config_manager)}"
+        )
+
+    def _job_runs_live(self, job) -> bool:
+        """Whether this job's next run will WRITE (its dry_run setting is off)."""
+        try:
+            cfg = self.get_job_config(job.job_id) or {}
+            return not (cfg.get('settings') or {}).get('dry_run', True)
+        except Exception:
+            return False
+
+    def retire_vanished_findings(self, job_id: str) -> int:
+        """Close this job's pending findings whose file is no longer on disk.
+
+        A finding carries its own snapshot of a path, and nothing ever closed one
+        after the file moved, was replaced or was deleted. The stale snapshot
+        stayed in the list with a Fix button that could only fail — reported as
+        Corrupt Audio findings naming files that no longer existed by the time
+        the user looked.
+
+        The trap a sweep like this has to avoid is retiring findings because THIS
+        process cannot see the library. A Docker install whose catalogue holds
+        the media server's paths ("/music/…") resolves nothing locally, and a
+        naive "the file is not there" test would wipe every finding it has. So a
+        finding is retired only when its CONTAINING FOLDER is right there and the
+        file is not: the folder is the proof that we are looking at the real
+        library and the file really did go away.
+
+        Returns the number retired. Best-effort — a maintenance sweep must never
+        be the reason a scan reports failure.
+        """
+        conn = None
+        retired = 0
+        try:
+            conn = self.db._get_connection()
+            marks = ','.join('?' for _ in _ABSENCE_IS_THE_FINDING)
+            rows = conn.execute(
+                "SELECT id, file_path FROM repair_findings "
+                "WHERE job_id = ? AND status = 'pending' "
+                "AND file_path IS NOT NULL AND file_path <> '' "
+                f"AND finding_type NOT IN ({marks})",
+                (job_id, *sorted(_ABSENCE_IS_THE_FINDING)),
+            ).fetchall()
+            download_folder = None
+            if self._config_manager:
+                download_folder = self._config_manager.get('soulseek.download_path', '')
+            gone = []
+            for row in rows:
+                raw = row['file_path'] if not isinstance(row, tuple) else row[1]
+                finding_id = row['id'] if not isinstance(row, tuple) else row[0]
+                resolved = _resolve_file_path(
+                    raw, self.transfer_folder, download_folder,
+                    config_manager=self._config_manager) or raw
+                if os.path.exists(resolved):
+                    # exists(), not isfile(): a finding may legitimately name a
+                    # DIRECTORY, and isfile() of one is False.
+                    continue
+                parent = os.path.dirname(resolved)
+                if not parent or not os.path.isdir(parent):
+                    continue      # the library itself is out of reach from here
+                gone.append(finding_id)
+            for finding_id in gone:
+                conn.execute(
+                    "UPDATE repair_findings SET status = 'resolved', "
+                    "user_action = 'obsolete', resolved_at = CURRENT_TIMESTAMP, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (finding_id,),
+                )
+                retired += 1
+            if retired:
+                conn.commit()
+                logger.info("[%s] Retired %d finding(s) whose file is gone",
+                            job_id, retired)
+        except Exception as e:
+            logger.debug("Vanished-findings sweep skipped for %s: %s", job_id, e)
+        finally:
+            if conn:
+                conn.close()
+        return retired
+
+    def retire_tracked_orphan_findings(self) -> int:
+        """Close pending orphan findings whose files were imported after detection.
+
+        A completed scan reports only *new* orphans; it does not otherwise
+        reconcile existing findings. Read the current catalogue here so a scan
+        that finds zero orphans can retire its stale pending rows.
+        """
+        from core.repair_jobs.orphan_file_detector import (
+            is_tracked_path, known_file_suffixes,
+        )
+
+        try:
+            suffixes = known_file_suffixes(self.db)
+            conn = self.db._get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT id, file_path FROM repair_findings "
+                    "WHERE job_id = 'orphan_file_detector' "
+                    "AND finding_type = 'orphan_file' AND status = 'pending' "
+                    "AND file_path IS NOT NULL AND file_path != ''"
+                ).fetchall()
+                tracked = [row[0] for row in rows
+                           if os.path.isfile(row[1])
+                           and is_tracked_path(row[1], suffixes)]
+                if tracked:
+                    conn.executemany(
+                        "UPDATE repair_findings SET status = 'resolved', "
+                        "user_action = 'already_tracked', resolved_at = CURRENT_TIMESTAMP, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND status = 'pending'",
+                        ((finding_id,) for finding_id in tracked),
+                    )
+                    conn.commit()
+                    logger.info("Retired %d orphan finding(s) now tracked in the database",
+                                len(tracked))
+                return len(tracked)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.error("Could not reconcile tracked orphan findings: %s", e, exc_info=True)
+            return 0
 
     def resolve_finding(self, finding_id: int, action: str = None) -> bool:
         """Resolve a finding with an optional action."""
@@ -999,6 +2060,22 @@ class RepairWorker:
 
             if result.get('success'):
                 self.resolve_finding(finding_id, action=result.get('action', 'auto_fix'))
+                self._set_finding_error(finding_id, None)
+            elif result.get('stale'):
+                # The file this finding is ABOUT is gone — reorganised, renamed
+                # or deleted since the scan raised it. That is not a failure to
+                # retry: it can never succeed, and left pending it is attempted
+                # again on every run forever. Users were having to clear these
+                # by hand to get a maintenance action moving again (#1143).
+                # Retire it instead; the next scan re-raises a finding against
+                # the file's new path if there is still something to fix.
+                self.resolve_finding(finding_id, action='obsolete')
+                self._set_finding_error(finding_id, result.get('error'))
+            else:
+                # Keep the reason ON the row: the finding stays pending, and
+                # without this the user is left with a row that silently
+                # refuses to fix and no way to learn why.
+                self._set_finding_error(finding_id, result.get('error'))
 
             return result
 
@@ -1008,6 +2085,69 @@ class RepairWorker:
         finally:
             if conn:
                 conn.close()
+
+    def _set_finding_error(self, finding_id: int, error: Optional[str]) -> None:
+        """Record (or clear) why a finding's last fix attempt failed."""
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE repair_findings SET last_error = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?",
+                (str(error)[:500] if error else None, finding_id))
+            conn.commit()
+        except Exception as e:
+            logger.debug("Could not record fix error for finding %s: %s", finding_id, e)
+        finally:
+            if conn:
+                conn.close()
+
+    def get_finding_type_catalog(self) -> List[dict]:
+        """Every finding type the system knows, with how the UI should treat it.
+
+        One source of truth for fixability. The client kept its own list of 20
+        types while this process had 29 handlers, so nine working fixes had no
+        button (reachable only by a blanket Fix All) and two types that can
+        NEVER be fixed still showed one. ``job_ids`` comes from the findings
+        actually on record, so it reflects this install rather than a guess.
+        """
+        handlers = self._fix_handlers()
+        jobs_by_type: Dict[str, List[str]] = {}
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT DISTINCT finding_type, job_id FROM repair_findings")
+            for finding_type, job_id in cursor.fetchall():
+                jobs_by_type.setdefault(finding_type, []).append(job_id)
+        except Exception as e:
+            logger.debug("Could not resolve job ids for finding types: %s", e)
+        finally:
+            if conn:
+                conn.close()
+
+        # Union of what we have metadata for, what we can fix, and what is
+        # actually on record — a type missing from the meta table must still
+        # be listed rather than vanish from the UI.
+        slugs = set(FINDING_TYPE_META) | set(handlers) | set(jobs_by_type)
+        catalog = []
+        for slug in sorted(slugs):
+            meta = FINDING_TYPE_META.get(slug, {})
+            fixable = slug in handlers
+            catalog.append({
+                'type': slug,
+                'label': meta.get('label') or slug.replace('_', ' ').title(),
+                'verb': (meta.get('verb') or 'Fix') if fixable else None,
+                'fixable': fixable,
+                'destructive': slug in DESTRUCTIVE_FINDING_TYPES,
+                'job_ids': sorted(jobs_by_type.get(slug, [])),
+                # What the bulk-fix confirmation says for this type, where the
+                # generic "moves or deletes files ... cannot be undone" is wrong.
+                **({'confirm': meta['confirm']} if meta.get('confirm') else {}),
+            })
+        return catalog
 
     def _fix_handlers(self) -> dict:
         """Single source of truth for finding_type → fix handler.
@@ -1025,9 +2165,11 @@ class RepairWorker:
             'missing_lyrics': self._fix_missing_lyrics,
             'missing_replaygain': self._fix_missing_replaygain,
             'replaygain_retag': self._fix_missing_replaygain,   # #1060 — same analyze+write
+            'untagged_download': self._fix_untagged_download,
             'empty_folder': self._fix_empty_folder,
             'expired_download': self._fix_expired_download,
             'metadata_gap': self._fix_metadata_gap,
+            'bpm_backfill': self._fix_metadata_gap,
             'duplicate_tracks': self._fix_duplicates,
             'single_album_redundant': self._fix_single_album_redundant,
             'mbid_mismatch': self._fix_mbid_mismatch,
@@ -1046,7 +2188,11 @@ class RepairWorker:
             'corrupt_audio': self._fix_corrupt_audio,
             'canonical_version': self._fix_canonical_version,
             'genre_cleanup': self._fix_genre_cleanup,
+            'genre_enrichment': self._fix_genre_enrichment,
             'comma_artist_split': self._fix_comma_artist_split,
+            'suspect_album_tag': self._fix_suspect_album_tag,
+            'fake_lossless': self._fix_fake_lossless,
+            'album_release_year_mismatch': self._fix_album_release_year_mismatch,
         }
 
     def _execute_fix(self, finding_type: str, entity_type: str, entity_id: str,
@@ -1056,6 +2202,66 @@ class RepairWorker:
         if not handler:
             return {'success': False, 'error': f'No fix available for finding type: {finding_type}'}
         return handler(entity_type, entity_id, file_path, details)
+
+    def _fix_suspect_album_tag(self, entity_type, entity_id, file_path, details):
+        """Re-identify a track with suspect album tags.
+
+        If a specific release was picked via fix_action or details ('source:track_id'),
+        apply it via stage_file_for_reidentify.
+        Otherwise, prompt the user to use the Re-identify modal.
+        """
+        source = details.get('source')
+        source_track_id = details.get('source_track_id') or details.get('track_id_picked')
+        fix_action = details.get('_fix_action')
+
+        if isinstance(fix_action, str) and ':' in fix_action:
+            parts = fix_action.split(':', 1)
+            source, source_track_id = parts[0], parts[1]
+
+        if not source or not source_track_id:
+            return {
+                'success': False,
+                'error': 'Please use the Re-identify button to select the target album release.',
+            }
+
+        try:
+            from core.imports.rematch_search import resolve_hint_fields
+            from core.imports.rematch_apply import stage_file_for_reidentify, build_reidentify_hint
+            from core.imports.rematch_hints import create_hint
+            from core.library.path_resolver import resolve_library_file_path
+
+            hint_fields = resolve_hint_fields(source, source_track_id)
+            if not hint_fields:
+                return {'success': False, 'error': 'Could not resolve the selected release metadata'}
+
+            conn = self.db._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT file_path FROM tracks WHERE id = ?", (str(entity_id),))
+                row = cur.fetchone()
+            finally:
+                conn.close()
+
+            if not row or not row['file_path']:
+                return {'success': False, 'error': 'Library track has no file on disk'}
+
+            resolved = resolve_library_file_path(row['file_path'], transfer_folder=self.transfer_folder, config_manager=self._config_manager)
+            if not resolved or not os.path.exists(resolved):
+                return {'success': False, 'error': f'Source file not found on disk: {row["file_path"]}'}
+
+            staged_path = stage_file_for_reidentify(resolved, self.transfer_folder)
+            replace = bool(details.get('replace', True))
+            hint = build_reidentify_hint(
+                source=source,
+                original_path=row['file_path'],
+                resolved_fields=hint_fields,
+                replace_original=replace,
+            )
+            create_hint(staged_path, hint)
+            return {'success': True, 'action': 'reidentify_staged', 'message': f'Staged for re-identification under {hint_fields.get("album_title", "new album")}'}
+        except Exception as e:
+            logger.error("Failed to apply re-identify for track %s: %s", entity_id, e)
+            return {'success': False, 'error': str(e)}
 
     def _fix_genre_cleanup(self, entity_type, entity_id, file_path, details):
         """#1057 — rewrite a stored genre list to only its whitelisted genres.
@@ -1078,6 +2284,7 @@ class RepairWorker:
             if cursor.rowcount == 0:
                 conn.commit()
                 return {'success': False, 'error': f'{entity_type} {entity_id} no longer exists'}
+            _lock_genres(cursor, table, entity_id)
             conn.commit()
             removed = details.get('removed_genres') or []
             logger.info("Genre cleanup: %s %s — removed %d off-whitelist genre(s)",
@@ -1090,8 +2297,41 @@ class RepairWorker:
             if conn:
                 conn.close()
 
+    def _fix_genre_enrichment(self, entity_type, entity_id, file_path, details):
+        """Merge scanned additions with current genres without deleting anything."""
+        additions = details.get('added_genres')
+        table = {'artist': 'artists', 'album': 'albums'}.get(entity_type)
+        if not isinstance(additions, list) or table is None:
+            return {'success': False, 'error': 'Invalid genre enrichment finding'}
+        if not additions:
+            return {'success': False, 'error': 'No unambiguous genres are available to apply'}
+        conn = None
+        try:
+            conn = self.db._get_connection(); cur = conn.cursor()
+            cur.execute(f"SELECT genres FROM {table} WHERE id = ?", (entity_id,))
+            row = cur.fetchone()
+            if not row:
+                conn.close(); return {'success': False, 'error': f'{entity_type} {entity_id} no longer exists'}
+            from core.metadata.genre_enrichment import parse_values
+            from core.genre_filter import _normalize_for_match
+            current = parse_values(row[0]); seen = {_normalize_for_match(g) for g in current}
+            for genre in additions:
+                if genre and _normalize_for_match(genre) not in seen:
+                    current.append(genre); seen.add(_normalize_for_match(genre))
+            cur.execute(f"UPDATE {table} SET genres = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", (json.dumps(current), entity_id))
+            _lock_genres(cur, table, entity_id)
+            conn.commit(); conn.close()
+            return {'success': True, 'action': 'genres_applied'}
+        except Exception as e:
+            logger.error("Genre enrichment fix failed for %s %s: %s", entity_type, entity_id, e)
+            try:
+                conn.close()
+            except Exception as close_err:   # noqa: BLE001 — the real error is already logged above
+                logger.debug("Genre enrichment: connection close failed: %s", close_err)
+            return {'success': False, 'error': str(e)}
+
     def _fix_comma_artist_split(self, entity_type, entity_id, file_path, details):
-        """Split a comma-joined artist tag into properly separated artists (jadux).
+        """Split a separator-joined artist tag into properly separated artists (jadux).
 
         Re-tags every file still under the combined artist: display artist
         becomes "A; B", the per-artist list goes into the multi-value Artists
@@ -1102,9 +2342,10 @@ class RepairWorker:
         global write_multi_artist opt-in doesn't gate it.
 
         Stale-finding guard: a file whose CURRENT artist tag no longer matches
-        the combined string (user edited it, or it's already split) is left
-        untouched. The file list comes fresh from the DB, not from the
-        finding's display-capped sample.
+        the combined string (user edited it) is left untouched and the finding
+        is retired. A file that already carries the split list counts as done,
+        not stale. The file list comes from the finding details, which scanned
+        the actual file metadata (not the database).
         """
         parts = details.get('split_artists')
         combined = details.get('combined_name') or details.get('artist_name')
@@ -1116,20 +2357,20 @@ class RepairWorker:
         display = details.get('new_display_artist') or '; '.join(parts)
         primary = details.get('primary_artist') or parts[0]
 
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT file_path FROM tracks WHERE artist_id = ? "
-                "AND file_path IS NOT NULL AND file_path != ''", (entity_id,))
-            files = [r[0] for r in cursor.fetchall()]
-        except Exception as e:
-            return {'success': False, 'error': str(e)}
-        finally:
-            if conn:
-                conn.close()
+        # Get file list from finding details
+        file_infos = details.get('all_files') or details.get('files') or []
+        files = [f.get('file_path') if isinstance(f, dict) else f for f in file_infos]
         if not files:
+            files = self._comma_split_files_from_db(entity_id, details)
+        if not files:
+            # No list in the finding AND the DB fallback found nothing under
+            # this artist: the files are gone, so there is nothing left to
+            # split. This must stay a SUCCESS — only success resolves the
+            # finding (fix_finding checks result['success'] before calling
+            # resolve_finding), so returning an error here left a finding for
+            # deleted files permanently stuck: the Fix button errored with
+            # "re-run the scan", and a rescan is exactly the thing that can't
+            # find files that no longer exist. Restores the pre-#1081 return.
             return {'success': True, 'action': 'already_gone',
                     'message': 'No files under this artist anymore'}
 
@@ -1138,23 +2379,26 @@ class RepairWorker:
         from mutagen.mp4 import MP4
         from core.library.path_resolver import resolve_library_file_path
         from core.metadata.common import save_audio_file, get_mutagen_symbols
+        from core.repair_jobs.comma_artist_splitter import file_already_split
 
         def _norm(v):
             return ' '.join(str(v or '').casefold().split())
 
-        def _single_value(raw):
-            """Current tag value IF it is a single string; None for multi-value
-            (already split) or missing."""
+        def _matches_norm(raw, target_norm):
+            """does ANY value of the current tag equal the combined string?
+            the scan reads text[0], so the fix must accept whatever the scan
+            accepted: a zero-padded id3v2.4 TPE1 reads back from mutagen as
+            ['A; B', ''] (two values) and the old exactly-one-value guard
+            called every such file stale, forever. mutagen only strips that
+            padding for v2.3 (its #276)."""
             if raw is None:
-                return None
-            if isinstance(raw, (list, tuple)):
-                if len(raw) != 1:
-                    return None
-                raw = raw[0]
-            return str(raw)
+                return False
+            if isinstance(raw, (list, tuple, set)):
+                return any(_norm(x) == target_norm for x in raw if x)
+            return _norm(raw) == target_norm
 
         combined_norm = _norm(combined)
-        fixed = stale = missing = errors = 0
+        fixed = stale = missing = errors = already_split = 0
 
         for fp in files:
             resolved = resolve_library_file_path(
@@ -1171,11 +2415,18 @@ class RepairWorker:
                 if audio.tags is None:
                     audio.add_tags()
 
+                # already carries the split list (our earlier fix, or picard):
+                # nothing to write, but the finding IS done. counted apart
+                # from stale so it resolves as a success below.
+                if file_already_split(audio, parts):
+                    already_split += 1
+                    continue
+
                 changed = False
                 if isinstance(audio.tags, ID3):
                     tpe1 = audio.tags.get('TPE1')
-                    current = _single_value(tpe1.text if tpe1 else None)
-                    if current is None or _norm(current) != combined_norm:
+                    tpe1_text = getattr(tpe1, 'text', None) if tpe1 else None
+                    if not _matches_norm(tpe1_text, combined_norm):
                         stale += 1
                         continue
                     audio.tags.delall('TPE1')
@@ -1183,28 +2434,28 @@ class RepairWorker:
                     audio.tags.delall('TXXX:Artists')
                     audio.tags.add(TXXX(encoding=3, desc='Artists', text=list(parts)))
                     tpe2 = audio.tags.get('TPE2')
-                    if tpe2 and _norm(_single_value(tpe2.text)) == combined_norm:
+                    if tpe2 and _matches_norm(getattr(tpe2, 'text', None), combined_norm):
                         audio.tags.delall('TPE2')
                         audio.tags.add(TPE2(encoding=3, text=[primary]))
                     changed = True
                 elif isinstance(audio, MP4):
-                    current = _single_value(audio.tags.get('\xa9ART'))
-                    if current is None or _norm(current) != combined_norm:
+                    art = audio.tags.get('\xa9ART') if audio.tags else None
+                    if not _matches_norm(art, combined_norm):
                         stale += 1
                         continue
                     # MP4 artist carries the list directly (#587 convention).
                     audio.tags['\xa9ART'] = list(parts)
-                    if _norm(_single_value(audio.tags.get('aART'))) == combined_norm:
+                    if _matches_norm(audio.tags.get('aART'), combined_norm):
                         audio.tags['aART'] = [primary]
                     changed = True
                 elif hasattr(audio, 'get'):  # Vorbis family (FLAC/Ogg/Opus)
-                    current = _single_value(audio.get('artist'))
-                    if current is None or _norm(current) != combined_norm:
+                    artist_val = audio.get('artist')
+                    if not _matches_norm(artist_val, combined_norm):
                         stale += 1
                         continue
                     audio['artist'] = [display]
                     audio['artists'] = list(parts)
-                    if _norm(_single_value(audio.get('albumartist'))) == combined_norm:
+                    if _matches_norm(audio.get('albumartist'), combined_norm):
                         audio['albumartist'] = [primary]
                     changed = True
                 else:
@@ -1222,6 +2473,8 @@ class RepairWorker:
         if fixed > 0:
             msg = f'Re-tagged {fixed} file(s) as "{display}"'
             extras = []
+            if already_split:
+                extras.append(f'{already_split} already split')
             if stale:
                 extras.append(f'{stale} skipped (tag changed since scan)')
             if missing:
@@ -1231,9 +2484,25 @@ class RepairWorker:
             if extras:
                 msg += f' ({", ".join(extras)})'
             logger.info("Comma-artist split: %s → %s — %s", combined, parts, msg)
-            return {'success': True, 'action': 'artists_split', 'message': msg}
+            return {'success': True, 'action': 'artists_split', 'message': msg, 'fixed': fixed}
+
+        if already_split > 0 and not errors:
+            msg = f'All {already_split} file(s) already have split artist tags'
+            if missing or stale:
+                extras = []
+                if stale:
+                    extras.append(f'{stale} skipped (tag changed since scan)')
+                if missing:
+                    extras.append(f'{missing} not found on disk')
+                msg = f'{already_split} file(s) already split ({", ".join(extras)})'
+            logger.info("Comma-artist split: %s already split — %s", combined, msg)
+            return {'success': True, 'action': 'artists_split', 'message': msg, 'fixed': 0}
+
         if stale and not errors and not missing:
-            return {'success': False,
+            # can never succeed: the tag the finding is about is gone. 'stale'
+            # retires it (#1143 path) instead of leaving it pending to fail
+            # on every run; the next scan re-raises it if anything is left.
+            return {'success': False, 'stale': True,
                     'error': f'All {stale} file(s) no longer carry "{combined}" — '
                              f'tags changed since the scan; re-run the job'}
         if missing == len(files):
@@ -1241,6 +2510,42 @@ class RepairWorker:
                     'message': 'No files found on disk for this artist'}
         return {'success': False,
                 'error': f'No files re-tagged ({stale} stale, {missing} missing, {errors} errors)'}
+
+    def _comma_split_files_from_db(self, entity_id, details):
+        """Fallback for legacy findings that predate stored file-path lists."""
+        artist_id = details.get('db_artist_id') or entity_id
+        combined = (details.get('combined_name') or details.get('artist_name') or '').strip()
+        if not artist_id and not combined:
+            return []
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            if artist_id:
+                cursor.execute("""
+                    SELECT t.file_path
+                    FROM tracks t
+                    WHERE t.artist_id = ? AND t.file_path IS NOT NULL AND t.file_path != ''
+                """, (artist_id,))
+                rows = [r[0] for r in cursor.fetchall() if r[0]]
+                if rows:
+                    return rows
+            if combined:
+                cursor.execute("""
+                    SELECT t.file_path
+                    FROM tracks t
+                    JOIN artists ar ON ar.id = t.artist_id
+                    WHERE LOWER(TRIM(ar.name)) = LOWER(TRIM(?))
+                      AND t.file_path IS NOT NULL AND t.file_path != ''
+                """, (combined,))
+                return [r[0] for r in cursor.fetchall() if r[0]]
+            return []
+        except Exception as e:
+            logger.debug("Could not derive comma-split files from DB: %s", e)
+            return []
+        finally:
+            if conn:
+                conn.close()
 
     def _fix_canonical_version(self, entity_type, entity_id, file_path, details):
         """Apply a canonical-version finding — pin the release the resolver chose
@@ -1290,13 +2595,16 @@ class RepairWorker:
                 spotify_track_data=track_data,
                 failure_reason='Discography backfill — missing from library',
                 source_type='repair',
-                source_info={'job': 'discography_backfill', 'artist': details.get('artist_name', '')}
+                source_info={'job': 'discography_backfill', 'artist': details.get('artist_name', '')},
+                # #1504: stashed by the producer; None -> shared/1.
+                profile_id=details.get('owner_profile_id') or 1,
             )
             track_name = track_data.get('name', '?')
             if success:
                 return {'success': True, 'action': 'added_to_wishlist',
                         'message': f"Added '{track_name}' to wishlist"}
-            return {'success': False, 'error': f"Could not add '{track_name}' to wishlist (may already exist)"}
+            return {'success': True, 'action': 'already_wishlisted',
+                    'message': f"'{track_name}' is already in wishlist for backfill"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
@@ -1308,30 +2616,37 @@ class RepairWorker:
         quality-upgrade redownload keeps the low-quality file/row in place
         until the replacement actually imports).
 
-        THE FINDING'S OWN DETAILS ARE A VALID SOURCE, not merely a per-field
+        THE FINDING'S OWN DETAILS ARE A VALID SOURCE, not just a per-field
         fallback. A full database refresh calls `clear_server_data`, which
-        DELETEs every track for the server and re-inserts it — so each row comes
-        back with a new autoincrement id and every finding written beforehand
-        points at an id that no longer exists. Returning None on the missing row
-        surfaced as "No matched track in finding" for every upgrade applied
-        after a refresh. The details carry title, artist and album, so the
+        DELETEs every track for the server and re-inserts it — so each row
+        comes back with a new autoincrement id and every finding written
+        before that refresh points at an id that no longer exists. This used
+        to `return None` on the missing row, which surfaced as "No matched
+        track in finding" for EVERY upgrade a user tried to apply after a
+        refresh. The details carry the title, artist and album, so the
         redownload can still be built without the row.
 
         Accepts BOTH detail vocabularies, because the two producers disagree:
-        the Quality Check scanner writes `expected_title`/`expected_artist`, the
-        Quality Upgrade job writes `track_title`/`artist`, and reading one set
-        left the other's findings unresolvable.
+        the Quality Check scanner writes `expected_title`/`expected_artist`,
+        and the Quality Upgrade job writes `track_title`/`artist`. Reading
+        only one set left the other's findings unresolvable.
 
-        `entity_id` may legitimately be None — that is what the scanner records
-        for a file it could not match to a library row (entity_type='file'). Not
-        an error; it means the details are the only source."""
+        `entity_id` may legitimately be None — the scanner records that for a
+        file it could not match to a library track row (entity_type='file').
+        That is not an error, it just means the details are the only source."""
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
+            # #1504: owner_profile_id may not exist in minimal test schemas;
+            # fall back to NULL (routes to shared) when the column is absent.
+            cursor.execute("PRAGMA table_info(tracks)")
+            _track_cols = {col[1] for col in cursor.fetchall()}
+            _owner_sel = "t.owner_profile_id" if 'owner_profile_id' in _track_cols else "NULL AS owner_profile_id"
+            cursor.execute(f"""
                 SELECT t.id, t.title, t.track_number, t.duration,
                        t.spotify_track_id, t.itunes_track_id, t.deezer_id,
+                       {_owner_sel},
                        ar.name AS artist_name,
                        al.title AS album_title, al.spotify_album_id,
                        al.record_type, al.track_count, al.year, al.thumb_url AS album_thumb
@@ -1355,29 +2670,29 @@ class RepairWorker:
                         return value
                 return default
 
+            # `track_title`/`artist` are what the quality_upgrade job writes;
+            # `expected_*` are kept because other producers use those names.
             track_name = _from('title', 'track_title', 'expected_title')
             artist_name = _from('artist_name', 'artist', 'expected_artist')
             album_title = _from('album_title', 'album_title', default='')
 
             if not track_name or not artist_name:
-                # Nothing identifiable from either source. A wishlist entry
+                # Nothing identifiable from either source — a wishlist entry
                 # built from "Unknown - Unknown" would search for nothing and
                 # sit there forever, so refuse rather than queue garbage.
                 logger.warning(
-                    "Track identity for %s has neither a DB row nor usable details",
-                    entity_id)
+                    "Track identity for %s has neither a DB row nor usable details", entity_id)
                 return None
 
             # A stable, UNIQUE id. entity_id is None for an unmatched file, and
-            # a literal "redownload_None" would make every such finding share a
-            # single wishlist row — the second would be deduped away and never
-            # downloaded at all.
+            # a literal "redownload_None" would make every such finding share
+            # one wishlist row — the second would be deduped away and silently
+            # never downloaded.
             if entity_id:
                 fallback_id = f"redownload_{entity_id}"
             else:
                 seed = f"{artist_name}|{track_name}|{details.get('file_path') or ''}"
-                fallback_id = "redownload_" + hashlib.sha1(
-                    seed.encode('utf-8')).hexdigest()[:16]
+                fallback_id = f"redownload_{hashlib.sha1(seed.encode('utf-8')).hexdigest()[:16]}"
             wishlist_id = (_from('spotify_track_id') or _from('itunes_track_id')
                            or _from('deezer_id') or fallback_id)
             album_images = []
@@ -1408,6 +2723,10 @@ class RepairWorker:
                 'uri': (f"spotify:track:{_from('spotify_track_id')}"
                         if _from('spotify_track_id') else ''),
                 'is_local': False,
+                # #1504: owning profile for wishlist routing (None = shared).
+                # read from the row when available; callers map None -> 1
+                # (the wishlist column is NOT NULL).
+                'owner_profile_id': row['owner_profile_id'] if row is not None else None,
             }
         except Exception as e:
             logger.warning("Track identity lookup failed for track %s: %s", entity_id, e)
@@ -1431,21 +2750,33 @@ class RepairWorker:
                pipeline finds the replacement.
            'delete': remove the low-quality file + its DB row outright.
            'ignore' is handled in the UI by dismissing the finding — never here.
+           Exception (#1289): when no explicit action is given and the issue is
+           'format_not_in_profile', the finding resolves as ignored without
+           touching the file — redownloading would fetch the profile's target,
+           often a downgrade.
         """
-        fix_action = details.get('_fix_action', 'redownload')
+        fix_action = details.get('_fix_action')
+        if not fix_action:
+            if details.get('quality_issue') == 'format_not_in_profile':
+                # #1289: the profile doesn't target this format at all, so
+                # redownloading would fetch the profile's target — often a
+                # downgrade (e.g. FLAC -> MP3). There is nothing to upgrade to;
+                # the fix is a profile change, not a file change. Resolve the
+                # finding without touching the file (the backend equivalent of
+                # the UI's Ignore).
+                return {'success': True, 'action': 'ignored',
+                        'message': 'Format not targeted by quality profile — file left as-is'}
+            fix_action = 'redownload'
 
         if fix_action == 'delete':
+            deleted_file, delete_note = _delete_file_if_present(
+                file_path, self.transfer_folder, config_manager=self._config_manager)
             if file_path:
                 resolved = _resolve_file_path(
                     file_path, self.transfer_folder,
                     config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                        self._cleanup_empty_parents(resolved)
-                    except Exception as e:
-                        logger.warning("Could not delete low-quality file %s: %s",
-                                       resolved, e)
+                if deleted_file and resolved:
+                    self._cleanup_empty_parents(resolved)
             if entity_id:
                 try:
                     conn = self.db._get_connection()
@@ -1454,6 +2785,9 @@ class RepairWorker:
                     conn.close()
                 except Exception as e:
                     return {'success': False, 'error': f'DB delete failed: {e}'}
+            if not deleted_file and delete_note:
+                return {'success': True, 'action': 'deleted_file',
+                        'message': f'Removed library row, but the low-quality file was not deleted: {delete_note}'}
             return {'success': True, 'action': 'deleted_file',
                     'message': f'Deleted low-quality file: '
                                f'{os.path.basename(file_path or "")}'}
@@ -1461,11 +2795,12 @@ class RepairWorker:
         track_data = details.get('matched_track_data')
         if not track_data:
             # NOT gated on entity_id. The Quality Check scanner records
-            # entity_id=None for any file it could not match to a library track
-            # row (entity_type='file'), and gating here meant the resolver was
-            # never reached for exactly those findings — so applying one failed
-            # with "No matched track in finding" even though the finding's own
-            # details carry the title and artist.
+            # `entity_id=None` for any file it could not match to a library
+            # track row (entity_type='file'), and gating here meant the
+            # resolver was never reached for those findings — so applying one
+            # failed with "No matched track in finding" even though the
+            # finding's own details carry the title and artist. That is the
+            # every-single-time failure two users reported.
             track_data = self._track_identity_for_redownload(entity_id, details)
         if not track_data:
             return {'success': False, 'error': 'No matched track in finding'}
@@ -1486,12 +2821,16 @@ class RepairWorker:
                     'provider': details.get('provider'),
                 },
                 quality_profile_id=details.get('quality_profile_id'),
+                # #1504: route to the owning profile's wishlist. this is the
+                # USER profile, not the quality profile above — separate kwargs.
+                profile_id=track_data.get('owner_profile_id') or 1,
             )
             track_name = track_data.get('name', '?')
             if success:
                 return {'success': True, 'action': 'added_to_wishlist',
                         'message': f"Added '{track_name}' to wishlist for re-download"}
-            return {'success': False, 'error': f"Could not add '{track_name}' to wishlist (may already exist or be blocklisted)"}
+            return {'success': True, 'action': 'already_wishlisted',
+                    'message': f"'{track_name}' is already queued in wishlist for quality upgrade"}
         except Exception as e:
             return {'success': False, 'error': str(e)}
 
@@ -1500,9 +2839,6 @@ class RepairWorker:
            'redownload' (default) — add to wishlist + remove DB entry
            'remove' — just remove the dead DB entry without re-downloading
         """
-        if not entity_id:
-            return {'success': False, 'error': 'No track ID associated with this finding'}
-
         fix_action = details.get('_fix_action', 'redownload')
 
         # Simple removal — just delete the dead track record
@@ -1511,11 +2847,14 @@ class RepairWorker:
             try:
                 conn = self.db._get_connection()
                 cursor = conn.cursor()
-                cursor.execute("SELECT title FROM tracks WHERE id = ?", (entity_id,))
-                row = cursor.fetchone()
-                track_name = row['title'] if row else 'Unknown'
-                cursor.execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
-                conn.commit()
+                track_name = details.get('title') or 'Unknown'
+                if entity_id:
+                    cursor.execute("SELECT title FROM tracks WHERE id = ?", (entity_id,))
+                    row = cursor.fetchone()
+                    if row and row['title']:
+                        track_name = row['title']
+                    cursor.execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
+                    conn.commit()
                 return {'success': True, 'action': 'removed',
                         'message': f'Removed "{track_name}" from database'}
             except Exception as e:
@@ -1526,321 +2865,327 @@ class RepairWorker:
                     conn.close()
 
         # Default: re-download flow
-        conn = None
+        track_data = self._track_identity_for_redownload(entity_id, details)
+        if not track_data:
+            return {'success': False, 'error': 'Could not resolve track identity from database or finding details'}
+
+        track_name = track_data.get('name', details.get('title', 'Unknown'))
+        source_info = {
+            'original_path': file_path or details.get('original_path', ''),
+            'album_title': track_data.get('album', {}).get('name', details.get('album', '')),
+            'artist': ((track_data.get('artists') or [{}])[0].get('name') if track_data.get('artists') else details.get('artist', '')),
+            'reason': 'dead_file_redownload',
+        }
+
         try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-
-            # Fetch full track + album + artist data from DB
-            cursor.execute("""
-                SELECT t.id, t.title, t.track_number, t.duration, t.bitrate,
-                       t.spotify_track_id, t.itunes_track_id, t.deezer_id, t.isrc,
-                       ar.name AS artist_name, ar.spotify_artist_id,
-                       al.title AS album_title, al.spotify_album_id,
-                       al.record_type, al.track_count, al.year, al.thumb_url AS album_thumb
-                FROM tracks t
-                LEFT JOIN artists ar ON ar.id = t.artist_id
-                LEFT JOIN albums al ON al.id = t.album_id
-                WHERE t.id = ?
-            """, (entity_id,))
-            row = cursor.fetchone()
-
-            if not row:
-                return {'success': False, 'error': 'Track not found in database'}
-
-            track_name = row['title'] or details.get('title', 'Unknown')
-            artist_name = row['artist_name'] or details.get('artist', 'Unknown Artist')
-            album_title = row['album_title'] or details.get('album', '')
-
-            # Best available ID for wishlist (spotify preferred, then itunes, deezer, fallback)
-            wishlist_id = (row['spotify_track_id']
-                           or row['itunes_track_id']
-                           or row['deezer_id']
-                           or f"redownload_{entity_id}")
-
-            # Build album images list
-            album_images = []
-            album_thumb = row['album_thumb'] or details.get('album_thumb_url')
-            if album_thumb:
-                album_images = [{'url': album_thumb}]
-
-            # Build wishlist-compatible track data
-            spotify_track_data = {
-                'id': wishlist_id,
-                'name': track_name,
-                'artists': [{'name': artist_name}],
-                'album': {
-                    'name': album_title or track_name,
-                    'id': row['spotify_album_id'] or '',
-                    'release_date': str(row['year']) if row['year'] else '',
-                    'images': album_images,
-                    'album_type': row['record_type'] or 'album',
-                    'total_tracks': row['track_count'] or 0,
-                    'artists': [{'name': artist_name}],
-                },
-                'duration_ms': row['duration'] or 0,
-                'track_number': row['track_number'] or 1,
-                'disc_number': 1,
-                'explicit': False,
-                'external_urls': {},
-                'popularity': 0,
-                'preview_url': None,
-                'uri': f"spotify:track:{row['spotify_track_id']}" if row['spotify_track_id'] else '',
-                'is_local': False,
-            }
-
-            source_info = {
-                'original_path': file_path or details.get('original_path', ''),
-                'album_title': album_title,
-                'artist': artist_name,
-                'reason': 'dead_file_redownload',
-            }
-
             added = self.db.add_to_wishlist(
-                spotify_track_data,
+                track_data,
                 failure_reason='Dead file — re-download requested',
                 source_type='redownload',
                 source_info=source_info,
+                # #1504: owning profile's wishlist (None -> shared/1).
+                profile_id=track_data.get('owner_profile_id') or 1,
             )
 
-            if not added:
-                return {'success': False, 'error': 'Failed to add to wishlist (may already exist)'}
+            # Remove dead track entry from DB regardless of whether wishlist already had it
+            if entity_id:
+                try:
+                    conn = self.db._get_connection()
+                    conn.cursor().execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    logger.debug("Failed to remove dead track row %s: %s", entity_id, e)
 
-            # Remove dead track entry from DB
-            cursor.execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
-            conn.commit()
-
-            return {'success': True, 'action': 'added_to_wishlist',
-                    'message': f'Added "{track_name}" to wishlist for re-download'}
+            if added:
+                return {'success': True, 'action': 'added_to_wishlist',
+                        'message': f'Added "{track_name}" to wishlist for re-download'}
+            return {'success': True, 'action': 'already_wishlisted',
+                    'message': f'"{track_name}" is already in wishlist for re-download; removed dead database entry'}
         except Exception as e:
             logger.error("Dead file re-download failed for track %s: %s", entity_id, e)
             return {'success': False, 'error': str(e)}
-        finally:
-            if conn:
-                conn.close()
 
     def _fix_short_preview_track(self, entity_type, entity_id, file_path, details):
         """Approve a preview-clip finding: delete the ~30s preview file, drop its DB row, and
         re-add the track to the wishlist (full payload) so the real version downloads. Mirrors
         the dead-file 'redownload' payload + the acoustid-mismatch file delete. (Tools #937-adj)
         """
-        if not entity_id:
-            return {'success': False, 'error': 'No track ID associated with this finding'}
-        conn = None
+        # Resolve entity_id from file_path if entity_id missing
+        if not entity_id and file_path:
+            try:
+                conn = self.db._get_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM tracks WHERE file_path = ?", (file_path,))
+                r = cur.fetchone()
+                if r:
+                    entity_id = r['id'] if isinstance(r, dict) else r[0]
+                conn.close()
+            except Exception as e:
+                logger.debug("Failed to resolve track id for %s: %s", file_path, e)
+
+        track_data = self._track_identity_for_redownload(entity_id, details)
+        if not track_data:
+            return {'success': False, 'error': 'Could not resolve track identity from database or finding details'}
+
+        track_name = track_data.get('name', details.get('title', 'Unknown'))
+        artist_name = (track_data.get('artists') or [{}])[0].get('name') if track_data.get('artists') else details.get('artist', 'Unknown Artist')
+        album_title = track_data.get('album', {}).get('name') or details.get('album', '')
+
+        # Real expected length from finding details if available
+        if details.get('expected_duration_s'):
+            track_data['duration_ms'] = int(float(details['expected_duration_s']) * 1000)
+
+        # Captured album art from finding details
+        album_thumb = details.get('album_thumb_url')
+        if album_thumb:
+            track_data['album']['images'] = [{'url': album_thumb}]
+
+        source_info = {
+            'original_path': file_path or details.get('original_path', ''),
+            'album_title': album_title,
+            'artist': artist_name,
+            'reason': 'preview_clip_redownload',
+        }
+
         try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT t.id, t.title, t.track_number, t.duration, t.bitrate,
-                       t.spotify_track_id, t.itunes_track_id, t.deezer_id, t.isrc,
-                       ar.name AS artist_name, ar.spotify_artist_id,
-                       al.title AS album_title, al.spotify_album_id,
-                       al.record_type, al.track_count, al.year, al.thumb_url AS album_thumb
-                FROM tracks t
-                LEFT JOIN artists ar ON ar.id = t.artist_id
-                LEFT JOIN albums al ON al.id = t.album_id
-                WHERE t.id = ?
-            """, (entity_id,))
-            row = cursor.fetchone()
-            if not row:
-                return {'success': False, 'error': 'Track not found in database'}
-
-            track_name = row['title'] or details.get('title', 'Unknown')
-            artist_name = row['artist_name'] or details.get('artist', 'Unknown Artist')
-            album_title = row['album_title'] or details.get('album', '')
-
-            wishlist_id = (row['spotify_track_id']
-                           or row['itunes_track_id']
-                           or row['deezer_id']
-                           or f"preview_redl_{entity_id}")
-
-            # Prefer the finding's stored art (the scan captures the metadata source's CDN image)
-            # over the library album thumb, which is often empty for un-enriched HiFi previews.
-            album_images = []
-            album_thumb = details.get('album_thumb_url') or row['album_thumb']
-            if album_thumb:
-                album_images = [{'url': album_thumb}]
-
-            spotify_track_data = {
-                'id': wishlist_id,
-                'name': track_name,
-                'artists': [{'name': artist_name}],
-                'album': {
-                    'name': album_title or track_name,
-                    'id': row['spotify_album_id'] or '',
-                    'release_date': str(row['year']) if row['year'] else '',
-                    'images': album_images,
-                    'album_type': row['record_type'] or 'album',
-                    'total_tracks': row['track_count'] or 0,
-                    'artists': [{'name': artist_name}],
-                },
-                'duration_ms': int((details.get('expected_duration_s') or 0) * 1000) or (row['duration'] or 0),
-                'track_number': row['track_number'] or 1,
-                'disc_number': 1,
-                'explicit': False,
-                'external_urls': {},
-                'popularity': 0,
-                'preview_url': None,
-                'uri': f"spotify:track:{row['spotify_track_id']}" if row['spotify_track_id'] else '',
-                'is_local': False,
-            }
-
-            source_info = {
-                'original_path': file_path or details.get('original_path', ''),
-                'album_title': album_title,
-                'artist': artist_name,
-                'reason': 'preview_clip_redownload',
-            }
-
             added = self.db.add_to_wishlist(
-                spotify_track_data,
+                track_data,
                 failure_reason='Preview clip — re-downloading full track',
                 source_type='redownload',
                 source_info=source_info,
+                # #1504: owning profile's wishlist (None -> shared/1).
+                profile_id=track_data.get('owner_profile_id') or 1,
             )
-            if not added:
-                return {'success': False, 'error': 'Failed to add to wishlist (may already exist or be blocklisted)'}
 
             # Delete the preview file (path resolved like the other delete tools).
-            deleted_file = False
             target_path = file_path or details.get('original_path')
+            deleted_file = False
+            delete_note = None
             if target_path:
                 download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else None
-                resolved = _resolve_file_path(target_path, self.transfer_folder,
-                                              download_folder=download_folder,
-                                              config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                        deleted_file = True
-                    except Exception as e:
-                        logger.warning("Could not delete preview file %s: %s", resolved, e)
+                deleted_file, delete_note = _delete_file_if_present(
+                    target_path, self.transfer_folder,
+                    config_manager=self._config_manager,
+                    download_folder=download_folder)
+
+            # If the preview file is still on disk and the delete failed, the
+            # approved action didn't happen — report failure and keep the DB
+            # row so the finding stays actionable.
+            if _file_removal_failed(deleted_file, delete_note):
+                return {'success': False,
+                        'error': f'Could not delete the preview file ({delete_note}) — '
+                                 f'library entry kept so you can retry'}
 
             # Drop the DB row so the track shows as missing.
-            cursor.execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
-            conn.commit()
+            if entity_id:
+                try:
+                    conn = self.db._get_connection()
+                    conn.cursor().execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    logger.debug("Failed to drop track row %s: %s", entity_id, e)
 
-            return {'success': True, 'action': 'added_to_wishlist',
-                    'message': (f'Deleted preview clip and re-wishlisted "{track_name}" for full download'
-                                if deleted_file else
-                                f'Re-wishlisted "{track_name}" (preview file already gone)')}
+            action = 'added_to_wishlist' if added else 'already_wishlisted'
+            if added:
+                msg = (f'Deleted preview clip and re-wishlisted "{track_name}" for full download'
+                       if deleted_file else
+                       f'Re-wishlisted "{track_name}" (preview file not deleted: {delete_note or "already gone"})')
+            else:
+                msg = (f'"{track_name}" is already in wishlist for re-download; deleted preview clip'
+                       if deleted_file else
+                       f'"{track_name}" is already in wishlist for re-download')
+
+            return {'success': True, 'action': action, 'message': msg}
         except Exception as e:
             logger.error("Preview-clip fix failed for track %s: %s", entity_id, e)
             return {'success': False, 'error': str(e)}
-        finally:
-            if conn:
-                conn.close()
 
     def _fix_corrupt_audio(self, entity_type, entity_id, file_path, details):
-        """Approve a corrupt-file finding: delete the damaged file, drop its DB row, and
-        re-add the track to the wishlist (full payload) so the real version downloads.
-        Frame-corrupt audio can't be repaired by re-tagging — the data is gone — so a
-        fresh download is the only cure. Mirrors the preview-clip redownload path (#1000).
+        """Approve a corrupt-file finding: move the damaged file to the deleted-files
+        quarantine, drop its DB row, and re-add the track to the wishlist (full
+        payload) so the real version downloads. Frame-corrupt audio can't be
+        repaired by re-tagging — the data is gone — so a fresh download is the only
+        cure (#1000).
+
+        Quarantined rather than deleted: until a replacement has actually arrived,
+        the damaged copy is still the only one, and it can be restored from the
+        deleted-files manager if the re-download never succeeds.
         """
-        if not entity_id:
-            return {'success': False, 'error': 'No track ID associated with this finding'}
-        conn = None
+        if not entity_id and file_path:
+            try:
+                conn = self.db._get_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM tracks WHERE file_path = ?", (file_path,))
+                r = cur.fetchone()
+                if r:
+                    entity_id = r['id'] if isinstance(r, dict) else r[0]
+                conn.close()
+            except Exception as e:
+                logger.debug("Failed to resolve track id for %s: %s", file_path, e)
+
+        track_data = self._track_identity_for_redownload(entity_id, details)
+        if not track_data:
+            return {'success': False, 'error': 'Could not resolve track identity from database or finding details'}
+
+        track_name = track_data.get('name', details.get('title', 'Unknown'))
+        artist_name = (track_data.get('artists') or [{}])[0].get('name') if track_data.get('artists') else details.get('artist', 'Unknown Artist')
+        album_title = track_data.get('album', {}).get('name') or details.get('album', '')
+
+        album_thumb = details.get('album_thumb_url')
+        if album_thumb:
+            track_data['album']['images'] = [{'url': album_thumb}]
+
+        source_info = {
+            'original_path': file_path or details.get('original_path', ''),
+            'album_title': album_title,
+            'artist': artist_name,
+            'reason': 'corrupt_file_redownload',
+        }
+
         try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT t.id, t.title, t.track_number, t.duration,
-                       t.spotify_track_id, t.itunes_track_id, t.deezer_id, t.isrc,
-                       ar.name AS artist_name, ar.spotify_artist_id,
-                       al.title AS album_title, al.spotify_album_id,
-                       al.record_type, al.track_count, al.year, al.thumb_url AS album_thumb
-                FROM tracks t
-                LEFT JOIN artists ar ON ar.id = t.artist_id
-                LEFT JOIN albums al ON al.id = t.album_id
-                WHERE t.id = ?
-            """, (entity_id,))
-            row = cursor.fetchone()
-            if not row:
-                return {'success': False, 'error': 'Track not found in database'}
-
-            track_name = row['title'] or details.get('title', 'Unknown')
-            artist_name = row['artist_name'] or details.get('artist', 'Unknown Artist')
-            album_title = row['album_title'] or details.get('album', '')
-
-            wishlist_id = (row['spotify_track_id']
-                           or row['itunes_track_id']
-                           or row['deezer_id']
-                           or f"corrupt_redl_{entity_id}")
-
-            album_images = []
-            album_thumb = details.get('album_thumb_url') or row['album_thumb']
-            if album_thumb:
-                album_images = [{'url': album_thumb}]
-
-            spotify_track_data = {
-                'id': wishlist_id,
-                'name': track_name,
-                'artists': [{'name': artist_name}],
-                'album': {
-                    'name': album_title or track_name,
-                    'id': row['spotify_album_id'] or '',
-                    'release_date': str(row['year']) if row['year'] else '',
-                    'images': album_images,
-                    'album_type': row['record_type'] or 'album',
-                    'total_tracks': row['track_count'] or 0,
-                    'artists': [{'name': artist_name}],
-                },
-                'duration_ms': row['duration'] or 0,
-                'track_number': row['track_number'] or 1,
-                'disc_number': 1,
-                'explicit': False,
-                'external_urls': {},
-                'popularity': 0,
-                'preview_url': None,
-                'uri': f"spotify:track:{row['spotify_track_id']}" if row['spotify_track_id'] else '',
-                'is_local': False,
-            }
-
-            source_info = {
-                'original_path': file_path or details.get('original_path', ''),
-                'album_title': album_title,
-                'artist': artist_name,
-                'reason': 'corrupt_file_redownload',
-            }
-
             added = self.db.add_to_wishlist(
-                spotify_track_data,
+                track_data,
                 failure_reason='Corrupt file — re-downloading',
                 source_type='redownload',
                 source_info=source_info,
+                # #1504: owning profile's wishlist (None -> shared/1).
+                profile_id=track_data.get('owner_profile_id') or 1,
             )
-            if not added:
-                return {'success': False, 'error': 'Failed to add to wishlist (may already exist or be blocklisted)'}
 
-            # Delete the corrupt file (path resolved like the other delete tools).
-            deleted_file = False
+            # Quarantine the corrupt file (path resolved like the other delete tools).
             target_path = file_path or details.get('original_path')
+            moved = False
+            move_note = None
             if target_path:
                 download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else None
-                resolved = _resolve_file_path(target_path, self.transfer_folder,
-                                              download_folder=download_folder,
-                                              config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                        deleted_file = True
-                    except Exception as e:
-                        logger.warning("Could not delete corrupt file %s: %s", resolved, e)
+                moved, move_note, _dest = _quarantine_file_if_present(
+                    target_path, self.transfer_folder, 'corrupt_audio',
+                    config_manager=self._config_manager,
+                    download_folder=download_folder)
+
+            # If the corrupt file is still on disk and the quarantine move
+            # failed, the approved action didn't happen — report failure and
+            # keep the DB row so the finding stays actionable.
+            if _file_removal_failed(moved, move_note):
+                return {'success': False,
+                        'error': f'Could not move the corrupt file to the deleted folder '
+                                 f'({move_note}) — library entry kept so you can retry'}
 
             # Drop the DB row so the track shows as missing.
-            cursor.execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
-            conn.commit()
+            if entity_id:
+                try:
+                    conn = self.db._get_connection()
+                    conn.cursor().execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    logger.debug("Failed to drop track row %s: %s", entity_id, e)
 
-            return {'success': True, 'action': 'added_to_wishlist',
-                    'message': (f'Deleted corrupt file and re-wishlisted "{track_name}" for download'
-                                if deleted_file else
-                                f'Re-wishlisted "{track_name}" (corrupt file already gone)')}
+            action = 'added_to_wishlist' if added else 'already_wishlisted'
+            if added:
+                msg = (f'Moved the corrupt file to the deleted folder and re-wishlisted '
+                       f'"{track_name}" for download'
+                       if moved else
+                       f'Re-wishlisted "{track_name}" (corrupt file not moved: {move_note or "already gone"})')
+            else:
+                msg = (f'"{track_name}" is already in wishlist for re-download; moved corrupt file to the deleted folder'
+                       if moved else
+                       f'"{track_name}" is already in wishlist for re-download')
+
+            return {'success': True, 'action': action, 'message': msg}
         except Exception as e:
             logger.error("Corrupt-file fix failed for track %s: %s", entity_id, e)
             return {'success': False, 'error': str(e)}
-        finally:
-            if conn:
+
+    def _fix_fake_lossless(self, entity_type, entity_id, file_path, details):
+        """Fix a fake lossless finding.
+        Action depends on details['_fix_action']:
+           'redownload' (default): queue track to wishlist for genuine FLAC download
+           'delete': delete fake file and remove DB row
+        """
+        fix_action = details.get('_fix_action', 'redownload')
+
+        if fix_action == 'delete':
+            deleted_file, delete_note = _delete_file_if_present(
+                file_path, self.transfer_folder, config_manager=self._config_manager)
+            if file_path:
+                resolved = _resolve_file_path(
+                    file_path, self.transfer_folder,
+                    config_manager=self._config_manager)
+                if deleted_file and resolved:
+                    self._cleanup_empty_parents(resolved)
+
+            if not entity_id and file_path:
+                try:
+                    conn = self.db._get_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM tracks WHERE file_path = ?", (file_path,))
+                    row = cur.fetchone()
+                    if row:
+                        entity_id = row['id'] if isinstance(row, dict) else row[0]
+                    conn.close()
+                except Exception as e:
+                    logger.debug("Failed to resolve track id for %s: %s", file_path, e)
+
+            if entity_id:
+                try:
+                    conn = self.db._get_connection()
+                    conn.cursor().execute("DELETE FROM tracks WHERE id = ?", (entity_id,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    return {'success': False, 'error': f'DB delete failed: {e}'}
+
+            if not deleted_file and delete_note:
+                return {'success': True, 'action': 'deleted_file',
+                        'message': f'Removed library record, but file not deleted: {delete_note}'}
+            return {'success': True, 'action': 'deleted_file',
+                    'message': f'Deleted fake lossless file: {os.path.basename(file_path or "")}'}
+
+        # Default: redownload flow
+        if not entity_id and file_path:
+            try:
+                conn = self.db._get_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id FROM tracks WHERE file_path = ?", (file_path,))
+                row = cur.fetchone()
+                if row:
+                    entity_id = row['id'] if isinstance(row, dict) else row[0]
                 conn.close()
+            except Exception as e:
+                logger.debug("Failed to resolve track id for %s: %s", file_path, e)
+
+        track_data = self._track_identity_for_redownload(entity_id, details)
+        if not track_data:
+            return {'success': False, 'error': 'Could not resolve track identity for fake lossless file'}
+
+        track_name = track_data.get('name', details.get('title', 'Unknown'))
+        source_info = {
+            'original_path': file_path or details.get('original_path', ''),
+            'album_title': track_data.get('album', {}).get('name', details.get('album', '')),
+            'artist': ((track_data.get('artists') or [{}])[0].get('name') if track_data.get('artists') else details.get('artist', '')),
+            'reason': 'fake_lossless_redownload',
+        }
+
+        try:
+            added = self.db.add_to_wishlist(
+                track_data,
+                failure_reason=f"Fake lossless detected — spectral cutoff at ~{details.get('detected_cutoff_khz', '?')} kHz",
+                source_type='repair',
+                source_info=source_info,
+                # #1504: owning profile's wishlist (None -> shared/1).
+                profile_id=track_data.get('owner_profile_id') or 1,
+            )
+            if added:
+                return {'success': True, 'action': 'added_to_wishlist',
+                        'message': f'Added "{track_name}" to wishlist for genuine lossless download'}
+            return {'success': True, 'action': 'already_wishlisted',
+                    'message': f'"{track_name}" is already in wishlist for re-download'}
+        except Exception as e:
+            logger.error("Fake lossless re-download failed for track %s: %s", entity_id, e)
+            return {'success': False, 'error': str(e)}
 
     def _fix_orphan_file(self, entity_type, entity_id, file_path, details):
         """Handle an orphan file — move to staging or delete based on user choice.
@@ -1848,9 +3193,14 @@ class RepairWorker:
         The fix_action is passed via details['_fix_action']:
           'staging' — move file to the staging folder for import
           'delete'  — delete file from disk
+          'delete_confirmed' — delete, after the user saw the library track
+                               that shares its filename
         If no action specified, returns an error asking the user to choose.
         """
         fix_action = details.get('_fix_action', '')
+        confirmed = fix_action == 'delete_confirmed'
+        if confirmed:
+            fix_action = 'delete'
         if fix_action not in ('staging', 'delete'):
             return {'success': False, 'error': 'Please choose an action: move to staging or delete',
                     'needs_action': True}
@@ -1868,6 +3218,36 @@ class RepairWorker:
             if not os.path.exists(resolved):
                 return {'success': True, 'action': 'already_gone',
                         'message': 'File was already removed'}
+
+            # The file may have entered the catalogue since the finding was
+            # raised. Fail closed if the DB cannot be read: neither action may
+            # move or delete a file whose current status is unknown.
+            from core.repair_jobs.orphan_file_detector import (
+                is_tracked_path, known_file_suffixes, same_name_library_paths,
+            )
+            try:
+                suffixes = known_file_suffixes(self.db)
+            except Exception as e:
+                logger.error("Could not recheck orphan file against tracks: %s", e,
+                             exc_info=True)
+                return {'success': False, 'error':
+                        'Could not verify whether this file is now tracked; no file was changed'}
+            if is_tracked_path(resolved, suffixes):
+                return {'success': True, 'action': 'already_tracked',
+                        'message': 'File is now tracked in the library; no file was changed'}
+            # a library track with the same filename in another album may be
+            # this song or a different one. staging keeps the file so it goes
+            # ahead. a delete shows the user that track and waits for a yes:
+            # refusing both with no way past left these stuck for good.
+            if fix_action == 'delete' and not confirmed and is_tracked_path(resolved, suffixes, min_depth=1):
+                try:
+                    library_paths = same_name_library_paths(self.db, resolved)
+                except Exception as e:
+                    logger.debug("same-name library lookup failed: %s", e)
+                    library_paths = []
+                return {'success': False, 'needs_confirm': True, 'library_paths': library_paths,
+                        'error': 'A library track has the same filename in another folder. '
+                                 'Check it is the same song before deleting this file.'}
 
             if fix_action == 'staging':
                 # Move to staging folder
@@ -1892,8 +3272,27 @@ class RepairWorker:
                 # Clean up empty parent directories
                 self._cleanup_empty_parents(resolved)
 
+                # Nudge the auto-import worker so the file doesn't sit in
+                # staging until the next poll cycle. When auto-import is
+                # disabled the worker isn't running and this is a safe
+                # no-op — the message below says so honestly instead of
+                # promising an import that will never come (Specialmed:
+                # "moved to staging... not automatically added to the
+                # database... ss wants to redownload the track").
+                self._trigger_auto_import_scan()
+                auto_import_on = bool(
+                    self._config_manager
+                    and self._config_manager.get('auto_import.enabled', False)
+                )
+                if auto_import_on:
+                    message = 'Moved to staging folder — auto-import will pick it up'
+                else:
+                    message = ('Moved to staging folder. Auto-import is off, so it '
+                               'will NOT be imported automatically — import it from '
+                               'the Import page, or enable auto-import in Settings.')
+
                 return {'success': True, 'action': 'moved_to_staging',
-                        'message': 'Moved to staging folder for import'}
+                        'message': message}
 
             elif fix_action == 'delete':
                 os.remove(resolved)
@@ -1904,14 +3303,55 @@ class RepairWorker:
         except OSError as e:
             return {'success': False, 'error': f'Failed to handle orphan file: {e}'}
 
-    def _cleanup_empty_parents(self, file_path):
-        """Remove empty parent directories up to 3 levels, never removing the transfer folder."""
+    def _protected_root_dirs(self):
+        """Configured roots that must never be auto-removed as 'empty'.
+
+        The transfer folder plus everything ``protected_root_dirs()`` knows
+        (staging / download / transfer from settings) — issue #976 / the
+        Specialmed report: a staging folder nested under the transfer folder
+        (UnRaid single-share) was rmdir'd when a repair fix emptied it.
+        All paths in canonical ``config_root_path`` form, normpath'd.
+        """
         try:
-            transfer_norm = os.path.normpath(self.transfer_folder)
+            from core.imports.file_ops import protected_root_dirs
+            roots = {os.path.normpath(p) for p in protected_root_dirs() if p}
+        except Exception:
+            roots = set()
+        roots.add(os.path.normpath(self.transfer_folder))
+        return roots
+
+    def _trigger_auto_import_scan(self):
+        """Nudge the auto-import worker to scan the staging folder now.
+
+        Best effort: the worker handle lives in ``api.import_routes`` (deferred
+        import — the repair worker must not depend on the API layer at module
+        load). ``trigger_scan()`` on a non-running worker is a safe no-op, so
+        this never starts background processing the user didn't ask for; it
+        only shortens the wait when the worker is actually running.
+        """
+        try:
+            from api.import_routes import auto_import_worker
+        except Exception as e:
+            logger.debug("Could not reach auto-import worker: %s", e)
+            return
+        try:
+            if auto_import_worker is not None:
+                auto_import_worker.trigger_scan()
+        except Exception as e:
+            logger.debug("Could not trigger auto-import scan: %s", e)
+
+    def _cleanup_empty_parents(self, file_path):
+        """Remove empty parent directories up to 3 levels.
+
+        Never removes the transfer folder or any configured root (staging /
+        download / transfer) — even when nested and empty.
+        """
+        try:
+            protected = self._protected_root_dirs()
             parent = os.path.dirname(file_path)
             for _ in range(3):
                 if (parent and os.path.isdir(parent)
-                        and os.path.normpath(parent) != transfer_norm
+                        and os.path.normpath(parent) not in protected
                         and not os.listdir(parent)):
                     os.rmdir(parent)
                     parent = os.path.dirname(parent)
@@ -1926,13 +3366,6 @@ class RepairWorker:
         if correct_num is None:
             return {'success': False, 'error': 'No correct track number in finding details'}
 
-        # If we have an entity_id (track DB ID), update DB directly
-        if entity_id:
-            try:
-                self.db.update_track_fields(int(entity_id), {'track_number': int(correct_num)})
-            except Exception as e:
-                logger.debug("DB track number update failed for entity %s: %s", entity_id, e)
-
         # Fix the file tag (the primary fix — works even without entity_id)
         if not file_path:
             return {'success': False, 'error': 'No file path associated with this finding'}
@@ -1945,6 +3378,16 @@ class RepairWorker:
 
         if not os.path.isfile(resolved):
             return {'success': False, 'error': f'File not found: {os.path.basename(file_path)}'}
+
+        # The file exists, so the fix can actually run — update the DB track
+        # number now. (Writing it before the file check left the DB claiming a
+        # number the tags don't have whenever the file was missing.)
+        if entity_id:
+            try:
+                # track ids are TEXT (navidrome ids carry letters), never cast (#1574)
+                self.db.update_track_fields(entity_id, {'track_number': int(correct_num)})
+            except Exception as e:
+                logger.debug("DB track number update failed for entity %s: %s", entity_id, e)
 
         try:
             from core.repair_jobs.track_number_repair import (
@@ -2029,6 +3472,22 @@ class RepairWorker:
             logger.error("Error fixing track number for %s: %s", file_path, e)
             return {'success': False, 'error': str(e)}
 
+    @staticmethod
+    def _art_lock_column(cursor, table: str) -> bool:
+        """Does ``<table>.art_locked`` exist on this database?
+
+        Asked with the cursor we already hold rather than through the database
+        object: the repair worker is handed whatever exposes ``_get_connection``
+        (the real MusicDatabase in production, a plain fake in the tests), so
+        reaching for a method on it is an AttributeError waiting to happen — as
+        it was. Not memoized on purpose; a repair apply is a single user action,
+        not a scan loop, so one PRAGMA costs nothing."""
+        try:
+            cursor.execute(f"PRAGMA table_info({table})")
+            return any(row[1] == 'art_locked' for row in cursor.fetchall())
+        except Exception:
+            return False
+
     def _fix_artist_art(self, album_id, details):
         """Apply the found ARTIST image to the album's artist (DB thumb only —
         artist art has no per-file embed). Pache711: independently applyable
@@ -2040,12 +3499,26 @@ class RepairWorker:
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
+            # Never over-write a photo the user chose by hand (see the album
+            # twin below). Locked rows are simply left alone. On a schema that
+            # predates the column there is nothing to protect, so the clause is
+            # dropped rather than raising "no such column" at the user.
+            has_lock = self._art_lock_column(cursor, 'artists')
             cursor.execute(
                 "UPDATE artists SET thumb_url = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE id = (SELECT artist_id FROM albums WHERE id = ?)",
+                "WHERE id = (SELECT artist_id FROM albums WHERE id = ?)"
+                + (" AND COALESCE(art_locked, 0) = 0" if has_lock else ""),
                 (artist_url, album_id))
             conn.commit()
             if cursor.rowcount == 0:
+                if has_lock:
+                    cursor.execute("SELECT COALESCE(art_locked, 0) FROM artists "
+                                   "WHERE id = (SELECT artist_id FROM albums WHERE id = ?)",
+                                   (album_id,))
+                    row = cursor.fetchone()
+                    if row is not None and row[0]:
+                        return {'success': True, 'action': 'kept_chosen_artist_art',
+                                'message': 'Kept your chosen artist photo'}
                 return {'success': False, 'error': 'Artist not found for this album'}
         finally:
             if conn:
@@ -2093,11 +3566,38 @@ class RepairWorker:
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-            cursor.execute("UPDATE albums SET thumb_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                           (artwork_url, album_id))
-            conn.commit()
-            if cursor.rowcount == 0:
+            # Selecting a column the schema doesn't have raises, and this is a
+            # user-facing repair action — it must not 500 on a database that
+            # predates the column. No column ⇒ nothing can be locked.
+            has_lock = self._art_lock_column(cursor, 'albums')
+            cursor.execute(
+                "SELECT thumb_url, %s FROM albums WHERE id = ?"
+                % ("COALESCE(art_locked, 0)" if has_lock else "0"),
+                (album_id,))
+            existing = cursor.fetchone()
+            if existing is None:
                 return {'success': False, 'error': 'Album not found in database'}
+
+            # A hand-picked cover outranks whatever this job found. The scan flags
+            # an album whose art is missing in the DB *or* on disk, so an album
+            # with locked art but no cover.jpg WOULD land here and the plain
+            # UPDATE below would overwrite the user's pick — the very bug the
+            # lock exists to stop. Keep the DB value and push the USER's art to
+            # disk instead of a stranger's.
+            locked = bool(existing[1]) and bool((existing[0] or '').strip())
+            if locked:
+                if artwork_url:
+                    artwork_url = existing[0]
+                logger.info("[repair] album %s art is locked — keeping the chosen cover, "
+                            "writing it to disk instead", album_id)
+            elif artwork_url:
+                cursor.execute(
+                    "UPDATE albums SET thumb_url = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (artwork_url, album_id))
+                conn.commit()
+            # else: sidecar_from_embedded with no URL — the disk write below comes
+            # from the file's own embedded art. Writing NULL here would have
+            # blanked the album's DB art while "fixing" a missing sidecar.
 
             # Pull album metadata + local track paths so we can write art to disk.
             cursor.execute("""
@@ -2122,10 +3622,21 @@ class RepairWorker:
         # Resolve container/host path mismatches, keep only files that exist.
         download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else None
         resolved = []
+        folder_there = False
         for p in track_paths:
             rp = _resolve_file_path(p, self.transfer_folder, download_folder, config_manager=self._config_manager) or p
             if os.path.isfile(rp):
                 resolved.append(rp)
+            elif os.path.isdir(os.path.dirname(rp)):
+                folder_there = True
+
+        if not resolved and folder_there:
+            # #1701: the album's folder is right here but its files aren't, so
+            # they moved after the scan. calling that a success wrote nothing to
+            # disk and hid it, same folder rule as retire_vanished_findings.
+            return {'success': False, 'stale': True,
+                    'error': "Cover saved to the library, but the album's files moved "
+                             "since the scan so none were written. The next scan picks it up"}
 
         if not resolved:
             # Media-server-only album (no local files): DB thumbnail is all we can set.
@@ -2146,7 +3657,7 @@ class RepairWorker:
         }
         # Use the RESOLVED file's directory — NOT details['album_folder'], which
         # is the raw DB path (e.g. Jellyfin's /data/music) and frequently does
-        # NOT exist inside the Commissary container (only the resolved /app/...
+        # NOT exist inside the SoulSync container (only the resolved /app/...
         # path does). Passing the raw folder made os.path.isdir() fail in
         # apply_art_to_album_files, silently skipping the cover.jpg write while
         # embedding (which uses the resolved paths) still worked — Sokhi's
@@ -2210,7 +3721,10 @@ class RepairWorker:
         resolved = _resolve_file_path(raw_path, self.transfer_folder, download_folder,
                                       config_manager=self._config_manager) or raw_path
         if not os.path.isfile(resolved):
-            return {'success': False, 'error': f'File not found on disk: {os.path.basename(raw_path)}'}
+            # stale=True: the file is gone, so no retry can ever succeed. Marks
+            # the finding obsolete instead of leaving it pending forever (#1143).
+            return {'success': False, 'stale': True,
+                    'error': f'File not found on disk: {os.path.basename(raw_path)}'}
         try:
             from core.lyrics_client import lyrics_client
             duration = details.get('duration')
@@ -2239,7 +3753,10 @@ class RepairWorker:
         resolved = _resolve_file_path(raw_path, self.transfer_folder, download_folder,
                                       config_manager=self._config_manager) or raw_path
         if not os.path.isfile(resolved):
-            return {'success': False, 'error': f'File not found on disk: {os.path.basename(raw_path)}'}
+            # stale=True: the file is gone, so no retry can ever succeed. Marks
+            # the finding obsolete instead of leaving it pending forever (#1143).
+            return {'success': False, 'stale': True,
+                    'error': f'File not found on disk: {os.path.basename(raw_path)}'}
         try:
             from core.replaygain import (analyze_track, write_replaygain_tags,
                                          is_ffmpeg_available, get_target_lufs)
@@ -2256,6 +3773,43 @@ class RepairWorker:
             return {'success': False, 'error': 'Could not write ReplayGain tags'}
         return {'success': True, 'action': 'applied_replaygain',
                 'message': f'Wrote ReplayGain ({gain_db:+.2f} dB)'}
+
+    def _fix_untagged_download(self, entity_type, entity_id, file_path, details):
+        """write title/artist/album back from the download record. only the
+        fields the file is missing, so a tag fixed by hand since the scan stays."""
+        raw_path = details.get('file_path') or file_path
+        if not raw_path:
+            return {'success': False, 'error': 'No file path in finding'}
+        download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else None
+        resolved = _resolve_file_path(raw_path, self.transfer_folder, download_folder,
+                                      config_manager=self._config_manager) or raw_path
+        if not os.path.isfile(resolved):
+            return {'success': False, 'stale': True,
+                    'error': f'File not found on disk: {os.path.basename(raw_path)}'}
+        from core.repair_jobs.untagged_downloads import missing_core_fields
+        from core.tag_writer import read_file_tags, write_tags_to_file
+        current = read_file_tags(resolved)
+        missing = missing_core_fields(current)
+        if not missing:
+            return {'success': True, 'action': 'already_tagged',
+                    'message': 'File already has its title, artist and album'}
+        data = {}
+        if 'title' in missing and details.get('track_title'):
+            data['title'] = details['track_title']
+        if 'artist' in missing and details.get('artist'):
+            data['artist_name'] = details['artist']
+        if 'album' in missing and details.get('album_title'):
+            data['album_title'] = details['album_title']
+        if not current.get('track_number') and details.get('track_number'):
+            data['track_number'] = details['track_number']
+        if not data:
+            return {'success': False, 'error': 'The download record has nothing to write'}
+        result = write_tags_to_file(resolved, data, embed_cover=False)
+        if not result.get('success'):
+            return {'success': False, 'error': result.get('error') or 'Could not write tags'}
+        written = result.get('written_fields') or []
+        return {'success': True, 'action': 'wrote_tags',
+                'message': f"Wrote {', '.join(written)}"}
 
     def _fix_empty_folder(self, entity_type, entity_id, file_path, details):
         """Apply an empty-folder finding: re-check the folder is still empty/junk-
@@ -2321,10 +3875,13 @@ class RepairWorker:
                 plan['lyrics_meta'] = t['lyrics_meta']   # read-only lyrics query metadata
             resolved_plans.append(plan)
 
-        from core.repair_jobs.library_retag import apply_track_plans
+        from core.repair_jobs.library_retag import apply_track_plans, build_retag_enrichment_runtime
+        full = (details.get('depth') == 'full')
         res = apply_track_plans(resolved_plans, details.get('cover_action'), details.get('cover_url'),
-                                full=(details.get('depth') == 'full'),
-                                lyrics_action=details.get('lyrics_action', False))
+                                full=full,
+                                lyrics_action=details.get('lyrics_action', False),
+                                enrich_runtime=build_retag_enrichment_runtime(
+                                    self._config_manager, self.db) if full else None)
 
         if res['written'] == 0 and not res['cover_written'] and not res.get('lyrics_written'):
             return {'success': False,
@@ -2335,6 +3892,42 @@ class RepairWorker:
         if res['cover_written']:
             msg += ' + refreshed cover.jpg'
         return {'success': True, 'action': 'library_retag', 'message': msg, **res}
+
+    def _write_bpm_tag(self, file_path, bpm, bpm_source=None):
+        """put an applied bpm into the file too. it only ever reached the
+        database, so players and media servers never saw it. returns a note
+        for the message.
+
+        the deezer.tags.bpm setting gates deezer-sourced bpm writes only.
+        locally-analyzed bpm always writes — the backfill is an explicit
+        user action to fix bpm.
+        """
+        # Deezer-sourced BPM respects the deezer.tags.bpm setting.
+        # Locally-analyzed BPM always writes (explicit user action).
+        if bpm_source == 'deezer':
+            if self._config_manager and self._config_manager.get('deezer.tags.bpm', True) is False:
+                return ' (BPM tags are off in settings, file not changed)'
+        try:
+            bpm = float(bpm)
+        except (TypeError, ValueError):
+            return ''
+        if bpm <= 0 or not file_path:
+            return ''
+        download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else ''
+        resolved = _resolve_file_path(file_path, self.transfer_folder, download_folder,
+                                      config_manager=self._config_manager)
+        if not resolved or not os.path.exists(resolved):
+            return ' (file not reachable, saved in SoulSync only)'
+        try:
+            from core.tag_writer import write_tags_to_file
+            result = write_tags_to_file(resolved, {'bpm': int(round(bpm))}, embed_cover=False)
+        except Exception as e:  # noqa: BLE001 - the db value already landed
+            logger.warning("Could not write BPM to %s: %s", resolved, e)
+            return ' (could not write the file tag)'
+        if not result.get('success') or 'bpm' not in (result.get('written_fields') or []):
+            logger.warning("BPM tag not written to %s: %s", resolved, result.get('error'))
+            return ' (could not write the file tag)'
+        return ', written to the file'
 
     def _fix_metadata_gap(self, entity_type, entity_id, file_path, details):
         """Apply found metadata fields to the track."""
@@ -2379,12 +3972,20 @@ class RepairWorker:
             if updates:
                 conn.close()
                 conn = None
-                self.db.update_track_fields(int(entity_id), updates)
+                # Track primary keys are TEXT after the Plex/Jellyfin ID migration;
+                # Navidrome IDs can contain letters. The DB method accepts the ID
+                # as-is and reports when the track no longer exists.
+                update_result = self.db.update_track_fields(entity_id, updates)
+                if not update_result.get('success'):
+                    return update_result
 
             applied = list(updates.keys()) + list(direct_fields.keys())
             if applied:
-                return {'success': True, 'action': 'applied_metadata',
-                        'message': f'Applied metadata: {", ".join(applied)}'}
+                message = f'Applied metadata: {", ".join(applied)}'
+                if 'bpm' in updates:
+                    bpm_source = details.get('bpm_source') if isinstance(details, dict) else None
+                    message += self._write_bpm_tag(file_path, updates['bpm'], bpm_source)
+                return {'success': True, 'action': 'applied_metadata', 'message': message}
             return {'success': False, 'error': 'No applicable metadata fields to update'}
         finally:
             if conn:
@@ -2408,6 +4009,14 @@ class RepairWorker:
             # MP3 even when the FLAC's bitrate is missing in the DB), then
             # bitrate, duration, and track number as tie-breakers.
             from core.library.duplicate_keep import pick_duplicate_to_keep
+            # playlists change between the scan and the fix, ask again (cached,
+            # so a bulk keep best over hundreds of findings reads the server
+            # once). an empty answer keeps the scan's tags rather than
+            # treating every copy as playlist free
+            membership = _server_playlist_membership()
+            if membership:
+                from core.library.playlist_membership import tag_tracks
+                tag_tracks(tracks, membership)
             best = pick_duplicate_to_keep(tracks)
             best_id = best.get('track_id') or best.get('id')
 
@@ -2423,24 +4032,15 @@ class RepairWorker:
         if not remove_ids:
             return {'success': False, 'error': 'No duplicates to remove'}
 
-        # Collect file paths before deleting DB entries
-        remove_paths = []
+        # Collect file paths before deleting DB entries. The file move is the
+        # destructive operation users asked for; keep the DB row when the file
+        # cannot be located so a media-server refresh does not simply recreate
+        # the duplicate entry with no visible failure.
+        remove_entries = []
         for t in tracks:
             tid = t.get('track_id') or t.get('id')
             if tid and str(tid) != str(best_id) and t.get('file_path'):
-                remove_paths.append(t['file_path'])
-
-        conn = None
-        try:
-            conn = self.db._get_connection()
-            cursor = conn.cursor()
-            placeholders = ','.join(['?'] * len(remove_ids))
-            cursor.execute(f"DELETE FROM tracks WHERE id IN ({placeholders})", remove_ids)
-            conn.commit()
-            removed = cursor.rowcount
-        finally:
-            if conn:
-                conn.close()
+                remove_entries.append((tid, t['file_path']))
 
         # Move duplicate files to the <transfer>/deleted quarantine instead of hard
         # deleting them — recoverable, and consistent with the older duplicate
@@ -2449,11 +4049,62 @@ class RepairWorker:
         download_folder = None
         if self._config_manager:
             download_folder = self._config_manager.get('soulseek.download_path', '')
-        transfer_norm = os.path.normpath(self.transfer_folder)
-        deleted_root = os.path.join(self.transfer_folder, 'deleted')
+
+        # Never move the file the keeper points at. Two rows can carry the same
+        # path (#1210), and when they did, "remove the other copy" moved the only
+        # file there was and left the kept row pointing at nothing. The detector
+        # no longer produces those groups, but this is the layer that actually
+        # deletes, so it checks for itself.
+        keep_resolved = ''
+        if best.get('file_path'):
+            keep_resolved = _resolve_file_path(
+                best['file_path'], self.transfer_folder, download_folder,
+                config_manager=self._config_manager) or ''
+        if not keep_resolved:
+            # No usable path for the copy we are keeping, so there is no way to
+            # prove the files below aren't that same copy. Refuse rather than
+            # guess: a duplicate left on disk is fixable, the only copy of a
+            # song is not.
+            return {
+                'success': False,
+                'error': ('Could not resolve the file for the copy being kept, so no '
+                          'duplicate was removed. Check Settings > Library > Music Paths.'),
+                'files_deleted': 0,
+                'files_failed': 0,
+            }
+
+        def _is_keeper_file(candidate):
+            if not keep_resolved or not candidate:
+                return False
+            try:
+                if os.path.exists(keep_resolved) and os.path.exists(candidate):
+                    return os.path.samefile(keep_resolved, candidate)
+            except OSError:
+                pass
+            return (os.path.normcase(os.path.normpath(candidate))
+                    == os.path.normcase(os.path.normpath(keep_resolved)))
+
+        from core.repair_jobs.base import deleted_quarantine_root
+        deleted_root = deleted_quarantine_root(self.transfer_folder)
         files_deleted = 0
         files_failed = 0
-        for fpath in remove_paths:
+        db_remove_ids = []
+        active_server = 'unknown'
+        if self._config_manager:
+            try:
+                getter = getattr(self._config_manager, 'get_active_media_server', None)
+                if callable(getter):
+                    active_server = getter() or 'unknown'
+                else:
+                    active_server = self._config_manager.get('active_media_server', 'unknown') or 'unknown'
+            except Exception:
+                active_server = 'unknown'
+        navidrome_hint = (
+            ' In Navidrome, enable "Report Real Path" for the SoulSync player and run a full refresh.'
+            if str(active_server).lower() == 'navidrome' else ''
+        )
+
+        for tid, fpath in remove_entries:
             resolved = _resolve_file_path(fpath, self.transfer_folder, download_folder, config_manager=self._config_manager)
             if not resolved or not os.path.exists(resolved):
                 # #971/Docker: the stored path didn't map to a file the container
@@ -2463,45 +4114,74 @@ class RepairWorker:
                 files_failed += 1
                 logger.warning(
                     "Duplicate cleanup: could not locate file to remove (DB path %r "
-                    "did not resolve to an existing file). DB entry removed, file left "
+                    "did not resolve to an existing file). DB row kept and file left "
                     "on disk — check your Docker volume mapping and Settings > Library "
-                    "> Music Paths.", fpath)
+                    "> Music Paths.%s", fpath, navidrome_hint)
+                continue
+            if _is_keeper_file(resolved):
+                # Same file as the copy being kept: drop the extra database row
+                # so the phantom duplicate stops coming back, but leave the file
+                # exactly where it is.
+                logger.warning(
+                    "Duplicate cleanup: %r is the same file as the copy being kept. "
+                    "Removing the extra database row only, the file is untouched.", resolved)
+                db_remove_ids.append(tid)
                 continue
             try:
                 dest = self._quarantine_dest(resolved, deleted_root)
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 shutil.move(resolved, dest)
+                # remember where it came from so the deleted-files manager can
+                # restore it and retention can age it
+                from core.library.deleted_quarantine import record_deleted_entry
+                record_deleted_entry(deleted_root, dest, resolved, 'repair')
                 files_deleted += 1
+                db_remove_ids.append(tid)
             except OSError as e:
                 # Was `except OSError: pass` — a Docker PUID/PGID permission mismatch
                 # on the media volume silently no-op'd the removal with no log.
                 files_failed += 1
                 logger.warning(
                     "Duplicate cleanup: failed to move %s to the deleted folder (%s). "
-                    "DB entry removed, file left on disk — in Docker this is usually a "
+                    "DB row kept and file left on disk — in Docker this is usually a "
                     "PUID/PGID permission mismatch on the media volume.", resolved, e)
                 continue
             # Clean up empty parent directories (best effort, cosmetic; never remove
-            # the transfer folder itself). A failure here must not count as a failed
-            # removal — the file WAS moved out.
+            # the transfer folder or a configured root). A failure here must not
+            # count as a failed removal — the file WAS moved out.
+            self._cleanup_empty_parents(resolved)
+
+        removed = 0
+        if db_remove_ids:
+            conn = None
             try:
-                parent = os.path.dirname(resolved)
-                for _ in range(3):
-                    if (parent and os.path.isdir(parent)
-                            and os.path.normpath(parent) != transfer_norm
-                            and not os.listdir(parent)):
-                        os.rmdir(parent)
-                        parent = os.path.dirname(parent)
-                    else:
-                        break
-            except OSError:
-                pass
+                conn = self.db._get_connection()
+                cursor = conn.cursor()
+                placeholders = ','.join(['?'] * len(db_remove_ids))
+                cursor.execute(f"DELETE FROM tracks WHERE id IN ({placeholders})", db_remove_ids)
+                conn.commit()
+                removed = cursor.rowcount
+            finally:
+                if conn:
+                    conn.close()
+
+        if files_failed and not files_deleted:
+            return {
+                'success': False,
+                'error': (
+                    f'Could not remove duplicate file(s): {files_failed} path(s) could not be located. '
+                    f'No database rows were removed. Check Settings → Library → Music Paths.'
+                    f'{navidrome_hint}'
+                ),
+                'files_deleted': files_deleted,
+                'files_failed': files_failed,
+            }
 
         msg = f'Kept best quality copy, removed {removed} duplicate(s)'
         if files_deleted:
             msg += f' and moved {files_deleted} file(s) to the deleted folder'
         if files_failed:
-            msg += f' — {files_failed} file(s) could NOT be removed (see logs)'
+            msg += f' — {files_failed} file(s) could NOT be removed and were left in the database'
         return {'success': True, 'action': 'removed_duplicates', 'message': msg,
                 'files_deleted': files_deleted, 'files_failed': files_failed}
 
@@ -2529,6 +4209,27 @@ class RepairWorker:
             n += 1
         return dest
 
+    def _redundant_single_keep_reason(self, single_path, album_path):
+        """why the single must stay, or None when the album copy is a separate
+        file on disk."""
+        download_folder = self._config_manager.get('soulseek.download_path', '') if self._config_manager else None
+        try:
+            album_resolved = _resolve_file_path(album_path, self.transfer_folder, download_folder,
+                                                config_manager=self._config_manager) if album_path else None
+            single_resolved = _resolve_file_path(single_path, self.transfer_folder, download_folder,
+                                                 config_manager=self._config_manager) if single_path else None
+        except Exception as e:
+            return f'Could not check the album copy: {e} — keeping single'
+        if not album_resolved or not os.path.exists(album_resolved):
+            return 'Album copy is not on disk — keeping single'
+        if single_resolved and os.path.exists(single_resolved):
+            try:
+                if os.path.samefile(album_resolved, single_resolved):
+                    return 'Single and album entries are the same file — keeping it'
+            except OSError:
+                pass
+        return None
+
     def _fix_single_album_redundant(self, entity_type, entity_id, file_path, details):
         """Remove the single/EP version, keeping the album version."""
         single_info = details.get('single_track', {})
@@ -2545,23 +4246,27 @@ class RepairWorker:
             conn = self.db._get_connection()
             cursor = conn.cursor()
             album_id = album_info.get('id')
+            album_path = album_info.get('file_path')
             if album_id:
-                cursor.execute("SELECT id FROM tracks WHERE id = ?", (album_id,))
-                if not cursor.fetchone():
+                cursor.execute("SELECT id, file_path FROM tracks WHERE id = ?", (album_id,))
+                row = cursor.fetchone()
+                if not row:
                     return {'success': False, 'error': 'Album version no longer exists in library — keeping single'}
-
-            # Remove single from DB
-            cursor.execute("DELETE FROM tracks WHERE id = ?", (single_id,))
-            conn.commit()
-            removed = cursor.rowcount
+                album_path = row[1] or album_path
         finally:
             if conn:
                 conn.close()
 
-        if removed == 0:
-            return {'success': True, 'action': 'already_removed', 'message': 'Single track was already removed'}
+        # the album copy has to be a different file that's really there, or
+        # removing the single deletes the only copy (#1611: one file, two rows)
+        keep_error = self._redundant_single_keep_reason(single_path, album_path)
+        if keep_error:
+            return {'success': False, 'error': keep_error}
 
-        # Delete single file from disk
+        # Delete the single file from disk BEFORE touching the DB: if the file
+        # delete fails, the library row (and the finding) stays intact so the
+        # user can retry. (The old order committed the DB delete first and
+        # swallowed file-delete errors as success, orphaning the file.)
         file_deleted = False
         if single_path:
             download_folder = None
@@ -2572,19 +4277,26 @@ class RepairWorker:
                 if resolved and os.path.exists(resolved):
                     os.remove(resolved)
                     file_deleted = True
-                    # Clean up empty parent directories
-                    transfer_norm = os.path.normpath(self.transfer_folder)
-                    parent = os.path.dirname(resolved)
-                    for _ in range(3):
-                        if (parent and os.path.isdir(parent)
-                                and os.path.normpath(parent) != transfer_norm
-                                and not os.listdir(parent)):
-                            os.rmdir(parent)
-                            parent = os.path.dirname(parent)
-                        else:
-                            break
-            except OSError:
-                pass  # Best effort — DB entry already removed
+                    # Clean up empty parent directories (never a configured root)
+                    self._cleanup_empty_parents(resolved)
+            except OSError as e:
+                return {'success': False,
+                        'error': f'Could not delete {os.path.basename(single_path)}: {e} — library entry kept'}
+
+        # Remove single from DB
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM tracks WHERE id = ?", (single_id,))
+            conn.commit()
+            removed = cursor.rowcount
+        finally:
+            if conn:
+                conn.close()
+
+        if removed == 0:
+            return {'success': True, 'action': 'already_removed', 'message': 'Single track was already removed'}
 
         album_name = album_info.get('album', 'unknown album')
         msg = f'Removed single, album version on "{album_name}" kept'
@@ -2601,6 +4313,26 @@ class RepairWorker:
 
         if not track_id:
             return {'success': False, 'error': 'No track ID to remove'}
+
+        # Delete the file from disk BEFORE touching the DB: if the file delete
+        # fails, the library rows (and the finding) stay intact so the user can
+        # retry. (The old order committed the DB deletes first and swallowed
+        # file-delete errors as success, orphaning the file.)
+        file_deleted = False
+        if track_path:
+            download_folder = None
+            if self._config_manager:
+                download_folder = self._config_manager.get('soulseek.download_path', '')
+            try:
+                resolved = _resolve_file_path(track_path, self.transfer_folder, download_folder, config_manager=self._config_manager)
+                if resolved and os.path.exists(resolved):
+                    os.remove(resolved)
+                    file_deleted = True
+                    # Clean up empty parent directories (never a configured root)
+                    self._cleanup_empty_parents(resolved)
+            except OSError as e:
+                return {'success': False,
+                        'error': f'Could not delete {os.path.basename(track_path)}: {e} — library entry kept'}
 
         # Remove from DB
         conn = None
@@ -2628,31 +4360,6 @@ class RepairWorker:
 
         if removed == 0:
             return {'success': True, 'action': 'already_removed', 'message': 'Track was already removed'}
-
-        # Delete file from disk
-        file_deleted = False
-        if track_path:
-            download_folder = None
-            if self._config_manager:
-                download_folder = self._config_manager.get('soulseek.download_path', '')
-            try:
-                resolved = _resolve_file_path(track_path, self.transfer_folder, download_folder, config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    os.remove(resolved)
-                    file_deleted = True
-                    # Clean up empty parent directories
-                    transfer_norm = os.path.normpath(self.transfer_folder)
-                    parent = os.path.dirname(resolved)
-                    for _ in range(3):
-                        if (parent and os.path.isdir(parent)
-                                and os.path.normpath(parent) != transfer_norm
-                                and not os.listdir(parent)):
-                            os.rmdir(parent)
-                            parent = os.path.dirname(parent)
-                        else:
-                            break
-            except OSError:
-                pass  # Best effort — DB entry already removed
 
         msg = f'{type_label} track removed from library'
         if file_deleted:
@@ -2694,7 +4401,7 @@ class RepairWorker:
             logger.warning(f"Tag write failed during unknown artist fix: {e}")
 
         # Step 2: Move file if expected path differs — but ONLY when the file lives
-        # under the Commissary transfer folder. For a media-server / non-transfer
+        # under the SoulSync transfer folder. For a media-server / non-transfer
         # library the resolved file is elsewhere, and building the destination from
         # transfer_folder would YANK it into the transfer folder, away from its real
         # library (same class as #978). There we just re-tag + fix the DB metadata and
@@ -2764,11 +4471,20 @@ class RepairWorker:
                                    (corrected_track_number, track_id))
                 album_id = details.get('album_id')
                 if album_id:
+                    # Every one of these columns is exported by MetaSync, so
+                    # each write moves updated_at (L2-011) — otherwise the full
+                    # export changes and no incremental ever mentions the row.
                     if corrected_album:
-                        cursor.execute("UPDATE albums SET title = ? WHERE id = ?", (corrected_album, album_id))
+                        cursor.execute("UPDATE albums SET title = ?, "
+                                       "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                       (corrected_album, album_id))
                     if corrected_year and corrected_year.isdigit():
-                        cursor.execute("UPDATE albums SET year = ? WHERE id = ?", (int(corrected_year), album_id))
-                    cursor.execute("UPDATE albums SET artist_id = ? WHERE id = ?", (new_artist_id, album_id))
+                        cursor.execute("UPDATE albums SET year = ?, "
+                                       "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                       (int(corrected_year), album_id))
+                    cursor.execute("UPDATE albums SET artist_id = ?, "
+                                   "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                   (new_artist_id, album_id))
                 conn.commit()
             finally:
                 conn.close()
@@ -2777,6 +4493,29 @@ class RepairWorker:
 
         return {'success': True, 'action': 'fixed_unknown_artist',
                 'message': f'Fixed: {corrected_artist} - {corrected_title}'}
+
+    @staticmethod
+    def _acoustid_candidate(details, idx):
+        """``(title, artist)`` of candidate ``idx`` on an acoustid finding, or None.
+
+        New findings carry structured ``candidates_detail``; findings written
+        before that only have the display labels ('"Title" by Artist'), which
+        parse back losslessly because the title is always quoted whole.
+        """
+        detail = details.get('candidates_detail') or []
+        if 0 <= idx < len(detail):
+            entry = detail[idx] or {}
+            title = (entry.get('title') or '').strip()
+            artist = (entry.get('artist') or '').strip()
+            if title:
+                return title, artist
+        labels = details.get('candidates') or []
+        if 0 <= idx < len(labels):
+            import re as _re
+            m = _re.match(r'^"(?P<title>.*)" by (?P<artist>.*)$', str(labels[idx]))
+            if m and m.group('title').strip():
+                return m.group('title').strip(), m.group('artist').strip()
+        return None
 
     def _fix_acoustid_mismatch(self, entity_type, entity_id, file_path, details):
         """Fix an AcoustID mismatch. Actions:
@@ -2787,15 +4526,53 @@ class RepairWorker:
         fix_action = details.get('_fix_action', 'retag')
         track_id = entity_id
 
+        # 'retag:<n>' / 'relocate:<n>' — the user PICKED candidate n of an
+        # ambiguous fingerprint in the fix dialog (Discord request: the finding
+        # names the possible recordings, so let me choose one instead of only
+        # offering manual/redownload/delete). Same composite-string convention
+        # the duplicate keeper uses ('track-42').
+        _chosen = None
+        if isinstance(fix_action, str) and ':' in fix_action:
+            _base, _, _idx = fix_action.partition(':')
+            if _base in ('retag', 'relocate') and _idx.isdigit():
+                fix_action = _base
+                _chosen = self._acoustid_candidate(details, int(_idx))
+                if _chosen is None:
+                    return {'success': False,
+                            'error': 'That candidate is not on this finding any more — '
+                                     'refresh and pick again.'}
+                # From here the ordinary retag/relocate path runs with the
+                # user's chosen recording as the answer.
+                details = dict(details)
+                details['acoustid_title'] = _chosen[0]
+                details['acoustid_artist'] = _chosen[1]
+
+        # #1132: an ambiguous fingerprint has no single answer — its
+        # `acoustid_title`/`acoustid_artist` are one arbitrary pick from several
+        # equally-scored recordings. Both the retag and relocate paths below
+        # WRITE those values (into the DB, and into the file's tags), which is
+        # how a wrong suggestion becomes wrong data. Deleting or re-downloading
+        # is still fine: those act on "this file is wrong", which the scan did
+        # establish. A user's explicit pick above IS the single answer.
+        if details.get('ambiguous') and _chosen is None and fix_action in ('retag', 'relocate'):
+            cands = details.get('candidates') or []
+            return {
+                'success': False,
+                'error': (
+                    'This fingerprint matches several different recordings, so there '
+                    'is no single correct title to apply'
+                    + (' (%s)' % '; '.join(cands[:3]) if cands else '')
+                    + '. Pick one of them in the fix dialog, or use Re-download / Delete.'
+                ),
+            }
+
         if fix_action == 'delete':
             # Delete file + DB record
+            deleted_file, delete_note = _delete_file_if_present(
+                file_path, self.transfer_folder, config_manager=self._config_manager)
             if file_path:
-                resolved = _resolve_file_path(file_path, self.transfer_folder, config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                    except Exception as e:
-                        logger.warning("Could not delete file %s: %s", resolved, e)
+                logger.debug("AcoustID delete result for %s: deleted=%s note=%s",
+                             file_path, deleted_file, delete_note)
             if track_id:
                 try:
                     conn = self.db._get_connection()
@@ -2805,6 +4582,9 @@ class RepairWorker:
                     conn.close()
                 except Exception as e:
                     return {'success': False, 'error': f'DB delete failed: {e}'}
+            if not deleted_file and delete_note:
+                return {'success': True, 'action': 'deleted',
+                        'message': f'Removed library row, but the wrong file was not deleted: {delete_note}'}
             return {'success': True, 'action': 'deleted',
                     'message': f'Deleted wrong file: {os.path.basename(file_path or "")}'}
 
@@ -2815,6 +4595,25 @@ class RepairWorker:
             album_title = details.get('album_title', '')
             if expected_title and expected_artist:
                 try:
+                    # #1504: capture the owner BEFORE the row is deleted below.
+                    # (column may be absent in minimal test schemas -> NULL.)
+                    owner_pid = None
+                    if track_id:
+                        try:
+                            oconn = self.db._get_connection()
+                            try:
+                                ocols = {c[1] for c in oconn.execute("PRAGMA table_info(tracks)")}
+                                if 'owner_profile_id' in ocols:
+                                    orow = oconn.execute(
+                                        "SELECT owner_profile_id FROM tracks WHERE id = ?",
+                                        (track_id,),
+                                    ).fetchone()
+                                    if orow and orow[0]:
+                                        owner_pid = int(orow[0])
+                            finally:
+                                oconn.close()
+                        except Exception as exc:
+                            logger.debug("AcoustID owner lookup failed: %s", exc)
                     track_data = {
                         'id': f'acoustid_fix_{uuid.uuid4().hex[:8]}',
                         'name': expected_title,
@@ -2825,19 +4624,20 @@ class RepairWorker:
                         spotify_track_data=track_data,
                         failure_reason='AcoustID mismatch — re-downloading correct track',
                         source_type='repair',
+                        # #1504: the re-downloaded correct track belongs to the
+                        # same library that held the wrong file.
+                        profile_id=owner_pid or 1,
                     )
                     logger.info("Added '%s' by '%s' to wishlist for re-download",
                                 expected_title, expected_artist)
                 except Exception as e:
                     logger.warning("Could not add to wishlist: %s", e)
             # Delete wrong file
+            deleted_file, delete_note = _delete_file_if_present(
+                file_path, self.transfer_folder, config_manager=self._config_manager)
             if file_path:
-                resolved = _resolve_file_path(file_path, self.transfer_folder, config_manager=self._config_manager)
-                if resolved and os.path.exists(resolved):
-                    try:
-                        os.remove(resolved)
-                    except Exception as e:
-                        logger.debug("Failed to remove wrong file %s: %s", resolved, e)
+                logger.debug("AcoustID redownload delete result for %s: deleted=%s note=%s",
+                             file_path, deleted_file, delete_note)
             if track_id:
                 try:
                     conn = self.db._get_connection()
@@ -2847,6 +4647,9 @@ class RepairWorker:
                     conn.close()
                 except Exception as e:
                     logger.debug("Failed to delete wrong track row from DB: %s", e)
+            if not deleted_file and delete_note:
+                return {'success': True, 'action': 'redownload',
+                        'message': f'Added "{expected_title}" to wishlist; wrong file was not deleted: {delete_note}'}
             return {'success': True, 'action': 'redownload',
                     'message': f'Added "{expected_title}" to wishlist, removed wrong file'}
 
@@ -2874,7 +4677,11 @@ class RepairWorker:
             if aid_title:
                 tag_updates['title'] = aid_title
             if aid_artist:
-                tag_updates['artist_name'] = aid_artist
+                # track_artist, not artist_name: the writer puts artist_name
+                # into album artist, and the file lands in staging with its
+                # album tag intact — a compilation track would split off its
+                # album (#1289, mirrors the retag fix below).
+                tag_updates['track_artist'] = aid_artist
                 tag_updates['artists_list'] = _split_acoustid_credit(aid_artist)
 
             def _drop_row():
@@ -2891,10 +4698,30 @@ class RepairWorker:
             from core.tag_writer import write_tags_to_file
             from core.imports.file_ops import safe_move_file
             try:
+                # #1504: capture the owner BEFORE the row is dropped, so the
+                # staged file carries a breadcrumb for auto-import.
+                relocate_owner_pid = None
+                if track_id:
+                    try:
+                        ro_conn = self.db._get_connection()
+                        try:
+                            ro_cols = {c[1] for c in ro_conn.execute("PRAGMA table_info(tracks)")}
+                            if 'owner_profile_id' in ro_cols:
+                                ro_row = ro_conn.execute(
+                                    "SELECT owner_profile_id FROM tracks WHERE id = ?",
+                                    (track_id,),
+                                ).fetchone()
+                                if ro_row and ro_row[0]:
+                                    relocate_owner_pid = int(ro_row[0])
+                        finally:
+                            ro_conn.close()
+                    except Exception as exc:
+                        logger.debug("relocate owner lookup failed: %s", exc)
                 dest = relocate_mismatch_to_staging(
                     resolved, staging_path, tag_updates,
                     write_tags=write_tags_to_file, move_file=safe_move_file,
-                    drop_db_row=_drop_row, exists=os.path.exists)
+                    drop_db_row=_drop_row, exists=os.path.exists,
+                    owner_profile_id=relocate_owner_pid)
             except Exception as e:
                 return {'success': False, 'error': f'Relocate failed: {e}'}
             self._cleanup_empty_parents(resolved)   # remove the now-empty wrong folder
@@ -2948,7 +4775,11 @@ class RepairWorker:
                     from core.tag_writer import write_tags_to_file
                     tag_updates = {'title': aid_title}
                     if aid_artist:
-                        tag_updates['artist_name'] = aid_artist
+                        # track_artist, not artist_name: the writer puts
+                        # artist_name into album artist, and the track stays on
+                        # its album, so a compilation track would split off
+                        # its album (#1289)
+                        tag_updates['track_artist'] = aid_artist
                         # Issue #587 — derive a per-artist list from
                         # AcoustID's credit string when it carries
                         # multiple contributors. The post-download
@@ -2988,6 +4819,23 @@ class RepairWorker:
                 mbid = details.get('mbid', 'unknown')
                 mb_title = details.get('mb_title', 'unknown')
                 title = details.get('title', 'unknown')
+
+                # The same bad MBID was also copied verbatim into
+                # tracks.musicbrainz_recording_id at import (core/imports/side_effects.py),
+                # and the export MBID waterfall's DB rung (core/exports/export_sources.py)
+                # reads that column directly — stripping only the file tag would leave
+                # exports still resolving the wrong recording. Clear it too, but only if it
+                # still holds this SAME bad value (guarded in the DB helper).
+                bad_mbid = details.get('mbid')
+                if bad_mbid and bad_mbid != 'unknown' and entity_type == 'track' and entity_id:
+                    try:
+                        self.db.clear_track_recording_mbid_if_matches(entity_id, bad_mbid)
+                    except Exception as e:
+                        logger.debug(
+                            "Could not clear tracks.musicbrainz_recording_id for track %s: %s",
+                            entity_id, e,
+                        )
+
                 return {
                     'success': True,
                     'action': 'removed_mbid',
@@ -3077,10 +4925,13 @@ class RepairWorker:
                 file_changed = False
                 for field, canonical in canonical_map.items():
                     current = _read_tag(audio, field)
-                    if current and current != canonical:
+                    # an empty tag is a mismatch too: navidrome keys on the
+                    # release id, so a file without one splits off exactly
+                    # like a file with the wrong one
+                    if (current or '') != canonical:
                         if _write_tag(audio, field, canonical):
                             file_changed = True
-                            changes.append(f'{field}: "{current}" → "{canonical}" in {os.path.basename(resolved)}')
+                            changes.append(f'{field}: "{current or "(missing)"}" → "{canonical}" in {os.path.basename(resolved)}')
 
                 if file_changed:
                     # Atomic + audio-integrity-verified save (#819/#1000): never
@@ -3103,6 +4954,52 @@ class RepairWorker:
             return {'success': False, 'error': f'Failed to fix {errors} file(s)'}
         else:
             return {'success': True, 'action': 'already_consistent', 'message': 'All tags already consistent'}
+
+    def _fix_album_release_year_mismatch(self, entity_type, entity_id, file_path, details):
+        """Align album and track release years to canonical release dates and rename folder."""
+        from core.repair_jobs.album_release_year_repair import apply_album_year_fix
+
+        album_id = details.get('album_id')
+        canonical_year = details.get('canonical_year')
+        canonical_date = details.get('canonical_date')
+        tracks = details.get('tracks', [])
+        folder_path = details.get('folder_path')
+        new_folder_name = details.get('new_folder_name')
+
+        if not album_id or not canonical_year:
+            return {'success': False, 'error': 'Missing album_id or canonical_year in finding details'}
+
+        cfg = self._config_manager
+        rename_folders = cfg.get('repair.jobs.album_release_year_repair.rename_folders', True) if cfg else True
+        update_date_tag = cfg.get('repair.jobs.album_release_year_repair.update_date_tag', True) if cfg else True
+
+        res = apply_album_year_fix(
+            db=self.db,
+            # album_id stays as-is: on Navidrome-backed libraries album ids
+            # are TEXT soul ids (e.g. '2G0CgWoRXSwDbwnkmPpg6e'), and int()
+            # raises on those. apply_album_year_fix only uses the id in SQL
+            # parameter bindings, which are type-agnostic. (#1633)
+            album_id=album_id,
+            canonical_year=str(canonical_year),
+            canonical_date=canonical_date,
+            tracks=tracks,
+            transfer_folder=self.transfer_folder,
+            config_manager=self._config_manager,
+            rename_folders=rename_folders,
+            update_date_tag=update_date_tag,
+            folder_path=folder_path,
+            new_folder_name=new_folder_name,
+        )
+
+        if res.get('success'):
+            return {
+                'success': True,
+                'action': 'aligned_release_year',
+                'fixed_files': res.get('fixed_files', 0),
+                'renamed_folder': res.get('renamed_folder'),
+                'message': '; '.join(res.get('changes', [])) or f'Aligned year to {canonical_year}',
+            }
+        return {'success': False, 'error': res.get('error') or 'Failed to align album release year'}
 
     # --- Album Completeness Auto-Fill ---
 
@@ -3213,6 +5110,11 @@ class RepairWorker:
                 lines.append(f"Probed base directories: {joined}")
             else:
                 lines.append("No base directories were available to probe.")
+        if str(active_server).lower() == 'navidrome':
+            lines.append(
+                'Navidrome users: open Profile → Players → SoulSync and enable '
+                '"Report Real Path", then run a full database refresh in SoulSync.'
+            )
         lines.append(
             "Fix: Settings → Library → Music Paths → add the path where "
             "this container can read your library files."
@@ -3237,6 +5139,24 @@ class RepairWorker:
 
         if not album_id:
             return {'success': False, 'error': 'Missing album_id in finding details'}
+
+        # #1504: the missing tracks belong to the album owner's library.
+        # (column may be absent in minimal test schemas -> NULL/shared.)
+        album_owner_pid = None
+        try:
+            oconn = self.db._get_connection()
+            try:
+                ocols = {c[1] for c in oconn.execute("PRAGMA table_info(albums)")}
+                if 'owner_profile_id' in ocols:
+                    orow = oconn.execute(
+                        "SELECT owner_profile_id FROM albums WHERE id = ?", (str(album_id),)
+                    ).fetchone()
+                    if orow and orow[0]:
+                        album_owner_pid = int(orow[0])
+            finally:
+                oconn.close()
+        except Exception as exc:
+            logger.debug("Incomplete-album owner lookup failed: %s", exc)
 
         # If missing_tracks list is empty (scanner couldn't identify them), try to fetch now
         if not missing_tracks:
@@ -3446,6 +5366,8 @@ class RepairWorker:
                         failure_reason='Missing from incomplete album',
                         source_type='album',
                         source_info=source_info,
+                        # #1504: route to the album owner's wishlist.
+                        profile_id=album_owner_pid or 1,
                     )
                     wishlisted_count += 1
                     track_details.append({
@@ -3706,14 +5628,18 @@ class RepairWorker:
             return {'success': False, 'error': str(e)}
 
     def _cleanup_empty_dirs(self, directory):
-        """Remove empty parent directories up to 3 levels, never removing transfer folder."""
+        """Remove empty parent directories up to 3 levels.
+
+        Never removes the transfer folder or any configured root (staging /
+        download / transfer) — even when nested and empty.
+        """
         if not directory:
             return
-        transfer_norm = os.path.normpath(self.transfer_folder)
+        protected = self._protected_root_dirs()
         parent = directory
         for _ in range(3):
             if (parent and os.path.isdir(parent)
-                    and os.path.normpath(parent) != transfer_norm
+                    and os.path.normpath(parent) not in protected
                     and not os.listdir(parent)):
                 try:
                     os.rmdir(parent)
@@ -3927,10 +5853,9 @@ class RepairWorker:
                 # it can MISS for media-server libraries whose stored file_path differs
                 # from the resolved path we just moved, which is exactly the #978
                 # population (so without this the file moves but the DB stays stale).
-                try:
-                    tid = int(entity_id) if entity_id not in (None, '') else None
-                except (TypeError, ValueError):
-                    tid = None
+                # TEXT ids (navidrome) fell back to the path match, which misses
+                # exactly the rows this exists for (#1574)
+                tid = str(entity_id) if entity_id not in (None, '') else None
                 if tid is not None:
                     cursor.execute("UPDATE tracks SET file_path = ? WHERE id = ?", (dst, tid))
                 if tid is None or cursor.rowcount == 0:
@@ -3955,11 +5880,13 @@ class RepairWorker:
                 if conn:
                     conn.close()
 
-            # Clean up empty source directories
+            # Clean up empty source directories (never a configured root, even
+            # when nested under the transfer folder — #976 / Specialmed)
+            protected = self._protected_root_dirs()
             parent = os.path.dirname(src)
             for _ in range(5):
                 if (parent and os.path.isdir(parent)
-                        and os.path.normpath(parent) != transfer_norm
+                        and os.path.normpath(parent) not in protected
                         and not os.listdir(parent)):
                     os.rmdir(parent)
                     parent = os.path.dirname(parent)
@@ -3981,12 +5908,33 @@ class RepairWorker:
         if not file_path:
             return {'success': False, 'error': 'No file path associated with this finding'}
 
-        # Read fresh from current settings — not from finding details
+        # Read the track's assigned quality profile LIVE. Finding details only
+        # carry its id; codec/bitrate/delete-original may have changed since
+        # the scan. Fall back to legacy globals for old findings/installations.
         codec = 'mp3'
         bitrate = '320'
-        if self._config_manager:
+        delete_original = False
+        profile = None
+        profile_id = details.get('quality_profile_id') if isinstance(details, dict) else None
+        try:
+            from core.quality.selection import load_profile_by_id
+            # A NULL assignment deliberately means "use the current default".
+            # load_profile_by_id(None) performs that live resolution, so a
+            # default-profile change between scan and apply is respected.
+            profile = load_profile_by_id(profile_id)
+        except Exception as e:
+            logger.debug("Could not resolve lossy-converter profile %r: %s", profile_id, e)
+        if isinstance(profile, dict) and 'lossy_copy_enabled' in profile:
+            if not profile.get('lossy_copy_enabled'):
+                return {'success': False, 'error': 'Lossy Copy is disabled for this track profile'}
+            codec = str(profile.get('lossy_copy_codec') or 'mp3').lower()
+            bitrate = str(profile.get('lossy_copy_bitrate') or '320')
+            delete_original = bool(profile.get('lossy_copy_delete_original'))
+        elif self._config_manager:
             codec = self._config_manager.get('lossy_copy.codec', 'mp3').lower()
             bitrate = self._config_manager.get('lossy_copy.bitrate', '320')
+            delete_original = bool(
+                self._config_manager.get('lossy_copy.delete_original', False))
         # Opus max per-channel bitrate is 256kbps — cap to avoid encoding failures
         if codec == 'opus' and int(bitrate) > 256:
             bitrate = '256'
@@ -4021,6 +5969,9 @@ class RepairWorker:
 
         if not os.path.exists(resolved):
             return {'success': False, 'error': f'Source file not found: {file_path}'}
+
+        from core.imports.file_ops import probe_audio_quality
+        acquired_quality = probe_audio_quality(resolved)
 
         out_path = os.path.splitext(resolved)[0] + out_ext
         # Safety invariant: ffmpeg runs with -y, so refuse to convert a file onto
@@ -4062,82 +6013,58 @@ class RepairWorker:
                 logger.debug("Full ffmpeg stderr for %s:\n%s", resolved, proc.stderr)
                 return {'success': False, 'error': f'ffmpeg conversion failed: {reason}'}
 
-            # Update QUALITY tag
-            try:
-                from mutagen import File as MutagenFile
-                audio = MutagenFile(out_path)
-                if audio is not None:
-                    if codec == 'mp3':
-                        from mutagen.id3 import TXXX
-                        audio.tags.add(TXXX(encoding=3, desc='QUALITY', text=[quality_label]))
-                    elif codec == 'opus':
-                        audio['QUALITY'] = [quality_label]
-                    elif codec == 'aac':
-                        from mutagen.mp4 import MP4FreeForm
-                        audio['----:com.apple.iTunes:QUALITY'] = [MP4FreeForm(quality_label.encode('utf-8'))]
-                    audio.save()
-            except Exception as e:
-                logger.debug("Failed to write QUALITY tag on lossy copy: %s", e)
-
-            # Embed cover art from source FLAC
-            if codec in ('opus', 'aac'):
-                try:
-                    from mutagen import File as MutagenFile
-                    from mutagen.flac import FLAC as MutagenFLAC
-                    source_audio = MutagenFLAC(resolved)
-                    if source_audio and source_audio.pictures:
-                        pic = source_audio.pictures[0]
-                        dest_audio = MutagenFile(out_path)
-                        if dest_audio is not None:
-                            if codec == 'opus':
-                                import base64, struct
-                                from mutagen.oggopus import OggOpus
-                                if isinstance(dest_audio, OggOpus):
-                                    picture_data = (
-                                        struct.pack('>II', pic.type, len(pic.mime.encode('utf-8')))
-                                        + pic.mime.encode('utf-8')
-                                        + struct.pack('>I', len(pic.desc.encode('utf-8')))
-                                        + pic.desc.encode('utf-8')
-                                        + struct.pack('>IIII', pic.width, pic.height, pic.depth, pic.colors)
-                                        + struct.pack('>I', len(pic.data))
-                                        + pic.data
-                                    )
-                                    dest_audio['METADATA_BLOCK_PICTURE'] = [base64.b64encode(picture_data).decode('ascii')]
-                                    dest_audio.save()
-                            elif codec == 'aac':
-                                from mutagen.mp4 import MP4Cover
-                                fmt = MP4Cover.FORMAT_JPEG if 'jpeg' in pic.mime else MP4Cover.FORMAT_PNG
-                                dest_audio['covr'] = [MP4Cover(pic.data, imageformat=fmt)]
-                                dest_audio.save()
-                except Exception as e:
-                    logger.debug("Failed to embed cover art in lossy copy: %s", e)
-
-            # Blasphemy Mode — uses the job's own setting, not the global lossy_copy one
-            delete_original = False
-            if self._config_manager:
-                job_settings = self._config_manager.get('repair.jobs.lossy_converter.settings', {})
-                if isinstance(job_settings, dict):
-                    delete_original = job_settings.get('delete_original', False)
+            # rebuild the copy's tags from the source: -map_metadata leaves
+            # vorbis names in an mp3 and drops the cover (#1422)
+            from core.metadata.lossy_tags import carry_tags_to_lossy_copy
+            carry_tags_to_lossy_copy(resolved, out_path, quality_label)
 
             if delete_original:
                 try:
                     from mutagen import File as MutagenFile
                     test = MutagenFile(out_path)
                     if test is not None:
-                        os.remove(resolved)
-                        # Update DB path using original DB format
+                        # Update the DB FIRST: if the DB update fails, the
+                        # source file is untouched and the row still points at
+                        # it. Deleting the file first and swallowing the DB
+                        # error as success left the DB pointing at a gone file.
                         new_db_path = os.path.splitext(file_path)[0] + out_ext
+                        from core.quality.retention import quality_json, transforms_json
+                        output_quality = probe_audio_quality(out_path)
+                        retention_json = transforms_json([{
+                            'type': 'lossy_copy',
+                            'source_replaced': True,
+                            'codec': codec,
+                            'bitrate': bitrate,
+                            'output_quality': (
+                                output_quality.to_dict() if output_quality else None),
+                        }])
+                        conn = None
                         try:
                             conn = self.db._get_connection()
                             cursor = conn.cursor()
                             cursor.execute(
-                                "UPDATE tracks SET file_path = ? WHERE id = ?",
-                                (new_db_path, entity_id)
+                                """UPDATE tracks
+                                      SET file_path=?, acquired_quality_json=?,
+                                          retention_json=?, updated_at=CURRENT_TIMESTAMP
+                                    WHERE id=?""",
+                                (new_db_path, quality_json(acquired_quality),
+                                 retention_json, entity_id)
                             )
                             conn.commit()
-                            conn.close()
                         except Exception as e:
-                            logger.debug("Failed to update DB path after lossy conversion: %s", e)
+                            return {'success': False,
+                                    'error': f'Converted to {quality_label} but the DB path '
+                                             f'update failed — original kept: {e}'}
+                        finally:
+                            if conn:
+                                conn.close()
+                        try:
+                            os.remove(resolved)
+                        except OSError as e:
+                            return {'success': False,
+                                    'error': f'Converted to {quality_label} (the library now '
+                                             f'points at it) but the original could not be '
+                                             f'deleted: {e}'}
                         return {'success': True, 'action': 'converted_and_deleted',
                                 'message': f'Converted to {quality_label} and deleted original'}
                 except Exception as e:
@@ -4178,17 +6105,30 @@ class RepairWorker:
                 conn.close()
 
     def _pending_fixable_ids(self, job_id: str = None, severity: str = None,
-                             finding_ids: List[int] = None) -> List[int]:
+                             finding_ids: List[int] = None,
+                             finding_type: str = None,
+                             safe_only: bool = False) -> List[int]:
         """IDs of pending findings the fix loop can actually fix.
 
         Fixable = has a fix handler — derived from the dispatch map so the
         two can never drift apart again (a stale copy of this list silently
-        skipped genre_cleanup / replaygain_retag findings in Fix All)."""
+        skipped genre_cleanup / replaygain_retag findings in Fix All).
+
+        ``safe_only`` drops every DESTRUCTIVE_FINDING_TYPES row, which is what
+        makes a one-click "fix everything harmless" honest.
+        """
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-            fixable_types = tuple(self._fix_handlers().keys())
+            fixable = set(self._fix_handlers().keys())
+            if safe_only:
+                fixable -= DESTRUCTIVE_FINDING_TYPES
+            if finding_type:
+                fixable &= {finding_type}
+            if not fixable:
+                return []
+            fixable_types = tuple(sorted(fixable))
             placeholders = ','.join(['?'] * len(fixable_types))
             where_parts = [f"finding_type IN ({placeholders})", "status = 'pending'"]
             params = list(fixable_types)
@@ -4226,7 +6166,16 @@ class RepairWorker:
             failed = 0
             errors = []
             for fid in ids_to_fix:
-                result = self.fix_finding(fid, fix_action=fix_action)
+                try:
+                    result = self.fix_finding(fid, fix_action=fix_action)
+                except Exception as e:  # noqa: BLE001
+                    # One bad finding must not abandon the rest. Without this
+                    # the whole loop fell to the outer handler and returned
+                    # {'fixed': 0, 'failed': 0, 'total': 0} — throwing away
+                    # every fix already applied and reporting nothing happened.
+                    # The background twin (_run_bulk_fix) has always had this
+                    # guard; this loop never got it.
+                    result = {'success': False, 'error': str(e)}
                 if result.get('success'):
                     fixed += 1
                 else:
@@ -4251,8 +6200,21 @@ class RepairWorker:
     # the same loop on a worker thread instead; the UI polls for progress.
 
     def start_bulk_fix(self, job_id: str = None, severity: str = None,
-                       finding_ids: List[int] = None, fix_action: str = None) -> dict:
+                       finding_ids: List[int] = None, fix_action: str = None,
+                       finding_type: str = None, safe_only: bool = False) -> dict:
         """Start a background bulk-fix run. Only one runs at a time.
+
+        ``fix_action`` may only reach ONE finding type per run. The string is
+        interpreted per handler — 'delete' means "delete the file" to the
+        orphan, quality and AcoustID fixers, while `_fix_duplicates` reads the
+        same parameter as the id of the track to KEEP. Forwarding one string
+        across a mixed selection is how a user answering a question about
+        orphan files could silently delete audio under three other types.
+
+        The check is on the RESOLVED SELECTION, not on which filter produced
+        it: a job scope usually is a single type (the orphan detector emits
+        only orphan_file), and rejecting those would break the working
+        per-job Fix All while catching nothing real.
 
         Returns ``{'started': True, 'total': N}`` or
         ``{'started': False, 'error': ..., 'already_running': bool}``."""
@@ -4262,12 +6224,23 @@ class RepairWorker:
                         'error': 'A bulk fix is already running'}
             try:
                 ids = self._pending_fixable_ids(
-                    job_id=job_id, severity=severity, finding_ids=finding_ids)
+                    job_id=job_id, severity=severity, finding_ids=finding_ids,
+                    finding_type=finding_type, safe_only=safe_only)
             except Exception as e:
                 logger.error("Error starting bulk fix: %s", e, exc_info=True)
                 return {'started': False, 'error': str(e)}
             if not ids:
                 return {'started': False, 'error': 'No pending fixable findings match'}
+
+            if fix_action:
+                spanned = set(self._types_for_findings(ids).values())
+                if len(spanned) > 1:
+                    return {'started': False, 'invalid': True, 'error': (
+                        f"'{fix_action}' would be applied to {len(spanned)} different "
+                        "finding types, and it means something different to each fixer "
+                        "(for one it deletes files; for another it names the copy to "
+                        "KEEP). Narrow the run to a single type, or run it without an "
+                        "action.")}
 
             self._bulk_fix_stop_event.clear()
             # Every key the runner will ever touch is seeded here so later
@@ -4282,8 +6255,13 @@ class RepairWorker:
                 'failed': 0,
                 'stopped': False,
                 'job_id': job_id,
+                'finding_type': finding_type,
+                'safe_only': bool(safe_only),
                 'errors': [],
                 'error': None,
+                # Per-type tallies so a mixed run can say WHAT it is fixing
+                # ("312 cover art, 40 lyrics") instead of one opaque number.
+                'per_type': {},
             }
             self._bulk_fix_thread = threading.Thread(
                 target=self._run_bulk_fix, args=(list(ids), fix_action),
@@ -4293,8 +6271,30 @@ class RepairWorker:
                         len(ids), f" for {job_id}" if job_id else "")
             return {'started': True, 'total': len(ids)}
 
+    def _types_for_findings(self, ids: List[int]) -> Dict[int, str]:
+        """finding_id → finding_type, read once so the bulk loop can tally per
+        type without a query per row."""
+        if not ids:
+            return {}
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            placeholders = ','.join(['?'] * len(ids))
+            cursor.execute(
+                f"SELECT id, finding_type FROM repair_findings WHERE id IN ({placeholders})",
+                list(ids))
+            return {row[0]: row[1] for row in cursor.fetchall()}
+        except Exception as e:
+            logger.debug("Could not read finding types for bulk run: %s", e)
+            return {}
+        finally:
+            if conn:
+                conn.close()
+
     def _run_bulk_fix(self, ids: List[int], fix_action: str = None):
         state = self._bulk_fix_state
+        types = self._types_for_findings(ids)
         try:
             for fid in ids:
                 if self._bulk_fix_stop_event.is_set() or self.should_stop:
@@ -4307,6 +6307,16 @@ class RepairWorker:
                 except Exception as e:  # fix_finding shouldn't raise, but never kill the run
                     result = {'success': False, 'error': str(e)}
                 state['done'] += 1
+                slug = types.get(fid)
+                if slug:
+                    tally = state['per_type'].get(slug)
+                    if tally is None:
+                        # Seeded whole, never key-by-key: get_bulk_fix_status
+                        # copies this dict from another thread and a partial
+                        # insert could be observed mid-write.
+                        tally = {'fixed': 0, 'failed': 0}
+                        state['per_type'][slug] = tally
+                    tally['fixed' if result.get('success') else 'failed'] += 1
                 if result.get('success'):
                     state['fixed'] += 1
                 else:
@@ -4319,6 +6329,25 @@ class RepairWorker:
             logger.error("Background bulk fix crashed: %s", e, exc_info=True)
             state['error'] = str(e)
         finally:
+            # Release the thread reference BEFORE clearing the running flag.
+            #
+            # start_bulk_fix's single-flight guard asks `_bulk_fix_thread
+            # .is_alive()`, while callers wait on `state['running']` — two
+            # signals for one condition. A caller that correctly waited for the
+            # run to finish could still be told "a bulk fix is already running",
+            # because the flag flipped while this thread was still winding down.
+            # Rare locally, reliable on a loaded CI runner.
+            #
+            # This order makes the flag the conservative signal: anyone who
+            # observes running=False is guaranteed to observe a cleared
+            # reference too. The reverse order leaves the same window, only
+            # narrower — which is how a race hides rather than gets fixed.
+            #
+            # Safe to clear from inside the thread: `finally` runs even when the
+            # loop raises, and if start_bulk_fix re-assigns the reference after
+            # a very fast run it can only store an already-dead thread, which
+            # the guard reads as not-running anyway.
+            self._bulk_fix_thread = None
             state['running'] = False
             logger.info("Background bulk fix finished: %d fixed, %d failed of %d",
                         state['fixed'], state['failed'], state['total'])
@@ -4334,6 +6363,40 @@ class RepairWorker:
         """Ask a running background bulk fix to stop after its current fix."""
         self._bulk_fix_stop_event.set()
         return True
+
+    def dismiss_findings_by_type(self, finding_type: str) -> int:
+        """Dismiss every PENDING finding of one type. Returns count updated.
+
+        The inbox works a whole group at a time, and "dismiss this group" had
+        no honest implementation: the id-based bulk endpoint would have meant
+        paging thousands of ids to the client purely to send them back.
+
+        Pending only. A resolved row is a record of work that actually
+        happened — rewriting it to 'dismissed' would falsify the history the
+        recurrence grace and the run counters both read.
+        """
+        if not finding_type:
+            return 0
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE repair_findings
+                SET status = 'dismissed', resolved_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE finding_type = ? AND status = 'pending'
+            """, (finding_type,))
+            conn.commit()
+            count = cursor.rowcount
+            logger.info("Dismissed %d pending findings of type %s", count, finding_type)
+            return count
+        except Exception as e:
+            logger.error("Error dismissing findings of type %s: %s", finding_type, e)
+            return 0
+        finally:
+            if conn:
+                conn.close()
 
     def bulk_update_findings(self, finding_ids: List[int], action: str) -> int:
         """Bulk resolve or dismiss findings. Returns count updated."""
@@ -4367,28 +6430,32 @@ class RepairWorker:
             if conn:
                 conn.close()
 
-    def clear_findings(self, job_id: str = None, status: str = None) -> int:
-        """Delete findings from the database. Optionally filter by job_id and/or status. Returns count deleted."""
+    def clear_findings(self, job_id: str = None, status: str = None,
+                       severity: str = None, finding_type: str = None,
+                       q: str = None) -> int:
+        """Delete findings matching the SAME filters the list view applies.
+
+        Every argument here must be forwarded from the UI's current filter
+        state. This deletes rows outright, so a filter the caller drops widens
+        the blast radius silently — which is exactly how #1142 destroyed
+        findings the user had filtered away.
+        """
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-            conditions = []
-            params = []
-            if job_id:
-                conditions.append("job_id = ?")
-                params.append(job_id)
-            if status:
-                conditions.append("status = ?")
-                params.append(status)
-            where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
-            cursor.execute(f"SELECT COUNT(*) FROM repair_findings{where}", params)
+            where, params = self._findings_filter(
+                job_id=job_id, status=status, severity=severity,
+                finding_type=finding_type, q=q)
+            cursor.execute(f"SELECT COUNT(*) FROM repair_findings {where}", params)
             count = cursor.fetchone()[0]
-            cursor.execute(f"DELETE FROM repair_findings{where}", params)
+            cursor.execute(f"DELETE FROM repair_findings {where}", params)
             conn.commit()
-            logger.info("Cleared %d findings%s%s", count,
+            logger.info("Cleared %d findings%s%s%s%s", count,
                          f" for job {job_id}" if job_id else "",
-                         f" with status {status}" if status else "")
+                         f" with status {status}" if status else "",
+                         f" severity {severity}" if severity else "",
+                         f" matching {q!r}" if q and str(q).strip() else "")
             return count
         except Exception as e:
             logger.error("Error clearing findings: %s", e)
@@ -4438,10 +6505,15 @@ class RepairWorker:
             by_job = {}
             for job_id, finding_type, severity, cnt in cursor.fetchall():
                 if job_id not in by_job:
-                    by_job[job_id] = {'total': 0, 'types': {}, 'warning': 0, 'info': 0}
+                    # 'error' belongs here as much as the other two: the
+                    # corruption detector emits it, and leaving it out of the
+                    # buckets hid the single most urgent finding class from
+                    # every per-job severity total.
+                    by_job[job_id] = {'total': 0, 'types': {},
+                                      'error': 0, 'warning': 0, 'info': 0}
                 by_job[job_id]['total'] += cnt
                 by_job[job_id]['types'][finding_type] = by_job[job_id]['types'].get(finding_type, 0) + cnt
-                if severity in ('warning', 'info'):
+                if severity in ('error', 'warning', 'info'):
                     by_job[job_id][severity] += cnt
 
             # Resolve display names
@@ -4487,26 +6559,80 @@ class RepairWorker:
                 conn.close()
 
     def _record_job_finish(self, run_id: Optional[int], job_id: str,
-                           result: JobResult, duration: float):
-        """Record a job run completion."""
+                           result: JobResult, duration: float,
+                           status: str = 'completed', error_text: str = None):
+        """Record a job run completion.
+
+        ``status`` is the truth of the run — 'completed', 'failed' (the scan
+        raised) or 'cancelled' (the user stopped it). It used to be hardcoded
+        'completed', so the history tab could not tell a clean scan from a
+        crash, and a run that died mid-flight stayed 'running' forever.
+        Per-item errors are NOT a failed run: those are counted in ``errors``
+        and the scan still finished.
+        """
         if not run_id:
             return
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
-            status = 'completed'
-            cursor.execute("""
-                UPDATE repair_job_runs
-                SET finished_at = CURRENT_TIMESTAMP, duration_seconds = ?,
-                    items_scanned = ?, findings_created = ?, auto_fixed = ?,
-                    errors = ?, status = ?
-                WHERE id = ?
-            """, (duration, result.scanned, result.findings_created,
-                  result.auto_fixed, result.errors, status, run_id))
+            # Losing the whole finish record because one late column is
+            # missing would leave the run 'running' forever — the exact bug
+            # this method exists to fix. Record what we can.
+            if self._has_column(cursor, 'repair_job_runs', 'error_text'):
+                cursor.execute("""
+                    UPDATE repair_job_runs
+                    SET finished_at = CURRENT_TIMESTAMP, duration_seconds = ?,
+                        items_scanned = ?, findings_created = ?, auto_fixed = ?,
+                        errors = ?, status = ?, error_text = ?
+                    WHERE id = ?
+                """, (duration, result.scanned, result.findings_created,
+                      result.auto_fixed, result.errors, status,
+                      (error_text or None), run_id))
+            else:
+                cursor.execute("""
+                    UPDATE repair_job_runs
+                    SET finished_at = CURRENT_TIMESTAMP, duration_seconds = ?,
+                        items_scanned = ?, findings_created = ?, auto_fixed = ?,
+                        errors = ?, status = ?
+                    WHERE id = ?
+                """, (duration, result.scanned, result.findings_created,
+                      result.auto_fixed, result.errors, status, run_id))
             conn.commit()
         except Exception as e:
             logger.debug("Error recording job finish: %s", e)
+        finally:
+            if conn:
+                conn.close()
+
+    def _heal_stuck_runs(self) -> int:
+        """Close out runs left 'running' by a process that died mid-scan.
+
+        Only one job runs at a time per worker and this fires before the loop
+        starts, so anything still 'running' at boot belongs to a previous
+        process. Left alone those rows keep ``finished_at`` NULL forever,
+        which the scheduler reads as "never run" — the job then looks
+        infinitely stale and jumps the queue on every single poll.
+        """
+        conn = None
+        try:
+            conn = self.db._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE repair_job_runs
+                SET status = 'failed', finished_at = CURRENT_TIMESTAMP,
+                    error_text = COALESCE(error_text,
+                        'Interrupted — SoulSync stopped while this scan was running')
+                WHERE status = 'running' AND finished_at IS NULL
+            """)
+            conn.commit()
+            healed = cursor.rowcount or 0
+            if healed:
+                logger.info("Healed %d interrupted maintenance run(s)", healed)
+            return healed
+        except Exception as e:
+            logger.debug("Error healing stuck runs: %s", e)
+            return 0
         finally:
             if conn:
                 conn.close()
@@ -4546,25 +6672,34 @@ class RepairWorker:
                 conn.close()
 
     def get_history(self, job_id: str = None, limit: int = 50) -> List[dict]:
-        """Get job run history."""
+        """Get job run history.
+
+        `error_text` rides along: phase 1 started recording WHY a run failed
+        and this reader never selected it, so the history could say 'failed'
+        and nothing else — the one thing a failed run is worth opening for.
+        Guarded, because a reader that raises here shows an empty history,
+        which reads as "maintenance has never run".
+        """
         conn = None
         try:
             conn = self.db._get_connection()
             cursor = conn.cursor()
+            has_error_text = self._has_column(cursor, 'repair_job_runs', 'error_text')
+            columns = ("id, job_id, started_at, finished_at, duration_seconds, "
+                       "items_scanned, findings_created, auto_fixed, errors, status")
+            columns += ", error_text" if has_error_text else ", NULL"
 
             if job_id:
-                cursor.execute("""
-                    SELECT id, job_id, started_at, finished_at, duration_seconds,
-                           items_scanned, findings_created, auto_fixed, errors, status
+                cursor.execute(f"""
+                    SELECT {columns}
                     FROM repair_job_runs
                     WHERE job_id = ?
                     ORDER BY started_at DESC
                     LIMIT ?
                 """, (job_id, limit))
             else:
-                cursor.execute("""
-                    SELECT id, job_id, started_at, finished_at, duration_seconds,
-                           items_scanned, findings_created, auto_fixed, errors, status
+                cursor.execute(f"""
+                    SELECT {columns}
                     FROM repair_job_runs
                     ORDER BY started_at DESC
                     LIMIT ?
@@ -4587,6 +6722,7 @@ class RepairWorker:
                     'auto_fixed': row[7],
                     'errors': row[8],
                     'status': row[9],
+                    'error_text': row[10],
                 })
             return runs
         except Exception as e:
@@ -4649,12 +6785,16 @@ class RepairWorker:
     # ------------------------------------------------------------------
     @staticmethod
     def _resolve_path(path_str: str) -> str:
-        """Resolve Docker path mapping if running in a container."""
-        if os.path.exists('/.dockerenv') and len(path_str) >= 3 and path_str[1] == ':' and path_str[0].isalpha():
-            drive_letter = path_str[0].lower()
-            rest_of_path = path_str[2:].replace('\\', '/')
-            return f"/host/mnt/{drive_letter}{rest_of_path}"
-        return path_str
+        """Canonical absolute form of a configured folder (Docker mapping included).
+
+        Roots are routinely configured relative ("./Transfer" is the shipped
+        default). Returning them verbatim made every root comparison in the
+        repair jobs a string compare between "./Transfer/…" and the realpath'd
+        "/app/Transfer/…" of the very same file — which never matched.
+        """
+        from core.imports.paths import config_root_path
+
+        return config_root_path(path_str) or path_str
 
     def _get_transfer_path_from_db(self) -> str:
         """Read transfer path directly from the database app_config."""

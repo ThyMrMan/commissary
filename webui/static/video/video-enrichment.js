@@ -1,5 +1,5 @@
 /*
- * Commissary — Video enrichment dashboard buttons (isolated).
+ * SoulSync — Video enrichment dashboard buttons (isolated).
  *
  * Polls /api/video/enrichment/<svc>/status and reflects it on the dashboard
  * TMDB/TVDB buttons (spin while running, tooltip status). Click toggles

@@ -12,6 +12,8 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, List, Tuple
 
+from core.metadata.release_dates import discogs_release_date
+
 logger = logging.getLogger(__name__)
 
 # Hard ceiling on cached entity rows. TTL-only eviction has no upper bound, so
@@ -138,11 +140,74 @@ class MetadataCache:
             logger.debug(f"Cache lookup error ({source}/{entity_type}/{entity_id}): {e}")
             return None
 
+    def get_genre_translation(self, whitelist_hash: str, normalized_source_genre: str) -> Optional[dict]:
+        """Return and touch a persisted genre translation outcome."""
+        try:
+            db = self._get_db(); conn = db._get_connection()
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT * FROM genre_translation_cache WHERE whitelist_hash=? AND normalized_source_genre=?",
+                            (whitelist_hash, normalized_source_genre))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                cur.execute("UPDATE genre_translation_cache SET last_accessed_at=CURRENT_TIMESTAMP, access_count=access_count+1 WHERE id=?", (row['id'],))
+                conn.commit()
+                return dict(row)
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("Genre translation cache lookup failed: %s", e)
+            return None
+
+    def store_genre_translation(self, whitelist_hash: str, source_genre: str,
+                                normalized_source_genre: str, outcome: dict) -> None:
+        try:
+            db = self._get_db(); conn = db._get_connection()
+            try:
+                conn.execute("""INSERT INTO genre_translation_cache
+                    (whitelist_hash,source_genre,normalized_source_genre,status,matched_genre,score,margin,candidates_json)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    ON CONFLICT(whitelist_hash,normalized_source_genre) DO UPDATE SET
+                    source_genre=excluded.source_genre,status=excluded.status,matched_genre=excluded.matched_genre,
+                    score=excluded.score,margin=excluded.margin,candidates_json=excluded.candidates_json,
+                    updated_at=CURRENT_TIMESTAMP,last_accessed_at=CURRENT_TIMESTAMP,access_count=genre_translation_cache.access_count+1""",
+                    (whitelist_hash, source_genre, normalized_source_genre, outcome.get('status'),
+                     outcome.get('matched_genre'), outcome.get('score'), outcome.get('margin'),
+                     json.dumps(outcome.get('candidates', []))))
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as e:
+            logger.debug("Genre translation cache store failed: %s", e)
+
     # Names that indicate junk/placeholder data — should not be cached
     _JUNK_NAMES = frozenset({
         '', 'unknown', 'unknown artist', 'unknown album', 'unknown track',
         'untitled', 'none', 'n/a', 'null',
     })
+
+    # Entity TYPES that hold a synthetic payload rather than a named entity:
+    # an album's track list, an artist's discography. They have no 'name' of
+    # their own, so the junk check below — which rejects a blank name — throws
+    # every one of them away.
+    #
+    # The original guard exempted synthetic entries by entity_ID suffix
+    # ('..._features', '..._tracks'), but no caller names them that way: the
+    # Deezer resolver passes a bare album id with entity_type='album_tracks',
+    # and the other two pass 'album_tracks_<id>' / 'explorer_disco_<name>'.
+    # So the exemption matched nothing and these caches never stored a single
+    # row — silently, at debug level. On a 1500-track Deezer playlist that is
+    # ~1,000 album lookups repeated in full on EVERY load, which is most of
+    # the multi-minute wait people report.
+    _SYNTHETIC_ENTITY_TYPES = frozenset({'album_tracks', 'artist_discography'})
+
+    def _is_synthetic_entity(self, entity_type: str, entity_id: str) -> bool:
+        """True for cache rows that intentionally carry no entity name."""
+        if entity_type in self._SYNTHETIC_ENTITY_TYPES:
+            return True
+        return bool(entity_id) and (
+            entity_id.endswith('_features') or entity_id.endswith('_tracks'))
 
     def _is_junk_entity(self, fields: dict) -> bool:
         """Check if extracted fields represent junk/placeholder data."""
@@ -161,8 +226,9 @@ class MetadataCache:
             return
         try:
             fields = self._extract_fields(source, entity_type, raw_data)
-            # Skip validation for synthetic cache entries (_features, _tracks suffixes)
-            if not entity_id.endswith('_features') and not entity_id.endswith('_tracks') and self._is_junk_entity(fields):
+            # Skip validation for synthetic cache entries — they have no name
+            # to validate, so the junk check would reject all of them.
+            if not self._is_synthetic_entity(entity_type, entity_id) and self._is_junk_entity(fields):
                 logger.debug(f"Rejecting junk entity ({source}/{entity_type}/{entity_id}): name='{fields.get('name')}'")
                 return
             raw_json = json.dumps(raw_data, default=str)
@@ -1009,7 +1075,12 @@ class MetadataCache:
         144: 'Reggae', 129: 'Jazz', 84: 'Country', 67: 'Salsa', 173: 'Films/Games',
         98: 'Classical', 169: 'Soul & Funk', 2: 'African Music', 16: 'Asian Music',
         153: 'Blues', 75: 'Brazilian Music', 81: 'Indian Music', 95: 'Kids',
-        197: 'Latin Music', 73: 'Metal', 464: 'Rap', 174: 'Musicals',
+        # 464 is METAL. It read 'Rap' here, so every album that fell back to this
+        # map with genre 464 was filed as rap — checked against
+        # api.deezer.com/genre with Accept-Language: en, which is the same list
+        # this map was transcribed from. 73 and 174 are not in that list at all
+        # any more; kept because an older album can still carry them.
+        197: 'Latin Music', 73: 'Metal', 464: 'Metal', 174: 'Musicals',
     }
 
     def _extract_deezer_fields(self, entity_type: str, data: dict) -> dict:
@@ -1040,7 +1111,12 @@ class MetadataCache:
             fields['release_date'] = data.get('release_date', '')
             fields['total_tracks'] = data.get('nb_tracks', 0)
             record_type = data.get('record_type', 'album')
-            fields['album_type'] = record_type if record_type in ('single', 'ep', 'album') else 'album'
+            if record_type in ('compile', 'compilation'):
+                fields['album_type'] = 'compilation'
+            elif record_type in ('single', 'ep', 'album'):
+                fields['album_type'] = record_type
+            else:
+                fields['album_type'] = 'album'
             fields['label'] = data.get('label', '')
             fields['image_url'] = data.get('cover_xl') or data.get('cover_big') or data.get('cover_medium')
             # Deezer full album response: genres in data.genres.data[].name
@@ -1177,7 +1253,7 @@ class MetadataCache:
             else:
                 fields['name'] = raw_title
 
-            fields['release_date'] = str(data.get('year', '')) if data.get('year') else ''
+            fields['release_date'] = discogs_release_date(data)
             tracklist = data.get('tracklist', [])
             fields['total_tracks'] = len(tracklist) if tracklist else 0
             fields['genres'] = json.dumps(data.get('genres', []))
@@ -1253,6 +1329,7 @@ class MetadataCache:
             fields['duration_ms'] = int(duration) * 1000 if duration else 0
             fields['track_number'] = data.get('position')
             fields['genres'] = json.dumps([data['genre']]) if data.get('genre') else '[]'
+            fields['isrc'] = data.get('isrc') or None
             urls = {}
             if data.get('url'):
                 urls['beatport'] = data['url']
@@ -1293,7 +1370,7 @@ class MetadataCache:
                         results.append(dict(row))
                         if len(results) >= limit:
                             break
-                return results
+                return self._with_art(cursor, results, 'album')
             finally:
                 conn.close()
         except Exception as e:
@@ -1331,7 +1408,7 @@ class MetadataCache:
                     ORDER BY release_date DESC, COALESCE(popularity, 0) DESC
                     LIMIT ?
                 """, params + [limit])
-                return [dict(r) for r in cursor.fetchall()]
+                return self._with_art(cursor, [dict(r) for r in cursor.fetchall()], 'album')
             finally:
                 conn.close()
         except Exception as e:
@@ -1363,12 +1440,26 @@ class MetadataCache:
                     ORDER BY COALESCE(popularity, 0) DESC, access_count DESC
                     LIMIT ?
                 """, params + [limit])
-                return [dict(r) for r in cursor.fetchall()]
+                return self._with_art(cursor, [dict(r) for r in cursor.fetchall()], 'album')
             finally:
                 conn.close()
         except Exception as e:
             logger.error(f"Label explorer error: {e}")
             return []
+
+    @staticmethod
+    def _with_art(cursor, rows, entity_type):
+        """fill missing image_url from stored payloads (and, for artists, a
+        same-named twin or the library thumb). art never fails a shelf."""
+        try:
+            from core.metadata.entity_art import fill_artist_photos, fill_from_payloads
+            if entity_type == 'artist':
+                fill_artist_photos(cursor, rows)
+            else:
+                fill_from_payloads(cursor, rows, entity_type)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("art fill skipped for %s: %s", entity_type, e)
+        return rows
 
     def get_deep_cuts(self, artist_names, source=None, popularity_cap=30, limit=20):
         """Find low-popularity tracks from artists the user listens to."""
@@ -1396,7 +1487,7 @@ class MetadataCache:
                     ORDER BY COALESCE(popularity, 50) ASC, access_count DESC
                     LIMIT ?
                 """, params + [popularity_cap, limit])
-                return [dict(r) for r in cursor.fetchall()]
+                return self._with_art(cursor, [dict(r) for r in cursor.fetchall()], 'track')
             finally:
                 conn.close()
         except Exception as e:
@@ -1612,6 +1703,9 @@ class MetadataCache:
                     for artist in artists:
                         artist['library_id'] = lib_id_map.get(artist['name'].lower())
 
+                self._with_art(cursor, artists, 'artist')
+                self._with_art(cursor, albums, 'album')
+                self._with_art(cursor, tracks, 'track')
                 _payload = {'artists': artists, 'albums': albums, 'tracks': tracks,
                             'related_genres': related}
                 # Only successful dives are cached — a failure must be retried,

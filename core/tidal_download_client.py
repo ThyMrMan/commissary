@@ -32,7 +32,8 @@ except ImportError:
 import requests as http_requests
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_blocking
 
 # Import Soulseek data structures for drop-in replacement compatibility
 from core.download_plugins.types import TrackResult, AlbumResult, DownloadStatus
@@ -500,8 +501,8 @@ class TidalDownloadClient(DownloadSourcePlugin):
                 return {
                     'status': 'error',
                     'message': (
-                        "Tidal returned an invalid auth response while Commissary was finishing login. "
-                        "Try again after disabling VPN/proxy/network filtering, then restart Commissary if it repeats."
+                        "Tidal returned an invalid auth response while SoulSync was finishing login. "
+                        "Try again after disabling VPN/proxy/network filtering, then restart SoulSync if it repeats."
                     ),
                 }
             logger.error(f"Tidal device auth check error: {e}")
@@ -515,8 +516,7 @@ class TidalDownloadClient(DownloadSourcePlugin):
 
     async def check_connection(self) -> bool:
         try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.is_available)
+            return await run_blocking(self.is_available)
         except Exception as e:
             logger.error(f"Tidal connection check failed: {e}")
             return False
@@ -587,8 +587,17 @@ class TidalDownloadClient(DownloadSourcePlugin):
                 variants.append(candidate)
                 seen.add(candidate.lower())
 
-        _add(re.sub(r'\s*[\(\[][^\)\]]*[\)\]]\s*$', '', original))
-        _add(re.sub(r'\s*[\(\[][^\)\]]*[\)\]]', ' ', original))
+        # dd28-52: the previous `[^\)\]]*` regexes stop at the first closing
+        # bracket, so a genuinely nested group like "Song (Live (2015))" left a
+        # stray ")" behind instead of being removed. The shared strippers match
+        # by depth; the Prowlarr ladder uses the same ones.
+        from core.download_plugins.query_variants import (
+            strip_bracket_groups,
+            strip_trailing_bracket_group,
+        )
+
+        _add(strip_trailing_bracket_group(original))
+        _add(strip_bracket_groups(original))
 
         tokens = original.split()
 
@@ -628,7 +637,6 @@ class TidalDownloadClient(DownloadSourcePlugin):
             last_error: Optional[Exception] = None
             any_fallback_filtered_out = False
 
-            loop = asyncio.get_event_loop()
             for attempt_idx, attempt_query in enumerate(queries_to_try):
                 try:
                     q_copy = attempt_query
@@ -638,7 +646,7 @@ class TidalDownloadClient(DownloadSourcePlugin):
                         results = self.session.search(q, models=[tidalapi.media.Track], limit=50)
                         return results.get('tracks', []) if isinstance(results, dict) else []
 
-                    found = await loop.run_in_executor(None, _search)
+                    found = await run_blocking(_search)
 
                     if found:
                         # Issue #589 — qualifier filter applies to ALL
@@ -776,6 +784,7 @@ class TidalDownloadClient(DownloadSourcePlugin):
                 'isrc': track.isrc or None,
                 'bpm': track.bpm if track.bpm and track.bpm > 0 else None,
                 'copyright': track.copyright or None,
+                'explicit': getattr(track, 'explicit', None),  # Commissary: explicit preference
             },
         )
 
@@ -1224,6 +1233,7 @@ class TidalDownloadClient(DownloadSourcePlugin):
             speed=record.get('speed', 0),
             time_remaining=record.get('time_remaining'),
             file_path=record.get('file_path'),
+            error=record.get('error'),
         )
 
     async def get_all_downloads(self) -> List[DownloadStatus]:

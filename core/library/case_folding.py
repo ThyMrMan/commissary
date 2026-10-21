@@ -1,7 +1,5 @@
 """Reuse a folder that already exists in a different case (#1091).
 
-Ported from upstream SoulSync 3.2.2.
-
 Reported by TomOdellSheetMusic: reorganize and download build every
 destination folder from metadata, so if the metadata's casing differs from
 the folder already on disk you get two folders for one album.
@@ -10,10 +8,10 @@ WHY THIS BITES DIFFERENTLY PER PLATFORM, and why both halves are bad:
 
   * case-SENSITIVE (his setup — Linux/proxmox): you genuinely get two
     directories, "Artist/Artist - Album" and "artist/artist - album". Jellyfin
-    shows the album twice and Commissary cannot tell which tracks belong
+    shows the album twice and SoulSync cannot tell which tracks belong
     together.
   * case-INSENSITIVE (Windows, default macOS): the second makedirs quietly
-    lands in the FIRST folder, so the files are fine but the path Commissary
+    lands in the FIRST folder, so the files are fine but the path SoulSync
     recorded is not the path on disk. That is the "broken browsing behaviour"
     half — every later exact-path lookup misses.
 

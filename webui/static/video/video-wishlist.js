@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Wishlist page (isolated).
+ * SoulSync — Video Wishlist page (isolated).
  *
  * The curated 'get this' list, split by a Movies / TV tab. Movies render as a
  * poster grid; TV groups into collapsible show → season → episode rows with
@@ -13,7 +13,6 @@
     var PAGE_ID = 'video-wishlist';
     var LIMIT = 60;
     var state = { loaded: false, tab: 'movie', search: '', sort: 'added', page: 1,
-                  rootFolderId: '',
                   counts: { movie: 0, show: 0, episode: 0 }, ytChannel: 0, ytVideo: 0,
                   showData: {}, showInfo: {},
                   // "⚠ Failing" filter (the LiveLeak fix-it hub): show only items
@@ -57,98 +56,169 @@
         failed: ['Failed', 'vwsh-st--failed'],
         monitored: ['Not out yet', 'vwsh-st--monitored'],
         upgrade: ['⇪ Upgrading', 'vwsh-st--upgrade'],
+        muted: ['Muted', 'vwsh-st--monitored'],
     };
     // The pill tells the TRUTH, not the stale status column: an active download
     // row wins, then the upgrade watch (owned below cutoff), then the column.
-    function liveStatus(it) {
+    // `muted` rides on the SHOW row and episodes are what get rendered, so the
+    // caller passes it down. An un-followed show's episodes are no longer
+    // searched by the drain; the pill says that rather than leaving them
+    // looking merely stuck.
+    function liveStatus(it, showMuted) {
         if (it.downloading) return 'downloading';
         if (it.upgrade_from) return 'upgrade';
+        if ((showMuted || it.muted) && (!it.status || it.status === 'wanted')) return 'muted';
         return STATUS[it.status] ? it.status : 'wanted';
     }
+    // Why a row keeps coming back empty. The count alone ("13") says a row is
+    // stuck but not whether to wait or act; the drain now stores the best release
+    // it refused and the rule that refused it (core.video.wishlist_evidence), and
+    // THAT is what turns the chip into a decision.
+    function failWhy(row, fails) {
+        var out = fails + ' searches without a grab';
+        if (row && row.last_search_at) out += ' · last tried ' + row.last_search_at;
+        var per = sourceLines(row);
+        if (per.length) out += '\n\n' + per.join('\n');
+        else if (row && row.last_refusal) return out + '\n' + row.last_refusal;
+        else return out + ' — try Search now, or a different quality profile';
+        return out;
+    }
+    // Per-source diagnostics for a stuck row. One attempt count and one refusal
+    // line described a search that may have asked three different sources, so
+    // "stuck on 40" could equally mean prowlarr was never configured, slskd
+    // returns nothing, or every source finds it and the profile refuses them
+    // all. The drain stores what each source actually did; this reads it back.
+    function sourceLines(row) {
+        var snap = row && row.search_snapshot;
+        if (!snap || !snap.sources) return [];
+        var order = (snap.chain && snap.chain.length) ? snap.chain : Object.keys(snap.sources);
+        var out = [];
+        for (var i = 0; i < order.length; i++) {
+            var name = order[i], s = snap.sources[name];
+            if (!s) continue;
+            if (!s.ran) { out.push('• ' + name + ': could not search — ' + (s.reason || 'unknown')); continue; }
+            if (!s.results) { out.push('• ' + name + ': found nothing'); continue; }
+            if (s.accepted) { out.push('• ' + name + ': ' + s.accepted + ' usable of ' + s.results); continue; }
+            out.push('• ' + name + ': ' + s.results + ' found, none accepted' +
+                     (s.reason ? ' — ' + s.reason : ''));
+        }
+        return out;
+    }
+
+    // ── stuck-row diagnostics drawer ─────────────────────────────────────────
+    // The tooltip above says how often a row was searched and the headline
+    // refusal. It cannot say WHICH releases came back, why each one lost, where
+    // the file would land, which ids the search was keyed on, or whether
+    // something is already downloading. Answering "why is this stuck" used to
+    // mean reading three screens and guessing. This is that answer, in place.
+    function diagKey(row, scope) {
+        var q = 'kind=' + (scope === 'movie' ? 'movie' : 'episode') +
+                '&tmdb_id=' + encodeURIComponent(row.tmdb_id != null ? row.tmdb_id : row.show_tmdb_id);
+        if (row.season_number != null) q += '&season_number=' + row.season_number;
+        if (row.episode_number != null) q += '&episode_number=' + row.episode_number;
+        return q;
+    }
+
+    function diagRowsHTML(d) {
+        var row = d.row || {}, ids = d.ids || {};
+        var bits = [];
+        function line(k, v, cls) {
+            return '<div class="vwsh-diag-line' + (cls ? ' ' + cls : '') + '">' +
+                '<span class="vwsh-diag-k">' + esc(k) + '</span>' +
+                '<span class="vwsh-diag-v">' + esc(v == null || v === '' ? '—' : v) + '</span></div>';
+        }
+        bits.push(line('Attempts', (row.search_attempts || 0) + ' searches'));
+        bits.push(line('Last tried', row.last_search_at));
+        bits.push(line('Latest reason', row.last_refusal));
+        // A row stuck for want of an id looks exactly like one nobody seeds.
+        bits.push(line('TMDB', ids.tmdb_id));
+        bits.push(line('TVDB', ids.tvdb_id, ids.tvdb_id ? '' : 'vwsh-diag-line--gap'));
+        bits.push(line('IMDb', ids.imdb_id, ids.imdb_id ? '' : 'vwsh-diag-line--gap'));
+        bits.push(line('Would land in', d.target_dir));
+
+        // Already downloading? Then it is not stuck at all.
+        (d.downloads || []).forEach(function (dl) {
+            bits.push(line('In flight', (dl.status || '?') +
+                (dl.progress ? ' · ' + Math.round(dl.progress) + '%' : '') +
+                (dl.release_title ? ' · ' + dl.release_title : ''), 'vwsh-diag-line--live'));
+        });
+
+        // The individual releases, per source, with the rule that refused each.
+        var snap = row.search_snapshot || {};
+        var srcs = snap.sources || {};
+        var order = (snap.chain && snap.chain.length) ? snap.chain : Object.keys(srcs);
+        var blocks = order.map(function (name) {
+            var s = srcs[name];
+            if (!s) return '';
+            var head = '<div class="vwsh-diag-src">' + esc(name) + ' — ' +
+                (!s.ran ? 'could not search: ' + esc(s.reason || 'unknown')
+                        : (s.results || 0) + ' found, ' + (s.accepted || 0) + ' usable') + '</div>';
+            var rows = (s.samples || []).map(function (x) {
+                return '<div class="vwsh-diag-rel' + (x.accepted ? ' vwsh-diag-rel--ok' : '') + '">' +
+                    '<span class="vwsh-diag-rel-t">' + esc(x.title || '?') + '</span>' +
+                    '<span class="vwsh-diag-rel-w">' + esc(x.accepted ? 'usable' : (x.rejected || '—')) + '</span>' +
+                    '</div>';
+            }).join('');
+            return head + (rows || '<div class="vwsh-diag-rel vwsh-diag-rel--none">no releases recorded — ' +
+                'this row has not been searched since receipts were added</div>');
+        }).join('');
+
+        return '<div class="vwsh-diag-grid">' + bits.join('') + '</div>' +
+            (blocks ? '<div class="vwsh-diag-rels">' + blocks + '</div>' : '');
+    }
+
+    function openDiagDrawer(btn, row, scope) {
+        var host = btn.closest('[data-vwsh-diag-host]');
+        if (!host) return;
+        var panel = host.querySelector('[data-vwsh-diag]');
+        if (panel) {   // already open — close it
+            panel.remove();
+            btn.setAttribute('aria-expanded', 'false');
+            return;
+        }
+        panel = document.createElement('div');
+        panel.className = 'vwsh-diag';
+        panel.setAttribute('data-vwsh-diag', '');
+        panel.innerHTML = '<div class="vwsh-diag-loading">Reading the last search\u2026</div>';
+        host.appendChild(panel);
+        btn.setAttribute('aria-expanded', 'true');
+        fetch('/api/video/wishlist/diagnostics?' + diagKey(row, scope),
+              { headers: { Accept: 'application/json' } })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) {
+                if (!panel.isConnected) return;
+                panel.innerHTML = (d && d.success)
+                    ? diagRowsHTML(d)
+                    : '<div class="vwsh-diag-loading">Nothing recorded for this row yet.</div>';
+            })
+            .catch(function () {
+                if (panel.isConnected) panel.innerHTML =
+                    '<div class="vwsh-diag-loading">Could not read the diagnostics.</div>';
+            });
+    }
+
     function statusPill(status, tip) {
         var s = STATUS[status] || STATUS.wanted;
         return '<span class="vwsh-st ' + s[1] + '"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' + s[0] + '</span>';
     }
-    // ── who may remove what ──────────────────────────────────────────────────
-    // The wishlist is shared. A profile with download rights manages all of it;
-    // everyone else may only take back what they themselves asked for, so every
-    // remove control is gated on the row's added_by_profile_id. Rows with none
-    // (added by automation, or before the column existed) belong to nobody and
-    // are a downloader's to clear. Courtesy only — /wishlist/remove enforces the
-    // same rule server-side and is the authority.
-    function myProfileId() {
-        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
-        return (cp && cp.id != null) ? +cp.id : null;
-    }
-    function mine(addedBy) {
-        var me = myProfileId();
-        return addedBy != null && me != null && +addedBy === me;
-    }
-    function mayRemove(addedBy) { return mayGrab() || mine(addedBy); }
-    // A bulk remove (a whole season / show / channel) only appears when it would
-    // do exactly what it says — every row under it is the viewer's. Otherwise
-    // they still have the per-item × on the rows that ARE theirs.
-    function mayRemoveAll(addedByList) {
-        if (mayGrab()) return true;
-        return !!(addedByList && addedByList.length) && addedByList.every(mine);
-    }
-    function showAddedBy(sh) {
-        var out = [];
-        (sh.seasons || []).forEach(function (se) {
-            (se.episodes || []).forEach(function (e) { out.push(e.added_by_profile_id); });
-        });
-        return out;
-    }
-    function isAdmin() {
-        var cp = (typeof currentProfile !== 'undefined') ? currentProfile : null;
-        return !cp || !!cp.is_admin || cp.id === 1;
-    }
-    // A wish added by a profile without download rights sits approved=0: it is on
-    // the list so the requester can see they asked, but every acquisition path
-    // skips it until an admin approves. Deliberately the same markup and CSS
-    // classes the watchlist uses (vwlp-pending-*), so the two queues read alike.
-    function pendingChrome(it, scope, attrs) {
-        if (it.approved !== false && it.approved !== 0) return { badge: '', actions: '' };
-        var who = it.requested_by_name ? ' · asked by ' + esc(it.requested_by_name) : '';
-        var badge = '<span class="vwlp-pending-badge" title="Waiting for an admin to approve' +
-            (it.requested_by_name ? ' — requested by ' + esc(it.requested_by_name) : '') + '">' +
-            '⏳ Awaiting approval' + (isAdmin() ? who : '') + '</span>';
-        if (!isAdmin()) return { badge: badge, actions: '' };
-        var d = 'data-vwsh-ap-scope="' + esc(scope) + '"' + attrs;
-        return { badge: badge, actions:
-            '<div class="vwlp-pending-actions">' +
-            '<button type="button" class="vwlp-approve" data-vwsh-approve ' + d + '>Approve</button>' +
-            '<button type="button" class="vwlp-deny" data-vwsh-deny ' + d + '>Decline</button></div>' };
-    }
-    // Any episode of a show still waiting? Drives the show orb's badge.
-    function showPending(sh) {
-        return (sh.seasons || []).some(function (se) {
-            return (se.episodes || []).some(function (e) {
-                return e.approved === false || e.approved === 0;
-            });
-        });
-    }
-    function rmBtn(scope, attrs, addedBy) {
-        if (!mayRemove(addedBy)) return '';
+    function rmBtn(scope, attrs) {
         return '<button class="vwsh-rm" type="button" title="Remove" aria-label="Remove" ' +
             'data-vwsh-rm="' + scope + '"' + attrs + '>&times;</button>';
     }
     // "Search now" — the manual override Sonarr users expect: skips the release
     // gate for THIS item and runs the drain's search/pick/enqueue immediately.
-    // Can THIS profile start a download? Mirrors the server's can_download gate
-    // (api/video/__init__.py) purely so the UI doesn't offer buttons that would
-    // come back 403. The server is still the authority — hiding a control is a
-    // courtesy, never a permission check.
-    function mayGrab() {
-        return (typeof canDownload !== 'function') || canDownload();
-    }
-
     function huntBtn(scope, attrs) {
-        if (!mayGrab()) return '';
-        return '<button class="vwsh-hunt" type="button" title="Search now" aria-label="Search now" ' +
+        return '<button class="vwsh-hunt" type="button" title="Auto search now" aria-label="Auto search now" ' +
             'data-vwsh-hunt="' + scope + '"' + attrs + '>' +
             '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
             'stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>' +
+            '</button>';
+    }
+    function retryBtn(scope, attrs) {
+        return '<button class="vwsh-hunt vwsh-retry" type="button" title="Retry with all sources" aria-label="Retry with all sources" ' +
+            'data-vwsh-retry="' + scope + '"' + attrs + '>' +
+            '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
+            'stroke-linecap="round" aria-hidden="true"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>' +
             '</button>';
     }
 
@@ -161,72 +231,7 @@
         'stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h9M4 18h6"/>' +
         '<circle cx="17.5" cy="16.5" r="3.4"/><path d="M21.8 20.8l-2-2"/></svg>';
 
-    // ── "where does this land?" picker ────────────────────────────────────────
-    // A wished title has no movies/shows row yet, so the detail page's Manage
-    // panel can't reassign it — which is why unattended grabs all ended up in
-    // the primary ('All Movies'/'All TV') Library. The card carries the choice
-    // instead. Emitted as an empty SLOT because the Library registry loads
-    // asynchronously and may land after the first render; paintLibPickers()
-    // fills every slot, and is called from BOTH ends of that race.
-    function libSlot(kind, tmdb, rfid) {
-        return '<div class="vwsh-lib" data-vwsh-lib-slot data-kind="' + esc(kind) +
-            '" data-tmdb="' + esc(tmdb) + '" data-current="' + esc(rfid == null ? '' : rfid) + '"></div>';
-    }
-
-    function paintLibPickers(root) {
-        var slots = (root || document).querySelectorAll('[data-vwsh-lib-slot]');
-        for (var i = 0; i < slots.length; i++) {
-            var el = slots[i];
-            var libs = _allLibsByKind[el.getAttribute('data-kind')] || [];
-            // One Library (or none configured) = no decision to make; an empty
-            // slot collapses, so the card looks exactly as it did before.
-            if (libs.length < 2) { el.innerHTML = ''; continue; }
-            var cur = el.getAttribute('data-current') || '';
-            var opts = '<option value=""' + (cur ? '' : ' selected') + '>Default library</option>';
-            for (var j = 0; j < libs.length; j++) {
-                var l = libs[j];
-                opts += '<option value="' + esc(l.id) + '"' + (String(l.id) === cur ? ' selected' : '') +
-                    '>' + esc(l.label || l.server_title || ('Library ' + l.id)) + '</option>';
-            }
-            el.innerHTML = '<select class="vwsh-lib-sel" data-vwsh-lib ' +
-                'title="Which Library this lands in when it\'s grabbed">' + opts + '</select>';
-        }
-    }
-
-    function setItemLibrary(sel) {
-        var slot = sel.closest('[data-vwsh-lib-slot]');
-        if (!slot) return;
-        var was = slot.getAttribute('data-current') || '';
-        var val = sel.value;
-        sel.disabled = true;
-        fetch('/api/video/wishlist/library', {
-            method: 'PUT', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ kind: slot.getAttribute('data-kind'),
-                                   tmdb_id: parseInt(slot.getAttribute('data-tmdb'), 10),
-                                   root_folder_id: val ? parseInt(val, 10) : null }),
-        }).then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                sel.disabled = false;
-                if (!d || !d.success) {
-                    sel.value = was;   // the server refused — don't leave the UI claiming otherwise
-                    if (typeof showToast === 'function')
-                        showToast((d && d.error) || 'Could not change the Library', 'error');
-                    return;
-                }
-                slot.setAttribute('data-current', val);
-                if (typeof showToast === 'function') {
-                    var name = sel.options[sel.selectedIndex].text;
-                    showToast(val ? ('Future grabs go to ' + name) : 'Using the default Library', 'success');
-                }
-            })
-            .catch(function () {
-                sel.disabled = false; sel.value = was;
-                if (typeof showToast === 'function') showToast('Could not change the Library', 'error');
-            });
-    }
-
     function pickBtn(cls, scope, attrs) {
-        if (!mayGrab()) return '';
         return '<button class="' + cls + ' vwsh-pick" type="button" ' +
             'title="Manual search — pick a release" aria-label="Manual search" ' +
             'data-vwsh-pick="' + scope + '"' + attrs + '>' + PICK_ICON + '</button>';
@@ -248,26 +253,23 @@
         // Repeatedly-failing marker (#liveleak-failing-hub): only meaningful while
         // the drain is still hunting (wanted/upgrade) — a monitored or already
         // downloading item isn't "failing".
-        var pend = pendingChrome(it, 'movie', ' data-tmdb="' + esc(it.tmdb_id) + '"');
         var fails = Number(it.search_attempts) || 0;
         var failChip = (fails >= 3 && (st === 'wanted' || st === 'upgrade'))
-            ? '<span class="vwsh-failing" title="' + esc(fails + ' searches without a grab' +
-                (it.last_search_at ? ' · last tried ' + it.last_search_at : '') +
-                ' — try Search now, or a different quality profile') + '">&#9888; ' + fails + '</span>'
+            ? '<span class="vwsh-failing" title="' + esc(failWhy(it, fails)) +
+                '">&#9888; ' + fails + '</span>'
             : '';
         return '<div class="vwsh-movie" data-vwsh-open-movie="' + esc(it.tmdb_id) +
             '" data-vwsh-src="' + (owned ? 'library' : 'tmdb') + '" data-vwsh-id="' + esc(owned ? it.library_id : it.tmdb_id) + '">' +
             '<div class="vwsh-movie-art">' + art + '<div class="vwsh-movie-scrim"></div>' +
             statusPill(st, tip) + failChip +
+            (fails >= 3 && st !== 'downloading' ? retryBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"') : '') +
             (st === 'downloading' ? '' : huntBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"')) +
             (st === 'downloading' ? '' : pickBtn('vwsh-hunt', 'movie',
                 ' data-tmdb="' + esc(it.tmdb_id) + '" data-title="' + esc(it.title || '') +
                 '" data-year="' + esc(it.year || '') + '" data-poster="' + esc(it.poster_url || '') + '"')) +
-            rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"', it.added_by_profile_id) + '</div>' +
+            rmBtn('movie', ' data-tmdb="' + esc(it.tmdb_id) + '"') + '</div>' +
             '<div class="vwsh-movie-info"><span class="vwsh-movie-title" title="' + esc(it.title) + '">' +
             esc(it.title) + '</span>' + (meta ? '<span class="vwsh-movie-meta">' + esc(meta) + '</span>' : '') +
-            pend.badge + pend.actions +
-            libSlot('movie', it.tmdb_id, it.root_folder_id) +
             '</div></div>';
     }
 
@@ -318,15 +320,13 @@
                     '<div class="vwsh-szn-name">' + esc(sName) + '</div>' +
                     '<div class="vwsh-szn-count">' + n + (yt ? ' video' : ' episode') + (n === 1 ? '' : 's') + '</div>' +
                     '<div class="vwsh-szn-go">' + (yt ? 'View channel' : 'View show') + ' &rarr;</div>' +
-                    ((yt || !mayGrab()) ? '' : '<button class="vwsh-szn-hunt" type="button" data-vwsh-hunt="season" ' +
+                    (yt ? '' : '<button class="vwsh-szn-hunt" type="button" data-vwsh-hunt="season" ' +
                         'data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" title="Search this season now">' +
                         '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
                         'stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg></button>') +
                     (yt ? '' : pickBtn('vwsh-szn-hunt', 'season',
                         ' data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '"')) +
-                    (mayRemoveAll((se.episodes || []).map(function (e) { return e.added_by_profile_id; }))
-                        ? '<button class="vwsh-szn-rm" type="button" ' + sRm + ' title="Remove">&#10005;</button>'
-                        : '') +
+                    '<button class="vwsh-szn-rm" type="button" ' + sRm + ' title="Remove">&#10005;</button>' +
                 '</div>' +
                 '<div class="vwsh-ep-grid">' + cards + '</div>' +
             '</div>';
@@ -346,9 +346,7 @@
             : 'data-vwsh-rm="show" data-tmdb="' + esc(sh.tmdb_id) + '"';
         return '<div class="wl-orb-group" data-vwsh-group data-vwsh-tmdb="' + esc(sh.tmdb_id) + '" ' +
             'data-vwsh-source="' + (yt ? 'youtube' : 'tmdb') + '" style="' + gstyle + '">' +
-            (mayRemoveAll(showAddedBy(sh))
-                ? '<button class="wl-orb-remove" type="button" ' + showRm + ' title="Remove">&#10005;</button>'
-                : '') +
+            '<button class="wl-orb-remove" type="button" ' + showRm + ' title="Remove">&#10005;</button>' +
             '<div class="vwsh-xhead">' +
                 '<div class="vwsh-info-syn" data-vwsh-syn></div>' +
                 '<div class="vwsh-xhead-mid">' +
@@ -358,19 +356,7 @@
                         '<div class="vwsh-prog"></div>' +
                     '</div>' +
                     '<div class="wl-orb-label" ' + openAttrs + ' title="' + esc(sh.title) + '">' + esc(sh.title) + '</div>' +
-                    // Show-level: approving here releases every pending episode
-                    // under it in one go (approve_wishlist only touches approved=0).
-                    (yt ? '' : (function () {
-                        if (!showPending(sh)) return '';
-                        var first = (((sh.seasons || [])[0] || {}).episodes || [])[0] || {};
-                        var p = pendingChrome({ approved: false, requested_by_name: first.requested_by_name },
-                                              'show', ' data-tmdb="' + esc(sh.tmdb_id) + '"');
-                        return p.badge + p.actions;
-                    })()) +
                     '<div class="wl-orb-meta">' + eps + (sh.done ? ' · ' + sh.done + ' done' : '') + '</div>' +
-                    // YouTube channels aren't filed under a Library at all (see
-                    // renderLibraryTabs) — no picker for them.
-                    (yt ? '' : libSlot('show', sh.tmdb_id, sh.root_folder_id)) +
                 '</div>' +
                 '<div class="vwsh-info-cast" data-vwsh-cast></div>' +
             '</div>' +
@@ -495,16 +481,26 @@
         var yt = sh.source === 'youtube';
         var pimg = function (u) { return (yt && window.VideoYoutube) ? VideoYoutube.img(u) : u; };
         var t = e.title || (yt ? 'Untitled' : ('Episode ' + e.episode_number));
-        var st = liveStatus(e);
+        var st = liveStatus(e, sh.muted);
         var date = fmtDate(e.air_date);
         // TMDB shows the SxEx label; a YouTube video shows just its upload date.
         // Repeatedly-failing marker (#liveleak-failing-hub) — same rule as movies.
         var fails = Number(e.search_attempts) || 0;
+        // The warning marker is now the handle for the drawer: the thing you
+        // hover to ask "why" should be the thing you click to find out.
         var failTxt = (fails >= 3 && (st === 'wanted' || st === 'upgrade'))
-            ? ' · <span class="vwsh-failing-inline" title="' + esc(fails + ' searches without a grab' +
-                (e.last_search_at ? ' · last tried ' + e.last_search_at : '')) + '">&#9888; ' + fails + '</span>'
+            ? ' · <button class="vwsh-failing-inline vwsh-failing-btn" type="button" data-vwsh-why ' +
+                'aria-expanded="false" title="' + esc(failWhy(e, fails)) +
+                '">&#9888; ' + fails + '</button>'
             : '';
-        var metaTxt = yt ? (date || 'Video') : ('S' + se.season_number + '·E' + e.episode_number + (date ? ' · ' + esc(date) : '') +
+        // A skipped YouTube video used to show nothing at all — the same blank
+        // row whether it was queued, deleted, or backing off. It carries the
+        // same fields as a TV row now, so it renders the same way.
+        var ytTxt = !yt ? '' : (e.unavailable
+            ? ' · <span class="vwsh-failing-inline" title="' + esc(e.last_refusal || '') + '">&#9888; unavailable</span>'
+            : (fails ? ' · <span class="vwsh-failing-inline" title="' + esc(e.last_refusal || failWhy(e, fails)) +
+                       '">&#9888; ' + fails + '</span>' : ''));
+        var metaTxt = yt ? (esc(date || 'Video') + ytTxt) : ('S' + se.season_number + '·E' + e.episode_number + (date ? ' · ' + esc(date) : '') +
             (e.upgrade_from ? ' · ⇪ ' + esc(e.upgrade_from) : '') + failTxt);
         var thumb = e.still_url
             ? '<span class="vwsh-epc-thumb"><img src="' + esc(sized(pimg(e.still_url), 342)) + '" alt="" loading="lazy" ' +
@@ -513,16 +509,24 @@
         var rm = yt
             ? 'data-vwsh-rm="yt-video" data-id="' + esc(e.source_id) + '"'
             : 'data-vwsh-rm="episode" data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"';
-        return '<div class="vwsh-epc" data-vwsh-ep data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"' +
+        return '<div class="vwsh-epc' + (yt ? ' vwsh-epc--youtube' : '') + '" data-vwsh-ep data-vwsh-diag-host data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"' +
             (yt ? ' data-src-id="' + esc(e.source_id) + '"' : '') + '>' + thumb +
             '<div class="vwsh-epc-body">' +
                 '<div class="vwsh-epc-title" title="' + esc(t) + '">' + esc(t) + '</div>' +
-                '<div class="vwsh-epc-meta"><span class="vwsh-ep-dot vwsh-ep-dot--' + st + '"></span>' + (yt ? esc(metaTxt) : metaTxt) + '</div>' +
+                '<div class="vwsh-epc-meta"><span class="vwsh-ep-dot vwsh-ep-dot--' + st + '"></span>' + metaTxt + '</div>' +
             '</div>' +
-            // built inline rather than via huntBtn(), so it needs the same
-            // mayGrab() gate — it was the one Search-now control still offering
-            // a member a grab that comes back 403.
-            (yt || st === 'downloading' || !mayGrab() ? ''
+            (!yt && fails >= 3 && st !== 'downloading'
+                ? retryBtn('episode', ' data-tmdb="' + esc(sh.tmdb_id) + '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"')
+                : '') +
+            (yt
+                ? (st === 'downloading' ? ''
+                    : '<button class="vwsh-epc-hunt vwsh-epc-hunt--yt" type="button" data-vwsh-yt-now="' + esc(e.source_id) +
+                      '" data-ch="' + esc(sh.youtube_id || '') + '" data-cht="' + esc(sh.title || '') +
+                      '" data-vt="' + esc(t) + '" data-pub="' + esc(e.air_date || '') +
+                      '" title="Download this video now, ignoring the retry wait">' +
+                      '<svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">' +
+                      '<polygon points="5,3 19,12 5,21"/></svg></button>')
+                : st === 'downloading' ? ''
                 : '<button class="vwsh-epc-hunt" type="button" data-vwsh-hunt="episode" data-tmdb="' + esc(sh.tmdb_id) +
                   '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '" title="Search now">' +
                   '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" ' +
@@ -530,19 +534,14 @@
             (yt || st === 'downloading' ? ''
                 : pickBtn('vwsh-epc-hunt', 'episode', ' data-tmdb="' + esc(sh.tmdb_id) +
                   '" data-s="' + se.season_number + '" data-e="' + e.episode_number + '"')) +
-            (mayRemove(e.added_by_profile_id)
-                ? '<button class="vwsh-epc-rm" type="button" ' + rm + ' title="Remove">&#10005;</button>'
-                : '') +
-            // Per-episode: badge only. The Approve/Decline pair lives on the show
-            // orb — a pair of buttons on every episode tile would drown the grid.
-            (yt ? '' : pendingChrome(e, 'episode', '').badge) +
+            '<button class="vwsh-epc-rm" type="button" ' + rm + ' title="Remove">&#10005;</button>' +
         '</div>';
     }
 
     // Same rule as the failing badges: repeated searches without a grab, and only
     // while the item is still wanted (a downloading item isn't "failing").
-    function isFailingItem(x) {
-        var st = liveStatus(x);
+    function isFailingItem(x, showMuted) {
+        var st = liveStatus(x, showMuted);
         return (Number(x.search_attempts) || 0) >= 3 && (st === 'wanted' || st === 'upgrade');
     }
 
@@ -554,20 +553,13 @@
         } else if (state.tab === 'show') {
             (rawItems || []).forEach(function (sh) {
                 (sh.seasons || []).forEach(function (se) {
-                    (se.episodes || []).forEach(function (e) { if (isFailingItem(e)) n += 1; });
+                    (se.episodes || []).forEach(function (e) { if (isFailingItem(e, sh.muted)) n += 1; });
                 });
             });
         }
         // Keep the chip visible while the filter is ON even at count 0, so the
         // user can always toggle back out of the filtered view.
-        //
-        // It's a fix-it hub, not a report: its whole purpose is to narrow the
-        // list down to what keeps failing so you can re-search, manually pick, or
-        // drop each one. A profile without download rights has none of those
-        // actions, so the filter leads somewhere with nothing to do — hide it
-        // rather than offer a dead end. (Client-side only, so unlike the other
-        // gated controls this one never 403s; it just goes nowhere.)
-        chip.hidden = state.tab === 'youtube' || !mayGrab() || (!n && !state.failingOnly);
+        chip.hidden = state.tab === 'youtube' || (!n && !state.failingOnly);
         chip.classList.toggle('vwsh-failing-filter--on', state.failingOnly);
         var nn = $('[data-vwsh-failing-n]'); if (nn) nn.textContent = n ? String(n) : '';
     }
@@ -575,9 +567,6 @@
     function render(items) {
         var grid = $('[data-vwsh-grid]'); if (!grid) return;
         state.lastItems = items;                       // unfiltered — the chip toggles re-render from this
-        // The toggle is hidden without download rights, so a filter left on would
-        // be a filtered list with no way back out.
-        if (!mayGrab()) state.failingOnly = false;
         _updateFailingChip(items);
         // "⚠ Failing" filter: movies filter directly; shows keep only seasons/
         // episodes that are failing (clones — the raw items stay intact).
@@ -602,7 +591,6 @@
         grid.innerHTML = nebula
             ? items.map(function (sh, i) { return nebulaOrb(sh, i); }).join('')
             : items.map(movieCard).join('');
-        paintLibPickers(grid);
     }
 
     // ── counts / badges / pager ───────────────────────────────────────────────
@@ -612,19 +600,11 @@
     // clobbering the other (the bug: badge shows the right number, then 'switches' to the
     // TV-only count). The endpoint /wishlist/counts is the single source of truth for the
     // grand total, so the setters just (re)sync the nav badge from it.
-    var _lastCounts = null;
     function setCounts(counts) {
-        if (counts) _lastCounts = counts;   // replayed when library tabs render later
         state.counts = { movie: (counts && counts.movie) || 0, show: (counts && counts.show) || 0,
                          episode: (counts && counts.episode) || 0 };
         var cm = $('[data-vwsh-count-movie]'); if (cm) cm.textContent = state.counts.movie;
         var cs = $('[data-vwsh-count-show]'); if (cs) cs.textContent = state.counts.show;
-        var byLib = (counts && counts.by_library) || {};
-        var libEls = document.querySelectorAll('[data-vwsh-count-lib]');
-        for (var i = 0; i < libEls.length; i++) {
-            var id = libEls[i].getAttribute('data-vwsh-count-lib');
-            libEls[i].textContent = byLib[id] != null ? byLib[id] : 0;
-        }
         refreshBadge();                                   // authoritative grand total
         updateSub();
         updateClearBtn();
@@ -643,18 +623,53 @@
         var has = state.tab === 'movie' ? state.counts.movie > 0
             : state.tab === 'show' ? state.counts.show > 0
             : (state.ytVideo > 0 || state.ytChannel > 0);
-        // Clear-all is ownership-scoped server-side: it empties the tab for a
-        // profile that manages the shared wishlist, and clears just the viewer's
-        // own titles for everyone else. So it stays available to members — the
-        // confirm text below is what changes.
         btn.hidden = !has;
-        // "Search all missing" — TMDB tabs only (YouTube has its own drain), and
-        // only when there's something to search.
+        // The bulk action. On the TMDB tabs it searches; on YouTube there is
+        // nothing to search (the video IS the release) so it downloads instead.
+        // Hiding it there left that tab with no bulk action at all.
         var sa = $('[data-vwsh-searchall]');
-        if (sa) sa.hidden = state.tab === 'youtube' || !has || !mayGrab();
+        if (sa) {
+            sa.hidden = !has;
+            var yt = state.tab === 'youtube';
+            sa.setAttribute('data-vwsh-mode', yt ? 'youtube' : 'search');
+            var label = sa.lastChild;
+            if (label && label.nodeType === 3) label.nodeValue = yt ? ' Download all waiting' : ' Search all missing';
+            sa.title = yt
+                ? 'Queue every waiting video now instead of waiting for the automation — skips the retry wait, ignores nothing else'
+                : 'Search every eligible wishlist item now instead of waiting for the hourly automation';
+        }
     }
 
     // ── manual acquisition (per-item 'Search now' + 'Search all missing') ─────
+    // YouTube's "Search now". There is nothing to search — the video IS the
+    // release — so it enqueues the download directly, ignoring the retry wait
+    // and the unavailable mark. A user asking for it out-ranks both.
+    function doYtNow(btn) {
+        if (btn.disabled) return;
+        btn.disabled = true; btn.classList.add('vwsh-hunt--busy');
+        fetch('/api/video/youtube/download', {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                video_id: btn.getAttribute('data-vwsh-yt-now'),
+                channel_id: btn.getAttribute('data-ch') || null,
+                channel_title: btn.getAttribute('data-cht') || null,
+                video_title: btn.getAttribute('data-vt') || null,
+                published_at: btn.getAttribute('data-pub') || null,
+            }),
+        }).then(function (r) { return r.json(); })
+            .then(function (res) {
+                if (!res || !res.success) throw new Error((res && res.error) || 'failed');
+                if (typeof showToast === 'function')
+                    showToast(res.already ? 'Already downloading' : 'Downloading now', 'success');
+                btn.classList.remove('vwsh-hunt--busy');
+            })
+            .catch(function (err) {
+                btn.disabled = false; btn.classList.remove('vwsh-hunt--busy');
+                if (typeof showToast === 'function')
+                    showToast((err && err.message) || 'Could not start that download', 'error');
+            });
+    }
+
     function doHunt(btn) {
         if (btn.disabled) return;
         var payload = { scope: btn.getAttribute('data-vwsh-hunt'),
@@ -667,6 +682,12 @@
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (res) {
                 if (!res || !res.success) throw new Error();
+                if (res.missing_target) {
+                    if (typeof showToast === 'function')
+                        showToast('Set the ' + (res.missing_target === 'movie' ? 'Movies' : 'TV') + ' library folder in Video Settings first', 'error');
+                    btn.disabled = false; btn.classList.remove('vwsh-hunt--busy');
+                    return;
+                }
                 if (typeof showToast === 'function') {
                     showToast(res.queued
                         ? 'Searching for ' + res.queued + ' item' + (res.queued === 1 ? '' : 's') + '… grabs land in Downloads'
@@ -681,24 +702,88 @@
                 if (typeof showToast === 'function') showToast('Search could not start', 'error');
             });
     }
+    // YouTube's half of the bulk action: queue everything that is waiting. The
+    // click out-ranks the retry backoff, the same way "Search all missing"
+    // out-ranks the movie/TV drain's gates. Deleted videos stay skipped.
+    function downloadAllWaiting(btn) {
+        btn.disabled = true;
+        fetch('/api/video/wishlist/youtube/download-all', { method: 'POST' })
+            .then(function (r) { return r.json(); })
+            .then(function (res) {
+                if (!res || !res.success) throw new Error((res && res.error) || 'failed');
+                var msg;
+                if (res.queued) {
+                    msg = 'Queued ' + res.queued + ' video' + (res.queued === 1 ? '' : 's') +
+                          ' — ' + res.started + ' downloading now, the rest drain automatically';
+                } else if (res.refused) {
+                    msg = 'Nothing queued — the disk-space guard held ' + res.refused + ' back';
+                } else if (res.already) {
+                    msg = res.already + ' already downloading';
+                } else if (res.unavailable) {
+                    msg = 'Nothing to queue — ' + res.unavailable +
+                          ' video(s) are unavailable (deleted, private or members-only)';
+                } else {
+                    msg = 'Nothing waiting to download';
+                }
+                if (typeof showToast === 'function')
+                    showToast(msg, res.queued ? 'success' : 'info');
+                btn.disabled = false;
+                load();
+            })
+            .catch(function (err) {
+                btn.disabled = false;
+                if (typeof showToast === 'function')
+                    showToast((err && err.message) || 'Could not start the downloads', 'error');
+            });
+    }
+
+    function doRetry(btn) {
+        if (btn.disabled) return;
+        var payload = { scope: btn.getAttribute('data-vwsh-retry'),
+            tmdb_id: parseInt(btn.getAttribute('data-tmdb'), 10) };
+        if (btn.hasAttribute('data-s')) payload.season_number = parseInt(btn.getAttribute('data-s'), 10);
+        if (btn.hasAttribute('data-e')) payload.episode_number = parseInt(btn.getAttribute('data-e'), 10);
+        btn.disabled = true; btn.classList.add('vwsh-hunt--busy');
+        fetch('/api/video/wishlist/retry', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload) })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (res) {
+                if (!res || !res.success) throw new Error();
+                if (typeof showToast === 'function')
+                    showToast(res.queued ? 'Retrying with all sources — grabs land in Downloads' : 'Nothing queued for retry',
+                        res.queued ? 'success' : 'info');
+                btn.classList.remove('vwsh-hunt--busy');
+                load();
+            })
+            .catch(function () {
+                btn.disabled = false; btn.classList.remove('vwsh-hunt--busy');
+                if (typeof showToast === 'function') showToast('Retry could not start', 'error');
+            });
+    }
+
     function searchAllMissing() {
         var btn = $('[data-vwsh-searchall]'); if (!btn || btn.disabled) return;
+        if (state.tab === 'youtube') { downloadAllWaiting(btn); return; }
         btn.disabled = true;
         fetch('/api/video/wishlist/search-all', { method: 'POST' })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (res) {
                 if (!res || !res.success) throw new Error();
                 var k = res.kinds || {};
-                var going = [];
+                var going = [], missing = [];
                 if (k.movie === 'started') going.push('movies');
                 if (k.episode === 'started') going.push('episodes');
+                if (k.movie === 'unconfigured') missing.push('Movies');
+                if (k.episode === 'unconfigured') missing.push('TV');
                 if (typeof showToast === 'function') {
                     showToast(going.length
-                        ? 'Searching wishlist ' + going.join(' + ') + ' now — grabs land in Downloads'
-                        : (k.movie === 'busy' || k.episode === 'busy'
-                            ? 'A wishlist search is already running'
-                            : 'Nothing eligible to search right now'),
-                        going.length ? 'success' : 'info');
+                        ? 'Searching wishlist ' + going.join(' + ') + ' now — up to your Max downloads per run land in Downloads'
+                        : (missing.length
+                            ? 'Set the ' + missing.join(' and ') + ' library folder' + (missing.length === 1 ? '' : 's') + ' in Video Settings first'
+                            : (k.movie === 'busy' || k.episode === 'busy'
+                                ? 'A wishlist search is already running'
+                                : 'Nothing eligible to search right now')),
+                        going.length ? 'success' : (missing.length ? 'error' : 'info'));
                 }
                 btn.disabled = false;
             })
@@ -784,7 +869,8 @@
         if (state.tab === 'youtube') { loadYoutube(); return; }
         var ld = $('[data-vwsh-loading]'); if (ld) ld.classList.remove('hidden');
         var params = new URLSearchParams({ kind: state.tab, search: state.search, sort: state.sort, page: state.page, limit: LIMIT });
-        if (state.rootFolderId) params.set('root_folder_id', state.rootFolderId);
+        // Commissary: the picked video Library tab, if any
+        if (typeof CommissaryLibraryTabs !== 'undefined') CommissaryLibraryTabs.applyWishlist(params, state.tab);
         fetch('/api/video/wishlist?' + params.toString(), { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
             .then(function (d) {
@@ -833,14 +919,9 @@
             .catch(function () { /* best-effort */ });
     }
 
-    // A tab is either a bare kind ('movie') or a Library within a kind
-    // ('show:3') — see renderLibraryTabs.
     function setTab(tab) {
-        var parts = String(tab).split(':');
-        var kind = parts[0];
-        if (kind !== 'movie' && kind !== 'show' && kind !== 'youtube') return;
-        state.tab = kind; state.page = 1; state.search = '';
-        state.rootFolderId = parts.length > 1 ? parts[1] : '';
+        if (tab !== 'movie' && tab !== 'show' && tab !== 'youtube') return;
+        state.tab = tab; state.page = 1; state.search = '';
         var si = $('[data-vwsh-search]'); if (si) si.value = '';
         var tabs = document.querySelectorAll('[data-vwsh-tab]');
         for (var i = 0; i < tabs.length; i++)
@@ -849,162 +930,32 @@
         load();
     }
 
-    // Per-Library filters live IN the tab strip, right after the kind tab they
-    // belong to ('All Movies | Movies | Anime Films | All TV | TV Shows |
-    // Anime | YouTube') — 'Movies'/'TV' alone can't distinguish a standard
-    // library from a separate Anime one of the same kind. Only rendered for a
-    // kind with more than one Library configured (with one, the kind tab
-    // already IS that Library).
-    //
-    // Reads d.configured (the Library REGISTRY every profile can see), not
-    // d.movies/d.tv — those are the live server-section DISCOVERY list, which
-    // is admin-only and carries no root_folder id to filter by.
-    // Movies/TV only — deliberately NOT youtube. The YouTube tab is served by
-    // loadYoutube(), which has no root_folder_id filter at all (the YouTube
-    // wishlist isn't linked to a Library the way TMDB titles are), so a
-    // per-Library YouTube tab would silently show the unfiltered list.
-    var LIB_KEY = { movie: 'movies', show: 'tv' };
-    // A kind tab sitting next to its own Libraries needs to say it's the
-    // union, not repeat a Library's name: a Library called 'Movies' under a
-    // tab called 'Movies' just reads as a duplicate.
-    var KIND_ALL_LABEL = { movie: 'All Movies', show: 'All TV' };
-    var _libsByKind = {};
-    // Every configured Library per kind — the per-card picker needs the full
-    // list, where _libsByKind holds only the ones that earn their own TAB.
-    var _allLibsByKind = {};
-    var libsLoaded = false;
-    function loadLibraries() {
-        if (libsLoaded) return;
-        libsLoaded = true;
-        fetch('/api/video/libraries', { headers: { Accept: 'application/json' } })
-            .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) {
-                var configured = (d && d.configured) || {};
-                // Kept OUT of renderLibraryTabs, which bails when the tab strip
-                // isn't in the DOM — the per-card pickers need this either way.
-                Object.keys(LIB_KEY).forEach(function (kind) {
-                    _allLibsByKind[kind] = configured[LIB_KEY[kind]] || [];
-                });
-                renderLibraryTabs(configured);
-                // The other end of the race: cards rendered before the registry
-                // arrived have empty slots waiting to be filled.
-                paintLibPickers();
-            })
-            .catch(function () {});
-    }
-
-    function renderLibraryTabs(configured) {
-        var strip = document.querySelector('[data-video-subpage="video-wishlist"] .vwsh-tabs');
-        if (!strip) return;
-        var old = strip.querySelectorAll('[data-vwsh-lib-tab]');
-        for (var i = 0; i < old.length; i++) old[i].remove();
-        Object.keys(LIB_KEY).forEach(function (kind) {
-            var libs = configured[LIB_KEY[kind]] || [];
-            var anchor = strip.querySelector('[data-vwsh-tab="' + kind + '"]');
-            if (!anchor) return;
-            _libsByKind[kind] = libs.length > 1 ? libs : [];
-            if (libs.length < 2) return;
-            var kindLabel = anchor.childNodes[0];   // the text node before the count badge
-            if (kindLabel && kindLabel.nodeType === 3) kindLabel.nodeValue = KIND_ALL_LABEL[kind] + ' ';
-            libs.forEach(function (l) {
-                var b = document.createElement('button');
-                b.className = 'vwsh-tab vwsh-tab--lib';
-                b.type = 'button';
-                b.setAttribute('role', 'tab');
-                b.setAttribute('data-vwsh-tab', kind + ':' + l.id);
-                b.setAttribute('data-vwsh-lib-tab', '');
-                b.appendChild(document.createTextNode((l.label || l.server_title || 'Library') + ' '));
-                var n = document.createElement('span');
-                n.className = 'vwsh-tab-n';
-                n.setAttribute('data-vwsh-count-lib', l.id);
-                n.textContent = '0';
-                b.appendChild(n);
-                anchor.parentNode.insertBefore(b, anchor.nextSibling);
-                anchor = b;   // keep this kind's libraries in their configured order
-            });
-        });
-        // Paint badges for tabs that appeared after the last load. Only with
-        // real counts in hand — replaying a null would zero the kind badges.
-        if (_lastCounts) setCounts(_lastCounts);
-    }
-
-    // Clear the current tab (movies / TV / YouTube), after a confirm. What "all"
-    // means depends on the profile, and the server decides: a profile that manages
-    // the shared wishlist empties the tab; everyone else clears only the titles
-    // they added. The prompt has to say which, or a member reads "Remove ALL" and
-    // thinks they are about to wipe everyone's requests.
+    // Empty the whole current tab (movies / TV / YouTube), after a confirm.
     function clearAll() {
         var kind = state.tab;
         var label = kind === 'movie' ? 'movies' : kind === 'show' ? 'TV episodes' : 'YouTube videos';
-        var scoped = !mayGrab();
         var go = function () {
             fetch('/api/video/wishlist/clear', {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ kind: kind }),
-            }).then(function (r) { return r.json().catch(function () { return null; }); })
+            }).then(function (r) { return r.ok ? r.json() : null; })
                 .then(function (res) {
                     if (res && res.success) {
-                        if (typeof showToast === 'function') {
-                            var n = res.removed || 0;
-                            // Don't report "cleared" over a list that still has
-                            // other people's titles in it — say what was left.
-                            var msg = n
-                                ? ('Cleared ' + n + ' ' + label + (res.scoped ? ' you added' : '') +
-                                   (res.scoped && res.left ? ' — ' + res.left + ' from other people left in place' : ''))
-                                : (res.scoped
-                                    ? 'Nothing to clear — none of these ' + label + ' were added by you'
-                                    : 'Nothing to clear');
-                            showToast(msg, n ? 'success' : 'info');
-                        }
+                        if (typeof showToast === 'function')
+                            showToast('Cleared ' + (res.removed || 0) + ' ' + label + ' from your wishlist', 'success');
                         load();
                     } else if (typeof showToast === 'function') {
-                        showToast((res && res.error) || 'Could not clear wishlist', 'error');
+                        showToast('Could not clear wishlist', 'error');
                     }
                 }).catch(function () { if (typeof showToast === 'function') showToast('Could not clear wishlist', 'error'); });
         };
         if (typeof showConfirmDialog === 'function') {
             showConfirmDialog({
-                title: scoped ? 'Clear your wishlist items' : 'Clear wishlist',
-                message: scoped
-                    ? ('Remove the ' + label + ' YOU added from the wishlist? Titles other ' +
-                       'people asked for stay. This can’t be undone.')
-                    : ('Remove ALL ' + label + ' from your wishlist? This can’t be undone.'),
-                confirmText: scoped ? 'Clear mine' : 'Clear all', cancelText: 'Cancel', destructive: true,
+                title: 'Clear wishlist',
+                message: 'Remove ALL ' + label + ' from your wishlist? This can’t be undone.',
+                confirmText: 'Clear all', cancelText: 'Cancel', destructive: true,
             }).then(function (ok) { if (ok) go(); });
         } else { go(); }
-    }
-
-    // ── approve / decline a pending wish (admin) ─────────────────────────────
-    function doApproval(btn) {
-        var deny = btn.hasAttribute('data-vwsh-deny');
-        var body = { scope: btn.getAttribute('data-vwsh-ap-scope'),
-                     tmdb_id: parseInt(btn.getAttribute('data-tmdb'), 10) };
-        if (btn.hasAttribute('data-s')) body.season_number = parseInt(btn.getAttribute('data-s'), 10);
-        if (btn.hasAttribute('data-e')) body.episode_number = parseInt(btn.getAttribute('data-e'), 10);
-        // Disable BOTH buttons — approving and declining the same row in quick
-        // succession is exactly the double-click a pending queue invites.
-        var pair = btn.parentNode ? btn.parentNode.querySelectorAll('button') : [btn];
-        Array.prototype.forEach.call(pair, function (b) { b.disabled = true; });
-        fetch('/api/video/wishlist/' + (deny ? 'deny' : 'approve'), {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-        }).then(function (r) { return r.json().catch(function () { return null; }); })
-            .then(function (d) {
-                if (!d || !d.success) {
-                    Array.prototype.forEach.call(pair, function (b) { b.disabled = false; });
-                    if (typeof showToast === 'function')
-                        showToast((d && d.error) || 'Could not update that request', 'error');
-                    return;
-                }
-                if (typeof showToast === 'function')
-                    showToast(deny ? 'Request declined' : 'Approved — it will be searched for',
-                              deny ? 'info' : 'success');
-                load();
-                document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed'));
-            })
-            .catch(function () {
-                Array.prototype.forEach.call(pair, function (b) { b.disabled = false; });
-            });
     }
 
     // ── remove (TMDB scopes via /wishlist/remove; YouTube scopes via youtube) ──
@@ -1016,12 +967,7 @@
             load();
         };
         var afterYt = function () { after(); document.dispatchEvent(new CustomEvent('soulsync:video-wishlist-changed')); };
-        // Surface the server's reason: removing someone else's wish is a 403 with
-        // a sentence, and a silently re-enabled × looks like a broken button.
-        var fail = function (res) {
-            btn.disabled = false;
-            if (res && res.error && typeof showToast === 'function') showToast(res.error, 'error');
-        };
+        var fail = function () { btn.disabled = false; };
 
         if (scope === 'yt-video') {
             VideoYoutube.removeWish('video', btn.getAttribute('data-id')).then(afterYt).catch(fail); return;
@@ -1047,28 +993,23 @@
         if (btn.hasAttribute('data-e')) body.episode_number = parseInt(btn.getAttribute('data-e'), 10);
         fetch('/api/video/wishlist/remove', { method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body) })
-            .then(function (r) { return r.json().catch(function () { return null; }); })
-            .then(function (d) { if (!d || !d.success) { fail(d); return; } after(); })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (d) { if (!d || !d.success) { fail(); return; } after(); })
             .catch(fail);
     }
 
     // Manual pick — open the shared release-picker modal (VideoDownload.manualSearch,
-    // the exact modal the detail page uses). Every pick button carries the title's
-    // TMDB id, and it rides along as the media context: the backend needs it for the
-    // alias set, the user's own AKA titles and the air-date/absolute hints. Without
-    // it a wishlist pick searched by one title with no hints at all — the opposite
-    // of what the wishlist's own drain does with the very same episode.
+    // the exact modal the detail page uses). No media context is passed: like a
+    // tmdb-only item on the detail page, the grab lands as a plain download+import.
     function doPick(btn) {
         if (!window.VideoDownload || !VideoDownload.manualSearch) {
             if (typeof showToast === 'function') showToast('Manual search unavailable', 'error');
             return;
         }
         var scope = btn.getAttribute('data-vwsh-pick');
-        var tmdb = btn.getAttribute('data-tmdb') || null;
         if (scope === 'movie') {
             VideoDownload.manualSearch({
                 title: btn.getAttribute('data-title') || '', scope: 'movie',
-                mediaId: tmdb, mediaSource: 'tmdb',
                 year: btn.getAttribute('data-year') || null,
                 poster: btn.getAttribute('data-poster') || null });
             return;
@@ -1076,22 +1017,34 @@
         var sh = state.showData[parseInt(btn.getAttribute('data-tmdb'), 10)] || {};
         VideoDownload.manualSearch({
             title: sh.title || '', scope: scope,
-            mediaId: tmdb, mediaSource: 'tmdb',
             season: parseInt(btn.getAttribute('data-s'), 10),
             episode: btn.hasAttribute('data-e') ? parseInt(btn.getAttribute('data-e'), 10) : null,
             year: sh.year || null, poster: sh.poster_url || null });
     }
 
     function onGridClick(e) {
-        // The Library picker sits INSIDE a card that opens on click — using it
-        // must not navigate away mid-choice.
-        if (e.target.closest('[data-vwsh-lib-slot]')) { e.stopPropagation(); return; }
+        // The drawer reads the row's own data-attributes rather than re-deriving
+        // the identity, so it always asks about the row it is attached to.
+        var why = e.target.closest('[data-vwsh-why]');
+        if (why) {
+            e.preventDefault(); e.stopPropagation();
+            var host = why.closest('[data-vwsh-diag-host]');
+            var isEp = host && host.hasAttribute('data-e');
+            openDiagDrawer(why, {
+                tmdb_id: host && host.getAttribute('data-tmdb'),
+                season_number: isEp ? host.getAttribute('data-s') : null,
+                episode_number: isEp ? host.getAttribute('data-e') : null,
+            }, isEp ? 'episode' : 'movie');
+            return;
+        }
         var pick = e.target.closest('[data-vwsh-pick]');
         if (pick) { e.preventDefault(); e.stopPropagation(); doPick(pick); return; }
+        var ytNow = e.target.closest('[data-vwsh-yt-now]');
+        if (ytNow) { e.preventDefault(); e.stopPropagation(); doYtNow(ytNow); return; }
+        var retry = e.target.closest('[data-vwsh-retry]');
+        if (retry) { e.preventDefault(); e.stopPropagation(); doRetry(retry); return; }
         var hunt = e.target.closest('[data-vwsh-hunt]');
         if (hunt) { e.preventDefault(); e.stopPropagation(); doHunt(hunt); return; }
-        var ap = e.target.closest('[data-vwsh-approve], [data-vwsh-deny]');
-        if (ap) { e.preventDefault(); e.stopPropagation(); doApproval(ap); return; }
         var rm = e.target.closest('[data-vwsh-rm]');
         if (rm) { e.preventDefault(); e.stopPropagation(); doRemove(rm); return; }
         if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -1144,20 +1097,11 @@
     }
 
     function wire() {
-        // Delegated: the per-Library tabs are injected after wire() runs.
-        var strip = document.querySelector('[data-video-subpage="video-wishlist"] .vwsh-tabs');
-        if (strip) strip.addEventListener('click', function (e) {
-            var b = e.target.closest('[data-vwsh-tab]');
-            if (b) setTab(b.getAttribute('data-vwsh-tab'));
-        });
-        var grid = $('[data-vwsh-grid]');
-        if (grid) {
-            grid.addEventListener('click', onGridClick);
-            grid.addEventListener('change', function (e) {
-                var sel = e.target.closest('[data-vwsh-lib]');
-                if (sel) setItemLibrary(sel);
-            });
-        }
+        var tabs = document.querySelectorAll('[data-vwsh-tab]');
+        for (var i = 0; i < tabs.length; i++) (function (b) {
+            b.addEventListener('click', function () { setTab(b.getAttribute('data-vwsh-tab')); });
+        })(tabs[i]);
+        var grid = $('[data-vwsh-grid]'); if (grid) grid.addEventListener('click', onGridClick);
         var search = $('[data-vwsh-search]');
         if (search) search.addEventListener('input', function () {
             if (searchTimer) clearTimeout(searchTimer);
@@ -1173,11 +1117,7 @@
         var clearBtn = $('[data-vwsh-clear]');
         if (clearBtn) clearBtn.addEventListener('click', clearAll);
         var saBtn = $('[data-vwsh-searchall]');
-        // Hidden outright rather than wired-and-refused: it grabs everything
-        // eligible on the shared wishlist, which is the last thing a member
-        // should be able to set off by accident.
-        if (saBtn && !mayGrab()) saBtn.hidden = true;
-        else if (saBtn) saBtn.addEventListener('click', searchAllMissing);
+        if (saBtn) saBtn.addEventListener('click', searchAllMissing);
         var prev = $('[data-vwsh-prev]');
         if (prev) prev.addEventListener('click', function () { if (state.page > 1) { state.page--; load(); } });
         var next = $('[data-vwsh-next]');
@@ -1206,7 +1146,6 @@
 
     function init() {
         wire();
-        loadLibraries();
         document.addEventListener('soulsync:video-page-shown', onShown);
         refreshBadge();
         refreshYtCount();

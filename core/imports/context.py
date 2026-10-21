@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from core.context_sentinels import CONTEXT_SENTINEL_IDS
 from utils.logging_config import get_logger
 
 logger = get_logger("imports.context")
@@ -48,6 +49,34 @@ def _first_source_aware_id(source: str, *values: Any) -> str:
             continue
         return text
     return ""
+
+
+# Album-id values the pipeline itself invents when it has no real provider id.
+# Built from the canonical sentinel set (core/context_sentinels.py) plus the
+# album-flow-only 'wishlist_album' placeholder — they must never be treated
+# as a genuine shared album identity (e.g. by the #1567 poisoned-batch
+# guards). R3F1: a local copy here drifted from CONTEXT_SENTINEL_IDS, so
+# 'auto_import'/'explicit_artist' counted as REAL ids and silently bypassed
+# every distrust wire.
+_PLACEHOLDER_ALBUM_IDS = frozenset(CONTEXT_SENTINEL_IDS) | {"wishlist_album"}
+_NAME_FALLBACK_ALBUM_ID_PREFIX = "_name_"
+
+
+def is_real_provider_album_id(value: Any) -> bool:
+    """True when ``value`` looks like a real provider album id, not one of the
+    placeholder ids the download/import pipeline invents (the
+    ``CONTEXT_SENTINEL_IDS`` sentinels — ``auto_import``, ``explicit_album``,
+    ``explicit_artist``, ``from_sync_modal`` — plus ``wishlist_album`` and the
+    ``_name_<album>`` fallbacks)."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.casefold()
+    if lowered in _PLACEHOLDER_ALBUM_IDS:
+        return False
+    if lowered.startswith(_NAME_FALLBACK_ALBUM_ID_PREFIX):
+        return False
+    return True
 
 
 def extract_artist_name(artist: Any) -> str:
@@ -348,12 +377,33 @@ def build_import_album_info(
         or album_ctx.get("image_url")
         or ""
     )
-    total_tracks = (
-        album_ctx.get("total_tracks")
-        or track_info.get("total_tracks")
-        or (album_info or {}).get("total_tracks")
-        or 0
-    )
+    # Total tracks: prefer the album-level count. A 0 means "unknown" — it
+    # must NOT fall through to track_info's count via `or` (0 is falsy).
+    # The track's total_tracks is per-track tag data (often 1), not the
+    # album's track count; using it here filed 6-track EPs as Single when
+    # the album list didn't carry a count (e.g. Deezer's /artist/albums
+    # endpoint omits nb_tracks). Only use track_info's count if the album
+    # context has no count at all (None), not when it's 0 (unknown).
+    def _as_count(v):
+        try:
+            iv = int(v)
+            return iv if iv > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    album_total = album_ctx.get("total_tracks")
+    if album_total is None:
+        # No album-level count at all; try the other album-level sources,
+        # then track_info as a last resort.
+        total_tracks = (
+            _as_count((album_info or {}).get("total_tracks"))
+            or _as_count(track_info.get("total_tracks"))
+            or 0
+        )
+    else:
+        # Album context has a count (possibly 0=unknown); use it if valid,
+        # otherwise 0. Do NOT fall through to the per-track count.
+        total_tracks = _as_count(album_total) or 0
     album_type = (album_ctx.get("album_type") or track_info.get("album_type") or "album")
     source = get_import_source(context)
 

@@ -27,13 +27,19 @@ from core.download_plugins.album_bundle import (
     get_completed_no_path_window_seconds,
     incomplete_path_stability_check,
     pick_best_album_release,
+    profile_allowed_formats,
+    profile_quality_targets,
     poll_album_download,
     resolve_reported_save_path,
     snapshot_incomplete_path,
 )
 from core.download_plugins.base import DownloadSourcePlugin
+from core.commissary.tracker_link import safe_info_url as _safe_info_url  # Commissary
 from core.download_plugins.candidate_store import get_candidate_store
+from core.download_plugins.release_identity import dedupe_prowlarr_releases, torrent_hash_evidence, release_sources, release_evidence as get_release_evidence
 from core.download_plugins.torrent import (
+    prowlarr_search_with_variants,
+    prowlarr_track_search,
     _adapter_state_to_display,
     _decode_filename,
     _guess_quality_from_title,
@@ -50,7 +56,11 @@ from core.prowlarr_client import (
     DEFAULT_MUSIC_CATEGORIES,
     ProwlarrClient,
     ProwlarrSearchResult,
-    safe_info_url,
+)
+from core.quality.release_format import (
+    audio_quality_from_release,
+    evaluate_release,
+    is_sample_release,
 )
 from core.usenet_clients import get_active_adapter as get_active_usenet_adapter
 from utils.async_helpers import run_async
@@ -103,40 +113,44 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
     ) -> Tuple[List[TrackResult], List[AlbumResult]]:
         if not self._prowlarr.is_configured():
             return ([], [])
-        try:
-            indexer_ids = _parse_indexer_id_filter()
-            results = await self._prowlarr.search(
-                query,
-                categories=DEFAULT_MUSIC_CATEGORIES,
-                indexer_ids=indexer_ids,
-            )
-        except Exception as e:
-            logger.error("Usenet plugin search failed: %s", e)
-            return ([], [])
+        results = await prowlarr_track_search(
+            self._prowlarr, query, "usenet", timeout=timeout,
+        )
         return self._project_results(results)
 
     def _project_results(
-        self, results: List[ProwlarrSearchResult]
+        self, results: List[ProwlarrSearchResult], *, release_evidence=None
     ) -> Tuple[List[TrackResult], List[AlbumResult]]:
         tracks: List[TrackResult] = []
         albums: List[AlbumResult] = []
-        for result in results:
+        for result in dedupe_prowlarr_releases(results):
+            evidence = release_evidence or get_release_evidence(result)
             if result.protocol != 'usenet':
                 continue
             if not result.download_url:
                 continue
+            if is_sample_release(result.title, result.size):
+                continue
             # The filename crosses to the browser in search responses and
             # comes back on grab. Prowlarr NZB URLs can carry API keys /
             # signed params, so only an opaque server token travels (P0-03).
-            token = get_candidate_store().put(result.download_url)
+            token = get_candidate_store().put(
+                result.download_url,
+                metadata={'categories': list(evidence.categories or []),
+                          'release_title': evidence.title},
+            )
             filename = f"{token}{_FILENAME_SEP}{result.title}"
-            quality = _guess_quality_from_title(result.title)
-            parsed_artist, parsed_title = _parse_release_title(result.title)
+            audio_quality = audio_quality_from_release(
+                evidence.title,
+                evidence.categories,
+            )
+            quality = audio_quality.format
+            parsed_artist, parsed_title = _parse_release_title(evidence.title)
             tr = TrackResult(
                 username='usenet',
                 filename=filename,
                 size=result.size,
-                bitrate=None,
+                bitrate=audio_quality.bitrate,
                 duration=None,
                 quality=quality,
                 # Usenet doesn't expose per-uploader concurrency the way
@@ -144,6 +158,8 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                 free_upload_slots=1,
                 upload_speed=0,
                 queue_length=0,
+                sample_rate=audio_quality.sample_rate,
+                bit_depth=audio_quality.bit_depth,
                 # Pre-fill artist + title so TrackResult.__post_init__
                 # doesn't auto-parse the filename — same URL-in-filename
                 # gotcha as the torrent plugin.
@@ -155,12 +171,22 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                     'indexer': result.indexer_name,
                     'indexer_id': result.indexer_id,
                     'grabs': result.grabs,
+                    'publish_date': result.publish_date,
                     'protocol': 'usenet',
-                    # Same as the torrent plugin: the indexer's details page,
-                    # scheme-checked because it is rendered as a clickable link.
-                    'info_url': safe_info_url(result.info_url),
+                    'release_title': result.title,
+                    'info_hash': torrent_hash_evidence(result)[0],
+                    'hash_conflict': torrent_hash_evidence(result)[1],
+                    'categories': list(result.categories or []),
+                    # Commissary: the tracker's details page for the picker,
+                    # never the download link (P0-03) — see tracker_link.
+                    'info_url': _safe_info_url(result.info_url, download_url=result.download_url,
+                                               magnet_uri=result.magnet_uri),
                 },
             )
+            tr._release_sources = [
+                source for raw in result._release_sources
+                for source in self._project_results([raw], release_evidence=evidence)[0]
+            ]
             tracks.append(tr)
             albums.append(AlbumResult(
                 username='usenet',
@@ -184,6 +210,8 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         username: str,
         filename: str,
         file_size: int = 0,
+        *,
+        quality_profile_id=None,
     ) -> Optional[str]:
         if not self.is_configured():
             return None
@@ -193,11 +221,26 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             return None
         # Only a token from OUR candidate store is accepted — a raw URL from
         # the client is a trust-boundary violation, not a fallback (P0-03).
-        nzb_url = get_candidate_store().resolve(token)
+        nzb_url, candidate_metadata = get_candidate_store().resolve_with_metadata(token)
         if not nzb_url:
             logger.error("Usenet download: unknown or expired candidate for %r "
                          "— re-run the search", display_name)
             return None
+
+        # Same pre-grab veto as torrents.  The per-item profile id is passed
+        # from the task context; omitting it intentionally resolves the app
+        # default for interactive/manual grabs.
+        allowed_formats = profile_allowed_formats(quality_profile_id)
+        if allowed_formats:
+            ok, why = evaluate_release(
+                allowed_formats,
+                candidate_metadata.get('release_title') or display_name,
+                categories=candidate_metadata.get('categories'),
+            )
+            if not ok:
+                logger.info("Usenet declined %r on the quality profile: %s",
+                            display_name, why)
+                return None
 
         download_id = str(uuid.uuid4())
         with self._lock:
@@ -232,6 +275,10 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             self._mark_error(download_id, "No usenet client configured")
             return
 
+        with self._lock:
+            submission_row = self.active_downloads.get(download_id)
+            if submission_row is None or submission_row.get('state') == 'Cancelled':
+                return
         try:
             job_id = run_async(adapter.add_nzb(nzb_url))
         except Exception as e:
@@ -243,9 +290,20 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
 
         with self._lock:
             row = self.active_downloads.get(download_id)
-            if row is not None:
+            cancelled = row is None or row.get('state') == 'Cancelled'
+            # Keep the original row's intent even if the UI has cleared it.
+            delete_files = submission_row.get('cancel_remove_files', row is None)
+            if not cancelled:
                 row['job_id'] = job_id
                 row['state'] = 'InProgress, Downloading'
+        if cancelled:
+            # Cancellation can precede the submit response and its remote ID.
+            # Retire that late job instead of leaving it running untracked.
+            try:
+                run_async(adapter.remove(job_id, delete_files=delete_files))
+            except Exception as exc:
+                logger.warning("Usenet late-job cleanup failed (%s)", type(exc).__name__)
+            return
 
         deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
         last_save_path: Optional[str] = None
@@ -280,6 +338,10 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         while time.monotonic() < deadline:
             if self.shutdown_check and self.shutdown_check():
                 return
+            with self._lock:
+                row = self.active_downloads.get(download_id)
+                if row is None or row.get('state') == 'Cancelled':
+                    return
             try:
                 status = run_async(adapter.get_status(job_id))
             except Exception as e:
@@ -301,13 +363,14 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
 
             with self._lock:
                 row = self.active_downloads.get(download_id)
-                if row is not None:
-                    row['progress'] = status.progress * 100.0
-                    row['transferred'] = status.downloaded
-                    row['speed'] = status.download_speed
-                    row['size'] = status.size or row.get('size', 0)
-                    row['state'] = _adapter_state_to_display(status.state)
-                    row['error'] = status.error
+                if row is None or row.get('state') == 'Cancelled':
+                    return
+                row['progress'] = status.progress * 100.0
+                row['transferred'] = status.downloaded
+                row['speed'] = status.download_speed
+                row['size'] = status.size or row.get('size', 0)
+                row['state'] = _adapter_state_to_display(status.state)
+                row['error'] = status.error
             if status.save_path:
                 last_save_path = status.save_path
             incomplete_path = getattr(status, 'incomplete_path', None)
@@ -414,7 +477,7 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             self._mark_error(download_id, "Usenet job completed but no save_path reported")
             return
         # Translate the client-reported path to one THIS process can read
-        # (SAB reports its own container path; Commissary may see the same
+        # (SAB reports its own container path; SoulSync may see the same
         # files at a different mount). See ``resolve_reported_save_path``.
         local_path = resolve_reported_save_path(save_path)
         if local_path != save_path:
@@ -432,7 +495,7 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         primary = audio_files[0]
         with self._lock:
             row = self.active_downloads.get(download_id)
-            if row is not None:
+            if row is not None and row.get('state') != 'Cancelled':
                 row['state'] = 'Completed, Succeeded'
                 row['progress'] = 100.0
                 row['file_path'] = str(primary)
@@ -441,12 +504,13 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                     download_id[:8], primary.name, len(audio_files))
 
     def _mark_error(self, download_id: str, message: str) -> None:
-        logger.error("Usenet download %s failed: %s", download_id[:8], message)
         with self._lock:
             row = self.active_downloads.get(download_id)
-            if row is not None:
-                row['state'] = 'Completed, Errored'
-                row['error'] = message
+            if row is None or row.get('state') == 'Cancelled':
+                return
+            row['state'] = 'Completed, Errored'
+            row['error'] = message
+        logger.error("Usenet download %s failed: %s", download_id[:8], message)
 
     # ------------------------------------------------------------------
     # Status / lifecycle
@@ -474,6 +538,9 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         with self._lock:
             row = self.active_downloads.get(download_id)
             job_id = row.get('job_id') if row else None
+            if row is not None:
+                row['cancel_remove_files'] = remove
+                row['state'] = 'Cancelled'
         if adapter and job_id:
             try:
                 await adapter.remove(job_id, delete_files=remove)
@@ -506,12 +573,12 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         artist_name: str,
         staging_dir: str,
         progress_callback=None,
-        *,
-        preferred_release: Optional[Dict[str, Any]] = None,
+        quality_profile_id=None,
+        expected_duration_seconds=None,
+        preferred_release=None,  # Commissary: a release picked by hand
     ) -> Dict[str, Any]:
         """Usenet sibling of ``TorrentDownloadPlugin.download_album_to_staging``.
-        See that method's docstring for the contract, including the
-        ``preferred_release`` user-pick shortcut."""
+        See that method's docstring for the contract."""
         result: Dict[str, Any] = {'success': False, 'files': [], 'error': None}
         if not self.is_configured():
             result['error'] = 'Usenet source not configured'
@@ -529,71 +596,86 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
                 except Exception as cb_exc:
                     logger.debug("[Usenet album] progress callback failed: %s", cb_exc)
 
-        # A user pick skips the search + heuristic entirely — see the torrent
-        # plugin's docstring for why a stale token fails instead of falling
-        # back to a release the user didn't choose.
-        if preferred_release:
-            release_title = str(preferred_release.get('title') or '').strip() or album_name
-            nzb_url = get_candidate_store().resolve(
-                str(preferred_release.get('token') or ''))
-            if not nzb_url:
-                result['error'] = ('That release is no longer available to grab '
-                                   '— re-run the source search and pick again')
-                return result
-            logger.info("[Usenet album] Using user-picked release '%s'", release_title)
-            _emit('queued', release=release_title)
-        else:
-            query = f"{artist_name} {album_name}".strip()
-            _emit('searching', query=query)
-            try:
-                search_results = run_async(self._prowlarr.search(
-                    query, categories=DEFAULT_MUSIC_CATEGORIES,
-                    indexer_ids=_parse_indexer_id_filter(),
-                ))
-            except Exception as e:
-                result['error'] = f'Prowlarr search failed: {e}'
-                return result
-
-            candidates = [r for r in search_results
-                          if r.protocol == 'usenet' and r.download_url]
-            if not candidates:
-                # Album isn't available on this source — fall back to the per-track
-                # flow (next configured source in hybrid mode) rather than hard-
-                # failing the whole batch. Mirrors the torrent plugin + soulseek's
-                # default fallback contract.
-                result['error'] = f'No usenet results found for "{query}"'
-                result['fallback'] = True
-                return result
-
-            picked = pick_best_album_release(
-                candidates, _guess_quality_from_title, album_name=album_name,
-            )
-            if picked is None:
-                # No candidate matched the requested album (or none passed filtering).
-                # Fall back to per-track rather than grabbing a wrong album (#730).
-                result['error'] = 'No NZB candidate matched the requested album'
-                result['fallback'] = True
-                return result
-
-            release_title = picked.title
-            nzb_url = picked.download_url
-            logger.info("[Usenet album] Picked '%s' (size=%.1fMB grabs=%s indexer=%s)",
-                        picked.title, picked.size / 1_048_576, picked.grabs, picked.indexer_name)
-            _emit('queued', release=picked.title, size=picked.size, grabs=picked.grabs)
-
+        query = f"{artist_name} {album_name}".strip()
+        _emit('searching', query=query)
         try:
-            job_id = run_async(adapter.add_nzb(nzb_url))
+            search_results = run_async(prowlarr_search_with_variants(
+                self._prowlarr, query, 'usenet',
+            ))
         except Exception as e:
-            result['error'] = f'Usenet client refused the NZB: {e}'
-            return result
-        if not job_id:
-            result['error'] = 'Usenet client refused the NZB'
+            result['error'] = f'Prowlarr search failed: {e}'
             return result
 
-        _emit('downloading', release=release_title)
+        candidates = [r for r in search_results
+                      if r.protocol == 'usenet' and r.download_url]
+        if not candidates:
+            # Album isn't available on this source — fall back to the per-track
+            # flow (next configured source in hybrid mode) rather than hard-
+            # failing the whole batch. Mirrors the torrent plugin + soulseek's
+            # default fallback contract.
+            result['error'] = f'No usenet results found for "{query}"'
+            result['fallback'] = True
+            return result
+
+        # narrate the selection step (#1156), same as the torrent plugin
+        _emit('selecting', count=len(candidates), query=query)
+
+        # #1149 applies to the hybrid chain too, not just torrents: the same
+        # profile veto, so a lossy NZB is not the thing that satisfies a
+        # lossless-only profile after the torrent path correctly refused.
+        allowed_formats = profile_allowed_formats(quality_profile_id)
+        quality_targets, fallback_enabled = profile_quality_targets(quality_profile_id)
+        picked = pick_best_album_release(
+            candidates, _guess_quality_from_title, album_name=album_name,
+            artist_name=artist_name,
+            allowed_formats=allowed_formats,
+            quality_targets=quality_targets,
+            fallback_enabled=fallback_enabled,
+            expected_duration_seconds=expected_duration_seconds,
+        )
+        # Commissary: the release chosen in the album release picker - that one
+        # or none, never a different one (core/commissary/release_picker.py)
+        if preferred_release:
+            from core.commissary.release_picker import PIN_GONE, pick_pinned
+            picked = pick_pinned('usenet', candidates, preferred_release)
+            if picked is None:
+                result['error'] = PIN_GONE
+                return result
+        if picked is None:
+            # No candidate matched the requested album (or none passed filtering).
+            # Fall back to per-track rather than grabbing a wrong album (#730).
+            if allowed_formats:
+                result['error'] = (
+                    'No NZB candidate matched the requested album in '
+                    f"{'/'.join(sorted(allowed_formats)).upper()} "
+                    '(quality profile allows no other format)')
+            else:
+                result['error'] = 'No NZB candidate matched the requested album'
+            result['fallback'] = True
+            return result
+
+        logger.info("[Usenet album] Picked '%s' (size=%.1fMB grabs=%s indexer=%s)",
+                    picked.title, picked.size / 1_048_576, picked.grabs, picked.indexer_name)
+        _emit('queued', release=picked.title, size=picked.size, grabs=picked.grabs)
+
+        job_id = None
+        for source in release_sources(picked):
+            if not source.download_url:
+                continue
+            try:
+                job_id = run_async(adapter.add_nzb(source.download_url))
+            except Exception:  # endpoint unavailable; do not log signed URLs
+                job_id = None
+            if job_id:
+                break
+        if not job_id:
+            result['error'] = 'Usenet client refused the NZB on every indexer source'
+            return result
+
+        _emit('downloading', release=picked.title)
         save_path = poll_album_download(
             get_status=lambda: run_async(adapter.get_status(job_id)),
-            title=release_title,
+            title=picked.title,
             emit=_emit,
             # Usenet completes into history as 'completed'; no 'seeding'
             # equivalent. Failed is explicit on history failures.
@@ -615,8 +697,8 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             result['error'] = 'Usenet download failed or timed out'
             return result
 
-        _emit('staging', release=release_title)
-        # SAB reports its own container path; Commissary may mount the same
+        _emit('staging', release=picked.title)
+        # SAB reports its own container path; SoulSync may mount the same
         # files elsewhere. Resolve to a locally-readable path before walking.
         local_path = resolve_reported_save_path(save_path)
         if local_path != save_path:
@@ -640,4 +722,3 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         result['success'] = True
         result['files'] = copied
         return result
-

@@ -1,7 +1,7 @@
 """Resolve a playlist track's MusicBrainz *recording* MBID, cheapest source first.
 
 A ListenBrainz playlist export needs each track's recording MBID (``jspf_export``). A
-Commissary track can supply it from several places, in increasing cost:
+SoulSync track can supply it from several places, in increasing cost:
 
 1. **resolution cache** — a prior (artist,title)->mbid result (persistent; reused across
    playlists and runs, so the same song never costs twice).
@@ -28,6 +28,7 @@ from typing import Any, Callable, List, Optional, Tuple
 SRC_CACHE = "cache"
 SRC_DB = "db"
 SRC_FILE = "file"
+SRC_ISRC = "isrc"
 SRC_MUSICBRAINZ = "musicbrainz"
 SRC_NONE = None
 
@@ -84,5 +85,6 @@ __all__ = [
     "SRC_CACHE",
     "SRC_DB",
     "SRC_FILE",
+    "SRC_ISRC",
     "SRC_MUSICBRAINZ",
 ]

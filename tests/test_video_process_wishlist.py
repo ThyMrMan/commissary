@@ -10,16 +10,16 @@ import json
 import pytest
 
 from core.automation.handlers.video_process_wishlist import (
-    _category_for_item,
-    _item_target_dir,
-    _preferred_indexer_ids_for_item,
-    _root_folder_for_item,
     active_download_keys,
     annotate_upgrades,
     auto_video_process_wishlist,
     build_download_record,
     item_key,
     pick_best,
+    reset_source_cooldowns,
+    season_pack_requests,
+    source_cooldown_remaining,
+    note_source_refusal,
 )
 
 
@@ -37,6 +37,18 @@ def _cand(fn, *, accepted=True, score=10, user="u"):
 
 
 # ── pure ──────────────────────────────────────────────────────────────────────
+def test_repeated_client_refusals_cool_down_that_item_source():
+    reset_source_cooldowns()
+    item = {"tmdb_id": 1, "title": "A"}
+    cand = dict(_cand("A.1080p.mkv"), source="torrent")
+    assert source_cooldown_remaining(item, "movie", cand, now=100) == 0
+    note_source_refusal(item, "movie", cand, now=100, limit=2, cooldown_seconds=3600)
+    assert source_cooldown_remaining(item, "movie", cand, now=101) == 0
+    note_source_refusal(item, "movie", cand, now=102, limit=2, cooldown_seconds=3600)
+    assert source_cooldown_remaining(item, "movie", cand, now=103) > 3500
+    reset_source_cooldowns()
+
+
 def test_pick_best_takes_first_accepted():
     cands = [_cand("a", accepted=False), _cand("b", accepted=True), _cand("c", accepted=True)]
     assert pick_best(cands)["filename"] == "b"
@@ -57,9 +69,34 @@ def test_active_download_keys_reads_ctx_for_episodes():
     active = [
         {"kind": "movie", "media_id": "5"},
         {"kind": "episode", "media_id": "9", "search_ctx": json.dumps({"season": 1, "episode": 3})},
+        {"kind": "show", "media_id": "9", "search_ctx": json.dumps({"scope": "season", "season": 2})},
     ]
     keys = active_download_keys(active)
     assert ("movie", "5") in keys and ("episode", "9", 1, 3) in keys
+    assert ("season", "9", 2) in keys
+
+
+def test_season_pack_requests_group_many_missing_standard_episodes():
+    items = [
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 1},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 2},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 3},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 3, "episode_number": 1},
+    ]
+    packs = season_pack_requests(items, active=set(), min_missing=3)
+    assert len(packs) == 1
+    assert item_key(packs[0], "episode") == ("season", "9", 2)
+    assert packs[0]["_pack_members"] == [(2, 1), (2, 2), (2, 3)]
+
+
+def test_season_pack_requests_skip_upgrades_special_numbering_and_active_members():
+    base = {"show_tmdb_id": 9, "show_title": "Show", "season_number": 2}
+    upgrade = [dict(base, episode_number=n, owned=1, owned_resolutions="720p") for n in (1, 2, 3)]
+    anime = [dict(base, episode_number=n, series_type="anime") for n in (1, 2, 3)]
+    active = [dict(base, episode_number=n) for n in (1, 2, 3)]
+    assert season_pack_requests(upgrade, active=set()) == []
+    assert season_pack_requests(anime, active=set()) == []
+    assert season_pack_requests(active, active={("episode", "9", 2, 2)}) == []
 
 
 def test_build_record_movie_shape():
@@ -70,7 +107,11 @@ def test_build_record_movie_shape():
     assert rec["kind"] == "movie" and rec["title"] == "The Matrix" and rec["media_id"] == "5"
     assert rec["source"] == "soulseek" and rec["status"] == "downloading"
     assert rec["target_dir"] == "/movies" and rec["filename"] == "Matrix.1999.1080p.mkv"
-    assert json.loads(rec["search_ctx"]) == {"scope": "movie", "title": "The Matrix", "year": "1999"}
+    # search_ctx now also carries the external ids the indexer search needs — the
+    # drain used to run every Prowlarr query as free text because nothing filled
+    # them. They ride here so a RETRY searches as well-informed as the first try.
+    assert json.loads(rec["search_ctx"]) == {"scope": "movie", "title": "The Matrix",
+                                             "year": "1999", "tmdb_id": 5}
     assert [c["filename"] for c in json.loads(rec["candidates"])] == ["other.mkv"]   # best excluded
 
 
@@ -83,106 +124,47 @@ def test_build_record_stashes_peer_availability_in_ctx():
         "slots": 1, "queue": 0, "speed": 2100000, "availability": 0.15}
 
 
+def test_build_record_season_pack_shape():
+    item = {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2,
+            "episode_number": None, "poster_url": "/p.jpg", "tvdb_id": 123}
+    best = dict(_cand("Silo.S02.1080p", accepted=True), source="torrent", _client_ref="hash")
+    rec = build_download_record(item, best, [best], media_type="episode", target_dir="/tv", query="Silo S02")
+    ctx = json.loads(rec["search_ctx"])
+    assert rec["kind"] == "show" and rec["media_id"] == "9"
+    assert ctx["scope"] == "season" and ctx["season"] == 2 and "episode" not in ctx
+    assert ctx["tvdb_id"] == 123
+
+
 def test_build_record_episode_shape():
     item = {"show_tmdb_id": 9, "show_title": "Breaking Bad", "season_number": 1,
             "episode_number": 3, "air_date": "2008-02-10"}
     best = _cand("BrBa.S01E03.mkv")
     rec = build_download_record(item, best, [best], media_type="episode", target_dir="/tv", query="q")
-    assert rec["kind"] == "episode" and rec["media_id"] == "9" and rec["year"] == "2008"
-    # 'absolute': 3 rides along even though nothing has typed this show. For
-    # SEASON 1 the absolute number IS the episode number, for every show — so it
-    # costs nothing here and it is the only reason a brand-new anime (which has
-    # no shows row, so no series type) can match a '[SubsPlease] Show - 03'
-    # release on its very first grab. A later season gets nothing without an
-    # explicit anime tag; see tests/test_video_anime_absolute_search.py.
+    # no show year known: no year at all. the air year is not the show's year
+    # (it named S03 folders "Breaking Bad (2010)" and rejected year-tagged releases)
+    assert rec["kind"] == "episode" and rec["media_id"] == "9" and rec["year"] is None
+    # Commissary: an untyped show's season-1 episode carries its absolute number
+    # (== the episode number in season 1 for every show; accept-only), so a new
+    # anime not yet tagged can match '[Group] Show - 03'.
     assert json.loads(rec["search_ctx"]) == {"scope": "episode", "title": "Breaking Bad",
-                                             "season": 1, "episode": 3, "year": "2008",
-                                             "air_date": "2008-02-10", "absolute": 3}
+                                             "season": 1, "episode": 3, "year": None,
+                                             "air_date": "2008-02-10", "tmdb_id": 9,
+                                             "absolute": 3}
+    rec = build_download_record(dict(item, show_year=2008), best, [best], media_type="episode",
+                                target_dir="/tv", query="q")
+    assert rec["year"] == "2008" and json.loads(rec["search_ctx"])["year"] == "2008"
 
 
-# ── multi-library #1105: per-item resolution helpers (pure, DB mocked) ────────
-
-def _mock_db(monkeypatch, root_folder):
-    import api.video
-
-    class _FakeDB:
-        def get_root_folder(self, rfid):
-            return root_folder if rfid == "the-id" else None
-
-    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
-
-
-def test_root_folder_for_item_none_without_a_root_folder_id(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
-    assert _root_folder_for_item({"title": "no library yet"}) is None
-
-
-def test_root_folder_for_item_looks_up_the_stamped_id(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
-    assert _root_folder_for_item({"root_folder_id": "the-id"}) == {"path": "/anime", "category": "anime"}
-
-
-def test_item_target_dir_prefers_its_own_library(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
-    assert _item_target_dir({"root_folder_id": "the-id"}, "/tv-shows") == "/anime"
-
-
-def test_item_target_dir_falls_back_when_no_library(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
-    assert _item_target_dir({"title": "no library"}, "/tv-shows") == "/tv-shows"
-
-
-def test_item_target_dir_falls_back_when_library_has_no_path_set(monkeypatch):
-    _mock_db(monkeypatch, {"path": "", "category": "anime"})
-    assert _item_target_dir({"root_folder_id": "the-id"}, "/tv-shows") == "/tv-shows"
-
-
-def test_category_for_item_prefers_its_own_library(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})
-    assert _category_for_item({"root_folder_id": "the-id"}, "show") == "anime"
-
-
-def test_category_for_item_falls_back_to_the_primary_when_no_library(monkeypatch):
-    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
-                        lambda mt: "primary-cat")
-    assert _category_for_item({"title": "no library"}, "show") == "primary-cat"
-
-
-def test_category_for_item_falls_back_when_library_category_is_blank(monkeypatch):
-    """A Library with no category set means 'inherit', not 'no category'."""
-    _mock_db(monkeypatch, {"path": "/anime", "category": "  "})
-    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
-                        lambda mt: "primary-cat")
-    assert _category_for_item({"root_folder_id": "the-id"}, "show") == "primary-cat"
-
-
-def test_preferred_indexer_ids_parses_the_libraries_comma_list(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime", "preferred_indexer_ids": "1, 3"})
-    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == {1, 3}
-
-
-def test_preferred_indexer_ids_empty_when_no_library(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime", "preferred_indexer_ids": "1"})
-    assert _preferred_indexer_ids_for_item({"title": "no library"}) == set()
-
-
-def test_preferred_indexer_ids_empty_when_library_has_none_set(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "category": "anime"})   # no preferred_indexer_ids key
-    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == set()
-
-
-def test_preferred_indexer_ids_drops_garbage_tokens(monkeypatch):
-    _mock_db(monkeypatch, {"path": "/anime", "preferred_indexer_ids": "2, bogus, 9,"})
-    assert _preferred_indexer_ids_for_item({"root_folder_id": "the-id"}) == {2, 9}
-
-
-def test_preferred_indexer_ids_does_not_fall_back_to_the_primary_library(monkeypatch):
-    """Unlike _item_target_dir/_category_for_item, an unlinked item gets NO
-    tracker preference — inheriting one from an unrelated 'primary' library
-    would be a surprising default for a soft ranking nudge."""
-    monkeypatch.setattr("core.automation.handlers.video_process_wishlist._default_category",
-                        lambda mt: "primary-cat")
-    assert _preferred_indexer_ids_for_item({"title": "no library"}) == set()
+def test_build_record_carries_the_series_ids_when_the_library_knows_them():
+    """A show that IS in the library contributes tvdb/imdb ids, and they must
+    reach the download row so the monitor's requery keeps the id-aware routing
+    the first search had."""
+    item = {"show_tmdb_id": 9, "show_title": "Breaking Bad", "season_number": 1,
+            "episode_number": 3, "tvdb_id": 81189, "imdb_id": "tt0903747"}
+    rec = build_download_record(item, _cand("BrBa.S01E03.mkv"), [], media_type="episode",
+                                target_dir="/tv", query="q")
+    ctx = json.loads(rec["search_ctx"])
+    assert ctx["tvdb_id"] == 81189 and ctx["imdb_id"] == "tt0903747" and ctx["tmdb_id"] == 9
 
 
 # ── handler ───────────────────────────────────────────────────────────────────
@@ -214,31 +196,6 @@ def test_grabs_each_wished_movie():
     assert res["status"] == "completed" and res["grabbed"] == 2 and res["searched"] == 2
     assert {e[0] for e in enq} == {("movie", "1"), ("movie", "2")}
     assert enq[0][2] == "/movies"
-
-
-def test_reported_bug_item_grabs_into_its_own_library_not_the_batch_primary(monkeypatch):
-    """THE reported bug: a show cataloged in the Anime library, watchlisted,
-    landed in the TV-Shows folder when auto-grabbed — because every item in
-    a drain batch shared the SAME resolved 'root', regardless of which
-    Library it actually belongs to. Two items in ONE batch, only one of them
-    filed under a Library, must land in two DIFFERENT target dirs."""
-    class _FakeDB:
-        def get_root_folder(self, rfid):
-            assert rfid == "anime-lib"
-            return {"path": "/media/anime", "category": "anime"}
-
-    import api.video
-    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
-
-    items = [
-        {"tmdb_id": 1, "title": "Filed under Anime", "year": "2020", "root_folder_id": "anime-lib"},
-        {"tmdb_id": 2, "title": "No library yet", "year": "2021"},
-    ]
-    res, enq, _, _ = _run(items, root="/tv-shows")
-    assert res["grabbed"] == 2
-    by_id = {e[0][1]: e[2] for e in enq}
-    assert by_id["1"] == "/media/anime"        # its OWN library, not the batch primary
-    assert by_id["2"] == "/tv-shows"           # no library of its own → the batch fallback
 
 
 def test_skips_items_already_downloading():
@@ -291,6 +248,89 @@ def test_episode_mode_keys_and_grabs():
     items = [{"show_tmdb_id": 9, "show_title": "BrBa", "season_number": 1, "episode_number": 3}]
     res, enq, seen, _ = _run(items, root="/tv", media_type="episode")
     assert res["grabbed"] == 1 and enq[0][0] == ("episode", "9", 1, 3) and enq[0][2] == "/tv"
+
+
+def test_episode_mode_searches_season_pack_before_member_episodes():
+    items = [
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 1},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 2},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 3},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 3, "episode_number": 1},
+    ]
+    searches = {
+        ("season", "9", 2): [dict(_cand("Silo.S02.1080p"), source="torrent")],
+        ("episode", "9", 3, 1): [dict(_cand("Silo.S03E01.1080p"), source="torrent")],
+    }
+    res, enq, seen, _ = _run(items, root="/tv", media_type="episode", searches=searches)
+    assert res["grabbed"] == 2 and res["searched"] == 2
+    assert seen == [("season", "9", 2), ("episode", "9", 3, 1)]
+    assert [e[0] for e in enq] == [("season", "9", 2), ("episode", "9", 3, 1)]
+
+
+def test_season_pack_auto_grab_ignores_soulseek_pack_candidates():
+    items = [
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 1},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 2},
+        {"show_tmdb_id": 9, "show_title": "Silo", "season_number": 2, "episode_number": 3},
+    ]
+    res, enq, seen, _ = _run(items, root="/tv", media_type="episode", searches={
+        ("season", "9", 2): [dict(_cand("Silo/Season 2"), source="soulseek")],
+    })
+    assert res["grabbed"] == 0 and enq == []
+    # no usable pack, so its episodes are searched one by one
+    assert seen == [("season", "9", 2), ("episode", "9", 2, 1),
+                    ("episode", "9", 2, 2), ("episode", "9", 2, 3)]
+
+
+def test_manual_retry_all_sources_combines_sources(monkeypatch):
+    import core.video.wishlist_search as ws
+    calls = []
+
+    def one(src, item, mt):
+        calls.append(src)
+        return ([dict(_cand(src + '.mkv'), source=src, score={'torrent': 5, 'usenet': 9, 'soulseek': 1}[src])], None)
+
+    import core.automation.handlers.video_process_wishlist as vpw
+    monkeypatch.setattr(vpw, '_search_one_source', one)
+    item = {"tmdb_id": 1, "title": "A"}
+    cands, err = ws._all_source_search(item, "movie")
+    assert calls == ["torrent", "usenet", "soulseek"] and err is None
+    assert cands[0]["source"] == "usenet"
+
+
+def test_client_refusal_cooldown_skips_reoffering_same_source():
+    reset_source_cooldowns()
+    try:
+        item = {"tmdb_id": 1, "title": "A"}
+        cand = dict(_cand("A.1080p.mkv"), source="torrent")
+        calls = []
+
+        def enqueue(_item, best, _cands, _mt, _target):
+            calls.append(best["filename"])
+            return {"ok": False, "error": "torrent already queued"}
+
+        deps = _Deps()
+        res = auto_video_process_wishlist(
+            {"_automation_id": "a", "max_concurrent": 1}, deps, media_type="movie",
+            fetch_items=lambda mt: [item], active_keys=lambda mt: set(), target_dir=lambda mt: "/movies",
+            search=lambda _item, _mt: [cand], enqueue=enqueue)
+        assert res["refused"] == 1 and calls == ["A.1080p.mkv"]
+
+        res = auto_video_process_wishlist(
+            {"_automation_id": "a", "max_concurrent": 1}, deps, media_type="movie",
+            fetch_items=lambda mt: [item], active_keys=lambda mt: set(), target_dir=lambda mt: "/movies",
+            search=lambda _item, _mt: [cand], enqueue=enqueue)
+        assert res["refused"] == 1 and calls == ["A.1080p.mkv", "A.1080p.mkv"]
+
+        res = auto_video_process_wishlist(
+            {"_automation_id": "a", "max_concurrent": 1}, deps, media_type="movie",
+            fetch_items=lambda mt: [item], active_keys=lambda mt: set(), target_dir=lambda mt: "/movies",
+            search=lambda _item, _mt: [cand], enqueue=enqueue)
+        assert res["refused"] == 1 and calls == ["A.1080p.mkv", "A.1080p.mkv"]
+        logs = " ".join(p.get("log_line") or "" for p in deps.progress)
+        assert "cooling down" in logs
+    finally:
+        reset_source_cooldowns()
 
 
 def test_top_level_error_is_caught_and_clears_guard():
@@ -352,86 +392,6 @@ def test_movie_wishlist_annotates_owned(db):
     assert rows[2]["owned"] == 0 and rows[2]["owned_resolutions"] is None
 
 
-def _add_library(db, *, path, kind="movie", category=None, server="plex"):
-    conn = db._get_connection()
-    cur = conn.execute(
-        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
-        (str(path), kind, server, category))
-    rid = cur.lastrowid
-    conn.commit(); conn.close()
-    return rid
-
-
-# ── multi-library #1105: a title already filed under its own Library ──────────
-# (e.g. Anime) must carry that association through to an unattended grab,
-# instead of always resolving to the primary Library for the kind.
-
-def test_movie_wishlist_to_download_carries_its_own_root_folder_id(db):
-    anime = _add_library(db, path="/media/anime", category="anime")
-    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
-    conn = db._get_connection()
-    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
-    conn.commit(); conn.close()
-    db.add_movie_to_wishlist(1, "Owned", year="2020", status="wanted", library_id=movie_id)
-    row = db.movie_wishlist_to_download()[0]
-    assert row["library_id"] == movie_id
-    assert row["root_folder_id"] == anime
-
-
-def test_movie_wishlist_to_download_root_folder_id_is_none_when_unlinked(db):
-    db.add_movie_to_wishlist(1, "Never Owned", year="2020", status="wanted")
-    row = db.movie_wishlist_to_download()[0]
-    assert row["library_id"] is None
-    assert row["root_folder_id"] is None
-
-
-def test_episode_wishlist_to_download_carries_its_shows_root_folder_id(db):
-    anime = _add_library(db, path="/media/anime", kind="show", category="anime")
-    show_id = db.upsert_show_tree("plex", {"server_id": "s9", "tmdb_id": 9, "title": "Show"})
-    conn = db._get_connection()
-    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (anime, show_id))
-    conn.commit(); conn.close()
-    db.add_episodes_to_wishlist(9, "Show",
-                                [{"season_number": 1, "episode_number": 1, "air_date": "2020-01-01"}],
-                                library_id=show_id)
-    row = db.episode_wishlist_to_download()[0]
-    assert row["library_id"] == show_id
-    assert row["root_folder_id"] == anime
-
-
-def test_wishlist_manual_search_items_carries_root_folder_id_both_scopes(db):
-    anime = _add_library(db, path="/media/anime", category="anime")
-    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
-    conn = db._get_connection()
-    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
-    conn.commit(); conn.close()
-    db.add_movie_to_wishlist(1, "Owned", year="2020", status="wanted", library_id=movie_id)
-    row = db.wishlist_manual_search_items("movie", 1)[0]
-    assert row["root_folder_id"] == anime
-
-    show_anime = _add_library(db, path="/media/anime-shows", kind="show", category="anime")
-    show_id = db.upsert_show_tree("plex", {"server_id": "s9", "tmdb_id": 9, "title": "Show"})
-    conn = db._get_connection()
-    conn.execute("UPDATE shows SET root_folder_id=? WHERE id=?", (show_anime, show_id))
-    conn.commit(); conn.close()
-    db.add_episodes_to_wishlist(9, "Show",
-                                [{"season_number": 1, "episode_number": 1, "air_date": "2020-01-01"}],
-                                library_id=show_id)
-    row = db.wishlist_manual_search_items("show", 9)[0]
-    assert row["root_folder_id"] == show_anime
-
-
-def test_root_folder_id_for_tmdb(db):
-    anime = _add_library(db, path="/media/anime", category="anime")
-    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Owned"})
-    conn = db._get_connection()
-    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (anime, movie_id))
-    conn.commit(); conn.close()
-    assert db.root_folder_id_for_tmdb("movie", 1) == anime
-    assert db.root_folder_id_for_tmdb("movie", 999) is None       # not owned
-    assert db.root_folder_id_for_tmdb("show", 1) is None          # wrong kind's table
-
-
 def test_episode_wishlist_annotates_owned(db):
     db.add_episodes_to_wishlist(9, "Show", [
         {"season_number": 1, "episode_number": 1, "air_date": "2020-01-01"},
@@ -446,6 +406,20 @@ def test_episode_wishlist_annotates_owned(db):
     assert set(rows) == {(1, 1), (1, 2)}
     assert rows[(1, 1)]["owned"] == 1 and rows[(1, 1)]["owned_resolutions"] == "720p"
     assert rows[(1, 2)]["owned"] == 0
+
+
+def test_record_wishlist_search_outcome_can_scope_to_one_season(db):
+    db.add_episodes_to_wishlist(9, "Show", [
+        {"season_number": 1, "episode_number": 1},
+        {"season_number": 2, "episode_number": 1},
+        {"season_number": 2, "episode_number": 2},
+    ])
+    db.record_wishlist_search_outcome("episode", 9, False, season_number=2,
+                                      refusal="No season pack", refusal_quality="WEBDL-1080p")
+    rows = db.query_wishlist(kind="show")["items"][0]["seasons"]
+    by_season = {s["season_number"]: s for s in rows}
+    assert by_season[1]["episodes"][0].get("last_refusal") is None
+    assert {e.get("last_refusal") for e in by_season[2]["episodes"]} == {"No season pack"}
 
 
 # ── upgrade-until-cutoff (pure) ───────────────────────────────────────────────
@@ -481,11 +455,14 @@ def test_wishlist_obtained_gates_on_cutoff(db, monkeypatch):
     db.add_movie_to_wishlist(1, "Low", year="2020", status="wanted")
     db.add_movie_to_wishlist(2, "Done", year="2020", status="wanted")
     db.add_movie_to_wishlist(3, "Mystery", year="2020", status="wanted")
+    db.add_movie_to_wishlist(4, "User Asked", year="2020", status="wanted")
     monkeypatch.setattr("core.video.quality_profile.load",
                         lambda _db: {"cutoff_resolution": "1080p"})
     dl = {"id": 7, "kind": "movie", "media_source": "tmdb", "media_id": "1"}
     dm._wishlist_obtained(db, dl, {"quality_label": "WEBDL-720p"})
     dm._wishlist_obtained(db, dict(dl, media_id="2"), {"quality_label": "BluRay-2160p"})
     dm._wishlist_obtained(db, dict(dl, media_id="3"), {"quality_label": "who knows"})
+    user_dl = dict(dl, media_id="4", search_ctx=json.dumps({"import_policy": "user_replace"}))
+    dm._wishlist_obtained(db, user_dl, {"quality_label": "WEBDL-720p"})
     left = {r["tmdb_id"] for r in db.movie_wishlist_to_download()}
-    assert left == {1}         # below cutoff kept; met removed; unreadable removed (classic)
+    assert left == {1}         # background below cutoff kept; user-triggered below cutoff satisfied

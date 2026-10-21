@@ -3,7 +3,7 @@
 Settings → YouTube offers two ways to authenticate yt-dlp:
 
 * a **browser dropdown** (Chrome/Firefox/…) → yt-dlp ``cookiesfrombrowser``, which
-  reads a logged-in browser's cookie store *on the same machine as Commissary*. Great
+  reads a logged-in browser's cookie store *on the same machine as SoulSync*. Great
   for local installs, useless on a headless server / Docker box (no browser there).
 * a **"Paste cookies.txt"** mode → yt-dlp ``cookiefile``, a Netscape-format cookie
   file the user exports (e.g. with a "Get cookies.txt LOCALLY" extension) and pastes
@@ -18,12 +18,96 @@ the seam is unit-testable without I/O. The web layer owns *where* the file lives
 
 from __future__ import annotations
 
+import hashlib
 import os
-from typing import Any, Dict
+import time
+from typing import Any, Dict, Optional
 
 # Sentinel dropdown value meaning "use a pasted cookies.txt file" rather than a
 # browser name. Anything else non-empty is treated as a browser for cookiesfrombrowser.
 PASTE_MODE = "custom"
+
+# Netscape cookies.txt convention: an HttpOnly cookie's domain field is prefixed
+# with this marker instead of being left plain. These are exactly the
+# session-identity cookies (SID, __Secure-1PSID, HSID, SSID, the SIDTS tokens)
+# that actually authenticate a request — treating the whole line as a comment
+# silently drops the cookies needed to look signed in.
+_HTTPONLY_PREFIX = "#HttpOnly_"
+
+
+def _cookie_line_fields(raw: str) -> Optional[list]:
+    """Split one cookies.txt line into its tab-separated fields, or ``None``
+    for a blank line or a genuine comment. Strips ``_HTTPONLY_PREFIX`` first."""
+    line = raw.rstrip("\n")
+    stripped = line.lstrip()
+    if stripped.startswith(_HTTPONLY_PREFIX):
+        line = stripped[len(_HTTPONLY_PREFIX):]
+    elif not line or stripped.startswith("#"):
+        return None
+    return line.split("\t")
+
+# ytmusicapi speaks to the same YouTube backend but wants HEADERS, not a cookie
+# file, so the pasted cookies.txt has to be projected into them (below).
+
+# The cookie that signs a YouTube API request. Google issues several aliases;
+# any one of them works, so take the first present in this order.
+_SAPISID_NAMES = ("__Secure-3PAPISID", "__Secure-1PAPISID", "SAPISID")
+
+# A browser export can carry 90 KB+ of cookies across every Google property,
+# and YouTube rejects a request whose headers are that large (HTTP 413). Only
+# these actually matter for auth.
+#
+# __Secure-1PSIDTS / __Secure-3PSIDTS are rotating session-refresh tokens
+# Google now binds the SID/SAPISID family to.
+_ESSENTIAL_COOKIES = frozenset({
+    "APISID", "HSID", "SSID", "SID", "SAPISID",
+    "__Secure-1PAPISID", "__Secure-3PAPISID",
+    "__Secure-1PSID", "__Secure-3PSID",
+    "__Secure-1PSIDTS", "__Secure-3PSIDTS",
+    "LOGIN_INFO", "PREF", "SOCS", "VISITOR_INFO1_LIVE", "YSC",
+})
+
+# Must match the Origin header ytmusicapi sends, or the hash is rejected.
+_YTMUSIC_ORIGIN = "https://music.youtube.com"
+
+
+def cookie_setup_problem(
+    mode: Any,
+    cookiefile_path: str = "",
+    *,
+    cookiefile_exists: bool = False,
+) -> Optional[str]:
+    """Why the configured cookies will NOT be used, or ``None`` when they will.
+
+    ``build_youtube_cookie_opts`` returns ``{}`` for paste mode with a missing
+    file, which is the right call — a broken ``cookiefile`` arg is worse than
+    none. What was missing is anybody saying so. The dropdown still reads
+    "Paste cookies.txt", so Settings looks configured while every request goes
+    out signed-out, and the user is left arguing with a bot gate about cookies
+    they believe are in play.
+
+    Docker makes this the default outcome rather than an edge case: the path
+    lives in the database (a mounted volume) and the file lives in the config
+    folder (often NOT one), so an image pull takes the file and leaves the
+    setting. "It worked for a couple of days and then stopped, and I changed
+    nothing" is what that looks like from the outside.
+
+    Pure — the caller does the ``os.path.exists``, same as the builder.
+    """
+    if str(mode or "").strip() != PASTE_MODE:
+        return None
+    if not cookiefile_path:
+        return ("Settings has 'Paste cookies.txt' selected but no file was ever "
+                "saved, so YouTube requests are going out signed-out. Paste your "
+                "cookies.txt again in Settings -> YouTube.")
+    if not cookiefile_exists:
+        return (f"Settings has 'Paste cookies.txt' selected but the saved file is "
+                f"gone ({cookiefile_path}), so YouTube requests are going out "
+                f"signed-out. Paste your cookies.txt again in Settings -> YouTube. "
+                f"In Docker this happens when the config folder is not a mounted "
+                f"volume: the file dies with the container while the setting "
+                f"survives in the database.")
+    return None
 
 
 def build_youtube_cookie_opts(
@@ -66,10 +150,8 @@ def looks_like_cookiefile(content: Any) -> bool:
     if not content or not isinstance(content, str):
         return False
     for raw in content.splitlines():
-        line = raw.rstrip("\n")
-        if not line or line.lstrip().startswith("#"):
-            continue
-        if len(line.split("\t")) >= 6:
+        fields = _cookie_line_fields(raw)
+        if fields is not None and len(fields) >= 6:
             return True
     return False
 
@@ -97,9 +179,106 @@ def write_pasted_cookiefile(content: Any, dest_path: str) -> str:
         return ""
 
 
+def parse_netscape_cookies(content: Any) -> Dict[str, str]:
+    """Parse a Netscape ``cookies.txt`` into ``{name: value}``. Pure.
+
+    Deliberately ignores the domain column. The cookies that authenticate a
+    YouTube request are Google-wide and an export taken on any Google property
+    carries the same values — a jar exported from ``google.de`` authenticates
+    music.youtube.com fine. Filtering on "youtube" in the domain silently
+    yields zero cookies for those exports, which reads as "not logged in".
+
+    Later rows win, matching how a browser resolves duplicate names.
+    """
+    cookies: Dict[str, str] = {}
+    if not content or not isinstance(content, str):
+        return cookies
+    for raw in content.splitlines():
+        fields = _cookie_line_fields(raw)
+        if fields is None or len(fields) < 7:
+            continue
+        name, value = fields[5].strip(), fields[6].strip()
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def ytmusic_auth_headers(
+    cookies: Dict[str, str], *, timestamp: Optional[int] = None
+) -> Optional[Dict[str, str]]:
+    """Build ytmusicapi browser-auth headers from parsed cookies, or ``None``. Pure.
+
+    ``None`` means "no usable auth" — the caller then goes anonymous, which
+    still resolves public playlists. Only a signed-in request can see a private
+    one, and Liked Music (``list=LM``) is always private.
+
+    The ``Authorization: SAPISIDHASH <ts>_<sha1(ts SAPISID origin)>`` scheme is
+    YouTube's own; SHA-1 is not a choice we get to make here. ``timestamp`` is
+    injectable so the header is reproducible in tests.
+    """
+    if not isinstance(cookies, dict) or not cookies:
+        return None
+    sapisid = next((cookies[n] for n in _SAPISID_NAMES if cookies.get(n)), "")
+    if not sapisid:
+        return None
+
+    stamp = str(int(timestamp if timestamp is not None else time.time()))
+    digest = hashlib.sha1(  # noqa: S324 - required by YouTube's auth scheme
+        f"{stamp} {sapisid} {_YTMUSIC_ORIGIN}".encode("utf-8")
+    ).hexdigest()
+
+    essential = {k: v for k, v in cookies.items() if k in _ESSENTIAL_COOKIES}
+    return {
+        "Cookie": "; ".join(f"{k}={v}" for k, v in essential.items()),
+        "Authorization": f"SAPISIDHASH {stamp}_{digest}",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.5",
+        "X-Goog-AuthUser": "0",
+        "Origin": _YTMUSIC_ORIGIN,
+    }
+
+
+def ytmusic_auth_from_cookiefile(path: Any) -> Optional[Dict[str, str]]:
+    """Read ``path`` and project it into ytmusicapi auth headers, or ``None``.
+
+    The one impure entry point: everything it can't do (missing file, unreadable,
+    logged-out export) collapses to ``None`` so the caller just goes anonymous.
+    """
+    if not path or not isinstance(path, str) or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            content = fh.read()
+    except OSError:
+        return None
+    return ytmusic_auth_headers(parse_netscape_cookies(content))
+
+
+def ytmusic_auth_from_config() -> Optional[Dict[str, str]]:
+    """ytmusicapi headers from Settings → YouTube cookies, or ``None`` (anonymous).
+
+    Same PASTE_MODE + cookies_file rule as the playlist import path: only a
+    pasted cookies.txt can be projected into headers. ``cookiesfrombrowser`` is
+    yt-dlp's reader and leaves no file for us to hash. Public catalog search
+    still works with ``None``.
+    """
+    try:
+        from core.settings import config_manager
+        if str(config_manager.get("youtube.cookies_browser", "") or "").strip() != PASTE_MODE:
+            return None
+        return ytmusic_auth_from_cookiefile(config_manager.get("youtube.cookies_file", ""))
+    except Exception:  # noqa: BLE001 - auth is best-effort; anonymous still works
+        return None
+
+
 __all__ = [
     "PASTE_MODE",
     "build_youtube_cookie_opts",
     "looks_like_cookiefile",
     "write_pasted_cookiefile",
+    "parse_netscape_cookies",
+    "ytmusic_auth_headers",
+    "ytmusic_auth_from_cookiefile",
+    "ytmusic_auth_from_config",
 ]

@@ -8,11 +8,11 @@ chase those ourselves (we tried; Spotify 429s the bare token), we lean on
 SpotipyFree — the maintained no-creds ``spotipy`` drop-in that spotDL uses,
 which tracks those rotating bits for us.
 
-Licensing: SpotipyFree is GPL-3.0, so it is NOT bundled or required by Commissary
+Licensing: SpotipyFree is GPL-3.0, so it is NOT bundled or required by SoulSync
 (MIT). It's an OPTIONAL install — if the user has run ``pip install spotipyFree``
 this lights up; otherwise the import fails, this raises, and the caller
 (``spotify_public_scraper.fetch_spotify_public``) falls back to the embed
-scraper (today's ≤100). So Commissary ships zero GPL code and stays cleanly MIT.
+scraper (today's ≤100). So SoulSync ships zero GPL code and stays cleanly MIT.
 
 ``client_factory`` is injectable so the orchestration is unit-testable without
 the library or the network.
@@ -84,6 +84,12 @@ def fetch_public_playlist_full(
         logger.debug("playlist metadata fetch failed (%s); continuing", e)
     name = meta.get('name', 'Unknown')
     subtitle = (meta.get('owner') or {}).get('display_name', '')
+    # Playlist artwork rides on the anonymous metadata call — surface it so
+    # no-auth consumers (Companion extension, link-paste) get cover art too.
+    image_url = ''
+    images = meta.get('images') or []
+    if images and isinstance(images[0], dict):
+        image_url = images[0].get('url', '') or ''
 
     tracks: List[Dict[str, Any]] = []
     results = client.playlist_items(spotify_id)
@@ -112,6 +118,7 @@ def fetch_public_playlist_full(
         'tracks': tracks,
         'url': source_url,
         'url_hash': hashlib.md5(source_url.encode()).hexdigest()[:12],
+        'image_url': image_url,
     }
 
 

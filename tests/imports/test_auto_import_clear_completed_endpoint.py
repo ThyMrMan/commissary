@@ -18,7 +18,7 @@ These tests pin:
 - `processing` rows ARE swept (no longer zombies)
 - Live `processing` rows (folder hash currently in `_active_imports`) survive
 - `pending_review` survives (user still must approve/reject)
-- `completed` / `approved` / `failed` / `needs_identification` /
+- `completed` / `partial` / `approved` / `failed` / `needs_identification` /
   `rejected` rows still get swept (unchanged contract)
 - Count returned in the JSON response matches the actual delete count
 - Empty active set falls through to the unparameterized DELETE
@@ -81,6 +81,7 @@ def seeded_db(tmp_path):
     seeds = [
         # (folder_name, folder_hash, status)
         ('Album A',           'hash-completed-1',  'completed'),
+        ('Album Partial',     'hash-partial-1',    'partial'),
         ('Album B',           'hash-approved-1',   'approved'),
         ('Album C',           'hash-failed-1',     'failed'),
         ('Album D',           'hash-needsid-1',    'needs_identification'),
@@ -117,6 +118,14 @@ def _statuses_remaining(conn):
     return [(row['folder_name'], row['status']) for row in cur.fetchall()]
 
 
+class _ImmediateThread:
+    def __init__(self, target, **_kwargs):
+        self.target = target
+
+    def start(self):
+        self.target()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -133,8 +142,8 @@ class TestClearCompletedEndpoint:
         # Worker reports one live import — folder_hash hash-LIVE
         fake_worker = MagicMock()
         fake_worker._snapshot_active.return_value = [{'folder_hash': 'hash-LIVE'}]
-        monkeypatch.setattr('web_server.auto_import_worker', fake_worker)
-        monkeypatch.setattr('web_server.get_database', lambda: fake_db)
+        monkeypatch.setattr('api.import_routes.auto_import_worker', fake_worker)
+        monkeypatch.setattr('api.auto_import.get_database', lambda: fake_db)  # routes live in api/auto_import.py now
 
         resp = app_test_client.post('/api/auto-import/clear-completed')
         assert resp.status_code == 200
@@ -153,7 +162,9 @@ class TestClearCompletedEndpoint:
         assert 'Zombie F' not in names
         assert 'Zombie G' not in names
         # Standard terminal-status rows swept
-        for completed_name in ('Album A', 'Album B', 'Album C', 'Album D', 'Album E'):
+        for completed_name in (
+            'Album A', 'Album Partial', 'Album B', 'Album C', 'Album D', 'Album E',
+        ):
             assert completed_name not in names, f"{completed_name} should have been deleted"
 
     def test_count_in_response_matches_actual_deletes(self, app_test_client, seeded_db, monkeypatch):
@@ -162,14 +173,14 @@ class TestClearCompletedEndpoint:
         fake_db, conn = seeded_db
         fake_worker = MagicMock()
         fake_worker._snapshot_active.return_value = [{'folder_hash': 'hash-LIVE'}]
-        monkeypatch.setattr('web_server.auto_import_worker', fake_worker)
-        monkeypatch.setattr('web_server.get_database', lambda: fake_db)
+        monkeypatch.setattr('api.import_routes.auto_import_worker', fake_worker)
+        monkeypatch.setattr('api.auto_import.get_database', lambda: fake_db)  # routes live in api/auto_import.py now
 
         resp = app_test_client.post('/api/auto-import/clear-completed')
         body = resp.get_json()
-        # 9 rows seeded; 7 deletable (5 terminal + 2 zombie processing);
+        # 10 rows seeded; 8 deletable (6 terminal + 2 zombie processing);
         # 2 survive (1 live, 1 pending_review)
-        assert body['count'] == 7, f"Expected 7 deletes; got {body['count']}"
+        assert body['count'] == 8, f"Expected 8 deletes; got {body['count']}"
         cur = conn.cursor()
         cur.execute("SELECT COUNT(*) FROM auto_import_history")
         assert cur.fetchone()[0] == 2
@@ -186,15 +197,15 @@ class TestClearCompletedEndpoint:
 
         fake_worker = MagicMock()
         fake_worker._snapshot_active.return_value = []  # nothing active
-        monkeypatch.setattr('web_server.auto_import_worker', fake_worker)
-        monkeypatch.setattr('web_server.get_database', lambda: fake_db)
+        monkeypatch.setattr('api.import_routes.auto_import_worker', fake_worker)
+        monkeypatch.setattr('api.auto_import.get_database', lambda: fake_db)  # routes live in api/auto_import.py now
 
         resp = app_test_client.post('/api/auto-import/clear-completed')
         assert resp.status_code == 200
         body = resp.get_json()
         assert body['success'] is True
-        # 5 terminal + 2 zombie processing = 7. Pending_review (1) survives.
-        assert body['count'] == 7
+        # 6 terminal + 2 zombie processing = 8. Pending_review (1) survives.
+        assert body['count'] == 8
 
         survivors = _statuses_remaining(conn)
         assert len(survivors) == 1
@@ -205,7 +216,7 @@ class TestClearCompletedEndpoint:
         bails early — no DB access, clear error. Pre-fix this branch
         was already in place; pinning ensures the active-hash refactor
         didn't accidentally start touching the worker before the guard."""
-        monkeypatch.setattr('web_server.auto_import_worker', None)
+        monkeypatch.setattr('api.import_routes.auto_import_worker', None)
         resp = app_test_client.post('/api/auto-import/clear-completed')
         assert resp.status_code == 500
         body = resp.get_json()
@@ -220,8 +231,8 @@ class TestClearCompletedEndpoint:
         fake_db, conn = seeded_db
         fake_worker = MagicMock()
         fake_worker._snapshot_active.return_value = []
-        monkeypatch.setattr('web_server.auto_import_worker', fake_worker)
-        monkeypatch.setattr('web_server.get_database', lambda: fake_db)
+        monkeypatch.setattr('api.import_routes.auto_import_worker', fake_worker)
+        monkeypatch.setattr('api.auto_import.get_database', lambda: fake_db)  # routes live in api/auto_import.py now
 
         app_test_client.post('/api/auto-import/clear-completed')
 
@@ -230,3 +241,32 @@ class TestClearCompletedEndpoint:
         assert cur.fetchone()[0] == 1, (
             "pending_review rows must never be swept by clear-completed"
         )
+
+
+def test_approve_endpoint_triggers_import_scan(app_test_client, monkeypatch):
+    worker = MagicMock(running=True)
+    worker.approve_item.return_value = {'success': True}
+    monkeypatch.setattr('api.import_routes.auto_import_worker', worker)
+    monkeypatch.setattr('web_server.threading.Thread', _ImmediateThread)
+
+    response = app_test_client.post('/api/auto-import/approve/17')
+
+    assert response.get_json()['success'] is True
+    worker.approve_item.assert_called_once_with(17)
+    worker.trigger_scan.assert_called_once_with()
+
+
+def test_approve_all_triggers_one_scan_after_all_tokens_are_stored(
+    app_test_client, monkeypatch,
+):
+    worker = MagicMock(running=True)
+    worker.get_results.return_value = [{'id': 1}, {'id': 2}]
+    worker.approve_item.return_value = {'success': True}
+    monkeypatch.setattr('api.import_routes.auto_import_worker', worker)
+    monkeypatch.setattr('web_server.threading.Thread', _ImmediateThread)
+
+    response = app_test_client.post('/api/auto-import/approve-all')
+
+    assert response.get_json() == {'success': True, 'count': 2}
+    assert worker.approve_item.call_count == 2
+    worker.trigger_scan.assert_called_once_with()

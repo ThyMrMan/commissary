@@ -319,7 +319,7 @@ def test_activity_feed_logged_on_completion():
     assert len(deps._activity_log) == 1
     args, _ = deps._activity_log[0]
     title, msg = args[1], args[2]
-    assert 'YouTube Discovery Complete' in title
+    assert 'YouTube Identification Complete' in title
     assert 'Test Playlist' in msg
 
 
@@ -434,3 +434,193 @@ def test_display_artist_stays_unknown_with_no_match():
 def test_display_artist_trims_whitespace():
     assert dy.resolve_display_artist('  ', 'Matched') == 'Matched'
     assert dy.resolve_display_artist('Real Artist  ', '') == 'Real Artist'
+
+
+# ---------------------------------------------------------------------------
+# Canonical title/artist (dual-title restatement, "Artist - Title" prefix)
+# ---------------------------------------------------------------------------
+
+def _scorer_keyed_on_title(expected_title, match, *, conf=0.95):
+    """A scorer that only pays out for `expected_title`, so a test can prove
+    WHICH title the worker scored with."""
+    def _score(title, artist, duration_ms, results):
+        if title == expected_title:
+            return (match, conf, 0)
+        return (None, 0.0, 0)
+    return _score
+
+
+def test_canonical_title_scored_when_raw_title_scores_nothing():
+    """"晴る - Sunny" must also be scored as "Sunny" — the provider indexes the
+    transliteration, so the raw restated string matches nothing."""
+    states = {}
+    match = _FakeMatch(name='Sunny', artists=['Yorushika'])
+    deps = _build_deps(states=states, spotify_results=[match])
+    deps.discovery_score_candidates = _scorer_keyed_on_title('Sunny', match)
+    _seed_state('h', states, tracks=[_track(name='晴る - Sunny', artist='Yorushika')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    result = states['h']['discovery_results'][0]
+    assert result['status'] == 'Found'
+    assert result['spotify_track'] == 'Sunny'
+    assert states['h']['spotify_matches'] == 1
+
+
+def test_canonical_artist_alone_is_propagated_to_strategy5():
+    """The title isn't always what changes — clean_source_artist strips
+    "- Topic" from an auto-generated YouTube channel name, so "Arctic Monkeys -
+    Topic" canonicalizes to "Arctic Monkeys" with the title untouched. Strategy
+    5 must query and score with THAT artist, proving the full (title, artist)
+    pair propagates, not just whichever half the other tests happen to cover."""
+    states = {}
+    match = _FakeMatch(name='Do I Wanna Know?', artists=['Arctic Monkeys'])
+
+    class _OnlyCanonicalArtistQuery(_FakeSpotifyClient):
+        def search_tracks(self, query, limit=10):
+            self.search_calls.append((query, limit))
+            return [match] if 'Arctic Monkeys' in query and 'Topic' not in query else []
+
+    deps = _build_deps(states=states)
+    deps.spotify_client = _OnlyCanonicalArtistQuery(results=[])
+
+    def _score(title, artist, duration_ms, results):
+        if artist == 'Arctic Monkeys' and results:
+            return (match, 0.95, 0)
+        return (None, 0.0, 0)
+    deps.discovery_score_candidates = _score
+    _seed_state('h', states, tracks=[
+        _track(name='Do I Wanna Know?', artist='Arctic Monkeys - Topic')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    assert states['h']['discovery_results'][0]['status'] == 'Found'
+    assert any('Topic' not in q for q, _ in deps.spotify_client.search_calls)
+
+
+def test_strategy5_queries_with_the_canonical_pair():
+    """Scoring the canonical form is not enough when the RAW query returns
+    nothing to score — strategy 5 has to ask the provider for "Sunny"."""
+    states = {}
+    match = _FakeMatch(name='Sunny', artists=['Yorushika'])
+
+    class _OnlyCanonicalQuery(_FakeSpotifyClient):
+        def search_tracks(self, query, limit=10):
+            self.search_calls.append((query, limit))
+            return [match] if 'Sunny' in query and '晴る' not in query else []
+
+    deps = _build_deps(states=states)
+    deps.spotify_client = _OnlyCanonicalQuery(results=[])
+    deps.discovery_score_candidates = _scorer_keyed_on_title('Sunny', match)
+    _seed_state('h', states, tracks=[_track(name='晴る - Sunny', artist='Yorushika')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    assert states['h']['discovery_results'][0]['status'] == 'Found'
+    assert any('晴る' not in q for q, _ in deps.spotify_client.search_calls)
+
+
+def test_raw_title_still_wins_when_it_scores_higher():
+    """Canonicalization is an ADDITIONAL candidate, never a replacement."""
+    states = {}
+    raw_match = _FakeMatch(id='raw', name='COLORS (Album Mix)')
+    canon_match = _FakeMatch(id='canon', name='Colors (Ailu Mix)')
+
+    def _score(title, artist, duration_ms, results):
+        if title == 'COLORS (Album Mix) - Colors (Ailu Mix)':
+            return (raw_match, 0.99, 0)
+        return (canon_match, 0.91, 0)
+
+    deps = _build_deps(states=states, spotify_results=[raw_match, canon_match])
+    deps.discovery_score_candidates = _score
+    _seed_state('h', states, tracks=[
+        _track(name='COLORS (Album Mix) - Colors (Ailu Mix)', artist='FLOW')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    assert states['h']['discovery_results'][0]['spotify_track'] == 'COLORS (Album Mix)'
+
+
+def test_plain_title_takes_no_canonical_detour():
+    """A title with no decoration must not trigger the extra strategy-5 search."""
+    states = {}
+    deps = _build_deps(states=states, spotify_results=[])
+    _seed_state('h', states, tracks=[_track(name='Semi-Charmed Life', artist='Third Eye Blind')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    assert states['h']['discovery_results'][0]['status'] == 'Wing It'
+    # strategies 1-4 only; no canonical retry was issued. Asserting the count,
+    # not just that every query contains the title — a redundant Strategy 5
+    # call would ALSO contain "Semi-Charmed Life" and pass the weaker check.
+    assert len(deps._spotify.search_calls) == 4
+
+
+def test_canonicalization_failure_does_not_break_discovery(monkeypatch):
+    """A raising canonicalizer must degrade to raw-only matching, not error out."""
+    import core.text.source_title as st
+    monkeypatch.setattr(st, 'canonical_source_track',
+                        lambda t, a: (_ for _ in ()).throw(RuntimeError('boom')))
+    states = {}
+    match = _FakeMatch()
+    deps = _build_deps(states=states, spotify_results=[match],
+                       score_candidates_result=(match, 0.95, 0))
+    _seed_state('h', states, tracks=[_track(name='晴る - Sunny', artist='Yorushika')])
+
+    dy.run_youtube_discovery_worker('h', deps)
+
+    assert states['h']['discovery_results'][0]['status'] == 'Found'
+
+
+# ---------------------------------------------------------------------------
+# Regression: pre-seeded counter must not double-count (issue: "365 out of 364")
+# ---------------------------------------------------------------------------
+
+class _SelectiveCacheDB(_FakeDB):
+    """Returns a cache hit only for the given (title, artist) pairs."""
+
+    def __init__(self, hits):
+        super().__init__(cache_match=None)
+        self._hits = {(t.lower(), a.lower()) for t, a in hits}
+
+    def get_discovery_cache_match(self, title, artist, source):
+        if (title.lower(), artist.lower()) in self._hits:
+            return {
+                'name': title,
+                'artists': [artist],
+                'album': {'name': 'Cached Album'},
+            }
+        return None
+
+
+def test_preseeded_counter_does_not_double_count_cached_tracks():
+    """Mirrored discovery used to pre-seed spotify_matches with the cached
+    count, but the worker re-processes those tracks and increments again on
+    cache hit — yielding "365 out of 364". The seed must start at 0 so the
+    worker counts every track exactly once.
+
+    Regression test: 2 tracks, both cache hits, counter starts at 0.
+    Must end at exactly 2 (the old pre-seed of 2 would have made 4)."""
+    states = {}
+    tracks = [
+        _track(name='Cached Song One', artist='Cached Artist'),
+        _track(name='Cached Song Two', artist='Cached Artist'),
+    ]
+    # This mirrors the fixed prepare_mirrored_discovery: counter starts at 0,
+    # not pre-seeded with the cached-track count.
+    _seed_state('h1', states, tracks=tracks)
+    assert states['h1']['spotify_matches'] == 0
+
+    db = _SelectiveCacheDB(hits=[
+        ('Cached Song One', 'Cached Artist'),
+        ('Cached Song Two', 'Cached Artist'),
+    ])
+    deps = _build_deps(states=states)
+    deps._db = db
+    deps.get_database = lambda: db
+
+    dy.run_youtube_discovery_worker('h1', deps)
+
+    state = states['h1']
+    assert state['spotify_matches'] == 2
+    assert len(state['discovery_results']) == 2

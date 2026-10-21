@@ -1,26 +1,209 @@
 """Base classes for the multi-job Library Maintenance Worker."""
 
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 import os
 import threading
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
+
+from core.library.residual_files import is_appledouble
+from utils.logging_config import get_logger
+
+logger = get_logger("repair_job.base")
+
+# The recoverable quarantine removed duplicates and dead files move into. Dot-
+# prefixed ON PURPOSE: Navidrome, Plex and Jellyfin all skip hidden folders by
+# default, so the quarantine stays out of everyone's library with no per-server
+# setup. The old bare name put deleted tracks straight back on people's media
+# servers (Discord, Jose: "the deleted folder that navidrome still picks up").
+DELETED_QUARANTINE_DIRNAME = '.deleted'
+LEGACY_DELETED_DIRNAME = 'deleted'
+
+
+def deleted_quarantine_root(transfer_folder: str) -> str:
+    """The quarantine folder under ``transfer_folder`` — always the hidden
+    spelling, migrating a legacy bare ``deleted`` folder when one exists.
+
+    The migration is a single ``os.rename``, so every file a user already has in
+    quarantine disappears from their media server the moment any tool touches the
+    quarantine again — no manual cleanup. If both spellings exist (someone made
+    ``.deleted`` by hand next to an old ``deleted``) the legacy folder is left
+    alone rather than merged: both are still recognised by every walker skip, and
+    merging directory trees is how files get clobbered. A failed rename (a media
+    server holding the handle, a read-only mount) falls back to the legacy path so
+    quarantining KEEPS WORKING exactly as before rather than failing the tool.
+    """
+    canonical = os.path.join(transfer_folder, DELETED_QUARANTINE_DIRNAME)
+    legacy = os.path.join(transfer_folder, LEGACY_DELETED_DIRNAME)
+    if os.path.isdir(legacy) and not os.path.exists(canonical):
+        try:
+            os.rename(legacy, canonical)
+            logger.info("Renamed quarantine folder %s -> %s (hidden from media servers)",
+                        legacy, canonical)
+        except OSError as e:
+            logger.warning("Could not rename %s to %s (%s) — using the legacy folder",
+                           legacy, canonical, e)
+            return legacy
+    if os.path.isdir(legacy) and os.path.isdir(canonical):
+        logger.info("Both %s and %s exist — new quarantined files go to the hidden one",
+                    LEGACY_DELETED_DIRNAME, DELETED_QUARANTINE_DIRNAME)
+    return canonical
+
+
+def is_internal_transfer_dir(path: str, transfer_folder: str) -> bool:
+    """True for a SoulSync-owned folder inside the library that no maintenance
+    job may treat as library content.
+
+    Two of them, for different reasons:
+
+    * ``<transfer>/deleted`` — the recoverable quarantine removed duplicates and
+      dead files are moved into (#746). Re-scanning it makes a just-removed file
+      reappear as a finding on the next pass.
+    * ``<transfer>/.soulsync_atomic_staging`` — a half-downloaded album, mid
+      atomic publish. These files are deliberately not in the database yet, so
+      the orphan detector would call every one of them an orphan, and the empty
+      folder cleaner would delete the tree out from under an in-flight publish.
+
+    Path-based rather than name-based so it works for bottom-up walks too, where
+    pruning ``dirs`` in place does nothing.
+    """
+    try:
+        target = os.path.normpath(os.path.abspath(path))
+        base = os.path.normpath(os.path.abspath(transfer_folder))
+    except (OSError, ValueError):
+        return False
+    # both quarantine spellings: '.deleted' is what SoulSync writes now, bare
+    # 'deleted' is what older installs still carry until the rename migration
+    # in deleted_quarantine_root() runs
+    for name in (DELETED_QUARANTINE_DIRNAME, LEGACY_DELETED_DIRNAME,
+                 '.soulsync_atomic_staging'):
+        owned = os.path.join(base, name)
+        if target == owned or target.startswith(owned + os.sep):
+            return True
+    return False
 
 
 def skip_deleted_quarantine(root: str, dirs: list, transfer_folder: str) -> None:
-    """In-place prune of the ``<transfer>/deleted`` quarantine from an ``os.walk``
-    ``dirs`` list (topdown walks only).
+    """In-place prune of SoulSync's own folders from an ``os.walk`` ``dirs``
+    list (topdown walks only).
 
-    Removed duplicates / dead files are MOVED into ``<transfer>/deleted`` rather
-    than hard-deleted (recoverable; the reorganizer already skips it, #746). The
-    transfer-walking repair jobs must not re-scan that quarantine, or a
-    just-de-duplicated file immediately reappears as an orphan/finding on the next
-    pass. Anchored to the top-level ``<transfer>/deleted`` so a legitimately-named
-    ``deleted`` folder deeper in the library is untouched."""
-    deleted_root = os.path.normpath(os.path.join(transfer_folder, 'deleted'))
+    Named for the quarantine it originally guarded; it now also prunes the
+    atomic-publish staging tree, which lives inside the transfer dir since the
+    sibling location proved unwritable on Docker. Both are anchored to the
+    top level, so a legitimately-named ``deleted`` folder deeper in the library
+    is untouched.
+    """
     dirs[:] = [d for d in dirs
-               if os.path.normpath(os.path.join(root, d)) != deleted_root]
+               if not is_internal_transfer_dir(os.path.join(root, d), transfer_folder)]
 
+
+def walk_library(root: str):
+    """Walk a library tree the way every maintenance job should: SoulSync's own
+    folders and macOS AppleDouble sidecars are already gone by the time you see them.
+
+    Yields ``(dirpath, dirnames, filenames)`` like ``os.walk``, minus the
+    quarantine / atomic-staging trees and minus ``._``-prefixed files. An
+    AppleDouble sidecar (``._01 - Track.flac``) is resource-fork bytes under the
+    real file's name and extension, so every extension check in the codebase reads
+    one as audio — the orphan detector files a finding for a file no media server
+    even shows, and the quality scanner tries to probe it. Nothing else is
+    filtered: a hidden *directory* is walked like any other, as it always was.
+
+    Exists because the exclusions used to be a thing each job had to REMEMBER:
+    `skip_deleted_quarantine` was called at seven of the eight walk sites, and the
+    one that forgot (the quality-upgrade scanner's `estimate_scope`) silently
+    counted staged files its own scan would skip. Reach for this instead of
+    ``os.walk`` and the whole class of mismatch goes away.
+    """
+    for dirpath, dirnames, filenames in os.walk(root):
+        skip_deleted_quarantine(dirpath, dirnames, root)
+        yield dirpath, dirnames, [f for f in filenames if not is_appledouble(f)]
+
+
+def all_library_roots(context) -> list:
+    """Every library root a walking maintenance job should cover: the shared
+    transfer folder first, then each own-library root. #1504: walking only
+    the shared folder left own libraries invisible to maintenance jobs.
+
+    Returns a list of absolute paths. Own roots that are missing/empty are
+    skipped. The shared root is always first so default behavior (no own
+    libraries) is exactly today's single-root walk.
+    """
+    roots = []
+    transfer = getattr(context, 'transfer_folder', None)
+    if transfer:
+        roots.append(transfer)
+    try:
+        db = getattr(context, 'db', None)
+        if db and hasattr(db, 'get_own_library_profiles'):
+            for prof in db.get_own_library_profiles() or []:
+                root = prof.get('root')
+                if root and os.path.isdir(root):
+                    # avoid double-walking if an own root equals shared
+                    if os.path.normpath(root) not in {os.path.normpath(r) for r in roots}:
+                        roots.append(root)
+    except Exception as exc:
+        logger.debug("all_library_roots own-profile lookup failed: %s", exc)
+    return roots
+
+
+# hand-tagged releases ("tag it yourself"): the user typed every tag for a
+# bootleg or live recording no service knows. jobs that would match it to a
+# service, renumber it, or offer to delete it must leave it alone.
+
+def hand_tagged_path_keys(db) -> set:
+    """every hand-tagged file's path key, once per job run. anything odd
+    (no db, old schema, a test double) means nothing is hand-tagged"""
+    if db is None:
+        return set()
+    try:
+        keys = db.manual_path_keys()
+    except Exception as e:  # noqa: BLE001 - never let the guard crash a job
+        logger.debug("hand-tagged keys unavailable: %s", e)
+        return set()
+    return keys if isinstance(keys, (set, frozenset)) else set()
+
+
+def is_hand_tagged_path(path, keys) -> bool:
+    """true when this file is one the user hand-tagged"""
+    if not keys or not path:
+        return False
+    from database.music_database import MusicDatabase
+    return MusicDatabase.manual_path_key(path) in keys
+
+
+def has_metadata_locked(cursor, table: str) -> bool:
+    """does this table carry metadata_locked yet. very old schemas don't, and
+    a missing column just means nothing there is locked"""
+    try:
+        cursor.execute(f"PRAGMA table_info({table})")
+        return any(row[1] == 'metadata_locked' for row in cursor.fetchall())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def not_locked_sql(cursor, table: str, alias: str = '') -> str:
+    """an ' AND ...' clause that drops hand-tagged rows, or '' on a schema
+    without the column"""
+    if not has_metadata_locked(cursor, table):
+        return ''
+    col = f"{alias}.metadata_locked" if alias else 'metadata_locked'
+    return f" AND COALESCE({col}, 0) = 0"
+
+
+
+# a discover playlist leaves one or two loose tracks per artist. that's not
+# the user asking for the artist, so jobs that fill a whole discography or
+# album need a stronger sign (#1572). the watchlist is the deliberate one.
+
+def watchlist_artist_names(cursor) -> set:
+    """casefolded names of every watched artist, any profile. no table (old
+    schema, test double) means nobody is watched"""
+    try:
+        cursor.execute("SELECT artist_name FROM watchlist_artists")
+        return {str(r[0]).strip().casefold() for r in cursor.fetchall() if r[0]}
+    except Exception:  # noqa: BLE001
+        return set()
 
 @dataclass
 class JobResult:
@@ -31,6 +214,10 @@ class JobResult:
     auto_fixed: int = 0
     errors: int = 0
     skipped: int = 0
+    # set when the scan quit before the end for a reason that is not the user's
+    # stop (a rate limit, no provider). the run is then recorded as 'stopped'
+    # with this as the reason, not 'completed' (#1289)
+    stopped_early: str = ''
 
 
 @dataclass
@@ -55,6 +242,9 @@ class JobContext:
     is_paused: Optional[Callable[[], bool]] = None
     update_progress: Optional[Callable[[int, int], None]] = None
     report_progress: Optional[Callable] = None  # Rich progress: (phase, log_line, log_type, scanned, total)
+    # {track_id: [server playlist titles]}, read lazily by jobs that care
+    # (duplicate detector keeps the copy a playlist points at). None = unknown
+    playlist_membership: Optional[Callable[[], Dict[str, List[str]]]] = None
 
     def check_stop(self) -> bool:
         """Return True if the worker should stop."""
@@ -120,6 +310,15 @@ class RepairJob(ABC):
     # these instead of a free-text box. Keys not listed render by value type.
     setting_options: Dict[str, list] = {}
     auto_fix: bool = False
+    # True for jobs that MOVE or REWRITE real library files based on catalogue
+    # paths (reorganize, retag, track numbers, unknown-artist moves, artist
+    # splits). When such a job runs LIVE (dry_run off), the worker first proves
+    # it can actually SEE the library: with 'Report Real Path' off in Navidrome
+    # (or a broken Docker mount) the catalogue holds paths that resolve to
+    # nothing — or worse, to the WRONG files via the pattern-probing resolver —
+    # and a live run then rearranges a library it is effectively blind to
+    # (Discord, Jose: good tracks swept into the deleted quarantine).
+    writes_library_files: bool = False
 
     @abstractmethod
     def scan(self, context: JobContext) -> JobResult:

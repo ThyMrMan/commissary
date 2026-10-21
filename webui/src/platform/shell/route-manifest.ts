@@ -6,7 +6,6 @@ export const shellPageIds = [
   'playlist-explorer',
   'watchlist',
   'wishlist',
-  'purchased',
   'automations',
   'active-downloads',
   'library',
@@ -17,9 +16,13 @@ export const shellPageIds = [
   'import',
   'settings',
   'issues',
+  'requests',
   'help',
   'hydrabase',
   'chat',
+  'podcasts',
+  'audiobooks',
+  'sample-studio',
 ] as const;
 
 export type ShellPageId = (typeof shellPageIds)[number];
@@ -32,27 +35,30 @@ export interface ShellRouteDefinition {
 }
 
 export const shellRouteManifest: readonly ShellRouteDefinition[] = [
-  { pageId: 'dashboard', path: '/dashboard', kind: 'legacy' },
-  { pageId: 'sync', path: '/sync', kind: 'legacy' },
-  { pageId: 'search', path: '/search', kind: 'legacy' },
-  { pageId: 'discover', path: '/discover', kind: 'legacy' },
-  { pageId: 'playlist-explorer', path: '/playlist-explorer', kind: 'legacy' },
-  { pageId: 'watchlist', path: '/watchlist', kind: 'legacy' },
-  { pageId: 'wishlist', path: '/wishlist', kind: 'legacy' },
-  { pageId: 'purchased', path: '/purchased', kind: 'legacy' },
-  { pageId: 'automations', path: '/automations', kind: 'legacy' },
-  { pageId: 'active-downloads', path: '/active-downloads', kind: 'legacy' },
+  { pageId: 'dashboard', path: '/dashboard', kind: 'react' },
+  { pageId: 'sync', path: '/sync', kind: 'react' },
+  { pageId: 'search', path: '/search', kind: 'react' },
+  { pageId: 'discover', path: '/discover', kind: 'react' },
+  { pageId: 'playlist-explorer', path: '/playlist-explorer', kind: 'react' },
+  { pageId: 'watchlist', path: '/watchlist', kind: 'react' },
+  { pageId: 'wishlist', path: '/wishlist', kind: 'react' },
+  { pageId: 'automations', path: '/automations', kind: 'react' },
+  { pageId: 'active-downloads', path: '/active-downloads', kind: 'react' },
   { pageId: 'import', path: '/import', kind: 'react' },
-  { pageId: 'library', path: '/library', kind: 'legacy' },
-  { pageId: 'tools', path: '/tools', kind: 'legacy' },
-  { pageId: 'artist-detail', path: '/artist-detail', kind: 'legacy' },
-  { pageId: 'label-detail', path: '/label-detail', kind: 'legacy' },
+  { pageId: 'library', path: '/library', kind: 'react' },
+  { pageId: 'tools', path: '/tools', kind: 'react' },
+  { pageId: 'artist-detail', path: '/artist-detail', kind: 'react' },
+  { pageId: 'label-detail', path: '/label-detail', kind: 'react' },
   { pageId: 'stats', path: '/stats', kind: 'react' },
   { pageId: 'settings', path: '/settings', kind: 'legacy' },
   { pageId: 'issues', path: '/issues', kind: 'react' },
+  { pageId: 'requests', path: '/requests', kind: 'react' },
   { pageId: 'help', path: '/help', kind: 'legacy' },
   { pageId: 'hydrabase', path: '/hydrabase', kind: 'legacy' },
   { pageId: 'chat', path: '/chat', kind: 'legacy' },
+  { pageId: 'podcasts', path: '/podcasts', kind: 'react' },
+  { pageId: 'audiobooks', path: '/audiobooks', kind: 'react' },
+  { pageId: 'sample-studio', path: '/sample-studio', kind: 'react' },
 ] as const;
 
 const routeByPageId = new Map(shellRouteManifest.map((route) => [route.pageId, route]));
@@ -62,6 +68,10 @@ export const reactShellRoutes = shellRouteManifest.filter((route) => route.kind 
 export const legacyShellRoutes = shellRouteManifest.filter((route) => route.kind === 'legacy');
 
 export function normalizeShellPath(pathname: string): string {
+  const base =
+    document.querySelector<HTMLMetaElement>('meta[name="soulsync-url-base"]')?.content || '';
+  if (base && (pathname === base || pathname.startsWith(base + '/')))
+    pathname = pathname.slice(base.length) || '/';
   if (!pathname) return '/';
   if (pathname === '/') return '/';
   const normalized = pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;

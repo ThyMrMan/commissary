@@ -1,5 +1,5 @@
 // ============================================================
-// Commissary — Page Particle System
+// SoulSync — Page Particle System
 // Single canvas, per-page particle behaviors
 // ============================================================
 

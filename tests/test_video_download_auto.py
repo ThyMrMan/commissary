@@ -91,12 +91,9 @@ def test_episode_per_source_auto_is_wired():
 
 def test_grab_whole_season_button_and_batch():
     assert 'data-vdl-season-grab="' in _VIEW          # per-season button
-    assert '>Download season<' in _VIEW
+    assert '>Grab season<' in _VIEW
     assert 'function grabSeason(' in _VIEW
-    # autoGrabEpisode is gone: Download season fetches ONE pack, so there is no
-    # per-episode auto-grab helper left to call.
-    assert 'function autoGrabEpisode(' not in _VIEW
-    assert "scope: 'season'" in _VIEW
+    assert 'function autoGrabEpisode(' in _VIEW
     # episode-LEVEL: it loops missing episodes and auto-grabs each (no pack grab)
     assert "st.epMeta[k].state === 'missing'" in _VIEW
     assert ".vdl-season-grab" in _CSS
@@ -105,9 +102,5 @@ def test_grab_whole_season_button_and_batch():
 def test_season_grab_reuses_the_single_grab_path():
     # each episode goes through the same searchInto + _autoPick as a manual Auto,
     # so the batch can't diverge from the single path
-    # One search and one grab for the whole season, not one per episode. The
-    # grab itself still goes through the shared sendGrab/_grabPack paths.
-    assert 'autoGrabEpisode' not in _VIEW
-    assert 'sendGrab(buildGrabPayload(panel, best))' in _VIEW
-    assert '_grabPack(panel, best)' in _VIEW
+    assert 'autoGrabEpisode(container, st, sn, eps[idx++], src)' in _VIEW
     assert 'searchInto(container, panel,' in _VIEW

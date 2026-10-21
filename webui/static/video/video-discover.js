@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Discover page (isolated, in-app).
+ * SoulSync — Video Discover page (isolated, in-app).
  *
  * A browse-everything page for TMDB titles you don't own yet: a cross-fading
  * trending hero, personalized "because you like…" rails, then a deep stack of
@@ -23,7 +23,8 @@
         myProviders: [],   // saved streaming services -> 'On your streaming services' rail
         io: null,
         hero: { items: [], idx: 0, timer: null },
-        cat: { title: '', q: '', page: 1, paginates: true, busy: false, hasMore: false },
+        catGen: 0,   // bumped per query; a response paints only if it still matches
+        cat: { title: '', q: '', page: 1, paginates: true, busy: false, hasMore: false, gen: 0 },
         sel: { kind: 'movie', genre: '', decade: '', providers: '', lang: '', sort: 'popularity.desc' },   // Browse panel
     };
     var AUTO = (typeof IntersectionObserver !== 'undefined');   // infinite-scroll capable
@@ -128,6 +129,22 @@
         { title: 'Hindi Cinema', q: 'kind=movie&sort=popularity.desc&lang=hi' },
     ];
 
+    // One-line descriptions under each group heading (music Discover
+    // language: a strong title, one quiet line, then the rows).
+    // IIFE scope: renderShelves() reads this when stamping group headers.
+    var GROUP_SUBS = {
+        foryou: 'Picked for your shelves',
+        topten: "What everyone's watching right now",
+        'new': 'Fresh releases and recent standouts',
+        collection: 'Complete the sets you started',
+        taste: 'Based on what you already own',
+        popular: 'Trending across the catalog',
+        mood: 'Find the right vibe for tonight',
+        studios: 'From the studios you follow',
+        genre: 'Every genre, one rail at a time',
+        different: 'Go off the beaten path',
+    };
+
     // The page is organised into a FIXED, authored sequence of groups (each with a header).
     // Static rails are placed into their group here; the async personalized rows fill their
     // group's body when they arrive — so the on-screen order is stable no matter which fetch
@@ -201,7 +218,9 @@
             'data-vsr-open="' + it.kind + '" data-vsr-source="' + source + '" data-vsr-id="' + id +
             '" style="--vgm-h:' + hueOf(it.title) + '">' + cb + notInt +
             '<div class="vsr-poster">' + img + ribbon + rating + fresh +
-            '<span class="vsr-peek" aria-hidden="true">i</span></div>' +
+            '<span class="vsr-peek" aria-hidden="true"><svg viewBox="0 0 24 24" width="18" height="18">' +
+            '<path d="M7 17L17 7M9 7h8v8" stroke="currentColor" stroke-width="2" fill="none" ' +
+            'stroke-linecap="round" stroke-linejoin="round"/></svg></span></div>' +
             '<div class="vsr-info"><span class="vsr-name" title="' + esc(it.title) + '">' + esc(it.title) +
             '</span><span class="vsr-sub">' + esc(sub) + '</span></div></a>';
     }
@@ -212,24 +231,153 @@
     function hydrateGet(root) { if (window.VideoWatchlist) VideoWatchlist.hydrate(root); }
 
     // ── 'Not interested' + ignore-list management ─────────────────────────────
+    // Resolves to the payload on a real success, null otherwise. Callers must
+    // check it: this used to be fired and forgotten, and the card disappeared
+    // whether or not anything was saved.
     function postIgnore(payload) {
         return fetch('/api/video/discover/ignore', {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
-        }).then(function (r) { return r.ok ? r.json() : null; });
+        }).then(function (r) { return r.ok ? r.json() : null; })
+          .then(function (d) { return (d && d.success === true) ? d : null; })
+          .catch(function () { return null; });
     }
+    // Every tile for the same title, wherever it sits. Hiding only the one you
+    // clicked left the same movie sitting in three other rails.
+    function occurrencesOf(kind, id) {
+        var sel = '.vsr-notint[data-ig-kind="' + kind + '"][data-ig-id="' + id + '"]';
+        return Array.prototype.map.call(document.querySelectorAll(sel), function (b) {
+            var c = b.closest('.vsr-card');
+            // A Top-10 tile carries a huge rank numeral in its wrapper; hiding
+            // the card alone leaves the number floating on its own.
+            return c ? (c.closest('.vsr-ranked') || c) : null;
+        }).filter(Boolean);
+    }
+    function toast(msg, kind) { if (window.showToast) window.showToast(msg, kind || 'info'); }
+
+    // The Undo bar. A toast can't carry a button and this needs one: hiding a
+    // title is a taste decision, and "not tonight" must be reversible.
+    var _undoPrev = null;   // _undoPrev: expire() of the live Undo bar
+    function showUndoBar(title, onUndo) {
+        // A second hide inside the first Undo window used to orphan the
+        // earlier tiles: the old bar was removed without expire() ever
+        // running, so its cards stayed hidden-but-present for the session.
+        // Expire the previous undo first — its cards are dropped for real —
+        // then the new bar takes over.
+        if (_undoPrev) { var prev = _undoPrev; _undoPrev = null; try { prev(); } catch (e) {} }
+        var ex = document.getElementById('vdsc-undo'); if (ex) ex.remove();
+        var bar = document.createElement('div');
+        bar.id = 'vdsc-undo';
+        bar.className = 'vdsc-undo';
+        bar.setAttribute('role', 'status');
+        bar.innerHTML = '<span class="vdsc-undo-txt">Hidden ' + esc(title || 'that title') + '</span>' +
+            '<button class="vdsc-undo-btn" type="button">Undo</button>' +
+            '<button class="vdsc-undo-x" type="button" aria-label="Dismiss">✕</button>';
+        document.body.appendChild(bar);
+        var settled = false;        // this bar's fate is decided — late events are no-ops
+        var undoing = false;        // an Undo request is in flight
+        var pendingExpire = false;  // expire() arrived mid-undo; honoured when the undo lands
+        var timer = null;           // this bar's own 9s clock (never the shared one)
+        var done = function () { if (timer) { clearTimeout(timer); timer = null; } if (bar.parentNode) bar.remove(); };
+        var expire = function () {   // keep the server state, drop the bar
+            if (settled) return;
+            // An Undo is in flight: dropping the cards now would strand them
+            // if the server restores the title a moment later. Wait for it.
+            if (undoing) { pendingExpire = true; return; }
+            settled = true;
+            if (_undoPrev === expire) _undoPrev = null;
+            done(); onUndo.expire();
+        };
+        bar.querySelector('.vdsc-undo-btn').addEventListener('click', function () {
+            var button = this;
+            if (button.disabled) return;
+            if (timer) { clearTimeout(timer); timer = null; }
+            button.disabled = true; button.textContent = 'Restoring…';
+            undoing = true;
+            Promise.resolve(onUndo()).then(function (saved) {
+                undoing = false;
+                // Note: expire() defers while undoing, so settled is always
+                // false here — the only question is whether an expire was
+                // deferred mid-flight (pendingExpire).
+                if (saved) {
+                    // Server restored the title; undo() already put the cards
+                    // back. A deferred expire must NOT drop them now.
+                    settled = true; pendingExpire = false;
+                    if (_undoPrev === expire) _undoPrev = null;
+                    done();
+                    return;
+                }
+                if (pendingExpire) {
+                    // The bar was superseded (or dismissed) mid-flight and the
+                    // Undo failed: honour the deferred expire — the hide
+                    // stands, so the cards are dropped for real.
+                    pendingExpire = false; expire();
+                    return;
+                }
+                button.disabled = false; button.textContent = 'Retry Undo';
+                // Keep failed Undo available instead of expiring its recovery path.
+                button.focus();
+            });
+        });
+        // A failed undo used to leave a permanent "Retry Undo" bar with no
+        // way off screen — the ✕ expires it like the timer would.
+        bar.querySelector('.vdsc-undo-x').addEventListener('click', expire);
+        timer = setTimeout(expire, 9000);
+        _undoPrev = expire;
+        return done;
+    }
+
     function wireNotInterested() {
         if (state._notIntWired) return; state._notIntWired = true;
         document.addEventListener('click', function (e) {
             var b = e.target.closest('.vsr-notint'); if (!b) return;
             e.preventDefault(); e.stopPropagation();
-            postIgnore({ action: 'add', kind: b.getAttribute('data-ig-kind'),
-                tmdb_id: parseInt(b.getAttribute('data-ig-id'), 10),
-                title: b.getAttribute('data-ig-title'),
+            if (b.disabled) return;
+            var kind = b.getAttribute('data-ig-kind');
+            var id = parseInt(b.getAttribute('data-ig-id'), 10);
+            var title = b.getAttribute('data-ig-title') || 'that title';
+            var cards = occurrencesOf(kind, id);
+            // Optimistic, but the cards stay in the DOM hidden until the save
+            // is acknowledged, so putting them back is exact rather than a
+            // guess at where they were.
+            b.disabled = true;
+            cards.forEach(function (c) { c.classList.add('vdsc-card-hiding'); });
+            postIgnore({ action: 'add', kind: kind, tmdb_id: id, title: title,
                 year: parseInt(b.getAttribute('data-ig-year'), 10) || null,
-                poster: b.getAttribute('data-ig-poster') || null });
-            var card = b.closest('.vsr-card');
-            if (card) { card.style.transition = 'opacity .2s, transform .2s'; card.style.opacity = '0'; card.style.transform = 'scale(.92)'; setTimeout(function () { card.remove(); }, 200); }
+                poster: b.getAttribute('data-ig-poster') || null })
+                .then(function (d) {
+                    if (!d) {
+                        // Put it back exactly where it was and say so. It used
+                        // to vanish whatever the server answered.
+                        cards.forEach(function (c) { c.classList.remove('vdsc-card-hiding'); });
+                        b.disabled = false;
+                        try { b.focus(); } catch (err) { /* not focusable, fine */ }
+                        toast('Couldn\'t hide ' + title + '. Try again.', 'error');
+                        return;
+                    }
+                    var undo = function () {
+                        return postIgnore({ action: 'remove', kind: kind, tmdb_id: id })
+                            .then(function (r) {
+                                if (!r) throw new Error('Undo not saved');
+                                cards.forEach(function (c) { c.classList.remove('vdsc-card-hiding'); });
+                                b.disabled = false;
+                                return true;
+                            })
+                            .catch(function () {
+                                toast('Couldn\'t un-hide ' + title + '. Try Undo again.', 'error');
+                                return false;
+                            });
+                    };
+                    // Nothing left to undo: drop the tiles for real.
+                    undo.expire = function () { cards.forEach(function (c) { c.remove(); }); };
+                    showUndoBar(title, undo);
+                })
+                .catch(function () {
+                    cards.forEach(function (c) { c.classList.remove('vdsc-card-hiding'); });
+                    b.disabled = false;
+                    try { b.focus(); } catch (err) { /* not focusable, fine */ }
+                    toast('Couldn\'t hide ' + title + '. Try again.', 'error');
+                });
         }, true);
     }
     function igRowHtml(it, btnLabel) {
@@ -307,15 +455,21 @@
             postIgnore({ action: 'add', kind: b.getAttribute('data-ig-kind'),
                 tmdb_id: parseInt(b.getAttribute('data-ig-id'), 10), title: b.getAttribute('data-ig-title'),
                 year: parseInt(b.getAttribute('data-ig-year'), 10) || null, poster: b.getAttribute('data-ig-poster') || null })
-                .then(function () { input.value = ''; resBox.innerHTML = ''; renderIgnoreList(ov); });
+                .then(function (d) {
+                    if (!d) { toast('Couldn\'t hide that title. Try again.', 'error'); return; }
+                    input.value = ''; resBox.innerHTML = ''; renderIgnoreList(ov);
+                });
         });
         ov.querySelector('[data-ig-list]').addEventListener('click', function (e) {
             var b = e.target.closest('.vdsc-ig-remove'); if (!b) return;
             var c = b.closest('.vdsc-ig-card');
             postIgnore({ action: 'remove', kind: c.getAttribute('data-ig-kind'),
                 tmdb_id: parseInt(c.getAttribute('data-ig-id'), 10) })
-                .then(function () { c.style.opacity = '0'; c.style.transform = 'scale(.9)';
-                    setTimeout(function () { renderIgnoreList(ov); }, 160); });
+                .then(function (d) {
+                    if (!d) { toast('Couldn\'t un-hide that title. Try again.', 'error'); return; }
+                    c.style.opacity = '0'; c.style.transform = 'scale(.9)';
+                    setTimeout(function () { renderIgnoreList(ov); }, 160);
+                });
         });
     }
 
@@ -323,7 +477,7 @@
     function loadHero() {
         fetch('/api/video/discover/hero', { headers: { Accept: 'application/json' } })
             .then(function (r) { return r.ok ? r.json() : null; })
-            .then(function (d) { state.hero.items = (d && d.items) || []; renderHero(); })
+            .then(function (d) { state.hero.items = (d && d.items) || []; _poolAdd(state.hero.items); renderHero(); maybeRenderStories(); })
             .catch(function () { /* hero is optional chrome */ });
     }
     function renderHero() {
@@ -339,11 +493,32 @@
             }).join('') + '</div>' +
             '<div class="vdsc-hero-body" data-vdsc-hero-body></div>' +
             '<div class="vdsc-dots">' + items.map(function (it, i) {
-                return '<button class="vdsc-dot' + (i === 0 ? ' vdsc-dot--on' : '') + '" type="button" data-vdsc-go="' + i + '" aria-label="Slide ' + (i + 1) + '"></button>';
-            }).join('') + '</div>';
+                // Music-Discover parity: the dots are poster thumbs (like the
+                // music side's artist avatar dots), plain dots when no poster.
+                var thumb = it.poster ? ' vdsc-dot--thumb" style="background-image:url(\'' + esc(it.poster) + '\')' : '';
+                return '<button class="vdsc-dot' + (i === 0 ? ' vdsc-dot--on' : '') + thumb + '" type="button" data-vdsc-go="' + i + '" aria-label="Pick ' + esc(it.title || ('slide ' + (i + 1))) + '"></button>';
+            }).join('') + '</div>' +
+            '<button class="vdsc-hero-picks" type="button" data-vdsc-picks>See all picks <span aria-hidden="true">→</span></button>' +
+            '<button class="vdsc-hero-nav vdsc-hero-nav--prev" type="button" data-vdsc-prev aria-label="Previous title">‹</button>' +
+            '<button class="vdsc-hero-nav vdsc-hero-nav--next" type="button" data-vdsc-next aria-label="Next title">›</button>';
         state.hero.idx = 0;
         paintHeroBody();
         startHeroTimer();
+    }
+    // Ambient wash crossfade: two hue layers (::before/::after) alternate so the
+    // background melts from one hero title's color into the next. The incoming
+    // layer fades in over 1.6s; the outgoing one is hidden only after it is
+    // fully covered, so there is never a snap.
+    var _ambFlip = false;
+    function paintAmbient(hue) {
+        var pageEl = $('[data-vdsc-page]'); if (!pageEl) return;
+        _ambFlip = !_ambFlip;
+        pageEl.style.setProperty(_ambFlip ? '--vdsc-amb-a' : '--vdsc-amb-b', hue);
+        var amb = $('[data-vdsc-amb]'); if (!amb) return;
+        amb.classList.add('vdsc-amb--on');
+        amb.classList.remove('vdsc-amb--a', 'vdsc-amb--b');
+        void amb.offsetWidth;   // reflow so the opacity transition always runs
+        amb.classList.add(_ambFlip ? 'vdsc-amb--a' : 'vdsc-amb--b');
     }
     function paintHeroBody() {
         var body = $('[data-vdsc-hero-body]'); if (!body) return;
@@ -351,12 +526,15 @@
         var owned = it.library_id != null;
         var source = owned ? 'library' : 'tmdb';
         var id = owned ? it.library_id : it.tmdb_id;
-        var pills = [it.kind === 'movie' ? 'Movie' : 'TV Series', it.year,
+        var meta = [it.kind === 'movie' ? 'Movie' : 'TV Series', it.year,
             it.rating ? '★ ' + (Math.round(it.rating * 10) / 10) : null,
-            owned ? 'In Library' : null].filter(Boolean);
+            owned ? 'In your library' : null].filter(Boolean);
         var hue = hueOf(it.title);
+        // Set on the hero host (not just the body) so the dots, scrims and
+        // eyebrow — all children of the host — inherit the per-title hue.
+        var heroEl = $('[data-vdsc-hero]'); if (heroEl) heroEl.style.setProperty('--vgm-h', hue);
         body.style.setProperty('--vgm-h', hue);
-        var pageEl = $('[data-vdsc-page]'); if (pageEl) pageEl.style.setProperty('--vdsc-amb', hue);   // ambient bleed
+        paintAmbient(hue);   // crossfading background wash
         // Netflix-style billboard: the TMDB wordmark logo when the title has
         // one (backend enriches hero items), text falls back. Alt carries the
         // title so a broken logo image still reads.
@@ -365,10 +543,12 @@
               'onerror="this.outerHTML=\'<h2 class=&quot;vdsc-hero-title&quot;>' + esc(it.title) + '</h2>\'">'
             : '<h2 class="vdsc-hero-title">' + esc(it.title) + '</h2>';
         body.innerHTML =
-            '<div class="vdsc-hero-eyebrow">' + (owned ? 'In your library' : '#' + (state.hero.idx + 1) + ' Trending now') + '</div>' +
+            (owned ? '' :
+            '<div class="vdsc-hero-eyebrow"><span class="vdsc-hero-eyebrow-dot" aria-hidden="true"></span>' +
+            '#' + (state.hero.idx + 1) + ' Trending now</div>') +
             titleHtml +
-            '<div class="vdsc-hero-pills">' + pills.map(function (p) {
-                return '<span class="vdsc-hero-pill">' + esc(p) + '</span>'; }).join('') + '</div>' +
+            '<div class="vdsc-hero-meta">' + meta.map(function (m) {
+                return '<span class="vdsc-hero-meta-item">' + esc(m) + '</span>'; }).join('') + '</div>' +
             (it.overview ? '<p class="vdsc-hero-ov">' + esc(it.overview) + '</p>' : '') +
             '<div class="vdsc-hero-actions">' +
             '<button class="discog-submit-btn vdsc-hero-cta" type="button" ' +
@@ -476,6 +656,7 @@
                 var rails = (d && d.rails) || [];
                 var body = $('[data-group-body="taste"]');
                 if (!rails.length || !body) return;
+                rails.forEach(function (rl) { _poolAdd(rl.items); });
                 var html = rails.map(function (rl) {
                     return filledShelfHtml(rl.title, (rl.items || []).map(card).join(''), 'vdsc-shelf--ml');
                 }).join('');
@@ -483,6 +664,7 @@
                 revealGroup('taste');
                 staggerWithin(body);
                 hydrateGet(body);
+                maybeRenderStories();   // throwback card may now have pool items
             })
             .catch(function () { /* personalization is best-effort */ });
     }
@@ -496,8 +678,11 @@
             .then(function (d) {
                 if (gen !== (state.railGen || 0)) return;   // a newer rebuild superseded this
                 var rails = (d && d.rails) || [];
+                state._gapRails = rails;
+                state._gapsArrived = true;
                 var body = $('[data-group-body="collection"]');
-                if (!rails.length || !body) return;
+                if (!rails.length || !body) { maybeRenderStories(); return; }
+                rails.forEach(function (rl) { _poolAdd(rl.items); });
                 var html = rails.map(function (rl) {
                     return filledShelfHtml(rl.title, (rl.items || []).map(card).join(''), 'vdsc-shelf--gap');
                 }).join('');
@@ -505,6 +690,7 @@
                 revealGroup('collection');
                 staggerWithin(body);
                 hydrateGet(body);
+                maybeRenderStories();
             })
             .catch(function () { /* gaps are best-effort */ });
     }
@@ -519,14 +705,241 @@
                 var items = (d && d.items) || [];
                 var body = $('[data-group-body="foryou"]');
                 if (items.length < 6 || !body) return;
+                state._foryouItems = items;
+                _poolAdd(items);
                 // afterbegin: sits above the (static) "On your streaming services" rail in the group.
                 body.insertAdjacentHTML('afterbegin',
                     filledShelfHtml('Recommended for you', items.map(card).join(''), 'vdsc-shelf--foryou'));
                 revealGroup('foryou');
                 staggerWithin(body);
                 hydrateGet(body);
+                renderTrailerRail();
+                maybeRenderStories();
             })
             .catch(function () { /* best-effort */ });
+    }
+
+    // ── story blocks (music-Discover parity) ────────────────────────────────
+    // Editorial cards + a vertical trailer rail, composed from data the page
+    // already fetches — no new endpoints. Each personalized loader stashes its
+    // items in state._pool; maybeRenderStories fires once hero + foryou + gaps
+    // have all landed (morelike/taste may join late — the throwback card is
+    // optional chrome and renders only if pool items exist by then).
+    function _poolAdd(items) {
+        if (!items || !items.length) return;
+        var pool = state._pool || (state._pool = []);
+        var seen = {};
+        pool.forEach(function (it) { if (it && it.tmdb_id != null) seen[it.kind + ':' + it.tmdb_id] = 1; });
+        items.forEach(function (it) {
+            if (!it || it.tmdb_id == null || seen[it.kind + ':' + it.tmdb_id]) return;
+            seen[it.kind + ':' + it.tmdb_id] = 1;
+            pool.push(it);
+        });
+    }
+    function _storyCard(o) {
+        // o: {eyebrow, eyebrowHue, title, sub, art, kind, tmdb_id, library_id, year, extraAction}
+        var owned = o.library_id != null;
+        var source = owned ? 'library' : 'tmdb';
+        var id = owned ? o.library_id : o.tmdb_id;
+        return '<article class="vdsc-story" style="--vgm-h:' + (o.eyebrowHue || hueOf(o.title)) + ';' +
+            (o.art ? "background-image:url('" + esc(o.art) + "')" : '') + '">' +
+            '<div class="vdsc-story-scrim" aria-hidden="true"></div>' +
+            '<div class="vdsc-story-body">' +
+            '<span class="vdsc-story-eyebrow"><span class="vdsc-story-eyebrow-dot" aria-hidden="true"></span>' +
+            esc(o.eyebrow) + '</span>' +
+            '<h3 class="vdsc-story-title">' + esc(o.title) + '</h3>' +
+            (o.sub ? '<p class="vdsc-story-sub">' + esc(o.sub) + '</p>' : '') +
+            '<div class="vdsc-story-actions">' +
+            (o.tmdb_id != null
+                ? '<button class="vdsc-hero-trailer" type="button" data-vdsc-trailer ' +
+                  'data-kind="' + o.kind + '" data-tmdb="' + o.tmdb_id + '" data-title="' + esc(o.title) + '">' +
+                  '<span class="vdsc-tr-ic" aria-hidden="true">▶</span> Trailer</button>'
+                : '') +
+            (id != null
+                ? '<button class="discog-submit-btn vdsc-hero-cta" type="button" ' +
+                  'data-vsr-open="' + o.kind + '" data-vsr-source="' + source + '" data-vsr-id="' + id + '">' +
+                  '<span class="discog-submit-text">More info</span></button>'
+                : '') +
+            (o.extraAction || '') +
+            '</div></div></article>';
+    }
+    function maybeRenderStories() {
+        maybeRenderBanners();   // banners share the data trio; own done-flag
+        if (state._storiesDone) return;
+        var heroItems = state.hero.items || [];
+        var foryou = state._foryouItems || [];
+        var gapRails = state._gapRails || [];
+        if (!heroItems.length || !foryou.length || !state._gapsArrived) return;   // wait for the trio
+        state._storiesDone = true;
+        var pool = (state._pool || []).slice();
+        var cards = [];
+        // 1 · New this week — the newest title across hero + for-you.
+        var newest = null;
+        heroItems.concat(foryou).forEach(function (it) {
+            if (it && it.year && (!newest || it.year > newest.year)) newest = it;
+        });
+        if (newest) cards.push(_storyCard({
+            eyebrow: 'NEW • ' + newest.year, eyebrowHue: hueOf(newest.title),
+            title: newest.title,
+            sub: (newest.kind === 'movie' ? 'New movie' : 'New series') +
+                 (newest.overview ? ' — ' + newest.overview.slice(0, 90) + '…' : ''),
+            art: newest.backdrop || newest.poster,
+            kind: newest.kind, tmdb_id: newest.tmdb_id, library_id: newest.library_id
+        }));
+        // 2 · Your collection is missing — first franchise gap rail.
+        var coll = null;
+        gapRails.forEach(function (rl) { if (!coll && rl && rl.kind === 'collection') coll = rl; });
+        if (coll) {
+            var fname = String(coll.title || '').replace(/^Complete the\s+/i, '') || 'this collection';
+            var n = (coll.items || []).length;
+            cards.push(_storyCard({
+                eyebrow: 'YOUR COLLECTION IS MISSING', eyebrowHue: 268,
+                title: fname,
+                sub: 'You own part of it — ' + n + (n === 1 ? ' title' : ' titles') + " you're missing.",
+                art: (coll.items[0] && (coll.items[0].backdrop || coll.items[0].poster)) || null,
+                kind: 'movie', tmdb_id: null, library_id: null,
+                extraAction: '<button class="vdsc-btn vdsc-btn--ghost" type="button" data-vdsc-goto-collection>' +
+                             'See what\u2019s missing</button>'
+            }));
+        }
+        // 3 · Throwback — the oldest title in the pool (prefers pre-2000).
+        var old = null, oldestAny = null;
+        pool.forEach(function (it) {
+            if (!it || !it.year) return;
+            if (!oldestAny || it.year < oldestAny.year) oldestAny = it;
+            if (it.year < 2000 && (!old || it.year < old.year)) old = it;
+        });
+        var tb = old || oldestAny;
+        if (tb && (!newest || tb.tmdb_id !== newest.tmdb_id || tb.kind !== newest.kind)) cards.push(_storyCard({
+            eyebrow: 'THROWBACK', eyebrowHue: 36,
+            title: tb.title,
+            sub: 'From ' + tb.year + ' — still holds up.',
+            art: tb.backdrop || tb.poster,
+            kind: tb.kind, tmdb_id: tb.tmdb_id, library_id: tb.library_id
+        }));
+        if (!cards.length) return;
+        var row = $('[data-vdsc-stories-row]'); if (!row) return;
+        row.innerHTML = cards.join('');
+        var sec = $('[data-vdsc-stories]'); if (sec) sec.classList.remove('hidden');
+        if (window.VideoWishState) VideoWishState.hydrate(row);
+    }
+    // ── full-width poster banners (music-Discover parity) ──────────────────
+    // Same data trio as the stories; each banner is a cinematic moment between
+    // rail groups. Rendered once per rail-stack build (own done-flag).
+    function maybeRenderBanners() {
+        if (state._bannersDone) return;
+        var heroItems = state.hero.items || [];
+        var foryou = state._foryouItems || [];
+        var gapRails = state._gapRails || [];
+        if (!heroItems.length || !foryou.length || !state._gapsArrived) return;
+        state._bannersDone = true;
+        renderSagaBanner(gapRails);
+        renderFreshBanner(heroItems.concat(foryou));
+        observeBanners();
+    }
+    function _bannerShell(label, art, marquee, eyebrow, title, sub, cta) {
+        var mq = esc((marquee + ' \u2022 ').repeat(3));
+        return '<section class="vdsc-banner" aria-label="' + esc(label) + '">' +
+            (art ? '<div class="vdsc-banner-art" style="background-image:url(\'' + esc(art) + '\')" aria-hidden="true"></div>' : '') +
+            '<div class="vdsc-banner-scrim" aria-hidden="true"></div>' +
+            '<div class="vdsc-banner-marquee" aria-hidden="true"><span>' + mq + '</span><span>' + mq + '</span></div>' +
+            '<div class="vdsc-banner-body">' +
+            '<span class="vdsc-banner-eyebrow">' + esc(eyebrow) + '</span>' +
+            '<h3 class="vdsc-banner-title">' + title + '</h3>' +
+            (sub ? '<p class="vdsc-banner-sub">' + sub + '</p>' : '') +
+            cta +
+            '</div></section>';
+    }
+    // "Complete the saga" — first franchise gap, after the collection group.
+    function renderSagaBanner(gapRails) {
+        var slot = document.querySelector('[data-vdsc-banner-slot="saga"]'); if (!slot) return;
+        var coll = null;
+        gapRails.forEach(function (rl) { if (!coll && rl && rl.kind === 'collection') coll = rl; });
+        if (!coll || !(coll.items || []).length) return;
+        var fname = String(coll.title || '').replace(/^Complete the\s+/i, '') || 'this collection';
+        var n = coll.items.length;
+        var art = null;
+        for (var i = 0; i < coll.items.length; i++) {
+            var a = coll.items[i].backdrop || coll.items[i].poster;
+            if (a) { art = a; break; }
+        }
+        slot.innerHTML = _bannerShell(
+            'Complete the saga', art, 'Complete the saga',
+            'Your collection is incomplete', esc(fname),
+            'You own part of it \u2014 <strong>' + n + (n === 1 ? ' title' : ' titles') +
+                '</strong> you don\u2019t own yet.',
+            '<button class="vdsc-btn" type="button" data-vdsc-goto-collection>See what\u2019s missing</button>'
+        );
+    }
+    // "Fresh this week" — newest titles across hero + for-you, after the new group.
+    function renderFreshBanner(items) {
+        var slot = document.querySelector('[data-vdsc-banner-slot="fresh"]'); if (!slot) return;
+        var fresh = items.filter(function (it) { return it && it.year; })
+            .sort(function (a, b) { return b.year - a.year; }).slice(0, 4);
+        if (fresh.length < 2) return;
+        var art = fresh[0].backdrop || fresh[0].poster;
+        var names = fresh.map(function (it) { return it.title; }).filter(Boolean);
+        var shown = names.slice(0, 3).map(esc).join(', ');
+        slot.innerHTML = _bannerShell(
+            'Fresh this week', art, names.join(' '),
+            'New & noteworthy', 'Fresh<br>this week',
+            '<strong>' + shown + '</strong>' + (names.length > 3 ? ' and more' : '') + ' just landed.',
+            '<button class="vdsc-btn" type="button" data-vdsc-goto-group="new">Browse new arrivals</button>'
+        );
+    }
+    // Reveal banners as they scroll into view (entrance + drift start together).
+    function observeBanners() {
+        var banners = document.querySelectorAll('.vdsc-banner:not([data-vdsc-obs])');
+        if (!banners.length) return;
+        var reveal = function (el) { el.classList.add('vdsc-banner--in'); };
+        var i;
+        if (!('IntersectionObserver' in window)) {
+            for (i = 0; i < banners.length; i++) reveal(banners[i]);
+            return;
+        }
+        var io = new IntersectionObserver(function (entries) {
+            entries.forEach(function (en) {
+                if (en.isIntersecting) { io.unobserve(en.target); reveal(en.target); }
+            });
+        }, { threshold: 0.15 });
+        for (i = 0; i < banners.length; i++) {
+            banners[i].setAttribute('data-vdsc-obs', '1');
+            io.observe(banners[i]);
+        }
+    }
+    // ── trailer section ("Trailers" — a cinematic breather before the feed) ───
+    // Each card is a link to the title's detail page; the glass play button
+    // nested inside opens the trailer lightbox instead. Backdrop art (falling
+    // back to the poster) gives the 16:9 cards a proper cinematic frame.
+    function renderTrailerRail() {
+        var items = (state._foryouItems || []).slice(0, 10);
+        if (items.length < 4) return;
+        var rail = $('[data-vdsc-trail-rail]'); if (!rail) return;
+        rail.innerHTML = items.map(function (it, i) {
+            var owned = it.library_id != null;
+            var source = owned ? 'library' : 'tmdb';
+            var id = owned ? it.library_id : it.tmdb_id;
+            var href = '/video-detail/' + source + '/' + it.kind + '/' + id;
+            var art = it.backdrop || it.poster;
+            return '<a class="vdsc-trailer-card" href="' + href + '" ' +
+                'data-vsr-open="' + it.kind + '" data-vsr-source="' + source + '" data-vsr-id="' + id + '" ' +
+                'style="--i:' + (i < 10 ? i : 10) + '" aria-label="' + esc(it.title || '') + ' — open details">' +
+                '<span class="vdsc-trailer-art"' +
+                (art ? ' style="background-image:url(\'' + esc(art) + '\')"' : '') + ' aria-hidden="true">' +
+                '<button class="vdsc-trailer-play" type="button" data-vdsc-trailer ' +
+                'data-kind="' + it.kind + '" data-tmdb="' + it.tmdb_id + '" data-title="' + esc(it.title || '') + '" ' +
+                'aria-label="Play trailer for ' + esc(it.title || '') + '">' +
+                '<svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">' +
+                '<path d="M8 5.5v13l11-6.5z" fill="currentColor"/></svg></button>' +
+                '</span>' +
+                '<span class="vdsc-trailer-body">' +
+                '<span class="vdsc-trailer-eyebrow">Picked for you</span>' +
+                '<span class="vdsc-trailer-title">' + esc(it.title || '') + '</span>' +
+                '<span class="vdsc-trailer-meta">' + (it.kind === 'movie' ? 'Movie' : 'TV') +
+                (it.year ? ' · ' + it.year : '') + '</span>' +
+                '</span></a>';
+        }).join('');
+        var sec = $('[data-vdsc-trailers]'); if (sec) sec.classList.remove('hidden');
     }
 
     // Rebuild the whole rail stack (genre/curated shelves + the prepended personalized rows).
@@ -534,6 +947,14 @@
     // it before prepending, so rapid re-toggles can't stack duplicate "Recommended for you" rows.
     function reloadRails() {
         state.railGen = (state.railGen || 0) + 1;
+        // Story blocks + trailer rail + banners are editorial — clear and rebuild with the rails.
+        state._storiesDone = false; state._bannersDone = false;
+        state._pool = []; state._foryouItems = [];
+        state._gapRails = []; state._gapsArrived = false;
+        var srow = $('[data-vdsc-stories-row]'); if (srow) srow.innerHTML = '';
+        var ssec = $('[data-vdsc-stories]'); if (ssec) ssec.classList.add('hidden');
+        var trl = $('[data-vdsc-trail-rail]'); if (trl) trl.innerHTML = '';
+        var tsec = $('[data-vdsc-trailers]'); if (tsec) tsec.classList.add('hidden');
         renderShelves();
         loadMoreLike();
         loadGaps();
@@ -590,10 +1011,16 @@
             var rails = sec.rails.map(lazyShelfHtml).join('');
             // Groups with no static rails (async-only, e.g. gaps) start hidden — revealed when filled.
             var emptyCls = sec.rails.length ? '' : ' vdsc-group--empty';
-            return '<section class="vdsc-group' + emptyCls + '" data-group="' + sec.id + '">' +
-                '<h2 class="vdsc-group-head">' + esc(sec.label) + '</h2>' +
+            var html = '<section class="vdsc-group' + emptyCls + '" data-group="' + sec.id + '">' +
+                '<div class="vdsc-group-head"><h2>' + esc(sec.label) + '</h2>' +
+                (GROUP_SUBS[sec.id] ? '<p>' + esc(GROUP_SUBS[sec.id]) + '</p>' : '') + '</div>' +
                 '<div class="vdsc-group-body" data-group-body="' + sec.id + '">' + rails + '</div>' +
             '</section>';
+            // Full-width poster banners between groups (music-Discover parity) —
+            // filled by maybeRenderBanners once the data trio lands.
+            if (sec.id === 'new') html += '<div data-vdsc-banner-slot="fresh"></div>';
+            if (sec.id === 'collection') html += '<div data-vdsc-banner-slot="saga"></div>';
+            return html;
         }).join('');
         wireJumpNav(host);
         observeShelves();
@@ -690,6 +1117,41 @@
             .catch(function () { shelf.remove(); pruneGroup(grp); });
     }
 
+    // Eager tile art: the browse strip sits ABOVE the genre rails, so painting
+    // on rail-load left every tile imageless. Fetch one poster per genre when
+    // the strip is first seen — cachedFetch means the rail load later is free.
+    // Posters are deduped across tiles: the top-popularity title often spans
+    // genres (Spider-Man is Action AND Adventure AND Sci-Fi), so each tile
+    // takes the first poster no earlier tile claimed.
+    function paintStripTiles() {
+        var tiles = Array.prototype.slice.call(
+            document.querySelectorAll('[data-vdsc-tile-genre]:not([data-vdsc-painted])'));
+        if (!tiles.length) return;
+        var used = {};
+        var jobs = tiles.map(function (tile) {
+            var id = tile.getAttribute('data-vdsc-tile-genre');
+            return cachedFetch(LIST_URL + '?kind=movie&genre=' + id + '&sort=popularity.desc')
+                .then(function (d) { return { tile: tile, items: (d && d.items) || [] }; })
+                .catch(function () { return { tile: tile, items: [] }; });
+        });
+        Promise.all(jobs).then(function (results) {
+            results.forEach(function (r) {
+                for (var j = 0; j < r.items.length; j++) {
+                    var it = r.items[j];
+                    var key = it && (it.tmdb_id || it.poster);
+                    if (it && it.poster && key && !used[key]) {
+                        used[key] = 1;
+                        r.tile.setAttribute('data-vdsc-painted', '1');
+                        r.tile.style.setProperty('--tile-art',
+                            'url("' + String(it.poster).replace(/"/g, '%22') + '")');
+                        r.tile.classList.add('vdsc-tile--art');
+                        break;
+                    }
+                }
+                // A tile whose whole list was claimed keeps its gradient.
+            });
+        });
+    }
     // ── category / filter grid (paged) ────────────────────────────────────────
     // `browse` = opened from the tiles / Browse-all (shows the live filter bar);
     // a rail's See-all keeps its fixed query and hides the bar. Every grid
@@ -697,7 +1159,12 @@
     function openCategory(title, q, browse) {
         state.mode = 'grid';
         if (isHideOwned() && q.indexOf('hide_owned=') === -1) q += '&hide_owned=1';
+        // Every query gets its own generation. A response only paints if its
+        // generation is still the current one, so a slow first filter can no
+        // longer append its rows into the grid of the filter after it.
+        state.catGen = (state.catGen || 0) + 1;
         state.cat = { title: title, q: q, page: 1, nextPage: 2, browse: !!browse,
+                      gen: state.catGen,
                       paginates: !/key=trending/.test(q), busy: false, hasMore: false };
         $('[data-vdsc-shelves]').classList.add('hidden');
         var hero = $('[data-vdsc-hero]'); if (hero) hero.classList.add('hidden');
@@ -722,6 +1189,7 @@
         var wrap = $('[data-vdsc-grid-wrap]'); wrap.classList.remove('hidden');
         var ttl = $('[data-vdsc-grid-title]'); if (ttl) ttl.textContent = title;
         $('[data-vdsc-grid]').innerHTML = '';
+        var gerr = $('[data-vdsc-grid-error]'); if (gerr) gerr.classList.add('hidden');
         try { wrap.scrollIntoView({ behavior: 'smooth', block: 'start' }); } catch (e) { /* ignore */ }
         loadGrid(true);
     }
@@ -743,6 +1211,8 @@
 
     function closeCategory() {
         state.mode = 'shelves';
+        // Anything still in flight belongs to a grid nobody is looking at.
+        state.catGen = (state.catGen || 0) + 1;
         $('[data-vdsc-grid-wrap]').classList.add('hidden');
         $('[data-vdsc-shelves]').classList.remove('hidden');
         var strip = $('[data-vdsc-browse-strip]'); if (strip) strip.classList.remove('hidden');
@@ -755,33 +1225,56 @@
         var c = state.cat;
         if (c.busy) return;
         c.busy = true;
-        var pageToLoad = reset ? 1 : c.nextPage;
+        var pageToLoad = reset ? 1 : (c.failedPage || c.nextPage);
+        c.failedPage = pageToLoad; // Retry this exact page until an accepted response succeeds.
         var more = $('[data-vdsc-more]'); if (more && !reset) { more.disabled = true; more.textContent = 'Loading…'; }
         var ld = reset ? $('[data-vdsc-grid-loading]') : $('[data-vdsc-more-loading]');
         if (ld) ld.classList.remove('hidden');
+        // This response belongs to THIS query. If the user changed a filter
+        // while it was out, everything below is discarded.
+        var mine = function () { return state.cat === c && c.gen === state.catGen; };
         cachedFetch(LIST_URL + '?' + c.q + '&page=' + pageToLoad)
             .then(function (d) {
                 c.busy = false;
+                if (!mine()) return;
                 if (ld) ld.classList.add('hidden');
-                var items = (d && d.items) || [];
-                var grid = $('[data-vdsc-grid]');
-                if (grid) { grid.insertAdjacentHTML('beforeend', items.map(card).join('')); hydrateGet(grid); }
+                // cachedFetch answers null for a non-OK response, so a 500 and
+                // an honestly empty page look identical here. Only an array of
+                // items is a real result; anything else is a failure to retry,
+                // not "Nothing found".
+                var failed = !d || !Array.isArray(d.items);
+                var items = failed ? [] : d.items;
+                if (!failed) {
+                    var grid = $('[data-vdsc-grid]');
+                    if (grid) { grid.insertAdjacentHTML('beforeend', items.map(card).join('')); hydrateGet(grid); }
+                }
                 var empty = $('[data-vdsc-grid-empty]');
-                if (empty) empty.classList.toggle('hidden', !(reset && !items.length));
+                if (empty) empty.classList.toggle('hidden', failed || !(pageToLoad === 1 && !items.length));
+                var err = $('[data-vdsc-grid-error]');
+                if (err) err.classList.toggle('hidden', !failed);
+                if (failed) {
+                    // Keep whatever is already on screen and let them retry
+                    // this page; do not advance the cursor past it.
+                    if (more) { more.textContent = 'Try again'; more.disabled = false; more.classList.remove('hidden'); }
+                    return;
+                }
                 // Honest pagination: the SERVER says whether more exists and which
                 // page it consumed up to (filtered fetches burn several TMDB pages
                 // per response). No more ≥18-items guessing — that stopped paging
                 // the moment filtering shrank a page.
-                c.hasMore = c.paginates && !!(d && d.has_more);
-                c.nextPage = (d && d.next_page) || (pageToLoad + 1);
+                c.failedPage = null;
+                c.hasMore = c.paginates && !!d.has_more;
+                c.nextPage = d.next_page || (pageToLoad + 1);
                 // Button is always the reliable control; the sentinel auto-loads on top.
                 if (more) { more.textContent = 'Load more'; more.disabled = false; more.classList.toggle('hidden', !c.hasMore); }
                 maybeAutoLoad();                                // keep filling while the sentinel stays in view
             })
             .catch(function () {
                 c.busy = false;
+                if (!mine()) return;
                 if (ld) ld.classList.add('hidden');
-                if (more) { more.textContent = 'Load more'; more.disabled = false; }
+                var errEl = $('[data-vdsc-grid-error]'); if (errEl) errEl.classList.remove('hidden');
+                if (more) { more.textContent = 'Try again'; more.disabled = false; more.classList.remove('hidden'); }
             });
     }
     // Self-correcting infinite scroll: if the sentinel is still on-screen after a
@@ -832,10 +1325,19 @@
                 '<span class="vdsc-tile-name">' + esc(name) + '</span></button>';
         }).join('');
         strip.innerHTML =
-            '<div class="vdsc-strip-head"><h2 class="vdsc-group-head">Browse</h2></div>' +
+            '<div class="vdsc-strip-head"><div class="vdsc-group-head"><h2>Browse</h2>' +
+            '<p>Jump into a genre, or open the full filter grid</p></div></div>' +
             '<div class="vdsc-tiles">' + tiles +
             '<button class="vdsc-tile vdsc-tile--all" type="button" data-vdsc-apply>' +
             '<span class="vdsc-tile-name">Browse all →</span></button></div>';
+        // Tile art loads when the strip is first approached — not at boot, so
+        // the hero and first rails win the network race.
+        if ('IntersectionObserver' in window) {
+            var _tio = new IntersectionObserver(function (en) {
+                if (en[0].isIntersecting) { _tio.disconnect(); paintStripTiles(); }
+            }, { rootMargin: '600px 0px' });
+            _tio.observe(strip);
+        } else paintStripTiles();
     }
     // Reflect state.sel onto the grid filter bar (used when a tile pre-selects a
     // genre, so the bar shows what the grid is actually filtered to).
@@ -866,6 +1368,12 @@
         explore = { mNext: 1, sNext: 1, mMore: true, sMore: true, busy: false,
                     seen: {}, gen: explore.gen + 1 };
         var grid = $('[data-vdsc-explore-grid]'); if (grid) grid.innerHTML = '';
+        var ld = $('[data-vdsc-explore-loading]'); if (ld) ld.classList.add('hidden');
+        // A prefs rebuild empties the feed while it may already be on screen —
+        // the sentinel won't refire (no intersection *change* happens), so
+        // resume explicitly instead of leaving "Keep exploring" empty.
+        var sec = $('[data-vdsc-explore]');
+        if (sec && sec.getAttribute('data-started')) loadExplore();
     }
     function startExplore() {
         var sec = $('[data-vdsc-explore]'); if (!sec) return;
@@ -928,9 +1436,7 @@
         var box = $('[data-vdsc-chipset="genre"]'); if (!box) return;
         box.innerHTML = '<button class="vdsc-chip vdsc-chip--reset vdsc-chip--on" type="button" data-val="">All genres</button>' +
             (state.genres[state.sel.kind] || []).map(function (g) {
-                var c = GENRE_COLORS[(g.name || '').toLowerCase()];
-                return '<button class="vdsc-chip" type="button" data-val="' + g.id + '"' +
-                    (c ? ' style="--c: ' + c + '"' : '') + '>' + esc(g.name) + '</button>';
+                return '<button class="vdsc-chip" type="button" data-val="' + g.id + '">' + esc(g.name) + '</button>';
             }).join('');
         state.sel.genre = '';
     }
@@ -946,6 +1452,14 @@
         var page = $('[data-video-subpage="' + PAGE_ID + '"]'); if (!page) return;
 
         page.addEventListener('click', function (e) {
+            // Trailer play buttons nest INSIDE the trailer cards' detail links —
+            // check them first or the link wins and the trailer never plays.
+            var trbtn = e.target.closest('[data-vdsc-trailer]');
+            if (trbtn) {
+                e.preventDefault();
+                openTrailer(trbtn.getAttribute('data-kind'), trbtn.getAttribute('data-tmdb'), trbtn.getAttribute('data-title'));
+                return;
+            }
             var open = e.target.closest('[data-vsr-open]');
             if (open) {
                 if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
@@ -958,9 +1472,22 @@
                 }));
                 return;
             }
-            var trbtn = e.target.closest('[data-vdsc-trailer]');
-            if (trbtn) {
-                openTrailer(trbtn.getAttribute('data-kind'), trbtn.getAttribute('data-tmdb'), trbtn.getAttribute('data-title'));
+            var picks = e.target.closest('[data-vdsc-picks]');
+            if (picks) {
+                var fy = document.querySelector('[data-group="foryou"]');
+                if (fy) fy.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                return;
+            }
+            var gotoColl = e.target.closest('[data-vdsc-goto-collection]');
+            if (gotoColl) {
+                var cg = document.querySelector('[data-group="collection"]');
+                if (cg) cg.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                return;
+            }
+            var gotoGroup = e.target.closest('[data-vdsc-goto-group]');
+            if (gotoGroup) {
+                var gg = document.querySelector('[data-group="' + gotoGroup.getAttribute('data-vdsc-goto-group') + '"]');
+                if (gg) gg.scrollIntoView({ block: 'start', behavior: 'smooth' });
                 return;
             }
             var heroAdd = e.target.closest('[data-vdsc-hero-add]');
@@ -1022,7 +1549,9 @@
                 return;
             }
             var dot = e.target.closest('[data-vdsc-go]');
-            if (dot) { goHero(parseInt(dot.getAttribute('data-vdsc-go'), 10)); startHeroTimer(); }
+            if (dot) { goHero(parseInt(dot.getAttribute('data-vdsc-go'), 10)); startHeroTimer(); return; }
+            if (e.target.closest('[data-vdsc-prev]')) { goHero(state.hero.idx - 1); startHeroTimer(); return; }
+            if (e.target.closest('[data-vdsc-next]')) { goHero(state.hero.idx + 1); startHeroTimer(); return; }
         });
 
         var hero = $('[data-vdsc-hero]');
@@ -1101,17 +1630,30 @@
             }, { rootMargin: '600px 0px' }).observe(sentinel);
         }
 
-        // Hero keyboard nav (←/→) when Discover is the visible view.
-        document.addEventListener('keydown', function (e) {
-            if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
-            if (trailerEl || state.mode !== 'shelves' || !state.hero.items.length) return;
-            if (!page || page.offsetParent === null) return;                 // Discover not visible
-            var tag = e.target && e.target.tagName;
-            if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-            e.preventDefault();
-            goHero(state.hero.idx + (e.key === 'ArrowRight' ? 1 : -1));
-            startHeroTimer();
-        });
+        // Hero keyboard nav (←/→), but only while focus is INSIDE the hero.
+        // It used to be a document handler that swallowed every arrow key on
+        // the page: a rail, a chip group, a slider, all of them moved the
+        // billboard instead of doing their own job.
+        var heroEl = $('[data-vdsc-hero]');
+        if (heroEl) {
+            heroEl.addEventListener('keydown', function (e) {
+                if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+                if (trailerEl || state.mode !== 'shelves' || !state.hero.items.length) return;
+                var t = e.target;
+                var tag = t && t.tagName;
+                if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+                if (t && t.isContentEditable) return;
+                e.preventDefault();
+                goHero(state.hero.idx + (e.key === 'ArrowRight' ? 1 : -1));
+                startHeroTimer();
+            });
+            // Keyboard focus pauses the rotation, same as hover. Otherwise the
+            // slide under a focused button changes out from under it.
+            heroEl.addEventListener('focusin', stopHeroTimer);
+            heroEl.addEventListener('focusout', function (e) {
+                if (!heroEl.contains(e.relatedTarget)) startHeroTimer();
+            });
+        }
     }
 
     function loadMeta() {

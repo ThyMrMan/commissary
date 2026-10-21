@@ -11,9 +11,9 @@ import types
 
 
 # Minimal stubs so the watchlist_scanner module imports without the full app.
-if "config.settings" not in sys.modules:
+if "core.settings" not in sys.modules:
     config_pkg = types.ModuleType("config")
-    settings_mod = types.ModuleType("config.settings")
+    settings_mod = types.ModuleType("core.settings")
 
     class _DummyConfigManager:
         def get(self, key, default=None):
@@ -25,10 +25,10 @@ if "config.settings" not in sys.modules:
     settings_mod.config_manager = _DummyConfigManager()
     config_pkg.settings = settings_mod
     sys.modules.setdefault("config", config_pkg)
-    sys.modules.setdefault("config.settings", settings_mod)
+    sys.modules.setdefault("core.settings", settings_mod)
 
 
-from core.watchlist_scanner import is_live_version  # noqa: E402
+from core.watchlist_scanner import is_live_version, is_remix_version  # noqa: E402
 from core.repair_jobs.live_commentary_cleaner import _detect_content_type  # noqa: E402
 
 
@@ -85,6 +85,35 @@ def test_is_live_version_handles_empty_input():
 
 # ── live_commentary_cleaner._detect_content_type ────────────────────────────
 
+# ── is_remix_version ────────────────────────────────────────────────────────
+
+def test_is_remix_version_catches_version_qualifiers():
+    for title in [
+        "Song Name (Remix)", "Song Name - Remix", "Song Name (Club Mix)",
+        "Song Name (Dance Mix)", "Song Name (Dub Mix)", "Song Name (Dub Version)",
+        "Song Name - Radio Edit", "Song Name (Extended Mix)", "Song Name [Dub]",
+        "Song Name (VIP Mix)", "Song Name \u2013 Extended Edit", "Song Name (Remixed)",
+    ]:
+        assert is_remix_version(title, "Album"), title
+    # an album of remixes marks its tracks
+    assert is_remix_version("Teardrop", "Blue Lines (Remixes)")
+    assert is_remix_version("Teardrop", "Mezzanine (Club Mix)")
+
+
+def test_is_remix_version_does_not_flag_title_words():
+    # #1381: 311's studio tracks were dropped from a discography download
+    assert not is_remix_version("Mix It Up", "Uplifter")
+    assert not is_remix_version("Rub a Dub", "Transistor")
+    assert not is_remix_version("Edit the World", "")
+    assert not is_remix_version("Song", "Mix It Up")
+
+
+def test_is_remix_version_keeps_remasters():
+    assert not is_remix_version("Song - 2011 Remaster", "")
+    assert not is_remix_version("Song (Club Mix) [Remastered]", "")
+    assert not is_remix_version("", "Remix Album")
+
+
 def test_detect_content_type_flags_live_recordings():
     assert _detect_content_type("Dimension - Live at Big Day Out", "Wolfmother") == "live"
     assert _detect_content_type("Thriller (Live)", "") == "live"
@@ -104,3 +133,10 @@ def test_detect_content_type_still_catches_other_categories():
     assert _detect_content_type("Director's Commentary", "Album") == "commentary"
     assert _detect_content_type("Spoken Word Poem", "") == "spoken_word"
     assert _detect_content_type("A Cappella Version", "") == "acappella"
+
+
+def test_detect_content_type_keeps_musical_interludes_and_introductions():
+    # The fix deletes the file: an album interlude or a classical
+    # "Introduction and Allegro" is music, not an interview or spoken word.
+    assert _detect_content_type("Rich (Interlude)", "To Pimp a Butterfly") is None
+    assert _detect_content_type("Introduction and Allegro", "Ravel: Chamber Works") is None

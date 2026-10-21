@@ -1,7 +1,7 @@
 """Mass rename with preview (arr-parity P7).
 
 Radarr/Sonarr can re-render the WHOLE library's filenames when you change the
-naming template; Commissary's templates only ever applied at import time, so a
+naming template; SoulSync's templates only ever applied at import time, so a
 template change forked your library into two naming eras. This closes it:
 
   preview()  — for every owned movie/episode file, resolve the DB's stored
@@ -51,141 +51,21 @@ def is_running() -> bool:
     return _running
 
 
-def _movie_fields(row: Dict[str, Any], custom_formats=None) -> Dict[str, Any]:
-    from core.video.organization import library_media_fields
-    return {"title": row.get("title"), "year": row.get("year"),
+def _movie_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"title": row.get("title"), "year": row.get("year"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
             "source": row.get("release_source"), "codec": row.get("video_codec"),
-            "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
-            # MediaInfo + release facts, so a rename reproduces the name the
-            # IMPORTER would have written rather than a shorter one.
-            **library_media_fields(row, custom_formats=custom_formats)}
+            "tmdbid": row.get("tmdb_id")})
 
 
-def _episode_fields(row: Dict[str, Any], custom_formats=None) -> Dict[str, Any]:
-    from core.video.organization import library_media_fields
-    return {"series": row.get("show_title"), "season": row.get("season_number"),
+def _episode_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"series": row.get("show_title"), "season": row.get("season_number"),
             "episode": row.get("episode_number"), "episode_title": row.get("episode_title"),
             "year": row.get("show_year"), "quality": row.get("quality"),
             "resolution": row.get("resolution"), "source": row.get("release_source"),
-            "codec": row.get("video_codec"), "tvdbid": row.get("tvdb_id"),
-            "tmdbid": row.get("tmdb_id"), "imdbid": row.get("imdb_id"),
-            "air_date": row.get("air_date"),
-            **library_media_fields(row, custom_formats=custom_formats)}
-
-
-# What each $token means, for the rename panel's variable list. The NAMES are
-# derived from organization.py at call time rather than repeated here — a token
-# added there but not described here is a test failure, not a silently missing
-# row in the UI.
-TOKEN_HELP = {
-    # episodes
-    "series": "Show title",
-    "season": "Season number, zero-padded (01)",
-    "seasonraw": "Season number, unpadded (1)",
-    "episode": "Episode number, zero-padded. A multi-episode file renders its "
-               "whole span (01-E02)",
-    "episodetitle": "Episode title",
-    "airdate": "Air date, YYYY-MM-DD — for daily shows",
-    "tvdbid": "TheTVDB id",
-    # movies
-    "title": "Movie title",
-    "titlefirst": "First letter of the title, for A/B/C… folders",
-    "edition": "Edition (Director's Cut, Extended…)",
-    "tmdbid": "TMDB id",
-    "imdbid": "IMDb id",
-    # both
-    "year": "Release year",
-    "quality": "Quality label (1080p, 2160p…)",
-    "resolution": "Resolution",
-    "source": "Release source (BluRay, WEB-DL…)",
-    "codec": "Video codec, uppercased (H264, HEVC…)",
-
-    # ── Sonarr/Radarr {Token} names ──────────────────────────────────────────
-    # Same rule as above: a token in organization.py with no entry here fails
-    # test_every_offered_variable_has_a_description rather than reaching the
-    # picker as a bare name nobody can interpret.
-    "Series Title": "Show title, as stored",
-    "Series CleanTitle": "Show title with filename-hostile characters removed",
-    "Series CleanTitleWithoutYear": "Clean show title with a trailing '(2019)' stripped, "
-                                    "so '{(Series Year)}' doesn't print it twice",
-    "Series TitleThe": "Show title with a leading article moved to the end (Matrix, The)",
-    "Series TitleYear": "Clean show title followed by its year",
-    "Series Year": "Year the show first aired",
-    "Movie Title": "Movie title, as stored",
-    "Movie CleanTitle": "Movie title with filename-hostile characters removed",
-    "Movie TitleThe": "Movie title with a leading article moved to the end",
-    "Movie OriginalTitle": "Original-language title, falling back to the stored one",
-    "Movie Year": "Release year",
-    "Release Year": "Release year",
-    "season": "Season number — pair with ':00' to zero-pad ({season:00})",
-    "episode": "Episode number — ':00' zero-pads. A multi-episode file renders its span",
-    "absolute": "Absolute episode number, for anime ({absolute:000})",
-    "Episode Title": "Episode title",
-    "Episode CleanTitle": "Episode title with filename-hostile characters removed; "
-                          "':90' caps the length",
-    "Air-Date": "Air date, 2026-07-08",
-    "AirDate": "Air date, dotted: 2026.07.08",
-    "Quality Full": "Full quality name (WEBDL-1080p, Bluray-2160p)",
-    "Quality Title": "Resolution only (1080p)",
-    "MediaInfo VideoCodec": "Video codec as the schemes write it (x265, x264)",
-    "MediaInfo AudioCodec": "Audio codec (EAC3, TrueHD, DTS)",
-    "MediaInfo AudioChannels": "Channel layout (5.1, 7.1)",
-    "MediaInfo AudioLanguages": "Audio track languages (EN+JA)",
-    "MediaInfo VideoBitDepth": "Bit depth (8, 10, 12)",
-    "MediaInfo VideoDynamicRange": "'HDR' when the file carries any HDR format, else empty",
-    "MediaInfo VideoDynamicRangeType": "Exact HDR format (DV, HDR10, HDR10+, HLG)",
-    "MediaInfo 3D": "'3D' for a 3D release, else empty",
-    "Release Group": "Release group, from the release name",
-    "Custom Formats": "Custom formats this release matched",
-    "Edition Tags": "Edition (Directors Cut, IMAX, Extended…)",
-    "Original Title": "The release name the file was grabbed under",
-    "Original Filename": "The file's name at import time",
-    "ImdbId": "IMDb id (tt0133093)",
-    "TmdbId": "TMDB id",
-    "TvdbId": "TheTVDB id",
-}
-
-
-def tokens_for(kind: str, sample_row: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
-    """Every variable available for ``kind`` — both the ``$name`` scheme and the
-    Sonarr/Radarr ``{Token}`` one — each with its meaning and, when a real file
-    is passed, the value it would take for THIS title.
-
-    Names come from organization.py's own value builders, so the list cannot
-    drift from what the template engine actually substitutes. This is the same
-    vocabulary the Settings page offers: a picker that showed fewer would leave
-    the tokens users had just been introduced to looking unavailable here.
-
-    Import-only tokens (``LIBRARY_UNAVAILABLE_TOKENS``) are still listed, but
-    marked — they render empty when renaming an existing file, and a picker that
-    hid them would make a template silently lose content instead of explaining
-    why.
-    """
-    from core.video import organization
-    scope = "movie" if kind == "movie" else "episode"
-    fields = _movie_fields(sample_row or {}) if scope == "movie" \
-        else _episode_fields(sample_row or {})
-    values = (organization._movie_values(fields) if scope == "movie"
-              else organization._episode_values(fields))
-    brace = (organization._movie_brace_tokens(fields) if scope == "movie"
-             else organization._episode_brace_tokens(fields))
-    unavailable = {organization.naming_tokens.canonical(n)
-                   for n in organization.LIBRARY_UNAVAILABLE_TOKENS}
-
-    out = [{"token": "$" + name, "style": "legacy",
-            "description": TOKEN_HELP.get(name, ""),
-            "example": str(values.get(name) or "")}
-           for name in sorted(values)]
-    for name in sorted(brace, key=str.lower):
-        note = TOKEN_HELP.get(name, "")
-        if organization.naming_tokens.canonical(name) in unavailable:
-            note = (note + " — " if note else "") + \
-                "only available at import; empty when renaming an existing file"
-        out.append({"token": "{" + name + "}", "style": "brace",
-                    "description": note,
-                    "example": str(brace.get(name) or "")})
-    return out
+            "codec": row.get("video_codec")})
 
 
 def _base_dir_of(path: str, base_dirs: List[str]) -> Optional[str]:
@@ -229,34 +109,21 @@ def _inverse_reroot(new_local: str, old_local: str, stored: str) -> str:
 def preview(progress: Optional[Callable[[int, int], None]] = None, *,
             scope: Optional[tuple] = None,
             template: Optional[str] = None) -> Dict[str, Any]:
+    # Commissary: ``scope`` = ('show', id) | ('movie', id) narrows the pass to one
+    # title; ``template`` previews a typed template without saving it.
     """Every file whose on-disk name differs from the current template.
     {status, entries: [{key, kind, title, current, proposed, reason?}],
     unresolved: int}.
 
     ``progress(done, total)`` is called as files are scanned so a background
-    caller can report a live count. Pure read — never mutates.
-
-    ``scope`` narrows the scan to one title: ``('show', show_id)`` or
-    ``('movie', movie_id)``. None is the whole library, as before.
-
-    ``template`` renders against a one-off template instead of the saved one,
-    for the per-title panel where you type a name and watch the result. It is
-    NEVER written back to settings — the global template is untouched.
-    """
+    caller can report a live count. Pure read — never mutates."""
     from api.video import get_video_db
     from core.video import organization
     from core.video.path_resolver import resolve_video_file_path, video_base_dirs
     db = get_video_db()
     settings = organization.load(db)
-    kind_scope = (scope or (None,))[0]
-    scope_id = scope[1] if scope else None
-    if template and str(template).strip():
-        # Shallow copy: the override applies to the kind being previewed and the
-        # stored settings object is left alone (organization.load returns a fresh
-        # dict, but copying makes that independence explicit rather than assumed).
-        settings = dict(settings)
-        key = "movie_template" if kind_scope == "movie" else "episode_template"
-        settings[key] = str(template)
+    from core.commissary.naming import with_template  # Commissary
+    settings = with_template(settings, scope, template)
     base_dirs = video_base_dirs(db)
     entries: List[Dict[str, Any]] = []
     unresolved = 0
@@ -283,13 +150,14 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
             dir_map[sdir] = os.path.dirname(local)
         return local
 
-    if kind_scope == "movie":
-        movies, episodes = db.repair_owned_movie_files(movie_id=scope_id), []
-    elif kind_scope == "show":
-        movies, episodes = [], db.rename_owned_episode_files(show_id=scope_id)
-    else:
-        movies = db.repair_owned_movie_files()
-        episodes = db.rename_owned_episode_files()
+    movies = db.repair_owned_movie_files()
+    episodes = db.rename_owned_episode_files()
+    # Commissary: ids, air date and file facts, so a rename names a file exactly
+    # as its import did - never a shorter name that strips them off disk
+    from core.commissary.naming import scope_rows, with_library_facts
+    movies, episodes = scope_rows(db, movies, episodes, scope)
+    movies = with_library_facts(db, movies, "movie")
+    episodes = with_library_facts(db, episodes, "episode")
     total = len(movies) + len(episodes)
     done = 0
 
@@ -306,11 +174,9 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
             entries.append({"key": key, "kind": kind, "title": title,
                             "current": local, "proposed": proposed})
 
-    # Loaded once for the whole pass, not per file — see library_custom_formats.
-    formats = organization.library_custom_formats(db)
     for r in movies:
         _consider("movie", "m:%s" % r["file_id"], "%s (%s)" % (r.get("title"), r.get("year") or "?"),
-                  r["relative_path"], r.get("size_bytes"), _movie_fields(r, formats))
+                  r["relative_path"], r.get("size_bytes"), _movie_fields(r))
         done += 1
         if progress and done % 25 == 0:
             progress(done, total)
@@ -318,7 +184,7 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
         label = "%s S%02dE%02d" % (r.get("show_title") or "?",
                                    r.get("season_number") or 0, r.get("episode_number") or 0)
         _consider("episode", "e:%s" % r["file_id"], label,
-                  r["relative_path"], r.get("size_bytes"), _episode_fields(r, formats))
+                  r["relative_path"], r.get("size_bytes"), _episode_fields(r))
         done += 1
         if progress and done % 25 == 0:
             progress(done, total)
@@ -373,20 +239,13 @@ def preview_state() -> Dict[str, Any]:
     return _snapshot()
 
 
-def apply(keys: Optional[List[str]] = None, *,
-          scope: Optional[tuple] = None,
+def apply(keys: Optional[List[str]] = None, *, scope: Optional[tuple] = None,
           template: Optional[str] = None) -> Dict[str, Any]:
+    # Commissary: scope/template MUST match what was previewed - the plan is
+    # rebuilt here, and without them a per-title apply would rebuild it from the
+    # whole library under the saved template and rename files nobody saw.
     """Perform the renames from a fresh preview (optionally only the picked
-    ``keys``). Collision-safe; DB stored paths follow each move.
-
-    ``scope`` and ``template`` MUST match the ones the caller previewed with.
-    The plan is recomputed here rather than trusted from the client — so
-    without forwarding them, a per-show apply would rebuild the plan from the
-    whole library and the GLOBAL template, and rename files the user never saw
-    a preview of. ``keys`` narrows the result but is not a substitute: it can
-    only filter a plan, and the proposed name inside that plan comes from the
-    template used to build it.
-    """
+    ``keys``). Collision-safe; DB stored paths follow each move."""
     global _running
     with _lock:
         if _running:
@@ -402,7 +261,7 @@ def apply(keys: Optional[List[str]] = None, *,
 def _apply_inner(keys, *, scope=None, template=None) -> Dict[str, Any]:
     from api.video import get_video_db
     db = get_video_db()
-    plan = preview(scope=scope, template=template)
+    plan = preview(scope=scope, template=template)   # Commissary
     renamed = skipped = 0
     failures: List[Dict[str, str]] = []
     for e in plan["entries"]:
@@ -441,6 +300,8 @@ def _apply_inner(keys, *, scope=None, template=None) -> Dict[str, Any]:
             _move_sidecars(src, dst)
             _update_stored_path(db, e["key"], src, dst)
             _sweep_empty_dir(os.path.dirname(src))
+            from core.commissary.naming import sweep_empty_parents  # Commissary: the old show folder too
+            sweep_empty_parents(db, os.path.dirname(src))
             renamed += 1
         except OSError as ex:
             failures.append({"key": e["key"], "reason": str(ex)})

@@ -1,4 +1,4 @@
-"""Commissary — video media-server adapters (Plex / Jellyfin).
+"""SoulSync — video media-server adapters (Plex / Jellyfin).
 
 Turn the live, already-connected media clients (owned by the shared
 MediaServerEngine) into normalized dicts the scanner understands. We REUSE the
@@ -14,6 +14,10 @@ these adapters.
 from __future__ import annotations
 
 import re
+import time
+import threading
+import hashlib
+from typing import Any, Dict
 
 from utils.logging_config import get_logger
 
@@ -21,7 +25,21 @@ logger = get_logger("video_sources")
 
 # Library scans are bulk operations — a far longer per-request timeout than the
 # shared client's interactive one, so big libraries don't read-timeout mid-scan.
+# However, connection attempts (TCP SYN) must fail quickly (8s) to avoid stalling
+# Gunicorn workers on unreachable or offline servers.
+PLEX_CONNECT_TIMEOUT = 8
 PLEX_SCAN_TIMEOUT = 120
+
+_plex_srv_cache: Dict[str, Any] = {"srv": None, "at": 0.0, "key": ""}
+_plex_status_cache: Dict[str, Any] = {"srv": None, "at": 0.0, "key": ""}
+_plex_cache_lock = threading.RLock()
+
+
+def invalidate_video_source_cache() -> None:
+    """Force the next _build_source call to re-establish connections."""
+    with _plex_cache_lock:
+        _plex_srv_cache.update(srv=None, at=0.0, key="")
+        _plex_status_cache.update(srv=None, at=0.0, key="")
 
 
 def _to_int(val):
@@ -87,84 +105,45 @@ def _vdb(db=None):
         return None
 
 
-# The video side's own server override. It lives in the app-wide config (under
-# video_plex.* / video_jellyfin.*) rather than video.db so the tokens get the
-# same Fernet-at-rest treatment as music's — see ConfigManager._SENSITIVE_PATHS.
-# A marker-guarded one-shot moves any pre-existing plaintext video.db pair.
-_VIDEO_SERVER_KEYS = {
-    "plex": (("video_plex.base_url", "video_plex.token"),
-             ("video_plex_url", "video_plex_token")),
-    "jellyfin": (("video_jellyfin.base_url", "video_jellyfin.api_key"),
-                 ("video_jellyfin_url", "video_jellyfin_key")),
-}
-_VIDEO_CREDS_MARKER = "video_server_creds_promoted"
-_creds_promotion_checked = False
-
-
-def promote_video_server_creds_once(db=None) -> None:
-    """Move plaintext video.db server creds into the encrypted app config, once."""
-    global _creds_promotion_checked
-    if _creds_promotion_checked:
-        return
+def video_plex_config(db=None):
+    """VIDEO's effective Plex connection: the video side's OWN stored creds
+    (video.db) when set, otherwise INHERITED read-only from the music config.
+    The video side never writes the music config, so this is one-way."""
     db = _vdb(db)
-    if db is None:
-        return
     try:
-        if str(db.get_setting(_VIDEO_CREDS_MARKER) or "") == "1":
-            _creds_promotion_checked = True
-            return
-        from config.settings import config_manager
-        for (cfg_url, cfg_secret), (old_url, old_secret) in _VIDEO_SERVER_KEYS.values():
-            url = (db.get_setting(old_url) or "").strip()
-            secret = (db.get_setting(old_secret) or "").strip()
-            if url and secret:
-                config_manager.set(cfg_url, url)
-                config_manager.set(cfg_secret, secret)
-            # Blank the plaintext copies — the whole point is to stop storing
-            # tokens in the clear. (set() refuses '' for sensitive paths, so the
-            # newly-written config value is safe from this.)
-            if url or secret:
-                db.set_setting(old_url, "")
-                db.set_setting(old_secret, "")
-        db.set_setting(_VIDEO_CREDS_MARKER, "1")
-        _creds_promotion_checked = True
+        url = (db.get_setting("video_plex_url") or "").strip() if db else ""
+        token = (db.get_setting("video_plex_token") or "").strip() if db else ""
     except Exception:
-        logger.exception("video server credential promotion failed (non-fatal)")
-
-
-def _video_server_config(db, kind: str, secret_field: str) -> dict:
-    """VIDEO's effective connection for one server: the video side's OWN stored
-    creds when set, otherwise INHERITED read-only from the music config. The
-    video side never writes the music config, so this is one-way.
-
-    The override is all-or-nothing on purpose: a URL without its secret (or the
-    reverse) is a half-configured server, which is worse than none — so it falls
-    back to music's pair entirely rather than mixing the two.
-    """
-    promote_video_server_creds_once(db)
-    (cfg_url, cfg_secret), _legacy = _VIDEO_SERVER_KEYS[kind]
+        url, token = "", ""
+    if url and token:
+        return {"base_url": url, "token": token, "source": "video"}
     try:
-        from config.settings import config_manager
-        url = (config_manager.get(cfg_url, "") or "").strip()
-        secret = (config_manager.get(cfg_secret, "") or "").strip()
-        if url and secret:
-            return {"base_url": url, secret_field: secret, "source": "video"}
-        getter = (config_manager.get_plex_config if kind == "plex"
-                  else config_manager.get_jellyfin_config)
-        cfg = getter() or {}
-        return {"base_url": cfg.get("base_url") or "",
-                secret_field: cfg.get("token" if kind == "plex" else "api_key") or "",
+        from core.settings import config_manager
+        cfg = config_manager.get_plex_config() or {}
+        return {"base_url": cfg.get("base_url") or "", "token": cfg.get("token") or "",
                 "source": "music"}
     except Exception:
-        return {"base_url": "", secret_field: "", "source": "music"}
-
-
-def video_plex_config(db=None):
-    return _video_server_config(_vdb(db), "plex", "token")
+        return {"base_url": "", "token": "", "source": "music"}
 
 
 def video_jellyfin_config(db=None):
-    return _video_server_config(_vdb(db), "jellyfin", "api_key")
+    """VIDEO's effective Jellyfin connection: the video side's OWN stored creds
+    when set, otherwise INHERITED read-only from the music config."""
+    db = _vdb(db)
+    try:
+        url = (db.get_setting("video_jellyfin_url") or "").strip() if db else ""
+        key = (db.get_setting("video_jellyfin_key") or "").strip() if db else ""
+    except Exception:
+        url, key = "", ""
+    if url and key:
+        return {"base_url": url, "api_key": key, "source": "video"}
+    try:
+        from core.settings import config_manager
+        cfg = config_manager.get_jellyfin_config() or {}
+        return {"base_url": cfg.get("base_url") or "", "api_key": cfg.get("api_key") or "",
+                "source": "music"}
+    except Exception:
+        return {"base_url": "", "api_key": "", "source": "music"}
 
 
 def resolve_video_server(db=None):
@@ -243,14 +222,16 @@ def _video_jellyfin_source(cfg, movies_lib=None, tv_lib=None):
 def video_jellyfin_test(cfg):
     """Diagnose the video Jellyfin connection precisely (for the Test button).
     Returns (ok: bool, message: str). Distinguishes 'can't reach the server',
-    'API key rejected', and 'no users' instead of one vague failure — reuses the
-    same X-Emby-Token header the music client uses (_make_request)."""
+    'API key rejected', and 'no users' instead of one vague failure. sends the
+    same header pair the music client does; a bare x-emby-token alone is a 401
+    on jellyfin 12 (#1250)."""
     base = (cfg.get("base_url") or "").rstrip("/")
     key = cfg.get("api_key") or ""
     if not base or not key:
         return False, "Jellyfin URL/API key not set"
     import requests
-    headers = {"X-Emby-Token": key}
+    from core.jellyfin_client import jellyfin_auth_headers
+    headers = jellyfin_auth_headers(key)
     try:
         info = requests.get(base + "/System/Info", headers=headers, timeout=8)
     except requests.exceptions.ConnectionError:
@@ -271,7 +252,7 @@ def video_jellyfin_test(cfg):
     return True, "Connected to %s" % name
 
 
-def _build_source(movies_lib=None, tv_lib=None):
+def _build_source(movies_lib=None, tv_lib=None, *, interactive=False):
     """Build a media source for the VIDEO server (see resolve_video_server),
     restricted to the named Movies/TV libraries when given. Uses VIDEO's OWN
     effective connection config (its creds, or inherited from music) — never the
@@ -284,18 +265,37 @@ def _build_source(movies_lib=None, tv_lib=None):
         base_url, token = cfg.get("base_url"), cfg.get("token")
         if not base_url or not token:
             return None
-        try:
-            from plexapi.server import PlexServer
-            srv = PlexServer(base_url, token, timeout=PLEX_SCAN_TIMEOUT)
-            return PlexVideoSource(srv, movies_lib=movies_lib, tv_lib=tv_lib)
-        except Exception:
-            logger.exception("video sources: Plex connect failed")
-            return None
+        key = hashlib.sha256(f"{base_url}|{token}".encode()).hexdigest()
+        cache = _plex_status_cache if interactive else _plex_srv_cache
+        with _plex_cache_lock:
+            now = time.time()
+            if cache["key"] == key and 0 <= now - cache["at"] < 60:
+                srv = cache["srv"]
+                return PlexVideoSource(srv, movies_lib=movies_lib, tv_lib=tv_lib) if srv is not None else None
+            try:
+                from plexapi.server import PlexServer
+                # The constructor itself makes an HTTP request. A short connect
+                # timeout alone cannot bound a server that accepts TCP then stalls.
+                srv = PlexServer(base_url, token, timeout=(PLEX_CONNECT_TIMEOUT, PLEX_CONNECT_TIMEOUT))
+                if not interactive:
+                    srv._timeout = (PLEX_CONNECT_TIMEOUT, PLEX_SCAN_TIMEOUT)
+                cache.update(srv=srv, at=time.time(), key=key)
+                return PlexVideoSource(srv, movies_lib=movies_lib, tv_lib=tv_lib)
+            except Exception as e:
+                logger.warning("video sources: Plex connect failed: %s", e)
+                cache.update(srv=None, at=time.time(), key=key)
+                return None
 
     if server == "jellyfin":
         return _video_jellyfin_source(video_jellyfin_config(db), movies_lib, tv_lib)
 
     return None
+
+
+def _vlib_tag(item, section_title):
+    """Commissary: remember which server section a scanned item came from."""
+    from core.commissary.video_libraries import tag
+    return tag(item, section_title)
 
 
 def _load_selection():
@@ -305,16 +305,53 @@ def _load_selection():
         server = resolve_video_server()
         if not server:
             return {}
-        return VideoDatabase().get_library_selection(server)
+        db = VideoDatabase()
+        # Commissary: with video Libraries, scan every library's section.
+        from core.commissary.video_libraries import scan_selection
+        return scan_selection(db, server, db.get_library_selection(server))
     except Exception:
         logger.exception("video sources: could not load library selection")
         return {}
 
 
-def get_active_video_source():
+def get_active_video_source(*, interactive=False):
     """Source for SCANNING — restricted to the user-mapped Movies/TV libraries.
-    Falls back to all libraries when nothing is mapped yet."""
+    An unmapped kind scans nothing (see scan_problem), never every library."""
     sel = _load_selection() or {}
+    return _build_source(sel.get("movies") or None, sel.get("tv") or None, interactive=interactive)
+
+
+def _auto_pick_single_libraries(server, libs, sel, db=None):
+    """a kind nobody ever picked (None; '' means picked none on purpose) takes
+    the server's only library of that kind, saved, so a fresh install's first
+    scan reads something. two or more stays unpicked: that's the user's call."""
+    if not server:
+        return sel
+    sel = dict(sel or {})
+    for key in ("movies", "tv"):
+        found = (libs or {}).get(key) or []
+        if sel.get(key) is None and len(found) == 1 and found[0].get("title"):
+            try:
+                _vdb(db).set_setting(server + "." + key + "_library", found[0]["title"])
+                sel[key] = found[0]["title"]
+                logger.info("video: picked the only %s library on %s: %s", key, server, found[0]["title"])
+            except Exception:
+                logger.exception("video: could not save the auto-picked %s library", key)
+    return sel
+
+
+def scan_video_source():
+    """get_active_video_source for a SCAN: a never-picked kind gets the server's
+    only library of that kind first. kept off the general getter, which runs on
+    every video lookup and shouldn't list libraries each time."""
+    sel = _load_selection() or {}
+    if sel.get("movies") is None or sel.get("tv") is None:
+        src = _build_source()
+        if src is not None:
+            try:
+                sel = _auto_pick_single_libraries(src.server_name, src.available_libraries(), sel)
+            except Exception:
+                logger.debug("video: library auto-pick failed", exc_info=True)
     return _build_source(sel.get("movies") or None, sel.get("tv") or None)
 
 
@@ -345,6 +382,7 @@ def refresh_video_server_sections(media_type="all"):
         return src.refresh_sections(media_type)
     except Exception as e:   # noqa: BLE001 - surface any server error to the automation
         logger.exception("video sources: refresh failed")
+        invalidate_video_source_cache()
         return {"ok": False, "error": str(e)}
 
 
@@ -363,6 +401,7 @@ def set_video_poster(server_id, *, image_url=None, image_bytes=None, kind="movie
                               delete_key=delete_key)
     except Exception as e:   # noqa: BLE001 - surface any server error to the caller
         logger.exception("video sources: set_poster failed")
+        invalidate_video_source_cache()
         return {"ok": False, "error": str(e)}
 
 
@@ -371,13 +410,16 @@ def video_server_scan_in_progress(media_type="all"):
     for 'all'); False if idle; None if it can't be determined — no server, or an
     adapter that can't report scan state. Callers fall back to a fixed wait on None."""
     media_type = normalize_media_type(media_type)
-    src = get_active_video_source()
+    src = get_active_video_source(interactive=True)
     if src is None or not hasattr(src, "is_scanning"):
         return None
     try:
         return bool(src.is_scanning(media_type))
     except Exception:
         logger.debug("video sources: scan-status check failed", exc_info=True)
+        with _plex_cache_lock:
+            if _plex_status_cache['srv'] is getattr(src, '_server', None):
+                _plex_status_cache.update(srv=None, at=time.time())
         return None
 
 
@@ -395,6 +437,7 @@ def video_server_has_item(media_type, item) -> bool:
         return bool(src.has_item(media_type, item))
     except Exception:
         logger.debug("video sources: has_item probe failed", exc_info=True)
+        invalidate_video_source_cache()
         return False
 
 
@@ -407,6 +450,26 @@ def list_video_libraries():
     out = src.available_libraries()
     out["server"] = src.server_name
     return out
+
+
+def _wanted_libraries(media_type, movies_lib, tv_lib):
+    """(label, kind, picked name) for each library a scan of media_type reads."""
+    wants = []
+    if media_type in ("all", "movie"):
+        wants.append(("Movies", "movie", movies_lib))
+    if media_type in ("all", "show"):
+        wants.append(("TV", "show", tv_lib))
+    return wants
+
+
+def _no_library_message(wants):
+    labels = " or ".join(label for label, _, _ in wants)
+    return ("No %s library is picked to scan. Choose one in Settings → Server Connection." % labels)
+
+
+def _missing_library_message(label, name, server):
+    return ("%s library '%s' isn't on %s anymore, or the selected user can't see it. "
+            "Re-pick it in Settings → Server Connection." % (label, name, server))
 
 
 # ── Plex ──────────────────────────────────────────────────────────────────────
@@ -486,20 +549,28 @@ class PlexVideoSource:
         self._movies_lib = movies_lib
         self._tv_lib = tv_lib
 
-    def _sections(self, kind: str, names=None):
-        """Sections of a kind, optionally restricted to the given name(s) — a
-        bare string (one library) or a list (multiple libraries)."""
+    def _sections(self, kind: str, name=None):
         secs = [s for s in self._server.library.sections() if s.type == kind]
-        if names:
-            wanted = {names} if isinstance(names, str) else set(names)
-            secs = [s for s in secs if s.title in wanted]
+        if name:
+            from core.commissary.video_libraries import matches_name  # Commissary: lists
+            secs = [s for s in secs if matches_name(s.title, name)]
         return secs
 
-    def _scan_sections(self, kind: str, names):
-        """Sections to SCAN for a kind. UNLIKE _sections, empty names means
+    def _scan_sections(self, kind: str, name):
+        """Sections to SCAN for a kind. UNLIKE _sections, an empty name means
         'this kind isn't mapped' → scan NOTHING (never fall back to all sections).
         Prevents a missing selection from silently pulling every library."""
-        return self._sections(kind, names) if names else []
+        return self._sections(kind, name) if name else []
+
+    def scan_problem(self, media_type="all"):
+        """why a scan of media_type would read nothing, or None (see Jellyfin's)."""
+        wants = _wanted_libraries(media_type, self._movies_lib, self._tv_lib)
+        if not any(name for _, _, name in wants):
+            return _no_library_message(wants)
+        for label, kind, name in wants:
+            if name and not self._sections(kind, name):
+                return _missing_library_message(label, name, "Plex")
+        return None
 
     def available_libraries(self) -> dict:
         return {
@@ -514,6 +585,37 @@ class PlexVideoSource:
         if incremental:
             m, sh = min(m, 100), min(sh, 50)
         return {"movies": m, "shows": sh}
+
+    def movie_item(self, server_id, title=None, tmdb_id=None):
+        """The normalized payload for ONE movie. Returns None only when the
+        source can positively treat the item as gone; other server failures
+        raise so a hiccup never deletes local state. Plex ids can be re-keyed,
+        so fall back to title/TMDB search before giving up."""
+        from plexapi.exceptions import NotFound
+        try:
+            item = self._server.fetchItem(int(server_id))
+        except NotFound:
+            item = None
+        if item is not None and getattr(item, "type", "") == "movie":
+            return self._movie(item)
+        want_tmdb = str(tmdb_id) if tmdb_id else None
+        for section in self._scan_sections("movie", self._movies_lib):
+            try:
+                hits = section.search(title=title, maxresults=10) if title else []
+            except Exception:
+                logger.exception("Plex: movie rekey-check search failed for %r", title)
+                raise
+            for h in hits:
+                if getattr(h, "type", "") != "movie":
+                    continue
+                ids = _parse_plex_guids(h)
+                if want_tmdb and ids.get("tmdb_id"):
+                    if str(ids.get("tmdb_id")) == want_tmdb:
+                        return self._movie(h)
+                    continue
+                if title and (getattr(h, "title", "") or "").strip().lower() == title.strip().lower():
+                    return self._movie(h)
+        return None
 
     def iter_movies(self, incremental=False, since=None):
         for section in self._scan_sections("movie", self._movies_lib):
@@ -546,9 +648,7 @@ class PlexVideoSource:
                 items = section.search(sort="addedAt:desc", maxresults=100)   # first run: recent window
             for m in items:
                 try:
-                    d = self._movie(m)
-                    d["_server_title"] = section.title
-                    yield d
+                    yield _vlib_tag(self._movie(m), section.title)  # Commissary
                 except Exception:
                     logger.exception("Plex: skipping movie %s", getattr(m, "title", "?"))
 
@@ -566,9 +666,7 @@ class PlexVideoSource:
         except NotFound:
             item = None
         if item is not None and getattr(item, "type", "") == "show":
-            d = self._show(item)
-            d["_server_title"] = getattr(item, "librarySectionTitle", None)
-            return d
+            return self._show(item)
         # Stale/re-keyed id — look the show up the durable way before giving up.
         want_tmdb = str(tmdb_id) if tmdb_id else None
         for section in self._scan_sections("show", self._tv_lib):
@@ -582,14 +680,10 @@ class PlexVideoSource:
                     continue
                 if want_tmdb and _parse_plex_guids(h).get("tmdb_id"):
                     if str(_parse_plex_guids(h).get("tmdb_id")) == want_tmdb:
-                        d = self._show(h)
-                        d["_server_title"] = section.title
-                        return d
+                        return self._show(h)
                     continue
                 if title and (getattr(h, "title", "") or "").strip().lower() == title.strip().lower():
-                    d = self._show(h)
-                    d["_server_title"] = section.title
-                    return d
+                    return self._show(h)
         return None
 
     def iter_shows(self, incremental=False, since=None):
@@ -612,9 +706,7 @@ class PlexVideoSource:
                 items = section.search(sort="addedAt:desc", maxresults=200)
             for sh in items:
                 try:
-                    d = self._show(sh)
-                    d["_server_title"] = section.title
-                    yield d
+                    yield _vlib_tag(self._show(sh), section.title)  # Commissary
                 except Exception:
                     logger.exception("Plex: skipping show %s", getattr(sh, "title", "?"))
 
@@ -684,7 +776,7 @@ class PlexVideoSource:
             return {"ok": False, "error": str(e)}
 
     # ── User metadata edits (Manage sidebar) ──────────────────────────────────
-    # Commissary editable field -> Plex edit field. Every pushed field is also
+    # SoulSync editable field -> Plex edit field. Every pushed field is also
     # LOCKED on Plex ('field.locked': 1) so Plex's own agents don't undo the
     # user's edit on their next refresh — the lock travels with the value.
     _EDIT_FIELDS = {
@@ -697,7 +789,7 @@ class PlexVideoSource:
                            unlock_fields=None) -> dict:
         """Push user metadata edits to a Plex item (by ratingKey), locking each
         pushed field server-side. ``unlock_fields`` releases Plex's field lock
-        (used when the user releases a Commissary lock). Fields Plex can't edit
+        (used when the user releases a SoulSync lock). Fields Plex can't edit
         (e.g. a show's network) are reported back in ``skipped``."""
         try:
             item = self._server.fetchItem(int(server_id))
@@ -747,7 +839,7 @@ class PlexVideoSource:
             logger.exception("Plex: set_watched failed for %s", server_id)
             return {"ok": False, "error": str(e)}
 
-    # ── Collections (Commissary-managed) ────────────────────────────────────────
+    # ── Collections (SoulSync-managed) ────────────────────────────────────────
     def _collection_section(self, kind: str):
         """The library section collections of a kind live in — the mapped one,
         else the first section of that kind."""
@@ -925,7 +1017,7 @@ class PlexVideoSource:
                         "section": getattr(sec, "title", None),
                         # Provenance fingerprints: Kometa labels everything it
                         # manages ('Kometa'/'PMM'); smart = filter-based, which
-                        # Commissary never creates.
+                        # SoulSync never creates.
                         "labels": labels,
                         "smart": bool(getattr(c, "smart", False)),
                     })
@@ -935,6 +1027,11 @@ class PlexVideoSource:
         """True if any SELECTED video section (scoped by media_type) is currently
         being scanned by Plex. Checks the per-section refreshing flag, then the
         server activity feed (real-time) — mirrors the music PlexClient check."""
+        # PlexAPI caches library sections on the connected server object.
+        # Reusing the connection must not reuse yesterday's refreshing flag.
+        reload_library = getattr(self._server.library, 'reload', None)
+        if callable(reload_library):
+            reload_library()
         sections = []
         for kind, name in (("movie", self._movies_lib), ("show", self._tv_lib)):
             if media_type != "all" and media_type != kind:
@@ -1209,22 +1306,38 @@ class JellyfinVideoSource:
     def _req(self, path, params=None):
         return self._c._make_request(path, params=params)
 
-    def _views(self, collection_type: str, names=None):
-        """Views of a collection type, optionally restricted to the given
-        name(s) — a bare string (one library) or a list (multiple libraries)."""
+    def _views(self, collection_type: str, name=None):
         resp = self._req(f"/Users/{self.uid}/Views") or {}
+        # a library made as "mixed movies and shows" has no collection type
+        # (or 'mixed'), so it never showed up to pick and an anime library set
+        # up that way was never scanned. it can hold either, so it counts as
+        # both; the scans ask for Series / Movie items inside it anyway
         views = [v for v in resp.get("Items", [])
-                 if (v.get("CollectionType") or "").lower() == collection_type]
-        if names:
-            wanted = {names} if isinstance(names, str) else set(names)
-            views = [v for v in views if v.get("Name") in wanted]
+                 if (v.get("CollectionType") or "mixed").lower() in (collection_type, "mixed")]
+        if name:
+            from core.commissary.video_libraries import matches_name  # Commissary: lists
+            views = [v for v in views if matches_name(v.get("Name"), name)]
         return views
 
-    def _scan_views(self, collection_type: str, names):
-        """Views to SCAN. Empty names means this kind isn't mapped → scan NOTHING
+    def _scan_views(self, collection_type: str, name):
+        """Views to SCAN. An empty name means this kind isn't mapped → scan NOTHING
         (never fall back to all views), so a missing selection can't pull every
         library. (available_libraries still lists all via _views.)"""
-        return self._views(collection_type, names) if names else []
+        return self._views(collection_type, name) if name else []
+
+    def scan_problem(self, media_type="all"):
+        """why a scan of media_type would read nothing, or None. an unpicked or
+        vanished library used to finish green with 0 items."""
+        wants = _wanted_libraries(media_type, self._movies_lib, self._tv_lib)
+        if not any(name for _, _, name in wants):
+            return _no_library_message(wants)
+        if self._req(f"/Users/{self.uid}/Views") is None:
+            return "Couldn't list Jellyfin libraries (%s)" % (
+                getattr(self._c, "last_error", None) or "no response")
+        for label, kind, name in wants:
+            if name and not self._views("movies" if kind == "movie" else "tvshows", name):
+                return _missing_library_message(label, name, "Jellyfin")
+        return None
 
     def available_libraries(self) -> dict:
         return {
@@ -1240,7 +1353,7 @@ class JellyfinVideoSource:
         base = (self._c.base_url or "").rstrip("/")
         if not base:
             return {"ok": False, "sections": 0}
-        headers = {"X-Emby-Token": self._c.api_key or ""}
+        headers = self._jf()[1]
         views = []
         if media_type in ("all", "movie"):
             views += list(self._scan_views("movies", self._movies_lib))
@@ -1278,7 +1391,7 @@ class JellyfinVideoSource:
             base = (self._c.base_url or "").rstrip("/")
             if not base:
                 return {"ok": False, "error": "Jellyfin not configured"}
-            headers = {"X-Emby-Token": self._c.api_key or "", "Content-Type": "image/jpeg"}
+            headers = {**self._jf()[1], "Content-Type": "image/jpeg"}
             r = _rq.post(base + "/Items/" + str(server_id) + "/Images/Primary",
                          data=_b64.b64encode(image_bytes), headers=headers, timeout=30)
             r.raise_for_status()
@@ -1355,10 +1468,14 @@ class JellyfinVideoSource:
             logger.exception("Jellyfin: set_watched failed for %s", server_id)
             return {"ok": False, "error": str(e)}
 
-    # ── Collections (BoxSets; Commissary-managed) ───────────────────────────────
+    # ── Collections (BoxSets; SoulSync-managed) ───────────────────────────────
     def _jf(self):
+        """base url + the auth header pair for direct requests calls. every
+        hand-rolled header dict in here goes through this so none of them can
+        fall back to x-emby-token alone (401 on jellyfin 12, #1250)."""
+        from core.jellyfin_client import jellyfin_auth_headers
         base = (self._c.base_url or "").rstrip("/")
-        return base, {"X-Emby-Token": self._c.api_key or ""}
+        return base, jellyfin_auth_headers(self._c.api_key)
 
     def find_collection(self, kind: str, name: str):
         resp = self._req(f"/Users/{self.uid}/Items", params={
@@ -1487,8 +1604,7 @@ class JellyfinVideoSource:
         if not base:
             return False
         try:
-            r = requests.get(base + "/ScheduledTasks",
-                             headers={"X-Emby-Token": self._c.api_key or ""}, timeout=10)
+            r = requests.get(base + "/ScheduledTasks", headers=self._jf()[1], timeout=10)
             tasks = r.json() if r.ok else []
         except Exception:
             return False
@@ -1507,7 +1623,7 @@ class JellyfinVideoSource:
         base = (self._c.base_url or "").rstrip("/")
         if not title or not base:
             return False
-        headers = {"X-Emby-Token": self._c.api_key or ""}
+        headers = self._jf()[1]
 
         def _find(item_type):
             try:
@@ -1563,7 +1679,13 @@ class JellyfinVideoSource:
         while True:
             p = dict(params)
             p.update({"StartIndex": str(start), "Limit": str(page_size)})
-            resp = self._req(path, p) or {}
+            resp = self._req(path, p)
+            if resp is None:
+                # a failed page is not the end of the library. reading it as
+                # one finished the scan with nothing, or let a deep scan prune
+                # everything past the page that timed out
+                raise RuntimeError("Jellyfin stopped answering at item %d (%s)" % (
+                    start, getattr(self._c, "last_error", None) or "no response"))
             batch = resp.get("Items", [])
             for it in batch:
                 yield it
@@ -1650,11 +1772,23 @@ class JellyfinVideoSource:
                 items = self._paged(path, params)
             for it in items:
                 try:
-                    d = self._movie(it)
-                    d["_server_title"] = view.get("Name")
-                    yield d
+                    yield _vlib_tag(self._movie(it), view.get("Name"))  # Commissary
                 except Exception:
                     logger.exception("Jellyfin: skipping movie %s", it.get("Name", "?"))
+
+    def movie_item(self, server_id, title=None, tmdb_id=None):
+        """The normalized payload for ONE movie. Jellyfin ids are durable, and
+        failures collapse to None in _req, so verify the server is still alive
+        before treating a missing item as removed."""
+        it = self._req(f"/Users/{self.uid}/Items/{server_id}",
+                       {"Fields": _JF_MOVIE_FIELDS})
+        if it and it.get("Id"):
+            if (it.get("Type") or "") != "Movie":
+                return None
+            return self._movie(it)
+        if self._req(f"/Users/{self.uid}/Views") is None:
+            raise RuntimeError("Jellyfin unreachable - cannot verify the movie's state")
+        return None
 
     @staticmethod
     def _first(seq):
@@ -1701,11 +1835,6 @@ class JellyfinVideoSource:
         if it and it.get("Id"):
             if (it.get("Type") or "") != "Series":
                 return None   # re-keyed to something else entirely — treat as gone
-            # No cheap way to resolve which view this single item lives under
-            # here (unlike iter_shows, which already has it) — leave
-            # _server_title unset; root_folder_id is an enrichment-protected
-            # column (_ENRICH_META_COLS) so upsert_show_tree preserves
-            # whatever the bulk scan last stamped instead of clearing it.
             return self._show(it)
         if self._req(f"/Users/{self.uid}/Views") is None:
             raise RuntimeError("Jellyfin unreachable — cannot verify the show's state")
@@ -1735,9 +1864,7 @@ class JellyfinVideoSource:
                 items = self._paged(path, params)
             for it in items:
                 try:
-                    d = self._show(it)
-                    d["_server_title"] = view.get("Name")
-                    yield d
+                    yield _vlib_tag(self._show(it), view.get("Name"))  # Commissary
                 except Exception:
                     logger.exception("Jellyfin: skipping show %s", it.get("Name", "?"))
 

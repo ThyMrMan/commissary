@@ -1,9 +1,11 @@
 // ============================================
-// Commissary Setup Wizard — First-Run Experience
+// SoulSync Setup Wizard — First-Run Experience
 // ============================================
 
 const WIZARD_STEPS = ['welcome', 'metadata', 'download-source', 'paths', 'watchlist', 'first-download', 'done'];
 let _wizardStep = 0;
+let _wizardSaving = false;
+let _wizardOpened = false;
 let _wizardSettings = {
     metadata_source: 'deezer',
     download_source: 'soulseek',
@@ -34,6 +36,8 @@ function openSetupWizard() {
     const overlay = document.getElementById('setup-wizard-overlay');
     if (!overlay) return;
     overlay.style.display = 'flex';
+    if (_wizardOpened) { _renderWizard(); return; }
+    _wizardOpened = true;
     _wizardStep = 0;
     _wizardSettings = {
         metadata_source: 'deezer',
@@ -60,12 +64,11 @@ function openSetupWizard() {
 }
 
 function closeSetupWizard() {
+    if (_wizardSaving) return;
     const overlay = document.getElementById('setup-wizard-overlay');
     if (overlay) overlay.style.display = 'none';
 
-    // Mark as complete so it doesn't show again (server + client)
-    localStorage.setItem('soulsync_setup_complete', 'true');
-    fetch('/api/setup/complete', { method: 'POST' }).catch(() => {});
+    // Dismissing postpones setup; only a successful Finish marks completion.
 
     // Continue app initialization if wizard was shown on first run
     if (typeof window._onSetupWizardComplete === 'function') {
@@ -76,19 +79,49 @@ function closeSetupWizard() {
 
 // ---- Navigation ----
 
-function wizardNext() {
-    if (!_validateWizardStep()) return;
+function _wizardSetSaving(saving) {
+    _wizardSaving = saving;
+    const overlay = document.getElementById('setup-wizard-overlay');
+    if (overlay) overlay.setAttribute('aria-busy', String(saving));
+    document.querySelectorAll('#setup-wizard-content .setup-btn').forEach(button => {
+        if (saving) { button.dataset.wasDisabled = String(button.disabled); button.disabled = true; }
+        else { button.disabled = button.dataset.wasDisabled === 'true'; delete button.dataset.wasDisabled; }
+    });
+}
 
-    // Save settings for the current step before advancing
-    _saveWizardStepSettings();
+async function _wizardPost(url, body) {
+    const response = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        ...(body ? { body: JSON.stringify(body) } : {})
+    });
+    const data = await response.json();
+    if (!response.ok || data.success !== true) throw new Error(data.error || 'Could not save setup. Please try again.');
+    return data;
+}
 
-    if (_wizardStep < WIZARD_STEPS.length - 1) {
-        _wizardStep++;
-        _renderWizard();
+function _wizardSaveError(error) {
+    const message = error instanceof Error ? error.message : 'Could not save setup. Please try again.';
+    let note = document.getElementById('setup-save-error');
+    if (!note) {
+        note = document.createElement('p'); note.id = 'setup-save-error'; note.setAttribute('role', 'alert');
+        document.getElementById('setup-wizard-content')?.prepend(note);
     }
+    note.textContent = message;
+}
+
+async function wizardNext() {
+    if (_wizardSaving || !_validateWizardStep()) return;
+    _wizardSetSaving(true);
+    try {
+        await _saveWizardStepSettings();
+        if (_wizardStep < WIZARD_STEPS.length - 1) _wizardStep++;
+        _renderWizard();
+    } catch (error) { _wizardSaveError(error); }
+    finally { _wizardSetSaving(false); }
 }
 
 function wizardBack() {
+    if (_wizardSaving) return;
     if (_wizardStep > 0) {
         _wizardStep--;
         _renderWizard();
@@ -96,6 +129,7 @@ function wizardBack() {
 }
 
 function wizardSkipStep() {
+    if (_wizardSaving) return;
     if (_wizardStep < WIZARD_STEPS.length - 1) {
         _wizardStep++;
         _renderWizard();
@@ -158,15 +192,8 @@ async function _saveWizardStepSettings() {
     }
 
     if (Object.keys(settings).length > 0) {
-        try {
-            await fetch('/api/settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings)
-            });
-        } catch (e) {
-            console.error('Wizard step save error:', e);
-        }
+        settings.setup = { in_progress: true };
+        await _wizardPost('/api/settings', settings);
     }
 }
 
@@ -206,8 +233,8 @@ function _renderWizard() {
 function _renderWelcome(el) {
     el.innerHTML = `
         <div class="setup-card">
-            <img src="/static/trans2.png" alt="Commissary" class="setup-welcome-logo">
-            <h2>Welcome to Commissary</h2>
+            <img src="/static/trans2.png" alt="SoulSync" class="setup-welcome-logo">
+            <h2>Welcome to SoulSync</h2>
             <p class="setup-welcome-tagline">Intelligent Music Discovery & Automation</p>
             <div class="setup-feature-list">
                 <div class="setup-feature-item">
@@ -266,9 +293,9 @@ function _renderMetadata(el) {
     el.innerHTML = `
         <div class="setup-card">
             <h2>Metadata Source</h2>
-            <p class="setup-subtitle">Where should Commissary look up track info, album art, and metadata?</p>
+            <p class="setup-subtitle">Where should SoulSync look up track info, album art, and metadata?</p>
             <div class="setup-info-box">
-                <strong>What is a metadata source?</strong> When you search for music or sync a playlist, Commissary needs a catalog to look up track names, artists, album art, track numbers, and release dates. This source provides that information — it does not affect where music is downloaded from.
+                <strong>What is a metadata source?</strong> When you search for music or sync a playlist, SoulSync needs a catalog to look up track names, artists, album art, track numbers, and release dates. This source provides that information — it does not affect where music is downloaded from.
             </div>
             <div class="setup-option-grid" style="grid-template-columns: 1fr 1fr 1fr;">
                 ${sources.map(s => `
@@ -360,11 +387,11 @@ function _renderDownloadSource(el) {
     el.innerHTML = `
         <div class="setup-card">
             <h2>Download Source</h2>
-            <p class="setup-subtitle">Choose where Commissary downloads music files from.</p>
+            <p class="setup-subtitle">Choose where SoulSync downloads music files from.</p>
             <div class="setup-info-box">
-                <strong>How downloads work:</strong> When you search for a track, Commissary uses your metadata source to identify it, then searches your download source for the actual audio file. The matching engine automatically finds the best quality match.
+                <strong>How downloads work:</strong> When you search for a track, SoulSync uses your metadata source to identify it, then searches your download source for the actual audio file. The matching engine automatically finds the best quality match.
                 <br><br>
-                <strong>Hybrid mode</strong> (available later in Settings) lets you set a priority order — if your primary source doesn't have a track, Commissary automatically tries the next source in line.
+                <strong>Hybrid mode</strong> (available later in Settings) lets you set a priority order — if your primary source doesn't have a track, SoulSync automatically tries the next source in line.
             </div>
             <div class="setup-option-grid" style="grid-template-columns: 1fr 1fr 1fr;">
                 ${sources.map(s => `
@@ -394,7 +421,7 @@ async function _wizardTestConnection(service) {
     const btns = document.querySelectorAll('.setup-test-btn');
     const btn = btns[btns.length - 1];
     if (btn) {
-        btn.innerHTML = '<span class="setup-spinner"></span>Testing…';
+        btn.innerHTML = '<span class="setup-spinner"></span>Testing...';
         btn.className = 'setup-test-btn';
     }
 
@@ -541,7 +568,7 @@ function _renderPaths(el) {
 
             <p class="setup-subtitle" style="margin-top: 20px; margin-bottom: 8px;">Connect a media server</p>
             <div class="setup-info-box" style="margin-bottom: 12px;">
-                Connecting a media server lets Commissary trigger library scans after downloads, import your existing library, and display what you already own when searching. Select <strong>None</strong> if you don't use one.
+                Connecting a media server lets SoulSync trigger library scans after downloads, import your existing library, and display what you already own when searching. Select <strong>None</strong> if you don't use one.
             </div>
             <div class="setup-server-grid">
                 ${['plex', 'jellyfin', 'navidrome', 'none'].map(s => `
@@ -613,7 +640,7 @@ function _renderWatchlist(el) {
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
                 </span>
                 <input class="setup-search-input" type="text" id="setup-artist-search"
-                       placeholder="Search for an artist…" autocomplete="off"
+                       placeholder="Search for an artist..." autocomplete="off"
                        oninput="_wizardArtistSearch(this.value)">
             </div>
             <div class="setup-artist-results" id="setup-artist-results"></div>
@@ -638,7 +665,7 @@ function _wizardArtistSearch(query) {
     _wizardSearchTimeout = setTimeout(async () => {
         const results = document.getElementById('setup-artist-results');
         if (!results) return;
-        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching…</div>';
+        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching...</div>';
 
         try {
             // Use the discover artist search endpoint — works with whatever metadata source is active
@@ -775,14 +802,14 @@ function _renderFirstDownload(el) {
             <h2>Your First Download</h2>
             <p class="setup-subtitle">Try searching for a track to see the full pipeline in action.</p>
             <div class="setup-info-box">
-                <strong>How it works:</strong> Type a song name below. Commissary searches your metadata source for the track, then finds the best matching audio file from your download source. The track is tagged with full metadata (artist, album, track number, artwork) and organized into your output folder.
+                <strong>How it works:</strong> Type a song name below. SoulSync searches your metadata source for the track, then finds the best matching audio file from your download source. The track is tagged with full metadata (artist, album, track number, artwork) and organized into your output folder.
             </div>
             <div class="setup-search-wrapper">
                 <span class="setup-search-icon">
                     <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
                 </span>
                 <input class="setup-search-input" type="text" id="setup-track-search"
-                       placeholder="Search for a song…" autocomplete="off"
+                       placeholder="Search for a song..." autocomplete="off"
                        oninput="_wizardTrackSearch(this.value)">
             </div>
             <div class="setup-track-results" id="setup-track-results"></div>
@@ -807,7 +834,7 @@ function _wizardTrackSearch(query) {
     _wizardSearchTimeout = setTimeout(async () => {
         const results = document.getElementById('setup-track-results');
         if (!results) return;
-        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching…</div>';
+        results.innerHTML = '<div style="text-align:center;padding:12px;color:rgba(255,255,255,0.4);"><span class="setup-spinner"></span> Searching...</div>';
 
         try {
             // Use enhanced-search which searches the configured metadata source
@@ -863,7 +890,7 @@ async function _wizardDownloadTrack(index) {
 
     const track = tracks[index];
     row.classList.add('downloading');
-    status.innerHTML = '<span class="setup-spinner"></span>Searching…';
+    status.innerHTML = '<span class="setup-spinner"></span>Searching...';
 
     try {
         // Step 1: Search for the best match via the configured download source
@@ -886,7 +913,7 @@ async function _wizardDownloadTrack(index) {
         }
 
         // Step 2: Start matched download with full metadata context from the search result
-        status.innerHTML = '<span class="setup-spinner"></span>Downloading…';
+        status.innerHTML = '<span class="setup-spinner"></span>Downloading...';
 
         const artistName = track.artist || 'Unknown Artist';
         const dlResp = await fetch('/api/download/matched', {
@@ -955,7 +982,7 @@ function _renderDone(el) {
                 </svg>
             </div>
             <h2>You're All Set!</h2>
-            <p class="setup-subtitle">Commissary is configured and ready to go. Here's a quick overview of what's available.</p>
+            <p class="setup-subtitle">SoulSync is configured and ready to go. Here's a quick overview of what's available.</p>
             <div class="setup-summary">
                 ${summaryRows.map(r => `
                     <div class="setup-summary-row">
@@ -967,7 +994,7 @@ function _renderDone(el) {
             <div class="setup-tips-grid">
                 <div class="setup-tip-card">
                     <div class="setup-tip-title">Sync Page</div>
-                    <div class="setup-tip-text">Mirror playlists from Spotify, Tidal, Deezer, YouTube, Beatport, and ListenBrainz. Commissary matches and downloads missing tracks automatically.</div>
+                    <div class="setup-tip-text">Mirror playlists from Spotify, Tidal, Deezer, YouTube, Beatport, and ListenBrainz. SoulSync matches and downloads missing tracks automatically.</div>
                 </div>
                 <div class="setup-tip-card">
                     <div class="setup-tip-title">Wishlist</div>
@@ -990,12 +1017,14 @@ function _renderDone(el) {
                     <div class="setup-tip-text">Everything from this wizard plus much more — file organization templates, quality preferences, tag embedding, and advanced options.</div>
                 </div>
             </div>
-            <button class="setup-btn setup-btn-primary setup-btn-big" onclick="_wizardFinish()">Start Using Commissary</button>
+            <button class="setup-btn setup-btn-primary setup-btn-big" onclick="_wizardFinish()">Start Using SoulSync</button>
         </div>
     `;
 }
 
 async function _wizardFinish() {
+    if (_wizardSaving) return;
+    _wizardSetSaving(true);
     // Final save — all settings were saved per-step, but do a final pass
     const settings = {
         metadata: { fallback_source: _wizardSettings.metadata_source },
@@ -1023,29 +1052,22 @@ async function _wizardFinish() {
     }
 
     try {
-        await fetch('/api/settings', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(settings)
-        });
-    } catch (e) {
-        console.error('Wizard final save error:', e);
+        await _wizardPost('/api/settings', settings);
+        await _wizardPost('/api/setup/complete');
+    } catch (error) {
+        _wizardSaveError(error);
+        _wizardSetSaving(false);
+        return;
     }
-
-    // Mark setup complete on both server and client
-    try {
-        await fetch('/api/setup/complete', { method: 'POST' });
-    } catch (e) {
-        console.error('Failed to mark setup complete on server:', e);
-    }
-    localStorage.setItem('soulsync_setup_complete', 'true');
+    _wizardSetSaving(false);
+    try { localStorage.setItem('soulsync_setup_complete', 'true'); } catch (_) {}
 
     const overlay = document.getElementById('setup-wizard-overlay');
     if (overlay) overlay.style.display = 'none';
 
     // Reload settings into the main UI
     if (typeof loadSettings === 'function') loadSettings();
-    if (typeof showToast === 'function') showToast('Setup complete — welcome to Commissary!', 'success');
+    if (typeof showToast === 'function') showToast('Setup complete — welcome to SoulSync!', 'success');
 
     // Continue app initialization if wizard was shown on first run
     if (typeof window._onSetupWizardComplete === 'function') {

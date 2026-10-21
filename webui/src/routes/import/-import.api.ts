@@ -1,6 +1,7 @@
 import { queryOptions, type QueryClient } from '@tanstack/react-query';
 
 import { apiClient, readJson } from '@/app/api-client';
+import { appURL } from '@/platform/url-base';
 
 import type {
   ImportAlbum,
@@ -8,10 +9,15 @@ import type {
   ImportAlbumMatchPayload,
   ImportAlbumSearchPayload,
   ImportAutoImportResultsPayload,
-  ImportBrowsePayload,
   ImportAutoImportSettingsPayload,
   ImportAutoImportStatusPayload,
+  ImportFingerprintPayload,
+  ImportInboxPayload,
+  ImportPreviewPayload,
   ImportProcessPayload,
+  ImportUploadChunkPayload,
+  ImportUploadPayload,
+  LibraryCheckPayload,
   ImportSearchSourcesPayload,
   ImportStagingFilesPayload,
   ImportStagingGroupsPayload,
@@ -31,39 +37,20 @@ export const IMPORT_QUERY_KEY = ['import'] as const;
 // responses actually arrive and the bar advances. Scoped to import only.
 const IMPORT_REQUEST_TIMEOUT_MS = 300_000; // 5 min/track
 
-// The staging endpoints scan the configured Import folder unless told otherwise.
-// An empty scanPath means exactly that, so the default call is byte-identical to
-// what it was before folder browsing existed.
-function scanParams(scanPath?: string) {
-  return scanPath ? { searchParams: { path: scanPath } } : undefined;
+export async function fetchImportInbox(): Promise<ImportInboxPayload> {
+  return readJson<ImportInboxPayload>(apiClient.get('import/inbox'));
 }
 
-export async function fetchImportStagingFiles(
-  scanPath?: string,
-): Promise<ImportStagingFilesPayload> {
-  return readJson<ImportStagingFilesPayload>(
-    apiClient.get('import/staging/files', scanParams(scanPath)),
-  );
+export async function fetchImportStagingFiles(): Promise<ImportStagingFilesPayload> {
+  return readJson<ImportStagingFilesPayload>(apiClient.get('import/staging/files'));
 }
 
-export async function fetchImportStagingGroups(
-  scanPath?: string,
-): Promise<ImportStagingGroupsPayload> {
-  return readJson<ImportStagingGroupsPayload>(
-    apiClient.get('import/staging/groups', scanParams(scanPath)),
-  );
+export async function fetchImportStagingGroups(): Promise<ImportStagingGroupsPayload> {
+  return readJson<ImportStagingGroupsPayload>(apiClient.get('import/staging/groups'));
 }
 
 export async function fetchImportStagingSuggestions(): Promise<ImportAlbumSearchPayload> {
   return readJson<ImportAlbumSearchPayload>(apiClient.get('import/staging/suggestions'));
-}
-
-/** List one folder on the server. Omit `path` to open on the first configured
- * root (normally the download folder), so the common case needs no typing. */
-export async function fetchImportBrowse(path?: string): Promise<ImportBrowsePayload> {
-  return readJson<ImportBrowsePayload>(
-    apiClient.get('import/browse', path ? { searchParams: { path } } : undefined),
-  );
 }
 
 export async function searchImportAlbums(
@@ -91,14 +78,9 @@ export async function matchImportAlbum(input: {
   albumName?: string | null;
   albumArtist?: string | null;
   filePaths?: string[] | null;
-  /** The folder the page is showing. Without it the server matched against the
-   * configured Import folder, which is not the folder on screen after "Import
-   * from a different folder". */
-  scanPath?: string;
 }): Promise<ImportAlbumMatchPayload> {
   return readJson<ImportAlbumMatchPayload>(
     apiClient.post('import/album/match', {
-      ...scanParams(input.scanPath),
       json: {
         album_id: input.albumId,
         source: input.source || '',
@@ -114,19 +96,55 @@ export async function matchImportAlbum(input: {
   );
 }
 
+type ImportJobResponse = {
+  job_id?: string;
+  state?: 'queued' | 'running' | 'complete';
+  result?: ImportProcessPayload;
+  status?: number;
+};
+
+async function runImportJob(path: string, json: unknown): Promise<ImportProcessPayload> {
+  // getRandomValues also works on plain HTTP LAN installs, where randomUUID
+  // is unavailable. Retain the old timeout for servers predating async imports.
+  const key = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) =>
+    byte.toString(16).padStart(2, '0'),
+  ).join('');
+  const accepted = await readJson<ImportJobResponse & ImportProcessPayload>(
+    apiClient.post(path, {
+      json,
+      headers: { Prefer: 'respond-async', 'Idempotency-Key': key },
+      timeout: IMPORT_REQUEST_TIMEOUT_MS,
+    }),
+  );
+  // Supports an older server during an upgrade.
+  if (!accepted.job_id) return accepted;
+  let failures = 0;
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    let job: ImportJobResponse;
+    try {
+      job = await readJson<ImportJobResponse>(apiClient.get(`import/jobs/${accepted.job_id}`));
+      failures = 0;
+    } catch (error) {
+      failures += 1;
+      if (failures >= 3 || (error instanceof Error && error.name === 'HTTPError')) throw error;
+      continue;
+    }
+    if (job.state === 'complete') {
+      if (!job.result) throw new Error('Import job returned no result');
+      if (!job.result.success || (job.status ?? 200) >= 400) {
+        throw new Error(job.result.error || 'Import processing failed');
+      }
+      return job.result;
+    }
+  }
+}
+
 export async function processImportAlbumTrack(input: {
   album: ImportAlbum;
   match: ImportAlbumMatch;
 }): Promise<ImportProcessPayload> {
-  return readJson<ImportProcessPayload>(
-    apiClient.post('import/album/process', {
-      json: {
-        album: input.album,
-        matches: [input.match],
-      },
-      timeout: IMPORT_REQUEST_TIMEOUT_MS,
-    }),
-  );
+  return runImportJob('import/album/process', { album: input.album, matches: [input.match] });
 }
 
 export async function searchImportTracks(query: string): Promise<ImportTrackSearchPayload> {
@@ -141,14 +159,7 @@ export async function searchImportTracks(query: string): Promise<ImportTrackSear
 }
 
 export async function processImportSingleFile(file: unknown): Promise<ImportProcessPayload> {
-  return readJson<ImportProcessPayload>(
-    apiClient.post('import/singles/process', {
-      json: {
-        files: [file],
-      },
-      timeout: IMPORT_REQUEST_TIMEOUT_MS,
-    }),
-  );
+  return runImportJob('import/singles/process', { files: [file] });
 }
 
 export async function fetchAutoImportStatus(): Promise<ImportAutoImportStatusPayload> {
@@ -163,6 +174,8 @@ export async function saveAutoImportSettings(input: {
   confidenceThreshold: number;
   scanInterval: number;
   qualityProfileId?: number | null;
+  autoProcess?: boolean;
+  clearFinished?: boolean;
 }): Promise<void> {
   await readJson<{ success: boolean; error?: string }>(
     apiClient.post('auto-import/settings', {
@@ -170,6 +183,8 @@ export async function saveAutoImportSettings(input: {
         confidence_threshold: input.confidenceThreshold,
         scan_interval: input.scanInterval,
         quality_profile_id: input.qualityProfileId ?? null,
+        ...(input.autoProcess === undefined ? {} : { auto_process: input.autoProcess }),
+        ...(input.clearFinished === undefined ? {} : { clear_finished: input.clearFinished }),
       },
     }),
   );
@@ -221,6 +236,20 @@ export async function rejectAutoImportResult(id: number): Promise<void> {
   }
 }
 
+export async function retryAutoImportResult(id: number): Promise<void> {
+  const payload = await readJson<{ success: boolean; error?: string }>(
+    apiClient.post(`auto-import/retry/${id}`),
+  );
+  if (!payload.success) throw new Error(payload.error || 'Failed to retry');
+}
+
+export async function resolveAutoImportResult(id: number): Promise<void> {
+  const payload = await readJson<{ success: boolean; error?: string }>(
+    apiClient.post(`auto-import/resolve/${id}`),
+  );
+  if (!payload.success) throw new Error(payload.error || 'Failed to record the import');
+}
+
 export async function approveAllAutoImportResults(): Promise<number> {
   const payload = await readJson<{ success: boolean; count?: number; error?: string }>(
     apiClient.post('auto-import/approve-all'),
@@ -244,32 +273,29 @@ export async function clearCompletedAutoImportResults(): Promise<number> {
 // the user is on another page so coming back doesn't re-scan either.
 const STAGING_CACHE = { staleTime: 30 * 60_000, gcTime: 60 * 60_000 } as const;
 
-// scanPath is part of the KEY, not just the request. Two folders are two
-// different scans; sharing one cache entry would show the previous folder's
-// files under the new folder's name until something invalidated it.
-export function importStagingFilesQueryOptions(scanPath = '') {
+// The inbox polls: the worker moves items through identifying / importing on
+// its own clock, and the page has to follow it without a refresh button.
+export function importInboxQueryOptions() {
   return queryOptions({
-    queryKey: [...IMPORT_QUERY_KEY, 'staging-files', scanPath],
-    queryFn: () => fetchImportStagingFiles(scanPath),
+    queryKey: [...IMPORT_QUERY_KEY, 'inbox'],
+    queryFn: fetchImportInbox,
+    staleTime: 4_000,
+  });
+}
+
+export function importStagingFilesQueryOptions() {
+  return queryOptions({
+    queryKey: [...IMPORT_QUERY_KEY, 'staging-files'],
+    queryFn: fetchImportStagingFiles,
     ...STAGING_CACHE,
   });
 }
 
-export function importStagingGroupsQueryOptions(scanPath = '') {
+export function importStagingGroupsQueryOptions() {
   return queryOptions({
-    queryKey: [...IMPORT_QUERY_KEY, 'staging-groups', scanPath],
-    queryFn: () => fetchImportStagingGroups(scanPath),
+    queryKey: [...IMPORT_QUERY_KEY, 'staging-groups'],
+    queryFn: fetchImportStagingGroups,
     ...STAGING_CACHE,
-  });
-}
-
-/** Folder listings are cheap and change under us (a download finishing adds a
- * folder), so unlike the staging scan these are NOT cached for half an hour. */
-export function importBrowseQueryOptions(path = '') {
-  return queryOptions({
-    queryKey: [...IMPORT_QUERY_KEY, 'browse', path],
-    queryFn: () => fetchImportBrowse(path),
-    staleTime: 0,
   });
 }
 
@@ -323,6 +349,7 @@ export function invalidateImportQueries(queryClient: QueryClient) {
 
 export function invalidateImportStagingQueries(queryClient: QueryClient) {
   return Promise.all([
+    queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'inbox'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'staging-files'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'staging-groups'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'staging-suggestions'] }),
@@ -331,8 +358,104 @@ export function invalidateImportStagingQueries(queryClient: QueryClient) {
 
 export function invalidateAutoImportQueries(queryClient: QueryClient) {
   return Promise.all([
+    queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'inbox'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'auto-import-status'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'auto-import-settings'] }),
     queryClient.invalidateQueries({ queryKey: [...IMPORT_QUERY_KEY, 'auto-import-results'] }),
   ]);
+}
+
+/** What an album import would do, per track. Nothing is written. */
+export async function previewImportAlbum(input: {
+  album: ImportAlbum;
+  matches: ImportAlbumMatch[];
+}): Promise<ImportPreviewPayload> {
+  return readJson<ImportPreviewPayload>(
+    apiClient.post('import/album/preview', { json: input, timeout: 60_000 }),
+  );
+}
+
+/** Which of these track names the library already has, for this artist. */
+export async function checkLibraryTracks(input: {
+  artistName: string;
+  albumName?: string;
+  tracks: { name: string }[];
+}): Promise<LibraryCheckPayload> {
+  return readJson<LibraryCheckPayload>(
+    apiClient.post('library/check-tracks', {
+      json: {
+        artist_name: input.artistName,
+        album_name: input.albumName ?? '',
+        tracks: input.tracks,
+      },
+      timeout: 60_000,
+    }),
+  );
+}
+
+/** pieces of a few megabytes get through any reverse proxy's body cap */
+const UPLOAD_CHUNK_BYTES = 8 * 1024 * 1024;
+
+function postForm(url: string, form: FormData, onProgress?: (fraction: number) => void) {
+  return new Promise<ImportUploadChunkPayload>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', url);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) onProgress(event.loaded / event.total);
+    };
+    xhr.onload = () => {
+      let payload: ImportUploadChunkPayload | null = null;
+      try {
+        payload = JSON.parse(xhr.responseText) as ImportUploadChunkPayload;
+      } catch {
+        payload = null;
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && payload?.success) resolve(payload);
+      else reject(new Error(payload?.error || `Upload failed (${xhr.status})`));
+    };
+    xhr.onerror = () => reject(new Error('Upload failed'));
+    xhr.send(form);
+  });
+}
+
+/**
+ * Upload one file into the import folder in pieces, keeping the relative
+ * path the browser knows (a dropped folder's name). XHR rather than ky: ky
+ * has no upload progress, and a 400 MB FLAC deserves a bar. Pieces because
+ * a proxy in front of a docker install may cap a body at a megabyte.
+ */
+export async function uploadImportFile(
+  file: File,
+  relativePath: string,
+  onProgress?: (fraction: number) => void,
+): Promise<ImportUploadPayload> {
+  const total = Math.max(1, Math.ceil(file.size / UPLOAD_CHUNK_BYTES));
+  const uploadId = Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) =>
+    b.toString(16).padStart(2, '0'),
+  ).join('');
+  let last: ImportUploadChunkPayload | null = null;
+  for (let index = 0; index < total; index += 1) {
+    const start = index * UPLOAD_CHUNK_BYTES;
+    const piece = file.slice(start, Math.min(file.size, start + UPLOAD_CHUNK_BYTES));
+    const form = new FormData();
+    form.append('upload_id', uploadId);
+    form.append('index', String(index));
+    form.append('total', String(total));
+    form.append('path', relativePath);
+    form.append('chunk', piece, file.name);
+    last = await postForm(appURL('/api/import/upload/chunk'), form, (fraction) => {
+      if (onProgress) onProgress((index + fraction) / total);
+    });
+  }
+  if (onProgress) onProgress(1);
+  return { success: true, saved: last?.saved ? [last.saved] : [], skipped: [] };
+}
+
+/** AcoustID the first few files of an item, on demand. */
+export async function fingerprintImportFiles(
+  filePaths: string[],
+): Promise<ImportFingerprintPayload> {
+  return readJson<ImportFingerprintPayload>(
+    apiClient.post('import/fingerprint', { json: { file_paths: filePaths }, timeout: 120_000 }),
+  );
 }

@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Automations page.
+ * SoulSync — Video Automations page.
  *
  * The automation engine is app-wide, so this shows the SAME system automations the
  * music side runs (minus Refresh Beatport Cache + user/playlist ones). To match the
@@ -42,7 +42,7 @@
         // Presentation
         'video_apply_overlays', 'video_sync_collections',
         // Maintenance
-        'video_clean_plex_images',
+        'video_clean_plex_images', 'video_purge_recycle_bin',
         'video_clean_search_history', 'video_clean_completed_downloads', 'video_full_cleanup', 'video_backup_database',
     ];
     function _sysOrderIndex(a) {

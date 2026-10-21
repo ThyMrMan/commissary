@@ -27,9 +27,16 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from core.downloads import seed_rules
+
 from utils.logging_config import get_logger
 
 logger = get_logger("video.seeding")
+
+# How many awaiting rows to read, and how many of those we'll actually poll the
+# client about in one pass. The gap between them is headroom for exempt rows.
+MAX_ROWS_PER_SWEEP = 1000
+MAX_POLLS_PER_SWEEP = 100
 
 _running = False
 _lock = threading.Lock()
@@ -40,34 +47,39 @@ def is_running() -> bool:
 
 
 def _completed_age_hours(dl: Dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
-    """How long ago this download finished, in hours.
-
-    The two candidate columns have DIFFERENT time bases and have to be told
-    apart. ``completed_at`` is written by the app in local wall-clock;
-    ``updated_at`` is SQLite's own ``datetime('now')``, which is UTC. Reading
-    both as UTC — as this did — made every app-written value look a whole UTC
-    offset older than it was, and this function decides when a torrent may be
-    released. With ``seed_remove_data`` on, that is a deletion happening hours
-    early. An arithmetic bug that ends in an irreversible action is worth
-    naming the columns for."""
-    from core.video.timestamps import LOCAL, UTC, to_epoch
-    raw, naive_is = dl.get("completed_at"), LOCAL
-    if not raw:
-        raw, naive_is = dl.get("updated_at"), UTC      # SQLite datetime('now')
+    raw = dl.get("completed_at") or dl.get("updated_at")
     if not raw:
         return None
-    epoch = to_epoch(raw, naive_is=naive_is)
-    if epoch is None:
+    try:
+        ts = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+    except ValueError:
         return None
     now = now or datetime.now(timezone.utc)
-    return max(0.0, (now.timestamp() - epoch) / 3600.0)
+    return max(0.0, (now - ts).total_seconds() / 3600.0)
+
+
+def is_pack(dl: Dict[str, Any]) -> bool:
+    """True for a season pack grab. Sonarr keeps packs seeding longer than
+    single episodes, so they get their own goal.
+
+    Delegates to season_pack.is_pack_download rather than re-deciding it here.
+    A second definition drifted immediately: it missed scope 'pack' and wrongly
+    counted scope 'show', which the real one settles off ``kind`` instead."""
+    from core.video.season_pack import is_pack_download
+    return bool(is_pack_download(dl or {}))
+
+
+def goal_for(dl: Dict[str, Any], cfg: Dict[str, Any]):
+    """The (ratio, hours) goal this grab is judged against. Pure."""
+    return seed_rules.effective_goal(cfg, (dl or {}).get("indexer_id"), is_pack=is_pack(dl))
 
 
 def goals_met(status: Any, dl: Dict[str, Any], cfg: Dict[str, Any],
               now: Optional[datetime] = None) -> Optional[str]:
     """Why this torrent may be released, or None to keep seeding. Pure."""
-    ratio_goal = float(cfg.get("seed_ratio_goal") or 0)
-    time_goal_h = int(cfg.get("seed_time_goal_hours") or 0)
+    ratio_goal, time_goal_h = goal_for(dl, cfg)
     if ratio_goal and getattr(status, "ratio", None) is not None \
             and status.ratio >= ratio_goal:
         return "ratio %.2f reached the %.2f goal" % (status.ratio, ratio_goal)
@@ -83,12 +95,16 @@ def goals_met(status: Any, dl: Dict[str, Any], cfg: Dict[str, Any],
 
 
 def sweep() -> Dict[str, Any]:
-    """One pass over completed torrent grabs. Returns
-    {status, checked, released, seeding, skipped?}."""
+    """One pass over completed torrent grabs. Every return carries the full
+    {status, checked, released, seeding} key set (plus reason when skipped) —
+    one shape, so callers may index directly. A concurrent sweep left in
+    flight (a background automation thread) used to return a keyless skip
+    dict and KeyError any caller that did."""
     global _running
     with _lock:
         if _running:
-            return {"status": "skipped", "reason": "already_running"}
+            return {"status": "skipped", "reason": "already_running",
+                    "checked": 0, "released": 0, "seeding": 0}
         _running = True
     try:
         return _sweep_inner()
@@ -97,19 +113,48 @@ def sweep() -> Dict[str, Any]:
             _running = False
 
 
+def _status(ref: str):
+    """The client's word on one torrent, as ``(status, answered)``.
+
+    ``answered`` is False when the CLIENT never answered: no client configured,
+    a refused connection, a timeout, bad credentials. That is emphatically NOT
+    "the torrent is gone", and the difference decides whether a row is marked
+    ``seed_released`` — which is terminal, the awaiting query filters released
+    rows out for good.
+
+    Going through ``client_download._get_status`` collapsed both cases into
+    None, so a qBittorrent that was merely down would silently abandon seed
+    management for every row this sweep touched, forever. The music sweep has
+    guarded exactly this since it shipped; this side had not.
+    """
+    from core.torrent_clients import get_active_adapter
+    from utils.async_helpers import run_async
+    adapter = get_active_adapter()
+    if adapter is None:
+        return None, False
+    try:
+        return run_async(adapter.get_status(ref)), True
+    except Exception:   # noqa: BLE001 - client hiccup: keep managing, retry next sweep
+        logger.debug("seeding: status poll failed for %s, retrying next sweep",
+                     ref[:8], exc_info=True)
+        return None, False
+
+
 def _sweep_inner() -> Dict[str, Any]:
     from api.video import get_video_db
     from core.video import download_config
-    from core.video.client_download import _get_status
     db = get_video_db()
     cfg = download_config.load(db)
-    if not cfg.get("seed_ratio_goal") and not cfg.get("seed_time_goal_hours"):
-        return {"status": "skipped", "reason": "no_goals_set", "checked": 0, "released": 0}
+    # a user who set rules on one tracker and left the globals blank still
+    # wants a sweep. checking only the globals meant it never ran for them.
+    if not seed_rules.any_goal_set(cfg):
+        return {"status": "skipped", "reason": "no_goals_set",
+                "checked": 0, "released": 0, "seeding": 0}
 
     # Client mode (arr-style): hand the ratio/time goal to the torrent client so
-    # IT enforces, then release the row. If the push fails or the client can't
-    # take share limits (non-qBit), fall through to Commissary's own management so
-    # the goal still gets enforced — never leave a grab unmanaged.
+    # it has native limits too. SoulSync still keeps the row managed until the
+    # goal is actually met, because the Settings checkbox promises that SoulSync
+    # can remove/delete the client's copy after the seed goal.
     client_mode = cfg.get("seed_mode") == "client"
     adapter = None
     push_seed_goal = None
@@ -119,20 +164,41 @@ def _sweep_inner() -> Dict[str, Any]:
         adapter = get_active_adapter()
         push_seed_goal = _psg
 
-    rows = db.torrents_awaiting_seed_release()
-    released = seeding = 0
+    # Fetch wide, poll narrow. An exempt row (its indexer has no goal) is never
+    # released, so it sits at the front of an `ORDER BY id LIMIT n` window
+    # forever — collect enough of them and no newer torrent is ever swept
+    # again. Exempt rows are free to skip, so only the ones we actually poll
+    # count against the budget.
+    rows = db.torrents_awaiting_seed_release(limit=MAX_ROWS_PER_SWEEP)
+    released = seeding = exempt = deferred = 0
+    polled = 0
     for dl in rows:
         ref = str(dl["client_ref"])
 
-        if client_mode and push_seed_goal(adapter, ref, cfg.get("seed_ratio_goal"),
-                                          cfg.get("seed_time_goal_hours")):
-            db.update_video_download(dl["id"], seed_released=1)
-            released += 1
-            logger.info("seeding: handed '%s' to the torrent client (client mode)", dl.get("title"))
+        row_ratio, row_hours = goal_for(dl, cfg)
+        if client_mode and push_seed_goal(adapter, ref, row_ratio, row_hours):
+            logger.info("seeding: refreshed client seed limits for '%s' (client mode)", dl.get("title"))
+        # SoulSync polls + removes in both modes. In client mode qBittorrent may
+        # also enforce its own limits, but we do not mark the row released until
+        # the configured removal/delete policy has actually run.
+        if not row_ratio and not row_hours:
+            # this tracker is exempt (or nothing applies to it). leave it
+            # seeding forever, that is what "no goal" means. costs no client
+            # call, so it doesn't spend the poll budget.
+            exempt += 1
             continue
-        # soulsync mode, OR client-mode push failed → Commissary polls + removes.
 
-        status = _get_status("torrent", ref)
+        if polled >= MAX_POLLS_PER_SWEEP:
+            deferred += 1
+            continue
+        polled += 1
+
+        status, answered = _status(ref)
+        if not answered:
+            # the client did not answer. leave the row exactly as it is and
+            # try again next sweep — never read silence as "it's gone".
+            seeding += 1
+            continue
         if status is None:
             # client forgot it (user removed by hand, or a restart lost it) —
             # nothing left to manage
@@ -149,8 +215,17 @@ def _sweep_inner() -> Dict[str, Any]:
             logger.info("seeding: released '%s' — %s", dl.get("title"), reason)
         else:
             seeding += 1   # removal failed → try again next sweep
-    return {"status": "completed", "checked": len(rows),
-            "released": released, "seeding": seeding}
+    if deferred:
+        # never let a bounded pass read as "checked everything"
+        logger.info("seeding: %d torrent(s) deferred to the next sweep (polled %d)",
+                    deferred, polled)
+    out = {"status": "completed", "checked": len(rows),
+           "released": released, "seeding": seeding + exempt}
+    if exempt:
+        out["exempt"] = exempt
+    if deferred:
+        out["deferred"] = deferred
+    return out
 
 
 def _remove(ref: str, delete_files: bool) -> bool:

@@ -21,7 +21,7 @@ This sweep does exactly that for completed MUSIC torrent grabs.
     not a None) is left alone and retried next sweep, so a flaky/unreachable
     client can never trigger an erroneous release.
 
-Only ever touches torrents recorded in ``torrent_seed_grabs`` (grabs Commissary
+Only ever touches torrents recorded in ``torrent_seed_grabs`` (grabs SoulSync
 itself completed) — never a torrent the user added, and never the video side's
 grabs. Usenet never seeds; slskd has no concept of it — torrent grabs only.
 """
@@ -61,7 +61,7 @@ def _coerce_hours(v: Any) -> int:
 def _load_cfg() -> Dict[str, Any]:
     """Read + normalize the seeding goals. A malformed stored value defaults to
     OFF (0) rather than crashing the sweep — the goals are opt-in either way."""
-    from config.settings import config_manager
+    from core.settings import config_manager
     return {
         "seed_ratio_goal": _coerce_ratio(config_manager.get("torrent_client.seed_ratio_goal", 0)),
         "seed_time_goal_hours": _coerce_hours(config_manager.get("torrent_client.seed_time_goal_hours", 0)),
@@ -103,12 +103,15 @@ def goals_met(status: Any, dl: Dict[str, Any], cfg: Dict[str, Any],
 
 
 def sweep() -> Dict[str, Any]:
-    """One pass over recorded music torrent grabs. Returns
-    {status, checked, released, seeding, ...}."""
+    """One pass over recorded music torrent grabs. Every return carries the
+    full {status, checked, released, seeding} key set (plus reason when
+    skipped) — one shape, so callers may index directly (the keyless
+    already_running skip used to KeyError callers that did)."""
     global _running
     with _lock:
         if _running:
-            return {"status": "skipped", "reason": "already_running"}
+            return {"status": "skipped", "reason": "already_running",
+                    "checked": 0, "released": 0, "seeding": 0}
         _running = True
     try:
         return _sweep_inner()
@@ -122,13 +125,15 @@ def _sweep_inner() -> Dict[str, Any]:
     db = get_database()
     cfg = _load_cfg()
     if not float(cfg.get("seed_ratio_goal") or 0) and not int(cfg.get("seed_time_goal_hours") or 0):
-        return {"status": "skipped", "reason": "no_goals_set", "checked": 0, "released": 0}
+        return {"status": "skipped", "reason": "no_goals_set",
+                "checked": 0, "released": 0, "seeding": 0}
 
     from core.torrent_clients import get_active_adapter
     from utils.async_helpers import run_async
     adapter = get_active_adapter()
     if adapter is None:
-        return {"status": "skipped", "reason": "no_torrent_client", "checked": 0, "released": 0}
+        return {"status": "skipped", "reason": "no_torrent_client",
+                "checked": 0, "released": 0, "seeding": 0}
 
     rows = db.torrents_awaiting_seed_release()
     released = seeding = 0

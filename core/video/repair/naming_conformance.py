@@ -1,7 +1,7 @@
 """Naming Conformance job — retroactively apply the naming templates.
 
 The organization templates only ever applied to NEW imports; a template change
-(or a library that predates Commissary) leaves existing files on old names
+(or a library that predates SoulSync) leaves existing files on old names
 forever — the Sonarr/Radarr "preview rename" gap. This job renders the
 CURRENT template for every owned movie/episode file and flags the ones whose
 real on-disk path differs. The findings list IS the preview (current → new);
@@ -22,28 +22,18 @@ import shutil
 
 from core.video.repair import register_job
 from core.video.repair.base import JobContext, JobResult, VideoRepairJob
-from utils.logging_config import get_logger
-
-logger = get_logger("video.repair.naming_conformance")
 
 _SIDECAR_SUFFIXES = (".nfo", "-thumb.jpg", "-thumb.jpeg", "-thumb.png", "-thumb.webp",
                      ".srt", ".ass", ".sub", ".idx", ".jpg")
 
 
-def _fields_of(row: dict, custom_formats=None) -> dict:
-    from core.video.organization import library_media_fields
-    return {"title": row.get("title"), "series": row.get("series"),
+def _fields_of(row: dict) -> dict:
+    from core.commissary.naming import with_naming  # Commissary: the {Token} facts
+    return with_naming(row, {"title": row.get("title"), "series": row.get("series"),
             "year": row.get("year"), "season": row.get("season"),
             "episode": row.get("episode"), "episode_title": row.get("episode_title"),
             "quality": row.get("quality"), "resolution": row.get("resolution"),
-            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id"),
-            "tvdbid": row.get("tvdb_id"), "imdbid": row.get("imdb_id"),
-            "air_date": row.get("air_date"), "source": row.get("release_source"),
-            # Without these the expected name is computed WITHOUT the file's
-            # audio, dynamic range, release group and custom formats — so a
-            # correctly-named file looks wrong and "fixing" it would strip those
-            # from the filename.
-            **library_media_fields(row, custom_formats=custom_formats)}
+            "codec": row.get("video_codec"), "tmdbid": row.get("tmdb_id")})
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -108,50 +98,26 @@ class NamingConformanceJob(VideoRepairJob):
         from core.video import organization
         from core.video.path_resolver import resolve_video_file_path, video_base_dirs
         result = JobResult()
-        from core.video.path_resolver import library_roots
-        from core.video.recycle import _root_for
         settings = organization.load(context.db)
         base_dirs = video_base_dirs(context.db)
-        # Every configured root per scope — the Libraries registry plus the
-        # legacy flat paths. This used to read ONLY movies_path/tv_path, so an
-        # install that set its destinations in Settings → Connections skipped
-        # every single file below. Multiple roots per kind are normal now
-        # ("Movies" + "Anime Movies"), so the right root is the one that
-        # actually contains the file, not whichever comes first.
-        roots = {"movie": library_roots(context.db, "movie"),
-                 "episode": library_roots(context.db, "show")}
-        custom_formats = organization.library_custom_formats(context.db)
-        # A template asking for something only the import path can know — bit
-        # depth, audio languages, the original release name — cannot be fully
-        # reproduced from a library row, so the rendered name may be missing
-        # whatever the template asked for there.
-        #
-        # This used to skip those files outright, which meant the job examined
-        # nothing and reported "0 findings" — indistinguishable from a library
-        # that already conforms, and it silently disabled the whole tool for
-        # anyone using a template with one of these tokens. The findings ARE a
-        # preview: the user sees current -> new and approves file by file, and
-        # nothing here ever renames on its own. So say what cannot be
-        # reproduced, on the finding itself, and let them judge.
-        risky = {scope: organization.template_uses_unavailable_tokens(
-                     settings.get("movie_template" if scope == "movie" else "episode_template"))
-                 for scope in ("movie", "episode")}
-        for scope, tokens in risky.items():
-            if tokens:
-                logger.warning(
-                    "naming conformance: the %s template uses %s, which a rename cannot "
-                    "reproduce from the library — those findings are flagged as a warning "
-                    "and the new name may drop what the template asked for there",
-                    scope, ", ".join("{%s}" % t for t in tokens))
+        from core.video.library_roots import library_roots, containing_root
+        roots = {kind: library_roots(context.db, kind) for kind in ("movie", "episode")}
         rows = context.db.repair_library_files() or []
+        # Commissary: the same facts the import named the file from
+        from core.commissary.naming import template_uses_unavailable_tokens, with_library_facts
+        rows = with_library_facts(context.db, rows)
+        # tokens only an import can know: the finding is a warning naming them,
+        # since approving it would drop them from the filename
+        _lossy = {"movie": template_uses_unavailable_tokens(settings.get("movie_template")),
+                  "episode": template_uses_unavailable_tokens(settings.get("episode_template"))}
         context.report(total=len(rows), phase="checking names")
         valid = []
         for i, r in enumerate(rows, 1):
             context.check_stop()
             result.scanned += 1
             context.report(processed=i, current_item=r.get("title"))
-            scope_roots = roots.get(r["scope"]) or []
-            if not scope_roots:
+            configured_roots = roots.get(r["scope"])
+            if not configured_roots:
                 result.skipped += 1          # that library has no configured folder
                 continue
             real = resolve_video_file_path(r.get("relative_path"), base_dirs,
@@ -159,16 +125,12 @@ class NamingConformanceJob(VideoRepairJob):
             if not real:
                 result.skipped += 1          # can't locate locally — never guess
                 continue
-            # Deepest-wins containment (shared with the recycle bin). A file
-            # outside every root falls back to the primary one rather than
-            # being skipped — the template still describes where it belongs.
-            # abspath on both branches: _root_for already returns one, and
-            # _same_path below normalizes but does NOT absolutize — a relative
-            # root mixed with an absolute `real` would flag every file.
-            root = _root_for(real, scope_roots) or os.path.abspath(scope_roots[0])
+            root = containing_root(real, configured_roots)
+            if not root:
+                result.skipped += 1
+                continue
             ext = os.path.splitext(real)[1]
-            expected = organization.render_path(r["scope"], root,
-                                                _fields_of(r, custom_formats),
+            expected = organization.render_path(r["scope"], root, _fields_of(r),
                                                 settings, ext)["path"]
             if _same_path(real, expected):
                 continue
@@ -177,22 +139,18 @@ class NamingConformanceJob(VideoRepairJob):
             label = r.get("title") or "?"
             if r["scope"] == "episode":
                 label = "%s S%02dE%02d" % (label, r.get("season") or 0, r.get("episode") or 0)
-            unreproducible = risky.get(r["scope"]) or []
-            note = ("  ⚠ your template uses "
-                    + ", ".join("{%s}" % t for t in unreproducible)
-                    + ", which cannot be worked out for a file already in the library — "
-                      "check the new name before approving") if unreproducible else ""
             context.create_finding(
                 finding_type="naming_mismatch",
-                severity="warning" if unreproducible else "info",
+                severity="warning" if _lossy.get(r["scope"]) else "info",   # Commissary
                 entity_type=r["scope"], entity_id=entity_id,
                 title=f"{label} — file name doesn't match the template",
-                description=os.path.basename(real) + "  →  " + os.path.basename(expected) + note,
+                description=os.path.basename(real) + "  →  " + os.path.basename(expected)
+                + ("  (can't rebuild %s for a file already in the library — check before "
+                   "approving)" % ", ".join(_lossy[r["scope"]]) if _lossy.get(r["scope"]) else ""),
                 details={"scope": r["scope"], "item_id": r["item_id"],
                          "file_id": r["file_id"], "title": r.get("title"),
                          "season": r.get("season"), "episode": r.get("episode"),
                          "current_path": real, "expected_path": expected,
-                         "unreproducible_tokens": unreproducible,
                          "size_bytes": r.get("size_bytes")})
         if result.errors == 0:
             context.db.repair_dismiss_absent(self.job_id, "naming_mismatch", valid)

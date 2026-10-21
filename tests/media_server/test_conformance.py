@@ -31,7 +31,7 @@ def _import_server_classes():
 
 def test_default_registry_registers_all_four_servers():
     """Smoke check that the foundation registry knows about every
-    server Commissary historically dispatched to."""
+    server SoulSync historically dispatched to."""
     from core.media_server.registry import build_default_registry
 
     registry = build_default_registry()

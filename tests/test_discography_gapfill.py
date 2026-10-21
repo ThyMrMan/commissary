@@ -11,6 +11,7 @@ fallback disabled, and only ever appends cards.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from core.metadata.discography_gapfill import (
@@ -129,18 +130,26 @@ def test_edition_uncertainty_shows_both():
 # ── wiring contracts ─────────────────────────────────────────────────────────
 
 def test_endpoint_is_conservative_and_additive():
-    ws = (_ROOT / "web_server.py").read_text(encoding="utf-8")
+    # the artist family moved to api/artist_detail.py (aug 26 lift)
+    ws = (_ROOT / "api" / "artist_detail.py").read_text(encoding="utf-8")
     assert "/discography/gap-fill" in ws
     fn = ws[ws.index("def get_artist_discography_gap_fill"):]
-    fn = fn[:fn.index("@app.route")]
+    fn = fn[:fn.index("@bp.route")]
     assert "artist_source_ids.get(s)" in fn          # verified-id sources only
     assert "allow_fallback=False" in fn              # no cross-source double count
     # other-source fetches carry NO artist name — the per-source lookup has an
     # internal search-by-name fallback, and a stale id must mean "no gap-fill",
     # never a name search that could pick the wrong artist
-    assert "def _fetch(source, source_artist_id, name='')" in fn
+    # (#1450: _fetch grew a dedup_variants keyword so the BASE fetch can mirror
+    # the page's dedup setting; others keep the default)
+    assert "def _fetch(source, source_artist_id, name='', dedup_variants=True)" in fn
     assert "_fetch(source, artist_source_ids[source])" in fn      # others: nameless
     assert "name=artist_name" in fn                               # base keeps the name
+    # #1450: the base fetch mirrors the page's dedup setting so the
+    # edition-supersede computation sees the same release set the page
+    # annotated; other sources keep the deduped default
+    assert "dedup_variants=base_dedup_variants" in fn
+    assert fn.count("dedup_variants=base_dedup_variants") == 2    # both base paths
     # #1068 follow-up: with no explicit base_source, the base resolves the way
     # the PAGE does (no override → ragnarlotus's library-source setting picks),
     # and the answering source is read back and excluded from gap candidates
@@ -152,38 +161,68 @@ def test_endpoint_is_conservative_and_additive():
 
 
 def test_frontend_contract():
-    js = (_ROOT / "webui" / "static" / "library.js").read_text(encoding="utf-8")
-    assert "_loadDiscographyGapFill" in js
-    assert "_gap_source" in js
-    # the click override routes the card's OWN source into the tracks fetch
-    click = js[js.index("if (rel._gap_source)"):]
-    assert "_aat2.set('source', rel._gap_source)" in click[:200]
-    # opt-in chip + persisted preference; default off
-    assert "discog_gapfill" in js
-    assert "gapfill-source-badge" in js
+    """The page half of #1067 now lives in React, so this pins it there.
+
+    The vanilla implementation this used to read -- _loadDiscographyGapFill,
+    _insertGapCardSorted, _gapSameRelease, the static #gapfill-toggle-btn chip
+    -- was deleted with the vanilla artist-detail page. Each assertion below
+    names the module that replaced it; the behaviour itself is covered in
+    detail by the vitest suites next to them (persistence, dedup, per-source
+    ownership, sorted merge).
+    """
+    react = _ROOT / "webui" / "src" / "routes" / "artist-detail"
+    gapfill = (react / "-artist-detail.gap-fill.ts").read_text(encoding="utf-8")
+    # opt-in chip + persisted preference, default off, under the vanilla's key
+    assert "discog_gapfill" in gapfill
     # client-side FINAL dedup vs the page's library-merged view: an owned
     # release the base source doesn't list must not return as a gap card
-    assert "_renderedDiscography" in js
-    assert "_gapSameRelease" in js
-    # Boulder's live feedback: cards slot into the REAL sections (no bolted-on
-    # extra section), and the toggle lives with the other filter groups
-    assert "gapfill-card" in js
-    assert "_insertGapCardSorted" in js
-    after_insert = js[js.index("_insertGapCardSorted(grid, card, _gapYear"):]
-    assert "applyDiscographyFilters" in after_insert[:800]    # filters apply to gap cards
+    assert re.search(r"export function dedupeGaps\b", gapfill), "dedupeGaps is gone"
+    assert re.search(r"export function gapSameRelease\b", gapfill), "gapSameRelease is gone"
+    # cards slot into the REAL sections rather than a bolted-on extra one
+    assert re.search(r"export function mergeGapReleases\b", gapfill), "mergeGapReleases is gone"
+
+    card = (react / "-ui" / "release-card.tsx").read_text(encoding="utf-8")
+    assert "gapfill-card" in card
+    assert "gapSourceLabel" in card                  # the source badge
+
+    # the click override routes the card's OWN source into the tracks fetch
+    open_release = (react / "-artist-detail.open-release.ts").read_text(encoding="utf-8")
+    assert "if (release._gap_source) params.source = String(release._gap_source);" in open_release
+
     html = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
-    assert 'id="gapfill-toggle-btn"' in html          # static chip in the Sources group
     assert 'gapfill-section' not in html              # the separate section is gone
 
 
 def test_download_discography_modal_includes_gaps():
     """Boulder's live catch: the Download Discography modal skipped gap-fill
-    releases. When the chip is on, the modal fetches gaps, dedups against its
-    own list, and each entry POSTs with ITS source (backend honors per-entry
-    source at entry['source'])."""
-    js = (_ROOT / "webui" / "static" / "library.js").read_text(encoding="utf-8")
-    # both the page loader AND the modal call the gap-fill endpoint
-    assert js.count("discography/gap-fill") == 2
-    assert "gapSource: cb.dataset.gapSource" in js
-    assert "source: e.gapSource || sourceForBatch" in js
-    assert "data-gap-source=" in js
+    releases. When the chip is on, the gaps reach the modal and each entry
+    POSTs with ITS source (backend honors per-entry source at entry['source']).
+
+    the modal used to fetch its own gaps. now it lists what the page shows
+    (the page already merged the gaps in), so it can't drift from the page
+    (discord, SeadogsBooty). the gap fetch lives in the page's gap-fill
+    module, the modal keeps each gap's _gap_source."""
+    gapfill = (
+        _ROOT / "webui" / "src" / "routes" / "artist-detail"
+        / "-artist-detail.gap-fill.ts"
+    ).read_text(encoding="utf-8")
+    page = (
+        _ROOT / "webui" / "src" / "routes" / "artist-detail" / "-ui" / "artist-detail-page.tsx"
+    ).read_text(encoding="utf-8")
+    hero = (
+        _ROOT / "webui" / "src" / "routes" / "artist-detail" / "-ui" / "artist-hero.tsx"
+    ).read_text(encoding="utf-8")
+    module = (
+        _ROOT / "webui" / "src" / "routes" / "artist-detail"
+        / "-artist-detail.discography-modal.ts"
+    ).read_text(encoding="utf-8")
+    component = (
+        _ROOT / "webui" / "src" / "routes" / "artist-detail" / "-ui" / "discography-modal.tsx"
+    ).read_text(encoding="utf-8")
+    assert "discography/gap-fill" in gapfill
+    assert "mergeGapReleases(streamed, gapFill.releases)" in page
+    assert "discography={displayed}" in page
+    assert "discography={discography}" in hero
+    assert "_gap_source: (release._gap_source" in module
+    assert "source: e.gapSource || sourceForBatch" in module
+    assert "data-gap-source=" in component

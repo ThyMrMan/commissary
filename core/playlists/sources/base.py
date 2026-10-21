@@ -38,10 +38,12 @@ SOURCE_DEEZER = "deezer"
 SOURCE_TIDAL = "tidal"
 SOURCE_QOBUZ = "qobuz"
 SOURCE_YOUTUBE = "youtube"
+SOURCE_YTMUSIC = "ytmusic"
 SOURCE_ITUNES_LINK = "itunes_link"
 SOURCE_LISTENBRAINZ = "listenbrainz"
 SOURCE_LASTFM = "lastfm"
 SOURCE_SOULSYNC_DISCOVERY = "soulsync_discovery"
+SOURCE_BEATPORT = "beatport"
 
 ALL_SOURCES = (
     SOURCE_SPOTIFY,
@@ -50,10 +52,12 @@ ALL_SOURCES = (
     SOURCE_TIDAL,
     SOURCE_QOBUZ,
     SOURCE_YOUTUBE,
+    SOURCE_YTMUSIC,
     SOURCE_ITUNES_LINK,
     SOURCE_LISTENBRAINZ,
     SOURCE_LASTFM,
     SOURCE_SOULSYNC_DISCOVERY,
+    SOURCE_BEATPORT,
 )
 
 
@@ -160,7 +164,7 @@ class PlaylistSource(ABC):
 
         Default behavior is usually identical to ``get_playlist``.
         Sources whose refresh has side effects (e.g. ListenBrainz cache
-        update, Commissary Discovery regeneration) do real work here."""
+        update, SoulSync Discovery regeneration) do real work here."""
 
     def discover_tracks(self, tracks: List[NormalizedTrack]) -> List[NormalizedTrack]:
         """Match raw tracks against a provider (Spotify / iTunes / etc.).
@@ -224,12 +228,6 @@ def to_mirror_track_dict(track: NormalizedTrack) -> Dict[str, Any]:
     }
 
     extra = track.extra or {}
-    # An adapter passes a track's ISRC through in ``extra`` (Qobuz does); it is
-    # stored in its own column so discovery can match the recording exactly.
-    from core.text.isrc import normalize_isrc
-    isrc = normalize_isrc(extra.get("isrc"))
-    if isrc:
-        result["isrc"] = isrc
     matched_data = extra.get("matched_data")
     is_discovered = bool(extra.get("discovered"))
     spotify_hint = extra.get("spotify_hint")

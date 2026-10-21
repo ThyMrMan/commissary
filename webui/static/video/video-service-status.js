@@ -2,19 +2,20 @@
  * Video-side Service Status — the sidebar dots (data-video-only section) + the switch modal.
  *
  * Mirrors the music service-switch look (reuses the .ss-* modal classes) but the video side has
- * its OWN sources: TMDB/TVDB metadata (required, status-only), the video media server (Plex/
- * Jellyfin — switchable), and the video download preference (soulseek/torrent/usenet + a hybrid
- * order — switchable). Reads /api/video/service-status; writes /api/video/server and
- * /api/video/downloads/config. The music side is untouched.
+ * its OWN sources: TMDB/TVDB metadata (required), the video media server (Plex/Jellyfin) and the
+ * video download chain. All three are shown here, not changed: a server switch means a fresh
+ * library scan and the chain has its own editor, so each gets a way into Settings (#1301).
+ * Reads /api/video/service-status.
  */
 (function () {
     'use strict';
     var API = '/api/video';
-    var SOURCES = ['soulseek', 'torrent', 'usenet'];
+    var SOURCES = ['torrent', 'extto', 'soulseek', 'usenet'];
     // Real service logos, same sources the music side uses (torrent/usenet have no logo → emoji).
     var DL_INFO = {
         soulseek: { name: 'Soulseek', logo: '/static/img/brands/slskd.png', emoji: '🎵' },
         torrent: { name: 'Torrent', logo: null, emoji: '🧲' },
+        extto: { name: 'EXT.to', logo: null, emoji: 'EX' },
         usenet: { name: 'Usenet', logo: null, emoji: '📰' }
     };
     var SRV_INFO = {
@@ -25,8 +26,7 @@
         tmdb: { name: 'TMDB', logo: '/static/img/brands/tmdb.svg', emoji: '🎬' },
         tvdb: { name: 'TVDB', logo: '/static/img/brands/tvdb.svg', emoji: '📺' }
     };
-    var SRC_LABEL = { soulseek: 'Soulseek', torrent: 'Torrent', usenet: 'Usenet' };
-    var SRV_LABEL = { plex: 'Plex', jellyfin: 'Jellyfin' };
+    var SRC_LABEL = { soulseek: 'Soulseek', torrent: 'Torrent', extto: 'EXT.to', usenet: 'Usenet' };
 
     // A service logo (img, with emoji fallback on load error) — mirrors the music _ssCard media.
     function media(cls, logo, emoji, dark) {
@@ -55,7 +55,9 @@
         if (ind) {
             var dot = ind.querySelector('.status-dot');
             if (dot) dot.className = 'status-dot ' + (ok ? 'connected' : 'disconnected');
-            ind.setAttribute('data-status-ready', ok ? 'true' : 'false');
+            // ready means "status has landed", not "configured". tying it to ok hid
+            // unset rows forever and left a blank gap in the sidebar
+            ind.setAttribute('data-status-ready', 'true');
         }
         var nm = document.getElementById(nameId);
         if (nm && name != null) nm.textContent = name;
@@ -65,7 +67,8 @@
         var m = d.metadata || {}, s = d.server || {}, dl = d.download || {};
         setDot('video-metadata-indicator', 'video-metadata-name', !!m.configured,
             m.configured ? 'TMDB / TVDB' : 'TMDB / TVDB — add keys');
-        setDot('video-server-indicator', 'video-server-name', !!s.configured, s.name || 'No server');
+        setDot('video-server-indicator', 'video-server-name', !!s.configured,
+            s.configured ? (s.name || 'Media Server') : 'Media server not set');
         setDot('video-download-indicator', 'video-download-name', !!dl.configured, dl.name || 'Downloads');
     }
     function fetchStatus() {
@@ -113,7 +116,7 @@
         o.innerHTML =
             '<div class="ss-modal" role="dialog" aria-modal="true" aria-label="Video Sources" tabindex="-1">' +
                 '<div class="ss-topbar">' +
-                    '<div class="ss-topbar-icon"><img src="/static/trans2.png" alt="Commissary" class="ss-topbar-logo"></div>' +
+                    '<div class="ss-topbar-icon"><img src="/static/trans2.png" alt="SoulSync" class="ss-topbar-logo"></div>' +
                     '<div class="ss-topbar-titles">' +
                         '<h3 class="ss-topbar-title">Video Sources</h3>' +
                         '<div class="ss-topbar-sub">What the video side uses for metadata, server, and downloads</div>' +
@@ -183,7 +186,7 @@
         if (!panel) return;
         if (_tab === 'metadata') panel.innerHTML = panelMetadata();
         else if (_tab === 'server') panel.innerHTML = panelServer();
-        else { panel.innerHTML = panelDownload(); wireHybridDrag(); }
+        else { panel.innerHTML = panelDownload(); }
     }
 
     function panelMetadata() {
@@ -195,77 +198,50 @@
             '<div class="ss-hint">TMDB &amp; TVDB are <strong>required</strong> and can\'t be swapped &mdash; the video side matches and enriches everything from them. Set the keys in <strong>Settings &rarr; Connections</strong>.</div>';
     }
 
+    // one quiet line of why, one way into the right Settings spot
+    function foot(kind, note) {
+        var label = kind === 'server' ? 'Change in Settings' : 'Edit in Settings';
+        return '<div class="ss-foot"><p class="ss-foot-note">' + note + '</p>' +
+            '<button class="ss-cta" onclick="_vssOpenSettings(\'' + kind + '\')">' + label +
+            '<span class="ss-cta-arrow" aria-hidden="true">&rarr;</span></button></div>';
+    }
+
     function panelServer() {
         var s = _data.server || {};
-        var out = '<div class="ss-grid">';
-        ['plex', 'jellyfin'].forEach(function (srv) {
-            var info = SRV_INFO[srv], configured = !!s[srv];
-            out += card(info.name, info.logo, info.emoji, s.active === srv, !configured,
-                configured ? "_vssSetServer('" + srv + "')" : null,
-                configured ? null : 'Not set up', info.dark);
-        });
-        out += '</div>';
-        if (!s.plex && !s.jellyfin) {
-            out += '<div class="ss-hint">No video server configured yet &mdash; add Plex or Jellyfin in <strong>Settings &rarr; Connections</strong>.</div>';
-        }
-        return out;
+        var info = SRV_INFO[s.active] || null;
+        var others = ['plex', 'jellyfin'].filter(function (srv) { return srv !== s.active && s[srv]; })
+            .map(function (srv) { return SRV_INFO[srv].name; });
+        return '<div class="ss-facts">' +
+                '<div class="ss-fact"><span class="ss-fact-k">Server</span><span class="ss-fact-v">' +
+                    (info ? media('ss-chain-logo', info.logo, info.emoji, info.dark) : '') +
+                    esc(s.name || 'None yet') + '</span></div>' +
+                '<div class="ss-fact"><span class="ss-fact-k">Status</span><span class="ss-fact-v">' +
+                    '<span class="ss-dot ss-dot--' + (s.configured ? 'ok' : 'bad') + '"></span>' +
+                    (s.configured ? 'Set up' : 'Not set up yet') + '</span></div>' +
+                '<div class="ss-fact"><span class="ss-fact-k">Also set up</span><span class="ss-fact-v' +
+                    (others.length ? '' : ' ss-fact-v--quiet') + '">' +
+                    (others.length ? esc(others.join(', ')) : 'No other servers') + '</span></div>' +
+            '</div>' +
+            foot('server', 'Switching servers starts the video library over with a fresh scan, so it lives in Settings.');
     }
 
     function panelDownload() {
         var d = _data.download || {};
         var mode = d.mode || 'soulseek';
-        var hybrid = mode === 'hybrid';
-        var toggle = '<div class="ss-seg">' +
-            '<button class="ss-seg-btn' + (!hybrid ? ' active' : '') + '" onclick="_vssMode(\'single\')">Single source</button>' +
-            '<button class="ss-seg-btn' + (hybrid ? ' active' : '') + '" onclick="_vssMode(\'hybrid\')">Hybrid</button></div>';
-        if (!hybrid) {
-            var cards = '<div class="ss-grid">' + SOURCES.map(function (src) {
-                var info = DL_INFO[src];
-                return card(info.name, info.logo, info.emoji, mode === src, false, "_vssSetSource('" + src + "')");
-            }).join('') + '</div>';
-            return toggle + cards;
-        }
-        var order = (d.hybrid_order && d.hybrid_order.length) ? d.hybrid_order : SOURCES.slice();
-        var rows = order.map(function (src, i) {
-            var info = DL_INFO[src] || { name: src, emoji: '⬇️', logo: null };
-            return '<div class="ss-hybrid-item" draggable="true" data-src="' + src + '">' +
-                '<span class="ss-hybrid-rank">' + (i + 1) + '</span>' +
-                media('ss-hybrid-logo', info.logo, info.emoji) +
-                '<span class="ss-hybrid-name">' + esc(info.name) + '</span></div>';
+        var order = (mode === 'hybrid' && d.hybrid_order && d.hybrid_order.length)
+            ? d.hybrid_order : [mode];
+        var steps = order.map(function (src, i) {
+            var info = DL_INFO[src] || { name: src, emoji: '\u2b07\ufe0f', logo: null };
+            return '<li class="ss-chain-step">' +
+                '<span class="ss-chain-rank">' + (i + 1) + '</span>' +
+                '<span class="ss-chain-disc">' + media('ss-chain-logo', info.logo, info.emoji) + '</span>' +
+                '<span class="ss-chain-name">' + esc(info.name) + '</span></li>';
         }).join('');
-        return toggle +
-            '<div class="ss-hint">Drag to set priority &mdash; the first source that has the file wins.</div>' +
-            '<div class="ss-hybrid-list" id="vss-hybrid-list">' + rows + '</div>';
-    }
-
-    // Drag-to-reorder the hybrid chain (mirrors the music modal's wiring).
-    function wireHybridDrag() {
-        var list = document.getElementById('vss-hybrid-list');
-        if (!list) return;
-        list.querySelectorAll('.ss-hybrid-item').forEach(function (item) {
-            item.addEventListener('dragstart', function (e) {
-                e.dataTransfer.effectAllowed = 'move';
-                e.dataTransfer.setData('text/plain', item.dataset.src);
-                item.classList.add('dragging');
-            });
-            item.addEventListener('dragend', function () { item.classList.remove('dragging'); });
-            item.addEventListener('dragover', function (e) { e.preventDefault(); });
-            item.addEventListener('drop', function (e) {
-                e.preventDefault();
-                var dragged = e.dataTransfer.getData('text/plain');
-                if (dragged && dragged !== item.dataset.src) reorder(dragged, item.dataset.src);
-            });
-        });
-    }
-    function reorder(draggedId, targetId) {
-        var order = ((_data.download || {}).hybrid_order || []).slice();
-        if (!order.length) order = SOURCES.slice();
-        var from = order.indexOf(draggedId);
-        if (from < 0) return;
-        order.splice(from, 1);
-        var to = order.indexOf(targetId);
-        order.splice(to < 0 ? order.length : to, 0, draggedId);
-        saveDownload({ download_mode: 'hybrid', hybrid_order: order }).then(load);
+        return '<div class="ss-section-title">' + (order.length > 1 ? 'Download chain' : 'Download source') + '</div>' +
+            '<ol class="ss-chain">' + steps + '</ol>' +
+            foot('download', order.length > 1
+                ? 'Tried top to bottom until one has the file. The chain is edited in Settings.'
+                : 'Every video download comes from here. Add a second source in Settings and it becomes hybrid.');
     }
 
     // ── actions ──────────────────────────────────────────────────────────────────
@@ -274,43 +250,27 @@
         toast('Only an admin can change sources', true);
         return false;
     }
-    function saveServer(srv) {
-        return fetch(API + '/server', {
-            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify({ server: srv })
-        }).then(function (r) { return r.json(); });
-    }
-    function saveDownload(patch) {
-        return fetch(API + '/downloads/config', {
-            method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-            body: JSON.stringify(patch)
-        }).then(function (r) { return r.json(); });
-    }
-
     window._vssTab = function (t) { _tab = t; render(); };
-    window._vssSetServer = function (srv) {
-        if (!guardAdmin()) return;
-        saveServer(srv).then(function (res) {
-            if (res && (res.status === 'saved' || res.server)) { toast('Video server set to ' + (SRV_LABEL[srv] || srv)); load(); }
-            else toast((res && res.error) || 'Could not switch server', true);
-        }).catch(function () { toast('Could not switch server', true); });
-    };
-    window._vssSetSource = function (src) {
-        if (!guardAdmin()) return;
-        saveDownload({ download_mode: src }).then(function () {
-            toast('Download source set to ' + (SRC_LABEL[src] || src)); load();
-        }).catch(function () { toast('Could not save', true); });
-    };
-    window._vssMode = function (m) {
-        if (!guardAdmin()) return;
-        if (m === 'hybrid') {
-            var order = ((_data.download || {}).hybrid_order || []).slice();
-            if (!order.length) order = SOURCES.slice();
-            saveDownload({ download_mode: 'hybrid', hybrid_order: order }).then(load);
-        } else {
-            var first = ((_data.download || {}).hybrid_order || [])[0] || 'soulseek';
-            saveDownload({ download_mode: first }).then(load);
-        }
+    // the video half of each settings tab: connections -> video side, the
+    // server section; downloads -> the video chain
+    window._vssOpenSettings = function (kind) {
+        closeVideoServiceSwitchModal();
+        if (typeof navigateToPage === 'function') navigateToPage('settings');
+        setTimeout(function () {
+            try {
+                if (typeof switchSettingsTab === 'function') switchSettingsTab(kind === 'server' ? 'connections' : 'downloads');
+                if (kind === 'server' && typeof window.switchServiceKind === 'function') window.switchServiceKind('video');
+                if (kind === 'download' && typeof window.switchDownloadChain === 'function') window.switchDownloadChain('video');
+            } catch (e) { /* best effort: settings is open either way */ }
+            setTimeout(function () {
+                var el = document.querySelector(kind === 'server' ? '[data-video-server-toggle="plex"]' : '#download-chain-widget');
+                var spot = el && (kind === 'server' ? (el.closest('.settings-group') || el) : el);
+                if (!spot) return;
+                spot.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                spot.classList.add('ss-landed');
+                setTimeout(function () { spot.classList.remove('ss-landed'); }, 2200);
+            }, 140);
+        }, 80);
     };
 
     window.openVideoServiceSwitchModal = function (tab) {
@@ -329,6 +289,56 @@
             if (o && !o.classList.contains('hidden')) closeVideoServiceSwitchModal();
         }
     });
+
+    // ── sidebar test buttons ────────────────────────────────────────────────
+    // Live probes for the sidebar bolt buttons, reusing endpoints that already
+    // exist: /enrichment/{tmdb,tvdb}/test for metadata and /server-config/test
+    // for the active server. The download row has no button on purpose — it
+    // shows a PREFERENCE (mode + hybrid order), not a connection.
+    function testVideoConnection(kind) {
+        if (typeof showLoadingOverlay === 'function') {
+            showLoadingOverlay('Testing ' + (kind === 'server' ? 'video server' : 'TMDB / TVDB') + '...');
+        }
+        function done() { if (typeof hideLoadingOverlay === 'function') hideLoadingOverlay(); }
+        function post(url, body) {
+            return fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {})
+            })
+                .then(function (r) { return r.json(); })
+                .catch(function () { return null; });
+        }
+        var p;
+        if (kind === 'server') {
+            p = fetch(API + '/server', { headers: { Accept: 'application/json' } })
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (d) {
+                    var srv = d && d.server;
+                    if (!srv) { toast('No video server configured', true); return null; }
+                    return post(API + '/server-config/test', { server: srv });
+                });
+        } else {
+            p = Promise.all([post(API + '/enrichment/tmdb/test'), post(API + '/enrichment/tvdb/test')])
+                .then(function (results) {
+                    var msgs = results.map(function (res) {
+                        if (!res) return 'no response';
+                        return res.message || res.error || 'no response';
+                    });
+                    var ok = results.every(function (res) { return res && res.success; });
+                    return { success: ok, message: msgs.join(' — '), error: msgs.join(' — ') };
+                });
+        }
+        p.then(function (res) {
+            if (!res) return;
+            if (res.success) toast(res.message || 'Connection verified');
+            else toast(res.error || res.message || 'Connection test failed', true);
+            fetchStatus();
+        }).catch(function () {
+            toast('Connection test failed', true);
+        }).then(done);
+    }
+    window.testVideoConnection = testVideoConnection;
 
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', startPolling);
     else startPolling();

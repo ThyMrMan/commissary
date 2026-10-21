@@ -1,16 +1,25 @@
-"""Music wishlist 'Search manually' must land on the Soulseek (basic) surface —
-the user is there because auto-downloads failed; they want the FILE, not the
-default metadata source. Source guard (vanilla JS, no runner)."""
+"""Music wishlist 'Search manually' must search for the FILE: the person is
+there because the automatic download failed, so they want download sources
+(Soulseek and the rest), not the default metadata source. Source guard; the
+route's behaviour is tested in tests/downloads/test_inspector_routes.py."""
 
 from pathlib import Path
 
-_JS = (Path(__file__).resolve().parent.parent / "webui" / "static" / "api-monitor.js").read_text(encoding="utf-8")
+_ROOT = Path(__file__).resolve().parent.parent
+_SERVER = (_ROOT / "web_server.py").read_text(encoding="utf-8")
 
 
-def test_manual_search_jump_targets_soulseek_surface():
-    fn = _JS[_JS.index("function _searchWishlistTrackManually"):]
-    fn = fn[:fn.index("\nfunction ", 10)]
-    assert "downloads-search-input" in fn                     # basic-search input, not enhanced
-    assert '[data-source="soulseek"]' in fn                   # clicks the Soulseek source icon
-    assert "performDownloadsSearch" in fn                     # fallback runs the slskd search
-    assert "enhanced-search-input" not in fn                  # no longer lands on metadata search
+def _route_body(source: str, route: str) -> str:
+    body = source[source.index(f"@app.route('{route}'"):]
+    return body[:body.index("\n@app.route(", 10)]
+
+
+def test_manual_search_searches_download_sources_not_metadata():
+    fn = _route_body(_SERVER, "/api/wishlist/inspect")
+    assert "_inspect_sources_stream(" in fn        # the per-source file search
+    assert "search_metadata" not in fn and "enhanced" not in fn
+
+
+def test_the_pick_downloads_exactly_that_file():
+    fn = _route_body(_SERVER, "/api/wishlist/inspect/download")
+    assert "_pinned_batch" in fn

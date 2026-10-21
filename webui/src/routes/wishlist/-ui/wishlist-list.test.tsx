@@ -1,0 +1,161 @@
+/** The list view — display-only twin of the nebula (no new functionality). */
+
+import { cleanup, fireEvent, render, screen } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import type { ParsedWishlistTrack, WishlistArtistGroup } from '../-wishlist.types';
+
+import { openWishlistInspector } from '../../../features/downloads/inspector-modal';
+import { WishlistList } from './wishlist-list';
+
+vi.mock('../../../features/downloads/inspector-modal', () => ({
+  openWishlistInspector: vi.fn(),
+}));
+
+afterEach(() => {
+  cleanup();
+  vi.mocked(openWishlistInspector).mockClear();
+  delete window._navigateToArtistFromWishlist;
+});
+
+function track(over: Partial<ParsedWishlistTrack>): ParsedWishlistTrack {
+  return {
+    track: 'Xtal',
+    artist: 'Aphex Twin',
+    album: 'SAW 85-92',
+    image: 'https://img/cover.jpg',
+    type: 'album',
+    id: 't1',
+    retry: 0,
+    failing: false,
+    lastTried: '',
+    failReason: '',
+    ...over,
+  };
+}
+
+function group(over: Partial<WishlistArtistGroup>): WishlistArtistGroup {
+  return { name: 'Aphex Twin', albums: [], singles: [], total: 1, failingCount: 0, ...over };
+}
+
+const GROUPS: WishlistArtistGroup[] = [
+  group({ name: 'Calm Artist', total: 2, singles: [track({ id: 's1', type: 'single' })] }),
+  group({
+    name: 'Stuck Artist',
+    total: 1,
+    failingCount: 1,
+    albums: [
+      {
+        name: 'Lost Album',
+        image: '',
+        tracks: [
+          track({ id: 'f1', track: 'Ghost', retry: 7, failing: true, failReason: 'no sources' }),
+        ],
+      },
+    ],
+  }),
+];
+
+describe('WishlistList', () => {
+  it('marks only the artists whose downloads are filed as audiobooks', () => {
+    routed.names = new Set(['Calm Artist']);
+    try {
+      render(
+        <WishlistList
+          groups={GROUPS}
+          artistImages={new Map()}
+          onRemoveAlbum={vi.fn()}
+          onRemoveTrack={vi.fn()}
+        />,
+      );
+    } finally {
+      routed.names = new Set();
+    }
+    const badges = document.querySelectorAll('[data-audiobook-route-badge]');
+    expect(badges).toHaveLength(1);
+    expect(badges[0]?.previousElementSibling?.textContent).toBe('Calm Artist');
+  });
+
+  it('sorts failing artists first by default and badges them', () => {
+    render(
+      <WishlistList
+        groups={GROUPS}
+        artistImages={new Map([['stuck artist', 'https://img/stuck.jpg']])}
+        onRemoveAlbum={vi.fn()}
+        onRemoveTrack={vi.fn()}
+      />,
+    );
+    const names = screen.getAllByTitle('Open artist').map((el) => el.textContent);
+    expect(names).toEqual(['Stuck Artist', 'Calm Artist']);
+    // The avatar map is keyed by LOWERCASED name — the group name must be
+    // normalized on lookup or no avatar ever renders (the shipped v1 bug).
+    const avatars = document.querySelectorAll('img.wl-list-avatar');
+    expect(avatars).toHaveLength(1);
+    expect((avatars[0] as HTMLImageElement).src).toBe('https://img/stuck.jpg');
+    expect(screen.getByText('⚠ 1 failing')).toBeInTheDocument();
+    // Collapsed by default: the index shows, the rows don't — until expanded.
+    expect(screen.queryByText('⚠ 7 tries')).toBeNull();
+    fireEvent.click(screen.getByText('Expand all'));
+    expect(screen.getByText('⚠ 7 tries')).toBeInTheDocument();
+  });
+
+  it('re-sorts alphabetically on A–Z', () => {
+    render(
+      <WishlistList
+        groups={GROUPS}
+        artistImages={new Map()}
+        onRemoveAlbum={vi.fn()}
+        onRemoveTrack={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByText('A–Z'));
+    const names = screen.getAllByTitle('Open artist').map((el) => el.textContent);
+    expect(names).toEqual(['Calm Artist', 'Stuck Artist']);
+  });
+
+  it('routes every action through its seam', () => {
+    const onRemoveAlbum = vi.fn();
+    const onRemoveTrack = vi.fn();
+    const nav = vi.fn();
+    window._navigateToArtistFromWishlist = nav;
+
+    render(
+      <WishlistList
+        groups={GROUPS}
+        artistImages={new Map()}
+        onRemoveAlbum={onRemoveAlbum}
+        onRemoveTrack={onRemoveTrack}
+      />,
+    );
+
+    fireEvent.click(screen.getByText('Stuck Artist'));
+    expect(nav).toHaveBeenCalledWith('Stuck Artist');
+    // The name click NAVIGATES without toggling; rows appear via the
+    // separator (collapsed by default) — expand both groups for the rest.
+    fireEvent.click(screen.getAllByTitle('Expand')[0]);
+    fireEvent.click(screen.getAllByTitle('Expand')[0]);
+
+    // "Interactive Search" opens the candidate inspector on that exact track.
+    fireEvent.click(screen.getAllByTitle('Interactive Search')[0]);
+    expect(openWishlistInspector).toHaveBeenCalledWith({
+      id: 'f1',
+      name: 'Ghost',
+      artist: 'Aphex Twin',
+      album: 'SAW 85-92',
+    });
+
+    // The album remove lives on the row's album cell now (flat table).
+    fireEvent.click(screen.getByTitle('Remove all tracks from "SAW 85-92"'));
+    expect(onRemoveAlbum).toHaveBeenCalledWith('SAW 85-92');
+
+    fireEvent.click(screen.getAllByTitle('Remove from wishlist')[0]);
+    expect(onRemoveTrack).toHaveBeenCalledWith('f1');
+  });
+});
+
+// The routed-artist lookup has its own tests (features/audiobook-routes); these
+// files exercise the list itself without a QueryClient.
+const routed = vi.hoisted(() => ({ names: new Set<string>() }));
+vi.mock('@/features/audiobook-routes/audiobook-routes.queries', () => ({
+  useRoutedArtists: () => routed.names,
+}));

@@ -1,6 +1,6 @@
 """Series types + multi-episode files (arr-parity P8).
 
-Sonarr knows three kinds of series and Commissary treated them all as standard:
+Sonarr knows three kinds of series and SoulSync treated them all as standard:
 daily shows release by AIR DATE, anime by ABSOLUTE number — an SxxExx query
 simply never finds those. And a multi-episode file (S01E01E02) used to be
 rejected as "wrong episode". Covers: parsing spans + absolute tokens, the
@@ -88,7 +88,7 @@ def test_gate_anime_absolute_number_is_an_episode_identity():
     assert ok["accepted"]
     miss = _eval("[SubsPlease] One Piece - 1072 (1080p)",
                  want_season=20, want_episode=45, want_absolute=1071)
-    assert not miss["accepted"] and "No episode number" in miss["rejected"]
+    assert not miss["accepted"] and "Not a single episode" in miss["rejected"]
     # without want_absolute nothing changes for standard shows
     std = _eval("[SubsPlease] One Piece - 1071 (1080p)", want_season=20, want_episode=45)
     assert not std["accepted"]
@@ -221,22 +221,11 @@ def test_search_context_resolves_the_absolute_number(tmp_path):
                 "episode_number": 1, "air_date": "2026-07-01", "series_type": "anime"}
         ctx = search_context(item, "episode")
         assert ctx["series_type"] == "anime" and ctx["absolute"] == 4
-        # A daily show carries its type and no absolute — dailies are matched on
-        # air date, and the hint only ever accepts, so offering it is pure risk.
+        # a daily show carries its type; standard items carry neither key
         ctx2 = search_context({**item, "series_type": "daily"}, "episode")
         assert ctx2["series_type"] == "daily" and "absolute" not in ctx2
-        # An UNTYPED show gets the season-1 identity but NOT this library lookup:
-        # absolute 4 for S02E01 is only knowable from the episode list, and
-        # trusting that for a show nobody has called anime is how a standard show
-        # ends up accepting season one's episode 4. (The untyped case matters
-        # because a brand-new anime has no shows row for a type to live on — it
-        # is covered, on season 1, in tests/test_video_anime_absolute_search.py.)
         ctx3 = search_context({**item, "series_type": None}, "episode")
         assert "series_type" not in ctx3 and "absolute" not in ctx3
-        # An explicitly STANDARD show is left out: wanting S02E01 with absolute 4,
-        # a release named 'Show - 04' is far more likely season one's episode 4.
-        ctx4 = search_context({**item, "series_type": "standard"}, "episode")
-        assert "absolute" not in ctx4
     finally:
         videoapi._video_db = None
 

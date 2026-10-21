@@ -123,20 +123,19 @@ class VideoEnrichmentWorker:
         if not item:
             # No pending matches → use idle time for the full episode-list sync
             # (which also fills details for shows it touches), then the details
-            # backfill for everything already episode-synced but missing `status`,
-            # then re-checking identities an earlier title search may have guessed.
-            return (self._sync_episodes_once() or self._detail_backfill_one()
-                    or self._verify_identity_one())
+            # backfill for everything already episode-synced but missing `status`.
+            return self._sync_episodes_once() or self._detail_backfill_one()
         self.current_item = {"type": item["kind"], "name": item["title"]}
         try:
             # Prefer the provider id the server already gave us (enrich BY ID, no
-            # re-search); failing that, another provider's id the row already
-            # carries, which resolves EXACTLY. Only with neither does the client
-            # fall back to a title search — and that search has to prove the
-            # result is really this title before it counts.
+            # re-search); the client falls back to a title/year search if it's None.
+            # Commissary: the row's TVDB/IMDb ids, for TMDB's exact /find
+            from core.commissary.tmdb_match import external_ids_for as _ext_ids
+            _ids = (_ext_ids(self.db, item["kind"], item["id"])
+                    if self.service == "tmdb" and not item.get("known_id") else {})
+            _ext = {"external_ids": _ids} if _ids else {}
             result = self.client.match(item["kind"], item["title"], item.get("year"),
-                                       known_id=item.get("known_id"),
-                                       external_ids=item.get("external_ids"))
+                                       known_id=item.get("known_id"), **_ext)
         except Exception:
             logger.exception("video enrichment %s match failed for %s", self.service, item["title"])
             self.stats["errors"] += 1
@@ -158,7 +157,9 @@ class VideoEnrichmentWorker:
             # with their show instead of being a separate (huge) queue.
             if item["kind"] == "show" and hasattr(self.client, "season_episodes"):
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                if self._owns_numbering(item["id"], nums):
+                # Commissary: only the provider that owns the show's numbering creates episodes
+                from core.commissary.episode_numbering import owns as _owns_numbering
+                if _owns_numbering(self, item["id"], nums):
                     self._cascade_episodes(item["id"], result["id"], nums)
         else:
             self.db.enrichment_apply(self.service, item["kind"], item["id"], matched=False)
@@ -241,18 +242,16 @@ class VideoEnrichmentWorker:
                 self.db.enrichment_apply("tmdb", "show", show["id"], matched=True,
                                          external_id=result["id"], metadata=result.get("metadata"))
                 nums = [s["season_number"] for s in (result.get("metadata") or {}).get("seasons") or []]
-                if self._owns_numbering(show["id"], nums):
+                # Commissary: another provider owns this show's numbering. This pass is
+                # unattended, so writing ours would quietly undo the out-of-place clean-up.
+                from core.commissary.episode_numbering import owns as _owns_numbering
+                if _owns_numbering(self, show["id"], nums):
                     self._cascade_episodes(show["id"], result["id"], nums)   # marks synced
                     logger.info("Synced full episode list for show '%s'", show["title"])
                 else:
-                    # Another provider owns this show's season numbering. Writing
-                    # ours would re-create exactly the rows the out-of-place
-                    # clean-up just removed — this background pass runs
-                    # unattended, so it would undo the repair silently. Mark it
-                    # synced so the queue moves on rather than looping.
                     self.db.mark_episodes_synced(show["id"])
-                    logger.info("Skipped episode sync for '%s' — another provider owns "
-                                "its season numbering", show["title"])
+                    logger.info("Skipped episode sync for '%s' — another provider owns its "
+                                "season numbering", show["title"])
             else:
                 self.db.mark_episodes_synced(show["id"])     # no match → don't re-pick
         except Exception:
@@ -291,76 +290,6 @@ class VideoEnrichmentWorker:
             self.stats["errors"] += 1
         return True
 
-    def _verify_identity_one(self) -> bool:
-        """Re-check ONE show whose TMDB id may have been guessed from its title.
-
-        Before the cross-reference resolver existed, a show the media server
-        identified by TVDB guid but NOT by TMDB was matched by searching TMDB
-        for its name and taking the first result on faith. Where that guess was
-        wrong the show kept another title's id permanently — its overview,
-        status, ratings and SEASON LIST were all the other show's, so a wished
-        S03 had nowhere to land and the wishlist re-grabbed the same episode
-        forever. Nothing ever re-examined it, because the row said 'matched'.
-
-        This asks the one question that settles it — which TMDB id does this
-        show's TVDB id resolve to — and acts only when the answer CONTRADICTS
-        what is stored. Agreeing rows are marked verified and never looked at
-        again, so the sweep costs one call per show once and nothing after.
-        """
-        if self.service != "tmdb" or not hasattr(self.client, "find_by_external_id"):
-            return False
-        item = self.db.identity_unverified_show()
-        if not item:
-            return False
-        self.current_item = {"type": "show", "name": item["title"]}
-        try:
-            found, _ = self.client.find_by_external_id("show", {"tvdb_id": item["tvdb_id"]})
-        except Exception:
-            # A failed CALL is not evidence about the id. Leave the row
-            # unverified so this runs again, rather than blessing a match it
-            # never actually checked.
-            logger.exception("identity check failed for show '%s'", item["title"])
-            self.stats["errors"] += 1
-            return True
-        try:
-            contradicted = found is not None and int(found) != int(item["tmdb_id"])
-        except (TypeError, ValueError):
-            contradicted = False
-        if contradicted:
-            logger.warning(
-                "Show '%s' was matched to TMDB %s, but its TVDB id (%s) resolves to TMDB %s "
-                "— re-pointing and re-enriching from the correct title",
-                item["title"], item["tmdb_id"], item["tvdb_id"], found)
-            # rematch_item clears everything the wrong match derived (overview,
-            # status, genres, ratings, episode/detail sync flags) and puts the
-            # row back in the match queue, where it now enriches BY the new id.
-            self.db.rematch_item("show", item["id"], "tmdb", int(found))
-        self.db.mark_identity_verified(item["id"])
-        return True
-
-    def _owns_numbering(self, show_id, tmdb_season_nums) -> bool:
-        """Does THIS provider own the show's episode numbering?
-
-        Episodes are keyed by the media server's season numbers, so only the
-        provider whose season structure matches the server may create them (see
-        core/video/episode_numbering). The two background passes here run
-        unattended, so an unguarded cascade would quietly re-create the rows an
-        out-of-place clean-up had just removed — the repair would appear to work
-        and then undo itself.
-
-        Fails OPEN: any problem resolving this leaves the historical behaviour
-        (cascade) in place, because refusing to write episodes is the more
-        damaging way to be wrong."""
-        try:
-            from core.video.enrichment.engine import get_video_enrichment_engine
-            info = self.db.show_match_info(show_id) or {}
-            src = get_video_enrichment_engine()._episode_source(
-                show_id, info, tmdb_season_nums)
-        except Exception:   # noqa: BLE001
-            logger.debug("numbering check failed for show %s", show_id, exc_info=True)
-            return True
-        return src == self.service
-
     def _cascade_episodes(self, show_id, tv_id, season_numbers=None, mark_synced=True) -> None:
         """Backfill a show's episode list from the provider (one call per season) —
         owned + missing. Best-effort: a season failure never aborts the show's
@@ -368,7 +297,11 @@ class VideoEnrichmentWorker:
 
         ``mark_synced=False`` skips flagging the show episodes-synced — for a scoped
         refresh (e.g. the nightly airing job pulling only the current season), which
-        must not claim the FULL history was pulled."""
+        must not claim the FULL history was pulled.
+
+        Air dates are OVERWRITTEN (not gap-filled) when this worker is the TMDB
+        one: TMDB is the schedule source of truth, and a rescheduled premiere
+        must move."""
         seasons = season_numbers
         if not seasons:
             try:
@@ -380,8 +313,13 @@ class VideoEnrichmentWorker:
             try:
                 data = self.client.season_episodes(tv_id, snum)
                 if data and data.get("episodes"):
-                    self.db.backfill_episodes(show_id, snum, data["episodes"],
-                                              data.get("overview"), data.get("poster_url"))
+                    self.db.backfill_episodes(
+                        show_id, snum, data["episodes"],
+                        data.get("overview"), data.get("poster_url"),
+                        # TMDB is the schedule source of truth: a rescheduled
+                        # premiere must move. Other providers (TVDB) stay
+                        # gap-fill so they never clobber TMDB's data.
+                        overwrite_air_date=(self.service == "tmdb"))
             except Exception:
                 logger.exception("episode backfill failed: show %s season %s", show_id, snum)
         if mark_synced:

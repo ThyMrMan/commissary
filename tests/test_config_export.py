@@ -127,8 +127,8 @@ def test_video_settings_round_trip():
 
 @pytest.mark.parametrize("bad,reason_frag", [
     ("not a dict", "JSON object"),
-    ({"random": "json"}, "isn't a Commissary config export"),
-    ({BUNDLE_MARKER: True, "bundle_version": 99, "music": {}, "video": {}}, "newer Commissary"),
+    ({"random": "json"}, "isn't a SoulSync config export"),
+    ({BUNDLE_MARKER: True, "bundle_version": 99, "music": {}, "video": {}}, "newer SoulSync"),
     ({BUNDLE_MARKER: True, "bundle_version": 1, "music": "x", "video": {}}, "missing its music"),
 ])
 def test_validate_rejects_bad_bundles(bad, reason_frag):
@@ -164,7 +164,16 @@ def test_endpoints_and_ui_are_wired():
     assert "from core.config_export import build_bundle" in src
     js = (_ROOT / "webui" / "static" / "config-migration.js").read_text(encoding="utf-8", errors="replace")
     html = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8", errors="replace")
-    assert "openConfigExportModal" in js and "openConfigExportModal" in html
+    assert "openConfigExportModal" in js
+    # The modal itself is still the vanilla IIFE (it covers BOTH sides), but the
+    # button that opens it moved to the React Tools page when #tools-page was
+    # deleted — so the caller lives there now, not in index.html.
+    launcher = (
+        _ROOT / "webui" / "src" / "routes" / "tools" / "-ui" / "launcher-cards.tsx"
+    ).read_text(encoding="utf-8", errors="replace")
+    assert "openConfigExportModal" in launcher, (
+        "nothing opens the config export modal any more"
+    )
     assert "config-migration.js" in html
     # copy + save + credentials toggle + import all present
     assert "cfgx-copy" in js and "cfgx-save" in js and "cfgx-secrets" in js and "/api/config/import" in js

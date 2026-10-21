@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Optional
 
+from core.downloads.live_detail import build_live_detail, resolve_source_label
 from core.runtime_state import (
     download_batches,
     download_tasks,
@@ -77,6 +79,73 @@ def _schedule_completion_callback(deps, batch_id: str, task_id: str, success: bo
     ).start()
 
 
+# Recovery must not turn a progress poll into a recursive NAS scan. Bound
+# both running work and submissions, and allow only one probe per task.
+_recovery_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="DownloadRecovery")
+_recovery_slots = threading.BoundedSemaphore(2)
+_recovery_pending = {}
+
+
+def _recovery_identity(task):
+    ti = task.get('track_info') or {}
+    return (task.get('status'), task.get('status_change_time'), task.get('download_id'),
+            task.get('filename') or ti.get('filename'),
+            task.get('username') or ti.get('username'),
+            task.get('cancel_requested'), task.get('cancel_timestamp'))
+
+
+def _schedule_file_recovery(task_id, batch_id, task, deps):
+    """Called under tasks_lock. Revalidate the attempt after slow I/O."""
+    if task.get('cancel_requested') or task_id in _recovery_pending or not _recovery_slots.acquire(blocking=False):
+        return
+    identity = _recovery_identity(task)
+    _recovery_pending[task_id] = task
+
+    def run():
+        try:
+            download_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads'))
+            transfer_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.transfer_path', './Transfer'))
+            found, _ = deps.find_completed_file(download_dir, identity[3], transfer_dir)
+            with tasks_lock:
+                current = download_tasks.get(task_id)
+                if current is not task or _recovery_identity(current) != identity:
+                    return  # cancelled, retried, removed, or completed during I/O
+                if found:
+                    current['status'] = 'post_processing'
+                    current['status_change_time'] = time.time()
+                    processing_identity = _recovery_identity(current)
+                else:
+                    current['status'] = 'failed'
+                    current['error_message'] = 'Task stuck in downloading state; completed file not found'
+            if found:
+                try:
+                    deps.submit_post_processing(task_id, batch_id)
+                except Exception:
+                    # A rejected submission must not strand a download in
+                    # Processing with no worker. Preserve any newer transition.
+                    with tasks_lock:
+                        if download_tasks.get(task_id) is task and _recovery_identity(task) == processing_identity:
+                            task['status'] = identity[0]
+                            task['status_change_time'] = identity[1]
+                    raise
+            elif deps.on_download_completed:
+                deps.on_download_completed(batch_id, task_id, False)
+        except Exception as exc:
+            # A transient mount error is not proof that a download failed.
+            logger.warning("[Safety Valve] File recovery failed for %s: %s", task_id, exc)
+        finally:
+            with tasks_lock:
+                _recovery_pending.pop(task_id, None)
+            _recovery_slots.release()
+
+    try:
+        _recovery_pool.submit(run)
+    except Exception:
+        _recovery_pending.pop(task_id, None)
+        _recovery_slots.release()
+        raise
+
+
 @dataclass
 class StatusDeps:
     """Cross-cutting deps the status helpers need."""
@@ -114,6 +183,33 @@ _ENGINE_CANCELLED_STATES = ('Cancelled', 'Canceled')
 _ENGINE_SUCCESS_STATES = ('Succeeded', 'Completed, Succeeded')
 
 
+def classify_engine_state(state: Any) -> str:
+    """Read an engine/slskd state string as one of the four things it can mean.
+
+    Returns ``'cancelled'``, ``'failed'``, ``'success'`` or ``'pending'``.
+
+    THE ORDER MATTERS. slskd reports compound states — "Completed, Errored",
+    "Completed, Cancelled" — so testing for "Completed" first would read a
+    failed transfer as a successful one. Cancelled and failed are checked before
+    success for exactly that reason, which is the same priority the branches
+    below already use.
+
+    Public so callers outside this module classify a state the same way rather
+    than writing their own list of strings; the API's inbound request endpoint
+    needs it to tell a finished download from an abandoned one.
+    """
+    state_str = str(state or '')
+    if not state_str:
+        return 'pending'
+    if any(token in state_str for token in _ENGINE_CANCELLED_STATES):
+        return 'cancelled'
+    if any(token in state_str for token in _ENGINE_FAILURE_STATES):
+        return 'failed'
+    if any(token in state_str for token in _ENGINE_SUCCESS_STATES):
+        return 'success'
+    return 'pending'
+
+
 def _engine_state_str(record: Any) -> str:
     if record is None:
         return ''
@@ -133,8 +229,13 @@ def _engine_progress_pct(record: Any) -> float:
         progress = float(progress)
     except (TypeError, ValueError):
         return 0
-    if progress <= 1.0:
-        progress *= 100
+    # NO unit guessing. Every download client reports 0-100 (soulseek's
+    # percentComplete, deezer/tidal's own * 100, lidarr's 5.0/95.0, and amazon
+    # since it was normalised). The old `if progress <= 1.0: progress *= 100`
+    # existed only for amazon's 0-1 fraction and could not tell that 1.0 from
+    # a real one percent — so every other engine's opening 1% was inflated:
+    # 0.5% rendered 50%, 1.0% rendered 100%, on a row that now carries a
+    # visible bar and a number. Same family as #1197.
     return progress
 
 
@@ -261,6 +362,16 @@ def _apply_engine_state_fallback(
     task_status['progress'] = _engine_progress_pct(record)
 
 
+def _attach_live_detail(task_status: dict, task: dict, live_info: Optional[dict]) -> None:
+    """Decorate one per-task payload with its live_detail (#1156).
+
+    Uses the FINAL status already written to task_status (the builder mutates
+    it after reading the raw task), so the detail matches the badge shown."""
+    detail = build_live_detail(task, live_info, task_status.get('status') or '')
+    if detail:
+        task_status['live_detail'] = detail
+
+
 def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: dict, deps: StatusDeps) -> dict:
     """Build status payload for a single batch.
 
@@ -309,25 +420,15 @@ def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: d
 
             # If task has been running too long, check if file completed
             _dl_timeout = deps.config_manager.get('soulseek.download_timeout', 600) or 600
-            if task_age > _dl_timeout and task['status'] in ['downloading', 'queued', 'searching']:
+            if not batch.get("managed_externally") and task_age > _dl_timeout and task['status'] in ['downloading', 'queued', 'searching']:
                 stuck_state = task['status']
                 task_filename = task.get('filename') or (task.get('track_info') or {}).get('filename')
 
-                # Before failing, check if the file actually downloaded successfully
-                recovered = False
-                if task_filename and stuck_state == 'downloading':
-                    try:
-                        download_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.download_path', './downloads'))
-                        transfer_dir = deps.docker_resolve_path(deps.config_manager.get('soulseek.transfer_path', './Transfer'))
-                        found_file, file_location = deps.find_completed_file(download_dir, task_filename, transfer_dir)
-                        if found_file:
-                            logger.info(f"[Safety Valve] Task {task_id} stuck but file found in {file_location} — routing to post-processing")
-                            task['status'] = 'post_processing'
-                            task['status_change_time'] = current_time
-                            deps.submit_post_processing(task_id, batch_id)
-                            recovered = True
-                    except Exception as e:
-                        logger.error(f"[Safety Valve] Error checking for completed file: {e}")
+                # Leave this attempt live while recovery checks storage outside
+                # the request thread and the global task lock.
+                recovered = bool(task_filename and stuck_state == 'downloading')
+                if recovered:
+                    _schedule_file_recovery(task_id, batch_id, task, deps)
 
                 if not recovered:
                     if stuck_state == 'searching':
@@ -344,7 +445,7 @@ def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: d
                 'track_index': task['track_index'],
                 'status': task['status'],
                 'track_info': task['track_info'],
-                'progress': 0,
+                'progress': task.get('progress', 0),
                 # V2 SYSTEM: Add persistent state information
                 'cancel_requested': task.get('cancel_requested', False),
                 'cancel_timestamp': task.get('cancel_timestamp'),
@@ -356,10 +457,24 @@ def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: d
                 # 'verified' / 'unverified' / 'force_imported' — set by the
                 # import pipeline once post-processing finishes.
                 'verification_status': task.get('verification_status'),
+                # Authenticated playback-queue polling needs the verified,
+                # imported file before it can turn a missing queue row into a
+                # playable library row. Never expose a staging path.
+                'final_file_path': (
+                    task.get('final_file_path')
+                    if task.get('status') == 'completed'
+                    else None
+                ),
                 # "2/5" while the quarantine-retry engine walks candidates.
                 'retry_info': task.get('retry_info'),
                 'retry_trigger': task.get('retry_trigger'),
             }
+            # A book/release is monitored as a multi-file job by its own client
+            # monitor. Music's single-file timeout/recovery must not mutate it.
+            if batch.get('managed_externally'):
+                _attach_live_detail(task_status, task, None)
+                batch_tasks.append(task_status)
+                continue
             _ti = task.get('track_info') if isinstance(task.get('track_info'), dict) else {}
             task_filename = task.get('filename') or _ti.get('filename')
             task_username = task.get('username') or _ti.get('username')
@@ -371,6 +486,7 @@ def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: d
                 _apply_engine_state_fallback(
                     task_id, task, task_status, batch_id, deps,
                 )
+                _attach_live_detail(task_status, task, None)
                 batch_tasks.append(task_status)
                 continue
 
@@ -513,6 +629,10 @@ def build_batch_status_data(batch_id: str, batch: dict, live_transfers_lookup: d
                         _apply_engine_state_fallback(
                             task_id, task, task_status, batch_id, deps,
                         )
+            _live_row = None
+            if task_filename and task_username:
+                _live_row = live_transfers_lookup.get(deps.make_context_key(task_username, task_filename))
+            _attach_live_detail(task_status, task, _live_row)
             batch_tasks.append(task_status)
         batch_tasks.sort(key=lambda x: x['track_index'])
         response_data['tasks'] = batch_tasks
@@ -639,7 +759,7 @@ def build_batched_status(requested_batch_ids: list, deps: StatusDeps) -> dict:
 
     response["debug_info"] = debug_info
 
-    logger.info(f"[Batched Status] Returning status for {len(response['batches'])} batches")
+    logger.debug(f"[Batched Status] Returning status for {len(response['batches'])} batches")
 
     discrepancies = [bid for bid, info in debug_info.items() if info.get("worker_discrepancy")]
     if discrepancies:
@@ -717,6 +837,7 @@ def _build_history_download_item(entry: dict) -> dict:
         'file_path': entry.get('file_path') or '',
         'verification_status': entry.get('verification_status'),
         'is_persistent_history': True,
+        'download_source': source,
     }
 
 
@@ -727,11 +848,22 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
     """
     items = []
     live_identities = set()
+    # per-batch task_id -> 1-based position in the batch queue, built lazily.
+    # task['track_index'] is an IDENTITY (the original playlist/wishlist
+    # position, what cancel addresses tasks by) - it is NOT an ordinal. a
+    # wishlist album sub-batch of 2 tracks carries wishlist-wide indexes
+    # like 4929, and cancels prune the queue, so "Track {index} of {len}"
+    # printed nonsense (#1183: "Track 4930 of 2").
+    batch_positions = {}
     with tasks_lock:
         for task_id, task in download_tasks.items():
             track_info = task.get('track_info') or {}
             batch_id = task.get('batch_id', '')
             batch = download_batches.get(batch_id, {})
+            if batch_id and batch_id not in batch_positions:
+                batch_positions[batch_id] = {
+                    tid: i + 1 for i, tid in enumerate(batch.get('queue', []))
+                }
 
             # Extract track metadata — handle all format variations
             title = ''
@@ -775,12 +907,13 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
             status = task.get('status', 'queued')
             live_identities.add(_download_identity(title, artist, album))
             # Determine download progress percentage
-            progress = 0
+            progress = float(task.get('progress', 0) or 0)
+            live_info = None
             if status == 'completed':
                 progress = 100
             elif status == 'post_processing':
                 progress = 95
-            elif status in ('downloading', 'searching'):
+            elif status in ('downloading', 'searching', 'queued'):
                 # Check live transfer data for real progress
                 task_filename = task.get('filename') or track_info.get('filename')
                 task_username = task.get('username') or track_info.get('username')
@@ -788,9 +921,9 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
                     lookup_key = deps.make_context_key(task_username, task_filename)
                     live_info = deps.get_cached_transfer_data().get(lookup_key)
                     if live_info:
-                        progress = live_info.get('percentComplete', 0)
+                        progress = live_info.get('percentComplete', progress)
 
-            items.append({
+            item = {
                 'task_id': task_id,
                 'title': title,
                 'artist': artist,
@@ -798,7 +931,7 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
                 'artwork': artwork,
                 'status': status,
                 'progress': progress,
-                'error': task.get('error_message'),
+                'error': task.get('error_message') or task.get('error'),
                 'verification_status': task.get('verification_status'),
                 # library_history row id (set at import) so the Unverified review
                 # queue can act on a still-live completed task before it becomes
@@ -810,18 +943,27 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
                 'retry_info': task.get('retry_info'),
                 'retry_trigger': task.get('retry_trigger'),
                 'batch_id': batch_id,
-                'batch_name': batch.get('playlist_name') or batch.get('album_name') or '',
-                'batch_source': batch.get('source_page') or batch.get('initiated_from') or '',
+                'batch_name': batch.get('playlist_name') or batch.get('album_name') or task.get('batch_name') or '',
+                'batch_source': batch.get('source_page') or batch.get('initiated_from') or task.get('batch_source') or '',
                 # playlist_id is needed by per-row cancel (cancel_task_v2
                 # takes playlist_id + track_index). Surfacing it here so
                 # the frontend doesn't need a second lookup.
-                'playlist_id': batch.get('playlist_id', ''),
+                'playlist_id': batch.get('playlist_id', '') or task.get('playlist_id', ''),
                 'track_index': task.get('track_index', 0),
+                # the display ordinal - position within the batch queue, or
+                # None when the task somehow isn't in its batch's queue
+                'batch_position': batch_positions.get(batch_id, {}).get(task_id),
                 'batch_total': len(batch.get('queue', [])),
                 'timestamp': task.get('status_change_time', 0),
                 'priority': _STATUS_PRIORITY.get(status, 9),
                 'is_persistent_history': False,
-            })
+                # Where it came from, for LIVE rows too (#1156): the label used
+                # to appear only once the row aged into persistent history, so
+                # a just-completed download never said "YouTube"/"Tidal".
+                'download_source': task.get('download_source') or resolve_source_label(task.get('username')),
+            }
+            _attach_live_detail(item, task, live_info)
+            items.append(item)
 
     # --- Unverified history (unconditional, no limit) ---
     # Always load every library_history row that still needs human confirmation
@@ -890,6 +1032,9 @@ def build_unified_downloads_response(limit: int, deps: StatusDeps) -> dict:
                 'playlist_id': batch.get('playlist_id', ''),
                 'batch_name': batch.get('playlist_name') or batch.get('album_name') or '',
                 'source_page': batch.get('source_page') or batch.get('initiated_from') or '',
+                # what kind of thing is in it (audiobook, music_video), so the
+                # page can say "1 video" and not "1 tracks"
+                'batch_type': batch.get('batch_type') or '',
                 'phase': batch.get('phase', 'unknown'),
                 'total': len(queue),
                 'completed': sum(1 for s in statuses if s in ('completed', 'skipped', 'already_owned')),
@@ -931,6 +1076,7 @@ def _build_album_bundle_status(batch: dict) -> dict:
         'seeders': batch.get('album_bundle_seeders'),
         'grabs': batch.get('album_bundle_grabs'),
         'count': batch.get('album_bundle_count'),
+        'query': batch.get('album_bundle_query'),
     }
     return {key: value for key, value in status.items() if value is not None}
 

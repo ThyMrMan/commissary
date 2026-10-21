@@ -1,0 +1,699 @@
+/* The audiobooks tab of the wishlist page.
+   Hero, stats, triage and command bar use the shared wlp-* design system
+   (static/wishlist-premier.css, same as the music tab); this module keeps
+   only the panel, cards, shelf rows and their local controls. */
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  min-width: 0;
+  animation: abFade 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes abFade {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes heroPulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.4;
+    transform: scale(0.85);
+  }
+}
+
+.searchNowSpinner {
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--white-a30);
+  border-top-color: #fff;
+  border-radius: var(--radius-circle);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.notice {
+  margin: 0;
+  padding: 12px 18px;
+  border-radius: var(--radius-lg);
+  font-size: 13px;
+  font-weight: 500;
+  color: #ffffff;
+  background: linear-gradient(
+    135deg,
+    rgba(var(--accent-rgb), 0.16) 0%,
+    rgba(var(--accent-rgb), 0.08) 100%
+  );
+  border: 1px solid rgba(var(--accent-rgb), 0.35);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+  backdrop-filter: blur(10px);
+}
+
+.searchClear {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--white-a08);
+  border: none;
+  color: var(--white-a60);
+  cursor: pointer;
+  padding: 4px 6px;
+  font-size: 11px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-circle);
+  width: 22px;
+  height: 22px;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
+}
+
+.searchClear:hover {
+  background: var(--white-a18);
+  color: #ffffff;
+}
+
+/* Extra right padding so the clear-filter button never sits on the text
+   (double class raises specificity over the global .wlp-search input rule). */
+.cmdInput.cmdInput {
+  padding-right: 38px;
+}
+
+.filterDot {
+  width: 7px;
+  height: 7px;
+  border-radius: var(--radius-circle);
+  background: var(--white-a40);
+}
+
+.dotLooking {
+  background: #fbbf24;
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.6);
+}
+
+.dotActive {
+  background: #38bdf8;
+  box-shadow: 0 0 6px rgba(56, 189, 248, 0.6);
+}
+
+.dotDone {
+  background: #34d399;
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.6);
+}
+
+.dotFailed {
+  background: #f87171;
+  box-shadow: 0 0 6px rgba(248, 113, 113, 0.6);
+}
+
+.dotCancelled {
+  background: #94a3b8;
+}
+
+/* ── Loading state ──────────────────────────────────────────────────────── */
+
+.skeleton {
+  height: 320px;
+  border-radius: 18px;
+  background: linear-gradient(90deg, var(--white-a03), var(--white-a08), var(--white-a03));
+  background-size: 800px 100%;
+  animation: abShimmer 1.4s linear infinite;
+  border: 1px solid var(--white-a06);
+}
+
+@keyframes abShimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+
+/* ── Gallery Poster Grid ─────────────────────────────────────────────────── */
+
+.grid {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(178px, 1fr));
+  gap: 28px 20px;
+}
+
+.card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 10px;
+  border-radius: var(--radius-xl);
+  background: var(--white-a02);
+  border: 1px solid var(--white-a05);
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease,
+    box-shadow 0.2s ease,
+    transform 0.2s ease;
+}
+
+.card:hover {
+  background: var(--white-a04);
+  border-color: var(--white-a12);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.35);
+}
+
+.coverContainer {
+  position: relative;
+  display: block;
+}
+
+.coverLink {
+  display: block;
+  border-radius: var(--radius-lg);
+}
+
+.coverLink:focus-visible {
+  outline: 2px solid rgba(var(--accent-rgb), 0.9);
+  outline-offset: 3px;
+}
+
+.quickRemove {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-circle);
+  border: 1px solid var(--white-a20);
+  background: rgba(15, 17, 23, 0.85);
+  color: var(--white-a70);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  z-index: 5;
+  opacity: 0;
+  transition:
+    opacity 0.18s ease,
+    background 0.18s ease,
+    transform 0.18s ease,
+    color 0.18s ease;
+}
+
+.card:hover .quickRemove,
+.card:focus-within .quickRemove {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .quickRemove {
+    opacity: 1;
+  }
+}
+
+.quickRemove:hover {
+  background: rgba(239, 68, 68, 0.95);
+  border-color: transparent;
+  color: #fff;
+  transform: scale(1.12);
+}
+
+.art {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #15161e;
+  border: 1px solid var(--white-a08);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+  transition:
+    border-color 0.2s ease,
+    transform 0.2s ease,
+    box-shadow 0.2s ease;
+}
+
+.card:hover .art {
+  border-color: rgba(var(--accent-rgb), 0.55);
+  transform: translateY(-3px);
+  box-shadow:
+    0 16px 36px rgba(0, 0, 0, 0.45),
+    0 0 20px rgba(var(--accent-rgb), 0.15);
+}
+
+.spineSheen {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, var(--white-a15) 0%, rgba(0, 0, 0, 0.4) 3.5%, transparent 9%);
+  pointer-events: none;
+  z-index: 2;
+}
+
+.cover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.coverBlank {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 38px;
+  opacity: 0.35;
+}
+
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(0deg, rgba(0, 0, 0, 0.6) 0%, transparent 50%);
+  opacity: 0;
+  transition: opacity 0.2s ease;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.card:hover .scrim {
+  opacity: 1;
+}
+
+.badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  border-radius: var(--radius-pill);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  color: rgba(255, 255, 255, 0.92);
+  background: rgba(12, 14, 20, 0.78);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--white-a14);
+  white-space: nowrap;
+}
+
+.badgePulse {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-circle);
+  display: inline-block;
+}
+
+.badgeActive {
+  background: rgba(10, 12, 18, 0.82);
+  border-color: rgba(56, 189, 248, 0.5);
+  color: #7dd3fc;
+}
+
+.badgeActive .badgePulse {
+  background: #38bdf8;
+  box-shadow: 0 0 6px #38bdf8;
+  animation: heroPulse 1.5s infinite;
+}
+
+.badgeSearching {
+  background: rgba(10, 12, 18, 0.82);
+  border-color: rgba(251, 191, 36, 0.5);
+  color: #fde68a;
+}
+
+.badgeSearching .badgePulse {
+  background: #fbbf24;
+  box-shadow: 0 0 6px #fbbf24;
+  animation: heroPulse 1.2s infinite;
+}
+
+.badgeLooking {
+  background: rgba(10, 12, 18, 0.82);
+  border-color: var(--white-a20);
+  color: #e2e8f0;
+}
+
+/* This tab's command bar carries six status chips where music carries one,
+   so its search field takes a smaller flex base (it still grows into any
+   leftover row space) — otherwise the Search now button wraps onto a
+   second row at desktop widths. Double class outranks the global
+   .wlp-search rule regardless of sheet order. */
+.cmdSearch.cmdSearch {
+  flex: 1 1 150px;
+  min-width: 150px;
+}
+
+/* The status chips sit inside the shared wlp command bar, whose gap only
+   spaces its direct children — the nav carries its own flex rhythm so the
+   chips match the music tab's spacing instead of rendering flush. */
+.chipNav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.badgeDone {
+  background: rgba(10, 12, 18, 0.82);
+  border-color: rgba(34, 197, 94, 0.45);
+  color: #86efac;
+}
+
+.badgeDone .badgePulse {
+  background: #22c55e;
+}
+
+.badgeFailed {
+  background: rgba(10, 12, 18, 0.82);
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #fca5a5;
+}
+
+.badgeFailed .badgePulse {
+  background: #ef4444;
+}
+
+.info {
+  padding: 12px 2px 4px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.title {
+  display: block;
+  letter-spacing: -0.01em;
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffffff;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+
+.title:hover {
+  color: rgb(var(--accent-rgb));
+}
+
+.byline {
+  display: block;
+  font-size: 12px;
+  font-weight: 550;
+  color: var(--white-a65);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.narratorPill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  margin-top: 2px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 550;
+  max-width: fit-content;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.narratorLocked {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.1);
+  border-color: rgba(16, 185, 129, 0.25);
+}
+
+.narratorLocked:hover {
+  background: rgba(16, 185, 129, 0.2);
+  border-color: rgba(16, 185, 129, 0.4);
+}
+
+.narratorAny {
+  color: var(--white-a45);
+  background: var(--white-a05);
+  border-color: var(--white-a09);
+}
+
+.narratorAny:hover {
+  background: var(--white-a10);
+  color: #ffffff;
+}
+
+.series {
+  display: block;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.42);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.seriesBadge {
+  color: #93c5fd;
+  font-weight: 600;
+}
+
+.trail {
+  display: block;
+  font-size: 11px;
+  color: var(--white-a35);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-top: 2px;
+}
+
+.trailError {
+  color: #fca5a5;
+  font-weight: 600;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+  opacity: 0.88;
+  transition: opacity 0.18s ease;
+}
+
+.card:hover .actions,
+.card:focus-within .actions {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .actions {
+    opacity: 1;
+  }
+}
+
+.action {
+  font-family: inherit;
+  appearance: none;
+  -webkit-appearance: none;
+  border: 1px solid var(--white-a10);
+  background: var(--white-a05);
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 10px;
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background-color 0.15s ease,
+    color 0.15s ease,
+    border-color 0.15s ease,
+    transform 0.15s ease;
+}
+
+.action:hover {
+  background: var(--white-a12);
+  color: #ffffff;
+  transform: translateY(-1px);
+}
+
+.actionPrimary {
+  background: linear-gradient(
+    135deg,
+    rgba(var(--accent-rgb), 0.28) 0%,
+    rgba(var(--accent-rgb), 0.18) 100%
+  );
+  border-color: rgba(var(--accent-rgb), 0.5);
+  color: #ffffff;
+}
+
+.actionPrimary:hover {
+  background: linear-gradient(
+    135deg,
+    rgba(var(--accent-rgb), 0.45) 0%,
+    rgba(var(--accent-rgb), 0.3) 100%
+  );
+  border-color: rgba(var(--accent-rgb), 0.7);
+}
+
+.actionDanger:hover {
+  background: rgba(239, 68, 68, 0.9);
+  border-color: transparent;
+  color: #ffffff;
+}
+
+/* ── Bookshelf / List View ────────────────────────────────────────────────── */
+
+.shelfList {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.shelfRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 16px;
+  border-radius: 14px;
+  background: var(--white-a02);
+  border: 1px solid var(--white-a06);
+  transition:
+    background 0.18s ease,
+    border-color 0.18s ease,
+    box-shadow 0.18s ease;
+}
+
+.shelfRow:hover {
+  background: rgba(255, 255, 255, 0.045);
+  border-color: var(--white-a12);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
+}
+
+.shelfThumb {
+  position: relative;
+  width: 52px;
+  height: 52px;
+  border-radius: 10px;
+  overflow: hidden;
+  flex-shrink: 0;
+  background: #15161e;
+  border: 1px solid var(--white-a08);
+}
+
+.shelfCover {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.shelfInfo {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+}
+
+.shelfTitle {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffffff;
+  text-decoration: none;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.shelfTitle:hover {
+  color: rgb(var(--accent-rgb));
+}
+
+.shelfMeta {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--white-a50);
+  flex-wrap: wrap;
+}
+
+.shelfDetails {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-shrink: 0;
+}
+
+.shelfBadgeCol {
+  min-width: 120px;
+}
+
+.shelfBadgeCol .badge {
+  position: static;
+}
+
+.shelfActions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+@media (max-width: 768px) {
+  .shelfRow {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .shelfDetails {
+    width: 100%;
+    justify-content: space-between;
+  }
+}
+
+@media (max-width: 640px) {
+  .grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 20px 14px;
+  }
+}

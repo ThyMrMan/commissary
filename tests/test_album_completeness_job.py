@@ -3,15 +3,19 @@ import types
 
 class _DummyConfigManager:
     def get(self, key, default=None):
+        # these fixtures own one or two tracks per album to test grouping and
+        # counting; the #1572 min-owned gate has its own tests
+        if key == 'repair.jobs.album_completeness.settings':
+            return {'min_owned_tracks': 0}
         return default
 
     def get_active_media_server(self):
         return "plex"
 
 
-# NOTE: deliberately no sys.modules stubbing of spotipy / config.settings here. Both import
+# NOTE: deliberately no sys.modules stubbing of spotipy / core.settings here. Both import
 # fine in the test env, and faking them globally (with no teardown) leaked into other files —
-# it left a config.settings with no ConfigManager, intermittently breaking
+# it left a core.settings with no ConfigManager, intermittently breaking
 # tests/test_config_save_retry depending on collection order.
 from core.repair_jobs.album_completeness import AlbumCompletenessJob
 import core.repair_jobs.album_completeness as album_completeness_module

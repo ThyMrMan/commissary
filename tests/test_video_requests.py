@@ -69,8 +69,9 @@ def test_member_files_and_sees_only_their_own(app_db):
     assert len(rows) == 1 and rows[0]["requester_name"] == "Kid" and rows[0]["note"] == "please!"
 
 
-def test_approve_movie_lands_on_the_wishlist(app_db):
+def test_approve_movie_lands_on_the_wishlist(app_db, video_wishlist_forensics):
     client, db, persona = app_db
+    video_wishlist_forensics.arm(db)
     _as_member(persona)
     rid = client.post("/api/video/requests",
                       json={"kind": "movie", "tmdb_id": 603, "title": "The Matrix",
@@ -81,11 +82,67 @@ def test_approve_movie_lands_on_the_wishlist(app_db):
     out = client.post("/api/video/requests/%d/approve" % rid,
                       json={"response": "enjoy"}).get_json()
     assert out["success"] is True
-    assert db.wishlist_counts().get("movie") == 1
+    # Diagnostic, not decoration: this assert went red once on CI (2026-07-27)
+    # and never reproduced — not in isolation, not for the whole file, not over
+    # all of tests/video, not in a full 10,966-test run in CI's own order. The
+    # tripwire cleared the usual suspect (_video_db was the fixture's object),
+    # so the two live theories are (a) the approve took the SHOW branch, which
+    # writes video_watchlist instead, or (b) the row landed and something
+    # removed it — core/video/download_monitor.py's remove_from_wishlist("movie")
+    # runs off a daemon thread against the live get_video_db(). Each leaves a
+    # different fingerprint below, so the next red run names the cause instead
+    # of costing another 45-minute re-roll.
+    # approve writes to the requester's profile (per-profile wishlists), not profile 1
+    counts = db.wishlist_counts(profile_id=5)
+    if counts.get("movie") != 1:
+        import api.video as videoapi
+        conn = db.connect()
+        try:
+            wl = [dict(r) for r in conn.execute(
+                "SELECT kind, tmdb_id, title, status FROM video_wishlist")]
+            wa = [dict(r) for r in conn.execute(
+                "SELECT kind, tmdb_id, title FROM video_watchlist")]
+            rq = [dict(r) for r in conn.execute(
+                "SELECT id, kind, tmdb_id, status FROM video_requests")]
+        finally:
+            conn.close()
+        raise AssertionError(
+            "approve said %r but wishlist_counts()=%r\n"
+            "  request rows   : %r          <- kind here decides movie-vs-show branch\n"
+            "  wishlist rows  : %r\n"
+            "  watchlist rows : %r          <- populated => the SHOW branch ran\n"
+            "  db path        : %s\n"
+            "  fixture db %s / api._video_db %s / same object: %s\n"
+            "%s"
+            % (out, counts, rq, wl, wa, db.database_path,
+               hex(id(db)), hex(id(videoapi._video_db)), db is videoapi._video_db,
+               video_wishlist_forensics(db, "approve said %r" % out)))
+    assert counts.get("movie") == 1
     req = db.get_video_request(rid)
     assert req["status"] == "approved" and req["admin_response"] == "enjoy"
     # terminal — a second approve 409s
     assert client.post("/api/video/requests/%d/approve" % rid).status_code == 409
+
+
+def test_approve_writes_to_every_claimant_profile(app_db):
+    client, db, persona = app_db
+    # two members ask for the same movie
+    _as_member(persona, pid=5, name="Kid")
+    rid1 = client.post("/api/video/requests",
+                       json={"kind": "movie", "tmdb_id": 603, "title": "The Matrix",
+                             "year": 1999}).get_json()["id"]
+    _as_member(persona, pid=6, name="Other")
+    rid2 = client.post("/api/video/requests",
+                       json={"kind": "movie", "tmdb_id": 603, "title": "The Matrix",
+                             "year": 1999}).get_json()["id"]
+    # admin approves one — both claims resolve, both profiles get the wish
+    persona.update({"profile_id": 1, "is_admin": True})
+    out = client.post("/api/video/requests/%d/approve" % rid1).get_json()
+    assert out["success"] and out["approved"] == 2
+    assert db.wishlist_counts(profile_id=5).get("movie") == 1
+    assert db.wishlist_counts(profile_id=6).get("movie") == 1
+    assert db.get_video_request(rid1)["status"] == "approved"
+    assert db.get_video_request(rid2)["status"] == "approved"
 
 
 def test_approve_show_expands_the_monitor_policy(app_db, monkeypatch):
@@ -107,7 +164,8 @@ def test_approve_show_expands_the_monitor_policy(app_db, monkeypatch):
     persona.update({"profile_id": 1, "is_admin": True})
     out = client.post("/api/video/requests/%d/approve" % rid).get_json()
     assert out["success"] and out["wished"] == 1
-    assert db.wishlist_counts().get("episode") == 1
+    # episodes land on the requester's profile (per-profile wishlists)
+    assert db.wishlist_counts(profile_id=5).get("episode") == 1
 
 
 def test_deny_and_withdraw_edges(app_db):
@@ -162,7 +220,8 @@ def test_admin_detection_reads_the_real_global():
     # the bare global like every other video module.
     assert "window.currentProfile" not in _REQ_JS
     assert "typeof currentProfile !== 'undefined'" in _REQ_JS
-    assert "data-vreq-approve" in _REQ_JS and "data-vreq-withdraw" in _REQ_JS
+    # members withdraw from the row's ⋯ menu now, admins keep one approve button
+    assert "data-vreq-approve" in _REQ_JS and "label: 'Withdraw'" in _REQ_JS
 
 
 def test_no_download_profiles_get_the_request_button():

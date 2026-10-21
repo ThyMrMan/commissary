@@ -49,59 +49,6 @@ def test_global_retry_all_failed_button_wired():
     assert "retryAllFailedGlobal()" in _JS
 
 
-# ── "process first everywhere" isn't just Movies/Shows/Auto anymore ───────────
-
-def test_global_tabs_are_no_longer_a_fixed_static_list():
-    """The three buttons used to be hardcoded HTML in ensureOverlay(); they're
-    now built by renderGlobalTabs() from the configured Library list, so the
-    static markup must be gone."""
-    assert 'data-em-priority="movie">Movies</button>' not in _JS
-    assert '<button data-em-priority="movie">Movies</button>' not in _JS
-    assert 'id="vem-global-tabs"></div>' in _JS
-
-
-def test_render_global_tabs_builds_per_library_buttons():
-    body = _func("renderGlobalTabs")
-    assert "state.libraries" in body
-    assert "'movie:' +" in body and "'show:' +" in body
-    # only offered when there's more than one Library for that kind — a single
-    # -library install shouldn't see a redundant duplicate of the plain tab
-    assert "movieLibs.length > 1" in body
-    assert "tvLibs.length > 1" in body
-
-
-def test_render_global_tabs_drops_entries_with_no_id():
-    """Every button's data-em-priority must be distinct. An id-less entry would
-    render as 'movie:undefined' for all of them, so a single click matched —
-    and highlighted — several tabs at once."""
-    body = _func("renderGlobalTabs")
-    assert "l.id != null" in body
-
-
-def test_libraries_are_loaded_from_the_configured_registry():
-    """d.configured is the Library registry (ids + labels, visible to every
-    profile). d.movies/d.tv are the live server-section DISCOVERY list: no ids,
-    no labels, and empty for non-admins — reading those made every tab render
-    as 'Library'."""
-    assert "function loadLibraries(" in _JS
-    body = _func("loadLibraries")
-    assert "/api/video/libraries" in body
-    assert "d.configured" in body
-    code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("//"))
-    assert "d.movies" not in code and "d.tv" not in code
-    assert "renderGlobalTabs()" in body
-    # fetched once opening the modal, alongside the existing priority load
-    open_body = _func("open")
-    assert "loadLibraries()" in open_body
-
-
-def test_pinned_card_indicator_recognizes_a_library_scoped_priority():
-    """A 'show:3' priority should still light up the Shows breakdown card as
-    pinned, not just a bare 'show'."""
-    body = _func("renderCards")
-    assert "indexOf(e + ':')" in body
-
-
 def test_retry_all_failed_covers_every_kind_of_the_worker():
     body = _func("retryAllFailed")
     # iterate the worker's kinds (movie+show / show / video …), retry each

@@ -45,14 +45,14 @@ def qobuz_client_module():
 
     original_modules = {
         name: sys.modules.get(name)
-        for name in ('config', 'config.settings', 'core.qobuz_client')
+        for name in ('config', 'core.settings', 'core.qobuz_client')
     }
 
     if 'config' not in sys.modules:
         sys.modules['config'] = types.ModuleType('config')
-    settings_mod = types.ModuleType('config.settings')
+    settings_mod = types.ModuleType('core.settings')
     settings_mod.config_manager = _StubConfigManager()
-    sys.modules['config.settings'] = settings_mod
+    sys.modules['core.settings'] = settings_mod
 
     sys.modules.pop('core.qobuz_client', None)
     try:
@@ -215,7 +215,6 @@ def test_get_playlist_normalizes_tracks(authed_client):
         'image_url': 'https://qobuz.example/art.jpg',
         'external_urls': {'qobuz': 'https://play.qobuz.com/track/555'},
         'explicit': True,
-        'isrc': '',
     }]
 
 

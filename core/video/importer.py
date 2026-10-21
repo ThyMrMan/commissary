@@ -26,14 +26,13 @@ import uuid
 from typing import Any, Callable
 
 from core.video import organization
-from utils.logging_config import get_logger
-
 from core.video.download_pipeline import basename_of
-
-logger = get_logger("video.importer")
 from core.video.library_paths import quality_full
 from core.video.quality_eval import resolution_rank
-from core.video.release_parse import fansub_absolute_episode, parse_release
+from core.video.release_parse import parse_release
+from utils.logging_config import get_logger
+
+logger = get_logger("video.importer")
 
 VIDEO_EXTS = frozenset({
     ".mkv", ".mp4", ".avi", ".m4v", ".mov", ".ts", ".wmv",
@@ -49,6 +48,20 @@ _SAMPLE = re.compile(r"(^|[.\-_ ])sample([.\-_ ]|$)", re.I)
 # short get caught.
 _RUNTIME_FLOOR = {"movie": 15 * 60, "episode": 90}
 
+
+def _episode_sample_limit(expected_sec: float) -> float:
+    """Below this a file is a sample, not the episode. Sonarr's own tiers, keyed
+    off the show's runtime: 15s for a short under 3 min, 90s up to 10 min, 5 min
+    up to 30 min, 10 min for anything longer."""
+    minutes = (expected_sec or 0) / 60
+    if minutes <= 3:
+        return 15
+    if minutes <= 10:
+        return 90
+    if minutes <= 30:
+        return 300
+    return 600
+
 # Source ranking for the upgrade comparison (mirrors the quality ladder order).
 _SRC_RANK = {"remux": 6, "bluray": 5, "web-dl": 4, "webrip": 3, "hdtv": 2, "dvd": 1}
 
@@ -56,6 +69,21 @@ _SRC_RANK = {"remux": 6, "bluray": 5, "web-dl": 4, "webrip": 3, "hdtv": 2, "dvd"
 def ext_of(path: Any) -> str:
     """Lower-cased extension (with dot) of a path's basename, '' if none."""
     return os.path.splitext(basename_of(path))[1].lower()
+
+
+def _as_int(v: Any) -> int | None:
+    """Coerce a year-ish value (int / '2024' / '2024-07-01') to an int, or None."""
+    if v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        return int(s[:4]) if len(s) >= 4 and s[:4].isdigit() else int(s)
+    except (TypeError, ValueError):
+        return None
 
 
 def is_video(path: Any) -> bool:
@@ -82,7 +110,7 @@ def quality_score(parsed: Any) -> int:
 
 def _scope_of(dl: dict) -> str:
     """The import scope from the search context, falling back to the download kind.
-    Only 'movie' and 'episode' are placeable; packs/youtube are gated out upstream."""
+    Only 'movie', 'episode', and client-backed 'youtube' rows are placeable; packs are gated out upstream."""
     ctx = _search_ctx(dl)
     sc = str(ctx.get("scope") or "").lower()
     if sc in ("movie", "episode", "season", "series"):
@@ -92,6 +120,8 @@ def _scope_of(dl: dict) -> str:
         return "movie"
     if k in ("show", "tv", "episode"):
         return "episode"
+    if k == "youtube":
+        return "youtube"
     return k or "movie"
 
 
@@ -112,11 +142,46 @@ def _ctx(dl: dict) -> dict:
         "episode": sc.get("episode"),
         "episode_title": sc.get("episode_title"),
         "air_date": sc.get("air_date"),
-        # The show's absolute episode number. Carried for the numbering gate below
-        # (an indexer's SxxExx often IS the absolute) and for the {absolute} naming
-        # token, which read it from this dict and so was always empty.
+        "channel": sc.get("channel"),
+        "video_title": sc.get("video_title"),
+        "published_at": sc.get("published_at"),
+        "youtube_id": sc.get("youtube_id"),
+        # the scene (TVDB) numbering, when it differs (core/video/numbering.py)
+        "alt_season": sc.get("alt_season"),
+        "alt_episode": sc.get("alt_episode"),
+        "alt_exclusive": sc.get("alt_exclusive"),
+        # Commissary: the show's absolute episode number, for the numbering gate
         "absolute": sc.get("absolute"),
+        # Commissary: a manual folder placed as another season (core/commissary/manual_import)
+        "renumbered_from": sc.get("renumbered_from"),
     }
+
+
+def _user_replace_policy(dl: dict) -> bool:
+    """True when the row came from a direct user click rather than the background drain.
+
+    This is deliberately narrower than forced manual import: the normal sanity gates
+    still protect the library, but valid equal-quality replacements are allowed so a
+    corrupt copy can be recovered without pretending the new file is an upgrade.
+    """
+    ctx = _search_ctx(dl)
+    return str(ctx.get("import_policy") or "").lower() == "user_replace"
+
+
+def _unique_dest(dest: dict, names: list[str]) -> dict:
+    existing = {str(n).casefold() for n in (names or [])}
+    filename = str(dest.get("filename") or "")
+    if filename.casefold() not in existing:
+        return dest
+    stem, ext = os.path.splitext(filename)
+    for n in range(2, 1000):
+        candidate = f"{stem} ({n}){ext}"
+        if candidate.casefold() not in existing:
+            return {**dest, "filename": candidate,
+                    "path": os.path.join(dest["dir"], candidate)}
+    suffix = uuid.uuid4().hex[:8]
+    candidate = f"{stem} ({suffix}){ext}"
+    return {**dest, "filename": candidate, "path": os.path.join(dest["dir"], candidate)}
 
 
 def _reject(reason: str, bad_release: bool = False) -> dict:
@@ -156,7 +221,8 @@ def _existing_match(scope: str, dest_dir: str, ctx: dict, list_dir: Callable) ->
 def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | None = None,
                 settings: dict | None = None, force: bool = False,
                 override: dict | None = None, library_dir: str | None = None,
-                lock_reason: str | None = None, identity: dict | None = None) -> dict:
+                expected_duration_sec: float | None = None,
+                identity: dict | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
       {"action": "import",  "dest": {...}, "quality_label": str}
@@ -167,7 +233,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     ffprobe ``mediainfo`` result (or None when ffprobe is unavailable) — when present
     we trust the FILE's real resolution over the scene name and reject corrupt /
     too-short junk. ``settings`` are the user's organisation settings (naming templates
-    + replace policy); None = defaults.
+    + replace policy); None = defaults. ``expected_duration_sec`` is the item's known
+    runtime (TMDB, resolved by the caller): a probed file running far shorter is a
+    truncated download or the wrong file entirely, and is rejected.
 
     MANUAL placement: ``force=True`` with an ``override`` ({scope, title, year, season,
     episode, episode_title, target_dir, media_id}) trusts the user's chosen identity —
@@ -175,19 +243,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     files the file exactly where they said, replacing any worse copy. ffprobe is still
     used for the true resolution, but never to reject.
 
-    ``identity`` is the LIBRARY's own naming facts for this title
-    (``video_naming_identity`` — title, premiere year, tmdb/tvdb/imdb ids, and the
-    episode list), resolved by the CALLER for the same reason ``lock_reason`` is:
-    this function stays pure. It exists because naming a destination from the GRAB
-    instead of from the library forked every ongoing show into two folders — see
-    that method for the full account. None (an unowned title) keeps the previous
-    behaviour, which is all that can be known before the first file lands.
-
-    ``lock_reason`` is the "Lock automatic edits" verdict, resolved by the CALLER
-    (this function stays pure and has no DB). A non-empty string refuses the
-    placement outright — before any destination is computed, so a mis-identified
-    release cannot so much as name a file inside locked content. ``force`` bypasses
-    it deliberately: a manual placement IS the review the lock exists to demand."""
+    Commissary: ``identity`` is the LIBRARY's naming facts for the title
+    (core.commissary.naming_identity), resolved by the caller. None (unowned)
+    names from the grab."""
     dl = dl or {}
     settings = organization.normalize(settings)
     override = override or {}
@@ -196,42 +254,31 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     ext = ext_of(src_path)
     parsed = parse_release(dl.get("release_title") or name)
     ctx = _ctx(dl)
-    # The library's own title and year — the two naming facts the grab gets wrong,
-    # its "year" being the year this EPISODE aired rather than the year the series
-    # began. Deliberately nothing else: season, episode and air_date are what the
-    # sanity gates below judge the release against, so those keep coming from the
-    # grab and a library row cannot talk the importer into accepting a release it
-    # had already decided was the wrong episode. Applied before the force overlay,
-    # so a manual placement — itself a deliberate statement of identity — wins.
+    # Commissary: the library's title + PREMIERE year (the grab's year is the
+    # episode's air year). Numbering/air date stay the grab's — the gates judge
+    # the release against those. Applied before the override so manual wins.
     _ident = identity if isinstance(identity, dict) else {}
-    for _k, _v in (("title", _ident.get("title")), ("year", _ident.get("year"))):
-        if _v not in (None, ""):
-            ctx[_k] = _v
+    for _k in ("title", "year"):
+        if _ident.get(_k) not in (None, ""):
+            ctx[_k] = _ident[_k]
     if force:   # the user told us what it is — let their identity win
         for k in ("title", "year", "season", "episode", "episode_title"):
             if override.get(k) is not None:
                 ctx[k] = override.get(k)
-    # The episode's own title, looked up AFTER the numbering is final: a manual
-    # placement happens precisely when the detected episode was wrong, and reading
-    # the library at the pre-override number would name the corrected file after
-    # the episode it was mistaken for. Fills a gap only — the grab seldom carries
-    # a title, which is why a newly imported episode had none in its filename
-    # until some later rename pass put it back.
+        if override.get("season") is not None or override.get("episode") is not None:
+            # a hand-picked episode: the stored scene numbering was for another one
+            ctx["alt_season"] = ctx["alt_episode"] = None
+    # Commissary: the episode title from the library, read at the FINAL numbering.
     _ep = (_ident.get("episodes") or {}).get((ctx.get("season"), ctx.get("episode")))
     if _ep and _ep.get("episode_title") and not ctx.get("episode_title"):
         ctx["episode_title"] = _ep["episode_title"]
 
     if not is_video(src_path):   # can't place a non-video, even on a forced import
         return _reject("Not a video file (%s)" % (ext or "no extension"), bad_release=True)
-    # The import lock, checked BEFORE anything else decides where this would go.
-    # Not tagged bad_release: the release may be perfectly good and simply
-    # mis-identified — blocklisting it would punish the file for the lock.
-    if lock_reason and not force:
-        return _reject("%s. Place it by hand once you have checked it." % lock_reason)
     if not force:
         if is_sample(name, dl.get("size_bytes")):
             return _reject("Looks like a sample, not the feature", bad_release=True)
-        if scope not in ("movie", "episode"):
+        if scope not in ("movie", "episode", "youtube"):
             return _reject("Season/complete packs need manual import")
         if scope == "episode":
             if ctx.get("season") is None or ctx.get("episode") is None:
@@ -243,22 +290,46 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                 span_end = parsed.get("episode_end") or parsed.get("episode")
                 numbering_ok = (parsed.get("season") == ctx.get("season")
                                 and parsed.get("episode") <= ctx.get("episode") <= span_end)
+                from core.video.numbering import ctx_alt
+                alt = ctx_alt(ctx)
+                alt_ok = bool(alt and parsed.get("season") == alt[0]
+                              and parsed.get("episode") <= alt[1] <= span_end)
+                if alt and len(alt) > 2 and alt[2]:
+                    # the wished number is another episode in the scene's
+                    # numbering: only the scene number is this one
+                    numbering_ok = alt_ok
+                elif not numbering_ok:
+                    # named by the scene's (TVDB) numbering for this episode:
+                    # still this episode, filed under the number it was wished as
+                    numbering_ok = alt_ok
                 date_ok = bool(ctx.get("air_date")
                                and parsed.get("air_date") == ctx.get("air_date"))
-                # An anime tracker's synthesised SxxExx carries the show's ABSOLUTE
-                # number ('S04E82' for the episode filed as S4E16), so the file the
-                # search accepted arrives here looking like the wrong episode. Same
-                # two signals the search gate uses: the season agrees and the number
-                # is exactly the absolute computed for the episode requested.
+                # Commissary: an anime tracker's synthesised SxxExx carries the ABSOLUTE
+                # number ('S04E82' for S4E16). Same two signals as the search gate:
+                # the season agrees and the number is exactly this episode's absolute.
                 absolute_ok = bool(ctx.get("absolute")
                                    and parsed.get("season") == ctx.get("season")
-                                   and parsed.get("episode") <= ctx.get("absolute") <= span_end)
+                                   and parsed.get("episode") <= int(ctx["absolute"]) <= span_end)
                 if not numbering_ok and not date_ok and not absolute_ok:
                     return _reject("Release is S%02dE%02d, not the episode requested"
                                    % (parsed.get("season") or 0, parsed.get("episode") or 0))
+                # Show-identity gate (the "Dark Matter" case): two shows can share a
+                # name AND an SxxExx. When the numbering matched but the release name
+                # carries a year that disagrees with the wanted show's year, it's the
+                # wrong show — reject rather than mis-file it. Skipped when the match
+                # came via air date (the year token there is the air date, and the
+                # date itself is the stronger identity).
+                if numbering_ok:
+                    from core.video.quality_eval import tv_year_mismatch
+                    from core.video.release_parse import title_region_year
+                    want_year = _as_int(ctx.get("year"))
+                    rel_year = title_region_year(parsed.get("title"))
+                    if tv_year_mismatch(rel_year, want_year):
+                        return _reject("Release is from %s, not %s (%s)"
+                                       % (rel_year, ctx.get("title") or "this show", want_year))
     else:
-        if scope not in ("movie", "episode"):
-            return _reject("Pick a movie or an episode to place this file")
+        if scope not in ("movie", "episode", "youtube"):
+            return _reject("Pick a movie, an episode, or a YouTube video to place this file")
         if scope == "episode" and (ctx.get("season") is None or ctx.get("episode") is None):
             return _reject("Pick a season and episode to place this file")
 
@@ -282,85 +353,76 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             parsed["aspect"] = probe["aspect"]
         if probe.get("video_codec") and not parsed.get("codec"):
             parsed["codec"] = probe["video_codec"]
-        # MediaInfo naming tokens ({Mediainfo AudioChannels} and friends). These
-        # come from the container ONLY — there is no name-derived fallback for
-        # them, because a filename asserting '7.1' is exactly the kind of claim
-        # probing exists to check. Absent ffprobe they stay empty and their
-        # template groups collapse, which is the honest outcome.
-        for key in ("audio_codec", "audio_channels", "audio_languages",
-                    "video_bit_depth", "dynamic_range_type"):
-            if probe.get(key):
-                parsed[key] = probe[key]
+        # Commissary: {MediaInfo ...} tokens come from the container only
+        for _key in ("audio_codec", "audio_channels", "audio_languages",
+                     "video_bit_depth", "dynamic_range_type"):
+            if probe.get(_key):
+                parsed[_key] = probe[_key]
+
+    # Duration-vs-expected. TV runtime metadata cannot be trusted to reject a file:
+    # a new episode carries a placeholder (Name That Tune S06E02 listed at 159 min,
+    # title "TBA"), a slot-length runtime gets stored for one episode (Halloween
+    # Baking Championship S12E04 at 85 min for a 43 min show), and specials are
+    # whatever length they are. Every one of those failed a perfectly good file,
+    # over and over. So episodes do what Sonarr does: the expected runtime only
+    # picks a SAMPLE threshold (a 10 min floor for an hour show, not "65% of 85").
+    # Movies keep a check, because a film's runtime is reliable, but only for a
+    # file under half of it: a truncated download or the wrong file, never a cut.
+    # Soulseek truncations are caught by the advertised-size check either way.
+    # Unknown expected runtime: the absolute floor above has already run.
+    if probe is not None and not force and expected_duration_sec:
+        actual = probe.get("duration_sec") or 0
+        if probe.get("ok") and actual > 0:
+            want = float(expected_duration_sec)
+            if scope == "episode":
+                limit = _episode_sample_limit(want)
+                if actual < limit:
+                    return _reject("Runtime is only %d min — looks like a sample/clip, not the episode"
+                                   % int(actual // 60), bad_release=True)
+            elif scope == "movie" and want > 0 and actual < 0.5 * want:
+                return _reject("Runs %d of %d min — truncated download or the wrong file"
+                               % (int(actual // 60), int(want // 60)))
 
     root = (override.get("target_dir") if force else None) or dl.get("target_dir") or ""
     if not root:
         return _reject("No library folder configured for this type")
 
     media_id = override.get("media_id") if force else dl.get("media_id")
-    # A FORCED placement's media_id is a TMDB id by construction — the Place
-    # dialog resolves the title against TMDB and sends that id (it is the same
-    # value the endpoint feeds to root_folder_id_for_tmdb). Without this a manual
-    # placement of a title not yet in the library would lose the one id it does
-    # know, which is the case the dialog exists to serve.
+    # Commissary: media_id is a TMDB id only for a tmdb-sourced grab or a forced
+    # placement (the Place dialog sends a TMDB id); otherwise it's a local row id.
     _tmdb_sourced = bool(force) or str(dl.get("media_source") or "").lower() == "tmdb"
     quality = quality_full(parsed)
     # A multi-episode file is NAMED by its full span (S01E01-E02, the Sonarr/Plex
     # convention) even though the download row's identity is one episode of it.
     ep, ep_end = ctx.get("episode"), None
-    _ov_end = override.get("episode_end") if force else None
-    if _ov_end is not None:
-        # A pack member's span, supplied by the caller that already parsed it.
-        # Re-deriving it below fails under a season renumber, because the guard
-        # there requires the parsed season to agree with the one being filed —
-        # and disagreeing is the entire point of a renumber. Without this a
-        # renumbered S08E01-E02 would be filed as a single S07E01.
-        try:
-            _end = int(_ov_end)
-        except (TypeError, ValueError):
-            _end = None
-        if _end is not None and _end != ctx.get("episode"):
-            ep_end = _end
-    elif scope == "episode" and parsed.get("episode_end") \
-            and parsed.get("season") == ctx.get("season"):
+    # Commissary: a folder placed 'as season 7' keeps a file's S08E01-E02 span
+    if scope == "episode" and parsed.get("episode_end") \
+            and parsed.get("season") in (ctx.get("season"), ctx.get("renumbered_from")):
         ep, ep_end = parsed.get("episode"), parsed.get("episode_end")
-    fields = {
-        "title": ctx.get("title"), "year": ctx.get("year"),
-        "series": ctx.get("title"), "season": ctx.get("season"),
-        "episode": ep, "episode_end": ep_end, "episode_title": ctx.get("episode_title"),
-        "air_date": ctx.get("air_date"),
-        "quality": quality, "resolution": parsed.get("resolution"),
-        "source": parsed.get("source"), "codec": parsed.get("codec"),
-        # Ids come from the LIBRARY row, falling back to ``media_id`` only when it
-        # IS a TMDB id (a tmdb-sourced grab of a title not on disk yet — the first
-        # episode of a new show, which is precisely the import that used to leave
-        # an empty '(tmdb-)' for the media server to guess at). ``media_id`` was
-        # previously written into ``tvdbid`` for every episode: it is a TMDB id or
-        # a local row id and never a TVDB one, so that asserted an id that was
-        # false rather than merely missing. Only a real tvdb_id goes there now.
-        "tmdbid": _ident.get("tmdbid") or (media_id if _tmdb_sourced else None),
-        "tvdbid": _ident.get("tvdbid"),
-        "imdbid": _ident.get("imdbid"),
-        # Sonarr/Radarr {Token} inputs. Everything here is optional — a template
-        # that doesn't mention them is byte-for-byte unaffected, and a token
-        # whose value is missing collapses its own group.
-        "absolute": ctx.get("absolute"),
-        "release_group": parsed.get("group"),
-        "edition": parsed.get("edition"),
-        "three_d": parsed.get("three_d"),
-        "original_title": dl.get("release_title") or name,
-        "original_filename": name,
-        # Scored by the monitor, which has the DB and the profile; plan_import
-        # stays pure and just reads what it was handed.
-        "custom_formats": dl.get("_custom_formats"),
-        "audio_codec": parsed.get("audio_codec") or parsed.get("audio"),
-        "audio_channels": parsed.get("audio_channels"),
-        "audio_languages": parsed.get("audio_languages"),
-        "video_bit_depth": parsed.get("video_bit_depth"),
-        # The FILE's dynamic range when probed; the name's claim only as a
-        # last resort, flagged by being the coarser 'HDR' rather than a type.
-        "dynamic_range_type": (parsed.get("dynamic_range_type")
-                               or (str(parsed.get("hdr")).upper() if parsed.get("hdr") else None)),
-    }
+    if scope == "youtube":
+        fields = {
+            "channel": ctx.get("channel") or ctx.get("title") or dl.get("title"),
+            "title": ctx.get("video_title") or ctx.get("title") or dl.get("title"),
+            "published_at": ctx.get("published_at") or ctx.get("air_date") or dl.get("year"),
+            "date": ctx.get("published_at") or ctx.get("air_date") or dl.get("year"),
+            "youtube_id": ctx.get("youtube_id") or media_id,
+        }
+    else:
+        from core.commissary.naming import import_fields  # Commissary
+        fields = {
+            "title": ctx.get("title"), "year": ctx.get("year"),
+            "series": ctx.get("title"), "season": ctx.get("season"),
+            "episode": ep, "episode_end": ep_end, "episode_title": ctx.get("episode_title"),
+            "air_date": ctx.get("air_date"),
+            "quality": quality, "resolution": parsed.get("resolution"),
+            "source": parsed.get("source"), "codec": parsed.get("codec"),
+            # Commissary: real ids only — media_id is never a TVDB id.
+            "tmdbid": _ident.get("tmdbid") or (media_id if _tmdb_sourced else None),
+            "tvdbid": _ident.get("tvdbid"),
+            "imdbid": _ident.get("imdbid"),
+            # Commissary: the Sonarr/Radarr {Token} inputs (all optional)
+            **import_fields(dl, parsed, ctx, name),
+        }
     dest = organization.render_path(scope, root, fields, settings, ext)
     # The library already owns this item at a REAL, resolved location
     # (``library_dir`` — the server-stored path re-rooted by the video path
@@ -370,16 +432,8 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     if library_dir and not force:
         dest = {"dir": library_dir, "filename": dest["filename"],
                 "path": os.path.join(library_dir, dest["filename"])}
-    # WHERE THIS FILE IS ABOUT TO GO, and on whose authority. The video import
-    # path logged nothing at all: across eight days of a real app.log there was
-    # not one line naming a destination, so "it got filed as the wrong show" could
-    # only be investigated by reading the database afterwards and guessing. The
-    # music side has logged `Resolved path:` on every import for years.
-    #
-    # The SOURCE matters as much as the path. A destination built from the grab
-    # rather than from the library row is exactly how a show acquires a second
-    # folder, so the line says which one it was — and names the ids it used, since
-    # an absent tmdb id is what leaves a folder the media server has to guess at.
+    # Commissary: say where the file is going and on whose authority — a folder
+    # named from the grab rather than the library is how a show gets a second one.
     try:
         if library_dir and not force:
             _why = "existing library copy"
@@ -392,37 +446,54 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             _why = "the grab alone — this title is not in the library yet"
         logger.info("[Placement] %s %r -> %s  (naming from: %s)",
                     scope, ctx.get("title") or "?", dest["path"], _why)
-    except Exception:   # noqa: BLE001 - a log line must never cost an import
+    except Exception:   # noqa: BLE001, S110 - a log line must never cost an import
         pass
-
     # Where poster.jpg goes: the movie folder, or the SHOW root for an episode
     # (parent of the Season folder) — so it isn't dropped per-season.
-    artwork_dir = dest["dir"] if scope == "movie" else os.path.dirname(dest["dir"])
+    artwork_dir = dest["dir"] if scope in ("movie", "youtube") else os.path.dirname(dest["dir"])
 
-    existing = _existing_match(scope, dest["dir"], ctx, list_dir)
+    existing_names = []
+    try:
+        existing_names = [str(n) for n in (list_dir(dest["dir"]) or [])]
+    except Exception:   # noqa: BLE001 - collision avoidance is best-effort
+        existing_names = []
+    if scope == "youtube":
+        want = str(dest.get("filename") or "").casefold()
+        existing = next((n for n in existing_names
+                         if ext_of(n) in VIDEO_EXTS and str(n).casefold() == want), None)
+    else:
+        existing = _existing_match(scope, dest["dir"], ctx, lambda _d: existing_names)
     if existing:
         # A forced placement replaces whatever's there (the user chose to put it here).
         if force:
             return {"action": "upgrade", "dest": dest, "quality_label": quality,
                     "replace_path": os.path.join(dest["dir"], existing), "artwork_dir": artwork_dir}
+        new_score = quality_score(parsed)
+        old_score = quality_score(parse_release(existing))
+        if _user_replace_policy(dl):
+            if new_score >= old_score:
+                return {"action": "upgrade", "dest": dest, "quality_label": quality,
+                        "replace_path": os.path.join(dest["dir"], existing), "artwork_dir": artwork_dir}
+            return {"action": "import", "dest": _unique_dest(dest, existing_names),
+                    "quality_label": quality, "artwork_dir": artwork_dir,
+                    "kept_existing": os.path.join(dest["dir"], existing)}
         # Idempotent re-import: the file already sits at the EXACT path we'd write. This is
-        # the crash-recovery case — an import that finished the copy but died before the row
+        # the crash-recovery case - an import that finished the copy but died before the row
         # flipped to 'completed' (e.g. a restart), so the monitor re-drives it. The goal (this
-        # item in the library, here) is already met → report it done instead of the misleading
+        # item in the library, here) is already met -> report it done instead of the misleading
         # "not an upgrade" failure that would otherwise leave a landed download looking failed.
         if existing == dest["filename"]:
             return {"action": "already_placed", "dest": dest, "quality_label": quality,
                     "artwork_dir": artwork_dir}
         if not settings.get("replace_existing", True):
-            return _reject("Already in the library (%s) — replace is turned off" % existing)
-        new_score = quality_score(parsed)
-        old_score = quality_score(parse_release(existing))
+            return _reject("Already in the library (%s) - replace is turned off" % existing)
         if new_score > old_score:
             return {"action": "upgrade", "dest": dest, "quality_label": quality,
                     "replace_path": os.path.join(dest["dir"], existing), "artwork_dir": artwork_dir}
         return _reject("Not an upgrade over the copy already in the library (%s)" % existing)
 
-    return {"action": "import", "dest": dest, "quality_label": quality, "artwork_dir": artwork_dir}
+    return {"action": "import", "dest": _unique_dest(dest, existing_names),
+            "quality_label": quality, "artwork_dir": artwork_dir}
 
 
 def plan_subs(src_path: str, dest_path: str, list_dir: Callable) -> list:
@@ -455,8 +526,9 @@ def plan_subs(src_path: str, dest_path: str, list_dir: Callable) -> list:
 def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = None,
                settings: dict | None = None, force: bool = False,
                override: dict | None = None, library_dir: str | None = None,
-               recycle: Callable | None = None, lock_reason: str | None = None,
-               identity: dict | None = None) -> dict:
+               recycle: Callable | None = None,
+               expected_duration_sec: float | None = None,
+               plan: dict | None = None) -> dict:
     """Execute the import and return a DB patch dict for the download row.
 
     ``fs`` is an injected facade with: ``list_dir(dir)->iterable[name]``,
@@ -466,21 +538,36 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
     copy with a move-to-trash (core.video.recycle.discarder); None = hard remove.
     ``settings`` are the user's organisation settings (transfer mode, subtitle carry);
     None = defaults. ``force``/``override`` drive a MANUAL placement (see ``plan_import``).
+    ``expected_duration_sec`` is the item's known runtime for the duration check.
+    ``plan`` is a pre-computed ``plan_import`` result — when given, the internal
+    planning (and probing) is skipped. The caller may have persisted the plan's
+    destination BEFORE the file moves, so a crash mid-import stays recoverable.
     A reject becomes an ``import_failed`` row with ``dest_path`` pointing at the file's
     current (unplaced) location so the Import page can resolve it; a success becomes a
-    ``completed`` row with ``dest_path`` set to its final home."""
+    ``completed`` row with ``dest_path`` set to its final home.
+
+    The download copy is NOT reclaimed here. On success in copy mode the patch carries
+    a transient ``_cleanup_source`` (stripped by update_video_download like the other
+    underscore keys); the caller removes it AFTER the row is persisted. Deleting before
+    the persist meant a restart in between left a correctly-placed library file with a
+    stuck 'importing' row that aged into a misleading 'failed'."""
     settings = organization.normalize(settings)
-    probe_info = None
-    if prober is not None:
-        try:
-            probe_info = prober(src_path)
-        except Exception:   # noqa: BLE001 - a probe crash must not block the import
-            probe_info = None
-    plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
-                       settings=settings, force=force, override=override,
-                       library_dir=library_dir, lock_reason=lock_reason,
-                       identity=identity)
+    if plan is None:
+        probe_info = None
+        if prober is not None:
+            try:
+                probe_info = prober(src_path)
+            except Exception:   # noqa: BLE001 - a probe crash must not block the import
+                probe_info = None
+        plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
+                           settings=settings, force=force, override=override,
+                           library_dir=library_dir, expected_duration_sec=expected_duration_sec)
     if plan["action"] == "reject":
+        # Commissary: a refused import used to leave no trace in the log.
+        logger.info("[Import] %r refused: %s%s | file=%s",
+                    (dl or {}).get("title") or "?", plan.get("reason"),
+                    " (bad release — will be blocklisted)" if plan.get("bad_release") else "",
+                    src_path)
         # Leave the file where it is; remember WHERE so manual import can find it.
         # _bad_release is transient (stripped by update_video_download): it tells
         # the monitor to blocklist this exact release so it's never re-picked.
@@ -495,9 +582,22 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                 "quality_label": plan.get("quality_label") or dl.get("quality_label")}
 
     dest = plan["dest"]
-    move_mode = settings.get("transfer_mode") == "move"
+    # a torrent is never moved, whatever the setting: the client is still
+    # seeding that file, and taking it away broke the torrent (missing files,
+    # re-download) and left the seeding cleanup deleting nothing. radarr does
+    # the same: torrents are copied while they seed.
+    is_torrent = str(dl.get("source") or "").lower() == "torrent"
+    move_mode = settings.get("transfer_mode") == "move" and not is_torrent
     try:
         fs.makedirs(dest["dir"])
+        replace_path = plan.get("replace_path")
+        same_replace = bool(replace_path) and os.path.normcase(os.path.abspath(replace_path)) == \
+            os.path.normcase(os.path.abspath(dest["path"]))
+        if same_replace:
+            try:
+                (recycle or fs.remove)(replace_path)
+            except Exception:   # noqa: BLE001 - a failed pre-recycle falls through to copy error/manual import
+                pass
         if move_mode:
             fs.move(src_path, dest["path"])
         else:
@@ -508,251 +608,29 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                     fs.copy(sub_src, sub_dst)
                 except Exception:   # noqa: BLE001 - a subtitle that won't copy isn't fatal
                     pass
-        if plan["action"] == "upgrade" and plan.get("replace_path"):
+        if plan["action"] == "upgrade" and plan.get("replace_path") and not same_replace:
             try:
                 (recycle or fs.remove)(plan["replace_path"])
             except Exception:   # noqa: BLE001 - failing to delete the old file isn't fatal
                 pass
-        # Copy mode reclaims the download copy UNLESS it's a torrent (keep seeding) or a
-        # manually-added file (the user pointed at a file that's theirs, not a download
-        # client's temp copy — copying it into the library must never also delete it);
-        # move mode already relocated it.
-        if not move_mode and str(dl.get("source") or "").lower() not in ("torrent", "manual"):
-            try:
-                fs.remove(src_path)
-            except Exception:   # noqa: BLE001
-                pass
     except Exception as e:   # noqa: BLE001 - any copy/mkdir failure → manual import
+        logger.warning("[Import] %r failed placing %s -> %s: %s",   # Commissary
+                       (dl or {}).get("title") or "?", src_path, dest.get("path"), e,
+                       exc_info=True)
         return {"status": "import_failed", "progress": 100.0, "error": "Import failed: " + str(e),
                 "dest_path": src_path}
 
-    return {"status": "completed", "progress": 100.0, "dest_path": dest["path"],
-            "quality_label": plan.get("quality_label") or dl.get("quality_label"),
-            # transient (underscore = stripped by update_video_download): lets the
-            # monitor fire the 'Quality Upgrade Landed' event trigger
-            "_upgraded": plan["action"] == "upgrade"}
-
-
-# ── season packs ─────────────────────────────────────────────────────────────
-# A pack is a FOLDER of episodes, but everything above is built around one
-# download → one file. Rather than teach plan_import about packs (and fork every
-# naming / upgrade / subtitle / recycle / seeding rule in it), we fan the pack
-# out: each member file is parsed on its OWN name and handed to the very same
-# single-file importer as a synthetic per-episode download. Every behaviour the
-# episode path already has is inherited rather than reimplemented, and a pack
-# whose members are half-upgrades gets the per-episode upgrade decision for free.
-
-def pack_members(src_dir: str, lister: Callable, *, size_of: Callable | None = None) -> list:
-    """Importable episode files inside a pack, in (season, episode) order.
-
-    ``lister(dir)`` yields full paths recursively (same injection as
-    find_completed_file). Drops non-video files, samples, and anything whose name
-    carries no episode number — extras, trailers, "behind the scenes" and the
-    stray .nfo all fail that test, so they are never mistaken for an episode.
-    Specials (season 0) are kept: they are real episodes with a real destination.
-    """
-    out = []
-    for path in lister(src_dir) or []:
-        if not is_video(path):
-            continue
-        name = basename_of(path)
-        if is_sample(name, (size_of(path) if size_of else 0)):
-            continue
-        p = parse_release(name)
-        if p.get("episode") is not None and p.get("season") is not None:
-            out.append({"path": path, "season": p["season"], "episode": p["episode"],
-                        "episode_end": p.get("episode_end") or p["episode"], "parsed": p})
-            continue
-        # Fansub numbering: a leading group tag and a bare number glued on with a
-        # dash — '[GHOST] Nana - 01 [BD 1080p]'. That number is the show's ABSOLUTE
-        # episode, and nothing in the name says which season it falls in, so the
-        # member is kept with season None and resolved against the chosen show
-        # when it is placed (``resolve_absolute_members``). Dropping these made a
-        # whole BD release folder look like it held no episodes at all.
-        absolute = fansub_absolute_episode(name)
-        if absolute:
-            out.append({"path": path, "season": None, "episode": absolute,
-                        "episode_end": absolute, "absolute": absolute, "parsed": p})
-    out.sort(key=lambda m: (m["season"] is None, m["season"] or 0, m["episode"]))
-    return out
-
-
-def resolve_absolute_members(members: list, *, identity: dict | None = None,
-                             season: int | None = None) -> list:
-    """Give absolute-numbered pack members a real (season, episode).
-
-    In order of trust:
-      1. the chosen show's own episode list — the Nth aired episode, specials
-         excluded, IS absolute N, which is how a 2-season BD box files correctly;
-      2. a season the user typed in, read as 'these are that season's episodes';
-      3. season 1, where the absolute number and the episode number are the same
-         thing by definition — the same derivation manual search already uses.
-    A member the show's list cannot place (numbered past its last known episode)
-    falls through to the next rule rather than being dropped.
-    """
-    order = []
-    eps = (identity or {}).get("episodes") or {}
-    if eps:
-        order = sorted(k for k in eps if isinstance(k, tuple) and len(k) == 2
-                       and k[0] is not None and k[0] >= 1)
-    out = []
-    for m in members:
-        if m.get("season") is not None or not m.get("absolute"):
-            out.append(m)
-            continue
-        a = m["absolute"]
-        if 0 < a <= len(order):
-            s, e = order[a - 1]
-        elif season is not None:
-            s, e = season, a
-        else:
-            s, e = 1, a
-        out.append({**m, "season": s, "episode": e, "episode_end": e})
-    out.sort(key=lambda m: (m["season"], m["episode"]))
-    return out
-
-
-def _member_download(dl: dict, member: dict) -> dict:
-    """A synthetic single-episode download row for one pack member.
-
-    release_title becomes the MEMBER's filename: the pack's own name has no
-    episode number in it, so parsing that would give every member the same (and
-    wrong) identity. search_ctx is rewritten to scope='episode' with this file's
-    numbers, which is exactly what plan_import's episode branch expects.
-    """
-    ctx = dict(_search_ctx(dl))
-    ctx.update({"scope": "episode", "season": member["season"], "episode": member["episode"]})
-    ctx.pop("air_date", None)      # a pack member is identified by numbering, not date
-    out = dict(dl)
-    out["search_ctx"] = json.dumps(ctx)
-    out["release_title"] = basename_of(member["path"])
-    return out
-
-
-def run_season_import(dl: dict, src_dir: str, *, fs: Any, lister: Callable,
-                      prober: Callable | None = None, settings: dict | None = None,
-                      library_dir: str | None = None, recycle: Callable | None = None,
-                      size_of: Callable | None = None, force: bool = False,
-                      override: dict | None = None,
-                      lock_check: Callable | None = None,
-                      identity: dict | None = None) -> dict:
-    """Import every episode in a season/series pack. Returns a DB patch dict.
-
-    Partial success is SUCCESS: a pack advertised as S01 that ships 8 of 12
-    episodes, or one where four episodes are already in the library at better
-    quality, has still done its job. The patch reports what landed. Only a pack
-    from which nothing at all could be imported is a failure — and it keeps the
-    source path so the Import page can pick it up manually, same as any other
-    failed import.
-
-    ``force``/``override`` drive a MANUAL placement of a whole folder: the user
-    has chosen the show, so every member is placed against that identity.
-
-    EPISODE numbers always come from each FILE. The whole point of a pack is
-    that its members differ, and stamping one episode number across all of them
-    would file the entire season on top of itself.
-
-    SEASON is not the same kind of fact. It is a property of the PACK, not of
-    its members, so an override renumbers the lot — which is what makes a folder
-    whose filenames say S08 importable as season 7. Release groups numbering
-    differently from TMDB make that routine, and it used to be impossible: the
-    number was silently replaced by the one parsed out of each filename, so the
-    placement landed exactly where the user had just said it should not.
-
-    A renumber is REFUSED across a pack spanning several seasons. One number
-    cannot describe them, and applying it anyway would file S07E01 and S08E01 at
-    the same path — the second overwriting the first.
-    """
-    settings = organization.normalize(settings)
-    members = pack_members(src_dir, lister, size_of=size_of)
-    if not members:
-        return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
-                "error": "No episode files found in this pack"}
-
-    # The user's season, if they gave one. Resolved before the loop because it
-    # is a fact about the pack: the multi-season refusal has to be answered from
-    # ALL the members, not discovered halfway through copying them.
-    renumber = None
-    if override and override.get("season") is not None:
-        try:
-            renumber = int(override["season"])
-        except (TypeError, ValueError):
-            renumber = None
-    # Absolute-numbered members get their season/episode from the chosen show
-    # first. A season the user typed for such a pack says where its episodes go,
-    # so it seeds the resolution instead of renumbering on top of it.
-    if any(m.get("season") is None for m in members):
-        members = resolve_absolute_members(members, identity=identity, season=renumber)
-        renumber = None
-    if renumber is not None:
-        _seasons = sorted({m["season"] for m in members})
-        if len(_seasons) > 1:
-            return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
-                    "error": "This folder holds seasons %s. A season number can only be "
-                             "reassigned to a pack that is all one season — applying one "
-                             "number to several would file their episodes on top of each "
-                             "other." % ", ".join("%d" % s for s in _seasons)}
-
-    imported, upgraded, failed, dests = 0, 0, [], []
-    for m in members:
-        member_override = None
-        if override:
-            member_override = dict(override)
-            member_override.update({
-                "scope": "episode",
-                "season": m["season"] if renumber is None else renumber,
-                "episode": m["episode"],
-                # The member's own span, handed over rather than re-parsed. Under
-                # a renumber the filename's season and the one being filed under
-                # deliberately disagree, which is exactly what the span check in
-                # plan_import treats as a reason to distrust the parse.
-                "episode_end": m.get("episode_end"),
-            })
-            # The chosen show supplies the title; only the pack itself knows the
-            # per-episode title, and a stale one from the dialog would be worse
-            # than none (it names the file).
-            member_override.pop("episode_title", None)
-        try:
-            # Per MEMBER, not once for the pack: a season lock protects its own
-            # season, so a pack spanning a locked and an unlocked season imports
-            # the unlocked half and refuses the rest.
-            member_lock = lock_check(m.get("season")) if lock_check else None
-            # One identity for the whole pack — it carries every episode of the
-            # show, so each member still names itself from its OWN row.
-            patch = run_import(_member_download(dl, m), m["path"], fs=fs, prober=prober,
-                               settings=settings, library_dir=library_dir, recycle=recycle,
-                               force=force, override=member_override,
-                               lock_reason=member_lock, identity=identity)
-        except Exception as e:      # noqa: BLE001 - one bad member must not abort the pack
-            failed.append("S%02dE%02d: %s" % (m["season"], m["episode"], e))
-            continue
-        if patch.get("status") == "completed":
-            imported += 1
-            if patch.get("_upgraded"):
-                upgraded += 1
-            if patch.get("dest_path"):
-                dests.append(patch["dest_path"])
-        else:
-            failed.append("S%02dE%02d: %s" % (m["season"], m["episode"],
-                                              patch.get("error") or "not imported"))
-
-    if not imported:
-        return {"status": "import_failed", "progress": 100.0, "dest_path": src_dir,
-                "error": "Nothing in the pack could be imported — " + ("; ".join(failed[:3])
-                                                                       or "no usable episodes")}
-    return {
-        "status": "completed", "progress": 100.0,
-        # The season folder, not one episode — this is what the UI links to.
-        "dest_path": os.path.dirname(dests[0]) if dests else src_dir,
-        "quality_label": dl.get("quality_label"),
-        "_upgraded": upgraded > 0,
-        # transient (underscore-stripped on write): drives the completion message
-        # and lets the caller reconcile the wishlist for exactly what landed.
-        "_pack_imported": imported,
-        "_pack_total": len(members),
-        "_pack_failed": failed,
-        "_pack_episodes": [(m["season"], m["episode"]) for m in members],
-    }
+    patch = {"status": "completed", "progress": 100.0, "dest_path": dest["path"],
+             "quality_label": plan.get("quality_label") or dl.get("quality_label"),
+             # transient (underscore = stripped by update_video_download): lets the
+             # monitor fire the 'Quality Upgrade Landed' event trigger
+             "_upgraded": plan["action"] == "upgrade"}
+    # Copy mode reclaims the download copy UNLESS it's a torrent (keep seeding);
+    # move mode already relocated it. Deferred: the caller removes the source only
+    # AFTER the completed row is persisted (see docstring).
+    if not move_mode and not is_torrent:
+        patch["_cleanup_source"] = src_path
+    return patch
 
 
 def atomic_verified_copy(src: str, dst: str) -> None:
@@ -777,7 +655,16 @@ def atomic_verified_copy(src: str, dst: str) -> None:
     tmp = os.path.join(os.path.dirname(d) or ".",
                        os.path.basename(d) + ".tmp." + uuid.uuid4().hex[:8])
     try:
-        shutil.copy2(src, tmp)
+        # the data first, then the metadata as a courtesy. copy2 did both, and
+        # on shares that refuse chmod/utime/xattrs (unraid shfs, nfs with squash,
+        # smb) the metadata step raised "[Errno 13] Permission denied" AFTER the
+        # data was safely copied, failing an import that had worked (a user's report, sept 25 2026)
+        shutil.copyfile(src, tmp)
+        try:
+            shutil.copystat(src, tmp)
+        except OSError as e:
+            logger.info("video import: kept the copy of %s without its timestamps/permissions (%s)",
+                        os.path.basename(d), e)
         src_size = os.path.getsize(src)
         tmp_size = os.path.getsize(tmp)
         if src_size != tmp_size:
@@ -808,7 +695,14 @@ def atomic_verified_move(src: str, dst: str) -> None:
         if getattr(e, "errno", None) != errno.EXDEV:
             raise            # real error (perms/space/missing) — not cross-device
     atomic_verified_copy(src, dst)
-    os.remove(str(src))
+    # the library copy is verified and in place. a download folder we may not
+    # delete from (slskd owns its files) leaves the old copy behind; that is
+    # not a failed import
+    try:
+        os.remove(str(src))
+    except OSError as e:
+        logger.warning("video import: placed %s but couldn't remove the download copy (%s)",
+                       os.path.basename(str(dst)), e)
 
 
 class _RealFS:
@@ -836,7 +730,7 @@ class _RealFS:
     @staticmethod
     def save_url(url, dst):
         import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": "Commissary"})
+        req = urllib.request.Request(url, headers={"User-Agent": "SoulSync"})
         with urllib.request.urlopen(req, timeout=20) as resp, open(dst, "wb") as f:
             shutil.copyfileobj(resp, f)
 
@@ -857,5 +751,4 @@ def real_fs() -> _RealFS:
 __all__ = [
     "VIDEO_EXTS", "SUB_EXTS", "ext_of", "is_video", "is_sample", "quality_score",
     "plan_import", "plan_subs", "run_import", "real_fs",
-    "pack_members", "run_season_import",
 ]

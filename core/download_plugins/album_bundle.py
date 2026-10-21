@@ -21,16 +21,18 @@ folder scan.
 
 from __future__ import annotations
 
+import math
 import re
 import shutil
 import time
 import unicodedata
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from config.settings import config_manager
-from core.edition_preference import PREFER_DELUXE_KEY, has_deluxe_marker
+from core.quality.release_format import release_revision
+from core.settings import config_manager
 from utils.logging_config import get_logger
 
 logger = get_logger("download_plugins.album_bundle")
@@ -50,10 +52,10 @@ ALBUM_PICK_MIN_BYTES = 40 * 1024 * 1024
 ALBUM_PICK_MAX_BYTES = 3 * 1024 * 1024 * 1024
 
 
-# Quality-score weights for the album-pick heuristic. Mirrors the
-# tier order in ``core/imports/file_ops.py``'s ``quality_tiers`` —
-# higher number = preferred.
-_QUALITY_SCORE = {'flac': 4, 'ogg': 3, 'aac': 2, 'mp3': 1}
+# The album-pick heuristic used to carry its own four-entry ladder
+# (flac/ogg/aac/mp3). ALAC, WAV, Opus and DSD were not in it and scored zero,
+# below MP3. Ranking now goes through ``AudioQuality.tier_score()`` like every
+# other stage, so there is one answer to "which of these is better audio".
 
 
 # Default poll cadence + timeout for the album-download poll loop.
@@ -92,14 +94,34 @@ def get_poll_timeout() -> float:
     return DEFAULT_POLL_TIMEOUT_SECONDS
 
 
-def quality_score(title: str, quality_guess) -> int:
-    """Map a release title's inferred quality to a sortable integer.
+def quality_score(title: str, quality_guess) -> float:
+    """Rank one release title on the shared quality ladder.
 
-    ``quality_guess`` is the function from each plugin that maps a
-    title string to a quality string ('flac' / 'mp3' / etc.) — passed
-    in so this module doesn't have to import either plugin and risk
-    a circular import."""
-    return _QUALITY_SCORE.get(quality_guess(title) or '', 0)
+    ``quality_guess`` is the function from each plugin that maps a title string
+    to a quality string ('flac' / 'mp3' / etc.) — passed in so this module
+    doesn't have to import either plugin and risk a circular import. It is the
+    FALLBACK: the shared parser reads the title first, and the plugin only
+    answers for a release whose title said nothing, so a plugin that knows
+    something extra can still place its result.
+    """
+    return release_quality_score(title, quality_guess)
+
+
+def release_quality_score(title: str, quality_guess=None,
+                          categories=None, file_names=None) -> float:
+    """``AudioQuality.tier_score()`` for a release, from whatever it exposes."""
+    from core.quality.release_format import audio_quality_from_release
+
+    quality = audio_quality_from_release(title or '', categories, file_names)
+    if quality.format == 'unknown' and quality_guess is not None:
+        try:
+            guessed = quality_guess(title or '')
+        except Exception as exc:  # noqa: BLE001 - a plugin hook must not decide the pick
+            logger.debug("quality_guess failed for %r: %s", title, exc)
+            guessed = None
+        if guessed:
+            quality.format = str(guessed).lower()
+    return quality.tier_score()
 
 
 def _normalize_release_text(text: str) -> str:
@@ -181,9 +203,231 @@ def album_title_relevance(candidate_title: str, album_name: str) -> float:
     return coverage
 
 
+# Tribute / cover markers that disqualify a release for an ORIGINAL wishlist
+# album (the tribute-picker report). A title like "Animals Reimagined – A
+# Tribute to Pink Floyd" contains every significant word of "Animals" BY
+# CONSTRUCTION, so the relevance floor above cannot see it — the marker has
+# to be named explicitly.
+#
+# Bare "cover"/"covers" are deliberately NOT markers: tracker/usenet naming
+# tags legitimate rips with artwork words ([Covers], [Front Cover],
+# [FLAC + CUE + LOG + Covers], "+ Covers") and every seeded lossless copy
+# carrying scans would be refused as a "tribute album" (review BLOCK on
+# #1641). Real cover albums are caught by the explicit-phrase markers
+# ("cover album", "cover version", "cover band", "covers of").
+_TRIBUTE_COVER_MARKERS = (
+    "tribute",
+    "salute",
+    "a tribute to",
+    "in the style of",
+    "cover album",
+    "cover version",
+    "cover versions",
+    "cover band",
+    "covers of",
+)
+
+
+def _phrase_in_normalized_text(phrase: str, normalized_text: str) -> bool:
+    """Word-boundary (not substring) phrase match on normalized text.
+
+    Same anchoring as the full-phrase bonus in ``album_title_relevance``:
+    'cover' must not fire inside 'undercover'.
+    """
+    if not phrase or not normalized_text:
+        return False
+    return bool(re.search(rf"(?:^| ){re.escape(phrase)}(?: |$)", normalized_text))
+
+
+def _has_unexplained_tribute_marker(candidate_title: str, album_name: str,
+                                    artist_name: str) -> bool:
+    """True when the release title carries a tribute/cover marker that the
+    wishlist item does NOT explain.
+
+    The wishlist item explains the marker when the album NAME or the artist
+    NAME carries it too: a user who wishlisted a tribute album still gets
+    their tribute album, and an artist literally named 'Cover Drive' keeps
+    their own releases. Only when the item is an original (no marker in its
+    own name or artist) does a marked release get rejected.
+    """
+    norm_title = _normalize_release_text(candidate_title or "")
+    if not norm_title:
+        return False
+    norm_album = _normalize_release_text(album_name or "")
+    norm_artist = _normalize_release_text(artist_name or "")
+    for phrase in _TRIBUTE_COVER_MARKERS:
+        if not _phrase_in_normalized_text(phrase, norm_title):
+            continue
+        if _phrase_in_normalized_text(phrase, norm_album):
+            continue  # the wishlist item IS this tribute/cover album
+        if _phrase_in_normalized_text(phrase, norm_artist):
+            continue  # the marker is the artist's own name, not a tribute
+        return True
+    return False
+
+
+# Placeholder artist names that carry no identity. "Various Artists" is what
+# the metadata layer stores for compilations, but real-world VA release
+# titles say "VA - ..." — the placeholder words never appear there, so
+# gating on them would refuse every VA bundle. Treated like a missing
+# artist name: no opinion (fail open). "Various" included to match
+# core/library_reorganize.py's compilation placeholder set.
+_ARTIST_PLACEHOLDER_NAMES = frozenset({
+    "various artists",
+    "various",
+    "va",
+    "unknown artist",
+    "unknown",
+})
+
+
+def _release_has_artist_token(candidate_title: str, artist_name: str) -> bool:
+    """True when at least one significant artist word appears (word-boundary)
+    in the release title.
+
+    Empty or unparseable artist name -> True (fail open): with no artist
+    info to judge by there is no opinion, and the old behavior is kept
+    rather than dropping releases we cannot judge.
+    """
+    normalized = _normalize_release_text(artist_name or "")
+    if normalized in _ARTIST_PLACEHOLDER_NAMES:
+        # "Various Artists" is what the metadata layer stores for
+        # compilations, but real-world VA release titles say "VA - ..." —
+        # the placeholder words never appear. A placeholder carries no
+        # identity, so like a missing artist name it means no opinion.
+        return True
+    words = _significant_words(normalized)
+    if not words:
+        return True
+    title_words = set(_normalize_release_text(candidate_title or "").split())
+    return any(w in title_words for w in words)
+
+
+def profile_allowed_formats(quality_profile_id=None):
+    """The formats the caller's quality profile will accept, or None for any.
+
+    Lives here because the torrent and usenet plugins both need it and both
+    already share this module's picker (#1149 applies to the hybrid chain, not
+    just torrents).
+
+    Resolved LIVE (not snapshotted) through the same primitive every other
+    pipeline stage uses, so editing a profile takes effect on the next search
+    rather than the next restart. Any failure returns None: a profile we
+    cannot read must never become a filter that blocks every download.
+    """
+    try:
+        from core.quality.release_format import allowed_formats_from_profile
+        from core.quality.selection import load_profile_by_id
+        return allowed_formats_from_profile(load_profile_by_id(quality_profile_id))
+    except Exception as e:                        # pragma: no cover - defensive
+        logger.debug("Could not resolve profile formats, allowing any: %s", e)
+        return None
+
+
+def profile_quality_targets(quality_profile_id=None):
+    """Return ``(ranked targets, fallback_enabled)`` for an album grab.
+
+    ``profile_allowed_formats`` is intentionally only a strict format veto;
+    it cannot express MP3-first ladders or distinguish FLAC 16/44 from
+    FLAC 24/96.  Album release selection needs the complete target objects as
+    well.  Resolution fails open so a transient DB problem never disables an
+    otherwise usable download source.
+    """
+    try:
+        from core.quality.selection import load_profile_by_id, targets_from_profile
+        return targets_from_profile(load_profile_by_id(quality_profile_id))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not resolve profile quality targets: %s", exc)
+        return [], True
+
+
+def _availability_bucket(candidate) -> float:
+    """Seeders (or usenet grabs) rounded to an order of magnitude.
+
+    Availability is a tiebreaker inside one quality bucket, and 41 against 38
+    seeders is not a statement about which release is better — compared raw it
+    outvoted every key after it, including the size that describes the encode.
+    Lidarr rounds to log10 for exactly this reason; ten times the swarm still
+    wins, a rounding difference no longer does.
+    """
+    raw = candidate.seeders if candidate.seeders is not None else (candidate.grabs or 0)
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return round(math.log10(value)) if value > 0 else 0.0
+
+
+# Prowlarr's indexer priority is 1 (highest) to 50 (lowest), default 25 — the
+# same scale Lidarr uses, and the same job: a tiebreaker between releases that
+# are otherwise equal. Negated because the picker takes a maximum.
+DEFAULT_INDEXER_PRIORITY = 25
+
+
+def _indexer_priority_rank(candidate) -> int:
+    raw = getattr(candidate, 'indexer_priority', None)
+    try:
+        priority = int(raw if raw is not None else DEFAULT_INDEXER_PRIORITY)
+    except (TypeError, ValueError):
+        priority = DEFAULT_INDEXER_PRIORITY
+    return -priority
+
+
+# An NZB whose indexer omitted the publish date sorts below every dated post.
+# A neutral 0.0 put it ABOVE everything older than a week, which is backwards:
+# on usenet the date is how you judge whether a post is still complete, so a
+# post that will not even say is the one we know least about, and there is
+# always a dated alternative to prefer.
+UNKNOWN_AGE_BUCKET = -99.0
+
+
+def _usenet_age_bucket(candidate) -> float:
+    """How fresh a Usenet post is, in Lidarr's buckets. 0 for anything else.
+
+    A torrent's health is its swarm, and a seeded release is alive whatever its
+    post date, so age must not sort torrents at all. That test is the
+    candidate's PROTOCOL, not its seeder count: an indexer omitting seeders is
+    common enough that the availability gate exempts it by name, and using the
+    missing count as "this is usenet" handed those torrents the freshness
+    bonus. A Usenet post has no swarm to read, and the older it is the likelier
+    it is to be incomplete or past a provider's retention.
+    """
+    protocol = str(getattr(candidate, 'protocol', '') or '').strip().lower()
+    if protocol and protocol != 'usenet':
+        return 0.0
+    if not protocol and candidate.seeders is not None:
+        # No protocol on the object at all: fall back to the old signal rather
+        # than treat every candidate as usenet.
+        return 0.0
+    published = getattr(candidate, 'publish_date', None)
+    if not published:
+        return UNKNOWN_AGE_BUCKET
+    try:
+        stamp = datetime.fromisoformat(str(published).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return UNKNOWN_AGE_BUCKET
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - stamp).total_seconds() / 3600
+    if age_hours < 1:
+        return 1000.0
+    if age_hours <= 24:
+        return 100.0
+    age_days = age_hours / 24
+    if age_days <= 7:
+        return 10.0
+    return -round(math.log10(age_days))
+
+
 def pick_best_album_release(candidates, quality_guess,
                             album_name: str = "",
-                            prefer_deluxe: Optional[bool] = None) -> Optional[object]:
+                            artist_name: str = "",
+                            min_seeders: int = 0,
+                            allowed_formats=None,
+                            allow_mixed: bool = False,
+                            quality_targets=None,
+                            fallback_enabled: bool = True,
+                            expected_duration_seconds=None) -> Optional[object]:
     """Pick the single best torrent / NZB for an album-bundle download.
 
     Heuristic, in priority order:
@@ -193,23 +437,92 @@ def pick_best_album_release(candidates, quality_guess,
        different album. When ``album_name`` is given and NOTHING clears the
        relevance floor, return None — the caller then falls back to per-track
        rather than downloading a confident mismatch.
+    0a. IDENTITY gate (artist + tribute markers): the relevance floor only
+       scores the ALBUM's words, so "Animals Reimagined – A Tribute to Pink
+       Floyd" clears it for a Pink Floyd "Animals" wishlist item and then wins
+       on seeders — handing a tribute album to the downloader. Two sub-gates,
+       both fail-open:
+       - tribute/cover markers: reject a marked release when the wishlist
+         item is an original (the marker is unexplained by the album/artist
+         name). A wishlisted tribute album still passes — the filter only
+         fires when the item is an original.
+       - artist tokens: require at least one significant artist word in the
+         release title, so a wrong-artist same-name album can't win.
+       Only applied when we know the album name (same condition as gate 0);
+       without an artist name the artist sub-gate has no opinion (old
+       behavior). When nothing clears it, return None — same fallback
+       contract as gate 0.
+    0b. FORMAT gate (#1149): drop candidates whose format cannot satisfy the
+       caller's quality profile. ``allowed_formats=None`` disables it, which
+       is what a profile with fallback enabled (or no ranked targets) means
+       everywhere else in the pipeline. Quality used to be the SECOND sort key
+       after seeders, so a well-seeded MP3 rip beat a FLAC rip with fewer
+       seeders no matter what the profile said — sorting cannot express "never
+       this", only "prefer that". A release whose format cannot be determined
+       is dropped too rather than assumed lossy and ranked.
+    0c. SIZE gate: drop candidates whose bytes contradict the quality their
+       title claims — a 60 MB "FLAC" of a 45-minute album is a transcode, and
+       a release averaging far more than its stated lossy bitrate is not the
+       album that was searched for. Same mechanism as Lidarr's
+       AcceptableSizeSpecification (expected kbit/s x known duration), and the
+       same fail-open contract: without ``expected_duration_seconds`` there is
+       no opinion. Runs before availability so the log names the quality lie
+       rather than a dead swarm.
+    0d. Availability gate (#1139): drop candidates whose indexer-reported
+       seeder count is BELOW ``min_seeders``. Sorting by seeders was never
+       enough — with every candidate on zero, the sort still handed back a
+       release nobody is serving, and the download then sat on "downloading
+       metadata" until the deadline. Candidates that report NO seeder count
+       at all (``seeders is None``: usenet, and torrent indexers that omit
+       the field) are exempt — this only drops releases we positively know
+       are dead. ``min_seeders=0`` disables it.
     1. Reasonable album-ish size (40 MB – 3 GB) — drops single-track
        releases that snuck in and quarantines suspicious giants.
-    2. Higher seeders > lower (dead torrents = dead downloads).
-       Usenet releases use ``grabs`` as a popularity proxy when
-       seeders is None.
-    3. Higher quality (FLAC > AAC > MP3) inferred from title.
-    4. Larger size as tiebreaker (often = higher bitrate).
+    2. When ranked targets are supplied, the best target any available
+       release satisfies wins. Exact bitrate / sample-rate / bit-depth
+       constraints are honored; with fallback disabled an unproven release is
+       refused before it reaches the client.
+    3. Within that quality bucket, higher measured quality wins, followed by
+       seeders (or Usenet grabs) and size. Without ranked targets the legacy
+       seeders-first heuristic is retained.
     """
     if not candidates:
         return None
+
+    # Availability is endpoint-specific. Evaluate all preserved indexers with
+    # the release's consistent quality evidence before selecting an endpoint;
+    # a low seeder count must not hide an unknown/live alternative.
+    from copy import copy
+    from core.download_plugins.release_identity import release_sources, release_evidence
+    expanded = []
+    for candidate in candidates:
+        sources = release_sources(candidate)
+        if len(sources) == 1:
+            expanded.append(candidate)
+            continue
+        for source in sources:
+            endpoint = copy(source)
+            endpoint._release_evidence = release_evidence(candidate)
+            endpoint._release_sources = [s for s in sources if s is not source]
+            expanded.append(endpoint)
+    candidates = expanded
+
+    from core.downloads.size_limit import configured_limit, exceeds_size_limit, positive_number
+    cap = configured_limit()
+    duration = positive_number(expected_duration_seconds)
+    if cap and duration:
+        candidates = [c for c in candidates
+                      if not exceeds_size_limit(getattr(c, 'size', None), duration * 1000, cap)]
+        if not candidates:
+            logger.info("[Album Bundle] No release meets the %g MB/min size limit", cap)
+            return None
 
     # 0. Title-relevance gate. Only applied when we know the album name; with
     # no name we can't judge relevance, so we don't gate (old behavior).
     if album_name:
         relevant = [
             c for c in candidates
-            if album_title_relevance(c.title or "", album_name) >= _ALBUM_TITLE_RELEVANCE_FLOOR
+            if album_title_relevance(release_evidence(c).title or "", album_name) >= _ALBUM_TITLE_RELEVANCE_FLOOR
         ]
         if not relevant:
             logger.warning(
@@ -221,32 +534,237 @@ def pick_best_album_release(candidates, quality_guess,
             return None
         candidates = relevant
 
+    # 0a. Identity gate (artist + tribute markers). Runs right after the
+    # relevance floor so the log names the identity problem ("wrong artist" /
+    # "tribute album") rather than a later format/seeder complaint.
+    if album_name:
+        identified = []
+        for c in candidates:
+            title = release_evidence(c).title or ""
+            if _has_unexplained_tribute_marker(title, album_name, artist_name):
+                logger.debug("[Album Bundle] Rejected '%s': tribute/cover marker", title)
+                continue
+            if not _release_has_artist_token(title, artist_name):
+                logger.debug("[Album Bundle] Rejected '%s': no artist token for '%s'",
+                             title, artist_name)
+                continue
+            identified.append(c)
+        if not identified:
+            logger.warning(
+                "[Album Bundle] No candidate cleared the artist/tribute identity "
+                "gate for '%s' by '%s' (%d rejected) — refusing the bundle so the "
+                "caller falls back to per-track.",
+                album_name, artist_name or '?', len(candidates),
+            )
+            return None
+        if len(identified) != len(candidates):
+            logger.info("[Album Bundle] Dropped %d candidate(s) failing the "
+                        "artist/tribute identity gate",
+                        len(candidates) - len(identified))
+        candidates = identified
+
+    # 0b. Format gate. Runs before the seeder and size gates so the log says
+    # "nothing in the right format" rather than "nothing with enough seeders"
+    # when both are true — the first is the actionable one.
+    if allowed_formats:
+        from core.quality.release_format import evaluate_release
+
+        keeping = []
+        for c in candidates:
+            ok, why = evaluate_release(
+                allowed_formats, release_evidence(c).title or '',
+                file_names=getattr(c, 'file_names', None),
+                categories=getattr(release_evidence(c), 'categories', None),
+                allow_mixed=allow_mixed,
+            )
+            if ok:
+                keeping.append(c)
+            else:
+                logger.debug("[Album Bundle] Rejected '%s': %s", c.title, why)
+        if not keeping:
+            logger.warning(
+                "[Album Bundle] No candidate for '%s' matches the profile's "
+                "formats (%s); %d rejected — refusing the bundle so the caller "
+                "falls back rather than queueing something the import will "
+                "throw away.",
+                album_name or '?', '/'.join(sorted(allowed_formats)), len(candidates),
+            )
+            return None
+        if len(keeping) != len(candidates):
+            logger.info("[Album Bundle] Dropped %d candidate(s) failing the format profile",
+                        len(candidates) - len(keeping))
+        candidates = keeping
+
+    if expected_duration_seconds:
+        from core.quality.release_format import (
+            audio_quality_from_release,
+            size_contradicts_quality,
+        )
+
+        plausible = []
+        for c in candidates:
+            reason = size_contradicts_quality(
+                audio_quality_from_release(
+                    release_evidence(c).title or '',
+                    getattr(release_evidence(c), 'categories', None),
+                    getattr(c, 'file_names', None),
+                ),
+                getattr(c, 'size', None),
+                expected_duration_seconds,
+            )
+            if reason is None:
+                plausible.append(c)
+            else:
+                logger.debug("[Album Bundle] Rejected '%s': %s", c.title, reason)
+        if not plausible:
+            logger.warning(
+                "[Album Bundle] Every candidate for '%s' carries a size its own "
+                "quality claim cannot support (%d rejected) — refusing the "
+                "bundle so the caller falls back rather than queueing a "
+                "mislabelled release.",
+                album_name or '?', len(candidates),
+            )
+            return None
+        if len(plausible) != len(candidates):
+            logger.info("[Album Bundle] Dropped %d candidate(s) whose size "
+                        "contradicts their quality claim",
+                        len(candidates) - len(plausible))
+        candidates = plausible
+
+    if min_seeders > 0:
+        available = [c for c in candidates
+                     if c.seeders is None or (c.seeders or 0) >= min_seeders]
+        if not available:
+            logger.warning(
+                "[Album Bundle] Every candidate for '%s' reports fewer than %d "
+                "seeders (%d rejected as unavailable) — refusing the bundle so "
+                "the caller falls back rather than queueing a dead swarm.",
+                album_name or '?', min_seeders, len(candidates),
+            )
+            return None
+        if len(available) != len(candidates):
+            logger.info("[Album Bundle] Dropped %d candidate(s) below %d seeders",
+                        len(candidates) - len(available), min_seeders)
+        candidates = available
+
     sized = [c for c in candidates
              if ALBUM_PICK_MIN_BYTES <= (c.size or 0) <= ALBUM_PICK_MAX_BYTES]
     pool = sized or list(candidates)
     if not pool:
         return None
 
-    # Prefer deluxe editions: for a deluxe request, a release that names an
-    # edition beats one that doesn't — a standard-edition torrent lacks the bonus
-    # tracks. Only among releases not known to be dead; when none names an
-    # edition the pool is unchanged.
-    if album_name and has_deluxe_marker(album_name):
-        if prefer_deluxe is None:
-            try:
-                prefer_deluxe = bool(config_manager.get(PREFER_DELUXE_KEY, False))
-            except Exception:
-                prefer_deluxe = False
-        if prefer_deluxe:
-            same_edition = [c for c in pool
-                            if has_deluxe_marker(c.title or '')
-                            and (c.seeders is None or c.seeders > 0)]
-            if same_edition:
-                pool = same_edition
+    # A profile ladder is an ordering, not merely a set of permitted codecs.
+    # The old hardcoded FLAC>AAC>MP3 score contradicted MP3-first profiles and
+    # could not distinguish any lossless resolution. Parse every remaining
+    # release into the same AudioQuality model used by Soulseek/streaming.
+    if quality_targets:
+        from core.quality.model import (
+            rank_candidate,
+            satisfies_a_target_on_stated_facts,
+        )
+        from core.quality.release_format import audio_quality_from_release
+
+        quality_rows = []
+        for candidate in pool:
+            # File list over title is decided inside audio_quality_from_release
+            # so this stage and the legacy sort below cannot disagree.
+            aq = audio_quality_from_release(
+                release_evidence(candidate).title or '',
+                getattr(release_evidence(candidate), 'categories', None),
+                getattr(candidate, 'file_names', None),
+            )
+            quality_rows.append((rank_candidate(aq, quality_targets), aq, candidate))
+
+        best_target = min(
+            (rank[0] for rank, _aq, _candidate in quality_rows),
+            default=len(quality_targets),
+        )
+        if best_target < len(quality_targets):
+            quality_rows = [
+                row for row in quality_rows if row[0][0] == best_target
+            ]
+        elif not fallback_enabled:
+            # Nothing matched outright, which is NOT the same as the profile
+            # refusing these releases. A prowlarr title almost never states a
+            # bitrate, and the stock MP3 target asks for 320, so judging a title
+            # by the probed-file rule refuses whole albums the per-track lane
+            # accepts from the same indexer. Keep the ones that only failed on a
+            # bitrate they never claimed, refuse the rest. The post-download
+            # probe is still the last word.
+            #
+            # A hi-res target is NOT relaxed the same way: asking for 24/96 is a
+            # narrow, deliberate request, and a bare [FLAC] must not be grabbed
+            # on the hope it happens to be hi-res. A whole album is too much
+            # bandwidth to spend on that guess.
+            provable = [
+                row for row in quality_rows
+                if satisfies_a_target_on_stated_facts(
+                    row[1], quality_targets, unproven_resolution_ok=False,
+                )
+            ]
+            if not provable:
+                logger.warning(
+                    "[Album Bundle] No candidate for '%s' can satisfy the "
+                    "profile's quality targets; refusing an unproven release",
+                    album_name or '?',
+                )
+                return None
+            if len(provable) != len(quality_rows):
+                logger.info(
+                    "[Album Bundle] Kept %d/%d candidate(s) whose stated "
+                    "quality the profile can still accept",
+                    len(provable), len(quality_rows),
+                )
+            quality_rows = provable
+
+        preferred_formats = {
+            str(target.format).lower()
+            for target in quality_targets
+            if getattr(target, 'format', None)
+        }
+
+        def _profile_score(row) -> tuple:
+            _rank, aq, candidate = row
+            availability = _availability_bucket(candidate)
+            # If no real target matched and fallback is enabled, formats the
+            # user named still outrank unrelated formats — same rule as
+            # filter_and_rank's fallback path.
+            preferred = (
+                True if best_target < len(quality_targets)
+                else aq.format.lower() in preferred_formats
+            )
+            # Lidarr's DownloadDecisionComparer order with one deliberate
+            # change: indexer priority sits BELOW availability. Lidarr can put
+            # it above peers because it has no seeder sort key at all, only a
+            # minimum-seeders rejection. We have both, and a preferred indexer
+            # is not worth a dead swarm, so priority decides inside one
+            # availability bucket rather than across buckets.
+            return (
+                preferred,
+                aq.tier_score(),
+                # Only ever a tiebreaker: a repack is the corrected copy of the
+                # SAME quality, never a reason to take a worse format.
+                release_revision(release_evidence(candidate).title or '').rank,
+                availability,
+                _indexer_priority_rank(candidate),
+                _usenet_age_bucket(candidate),
+                candidate.size or 0,
+            )
+
+        return max(quality_rows, key=_profile_score)[2]
 
     def _score(c) -> tuple:
         seeders = c.seeders if c.seeders is not None else (c.grabs or 0)
-        return (seeders, quality_score(c.title or '', quality_guess), c.size or 0)
+        return (
+            seeders,
+            release_quality_score(
+                release_evidence(c).title or '', quality_guess,
+                getattr(release_evidence(c), 'categories', None),
+                getattr(c, 'file_names', None),
+            ),
+            release_revision(release_evidence(c).title or '').rank,
+            c.size or 0,
+        )
 
     return max(pool, key=_score)
 
@@ -477,9 +995,9 @@ def poll_album_download(
     monotonic: Callable[[], float] = time.monotonic,
     snapshot_path: Callable[[str], Optional[tuple]] = snapshot_incomplete_path,
     resolve_path: Callable[[str], str] = lambda p: p,
-    log_prefix: str = '[album_bundle]',
     stall_check: Optional[Callable[[Any, float], bool]] = None,
-    on_stall: Optional[Callable[[], None]] = None,
+    on_stall: Optional[Callable[[], str]] = None,
+    log_prefix: str = '[album_bundle]',
 ) -> Optional[str]:
     """Drive the per-poll status loop for an album-bundle download.
 
@@ -526,11 +1044,27 @@ def poll_album_download(
       this window). Terminal ``failed`` only fires when there's no path of
       any kind to scan.
 
+    - ``stall_check(status, now)`` is an optional per-poll "is this job
+      making no forward progress" question, and ``on_stall()`` an optional
+      cleanup hook that returns the failure reason. Injected rather than
+      imported because what counts as a stall is protocol-specific: a
+      torrent can sit forever on "downloading metadata" with a byte counter
+      that ticks up from protocol noise, which is what
+      ``torrent_stall.StallTracker`` knows how to see through. Usenet has no
+      equivalent — SAB either downloads or errors — so the usenet caller
+      passes neither and the loop behaves exactly as before.
+
+      This is #1139: the per-track torrent path already tracked stalls, but
+      the album-bundle path did not, so a dead magnet held an album batch for
+      the FULL poll deadline (hours, thousands of polls) while
+      ``torrent_stall_timeout_seconds`` was configured and simply never
+      consulted.
+
     Returns the adapter's reported save_path (or, as a last resort, its
     stability-confirmed ``incomplete_path``) on terminal success, or
     ``None`` on any failure (timeout / disappeared / explicit failed /
-    shutdown). On every failure path emits ``'failed'`` once with an
-    ``error`` field describing why.
+    stalled / shutdown). On every failure path emits ``'failed'`` once with
+    an ``error`` field describing why.
     """
     interval = poll_interval if poll_interval is not None else get_poll_interval()
     deadline = monotonic() + (timeout if timeout is not None else get_poll_timeout())
@@ -663,7 +1197,7 @@ def poll_album_download(
                 # field never landed. Fall back to the in-progress dir so
                 # the bundle can still scan + stage the audio, rather than
                 # leaving the user stuck with a completed-in-SAB download
-                # that Commissary never imports.
+                # that SoulSync never imports.
                 if last_incomplete_path:
                     # Don't trust incomplete_path just because the window
                     # elapsed — the client's own post-processing may still
@@ -749,141 +1283,25 @@ def poll_album_download(
                 _fail('Client returned unmapped state repeatedly')
                 return None
 
-        # Stall gate — LAST in the loop on purpose. Everything above can
-        # return on a terminal state this very poll, and a job that has
-        # already finished must never be killed for "not moving". Injected
-        # rather than imported: whether a torrent is stalled is a
-        # protocol-specific judgement (during the metadata phase the byte
-        # counter is noise, which only StallTracker knows), and usenet has no
-        # equivalent — the usenet caller passes neither and behaves exactly as
-        # before. #1139(2): this was wired into the per-TRACK poll only, so
-        # the configured timeout was never consulted for album bundles, which
-        # is the thousands-of-polls-for-hours part of the report.
-        if stall_check is not None and stall_check(status, monotonic()):
-            reason = 'Torrent stalled (no progress)'
-            logger.error("%s '%s' stalled — %s", log_prefix, title, reason)
+        # Stall gate. Last, deliberately: a job that reached a terminal state
+        # this poll has already returned above, so nothing that actually
+        # finished can be killed here for not moving.
+        if stall_check is not None and stall_check(status, now):
+            reason = 'Stalled (no progress)'
             if on_stall is not None:
                 try:
-                    on_stall()
-                except Exception as stall_exc:      # noqa: BLE001 - cleanup is best effort
-                    logger.debug("%s stall cleanup failed: %s", log_prefix, stall_exc)
+                    reason = on_stall() or reason
+                except Exception as exc:      # noqa: BLE001 - cleanup is best-effort
+                    logger.warning("%s stall cleanup failed: %s", log_prefix, exc)
+            logger.error("%s '%s' stalled — %s", log_prefix, title, reason)
             _fail(reason)
             return None
 
         sleep(interval)
 
     logger.error("%s '%s' timed out", log_prefix, title)
-    if on_stall is not None:
-        # A timeout leaves the job active in the client exactly as a stall
-        # does — #1139(4): without this it stayed there untracked and got
-        # re-grabbed as a duplicate on the next attempt.
-        try:
-            on_stall()
-        except Exception as stall_exc:      # noqa: BLE001
-            logger.debug("%s timeout cleanup failed: %s", log_prefix, stall_exc)
     _fail('Download timed out')
     return None
-
-
-def _iter_paths(value) -> list:
-    """One config value → zero or more roots.
-
-    ``download_source.torrent_download_path`` / ``usenet_download_path`` are
-    LISTS (a client sorting into category folders needs one entry per
-    category), while every other key here — and any config saved before that
-    change — is a bare string. Both are accepted forever.
-
-    Never ``str()`` a value that might be a list: that would stringify
-    ``['a', 'b']`` into one garbage root that silently never matches.
-    """
-    if isinstance(value, (list, tuple, set)):
-        return [p.strip() for p in value if isinstance(p, str) and p.strip()]
-    if isinstance(value, str) and value.strip():
-        return [value.strip()]
-    return []
-
-
-# Total directories examined per root while looking below it. These roots point
-# at whole download disks; a budget keeps a mis-configured root (say, / ) from
-# turning every resolution into a directory crawl.
-_MAX_SUBDIRS_SCANNED = 400
-
-# How many levels below a root to look for a release folder. Two is the case
-# that made this necessary — '<root>/complete/Movies/<release>', a client
-# sorting finished downloads into category folders — so three leaves a level of
-# headroom without inviting a deep crawl.
-_DEFAULT_SEARCH_DEPTH = 3
-_MAX_SEARCH_DEPTH = 6
-
-
-def _search_depth(config_get: Optional[Callable[..., Any]] = None) -> int:
-    """Levels below a download root to search, clamped to something sane."""
-    if config_get is None:
-        config_get = config_manager.get
-    try:
-        depth = int(config_get('download_source.import_search_depth',
-                               _DEFAULT_SEARCH_DEPTH))
-    except (TypeError, ValueError):
-        return _DEFAULT_SEARCH_DEPTH
-    return max(1, min(_MAX_SEARCH_DEPTH, depth))
-
-
-def _subdirs_of(root) -> list:
-    """Immediate subdirectories of ``root``, capped. Never recurses.
-
-    Kept as-is for callers that genuinely want one level; the resolver uses
-    :func:`_descendant_dirs` so it can reach a release nested under category
-    folders."""
-    out: list = []
-    try:
-        for entry in Path(root).iterdir():
-            try:
-                if entry.is_dir():
-                    out.append(entry)
-            except OSError:      # a broken symlink / permission hiccup
-                continue
-            if len(out) >= _MAX_SUBDIRS_SCANNED:
-                break
-    except OSError:              # root missing or unreadable — not our problem here
-        return []
-    return out
-
-
-def _descendant_dirs(root, max_depth: int, budget: int) -> list:
-    """``[(depth, dir), …]`` below ``root``, BREADTH-FIRST and shallowest first.
-
-    Breadth-first is the point, not an implementation detail: the caller tries
-    each candidate in the order returned, so a release sitting directly under a
-    root must be found before a same-named folder buried three levels down. A
-    depth-first walk would happily return the deep one first.
-
-    ``budget`` caps the TOTAL directories examined for this root, so a root
-    accidentally pointed at a whole filesystem costs a bounded scan rather than
-    a crawl. Unreadable directories are skipped, never fatal.
-    """
-    out: list = []
-    frontier = [Path(root)]
-    for depth in range(1, max(1, max_depth) + 1):
-        if not frontier or len(out) >= budget:
-            break
-        nxt: list = []
-        for parent in frontier:
-            try:
-                entries = list(parent.iterdir())
-            except OSError:      # missing / permission-denied — skip this branch
-                continue
-            for entry in entries:
-                try:
-                    if not entry.is_dir():
-                        continue
-                except OSError:  # broken symlink
-                    continue
-                out.append((depth, entry))
-                nxt.append(entry)
-                if len(out) >= budget:
-                    return out
-        frontier = nxt
-    return out
 
 
 def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
@@ -897,6 +1315,8 @@ def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
     (e.g. ``./downloads``) resolve against the process CWD — the
     container's ``/app`` — which is exactly where those mounts live.
     """
+    # Commissary: a setting may hold several folders (list, or ';'-separated).
+    from core.commissary.paths import split_paths
     roots: list = []
     for key in (
         'download_source.usenet_download_path',
@@ -906,7 +1326,9 @@ def _candidate_download_roots(config_get: Callable[..., Any]) -> list:
         'soulseek.download_path',
         'soulseek.transfer_path',
     ):
-        roots.extend(_iter_paths(config_get(key, None)))
+        value = config_get(key, None)
+        if value:
+            roots.extend(split_paths(value))
     seen: set = set()
     out: list = []
     for root in roots:
@@ -924,33 +1346,41 @@ def resolve_reported_save_path(
     """Translate a downloader-reported save_path into one THIS process can read.
 
     Usenet / torrent clients report paths from inside THEIR OWN container
-    (e.g. SAB hands back ``/data/downloads/music/<album>``); Commissary often
+    (e.g. SAB hands back ``/data/downloads/music/<album>``); SoulSync often
     mounts the very same files at a different point (``/app/downloads/<album>``).
     Feeding the client's path straight to the audio walker then yields
     "No audio files found" even though the files are physically present —
     the classic arr-stack remote-path mismatch.
 
+    Single-FILE torrents are first-class here, not a directory edge case:
+    qBittorrent's ``content_path`` for one names the file itself (the
+    standard shape for audiobook downloads, e.g.
+    ``\\\\NAS\\Media\\...\\Columbus Day (R.C. Bray).m4b``). Steps 1–3 accept
+    an existing file as readily as a directory; step 4 synthesizes
+    ``<root>/<expect_name>`` and returns the file itself when that names one.
+
     Resolution order:
-      1. The reported path verbatim, if it's readable here — a directory
-         (deployments that mirror the client's mount paths), or a FILE:
-         a single-file torrent/nzb with no release folder around it, where
-         the client's ``content_path`` names the file itself.
+      1. The reported path verbatim, if it's a readable directory or file
+         here (deployments that mirror the client's mount paths).
       2. Explicit prefix mappings from ``download_source.usenet_path_mappings``
          — a list of ``{"from": "...", "to": "..."}`` (Sonarr/Radarr-style
          remote path mapping) for non-shared / oddly-mounted layouts.
-      3. Basename fallback: a same-named folder OR file under a known
-         Commissary download root. Zero-config for the standard shared-volume
-         setup — the release shows up under Commissary's own ``./downloads``
-         mount with the same name the client reported.
-
-    A candidate that turns out to be a FILE (single-file release, no folder)
-    is accepted on existence alone — there's nothing to look "inside" the
-    way ``_contains_expected`` checks a directory, and matching on the full
-    reported basename is already as specific as a filename gets.
+      3. Basename fallback: a same-named folder or file under a known
+         SoulSync download root. Zero-config for the standard shared-volume
+         setup — the album folder shows up under SoulSync's own
+         ``./downloads`` mount with the same name the client reported. When
+         several roots hold the name, the most recently written one wins:
+         that is the download that just finished, not a stale copy from an
+         earlier grab via another source (single-file audiobooks reuse the
+         uploader's canonical filename across sources).
+      4. The roots themselves: when the expected name is known and names a
+         single FILE under a root, the file itself is returned — never the
+         whole root, which would let callers walk every other download in
+         the shared folder against this job.
 
     Returns the best resolved path, or ``reported_path`` unchanged when
-    nothing better is found (so the caller's existing "no audio"/"no video"
-    error still surfaces, with both paths logged).
+    nothing better is found (so the caller's existing "no audio" error still
+    surfaces, with both paths logged).
     """
     if not reported_path:
         return reported_path
@@ -969,28 +1399,50 @@ def resolve_reported_save_path(
         except OSError:
             return False
 
+    def _exists(candidate) -> bool:
+        """A candidate this process can actually hand to a caller: an
+        existing directory OR an existing file. The directory-only gates
+        this replaces meant a single-FILE torrent's path could never
+        resolve — the reported path came back unchanged and the audio
+        walker reported "No audio files in the download" for a file that
+        was sitting right there."""
+        return _is_dir(candidate) or _is_file(candidate)
+
     def _contains_expected(candidate) -> bool:
         """When the caller told us WHAT should be inside (the torrent/job
         name), an existing-but-content-less directory is the WRONG mount,
         not a resolution. TheHomeGuy's bug: qBittorrent reported its own
         container's '/downloads', a directory by that name happened to
-        exist in Commissary's namespace too, and the verbatim short-circuit
-        accepted it — Commissary then watched an empty folder instead of the
-        configured one that actually had the files."""
+        exist in SoulSync's namespace too, and the verbatim short-circuit
+        accepted it — SoulSync then watched an empty folder instead of the
+        configured one that actually had the files.
+
+        For a single-FILE candidate the expected name IS the filename:
+        qBittorrent names a single-file torrent after its file, so the
+        check is a name comparison rather than a directory listing.
+
+        The expected name is client-reported, so only its final component
+        is ever used — a name carrying path components ("a/../../b") must
+        not escape the candidate or the download root it is joined onto.
+        Matching stays exact and case-sensitive, like the directory check
+        always was; a renamed file simply fails closed to the caller's
+        "no audio" error."""
         if not expect_name:
             return True
+        wanted = Path(expect_name).name
+        if not wanted:
+            return False
         try:
-            return (Path(candidate) / expect_name).exists()
+            p = Path(candidate)
+            if p.is_file():
+                return p.name == wanted
+            return (p / wanted).exists()
         except OSError:
             return False
 
     # 1. Reported path is directly readable — mounts already line up.
-    #    A directory's verbatim acceptance requires the expected content
-    #    when known; a FILE has no "inside" to check, so existence is proof.
-    if _is_dir(reported_path):
-        if _contains_expected(reported_path):
-            return reported_path
-    elif _is_file(reported_path):
+    #    Verbatim acceptance requires the expected content when known.
+    if _exists(reported_path) and _contains_expected(reported_path):
         return reported_path
 
     normalized = str(reported_path).replace('\\', '/')
@@ -1010,73 +1462,88 @@ def resolve_reported_save_path(
                 continue
             if normalized == frm or normalized.startswith(frm + '/'):
                 rest = normalized[len(frm):].lstrip('/')
+                if '..' in Path(rest).parts:
+                    # A client-reported path must never escape the mapping
+                    # target. The old directory-only gates rejected file
+                    # escapes implicitly; the file-aware steps reject them
+                    # explicitly instead.
+                    continue
                 candidate = str(Path(to) / rest) if rest else to
-                if _is_dir(candidate):
-                    if _contains_expected(candidate):
-                        return candidate
-                elif _is_file(candidate):
+                if _exists(candidate) and _contains_expected(candidate):
                     return candidate
 
-    roots = _candidate_download_roots(config_get)
-
     # 3. Basename fallback under known download roots — covers the standard
-    #    shared-volume layout with zero configuration.
-    basename = Path(normalized).name
-    if basename:
-        for root in roots:
-            candidate = Path(root) / basename
-            if _is_dir(candidate):
-                if _contains_expected(candidate):
-                    return str(candidate)
-            elif _is_file(candidate):
-                return str(candidate)
+    #    shared-volume layout with zero configuration. When several roots
+    #    hold the name, the most recently written one wins: that is the
+    #    download that just finished, not a stale copy from an earlier grab
+    #    via another source (single-file audiobooks reuse the uploader's
+    #    canonical filename across sources, and usenet roots sort before
+    #    torrent roots). Exact ties keep config order, and anything that
+    #    bumps a stale file's mtime (retag jobs, media-server sidecars, a
+    #    concurrent grab still being written) can skew the pick toward it —
+    #    bounded consequence: the completeness gate stages, never imports, a
+    #    short/partial file. A remaining known limitation: Unicode
+    #    normalization mismatches (NFC reported vs NFD on disk) fail closed
+    #    here, like the directory check always did.
+    #
+    #    the parent folder is tried first: a client category that saves into
+    #    its own subfolder ('audiobooks/Book.m4b') lands one level down, not
+    #    at the root. the longer tail is the more specific match, so it wins
+    #    over a same-named file sitting at the root.
+    tail_parts = [part for part in Path(normalized).parts
+                  if part not in ('', '.', '..') and '/' not in part]
+    tails = []
+    if len(tail_parts) >= 2:
+        tails.append(Path(tail_parts[-2]) / tail_parts[-1])
+    if tail_parts:
+        tails.append(Path(tail_parts[-1]))
+    for tail in tails:
+        best: Optional[str] = None
+        best_mtime = -1.0
+        for root in _candidate_download_roots(config_get):
+            candidate = Path(root) / tail
+            if not (_exists(candidate) and _contains_expected(candidate)):
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                mtime = -1.0
+            if best is None or mtime > best_mtime:
+                best, best_mtime = str(candidate), mtime
+        if best is not None:
+            return best
 
-        # 3b. One level deeper. Clients sort finished downloads into CATEGORY
-        #     folders — '<root>/complete/Movies/<release>' — so a root pointed
-        #     at the parent misses the release entirely. Runs only after every
-        #     root's exact match above has been tried, so a precise hit never
-        #     loses to a deeper guess, and still content-checked so a
-        #     same-named folder in the wrong category can't be picked up.
-        #     Applies to a same-named FILE too — a single-file release with no
-        #     folder of its own, sitting in a category folder (a bare-file
-        #     movie/episode landing in '<root>/Movies/<name>.mkv').
-        #
-        #     This scanned ONE level, which could not reach the very layout the
-        #     line above describes: '<root>/complete/Movies/<release>' is two
-        #     levels down, so the release never resolved and the download sat
-        #     there never importing. It now descends _search_depth levels,
-        #     shallowest first ACROSS every root — depth is the outer loop — so
-        #     a match directly under one root still beats a deeper match under
-        #     an earlier one.
-        depth_limit = _search_depth(config_get)
-        per_root = [(root, _descendant_dirs(root, depth_limit, _MAX_SUBDIRS_SCANNED))
-                    for root in roots]
-        for level in range(1, depth_limit + 1):
-            for _root, descendants in per_root:
-                for depth, sub in descendants:
-                    if depth != level:
-                        continue
-                    candidate = sub / basename
-                    if _is_dir(candidate):
-                        if _contains_expected(candidate):
-                            return str(candidate)
-                    elif _is_file(candidate):
-                        return str(candidate)
+    # Commissary: deeper category folders - '<root>/complete/Music/<release>'
+    # (core/commissary/download_depth.py)
+    from core.commissary import download_depth as _depth
+    _deep = _depth.find_release(
+        _candidate_download_roots(config_get), tail_parts[-1] if tail_parts else None,
+        config_get, accept=lambda c: _exists(c) and _contains_expected(c))
+    if _deep:
+        return _deep
 
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY
     #    (e.g. '/downloads'), not a per-release folder — in the shared-mount
-    #    setup the release lands as '<Commissary download root>/<name>', so the
+    #    setup the release lands as '<SoulSync download root>/<name>', so the
     #    right resolution of '/downloads' is simply our own configured root.
+    #    When the expected name is a single FILE under the root, hand back
+    #    the file itself: callers walk whatever they are handed, and the
+    #    whole root would donate every other download in the shared folder
+    #    to this job's scan. The name is basenamed first (see above) so it
+    #    can never escape the root.
     if expect_name:
-        for root in roots:
+        wanted = Path(expect_name).name
+        for root in _candidate_download_roots(config_get):
             if _is_dir(root) and _contains_expected(root):
+                target = Path(root) / wanted
+                if _is_file(target):
+                    return str(target)
                 return str(root)
-        # 4b. ...and the same category-folder case: the client reported its
-        #     save dir, but the release sits under '<root>/<category>/'.
-        for root in roots:
-            for sub in _subdirs_of(root):
-                if _contains_expected(sub):
-                    return str(sub)
+        # Commissary: ...and the release in a category folder under a root
+        _holder = _depth.find_holder(_candidate_download_roots(config_get), expect_name,
+                                     config_get, contains=_contains_expected)
+        if _holder:
+            return _holder
 
     # Nothing verifiably better — hand back the reported path unchanged so
     # the caller's "no audio found" error can name it honestly.
@@ -1138,6 +1605,7 @@ __all__ = [
     "resolve_reported_save_path",
     "pick_best_album_release",
     "poll_album_download",
+    "profile_allowed_formats",
     "quality_score",
     "time",
     "unique_staging_path",

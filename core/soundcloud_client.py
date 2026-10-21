@@ -24,7 +24,6 @@ Quality reality check:
 
 import os
 import re
-import asyncio
 import uuid
 import time
 from typing import List, Optional, Dict, Any, Tuple, Callable
@@ -37,7 +36,8 @@ except ImportError:
     yt_dlp = None
 
 from utils.logging_config import get_logger
-from config.settings import config_manager
+from core.settings import config_manager
+from core.async_utils import run_blocking
 
 # Standard data structures shared across all download clients so downstream
 # matching/post-processing stays source-agnostic.
@@ -197,7 +197,7 @@ class SoundcloudClient(DownloadSourcePlugin):
         """Search SoundCloud for the given query.
 
         Returns (tracks, albums). SoundCloud has no album concept (only
-        playlists, which don't map to the album model the rest of Commissary
+        playlists, which don't map to the album model the rest of SoulSync
         expects), so the album list is always empty.
         """
         if not self.is_available():
@@ -221,9 +221,8 @@ class SoundcloudClient(DownloadSourcePlugin):
 
         logger.info(f"Searching SoundCloud for: {query} (limit={limit})")
 
-        loop = asyncio.get_event_loop()
         try:
-            entries = await loop.run_in_executor(None, self._extract_search_entries, search_url)
+            entries = await run_blocking(self._extract_search_entries, search_url)
         except Exception as exc:
             logger.error(f"SoundCloud search failed: {exc}")
             return ([], [])
@@ -285,9 +284,8 @@ class SoundcloudClient(DownloadSourcePlugin):
             return ([], [])
 
         logger.info(f"Resolving SoundCloud URL: {url}")
-        loop = asyncio.get_event_loop()
         try:
-            info = await loop.run_in_executor(None, self._extract_url_info, url)
+            info = await run_blocking(self._extract_url_info, url)
         except Exception as exc:
             logger.error(f"SoundCloud URL resolve failed: {exc}")
             return ([], [])
@@ -664,6 +662,7 @@ class SoundcloudClient(DownloadSourcePlugin):
             speed=record.get('speed', 0),
             time_remaining=record.get('time_remaining'),
             file_path=record.get('file_path'),
+            error=record.get('error'),
         )
 
     async def get_all_downloads(self) -> List[DownloadStatus]:

@@ -115,7 +115,6 @@ def test_html_has_new_options_scoped_right():
     assert '<option value="size">Largest</option>' in _INDEX
     assert '<option value="missing" hidden>Missing episodes</option>' in _INDEX
     assert "data-video-lib-res" in _INDEX
-    # missing-option unhidden only on a shows-kind tab; resolution reset off movies
-    # (per-Library tabs, not just 'movies'/'shows' — scoped by the tab's kind).
-    assert "miss.hidden = lib.kindSingular !== 'show'" in _LIB_JS
-    assert "lib.kindSingular !== 'movie' && state.resolution" in _LIB_JS
+    # missing-option unhidden only on the shows tab; resolution reset off movies
+    assert "miss.hidden = state.tab !== 'shows'" in _LIB_JS
+    assert "state.tab !== 'movies' && state.resolution" in _LIB_JS

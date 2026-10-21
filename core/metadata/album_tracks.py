@@ -100,21 +100,47 @@ def _search_albums_for_source(source: str, client: Any, query: str, limit: int =
         return []
 
 
+def _artist_catalog_weight(artist: Any) -> tuple:
+    """Rank same-named search results: catalog size, then popularity.
+
+    §62.5: providers carry FRAGMENT artist entries under the exact same name
+    (Deezer lists five "Hiroyuki Sawano"s; the first exact hit had 4 albums,
+    the real one 104). Catalog size (`nb_album`) is the direct discriminator;
+    fan/follower counts (`nb_fan`, Spotify's `followers.total`, `popularity`)
+    break remaining ties. Missing signals rank lowest, preserving the old
+    first-exact-hit behavior when a source reports nothing."""
+    def _num(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    albums = _num(_extract_lookup_value(artist, 'nb_album', 'album_count'))
+    followers = _extract_lookup_value(artist, 'followers')
+    if isinstance(followers, dict):
+        followers = followers.get('total')
+    fans = max(_num(_extract_lookup_value(artist, 'nb_fan')), _num(followers))
+    return (albums, fans, _num(_extract_lookup_value(artist, 'popularity')))
+
+
 def _pick_best_artist_match(search_results: List[Any], artist_name: str) -> Optional[Any]:
     """Pick the search result whose artist NAME matches, or None.
 
-    Exact (normalized) name wins; otherwise the closest fuzzy match, but only if
-    it's similar enough. Never a blind first result — that handed back an
-    unrelated popular artist (#988: a Deezer name-search for "The Outfield"
-    returning The Beatles) when the source's search doesn't actually contain the
-    artist we asked for. Returning None lets the caller fall back / show nothing
-    instead of the wrong artist's catalogue.
+    Exact (normalized) name wins; among SEVERAL exact hits the largest
+    catalog/most-popular entry is chosen (§62.5 — provider-side fragment
+    artists share the real entry's exact name). Otherwise the closest fuzzy
+    match, but only if it's similar enough. Never a blind first result — that
+    handed back an unrelated popular artist (#988: a Deezer name-search for
+    "The Outfield" returning The Beatles) when the source's search doesn't
+    actually contain the artist we asked for. Returning None lets the caller
+    fall back / show nothing instead of the wrong artist's catalogue.
     """
     if not search_results:
         return None
     target_name = _normalize_artist_name(artist_name)
     if not target_name:
         return None
+    exact: List[Any] = []
     best, best_ratio = None, 0.0
     for artist in search_results:
         candidate_name = _normalize_artist_name(
@@ -123,10 +149,13 @@ def _pick_best_artist_match(search_results: List[Any], artist_name: str) -> Opti
         if not candidate_name:
             continue
         if candidate_name == target_name:
-            return artist
+            exact.append(artist)
+            continue
         ratio = SequenceMatcher(None, target_name, candidate_name).ratio()
         if ratio > best_ratio:
             best, best_ratio = artist, ratio
+    if exact:
+        return max(exact, key=_artist_catalog_weight)
     return best if best_ratio >= 0.85 else None
 
 
@@ -215,7 +244,7 @@ def _normalize_context_artists(artists: Any) -> List[Dict[str, Any]]:
 
 def _build_album_info(album_data: Any, album_id: str, album_name: str = '',
                       artist_name: str = '', source: str = '') -> Dict[str, Any]:
-    """Build the canonical Commissary internal album-info dict.
+    """Build the canonical SoulSync internal album-info dict.
 
     When ``source`` is provided AND maps to a known typed converter,
     routes through the canonical ``Album.from_<source>_dict()`` path —
@@ -264,6 +293,13 @@ def _build_album_info_typed(album_data: Dict[str, Any], album_id: str,
 
     ctx = album.to_context_dict()
 
+    # the itunes and discogs clients return an already-normalized album
+    # ('release_date'), while their converters read the raw api shape
+    # ('releaseDate', 'year'), so the date came out empty and a matched
+    # import filed under "Rise" instead of "[2013] Rise"
+    if not ctx.get('release_date') and album_data.get('release_date'):
+        ctx['release_date'] = str(album_data['release_date'])
+
     # Preserve original `images` list shape from the raw input — the
     # legacy path passed the source's full multi-resolution images
     # array through verbatim. Some downstream consumers iterate the
@@ -281,7 +317,7 @@ def _build_album_info_typed(album_data: Dict[str, Any], album_id: str,
             if isinstance(first, dict):
                 ctx['image_url'] = first.get('url') or ctx.get('image_url')
 
-    for key in ('format', 'country', 'status', 'label', 'disambiguation', 'release_group_id'):
+    for key in ('format', 'country', 'status', 'label', 'disambiguation', 'release_group_id', 'musicbrainz_release_id'):
         value = album_data.get(key)
         if value:
             ctx[key] = value
@@ -313,6 +349,8 @@ def _normalize_album_type(value: Any, default: str = 'album') -> str:
     v = str(value).strip().lower()
     if not v:
         return default
+    if v in ('compile', 'compilations'):
+        return 'compilation'
     return v if v in _ALBUM_TYPE_CANONICAL else default
 
 
@@ -367,7 +405,7 @@ def _build_album_info_legacy(album_data: Any, album_id: str,
         ),
         'total_tracks': _extract_lookup_value(album_data, 'total_tracks', 'track_count', default=0) or 0,
     }
-    for key in ('format', 'country', 'status', 'label', 'disambiguation', 'release_group_id'):
+    for key in ('format', 'country', 'status', 'label', 'disambiguation', 'release_group_id', 'musicbrainz_release_id'):
         value = _extract_lookup_value(album_data, key, default='')
         if value:
             album_info[key] = value
@@ -424,17 +462,33 @@ def _build_album_track_entry(track_item: Any, album_info: Dict[str, Any], source
 _RAW_TYPE_KEYS = ('album_type', 'record_type', 'type', 'primary-type', 'collectionType')
 
 
+# Values that actually distinguish a release kind. A bare 'album' is NOT in
+# this set on purpose: it is the universal filler. SpotipyFree's formatAlbum()
+# hardcodes ``album["album_type"] = "album"`` on EVERY album (verified against
+# the published package — the old "#1064" comment claiming it emits no type
+# key was wrong), and the Discogs/Qobuz/Hydrabase/Bandcamp converters default
+# to 'album' when the provider gives no type. Treating that filler as an
+# explicit signal is exactly how a discography of singles/EPs all filed under
+# Album/ (CAL, 2026-09-24). Only a distinguishing value is trusted outright;
+# 'album' is verified against the real track count at the call site instead —
+# a genuine 7+ track album still derives to 'album', so nothing real changes.
+_EXPLICIT_TYPE_VALUES = ('single', 'ep', 'compilation', 'compile')
+
+
 def _has_explicit_type_signal(album_data: Any) -> bool:
-    """Did the SOURCE actually say what kind of release this is? SpotipyFree
-    (the no-auth Spotify fallback most installs ride) emits NO type key at
-    all — and the converters' 'album' default then poisoned every
-    discography single/EP into the Albums bucket (#1064). Absence must stay
-    distinguishable from a real 'album'."""
+    """Did the SOURCE actually say what kind of release this is?
+
+    Only a *distinguishing* type counts as a signal. A bare ``'album'``
+    does not: it is the value every filler and default produces, so it is
+    indistinguishable from "the source didn't say". The count-based
+    derivation at the call site re-verifies it — genuine albums keep their
+    type, mislabeled singles/EPs get corrected.
+    """
     if not isinstance(album_data, dict):
         album_data = getattr(album_data, '__dict__', None) or {}
     for key in _RAW_TYPE_KEYS:
         v = album_data.get(key)
-        if v is not None and str(v).strip():
+        if v is not None and str(v).strip().lower() in _EXPLICIT_TYPE_VALUES:
             return True
     return False
 
@@ -704,6 +758,44 @@ def resolve_album_reference(
     return None, None
 
 
+def _served_album_name_acceptable(requested_name: str, album_data: Any) -> bool:
+    """Sanity gate for id lookups: the album a source returned must at least
+    resemble the album the caller ASKED for.
+
+    Album ids are only meaningful within their own catalog, but this lookup
+    walks a source CHAIN — when an id from one id-space (a library DB row id,
+    another provider's id) reaches the wrong catalog, that catalog happily
+    returns whatever unrelated release owns the number, and the chain stops at
+    the first "success" (clicking GNX served a Lady Blacktronika record).
+    With no requested name there is no basis to reject; otherwise require a
+    lenient match — normalized containment either way, or a fuzzy ratio that
+    survives subtitle/edition noise. A rejected hit just continues the chain
+    and ultimately falls to resolve_album_reference, which matches by NAME.
+    """
+    if not requested_name:
+        return True
+    # The RAW source data, not the built payload — the payload builder stamps
+    # the caller's requested name over the served one, which would make this
+    # check vacuously true. Wire shapes: spotify/bandcamp 'name', deezer/
+    # discogs 'title', itunes 'collectionName'. Unknown shape → no basis.
+    served = ''
+    if isinstance(album_data, dict):
+        served = str(album_data.get('name') or album_data.get('title')
+                     or album_data.get('collectionName') or '')
+    else:
+        served = str(getattr(album_data, 'name', '') or getattr(album_data, 'title', '') or '')
+    if not served:
+        return True
+    def _norm(value: str) -> str:
+        return ' '.join(''.join(c if c.isalnum() else ' ' for c in value.casefold()).split())
+    a, b = _norm(requested_name), _norm(served)
+    if not a or not b:
+        return True
+    if a in b or b in a:
+        return True
+    return SequenceMatcher(None, a, b).ratio() >= 0.6
+
+
 def get_artist_album_tracks(
     album_id: str,
     artist_name: str = '',
@@ -737,6 +829,13 @@ def get_artist_album_tracks(
             artist_name=artist_name,
         )
         if payload['tracks']:
+            if not _served_album_name_acceptable(album_name, album_data):
+                logger.info(
+                    "Rejecting %s album %s for id %s: served name %r does not match requested %r",
+                    source, (payload.get('album') or {}).get('id'), album_id,
+                    (payload.get('album') or {}).get('name'), album_name,
+                )
+                continue
             payload['success'] = True
             payload['source_priority'] = source_chain
             payload['resolved_album_id'] = album_id
@@ -776,6 +875,19 @@ def get_artist_album_tracks(
                 artist_name=artist_name,
             )
             if payload['tracks']:
+                # The resolved id belongs to resolved_source's catalog — that
+                # hop is trusted (the id came from that source's own stored
+                # mapping or name search, and a stored external id may
+                # legitimately carry a different title). The OTHER retry hops
+                # walk the id through foreign catalogs — same collision class
+                # as above, so they must still resemble the requested name.
+                if source != resolved_source and not _served_album_name_acceptable(album_name, album_data):
+                    logger.info(
+                        "Rejecting %s album %s for resolved id %s: served name %r does not match requested %r",
+                        source, (payload.get('album') or {}).get('id'), resolved_album_id,
+                        (payload.get('album') or {}).get('name'), album_name,
+                    )
+                    continue
                 payload['success'] = True
                 payload['source_priority'] = source_chain
                 payload['resolved_album_id'] = resolved_album_id

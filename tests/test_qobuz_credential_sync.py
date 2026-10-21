@@ -5,7 +5,7 @@ Settings showed "Connected: <username> (Active)" but underneath an error
 "Qobuz not authenticated...", and the dashboard indicator stayed
 yellow even after a successful login.
 
-Root cause: Commissary runs two QobuzClient instances side by side — one
+Root cause: SoulSync runs two QobuzClient instances side by side — one
 through ``download_orchestrator.client('qobuz')`` for the auth-flow endpoints, and a
 second owned by the enrichment worker thread for thread safety. Login
 only updated the first instance's in-memory state. The dashboard's
@@ -40,7 +40,7 @@ def qobuz_client_module():
     in-memory dict so we can drive `qobuz.session` from the test.
 
     Snapshots and restores sys.modules entries on teardown — without
-    this, every downstream test that imports config.settings would
+    this, every downstream test that imports core.settings would
     receive our stub and the real config_manager.get would no longer
     reach the live config (which breaks tests like
     test_tidal_auth_instructions that monkeypatch config_manager.get
@@ -68,14 +68,14 @@ def qobuz_client_module():
     # Snapshot what we are about to mutate so teardown can put it back.
     original_modules = {
         name: sys.modules.get(name)
-        for name in ('config', 'config.settings', 'core.qobuz_client')
+        for name in ('config', 'core.settings', 'core.qobuz_client')
     }
 
     if 'config' not in sys.modules:
         sys.modules['config'] = types.ModuleType('config')
-    settings_mod = types.ModuleType('config.settings')
+    settings_mod = types.ModuleType('core.settings')
     settings_mod.config_manager = _StubConfigManager()
-    sys.modules['config.settings'] = settings_mod
+    sys.modules['core.settings'] = settings_mod
 
     sys.modules.pop('core.qobuz_client', None)
     try:

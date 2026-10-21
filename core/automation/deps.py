@@ -85,7 +85,7 @@ class AutomationDeps:
     # --- Engine + shared state ---
     engine: Any                                          # AutomationEngine instance
     state: AutomationState
-    config_manager: Any                                  # config.settings.ConfigManager singleton
+    config_manager: Any                                  # core.settings.ConfigManager singleton
     update_progress: Callable[..., None]                 # _update_automation_progress
     logger: Any                                          # module-level logger from utils.logging_config
 
@@ -126,7 +126,10 @@ class AutomationDeps:
     # Triggers a "Run Now" of a library-maintenance repair job by id (e.g.
     # 'quality_upgrade'). Returns truthy if the job was queued. Replaces the old
     # standalone quality-scanner executor/state (the scanner is now a repair job).
-    run_repair_job_now: Callable[[str], Any]
+    # (job_id, *, respect_enabled=False) -> bool. respect_enabled is for
+    # automations: a job switched off in Tools must stay off for a background
+    # trigger, only a Run Now click overrides it (#1207).
+    run_repair_job_now: Callable[..., Any]
 
     # --- Download orchestrator + queue accessors ---
     download_orchestrator: Any
@@ -156,10 +159,12 @@ class AutomationDeps:
     build_personalized_manager: Callable[[], Any]
 
     # --- Listening-history importers ---
-    # Optional: the importer is legitimately None when its boot failed or
-    # Last.fm is not configured, and the handler answers for that rather
-    # than the registration refusing to build.
     lastfm_import_worker: Optional[Any] = None
+    # one importer per pile (#1293), .shared is lastfm_import_worker
+    lastfm_import_workers: Optional[Any] = None
+    listenbrainz_import_worker: Optional[Any] = None
+    # one importer per pile (#1293), .shared is listenbrainz_import_worker
+    listenbrainz_import_workers: Optional[Any] = None
 
     # --- Unified PlaylistSource registry ---
     # Optional so test fixtures that don't exercise refresh_mirrored
@@ -167,3 +172,19 @@ class AutomationDeps:
     # ``web_server.py`` always populates it via
     # ``core.playlists.sources.bootstrap.build_playlist_source_registry``.
     playlist_source_registry: Optional[Any] = None
+
+    # (finding_ids) -> {fixed, failed, ...}: applies Library Maintenance
+    # findings (the "Apply Quality Upgrades" action). None when the repair
+    # worker isn't running, and in fixtures that don't exercise it.
+    bulk_fix_repair_findings: Optional[Callable[..., Any]] = None
+
+    # Opt-in automatic album completion. Optional so existing automation
+    # constructors remain compatible; handlers skip when unavailable.
+    # get_repair_findings(**filters) -> paginated repair findings
+    get_repair_findings: Optional[Callable[..., Any]] = None
+    # queue_album_completion(**album_details) -> {'status': 'queued' | 'skipped'}
+    queue_album_completion: Optional[Callable[..., Any]] = None
+    get_current_album_pin: Optional[Callable[..., Any]] = None
+    fetch_canonical_release: Optional[Callable[..., Any]] = None
+    # album_completion_cooling_down(source, release_id) -> bool, read-only peek
+    album_completion_cooling_down: Optional[Callable[..., Any]] = None

@@ -11,7 +11,6 @@ and https://deluge.readthedocs.io/en/latest/reference/webapi.html
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import threading
 from itertools import count
@@ -19,8 +18,8 @@ from typing import Any, List, Optional
 
 import requests as http_requests
 
-from config.settings import config_manager
-from core.torrent_clients import infohash
+from core.settings import config_manager
+from core.async_utils import run_control
 from core.torrent_clients.base import TorrentStatus, normalize_client_url
 from utils.logging_config import get_logger
 
@@ -59,6 +58,9 @@ class DelugeAdapter:
         'hash', 'name', 'state', 'progress', 'total_size',
         'total_done', 'download_payload_rate', 'upload_payload_rate',
         'num_seeds', 'num_peers', 'eta', 'save_path', 'tracker_status',
+        # the label plugin's key. deluge leaves out keys it doesn't know, so
+        # this is harmless with the plugin off
+        'label',
     ]
 
     def __init__(self) -> None:
@@ -76,7 +78,9 @@ class DelugeAdapter:
             or config_manager.get('torrent_client.username', '')
             or ''
         )
-        self._category = config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        self._category = str(
+            config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
+        ).strip() or 'soulsync'
         self._save_path = config_manager.get('torrent_client.save_path', '') or ''
         with self._session_lock:
             self._session = None
@@ -93,8 +97,7 @@ class DelugeAdapter:
     async def check_connection(self) -> bool:
         if not self.is_configured():
             return False
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._check_connection_sync)
+        return await run_control(self._check_connection_sync)
 
     def _check_connection_sync(self) -> bool:
         sess = self._ensure_session_sync()
@@ -165,13 +168,11 @@ class DelugeAdapter:
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_sync, url_or_magnet, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_sync, url_or_magnet, category, save_path)
 
     def _add_torrent_sync(
         self,
@@ -192,24 +193,20 @@ class DelugeAdapter:
             method = 'core.add_torrent_url'
         torrent_hash = self._rpc_sync(method, [url_or_magnet, options])
         if not torrent_hash:
-            # Deluge RAISES on a duplicate rather than handing back the hash it
-            # already has, and _rpc_sync maps every raise to None. See
-            # _existing_ref: an add refused because it was already done is a
-            # success with the answer withheld.
-            return self._existing_ref(url_or_magnet, category)
+            # Commissary: Deluge raises on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import deluge_held
+            return deluge_held(self, url_or_magnet, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
 
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: Optional[str] = None,
+        category: str = "soulsync",
         save_path: Optional[str] = None,
     ) -> Optional[str]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(
-            None, self._add_torrent_file_sync, file_bytes, category, save_path
-        )
+        return await run_control(
+            self._add_torrent_file_sync, file_bytes, category, save_path)
 
     def _add_torrent_file_sync(
         self,
@@ -225,41 +222,11 @@ class DelugeAdapter:
         encoded = base64.b64encode(file_bytes).decode('ascii')
         torrent_hash = self._rpc_sync('core.add_torrent_file', ['soulsync.torrent', encoded, options])
         if not torrent_hash:
-            return self._existing_ref(file_bytes, category)
+            # Commissary: Deluge raises on a duplicate; adopt what it holds.
+            from core.commissary.torrent_adopt import deluge_held
+            return deluge_held(self, file_bytes, category)
         self._apply_label(str(torrent_hash), category or self._category)
         return str(torrent_hash)
-
-    def _existing_ref(self, payload, category=None) -> Optional[str]:
-        """The hash of a torrent Deluge ALREADY holds, when the add was refused.
-
-        A duplicate is Deluge's commonest refusal and it is silent: the RPC
-        raises, ``_rpc_sync`` logs and returns None, and the whole stack above
-        reads that as "the torrent client didn't accept the release". No
-        download row is created, so nothing polls the torrent that is sitting
-        right there — frequently already finished — the wishlist row stays
-        wanted, and it re-grabs every hour forever. Two separate incidents on
-        the library this was written for looked exactly like that, one of them
-        for eight days.
-
-        The hash needs no asking: a magnet carries it, and a .torrent is the
-        SHA-1 of its bencoded info value. If Deluge has it, the add did not fail
-        — it was already done, and the right answer is the hash.
-
-        None for an http .torrent URL, whose hash cannot be derived without
-        fetching it. That is the same limit qBittorrent's _confirm_or_poll has,
-        and it falls back to today's behaviour rather than guessing."""
-        expected = infohash.expected_hash(payload)
-        if not expected:
-            return None
-        row = self._rpc_sync('core.get_torrent_status', [expected, ['hash']])
-        if not isinstance(row, dict) or not row:
-            return None
-        logger.info("Deluge already had %s — the add was a duplicate, not a "
-                    "refusal; adopting the existing torrent", expected)
-        # It may have been added by hand, or by an older build that lost track
-        # of it. Label it now so it lands in the right category either way.
-        self._apply_label(expected, category or self._category)
-        return expected
 
     def _apply_label(self, torrent_hash: str, label: str) -> None:
         """Best-effort label assignment. The Label plugin is optional
@@ -272,8 +239,7 @@ class DelugeAdapter:
         self._rpc_sync('label.set_torrent', [torrent_hash, label])
 
     async def get_status(self, torrent_id: str) -> Optional[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_status_sync, torrent_id)
+        return await run_control(self._get_status_sync, torrent_id)
 
     def _get_status_sync(self, torrent_id: str) -> Optional[TorrentStatus]:
         result = self._rpc_sync('core.get_torrent_status', [torrent_id, self._STATUS_FIELDS])
@@ -283,22 +249,8 @@ class DelugeAdapter:
         result.setdefault('hash', torrent_id)
         return self._parse_status(result)
 
-    async def list_files(self, torrent_id: str) -> Optional[List[str]]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._list_files_sync, torrent_id)
-
-    def _list_files_sync(self, torrent_id: str) -> Optional[List[str]]:
-        """Deluge reports each file as {'path': 'Release/file.rar', 'size': N};
-        an unresolved magnet has no 'files' key at all, which reads as unknown."""
-        result = self._rpc_sync('core.get_torrent_status', [torrent_id, ['files']])
-        if not isinstance(result, dict):
-            return None
-        return [str(f.get('path')) for f in (result.get('files') or [])
-                if isinstance(f, dict) and f.get('path')]
-
     async def get_all(self) -> List[TorrentStatus]:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._get_all_sync)
+        return await run_control(self._get_all_sync)
 
     def _get_all_sync(self) -> List[TorrentStatus]:
         result = self._rpc_sync('core.get_torrents_status', [{}, self._STATUS_FIELDS])
@@ -331,27 +283,25 @@ class DelugeAdapter:
             eta=int(item['eta']) if isinstance(item.get('eta'), (int, float)) and item.get('eta', 0) > 0 else None,
             save_path=item.get('save_path'),
             error=item.get('tracker_status') if 'Error' in (item.get('state') or '') else None,
+            category=str(item.get('label') or '') or None,
         )
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._remove_sync, torrent_id, delete_files)
+        return await run_control(self._remove_sync, torrent_id, delete_files)
 
     def _remove_sync(self, torrent_id: str, delete_files: bool) -> bool:
         result = self._rpc_sync('core.remove_torrent', [torrent_id, bool(delete_files)])
         return result is True
 
     async def pause(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._pause_sync, torrent_id)
+        return await run_control(self._pause_sync, torrent_id)
 
     def _pause_sync(self, torrent_id: str) -> bool:
         # Deluge 2.x core.pause_torrent takes a list of hashes.
         return self._rpc_sync('core.pause_torrent', [[torrent_id]]) is not None
 
     async def resume(self, torrent_id: str) -> bool:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._resume_sync, torrent_id)
+        return await run_control(self._resume_sync, torrent_id)
 
     def _resume_sync(self, torrent_id: str) -> bool:
         return self._rpc_sync('core.resume_torrent', [[torrent_id]]) is not None

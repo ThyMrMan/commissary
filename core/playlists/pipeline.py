@@ -17,13 +17,36 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List
 
+from core.profile_context import get_background_profile
+from core.playlists.user_playlists import pipeline_runs
+
 
 DISCOVERY_TIMEOUT_SECONDS = 3600
+# Grace period after a discovery timeout: the worker runs on a daemon thread
+# and can't be force-cancelled, so the phase joins it for this long before
+# handing off to sync. Tests shrink both constants via monkeypatch.
+DISCOVERY_TIMEOUT_GRACE_SECONDS = 120
 
 
 RefreshFn = Callable[[Dict[str, Any], Any], Dict[str, Any]]
 SyncOneFn = Callable[[Dict[str, Any], Any], Dict[str, Any]]
 SyncAndWishlistFn = Callable[..., Dict[str, int]]
+
+
+def resolve_pipeline_skip_wishlist(data: Dict[str, Any], config_manager=None) -> bool:
+    """Decide whether a pipeline run skips the wishlist phase (#1455).
+
+    An explicit ``skip_wishlist`` in the request data is a per-click manual
+    override and always wins. Otherwise the global
+    ``playlist_sync.wishlist_missing_tracks`` toggle decides (default True =
+    today's behavior: missing tracks are wishlisted).
+    """
+    explicit = data.get('skip_wishlist', None)
+    if explicit is not None:
+        return bool(explicit)
+    if config_manager is None:
+        return False
+    return not config_manager.get('playlist_sync.wishlist_missing_tracks', True)
 
 
 def run_mirrored_playlist_pipeline(
@@ -62,8 +85,17 @@ def run_mirrored_playlist_pipeline(
         playlist_id = config.get('playlist_id')
         process_all = config.get('all', False)
         skip_wishlist = config.get('skip_wishlist', False)
+        # refresh from source: pull the new track list and discover what's new,
+        # nothing pushed to the server, nothing downloaded (#1413)
+        refresh_only = bool(config.get('refresh_only', False))
+        # Owner of this run. The manual UI trigger passes it explicitly so a
+        # background thread never falls back to admin (P0-01); scheduled
+        # automations keep the historic default.
+        owner_profile_id = config.get('profile_id')
 
-        playlists = _resolve_pipeline_playlists(db, playlist_id, process_all)
+        playlists = _resolve_pipeline_playlists(
+            db, playlist_id, process_all, profile_id=owner_profile_id
+        )
         if playlists is None:
             deps.state.set_pipeline_running(False)
             return {'status': 'error', 'error': 'No playlist specified'}
@@ -94,51 +126,98 @@ def run_mirrored_playlist_pipeline(
             refresh_fn=refresh_fn,
         )
 
-        _run_discovery_phase(
+        discovery_phase = _run_discovery_phase(
             deps,
             automation_id,
             db=db,
             playlist_id=playlist_id,
             process_all=process_all,
+            profile_id=owner_profile_id,
         )
+        # M13/M14: the discovery outcome is honest, not always 'completed'.
+        discovery_status = discovery_phase.get('status', 'completed')
+        discovery_error = discovery_phase.get('error', '')
+        if discovery_status == 'completed':
+            tracks_discovered = 'completed'
+        elif discovery_status == 'timed_out':
+            tracks_discovered = f'timed_out: {discovery_error}'
+        else:
+            tracks_discovered = f'failed: {discovery_error}'
 
-        sync_summary = sync_and_wishlist_fn(
-            deps,
-            automation_id,
-            [pl for pl in playlists if pl.get('id')],
-            sync_one_fn=lambda pl: sync_one_fn(
-                {'playlist_id': str(pl['id']), '_automation_id': None},
+        if refresh_only:
+            deps.update_progress(
+                automation_id,
+                progress=90,
+                log_line='Refresh only: nothing pushed to the server or downloaded',
+                log_type='info',
+            )
+            sync_summary = {'synced': 0, 'skipped': 0, 'errors': 0, 'wishlist_queued': 0}
+        else:
+            sync_summary = sync_and_wishlist_fn(
                 deps,
-            ),
-            sync_id_for_fn=lambda pl: f"auto_mirror_{pl['id']}",
-            skip_wishlist=skip_wishlist,
-            progress_start=56,
-            progress_end=85,
-            sync_phase_label='Phase 3/4: Syncing to server...',
-            sync_phase_start_log='Phase 3: Sync',
-            wishlist_phase_label='Phase 4/4: Processing wishlist...',
-            wishlist_phase_start_log='Phase 4: Wishlist',
-        )
+                automation_id,
+                [pl for pl in playlists if pl.get('id')],
+                sync_one_fn=lambda pl: sync_one_fn(
+                    {'playlist_id': str(pl['id']), '_automation_id': None,
+                     'user_initiated': bool(config.get('user_initiated')),
+                     # #1689: the resolved skip must also stop the sync
+                     # itself from wishlisting missing tracks as it goes;
+                     # the wishlist-phase skip alone left the adds running.
+                     'skip_wishlist_add': bool(skip_wishlist),
+                     # the pipeline's own mode (#1704), a mirror's own beats it
+                     'sync_mode': config.get('sync_mode') or None},
+                    deps,
+                ),
+                sync_id_for_fn=lambda pl: f"auto_mirror_{pl['id']}",
+                skip_wishlist=skip_wishlist,
+                progress_start=56,
+                progress_end=85,
+                sync_phase_label='Phase 3/4: Syncing to server...',
+                sync_phase_start_log='Phase 3: Sync',
+                wishlist_phase_label='Phase 4/4: Processing wishlist...',
+                wishlist_phase_start_log='Phase 4: Wishlist',
+            )
 
         duration = int(time.time() - pipeline_start)
+        # M13/M14: the final status reflects a failed/timed-out discovery
+        # phase instead of claiming a clean success.
+        skipped = sync_summary.get('skipped', 0)
+        if discovery_status == 'completed':
+            final_log_line = f'Pipeline finished in {duration // 60}m {duration % 60}s'
+            final_log_type = 'success'
+        else:
+            final_log_line = (f'Pipeline finished in {duration // 60}m {duration % 60}s '
+                              f'— discovery {discovery_status}: {discovery_error}')
+            final_log_type = 'warning'
+        # #1549: surface unidentified tracks instead of claiming 100% clean.
+        if skipped > 0:
+            final_log_line += f' — {skipped} track{"s" if skipped != 1 else ""} need identification'
+            final_log_type = 'warning'
+        # imported here: core.automation.handlers imports this module
+        from core.automation.handlers._pipeline_shared import apply_sync_errors
+        result_errors: Dict[str, Any] = {}
+        final_log_line, final_log_type = apply_sync_errors(
+            sync_summary, result_errors, final_log_line, final_log_type)
         deps.update_progress(
             automation_id,
             status='finished',
             progress=100,
-            phase='Pipeline complete',
-            log_line=f'Pipeline finished in {duration // 60}m {duration % 60}s',
-            log_type='success',
+            phase='Refreshed from source' if refresh_only else 'Pipeline complete',
+            log_line=final_log_line,
+            log_type=final_log_type,
         )
 
         result = {
             'status': 'completed',
             '_manages_own_progress': True,
             'playlists_refreshed': str(refreshed),
-            'tracks_discovered': 'completed',
+            'tracks_discovered': tracks_discovered,
+            'discovery_error': discovery_error,
             'tracks_synced': str(sync_summary['synced']),
             'sync_skipped': str(sync_summary['skipped']),
             'wishlist_queued': str(sync_summary['wishlist_queued']),
             'duration_seconds': str(duration),
+            **result_errors,
         }
         try:
             _record_playlist_pipeline_history(
@@ -256,17 +335,30 @@ def _record_playlist_pipeline_history(
         )
 
 
-def _resolve_pipeline_playlists(db: Any, playlist_id: Any, process_all: bool) -> List[Dict[str, Any]] | None:
+def _resolve_pipeline_playlists(
+    db: Any,
+    playlist_id: Any,
+    process_all: bool,
+    *,
+    profile_id: Any = None,
+) -> List[Dict[str, Any]] | None:
     if process_all:
-        return db.get_mirrored_playlists()
+        # automations never save profile_id, so "all" falls back to the profile
+        # the engine is running this as (the automation's owner), not admin
+        owner = profile_id or get_background_profile()
+        return db.get_mirrored_playlists(int(owner)) if owner else db.get_mirrored_playlists()
     if playlist_id:
-        playlist = db.get_mirrored_playlist(int(playlist_id))
+        playlist = (
+            db.get_mirrored_playlist(int(playlist_id), profile_id=int(profile_id))
+            if profile_id
+            else db.get_mirrored_playlist(int(playlist_id))
+        )
         return [playlist] if playlist else []
     return None
 
 
 def _filter_refreshable_playlists(playlists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    return [pl for pl in playlists if pl.get('source', '') not in ('file', 'beatport')]
+    return [pl for pl in playlists if pipeline_runs(pl)]
 
 
 def _summarize_playlist_names(playlists: List[Dict[str, Any]]) -> str:
@@ -320,58 +412,106 @@ def _run_discovery_phase(
     db: Any,
     playlist_id: Any,
     process_all: bool,
-) -> None:
+    profile_id: Any = None,
+) -> Dict[str, Any]:
+    """Run the discovery phase; returns a phase-result dict.
+
+    ``status`` is one of ``'completed'``, ``'timed_out'``, ``'failed'``.
+    On timeout the phase joins the (daemon) worker for
+    ``DISCOVERY_TIMEOUT_GRACE_SECONDS`` before returning — sync must not
+    start while discovery can still be mutating playlist metadata. A worker
+    exception is recorded in the result and logged at error level, never
+    reported as success.
+    """
     deps.update_progress(
         automation_id,
         progress=26,
-        phase='Phase 2/4: Discovering metadata...',
-        log_line='Phase 2: Discover',
+        phase='Phase 2/4: Identifying metadata...',
+        log_line='Phase 2: Identify',
         log_type='info',
     )
 
-    if process_all:
-        disc_playlists = db.get_mirrored_playlists()
-    else:
-        disc_playlists = [db.get_mirrored_playlist(int(playlist_id))]
+    disc_playlists = _resolve_pipeline_playlists(
+        db, playlist_id, process_all, profile_id=profile_id
+    ) or []
     disc_playlists = [p for p in disc_playlists if p]
 
     disc_done = threading.Event()
+    disc_errors: List[str] = []
 
     def _disc_wrapper(pls):
         try:
             deps.run_playlist_discovery_worker(pls, automation_id=None)
-        except Exception as e:  # noqa: BLE001 - logged into pipeline progress
+        except Exception as e:  # noqa: BLE001 - recorded into the phase result below
             deps.logger.error(f"[Pipeline] Discovery error: {e}")
+            disc_errors.append(str(e))
         finally:
             disc_done.set()
 
-    threading.Thread(
+    worker = threading.Thread(
         target=_disc_wrapper,
         args=(disc_playlists,),
         daemon=True,
         name='pipeline-discover',
-    ).start()
+    )
+    worker.start()
 
+    timed_out = False
     poll_start = time.time()
     while not disc_done.wait(timeout=3):
         elapsed = int(time.time() - poll_start)
         deps.update_progress(
             automation_id,
             progress=min(26 + elapsed // 4, 54),
-            phase=f'Phase 2/4: Discovering... ({elapsed}s)',
+            phase=f'Phase 2/4: Identifying... ({elapsed}s)',
         )
         if elapsed > DISCOVERY_TIMEOUT_SECONDS:
+            timed_out = True
             deps.update_progress(
                 automation_id,
-                log_line='Discovery timed out after 1 hour',
+                log_line='Identification timed out after 1 hour',
                 log_type='warning',
             )
             break
 
+    if timed_out:
+        # M13: don't hand off to sync while the worker can still be mutating
+        # playlist metadata — join with a grace period first. The thread is
+        # daemon so it can't be force-cancelled; if it's still alive after
+        # the grace period the phase is still reported timed-out.
+        disc_done.wait(timeout=DISCOVERY_TIMEOUT_GRACE_SECONDS)
+        still_running = not disc_done.is_set()
+        deps.update_progress(
+            automation_id,
+            progress=55,
+            phase='Phase 2/4: Identification timed out',
+            log_line='Phase 2: identification timed out' + (
+                ' (worker still running after grace period)' if still_running else ''),
+            log_type='error',
+        )
+        return {
+            'status': 'timed_out',
+            'error': 'Discovery timed out after 1 hour',
+            'worker_still_running': still_running,
+        }
+
+    if disc_errors:
+        # M14: the worker raised — record it; never report success.
+        error = disc_errors[0]
+        deps.update_progress(
+            automation_id,
+            progress=55,
+            phase='Phase 2/4: Identification failed',
+            log_line=f'Phase 2 failed: identification error: {error}',
+            log_type='error',
+        )
+        return {'status': 'failed', 'error': error}
+
     deps.update_progress(
         automation_id,
         progress=55,
-        phase='Phase 2/4: Discovery complete',
-        log_line='Phase 2 done: discovery complete',
+        phase='Phase 2/4: Identification complete',
+        log_line='Phase 2 done: identification complete',
         log_type='success',
     )
+    return {'status': 'completed', 'error': ''}

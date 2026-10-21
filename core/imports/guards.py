@@ -8,7 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from config.settings import config_manager
+from core.settings import config_manager
 from core.imports.context import (
     get_import_clean_artist,
     get_import_clean_title,
@@ -44,7 +44,16 @@ def move_to_quarantine(file_path: str, context: dict, reason: str, automation_en
     """
     from core.imports.quarantine import serialize_quarantine_context
 
-    download_dir = _get_config_manager().get("soulseek.download_path", "./downloads")
+    # dd28-49: every OTHER quarantine consumer (retry, cleanup, approve, list,
+    # clear) resolves the download path through ``docker_resolve_path`` first.
+    # Writing entries to the unresolved path meant that on Docker with a
+    # Windows-style drive path configured, files landed where nothing could
+    # find them again.
+    from core.imports.paths import docker_resolve_path
+
+    download_dir = docker_resolve_path(
+        _get_config_manager().get("soulseek.download_path", "./downloads")
+    )
     quarantine_dir = Path(download_dir) / "ss_quarantine"
     quarantine_dir.mkdir(parents=True, exist_ok=True)
 
@@ -52,12 +61,28 @@ def move_to_quarantine(file_path: str, context: dict, reason: str, automation_en
     original_name = Path(file_path).stem
     file_ext = Path(file_path).suffix
 
-    quarantine_filename = f"{timestamp}_{original_name}{file_ext}.quarantined"
+    # dd28-50: a second-resolution timestamp collides whenever two candidates
+    # for the same track are quarantined in the same second — the normal shape
+    # of a multi-candidate retry walk. ``safe_move_file`` overwrites its
+    # destination, so the loser (and its sidecar) simply disappeared. Suffix
+    # until the name is free; the stem stays shared by file and sidecar.
+    entry_stem = f"{timestamp}_{original_name}"
+    if (quarantine_dir / f"{entry_stem}{file_ext}.quarantined").exists() or (
+        quarantine_dir / f"{entry_stem}.json"
+    ).exists():
+        for suffix in range(1, 1000):
+            candidate = f"{timestamp}_{original_name}_{suffix}"
+            if not (quarantine_dir / f"{candidate}{file_ext}.quarantined").exists() \
+                    and not (quarantine_dir / f"{candidate}.json").exists():
+                entry_stem = candidate
+                break
+
+    quarantine_filename = f"{entry_stem}{file_ext}.quarantined"
     quarantine_path = quarantine_dir / quarantine_filename
 
     safe_move_file(file_path, str(quarantine_path))
 
-    metadata_path = quarantine_dir / f"{timestamp}_{original_name}.json"
+    metadata_path = quarantine_dir / f"{entry_stem}.json"
     context = normalize_import_context(context)
     original_search = get_import_original_search(context)
     artist_context = get_import_context_artist(context)
@@ -78,6 +103,25 @@ def move_to_quarantine(file_path: str, context: dict, reason: str, automation_en
             json.dump(metadata, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         logger.warning("Failed to write quarantine metadata: %s", exc)
+
+    # #652: also record the source in the db. the sidecar used to be the only
+    # thing remembering this upload was bad, and approve/delete/clear all delete
+    # sidecars, so clearing the review list handed the same broken file straight
+    # back to the picker. the db row outlives the folder.
+    _blocked_user = str(original_search.get("username") or "")
+    _blocked_file = str(original_search.get("filename") or "")
+    if _blocked_user and _blocked_file:
+        try:
+            from database.music_database import MusicDatabase
+            MusicDatabase().add_quarantine_source_block(
+                _blocked_user, _blocked_file, trigger=trigger,
+                expected_artist=metadata.get("expected_artist", ""),
+                expected_track=metadata.get("expected_track", ""),
+            )
+        except Exception as exc:
+            # never let this stop the quarantine move. the sidecar still gates
+            # it until someone clears the folder.
+            logger.warning("Failed to record quarantine source block: %s", exc)
 
     logger.warning("File quarantined: %s - Reason: %s", quarantine_path, reason)
 

@@ -37,6 +37,11 @@ _lock = threading.Lock()
 _FETCH_LIMIT = 200
 
 
+def _with_scene_numbering(items, db):
+    from core.video.numbering import annotate
+    return annotate(items, db=db)
+
+
 def is_running() -> bool:
     return _running
 
@@ -44,27 +49,18 @@ def is_running() -> bool:
 def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, Any]]]:
     """The indexers' latest releases (movies + TV categories), projected into
     the shared hit shape. None = Prowlarr not configured; [] = nothing/errors."""
-    from core.video.prowlarr_search import (_MOVIE_CATS, _TV_CATS, _client, _project,
-                                            effective_indexer_ids)
+    from core.video.prowlarr_search import _MOVIE_CATS, _TV_CATS, _client, _project
     client = _client()
     if not client.is_configured():
         return None
     try:
-        # The global 'Restrict to indexer IDs' allowlist applies here too. This
-        # passed a hardcoded [] — so the RSS pass polled EVERY indexer even when
-        # the setting named a few, and releases from an excluded tracker could be
-        # matched and grabbed unattended. No per-Library restriction at this
-        # level: the feed is fetched once for the whole library and each item's
-        # own Library filter is applied in _rank, once we know which item a
-        # release is for.
-        results = client._search_sync("", _MOVIE_CATS + _TV_CATS,
-                                      effective_indexer_ids() or [], limit)
+        results = client._search_sync("", _MOVIE_CATS + _TV_CATS, [], limit)
     except Exception as e:   # noqa: BLE001 - a feed hiccup is a skipped tick, not a crash
         logger.warning("rss: recent-releases fetch failed: %s", e)
         return []
     hits: Dict[str, Dict[str, Any]] = {}
     for r in results:
-        # .torrent URL first, magnet second — see prowlarr_search (#1139).
+        # .torrent URL first, magnet second — see _project (#1139).
         url = getattr(r, "download_url", None) or getattr(r, "magnet_uri", None)
         if not url:
             continue
@@ -74,6 +70,69 @@ def fetch_recent_releases(limit: int = _FETCH_LIMIT) -> Optional[List[Dict[str, 
             continue
         hits[keyv] = _project(r, url, proto)
     return list(hits.values())
+
+
+def fetch_extto_releases() -> List[Dict[str, Any]]:
+    """The cached EXT.to Fresh Releases board, projected into the shared hit shape.
+
+    Reads the SNAPSHOT the hourly ``video_extto_fresh_refresh`` automation already
+    keeps - no scraping on the RSS tick. EXT.to sits behind Cloudflare and its
+    board refresh is deliberately hourly to keep that cheap; polling it every few
+    minutes would be a different and much worse bargain.
+
+    The rows already carry their magnet, scraped straight off the homepage, so a
+    match needs no second fetch. Grabbing one is a solved path too: the grab
+    endpoint takes source='extto', files the row as 'torrent' and keeps the
+    identity in the username, exactly as it does for a manual pick off the board.
+
+    This is a COVERAGE lane, not a speed one. The board is ~57 popular releases
+    refreshed hourly, so it will not beat Prowlarr's RSS to anything - what it
+    adds is releases the user's own indexers do not carry. Returns [] when the
+    board is empty or EXT.to isn't set up.
+    """
+    try:
+        from api.video import get_video_db
+        from core.video.extto_board import _rows_of, load_board
+        from core.video.extto_search import _size_bytes
+    except Exception:   # noqa: BLE001 - an optional lane never breaks the tick
+        return []
+    try:
+        rows = _rows_of((load_board(get_video_db()) or {}).get("sections") or {})
+    except Exception:   # noqa: BLE001
+        logger.warning("rss: EXT.to board could not be read", exc_info=True)
+        return []
+
+    hits: List[Dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        magnet = row.get("magnet_uri") or row.get("download_url") or row.get("magnet")
+        title = (row.get("title") or "").strip()
+        if not magnet or not title:
+            continue      # nothing to grab, or nothing to match on
+        size = row.get("size_bytes")
+        if not size:
+            try:
+                size = _size_bytes(row.get("size_text"))
+            except Exception:   # noqa: BLE001
+                size = 0
+        seeders = row.get("seeders")
+        hits.append({
+            "title": title,
+            "size_bytes": int(size or 0),
+            "seeders": seeders,
+            "peers": row.get("leechers"),
+            "username": "EXT.to",
+            "availability": seeders if seeders is not None else 0,
+            "filename": title,
+            "files": [], "file_count": 0, "folder_size_bytes": int(size or 0),
+            "download_url": magnet,
+            "magnet_uri": magnet,
+            "protocol": "torrent",
+            "indexer_id": None,
+            "guid": row.get("url") or magnet,
+        })
+    return hits
 
 
 # Words too common to distinguish a title — a release containing only these is
@@ -117,7 +176,8 @@ def _prescreen(hits: List[Dict[str, Any]], titles: List[str]) -> List[Dict[str, 
     return out
 
 
-def rss_pass(*, fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = None,
+def rss_pass(*, extto: Any = None,
+             fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = None,
              log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
     """One RSS tick: recent releases vs the eligible wishlist. Returns
     {status, grabbed, matched_items, releases, skipped?}."""
@@ -127,18 +187,30 @@ def rss_pass(*, fetch: Optional[Callable[[], Optional[List[Dict[str, Any]]]]] = 
             return {"status": "skipped", "reason": "already_running"}
         _running = True
     try:
-        return _rss_pass_inner(fetch=fetch, log=log or (lambda m: None))
+        return _rss_pass_inner(fetch=fetch, extto=extto, log=log or (lambda m: None))
     finally:
         with _lock:
             _running = False
 
 
-def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
+def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
     from api.video import get_video_db
     from core.automation.handlers import video_process_wishlist as vpw
 
     hits = (fetch or fetch_recent_releases)()
-    if hits is None:
+    prowlarr_off = hits is None
+    hits = list(hits or [])
+    # The EXT.to board rides along on the same pass. It costs nothing here (the
+    # snapshot is already refreshed on its own hourly schedule) and it covers
+    # releases the user's indexers may not carry. Deduped by guid so a release
+    # Prowlarr also returned isn't matched twice.
+    if extto is not False:
+        seen = {h.get("guid") for h in hits if h.get("guid")}
+        for h in ((extto if callable(extto) else fetch_extto_releases)() or []):
+            if h.get("guid") and h["guid"] in seen:
+                continue
+            hits.append(h)
+    if prowlarr_off and not hits:
         return {"status": "skipped", "reason": "prowlarr_not_configured",
                 "grabbed": 0, "releases": 0}
     if not hits:
@@ -164,8 +236,10 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
     except Exception:   # noqa: BLE001 - no profile → no cutoff
         cutoff = 0
 
-    for media_type, items in (("movie", db.movie_wishlist_to_download()),
-                              ("episode", db.episode_wishlist_to_download())):
+    # due_only=False: matching an incoming feed against the wishlist spends no
+    # searches, so there is nothing to back off from.
+    for media_type, items in (("movie", db.movie_wishlist_to_download(due_only=False)),
+                              ("episode", _with_scene_numbering(db.episode_wishlist_to_download(due_only=False), db))):
         if any(it.get("owned") for it in items):
             per_item = vpw._cutoff_rank_for_item if any(
                 it.get("quality_profile_id") for it in items) else None
@@ -173,19 +247,10 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
         target = vpw._default_target_dir(media_type)
         if not target:
             continue
-        if media_type == "episode":
-            items, _pack_grabs = _season_pack_pass(
-                hits, items, target=target, active=active, log=log)
-            grabbed += _pack_grabs
-        for item in items:
-            # A season pack already downloading — this pass's, an earlier RSS
-            # pass's, or the drain's — covers every episode in it. Only the
-            # per-item key was checked here, so RSS would happily grab episode 3
-            # on its own while the pack containing it was still landing, and the
-            # importer then had two claimants for one file.
+        # Commissary: season packs first, then the episodes no grabbed pack covers
+        from core.commissary.season_packs import rss_items
+        for item in rss_items(items, active, media_type, db=db):
             if vpw.item_key(item, media_type) in active:
-                continue
-            if media_type == "episode" and vpw.season_key(item, media_type) in active:
                 continue
             titles = [item.get("title") or item.get("show_title")]
             pool = _prescreen(hits, titles)
@@ -203,9 +268,7 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
                 log("RSS skip: %s — %s" % (_item_label(item, media_type),
                                            _skip_reason(cands, min_rank, item)))
                 continue
-            # multi-library #1105: land in the item's own Library when it has one.
-            item_target = vpw._item_target_dir(item, target)
-            if vpw._default_enqueue(item, best, cands, media_type, item_target):
+            if vpw._default_enqueue(item, best, cands, media_type, target):
                 grabbed += 1
                 active.add(vpw.item_key(item, media_type))
                 log("RSS grab: %s (%s)" % (best.get("title"), media_type))
@@ -215,68 +278,6 @@ def _rss_pass_inner(*, fetch, log) -> Dict[str, Any]:
 
     return {"status": "completed", "grabbed": grabbed,
             "matched_items": matched, "releases": len(hits)}
-
-
-def _season_pack_pass(pool_hits, items, *, target, active, log) -> tuple:
-    """Match SEASON PACKS in the feed before falling to per-episode.
-
-    RSS ranked every wanted episode with ``scope='episode'``, so a
-    ``Show.S01.1080p`` pack sitting in the same feed could not match anything —
-    the one acquisition path that sees releases the moment they are posted was
-    structurally blind to the release shape that covers a whole season. The
-    drain learned about packs; this had not.
-
-    Returns ``(remaining per-episode items, grabs)``. Everything is the drain's
-    own seams — same grouping, same per-show mode, same ranker, same enqueue —
-    so the two paths cannot drift on what a pack is or which shows may have one.
-    """
-    from core.automation.handlers import video_process_wishlist as vpw
-    try:
-        settings = vpw._season_pack_settings()
-        mode_for = vpw._pack_mode_resolver(settings)
-        packs = vpw.season_pack_groups(
-            items, min_episodes=settings["season_pack_min_episodes"], mode_for=mode_for)
-    except Exception:       # noqa: BLE001 - never let this break the normal pass
-        logger.exception("RSS season pack grouping failed")
-        return items, 0
-
-    claimed, skipped, grabs = set(), set(), 0
-    for pack in packs:
-        label = "%s S%02d" % (pack.get("show_title") or "?",
-                              int(pack.get("season_number") or 0))
-        try:
-            titles = [pack.get("show_title")]
-            cands = _rank(_prescreen(pool_hits, titles), pack, "episode")
-            best = vpw.pick_best(cands) if cands else None
-            if best and vpw._default_enqueue(pack, best, cands, "episode",
-                                             vpw._item_target_dir(pack, target)):
-                claimed.update(pack.get("_pack_members") or [])
-                active.add(vpw.season_key(pack, "episode"))
-                grabs += 1
-                log("RSS grab: %s season pack — covers %d wanted episode(s)"
-                    % (label, pack.get("_pack_size") or 0))
-                continue
-            # No pack in THIS feed. That is not "no pack exists" — the feed is
-            # the last few hundred releases, not a search — so unlike the drain
-            # nothing is failed or retried here; the episodes simply fall
-            # through and the drain searches properly on its own tick.
-            #
-            # Except under 'only', where grabbing singles is the thing the user
-            # ruled out. Same airing guard as the drain, so the two agree: a
-            # season still going out weekly has no pack to wait for and its
-            # episodes are grabbed normally.
-            if pack.get("_pack_mode") == "only" and vpw._season_has_finished_airing(pack):
-                skipped.update(pack.get("_pack_members") or [])
-                log("RSS skip: %s — no season pack in the feed, and this show is "
-                    "set to season packs only" % label)
-        except Exception:   # noqa: BLE001 - one season must not stop the rest
-            logger.exception("RSS season pack attempt failed for %s", label)
-            continue
-
-    drop = claimed | skipped
-    if not drop:
-        return items, grabs
-    return [it for it in items if vpw.item_key(it, "episode") not in drop], grabs
 
 
 def _item_label(item: Dict[str, Any], media_type: str) -> str:
@@ -320,25 +321,24 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     accepted candidate with its protocol as the grab source."""
     from api.video import get_video_db
     from api.video.downloads import _evaluate_hits
-    from core.automation.handlers.video_process_wishlist import (
-        _preferred_indexer_ids_for_item, search_context)
+    from core.automation.handlers.video_process_wishlist import search_context
+    from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
-    # The item's Library restricts which trackers may supply it. The search path
-    # enforces that at Prowlarr; here the pool is already fetched, so it is
-    # enforced by dropping releases from trackers this Library did not pick.
-    # A hit with no indexer_id cannot be shown to come from an allowed tracker,
-    # so it goes too — under an explicit restriction, unprovable means excluded.
-    restrict = _preferred_indexer_ids_for_item(item)
-    if restrict:
-        pool = [h for h in pool if h.get("indexer_id") in restrict]
+    # Commissary: only releases from the title's video Library's trackers
+    from core.commissary.video_libraries import filter_hits, search_indexer_ids
+    pool = filter_hits(pool, search_indexer_ids(get_video_db(), media_type, item=item))
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
                            want_title=ctx.get("titles") or ctx.get("title"),
-                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"))
+                           want_date=ctx.get("air_date"), want_absolute=ctx.get("absolute"),
+                           want_alt=ctx_alt(ctx))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
+    # Commissary: a release that just failed on its client isn't grabbed again
+    from core.commissary.client_retry import mark_failed as _mark_failed
+    cands = _mark_failed(item, media_type, cands)
     # Full ranked list, not just accepted: rejected candidates ride along into
     # the download row as the auto-retry ladder, exactly like the drain.
     return cands

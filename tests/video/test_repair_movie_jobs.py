@@ -5,9 +5,12 @@ scan → deduped findings (supersede on change), approve == fix with the
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from core.video.repair.worker import VideoRepairWorker
 from database.video_database import VideoDatabase
+
+_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 @pytest.fixture()
@@ -127,6 +130,50 @@ def test_quality_upgrade_no_cutoff_means_no_noise(db, worker, monkeypatch):
 
 
 # ── Broken Files ─────────────────────────────────────────────────────────────
+
+
+def test_quality_upgrade_scan_includes_owned_episodes(db, worker, monkeypatch):
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO shows(server_source, server_id, title, tmdb_id) "
+        "VALUES ('plex', 's1', 'Low Show', 9001)")
+    show_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO seasons(show_id, season_number, title) VALUES (?, 1, 'Season 1')",
+        (show_id,))
+    season_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO episodes(show_id, season_id, season_number, episode_number, title, has_file) "
+        "VALUES (?, ?, 1, 2, 'Second', 1)", (show_id, season_id))
+    ep_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO media_files(episode_id, relative_path, size_bytes, resolution, video_codec, quality) "
+        "VALUES (?, '/low-show-s01e02.mkv', ?, '720p', 'hevc', '720p')",
+        (ep_id, 1024**3))
+    conn.commit(); conn.close()
+    monkeypatch.setattr("core.video.quality_profile.load",
+                        lambda _db: {"cutoff_resolution": "1080p"})
+
+    worker._run_job("quality_upgrade", forced=True)
+
+    pend = _pending(db)
+    assert len(pend) == 1
+    f = pend[0]
+    assert f["entity_type"] == "episode"
+    assert "Low Show S01E02" in f["title"]
+    assert f["details"]["kind"] == "episode"
+    assert f["details"]["show_tmdb_id"] == 9001
+    assert f["details"]["season_number"] == 1
+    assert f["details"]["episode_number"] == 2
+
+
+def test_repair_ui_renders_episode_quality_upgrade_details():
+    src = (_ROOT / "webui" / "static" / "video" / "video-repair.js").read_text(
+        encoding="utf-8", errors="replace")
+    assert "episodeQualityPanelHTML" in src
+    assert "d.kind === 'episode'" in src
+
+
 def test_broken_files_truncated_and_stub(db, worker):
     ok = _seed_movie(db, sid="m1", tmdb=1, title="Fine", file={"path": "/f.mkv"})
     cut = _seed_movie(db, sid="m2", tmdb=2, title="Cut Short", file={"path": "/c.mkv"})
@@ -143,6 +190,33 @@ def test_broken_files_truncated_and_stub(db, worker):
     assert "runs 61 of 120 min" in pend["Cut Short"]["title"]
     assert "stub file" in pend["Stub"]["title"]
     assert pend["Cut Short"]["severity"] == "warning"
+
+
+def test_broken_files_finds_truncated_episodes(db, worker):
+    conn = db._get_connection()
+    cur = conn.execute(
+        "INSERT INTO shows(server_source, server_id, title, tmdb_id, runtime_minutes) "
+        "VALUES ('plex', 's1', 'Some Show', 9001, 42)")
+    show_id = cur.lastrowid
+    cur = conn.execute("INSERT INTO seasons(show_id, season_number) VALUES (?, 1)", (show_id,))
+    season_id = cur.lastrowid
+    cur = conn.execute(
+        "INSERT INTO episodes(show_id, season_id, season_number, episode_number, title, "
+        "runtime_minutes, has_file) VALUES (?, ?, 1, 1, 'Pilot', 42, 1), (?, ?, 1, 2, 'Fine', 42, 1)",
+        (show_id, season_id, show_id, season_id))
+    ep_ids = [cur.lastrowid - 1, cur.lastrowid]
+    conn.execute("INSERT INTO media_files(episode_id, relative_path, size_bytes, runtime_seconds) "
+                 "VALUES (?, '/show-s01e01.mkv', ?, ?)", (ep_ids[0], 1024**3, 20 * 60))
+    conn.execute("INSERT INTO media_files(episode_id, relative_path, size_bytes, runtime_seconds) "
+                 "VALUES (?, '/show-s01e02.mkv', ?, ?)", (ep_ids[1], 1024**3, 41 * 60))
+    conn.commit(); conn.close()
+    worker._run_job("broken_files", forced=True)
+    pend = _pending(db)
+    assert len(pend) == 1
+    f = pend[0]
+    assert f["entity_type"] == "episode"
+    assert "Some Show S01E01" in f["title"] and "runs 20 of 42 min" in f["title"]
+    assert f["details"]["show_tmdb_id"] == 9001 and f["details"]["episode_number"] == 1
 
 
 # ── Metadata Gaps ────────────────────────────────────────────────────────────
@@ -204,7 +278,7 @@ def test_complete_scan_retires_findings_for_fixed_problems(db, worker):
     _add_file(db, ok, path="/w.mkv", runtime_seconds=30 * 60)
     worker._run_job("broken_files", forced=True)
     old = _pending(db)[0]
-    # The file gets replaced outside Commissary (rescan updates the probe).
+    # The file gets replaced outside SoulSync (rescan updates the probe).
     conn = db._get_connection()
     conn.execute("UPDATE media_files SET runtime_seconds=? WHERE relative_path='/w.mkv'",
                  (118 * 60,))
@@ -218,13 +292,6 @@ def test_complete_scan_retires_findings_for_fixed_problems(db, worker):
 def test_grab_movie_contract(monkeypatch):
     from core.automation.handlers import video_process_wishlist as vpw
     from core.video.repair.grab import grab_movie
-    import api.video
-
-    class _FakeDB:
-        def root_folder_id_for_tmdb(self, kind, tmdb_id, server_source=None):
-            return None    # not filed under any Library → falls back to primary
-    monkeypatch.setattr(api.video, "get_video_db", lambda: _FakeDB())
-
     calls = {}
     monkeypatch.setattr(vpw, "_default_search",
                         lambda item, mt: ([{"accepted": True, "quality": "1080p",
@@ -244,36 +311,6 @@ def test_grab_movie_contract(monkeypatch):
     # Real search, nothing acceptable → stays pending.
     monkeypatch.setattr(vpw, "_default_search", lambda item, mt: ([], None))
     assert "quality profile" in grab_movie({"tmdb_id": 7, "title": "Film"})["error"]
-
-
-def test_grab_movie_routes_to_its_own_library(db, monkeypatch):
-    """multi-library #1105: an upgrade/broken-file fix for an already-owned
-    movie must re-grab into the SAME Library it's already filed under, not
-    always the primary — it's a repair, not a fresh acquisition."""
-    from core.automation.handlers import video_process_wishlist as vpw
-    from core.video.repair.grab import grab_movie
-    import api.video
-
-    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 7, "title": "Film"})
-    conn = db._get_connection()
-    cur = conn.execute(
-        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
-        ("/media/anime", "movie", "plex", "anime"))
-    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (cur.lastrowid, movie_id))
-    conn.commit(); conn.close()
-    monkeypatch.setattr(api.video, "get_video_db", lambda: db)
-
-    calls = {}
-    monkeypatch.setattr(vpw, "_default_search",
-                        lambda item, mt: ([{"accepted": True, "quality": "1080p",
-                                            "username": "u", "filename": "f",
-                                            "size_bytes": 1}], None))
-    monkeypatch.setattr(vpw, "_default_target_dir", lambda mt: "/primary-movies")
-    monkeypatch.setattr(vpw, "_default_enqueue",
-                        lambda item, best, cands, mt, tdir: calls.update(tdir=tdir) or True)
-    res = grab_movie({"tmdb_id": 7, "title": "Film"})
-    assert res["success"]
-    assert calls["tdir"] == "/media/anime"     # its OWN library, not the primary
 
 
 # ── Wishlist Audit ───────────────────────────────────────────────────────────

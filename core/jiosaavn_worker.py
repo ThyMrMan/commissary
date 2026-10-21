@@ -13,7 +13,7 @@ from core.worker_utils import (
     interruptible_sleep,
     set_album_api_track_count,
 )
-from core.enrichment.manual_match_honoring import honor_stored_match
+from core.enrichment.manual_match_honoring import MATCHED, honor_stored_match
 
 logger = get_logger("jiosaavn_worker")
 
@@ -276,8 +276,8 @@ class JioSaavnWorker:
 
     def _normalize_name(self, name: str) -> str:
         name = name.lower().strip()
-        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'\s*\(.*?\)\s*', ' ', name)
+        name = re.sub(r'\s+[-–—]\s+.*$', '', name)
         name = re.sub(r'[^\w\s]', '', name)
         name = re.sub(r'\s+', ' ', name).strip()
         return name
@@ -285,6 +285,13 @@ class JioSaavnWorker:
     def _name_matches(self, query_name: str, result_name: str) -> bool:
         norm_query = self._normalize_name(query_name)
         norm_result = self._normalize_name(result_name)
+        if not norm_query or not norm_result:
+            # Titles that normalize to NOTHING ("(Intro)", "[Skit]", "!!!",
+            # "...") would compare at SequenceMatcher ratio 1.0 against any
+            # other such title — fall back to exact raw comparison instead.
+            raw_q = (query_name or '').strip().lower()
+            raw_r = (result_name or '').strip().lower()
+            return bool(raw_q) and raw_q == raw_r
         similarity = SequenceMatcher(None, norm_query, norm_result).ratio()
         logger.debug("Name similarity: '%s' vs '%s' = %.2f", query_name, result_name, similarity)
         return similarity >= self.name_similarity_threshold
@@ -374,14 +381,29 @@ class JioSaavnWorker:
         self._update_track(track_id, full_track_dict)
 
     def _process_album(self, album_id: int, album_name: str, artist_name: str):
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='albums', entity_id=album_id,
             id_column='jiosaavn_id',
             client_fetch_fn=self.client.get_album,
             on_match_fn=self._refresh_album_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='jiosaavn_match_status',
             log_prefix='JioSaavn',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
+            return
+        # honor_stored_match also returns False when the stored id failed to
+        # re-fetch (transient error / rate limit). Don't fall through to a
+        # name search — it could clobber a manual match. Only search when
+        # there's genuinely no stored id (the Bandcamp guard, applied here).
+        if self._get_existing_id('album', album_id):
+            logger.debug("Preserving JioSaavn match for album '%s' despite a refresh miss", album_name)
             return
 
         query = f"{artist_name} {album_name}".strip()
@@ -419,14 +441,29 @@ class JioSaavnWorker:
             logger.debug("No match for album '%s'", album_name)
 
     def _process_track(self, track_id: int, track_name: str, artist_name: str):
-        if honor_stored_match(
+        _stored = honor_stored_match(
             db=self.db, entity_table='tracks', entity_id=track_id,
             id_column='jiosaavn_id',
             client_fetch_fn=self.client.get_track_details,
             on_match_fn=self._refresh_track_via_stored_id,
+            mark_status_fn=self._mark_status,
+            status_column='jiosaavn_match_status',
             log_prefix='JioSaavn',
-        ):
-            self.stats['matched'] += 1
+        )
+        if _stored:
+            # L2-005: a stored ID the source could not confirm right now is
+            # NOT released to a fuzzy name search below — a transient provider
+            # failure is not evidence that the ID is wrong, and searching
+            # overwrote deliberately chosen matches with whatever came back.
+            if _stored == MATCHED:
+                self.stats['matched'] += 1
+            return
+        # honor_stored_match also returns False when the stored id failed to
+        # re-fetch (transient error / rate limit). Don't fall through to a
+        # name search — it could clobber a manual match. Only search when
+        # there's genuinely no stored id (the Bandcamp guard, applied here).
+        if self._get_existing_id('track', track_id):
+            logger.debug("Preserving JioSaavn match for track '%s' despite a refresh miss", track_name)
             return
 
         query = f"{artist_name} {track_name}".strip()

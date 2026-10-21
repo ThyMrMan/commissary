@@ -30,8 +30,9 @@ def resolve_playable_tracks(db, wanted: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     wanted = list(wanted or [])[:MAX_RESOLVE]
     rows: List[Dict[str, Any]] = []
+    queue_rows: List[Dict[str, Any]] = []
     if not wanted:
-        return {"tracks": rows, "matched": 0, "total": 0}
+        return {"tracks": rows, "queue_tracks": queue_rows, "matched": 0, "total": 0}
 
     conn = db._get_connection()
     try:
@@ -42,37 +43,59 @@ def resolve_playable_tracks(db, wanted: List[Dict[str, Any]]) -> Dict[str, Any]:
         extra = "".join(
             f"t.{c}, " for c in ("bitrate", "sample_rate") if c in track_cols
         )
+        # A mix used to run one full LOWER(title) scan for every entry. Read
+        # candidate titles once, then disambiguate by artist without losing order.
+        titles = sorted({_norm(str(item.get("title") or item.get("name") or ""))
+                         for item in wanted} - {""})
+        candidates = {}
+        if titles:
+            placeholders = ",".join("?" for _ in titles)
+            cursor.execute(
+                f"""
+                SELECT t.id, t.title, t.duration, {extra}
+                       t.file_path, al.title AS album,
+                       COALESCE(al.thumb_url, ar.thumb_url) AS image_url,
+                       ar.name AS artist, t.artist_id, t.album_id
+                FROM tracks t
+                LEFT JOIN artists ar ON ar.id = t.artist_id
+                LEFT JOIN albums al ON al.id = t.album_id
+                WHERE t.file_path IS NOT NULL AND t.file_path != ''
+                  AND LOWER(t.title) IN ({placeholders})
+                ORDER BY t.id
+                """, titles,
+            )
+            for candidate in cursor.fetchall():
+                candidate = dict(candidate)
+                candidates.setdefault((_norm(candidate["title"]), _norm(candidate["artist"])), candidate)
         seen_paths = set()
         for item in wanted:
             title = _norm(str(item.get("title") or item.get("name") or ""))
             artist = _norm(str(item.get("artist") or ""))
             if not title or not artist:
                 continue
-            cursor.execute(
-                f"""
-                SELECT t.id, t.title, t.duration, {extra}
-                       t.file_path,
-                       al.title AS album,
-                       COALESCE(al.thumb_url, ar.thumb_url) AS image_url,
-                       ar.name AS artist,
-                       t.artist_id, t.album_id
-                FROM tracks t
-                LEFT JOIN artists ar ON ar.id = t.artist_id
-                LEFT JOIN albums  al ON al.id = t.album_id
-                WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                  AND LOWER(t.title) = ?
-                  AND LOWER(COALESCE(ar.name, '')) = ?
-                LIMIT 1
-                """,
-                (title, artist),
-            )
-            row = cursor.fetchone()
+            row = candidates.get((title, artist))
             if not row:
+                missing = dict(item)
+                missing.update(
+                    {
+                        "title": str(item.get("title") or item.get("name") or "").strip(),
+                        "name": str(item.get("title") or item.get("name") or "").strip(),
+                        "artist": str(item.get("artist") or "").strip(),
+                        "artists": item.get("artists") or [{"name": str(item.get("artist") or "").strip()}],
+                        "album": item.get("album") or item.get("album_title") or "",
+                        "file_path": "",
+                        "is_library": False,
+                        "playback_status": "missing",
+                    }
+                )
+                queue_rows.append(missing)
                 continue
             track = dict(row)
             if track.get("image_url"):
                 from core.metadata import normalize_image_url
                 track["image_url"] = normalize_image_url(track["image_url"]) or track["image_url"]
+            track["is_library"] = True
+            queue_rows.append(dict(track))
             # one copy per file - a mix repeating a track should not repeat it
             if track["file_path"] in seen_paths:
                 continue
@@ -80,10 +103,21 @@ def resolve_playable_tracks(db, wanted: List[Dict[str, Any]]) -> Dict[str, Any]:
             rows.append(track)
     except Exception as e:
         logger.error(f"resolve_playable_tracks failed: {e}")
-        return {"tracks": [], "matched": 0, "total": len(wanted), "error": str(e)}
+        return {
+            "tracks": [],
+            "queue_tracks": [],
+            "matched": 0,
+            "total": len(wanted),
+            "error": str(e),
+        }
     finally:
         try:
             conn.close()
         except Exception:  # noqa: BLE001, S110 - best effort
             pass
-    return {"tracks": rows, "matched": len(rows), "total": len(wanted)}
+    return {
+        "tracks": rows,
+        "queue_tracks": queue_rows,
+        "matched": len(rows),
+        "total": len(wanted),
+    }

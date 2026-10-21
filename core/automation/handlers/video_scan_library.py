@@ -47,8 +47,8 @@ def _default_run_video_scan(mode: str, media_type: str = "all") -> Dict[str, Any
     scopes it to one library ('movie' / 'show'); 'all' does both."""
     from api.video import get_video_db
     from core.video.scanner import get_video_scanner
-    from core.video.sources import get_active_video_source
-    return get_video_scanner(get_video_db()).scan_sync(get_active_video_source, mode, media_type)
+    from core.video.sources import scan_video_source
+    return get_video_scanner(get_video_db()).scan_sync(scan_video_source, mode, media_type)
 
 
 def auto_video_scan_library(
@@ -113,7 +113,7 @@ def auto_video_scan_library(
         # scan handler blocking until the scan resolves).
         deps.update_progress(
             automation_id,
-            phase=f'Reading {lib_label} library into Commissary...',
+            phase=f'Reading {lib_label} library into SoulSync...',
             progress=45,
         )
         result = run_video_scan(mode, media_type) or {}
@@ -396,7 +396,7 @@ def auto_video_update_database(
     lib_label = {'movie': 'Movie', 'show': 'TV'}.get(media_type, 'video')
     # 'deep'/'full' re-read the whole library; 'incremental' only grabs new items.
     phase = (f'Re-reading the {lib_label} library from the server…' if mode in ('deep', 'full')
-             else f'Reading new {lib_label} media into Commissary…')
+             else f'Reading new {lib_label} media into SoulSync…')
     try:
         deps.update_progress(automation_id, phase=phase, progress=40)
         result = run_video_scan(mode, media_type) or {}

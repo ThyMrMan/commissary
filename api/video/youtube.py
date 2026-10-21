@@ -15,7 +15,7 @@ yt-dlp only; reads/writes only video_library.db.
 
 from __future__ import annotations
 
-from flask import g, jsonify, request
+from flask import jsonify, request
 
 from utils.logging_config import get_logger
 
@@ -43,6 +43,16 @@ def _server():
         return resolve_video_server()
     except Exception:
         return None
+
+
+def _profile() -> int:
+    """The requesting profile: the video watchlist/wishlist are per-profile
+    (like the music side) — a non-admin must never see the admin's lists."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return int(get_current_profile_id() or 1)
+    except Exception:
+        return 1
 
 
 def register_routes(bp):
@@ -73,14 +83,14 @@ def register_routes(bp):
                 pl = yt.resolve_playlist(url, limit=max(1, min(50, limit)))
                 if not pl:
                     return jsonify({"success": False, "error": "Could not read that playlist"}), 404
-                following = bool(get_video_db().playlist_watch_state([pl["playlist_id"]]))
+                following = bool(get_video_db().playlist_watch_state([pl["playlist_id"]], profile_id=_profile()))
                 return jsonify({"success": True, "playlist": pl, "following": following})
             channel = yt.resolve_channel(url, limit=max(1, min(50, limit)))
             if not channel:
                 return jsonify({"success": False,
                                 "error": "Not a YouTube channel or playlist link (paste a channel "
                                          "URL like youtube.com/@handle, or a playlist link)"}), 404
-            following = bool(get_video_db().channel_watch_state([channel["youtube_id"]]))
+            following = bool(get_video_db().channel_watch_state([channel["youtube_id"]], profile_id=_profile()))
             return jsonify({"success": True, "channel": channel, "following": following})
         except Exception:
             logger.exception("youtube resolve failed for %r", url)
@@ -105,16 +115,10 @@ def register_routes(bp):
             if not channel or not channel.get("youtube_id"):
                 return jsonify({"success": False, "error": "Could not resolve channel"}), 404
 
-            followed = db.add_channel_to_watchlist(channel)
+            followed = db.add_channel_to_watchlist(channel, profile_id=_profile())
             # Wishlist only the configured recent slice (the resolve/preview may carry more).
             recent = (channel.get("videos") or [])[:count]
-            from . import acting_profile_id
-            _ok = bool(getattr(g, "can_download", True))
-            added = db.add_videos_to_wishlist(channel, recent, server_source=_server(),
-                                              added_by_profile_id=acting_profile_id(),
-                                              approved=_ok,
-                                              requested_by=None if _ok else acting_profile_id(),
-                                              requested_by_name=None if _ok else getattr(g, "profile_name", None))
+            added = db.add_videos_to_wishlist(channel, recent, server_source=_server(), profile_id=_profile())
             if followed:   # followed channels get their full upload-date catalog in the background
                 try:
                     from core.video.youtube_enrichment import get_youtube_date_enricher
@@ -123,7 +127,7 @@ def register_routes(bp):
                     pass
             return jsonify({"success": followed, "following": followed, "added_videos": added,
                             "channel": {k: channel.get(k) for k in ("youtube_id", "title", "avatar_url")},
-                            "counts": db.youtube_wishlist_counts()})
+                            "counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("youtube follow failed")
             return jsonify({"success": False, "error": "Failed to follow channel"}), 500
@@ -156,14 +160,11 @@ def register_routes(bp):
         def _follow_channel(ch):
             # Already following (manually or a prior import)? Leave it untouched —
             # the import is additive and must not re-wishlist or reconfigure it.
-            if db.channel_watch_state([ch["youtube_id"]]):
+            if db.channel_watch_state([ch["youtube_id"]], profile_id=_profile()):
                 return False          # → counted as 'skipped'
-            db.add_channel_to_watchlist(ch)
-            # No added_by_profile_id: this runs in the background import job, with
-            # no request context to read one from. A bulk subscription import is
-            # bookkeeping rather than one person's wish, and an unowned row is
-            # removable only by a profile with download rights — the safe default.
-            db.add_videos_to_wishlist(ch, (ch.get("videos") or [])[:count], server_source=_server())
+            db.add_channel_to_watchlist(ch, profile_id=_profile())
+            db.add_videos_to_wishlist(ch, (ch.get("videos") or [])[:count], server_source=_server(),
+                                    profile_id=_profile())
             try:
                 from core.video.youtube_enrichment import get_youtube_date_enricher
                 get_youtube_date_enricher().enqueue(ch.get("youtube_id"), ch.get("title"))
@@ -172,9 +173,9 @@ def register_routes(bp):
             return True
 
         def _follow_playlist(pl):
-            if db.playlist_watch_state([pl["playlist_id"]]):
+            if db.playlist_watch_state([pl["playlist_id"]], profile_id=_profile()):
                 return False
-            db.add_playlist_to_watchlist(pl)
+            db.add_playlist_to_watchlist(pl, profile_id=_profile())
             if pl.get("videos"):
                 try:
                     db.cache_channel_videos(pl["playlist_id"], pl["videos"])
@@ -213,7 +214,7 @@ def register_routes(bp):
         if not cid:
             return jsonify({"success": False, "error": "youtube_id is required"}), 400
         try:
-            get_video_db().remove_channel_from_watchlist(cid)
+            get_video_db().remove_channel_from_watchlist(cid, profile_id=_profile())
             return jsonify({"success": True, "following": False})
         except Exception:
             logger.exception("youtube unfollow failed")
@@ -233,7 +234,7 @@ def register_routes(bp):
                 playlist = yt.resolve_playlist(url) if url else None
             if not playlist or not playlist.get("playlist_id"):
                 return jsonify({"success": False, "error": "Could not resolve playlist"}), 404
-            ok = db.add_playlist_to_watchlist(playlist)
+            ok = db.add_playlist_to_watchlist(playlist, profile_id=_profile())
             if ok and playlist.get("videos"):   # remember the count straight away
                 try:
                     db.cache_channel_videos(playlist["playlist_id"], playlist["videos"])
@@ -252,7 +253,7 @@ def register_routes(bp):
         if not pid:
             return jsonify({"success": False, "error": "playlist_id is required"}), 400
         try:
-            get_video_db().remove_playlist_from_watchlist(pid)
+            get_video_db().remove_playlist_from_watchlist(pid, profile_id=_profile())
             return jsonify({"success": True, "following": False})
         except Exception:
             logger.exception("youtube playlist unfollow failed")
@@ -266,51 +267,77 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            channels = db.list_watchlist_channels()
-            playlists = db.list_watchlist_playlists()
+            channels = db.list_watchlist_channels(profile_id=_profile())
+            playlists = db.list_watchlist_playlists(profile_id=_profile())
             try:
                 from core.video.youtube_enrichment import get_youtube_date_enricher
                 enr = get_youtube_date_enricher()
                 for c in channels:
-                    if not db.channel_dates_enriched_recently(c["youtube_id"]):
+                    hours = db.youtube_archive_recheck_hours(c["youtube_id"], default_hours=24)
+                    if not db.channel_dates_enriched_recently(c["youtube_id"], within_hours=hours):
                         enr.enqueue(c["youtube_id"], c.get("title"))
             except Exception:
                 pass
             return jsonify({"success": True, "channels": channels, "playlists": playlists,
-                            "counts": db.youtube_wishlist_counts()})
+                            "counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("youtube channels list failed")
             return jsonify({"success": False, "error": "Failed"}), 500
 
     @bp.route("/youtube/channel/<channel_id>/settings", methods=["GET"])
     def video_youtube_channel_settings(channel_id):
-        """Per-channel overrides (custom show-name + quality), plus the global quality
-        default so the modal can show 'using default' until the user overrides."""
+        """Per-source overrides, plus the global quality default so the modal can
+        show 'using default' until the user overrides."""
         from . import get_video_db
         from core.video.youtube_quality import default_profile, load as load_quality
         db = get_video_db()
-        return jsonify({"success": True, "settings": db.get_channel_settings(channel_id) or {},
+        kind = str(request.args.get("kind") or "channel").strip().lower()
+        settings = db.get_playlist_settings(channel_id) if kind == "playlist" else db.get_channel_settings(channel_id)
+        return jsonify({"success": True, "settings": settings or {},
                         "default_quality": load_quality(db) or default_profile()})
 
     @bp.route("/youtube/channel/<channel_id>/settings", methods=["POST"])
     def video_youtube_channel_settings_save(channel_id):
-        """Save per-channel overrides. A blank custom_name / absent quality clears that
-        override (falls back to the channel title / global quality). Body:
-        {custom_name?, quality?{...}}."""
+        """Save per-source overrides. Blank/default values clear the override. Body:
+        {custom_name?, quality?{...}, retry_policy?, archive_recheck_days?, filters...}."""
         from . import get_video_db
         from core.video.youtube_quality import normalize as normalize_quality
         db = get_video_db()
         body = request.get_json(silent=True) or {}
+        kind = str(request.args.get("kind") or body.get("kind") or "channel").strip().lower()
         out = {}
         name = str(body.get("custom_name") or "").strip()
         if name:
             out["custom_name"] = name
         if body.get("quality"):       # falsy/absent → no override (use the global default)
             out["quality"] = normalize_quality(body.get("quality"))
-        keep = str(body.get("retention") or "").strip()
-        if keep and keep != "all":    # blank/'all' → no policy (keep everything)
-            out["retention"] = keep
-        db.set_channel_settings(channel_id, out)
+        if kind != "playlist":
+            for key in ("title_include", "title_exclude"):
+                val = str(body.get(key) or "").strip()
+                if val:
+                    out[key] = val
+            try:
+                mins = int(body.get("min_minutes") or 0)
+            except (TypeError, ValueError):
+                mins = 0
+            if mins > 0:
+                out["min_minutes"] = mins
+            keep = str(body.get("retention") or "").strip()
+            if keep and keep != "all":    # blank/'all' → no policy (keep everything)
+                out["retention"] = keep
+        retry = str(body.get("retry_policy") or "").strip().lower()
+        if retry in ("aggressive", "manual"):
+            out["retry_policy"] = retry
+        try:
+            days = int(body.get("archive_recheck_days") or 0)
+        except (TypeError, ValueError):
+            days = 0
+        if days > 0:
+            out["archive_recheck_days"] = max(1, min(days, 365))
+        if kind == "playlist":
+            db.set_playlist_settings(channel_id, out)
+        else:
+            db.set_channel_settings(channel_id, out)
         return jsonify({"success": True, "settings": out})
 
     @bp.route("/youtube/wishlist", methods=["GET"])
@@ -319,10 +346,10 @@ def register_routes(bp):
         from . import get_video_db
         try:
             db = get_video_db()
-            res = db.query_youtube_wishlist(
+            res = db.query_youtube_wishlist(profile_id=_profile(), 
                 search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
                 page=request.args.get("page", 1), limit=request.args.get("limit", 60))
-            return jsonify({"success": True, "counts": db.youtube_wishlist_counts(), **res})
+            return jsonify({"success": True, "counts": db.youtube_wishlist_counts(profile_id=_profile()), **res})
         except Exception:
             logger.exception("youtube wishlist list failed")
             return jsonify({"success": False, "error": "Failed"}), 500
@@ -340,7 +367,7 @@ def register_routes(bp):
         try:
             db = get_video_db()
             cid = str(channel_id).strip()
-            following = bool(db.channel_watch_state([cid]))
+            following = bool(db.channel_watch_state([cid], profile_id=_profile()))
             # Opening a channel page → (re)remember it in the background (followed or
             # not — you're looking at it). The enricher caches list + meta + dates.
             try:
@@ -377,7 +404,7 @@ def register_routes(bp):
 
             vids = channel.get("videos") or []
             ids = [v.get("youtube_id") for v in vids]
-            wished = db.youtube_video_wish_state(ids)
+            wished = db.youtube_video_wish_state(ids, profile_id=_profile())
             # Real ownership: a completed download in the permanent history —
             # 'owned' on the channel page means ON DISK, not merely wished.
             try:
@@ -426,7 +453,7 @@ def register_routes(bp):
             videos, token = page.get("videos") or [], page.get("continuation")
             ids = [v.get("youtube_id") for v in videos if v.get("youtube_id")]
             cached = db.get_video_dates(ids)
-            wished = db.youtube_video_wish_state(ids)
+            wished = db.youtube_video_wish_state(ids, profile_id=_profile())
             # Same ownership annotation as the initial detail load — without it
             # every video streamed in via continuation looked un-downloaded.
             try:
@@ -543,7 +570,7 @@ def register_routes(bp):
             return jsonify({"success": True, "channels": []})
         try:
             chans = yt.search_channels(q)
-            following = get_video_db().channel_watch_state([c["youtube_id"] for c in chans])
+            following = get_video_db().channel_watch_state([c["youtube_id"] for c in chans], profile_id=_profile())
             for c in chans:
                 c["following"] = c["youtube_id"] in following
             return jsonify({"success": True, "channels": chans})
@@ -559,7 +586,7 @@ def register_routes(bp):
         from core.video import youtube as yt
         try:
             pls = yt.channel_playlists(channel_id)
-            followed = get_video_db().playlist_watch_state([p.get("playlist_id") for p in pls])
+            followed = get_video_db().playlist_watch_state([p.get("playlist_id") for p in pls], profile_id=_profile())
             for p in pls:
                 p["following"] = p.get("playlist_id") in followed
             return jsonify({"success": True, "playlists": pls})
@@ -599,7 +626,7 @@ def register_routes(bp):
                 pass
             vids = pl.get("videos") or []
             ids = [v.get("youtube_id") for v in vids]
-            wished = db.youtube_video_wish_state(ids)
+            wished = db.youtube_video_wish_state(ids, profile_id=_profile())
             dates = db.get_video_dates(ids)
             try:
                 downloaded = set(db.owned_youtube_video_ids() or [])
@@ -615,7 +642,7 @@ def register_routes(bp):
             except Exception:
                 pass
             return jsonify({"success": True, "videos": vids, "playlist": pl,
-                            "following": bool(db.playlist_watch_state([pl["playlist_id"]])),
+                            "following": bool(db.playlist_watch_state([pl["playlist_id"]], profile_id=_profile())),
                             "kind": "playlist", "source": "youtube"})
         except Exception:
             logger.exception("youtube playlist failed for %r", playlist_id)
@@ -625,7 +652,7 @@ def register_routes(bp):
     def video_youtube_wishlist_add():
         """Wish specific videos (per-video add from the channel page). Body:
         {channel: {youtube_id, title, avatar_url?}, videos: [{youtube_id, title, …}]}."""
-        from . import get_video_db, acting_profile_id
+        from . import get_video_db
         body = request.get_json(silent=True) or {}
         channel = body.get("channel") or {}
         videos = body.get("videos") or []
@@ -635,30 +662,21 @@ def register_routes(bp):
             db = get_video_db()
             # A manual add is deliberate — it may re-wish an already-downloaded
             # video (the user can see the ✓ downloaded marker; they want it again).
-            # Pending unless this profile may acquire — same gate as the TMDB
-            # wishlist. The videos are wished and visible either way.
-            _ok = bool(getattr(g, "can_download", True))
             n = db.add_videos_to_wishlist(channel, videos, server_source=_server(),
-                                          allow_downloaded=True,
-                                          added_by_profile_id=acting_profile_id(),
-                                          approved=_ok,
-                                          requested_by=None if _ok else acting_profile_id(),
-                                          requested_by_name=None if _ok else getattr(g, "profile_name", None))
+                                          allow_downloaded=True, profile_id=_profile())
             if not n:
                 return jsonify({"success": False, "added": 0,
                                 "error": "Couldn't add — the video may be missing its id"})
-            return jsonify({"success": True, "added": n, "counts": db.youtube_wishlist_counts()})
+            return jsonify({"success": True, "added": n,
+                            "counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("youtube wishlist add failed")
             return jsonify({"success": False, "error": "Failed"}), 500
 
     @bp.route("/youtube/wishlist/remove", methods=["POST"])
     def video_youtube_wishlist_remove():
-        """Remove wished videos. Body: {scope: 'channel'|'video', source_id}.
-
-        Ownership-scoped for a profile without download rights, exactly like
-        /wishlist/remove — they can drop the videos they wished for and no more."""
-        from . import get_video_db, wishlist_owner_filter
+        """Remove wished videos. Body: {scope: 'channel'|'video', source_id}."""
+        from . import get_video_db
         body = request.get_json(silent=True) or {}
         scope = body.get("scope")
         source_id = (body.get("source_id") or "").strip()
@@ -666,12 +684,9 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "scope and source_id are required"}), 400
         try:
             db = get_video_db()
-            owner = wishlist_owner_filter()
-            removed = db.remove_youtube_from_wishlist(scope, source_id, only_profile_id=owner)
-            if owner is not None and not removed and db.count_youtube_wishlist_rows(scope, source_id):
-                return jsonify({"success": False,
-                                "error": "You can only remove videos you added yourself."}), 403
-            return jsonify({"success": True, "removed": removed, "counts": db.youtube_wishlist_counts()})
+            removed = db.remove_youtube_from_wishlist(scope, source_id, profile_id=_profile())
+            return jsonify({"success": True, "removed": removed,
+                            "counts": db.youtube_wishlist_counts(profile_id=_profile())})
         except Exception:
             logger.exception("youtube wishlist remove failed")
             return jsonify({"success": False, "error": "Failed"}), 500

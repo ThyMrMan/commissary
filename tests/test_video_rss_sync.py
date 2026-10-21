@@ -101,25 +101,6 @@ def test_matching_release_is_grabbed_instantly(db, seams):
     assert "Heat" in g["best"]["title"]
 
 
-def test_matched_item_with_its_own_library_overrides_the_batch_target(db, seams):
-    """multi-library #1105: RSS shares the same batch-hoisted-target bug the
-    wishlist drain had — a title already filed under a Library (e.g. Anime)
-    must grab there, not into the primary target every OTHER matched item
-    in this pass gets."""
-    _enable_torrent(db)
-    movie_id = db.upsert_movie("plex", {"server_id": "m1", "tmdb_id": 1, "title": "Heat"})
-    conn = db._get_connection()
-    cur = conn.execute(
-        "INSERT INTO root_folders (path, content_kind, server, category) VALUES (?,?,?,?)",
-        ("/media/anime", "movie", "plex", "anime"))
-    conn.execute("UPDATE movies SET root_folder_id=? WHERE id=?", (cur.lastrowid, movie_id))
-    conn.commit(); conn.close()
-    db.add_movie_to_wishlist(1, "Heat", year=1995, library_id=movie_id)
-    out = rss.rss_pass(fetch=lambda: [_feed_hit("Heat 1995 1080p BluRay x264-GRP")])
-    assert out["grabbed"] == 1
-    assert seams[0]["root"] == "/media/anime"
-
-
 def test_episode_release_matches_by_sxxexx(db, seams):
     _enable_torrent(db)
     db.add_episodes_to_wishlist(500, "Severance", [
@@ -157,8 +138,11 @@ def test_owned_item_only_accepts_strictly_better(db, seams, monkeypatch):
     real_annotate = vpw.annotate_upgrades
     orig_fetch = db.movie_wishlist_to_download
 
-    def fake_items():
-        items = orig_fetch()
+    def fake_items(**kw):
+        # **kw: the real getter grew `due_only` for the retry backoff. RSS passes
+        # due_only=False (matching a feed spends no searches), and a stub that
+        # can't take it fails the pass rather than the assertion.
+        items = orig_fetch(**kw)
         for it in items:
             it["owned"] = 1
             it["owned_resolutions"] = "1080p"
@@ -217,7 +201,7 @@ def test_skip_reason_reports_upgrade_only_for_owned(db, seams, monkeypatch):
     db.add_movie_to_wishlist(1, "Heat", year=1995)
     orig = db.movie_wishlist_to_download
 
-    def owned_1080():
+    def owned_1080(**kw):   # **kw: the getter grew due_only for the retry backoff
         items = orig()
         for it in items:
             it["owned"] = 1

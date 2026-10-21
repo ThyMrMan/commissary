@@ -1,5 +1,5 @@
 /*
- * Commissary — Video Library Maintenance (Tools page).
+ * SoulSync — Video Library Maintenance (Tools page).
  *
  * The music repair UI, video-scoped — SAME card DOM as enrichment.js's
  * loadRepairJobs/loadRepairFindings/loadRepairHistory so the shared .repair-*
@@ -59,12 +59,13 @@
         youtube_mass_missing: 'Mass Missing',
         watched_cleanup: 'Watched Cleanup',
         naming_mismatch: 'Naming',
+        missing_subtitles: 'Missing Subtitles',
     };
     // Types absent here are report-only: no approve button, dismiss + details only.
     var FIXABLE_TYPES = {
         missing_episodes: 'Send to Wishlist',
         incomplete_collection: 'Add to Wishlist',
-        quality_upgrade: 'Download Upgrade',
+        quality_upgrade: 'Grab Upgrade',
         broken_file: 'Re-download',
         metadata_gap: 'Re-enrich',
         stale_wishlist: 'Remove',
@@ -72,11 +73,12 @@
         youtube_mass_missing: 'Flag Individually',
         watched_cleanup: 'Clean Up',
         naming_mismatch: 'Rename',
+        missing_subtitles: 'Queue Subtitles',
     };
     var ACTION_LABELS = { wishlisted: 'Wishlisted', grabbed: 'Grabbed', refreshed: 'Refreshed',
         removed: 'Removed', resolved: 'Resolved',
         marked_deleted: 'Marked Deleted', forgotten: 'Forgotten', flagged: 'Flagged',
-        cleaned: 'Cleaned', renamed: 'Renamed' };
+        cleaned: 'Cleaned', renamed: 'Renamed', queued: 'Queued' };
     var GAP_LABELS = { unmatched: 'not TMDB-matched', overview: 'no summary',
         genres: 'no genres', poster: 'no poster', backdrop: 'no backdrop' };
 
@@ -443,6 +445,7 @@
         if (f.finding_type === 'youtube_mass_missing') return massMissingDetailHTML(d);
         if (f.finding_type === 'watched_cleanup') return watchedDetailHTML(d);
         if (f.finding_type === 'naming_mismatch') return namingDetailHTML(d);
+        if (f.finding_type === 'missing_subtitles') return subtitlesDetailHTML(d);
         return '<pre class="repair-finding-json">' + esc(JSON.stringify(d, null, 2)) + '</pre>';
     }
 
@@ -535,9 +538,7 @@
                 '<div class="vrf-show-title">' + esc(d.title || '?') + '</div>' +
                 '<div class="vrf-chips"><span class="vrf-chip vrf-chip--got">✓ already owned</span>' +
                     '<span class="vrf-chip">' + esc(d.kind || 'movie') + '</span></div>' +
-                // Why this row is dead weight depends on WHICH rule caught it: a row
-                // kept for an upgrade the engine is still chasing (include below
-                // cutoff) is not "sitting forever", and saying so would be a lie.
+                // Commissary: a row caught by 'include below cutoff' IS still chased.
                 '<p class="vrf-show-overview">' +
                     (d.reason === 'already downloaded and imported'
                         ? 'You already have this. Approving removes the wishlist row and ends ' +
@@ -575,7 +576,7 @@
             '<div class="vrf-show-info">' +
                 '<div class="vrf-show-title">' + esc(d.title || '?') + '</div>' +
                 '<div class="vrf-chips">' + chips + '</div>' +
-                '<p class="vrf-show-overview">Commissary downloaded this episode but the file is gone ' +
+                '<p class="vrf-show-overview">SoulSync downloaded this episode but the file is gone ' +
                     '(' + esc(d.dest_path || 'no path recorded') + '). Approving marks it deleted — ' +
                     'the badge clears and it will NOT be re-downloaded. Files are never touched.</p>' +
                 '<div class="vrf-actions">' + actions + '</div>' +
@@ -641,6 +642,47 @@
                 'the server picks the new name up on its next scan. Nothing is ever overwritten.</p>';
     }
 
+    // ── Missing Subtitles: which languages, per movie or per episode ─────────
+    function subLangChips(missing) {
+        return (missing || []).map(function (m) {
+            var label = String(m[0] || '?').toUpperCase() + (m[1] ? ' HI' : '') + (m[2] ? ' forced' : '');
+            return '<span class="vrf-chip vrf-chip--miss">' + esc(label) + '</span>';
+        }).join('');
+    }
+    function subtitlesDetailHTML(d) {
+        var isShow = d.kind === 'show';
+        var poster = d.library_id != null
+            ? '<img class="vrf-poster" src="/api/video/poster/' + (isShow ? 'show' : 'movie') + '/' +
+              d.library_id + '" alt="" loading="lazy" onerror="this.style.visibility=\'hidden\'">'
+            : '<div class="vrf-poster vrf-poster--empty">💬</div>';
+        var items = d.items || [];
+        var body;
+        if (isShow) {
+            var shown = items.slice(0, 60);
+            body = '<div class="repair-ep-list">' + shown.map(function (it) {
+                return '<div class="repair-ep-row"><span class="repair-ep-code">' + esc(it.label || '') +
+                    '</span><span class="repair-ep-title">' + subLangChips(it.missing) + '</span></div>';
+            }).join('') + '</div>' +
+            (items.length > shown.length
+                ? '<p class="repair-finding-hint">+' + (items.length - shown.length) + ' more episodes</p>' : '');
+        } else {
+            body = '<div class="vrf-chips">' + subLangChips((items[0] || {}).missing) + '</div>';
+        }
+        var view = d.library_id != null
+            ? '<button class="vrf-btn" type="button" data-vjr-open-' + (isShow ? 'show' : 'movie') + '="' +
+              d.library_id + '">View ' + (isShow ? 'show' : 'movie') + ' →</button>' : '';
+        return '<div class="vrf-show">' + poster +
+            '<div class="vrf-show-info">' +
+                '<div class="vrf-show-title">' + esc(d.title || '?') +
+                    (d.year ? ' <span class="vrf-mini-year">' + esc(d.year) + '</span>' : '') + '</div>' +
+                (isShow ? '' : body) +
+                '<p class="vrf-show-overview">No subtitle file next to the video and no embedded track ' +
+                    'in these languages. Approving queues them: the subtitle worker fetches them within ' +
+                    'your daily quota. Nothing is downloaded from here.</p>' +
+                '<div class="vrf-actions">' + view + '</div>' +
+            '</div></div>' + (isShow ? body : '');
+    }
+
     function simpleEpisodeList(d) {
         var rows = (d.episodes || []).map(function (e) {
             var code = 'S' + String(e.season_number).padStart(2, '0') +
@@ -673,7 +715,14 @@
         // quality_upgrade / broken_file / metadata_gap — one shared movie panel.
         var fallback = '<pre class="repair-finding-json">' +
             esc(JSON.stringify(d, null, 2)) + '</pre>';
-        if (d.movie_id == null) { host.innerHTML = fallback; return; }
+        if (d.movie_id == null) {
+            if (f.finding_type === 'quality_upgrade' && d.kind === 'episode') {
+                host.innerHTML = episodeQualityPanelHTML(f, d);
+                return;
+            }
+            host.innerHTML = fallback;
+            return;
+        }
         jget('/api/video/detail/movie/' + d.movie_id)
             .then(function (movie) {
                 host.innerHTML = movie ? moviePanelHTML(f, d, movie) : fallback;
@@ -1316,7 +1365,7 @@
                         body: JSON.stringify({ name: rs.getAttribute('data-vbk-restore') }) })
                         .then(function (r) { return r.json(); })
                         .then(function (d) {
-                            if (d && d.success) { if (typeof showToast === 'function') showToast('Restore staged — restart Commissary to apply', 'success'); loadBackups(); }
+                            if (d && d.success) { if (typeof showToast === 'function') showToast('Restore staged — restart SoulSync to apply', 'success'); loadBackups(); }
                             else if (typeof showToast === 'function') showToast((d && d.error) || 'Could not stage the restore', 'error');
                         })
                         .catch(function () { /* toast skipped */ });

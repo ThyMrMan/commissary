@@ -1,15 +1,47 @@
 """Duplicate Track Detector Job — finds potential duplicate tracks in the library."""
 
 import os
+import re
 from collections import defaultdict
 from difflib import SequenceMatcher
 
+from core.downloads.candidates import _strip_featuring
+from core.imports.compilation import VARIOUS_ARTIST_NAMES
 from core.imports.file_ops import _strip_slskd_dedup_suffix
+from core.library.duplicate_rules import (
+    is_lossy_companion_pair as _is_lossy_companion_pair,
+    lossy_companion_exts,
+)
+from core.library.file_tags import read_embedded_tags
 from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob
+from core.repair_jobs.base import (
+    JobContext,
+    JobResult,
+    RepairJob,
+    hand_tagged_path_keys,
+    is_hand_tagged_path,
+    not_locked_sql,
+)
+from database.music_database import split_credit_names
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.duplicates")
+
+_ROMAN_SEQUENCE = re.compile(
+    r'\b(?:pt|pts|part|parts|movement|movements|segue|interlude|chapter|act)\s*([ivx]+)\b'
+)
+_ROMAN_VALUES = dict(zip(
+    'i ii iii iv v vi vii viii ix x xi xii xiii xiv xv xvi xvii xviii xix xx'.split(),
+    range(1, 21),
+    strict=True,
+))
+_EDITION_YEAR = re.compile(
+    r'\b(?:remaster(?:ed)?|mix|edition|version)\s*(?P<after>(?:19|20)\d{2})\b'
+    r'|\b(?P<before>(?:19|20)\d{2})(?=\s*(?:remaster(?:ed)?|mix|edition|version)\b)'
+)
+_LIVE_YEAR = re.compile(
+    r'\blive\s+(?:(?:mix|edition|version)\s+)?(?P<year>(?:19|20)\d{2})\b'
+)
 
 
 @register_job
@@ -42,16 +74,21 @@ class DuplicateDetectorJob(RepairJob):
 
     def scan(self, context: JobContext) -> JobResult:
         result = JobResult()
+        self._membership = None
 
         settings = self._get_settings(context)
         title_threshold = float(settings.get('title_similarity', 0.85))
         artist_threshold = float(settings.get('artist_similarity', 0.80))
-        ignore_cross_album = settings.get('ignore_cross_album', True)
+        # fallback matches default_settings — it used to say True, which would have
+        # silently enabled the 'most common cause of missed duplicates' (per this
+        # job's own help text) on any settings dict missing the key
+        ignore_cross_album = settings.get('ignore_cross_album', False)
 
-        # Respect the global "allow duplicate tracks across albums" setting —
-        # if the user explicitly allows duplicates across albums, never flag them
-        if context.config_manager and context.config_manager.get('library.allow_duplicate_tracks', False):
-            ignore_cross_album = True
+        # (a 'library.allow_duplicate_tracks' override used to live here — a
+        # dead key nothing ever writes; the job's own ignore_cross_album
+        # setting is the real control)
+
+        lossy_companion_exts = self._lossy_companion_exts(context)
 
         # Fetch all tracks with artist/album names via JOIN
         tracks = []
@@ -59,16 +96,33 @@ class DuplicateDetectorJob(RepairJob):
         try:
             conn = context.db._get_connection()
             cursor = conn.cursor()
+            # artist_id is the ALBUM artist, so a compilation copy read as
+            # 'Various Artists' and never matched the same song on the
+            # artist's own album (#1263). the per-track credit wins when set
+            # hand-tagged: a live take the user typed would pair with its
+            # studio twin and one of them gets offered for deletion
+            locked_filter = not_locked_sql(cursor, 'tracks', 't')
             cursor.execute("""
-                SELECT t.id, t.title, ar.name, al.title, t.file_path,
-                       t.bitrate, t.duration, al.thumb_url, ar.thumb_url, ar.id
+                SELECT t.id, t.title, COALESCE(NULLIF(t.track_artist, ''), ar.name),
+                       al.title, t.file_path,
+                       t.bitrate, t.duration, al.thumb_url, ar.thumb_url, ar.id,
+                       t.track_artist, ar.name
                 FROM tracks t
                 LEFT JOIN artists ar ON ar.id = t.artist_id
                 LEFT JOIN albums al ON al.id = t.album_id
                 WHERE t.title IS NOT NULL AND t.title != ''
                   AND t.file_path IS NOT NULL AND t.file_path != ''
-            """)
+            """ + locked_filter)
             tracks = cursor.fetchall()
+            # #1315: track_artist only exists for rows written by a post-3.4.6
+            # sync. older rows on compilation albums still fall back to the
+            # album artist ('Various Artists') and can never match the
+            # performer's own copy — the exact #1263 miss, surviving the
+            # #1263 fix. heal those rows from the file's own tags before
+            # bucketing, and persist so the read happens once.
+            healed_artists = self._heal_compilation_track_artists(cursor, tracks)
+            if healed_artists:
+                conn.commit()
         except Exception as e:
             logger.error("Error fetching tracks from DB: %s", e, exc_info=True)
             result.errors += 1
@@ -87,9 +141,21 @@ class DuplicateDetectorJob(RepairJob):
         # Group tracks by normalized key for fast comparison
         # Bucket by first 4 chars of normalized title for efficiency
         buckets = defaultdict(list)
+        hand_tagged = hand_tagged_path_keys(context.db)
         for row in tracks:
-            track_id, title, artist_name, album_title, file_path, bitrate, duration, album_thumb, artist_thumb, artist_id = row
-            norm_title = _normalize(title)
+            (track_id, title, artist_name, album_title, file_path, bitrate,
+             duration, album_thumb, artist_thumb, artist_id,
+             _raw_track_artist, _album_artist) = row
+            # #1315 healing: prefer the file-tag credit over the
+            # 'Various Artists' fallback for rows that never synced it
+            artist_name = healed_artists.get(track_id, artist_name)
+            # same reason, for a hand-tagged file whose row isn't locked yet
+            if is_hand_tagged_path(file_path, hand_tagged):
+                continue
+            # a feat credit names who's on it, not which version: 'Crack a
+            # Bottle (feat. Dr. Dre & 50 Cent)' is 'Crack A Bottle' tagged
+            # by another source (#1568, scored 0.54 and was never flagged)
+            norm_title = _normalize(_strip_featuring(title))
             bucket_key = norm_title[:4] if len(norm_title) >= 4 else norm_title
             buckets[bucket_key].append({
                 'id': track_id,
@@ -97,6 +163,7 @@ class DuplicateDetectorJob(RepairJob):
                 'norm_title': norm_title,
                 'artist': artist_name or '',
                 'norm_artist': _normalize(artist_name or ''),
+                'artist_names': _credit_names(artist_name),
                 'album': album_title,
                 'file_path': file_path,
                 'bitrate': bitrate,
@@ -120,6 +187,7 @@ class DuplicateDetectorJob(RepairJob):
             self._scan_bucket(
                 bucket_tracks=bucket_tracks,
                 require_metadata_match=True,
+                lossy_companion_exts=lossy_companion_exts,
                 title_threshold=title_threshold,
                 artist_threshold=artist_threshold,
                 ignore_cross_album=ignore_cross_album,
@@ -153,6 +221,7 @@ class DuplicateDetectorJob(RepairJob):
             self._scan_bucket(
                 bucket_tracks=fname_tracks,
                 require_metadata_match=False,
+                lossy_companion_exts=lossy_companion_exts,
                 title_threshold=title_threshold,
                 artist_threshold=artist_threshold,
                 ignore_cross_album=ignore_cross_album,
@@ -170,6 +239,49 @@ class DuplicateDetectorJob(RepairJob):
                      result.scanned, result.findings_created)
         return result
 
+    def _heal_compilation_track_artists(self, cursor, tracks) -> dict:
+        """Backfill NULL track_artist from the file's own tags (#1315).
+
+        track_artist is only written by a post-3.4.6 sync, so every older
+        row on a compilation album falls back to the album artist
+        ('Various Artists') and can never match the performer's own copy
+        — the exact #1263 miss, surviving the #1263 fix. For those rows
+        the ground truth is in the file: read its embedded artist tag,
+        use it for this scan, and persist it so the read happens once.
+
+        Scoped to compilation-marker album artists so a normal library
+        doesn't pay a tag read per track. Mirrors the sync convention —
+        only a credit that differs from the album artist is stored, so a
+        NULL that genuinely means "same as album artist" stays NULL.
+        """
+        healed = {}
+        for row in tracks:
+            track_id, file_path = row[0], row[4]
+            raw_track_artist, album_artist = row[10], row[11] or ''
+            if raw_track_artist:
+                continue  # already has a per-track credit
+            album_artist_norm = album_artist.strip().casefold()
+            if album_artist_norm not in VARIOUS_ARTIST_NAMES:
+                continue
+            tag_artist = _embedded_artist_name(file_path)
+            if not tag_artist:
+                continue
+            tag_norm = tag_artist.casefold()
+            if tag_norm in VARIOUS_ARTIST_NAMES:
+                continue  # the file says so too — nothing learned
+            if tag_norm == album_artist_norm:
+                continue  # fallback was already right; keep the NULL
+            healed[track_id] = tag_artist
+        for track_id, artist in healed.items():
+            cursor.execute(
+                "UPDATE tracks SET track_artist = ? WHERE id = ? "
+                "AND (track_artist IS NULL OR track_artist = '')",
+                (artist, track_id))
+        if healed:
+            logger.info("duplicate detector: healed track_artist for %d "
+                        "compilation tracks from file tags", len(healed))
+        return healed
+
     def _scan_bucket(
         self,
         *,
@@ -183,6 +295,7 @@ class DuplicateDetectorJob(RepairJob):
         total,
         result,
         context,
+        lossy_companion_exts=frozenset(),
     ) -> None:
         """Compare every pair within a bucket; emit duplicate groups.
 
@@ -214,6 +327,7 @@ class DuplicateDetectorJob(RepairJob):
                 continue
 
             group = [t1]
+            numbered_title = t1['norm_title']
 
             for j in range(i + 1, len(bucket_tracks)):
                 t2 = bucket_tracks[j]
@@ -228,11 +342,23 @@ class DuplicateDetectorJob(RepairJob):
                 if ignore_cross_album and t1['album'] and t2['album'] and t1['album'] != t2['album']:
                     continue
 
+                # a lossless file with its own intentional lossy copy beside
+                # it (the lossy-copy feature) is not a duplicate
+                if _is_lossy_companion_pair(
+                        t1['file_path'], t2['file_path'], lossy_companion_exts):
+                    continue
+
+                # Part/sequence numbers distinguish tracks even when their
+                # remaining titles are nearly identical. Apply this to both
+                # passes: a shared filename cannot override conflicting tags.
+                if _conflicting_title_numbers(numbered_title, t2['norm_title']):
+                    continue
+
                 if require_metadata_match:
                     title_sim = SequenceMatcher(None, t1['norm_title'], t2['norm_title']).ratio()
                     if title_sim < title_threshold:
                         continue
-                    artist_sim = SequenceMatcher(None, t1['norm_artist'], t2['norm_artist']).ratio()
+                    artist_sim = _artist_similarity(t1, t2)
                     if artist_sim < artist_threshold:
                         continue
                 else:
@@ -249,7 +375,7 @@ class DuplicateDetectorJob(RepairJob):
                         if abs(t1['duration'] - t2['duration']) > 3.0:
                             continue
                     elif t1['norm_artist'] and t2['norm_artist']:
-                        artist_sim = SequenceMatcher(None, t1['norm_artist'], t2['norm_artist']).ratio()
+                        artist_sim = _artist_similarity(t1, t2)
                         if artist_sim < 0.6:
                             continue
                     # else: both durations missing AND at least one artist
@@ -265,6 +391,10 @@ class DuplicateDetectorJob(RepairJob):
                     continue
 
                 group.append(t2)
+                # A numberless first row may match either part, but cannot
+                # bridge Part 1 and Part 2 into the same duplicate group.
+                if not _title_numbers(numbered_title):
+                    numbered_title = t2['norm_title']
 
             if len(group) >= 2:
                 for t in group:
@@ -278,6 +408,7 @@ class DuplicateDetectorJob(RepairJob):
 
                 if context.create_finding:
                     try:
+                        playlists = self._playlist_membership(context)
                         group.sort(key=lambda t: (t['bitrate'] or 0), reverse=True)
                         inserted = context.create_finding(
                             job_id=self.job_id,
@@ -297,6 +428,9 @@ class DuplicateDetectorJob(RepairJob):
                                     'file_path': t['file_path'],
                                     'bitrate': t['bitrate'],
                                     'duration': t['duration'],
+                                    # so keep best keeps the copy a playlist
+                                    # points at (jadux)
+                                    'playlists': list(playlists.get(str(t['id']), [])),
                                 } for t in group],
                                 'count': len(group),
                                 'album_thumb_url': group[0].get('album_thumb_url'),
@@ -314,6 +448,31 @@ class DuplicateDetectorJob(RepairJob):
 
         if context.update_progress and processed_holder['count'] % 200 == 0:
             context.update_progress(processed_holder['count'], total)
+
+    def _playlist_membership(self, context: JobContext) -> dict:
+        """{track_id: [playlist titles]}, read once per scan, only once a
+        duplicate shows up. no reader or a failed read = {} (nothing tagged)."""
+        cached = getattr(self, '_membership', None)
+        if cached is not None:
+            return cached
+        membership = {}
+        reader = getattr(context, 'playlist_membership', None)
+        if reader:
+            try:
+                membership = reader() or {}
+            except Exception as e:
+                logger.debug("playlist membership read failed: %s", e)
+        self._membership = membership
+        return membership
+
+    def _lossy_companion_exts(self, context: JobContext) -> set:
+        """Extensions the lossy-copy feature writes next to lossless
+        sources — from the global toggle and any quality profile that has
+        it on. Empty set when nobody uses the feature, so nothing is ever
+        skipped for users who don't."""
+        return lossy_companion_exts(
+            context.config_manager, context.db, logger=logger,
+        )
 
     def _build_filename_buckets(self, *, buckets, found_groups):
         """Re-bucket all tracks by canonical filename stem.
@@ -336,7 +495,10 @@ class DuplicateDetectorJob(RepairJob):
                 if not stem:
                     continue
                 canonical = _strip_slskd_dedup_suffix(stem)
-                key = (canonical.lower(), ext.lower())
+                # stem only - keying on the extension too made this pass
+                # blind to 'same track, two formats, one folder', which is
+                # exactly where tags disagree most (flac + ogg rips)
+                key = canonical.lower()
                 filename_buckets[key].append(track)
         return {k: v for k, v in filename_buckets.items() if len(v) >= 2}
 
@@ -347,6 +509,18 @@ class DuplicateDetectorJob(RepairJob):
         merged = self.default_settings.copy()
         merged.update(cfg)
         return merged
+
+
+def _embedded_artist_name(file_path: str) -> str:
+    """The file's own embedded artist tag, '' when unreadable. Never raises."""
+    try:
+        info = read_embedded_tags(file_path)
+    except Exception:
+        return ''
+    if not info.get('available'):
+        return ''
+    tags = info.get('tags') or {}
+    return (tags.get('artist') or '').strip()
 
 
 def _normalize(text: str) -> str:
@@ -364,19 +538,73 @@ def _normalize(text: str) -> str:
     keeping any-script alphanumerics fixes every non-Latin script at once and
     needs no per-range maintenance. Dedup compares two library rows, so unlike
     matching_engine we don't transliterate — the native script is kept as-is.)
+
+    Dash-form provenance tails are stripped: ``Rabbit Run - From "8 Mile"
+    Soundtrack`` names the source release, not the song, so differently-tagged
+    copies of one recording still match (#1315 follow-up — kevin2xk's 8 Mile
+    pair scored 0.45 and was never flagged). Mirrors the rule
+    audio_verification has long applied. Dash-form only: parenthesized content
+    is still kept, so ``title`` vs ``title (from the vault)`` keep
+    distinguishing as the paragraph above requires.
     """
     if not text:
         return ""
     t = text.lower()
+    t = re.sub(r'\s*-\s*from\s+.+$', '', t)
     return ''.join(c for c in t if c.isalnum() or c in '() ').strip()
+
+
+def _conflicting_title_numbers(title1: str, title2: str) -> bool:
+    """Keep explicitly different numbered titles out of duplicate groups.
+
+    Only a conflict between two present numbers is decisive. A numberless
+    title may be an incomplete tag for the same recording.
+    """
+    numbers1 = _title_numbers(title1)
+    numbers2 = _title_numbers(title2)
+    return bool(numbers1 and numbers2 and numbers1 != numbers2)
+
+
+def _title_numbers(title: str) -> tuple[int, ...]:
+    """Read track numbers, excluding years explicitly labeling an edition."""
+    edition_years = {
+        match.start('after' if match.group('after') else 'before')
+        for match in _EDITION_YEAR.finditer(title)
+    }
+    # "Live Version 1977" still identifies the performance year, even
+    # though "version" is normally an edition marker.
+    edition_years.difference_update(match.start('year') for match in _LIVE_YEAR.finditer(title))
+    numbers = [(match.start(), int(match.group())) for match in re.finditer(r'\d+', title)
+               if match.start() not in edition_years]
+    for match in _ROMAN_SEQUENCE.finditer(title):
+        value = _ROMAN_VALUES.get(match.group(1))
+        if value is not None:
+            numbers.append((match.start(1), value))
+    return tuple(value for _, value in sorted(numbers))
+
+
+def _credit_names(artist: str) -> list:
+    """every credited name in an artist string, normalized, whole string
+    first. split BEFORE normalizing, _normalize eats the ';' and '&'."""
+    names = [_normalize(n) for n in split_credit_names(artist or '')]
+    return [n for n in names if n]
+
+
+def _artist_similarity(t1: dict, t2: dict) -> float:
+    """best match between any credited name on each side. jellyfin keeps a
+    feat as 'A; B', so a copy with the feat and a copy without it scored
+    ~0.5 as whole strings once the per-track credit was used (#1263)."""
+    names1 = t1.get('artist_names') or [t1['norm_artist']]
+    names2 = t2.get('artist_names') or [t2['norm_artist']]
+    return max(SequenceMatcher(None, a, b).ratio() for a in names1 for b in names2)
 
 
 def _is_same_physical_file(p1, p2, dur1, dur2) -> bool:
     """Detect when two DB rows point at the same file mounted at different paths.
 
-    When a user binds the same host music directory into both Commissary
+    When a user binds the same host music directory into both SoulSync
     (e.g. ``/app/Transfer``) and a media server like Plex (e.g.
-    ``/media/Music``), the Commissary scan and the media-server library
+    ``/media/Music``), the SoulSync scan and the media-server library
     sync each create a track row pointing at the same physical file
     via different mount paths. The two rows then look like a fuzzy-
     match duplicate to this job.
@@ -394,6 +622,14 @@ def _is_same_physical_file(p1, p2, dur1, dur2) -> bool:
         return False
     norm1 = str(p1).replace('\\', '/').rstrip('/')
     norm2 = str(p2).replace('\\', '/').rstrip('/')
+    # One path is one file. This has to come BEFORE the mount-root check
+    # below, which bails out whenever the roots match - and identical paths
+    # always match, so the job called a file a duplicate of itself and "keep
+    # this one" moved the only copy to the deleted folder (#1210).
+    # normcase, not lower(): on Linux, Song.flac and song.flac really are two
+    # files, and folding case would hide that duplicate instead.
+    if os.path.normcase(norm1) == os.path.normcase(norm2):
+        return True
     parts1 = [x for x in norm1.split('/') if x]
     parts2 = [x for x in norm2.split('/') if x]
     if len(parts1) < 3 or len(parts2) < 3:

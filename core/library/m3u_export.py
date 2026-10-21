@@ -41,7 +41,70 @@ def _entry_label(artist: str, title: str, path: str) -> str:
     return os.path.basename(path)
 
 
-def build_m3u(entries: Iterable[Dict[str, Any]], entry_base_path: str = "") -> str:
+def finalize_m3u_entry(line: str, rewrite_from: str = "", rewrite_to: str = "") -> str:
+    """Final per-entry transforms, shared by every m3u writer.
+
+    1. Prefix hot-swap (wolf39us): when ``rewrite_from`` is set and the line
+       starts with it, that prefix is replaced with ``rewrite_to`` — so an m3u
+       generated inside a container (``/data/media/...``) plays directly on
+       the machine that mounts the same storage elsewhere (``M:/media/...``).
+       Non-matching lines pass through untouched; empty settings = no-op.
+    2. The '#' guard: an entry line must never START with '#' (players parse
+       it as a comment and silently skip the track — the $artistletter '#'
+       catch-all made this a real case, #1072).
+    """
+    out = str(line or "")
+    rf = str(rewrite_from or "")
+    if rf and out.startswith(rf):
+        out = str(rewrite_to or "") + out[len(rf):]
+    if out.startswith("#"):
+        out = "./" + out
+    return out
+
+
+def relative_m3u_entry(track_path: str, m3u_dir: str) -> Optional[str]:
+    """``track_path`` relative to the folder the m3u sits in, or None when it can't be.
+
+    a relative entry is the only kind that survives the playlist being read
+    from somewhere else: the container writes /app/Transfer/..., the windows
+    box mounting that share sees Z:/..., and ../Artist/song.flac works for both.
+
+    None (caller falls back to the absolute entry) when the track path isn't
+    absolute (a windows path on linux, say), sits on another drive, or only
+    shares the filesystem root with the m3u - a media-server path the
+    container can't see would turn into ../../../ garbage otherwise.
+    """
+    track = str(track_path or "")
+    if not track or not m3u_dir or not os.path.isabs(track):
+        return None
+    try:
+        track = os.path.abspath(track)
+        folder = os.path.abspath(m3u_dir)
+        common = os.path.commonpath([track, folder])
+    except ValueError:
+        return None
+    if os.path.dirname(common) == common:
+        return None
+    return os.path.relpath(track, folder).replace(os.sep, "/")
+
+
+def m3u_entry_line(path: str, entry_base_path: str = "", rewrite_from: str = "",
+                   rewrite_to: str = "", relative_to: str = "") -> str:
+    """One entry line, shared by every m3u writer.
+
+    with ``relative_to`` (the folder the m3u is written into) the entry is
+    relative to it; base path and prefix rewrite only apply when it can't be.
+    """
+    if relative_to:
+        rel = relative_m3u_entry(path, relative_to)
+        if rel is not None:
+            return finalize_m3u_entry(rel)
+    base = (entry_base_path or "").rstrip("/\\")
+    return finalize_m3u_entry(f"{base}/{path}" if base else path, rewrite_from, rewrite_to)
+
+
+def build_m3u(entries: Iterable[Dict[str, Any]], entry_base_path: str = "",
+              rewrite_from: str = "", rewrite_to: str = "", relative_to: str = "") -> str:
     """Return an extended-M3U playlist string for ``entries``.
 
     Emits ``#EXTM3U`` then, per track with a non-empty ``path``, an ``#EXTINF:<secs>,<label>`` line
@@ -49,8 +112,12 @@ def build_m3u(entries: Iterable[Dict[str, Any]], entry_base_path: str = "") -> s
 
     ``entry_base_path`` is an optional prefix prepended to every track path (same knob the playlist
     M3U export uses) — for media servers that need a rewritten/absolute base. Empty = paths as stored.
+
+    ``rewrite_from``/``rewrite_to`` hot-swap a path prefix on the FINAL entry line (after the base
+    prepend) — see ``finalize_m3u_entry``. Both empty = byte-identical output to before.
+
+    ``relative_to`` = the folder the file is written into; see ``m3u_entry_line``.
     """
-    base = (entry_base_path or "").rstrip("/\\")
     lines = ["#EXTM3U"]
     for entry in entries:
         e = entry or {}
@@ -64,7 +131,7 @@ def build_m3u(entries: Iterable[Dict[str, Any]], entry_base_path: str = "") -> s
             path,
         )
         lines.append(f"#EXTINF:{secs},{label}")
-        lines.append(f"{base}/{path}" if base else path)
+        lines.append(m3u_entry_line(path, entry_base_path, rewrite_from, rewrite_to, relative_to))
     return "\n".join(lines) + "\n"
 
 
@@ -73,6 +140,9 @@ def write_library_m3u(
     folder: str,
     filename: str = DEFAULT_M3U_FILENAME,
     entry_base_path: str = "",
+    rewrite_from: str = "",
+    rewrite_to: str = "",
+    relative: bool = False,
 ) -> Optional[str]:
     """Write the library M3U into ``folder`` (created if missing). Returns the path written, or None
     on failure — the scan-sync hook must never raise into the scan-completion callback."""
@@ -82,7 +152,9 @@ def write_library_m3u(
         os.makedirs(folder, exist_ok=True)
         path = os.path.join(folder, filename)
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(build_m3u(entries, entry_base_path=entry_base_path))
+            fh.write(build_m3u(entries, entry_base_path=entry_base_path,
+                               rewrite_from=rewrite_from, rewrite_to=rewrite_to,
+                               relative_to=folder if relative else ""))
         return path
     except Exception as exc:
         logger.warning("Failed to write library M3U to %s: %s", folder, exc)

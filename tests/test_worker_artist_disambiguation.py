@@ -70,7 +70,7 @@ def test_spotify_picks_artist_overlapping_owned_catalog():
     w.db = _DB(OWNED)
     w.stats = {'matched': 0, 'not_found': 0, 'errors': 0}
     w.client = types.SimpleNamespace(
-        search_artists=lambda name, limit=5: [WRONG, RIGHT],   # wrong ranked first
+        search_artists=lambda name, limit=5, **k: [WRONG, RIGHT],   # wrong ranked first
         get_artist_albums=lambda aid: ALBUMS.get(aid, []),
     )
     captured = {}
@@ -132,11 +132,11 @@ def _mb_service(owned_release_groups):
     s._save_to_cache = lambda *a, **k: None
     s._calculate_similarity = lambda a, b: 1.0
     s.mb_client = types.SimpleNamespace(
-        search_artist=lambda name, limit=5: [
+        search_artist=lambda name, limit=5, strict=True, raise_on_error=False: [
             {'id': 'wrong_mbid', 'name': 'Rone', 'score': 100},  # ranked first
             {'id': 'right_mbid', 'name': 'Rone', 'score': 90},
         ],
-        get_artist=lambda mbid, includes=None: owned_release_groups.get(mbid),
+        get_artist=lambda mbid, includes=None, raise_on_error=False: owned_release_groups.get(mbid),
     )
     return s
 

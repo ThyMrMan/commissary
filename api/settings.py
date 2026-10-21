@@ -2,29 +2,10 @@
 Settings and API key management endpoints.
 """
 
-from flask import request, current_app, session
-from .auth import require_api_key, generate_api_key, _hash_key
+from flask import request, current_app
+from . import key_store
+from .auth import SCOPE_ADMIN, VALID_SCOPES, require_api_key
 from .helpers import api_success, api_error
-
-
-def _session_is_admin() -> bool:
-    """Whether the cookie session belongs to an admin profile.
-
-    Resolved from the DB rather than flask.g: web_server's profile-context hook
-    skips /api/v1/ entirely (it's key-authed, not session-authed), so g.is_admin
-    is never populated on this blueprint. Fails CLOSED — an unreadable profile
-    is not an admin, the opposite of the app-wide default where a missing
-    session resolves to profile 1.
-    """
-    try:
-        from database.music_database import get_database
-        pid = session.get("profile_id")
-        if not pid:
-            return False
-        profile = get_database().get_profile(pid)
-        return bool(profile and profile.get("is_admin"))
-    except Exception:
-        return False
 
 # Keys that must NEVER be exposed via the API
 _SENSITIVE_KEYS = {
@@ -97,19 +78,7 @@ def register_routes(bp):
         """List all API keys (prefix + label only, never the full key)."""
         try:
             cfg = current_app.soulsync["config_manager"]
-            keys = cfg.get("api_keys", [])
-            return api_success({
-                "keys": [
-                    {
-                        "id": k.get("id"),
-                        "label": k.get("label", ""),
-                        "key_prefix": k.get("key_prefix", ""),
-                        "created_at": k.get("created_at"),
-                        "last_used_at": k.get("last_used_at"),
-                    }
-                    for k in keys
-                ]
-            })
+            return api_success({"keys": key_store.list_keys(cfg)})
         except Exception as e:
             return api_error("SETTINGS_ERROR", str(e), 500)
 
@@ -118,26 +87,21 @@ def register_routes(bp):
     def create_api_key():
         """Generate a new API key.
 
-        Body: {"label": "My Bot"}
+        Body: {"label": "My Bot", "scope": "read"}
+        ``scope`` is "admin" (the default) or "read".
         The raw key is returned ONCE in the response.
         """
         body = request.get_json(silent=True) or {}
         label = body.get("label", "")
+        scope = body.get("scope", SCOPE_ADMIN)
+        if scope not in VALID_SCOPES:
+            return api_error("BAD_REQUEST",
+                             f"scope must be one of: {', '.join(VALID_SCOPES)}.", 400)
 
         try:
             cfg = current_app.soulsync["config_manager"]
-            raw_key, record = generate_api_key(label)
-            keys = cfg.get("api_keys", [])
-            keys.append(record)
-            cfg.set("api_keys", keys)
-
-            return api_success({
-                "key": raw_key,
-                "id": record["id"],
-                "label": record["label"],
-                "key_prefix": record["key_prefix"],
-                "created_at": record["created_at"],
-            }, status=201)
+            raw_key, record = key_store.create_key(cfg, label, scope)
+            return api_success(key_store.created_view(raw_key, record), status=201)
         except Exception as e:
             return api_error("SETTINGS_ERROR", str(e), 500)
 
@@ -147,14 +111,8 @@ def register_routes(bp):
         """Revoke (delete) an API key by its ID."""
         try:
             cfg = current_app.soulsync["config_manager"]
-            keys = cfg.get("api_keys", [])
-            original_len = len(keys)
-            keys = [k for k in keys if k.get("id") != key_id]
-
-            if len(keys) == original_len:
+            if not key_store.revoke_key(cfg, key_id):
                 return api_error("NOT_FOUND", "API key not found.", 404)
-
-            cfg.set("api_keys", keys)
             return api_success({"message": "API key revoked."})
         except Exception as e:
             return api_error("SETTINGS_ERROR", str(e), 500)
@@ -163,59 +121,19 @@ def register_routes(bp):
 
     @bp.route("/api-keys/bootstrap", methods=["POST"])
     def bootstrap_api_key():
-        """Generate the first API key when none exist. Authenticated admins only.
+        """Generate the first API key when none exist (no auth required).
 
-        This used to require no auth at all, which made it a login bypass on any
-        reachable instance. /api/v1/ is deliberately exempt from the login gate
-        (core/security/login_gate.py) because it authenticates with its own keys —
-        so a route here that mints a key WITHOUT one let an anonymous caller
-        obtain a credential, and PATCH /api/v1/settings could then set
-        security.require_login back to false. Two sound decisions, one hole
-        between them.
-
-        Requiring login mode is not belt-and-braces, it is the actual gate: with
-        login OFF every request resolves to profile 1 and therefore "admin", so
-        an admin check alone would still authorise anonymous callers. Same
-        reasoning (and same refusal) as the plaintext credential export in
-        web_server.export_config_bundle.
-
-        No UI depends on this: the Settings page creates keys through
-        /api/v1/api-keys-internal/generate, which is @admin_only and is the one
-        /api/v1/ path the login gate does NOT exempt.
-
+        This endpoint only works when zero API keys are configured.
         Body: {"label": "My First Key"}
         """
         try:
             cfg = current_app.soulsync["config_manager"]
-            if not cfg.get("security.require_login", False):
-                return api_error(
-                    "LOGIN_REQUIRED",
-                    "Minting an API key requires login mode. Enable Settings → "
-                    "Security → Require login, or create the key in Settings → "
-                    "API keys.", 403)
-            if not session.get("login_authenticated", False):
-                return api_error("AUTH_REQUIRED", "Sign in first.", 401)
-            if not _session_is_admin():
-                return api_error("FORBIDDEN", "Admin only.", 403)
-
-            existing = cfg.get("api_keys", [])
-            if existing:
+            body = request.get_json(silent=True) or {}
+            created = key_store.bootstrap_key(cfg, body.get("label", "Default"))
+            if created is None:
                 return api_error("FORBIDDEN",
                                  "API keys already exist. Use an authenticated request to create more.", 403)
-
-            body = request.get_json(silent=True) or {}
-            label = body.get("label", "Default")
-
-            raw_key, record = generate_api_key(label)
-            cfg.set("api_keys", [record])
-
-            return api_success({
-                "key": raw_key,
-                "id": record["id"],
-                "label": record["label"],
-                "key_prefix": record["key_prefix"],
-                "created_at": record["created_at"],
-            }, status=201)
+            return api_success(key_store.created_view(*created), status=201)
         except Exception as e:
             return api_error("SETTINGS_ERROR", str(e), 500)
 

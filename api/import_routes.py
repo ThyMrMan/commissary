@@ -1,0 +1,384 @@
+"""Import + reassign endpoints - lifted from web_server.py.
+
+the staging browser (files/groups/scan-status/hints/suggestions), the
+reassign family, the import search/match/process routes, the singles
+processor, and the auto-import worker boot (module-local handle: the
+staging deep-scan trigger and the wiring getter read it as a module
+attribute). bodies byte-identical; only the decorator changed and
+dev_mode_enabled / hydrabase_worker became getters.
+"""
+
+from flask import Blueprint, current_app, jsonify, request
+
+from core.imports.album import build_album_import_match_payload
+from core.imports.routes import ImportRouteRuntime as _ImportRouteRuntime
+from core.imports.routes import album_match as _import_album_match
+from core.imports.routes import album_preview as _import_album_preview
+from core.imports.routes import fingerprint_files as _import_fingerprint_files
+from core.imports.routes import album_process as _import_album_process
+from core.imports.routes import upload_chunk_to_staging as _import_upload_chunk_to_staging
+from core.imports.routes import upload_to_staging as _import_upload_to_staging
+from core.imports.routes import inbox as _import_inbox
+from core.imports.routes import process_single_import_file as _import_process_single_import_file
+from core.imports.routes import search_albums as _import_search_albums
+from core.imports.routes import search_sources as _import_search_sources
+from core.imports.routes import search_tracks as _import_search_tracks
+from core.imports.routes import singles_process as _import_singles_process
+from core.imports.routes import staging_files as _import_staging_files
+from core.imports.routes import staging_groups as _import_staging_groups
+from core.imports.routes import staging_hints as _import_staging_hints
+from core.imports.routes import staging_scan_status as _import_staging_scan_status
+from core.imports.routes import staging_suggestions as _import_staging_suggestions
+from core.profile_context import admin_only, get_current_profile_id
+from core.runtime_state import add_activity_item
+from utils.logging_config import get_logger
+
+logger = get_logger("web_server")
+
+# injected by configure()
+get_database = None
+config_manager = None
+docker_resolve_path = None
+import_singles_executor = None
+_post_process_matched_download = None
+automation_engine = None
+_dev_mode_enabled = None
+_hydrabase_worker = None
+
+
+def configure(**deps):
+    g = globals()
+    for name, value in deps.items():
+        if name not in g:
+            raise KeyError(f"import_routes.configure: unknown dep {name!r}")
+        g[name] = value
+    _boot_auto_import_worker()
+
+
+bp = Blueprint('import_routes', __name__)
+
+
+def create_blueprint():
+    return bp
+
+def _build_import_route_runtime():
+    return _ImportRouteRuntime(
+        post_process_matched_download=_post_process_matched_download,
+        add_activity_item=add_activity_item,
+        automation_engine=automation_engine,
+        hydrabase_worker=_hydrabase_worker(),
+        dev_mode_enabled=_dev_mode_enabled(),
+        import_singles_executor=import_singles_executor,
+        build_album_import_match_payload=build_album_import_match_payload,
+        # the singles executor runs outside the request: carry the request's
+        # profile along instead of resolving it again on the worker thread
+        process_single_import_file=lambda runtime, file_info: _process_single_import_file(
+            file_info, profile_id=runtime.profile_id),
+        logger=logger,
+        profile_id=_request_profile_id(),
+        # Commissary: scan a chosen download folder (core/commissary/import_folders.py)
+        **_commissary_import_folder(),
+    )
+
+
+def _commissary_import_folder():
+    from core.commissary.import_folders import runtime_overrides
+    return runtime_overrides()
+
+
+def _request_profile_id():
+    """the importing profile, when there is a request to read it from."""
+    try:
+        from flask import has_request_context
+        if not has_request_context():
+            return None
+        return int(get_current_profile_id())
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@bp.route('/api/import/staging/files', methods=['GET'])
+def import_staging_files():
+    payload, status = _import_staging_files(_build_import_route_runtime())
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/inbox', methods=['GET'])
+def import_inbox():
+    payload, status = _import_inbox(_build_import_route_runtime(), auto_import_worker)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/upload', methods=['POST'])
+@admin_only
+def import_upload():
+    """browser upload into the import folder. multipart: one or more
+    `files`, and a matching `paths` field per file carrying the relative
+    path the browser knows (webkitRelativePath) so a dropped folder lands
+    as a folder."""
+    files = request.files.getlist('files')
+    if not files:
+        return jsonify({"success": False, "error": "no files"}), 400
+    paths = request.form.getlist('paths')
+    payload, status = _import_upload_to_staging(_build_import_route_runtime(), files, paths)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/fingerprint', methods=['POST'])
+def import_fingerprint():
+    data = request.get_json() or {}
+    payload, status = _import_fingerprint_files(_build_import_route_runtime(), data.get('file_paths') or [])
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/upload/chunk', methods=['POST'])
+@admin_only
+def import_upload_chunk():
+    """one piece of a file. fields: upload_id, index, total, path; file: chunk."""
+    chunk = request.files.get('chunk')
+    if chunk is None:
+        return jsonify({"success": False, "error": "no chunk"}), 400
+    payload, status = _import_upload_chunk_to_staging(
+        _build_import_route_runtime(),
+        upload_id=request.form.get('upload_id', ''),
+        index=request.form.get('index', ''),
+        total=request.form.get('total', ''),
+        relative_path=request.form.get('path', '') or chunk.filename or '',
+        chunk=chunk,
+    )
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/album/preview', methods=['POST'])
+def import_album_preview():
+    payload, status = _import_album_preview(_build_import_route_runtime(), request.get_json() or {})
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/staging/groups', methods=['GET'])
+def import_staging_groups():
+    payload, status = _import_staging_groups(_build_import_route_runtime())
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/staging/scan-status', methods=['GET'])
+def import_staging_scan_status():
+    payload, status = _import_staging_scan_status(_build_import_route_runtime())
+    return jsonify(payload), status
+
+
+def _reassign_missing_fields(data):
+    """Which required identifiers a reassign request left out.
+
+    Named explicitly rather than left to degrade: without them the service
+    would answer "Nothing to reassign", which reads like the album is empty
+    instead of like the request was malformed.
+    """
+    return [field for field in ('source', 'local_album_id', 'album_id')
+            if not str(data.get(field) or '').strip()]
+
+
+@bp.route('/api/reassign/artists', methods=['GET'])
+@admin_only
+def reassign_search_artists():
+    """Step 1 of an album reassign: find the artist it SHOULD belong to.
+
+    Admin-only, like re-identify: it restages library files."""
+    try:
+        from core.imports.reassign_service import search_artists
+        return jsonify({'success': True, 'artists': search_artists(
+            request.args.get('source', ''), request.args.get('q', ''))})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/reassign/albums', methods=['GET'])
+@admin_only
+def reassign_artist_albums():
+    """Step 2: that artist's releases. Picking from THIS list is what
+    guarantees the target is one the source can answer for."""
+    try:
+        from core.imports.reassign_service import artist_albums
+        return jsonify({'success': True, 'albums': artist_albums(
+            request.args.get('source', ''), request.args.get('artist_id', ''))})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/reassign/preview', methods=['POST'])
+@admin_only
+def reassign_preview():
+    """Step 3: how the local files line up, BEFORE anything is staged."""
+    try:
+        from core.imports.reassign_service import preview_reassign
+        data = request.get_json() or {}
+        missing = _reassign_missing_fields(data)
+        if missing:
+            return jsonify({'success': False,
+                            'error': f"Missing required field(s): {', '.join(missing)}"}), 400
+        payload = preview_reassign(
+            get_database(), data.get('source', ''),
+            data.get('local_album_id'), data.get('album_id', ''))
+        return jsonify(payload), (200 if payload.get('success') else 400)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/reassign/apply', methods=['POST'])
+@admin_only
+def reassign_apply():
+    """Step 4: stage each file with its hint. The import pipeline re-files
+    them — tags, folder and database rows all come from the same code that
+    handles a fresh download."""
+    try:
+        from core.imports.reassign_service import apply_reassign
+        from core.imports.staging import get_staging_path
+        data = request.get_json() or {}
+        missing = _reassign_missing_fields(data)
+        if missing:
+            return jsonify({'success': False,
+                            'error': f"Missing required field(s): {', '.join(missing)}"}), 400
+        payload = apply_reassign(
+            get_database(),
+            source=data.get('source', ''),
+            local_album_id=data.get('local_album_id'),
+            album_id=data.get('album_id', ''),
+            album_name=data.get('album_name', ''),
+            artist_id=data.get('artist_id'),
+            artist_name=data.get('artist_name', ''),
+            album_type=data.get('album_type'),
+            staging_dir=get_staging_path(),
+            replace=bool(data.get('replace', True)),
+            # Only ever true when the client has shown the user the preview and
+            # they accepted an incomplete mapping.
+            allow_partial=bool(data.get('allow_partial', False)),
+        )
+        return jsonify(payload), (200 if payload.get('success') else 400)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/import/staging/hints', methods=['GET'])
+def import_staging_hints():
+    payload, status = _import_staging_hints(_build_import_route_runtime())
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/search/albums', methods=['GET'])
+def import_search_albums():
+    payload, status = _import_search_albums(
+        _build_import_route_runtime(),
+        request.args.get('q', ''),
+        request.args.get('limit', 12),
+        request.args.get('source', ''),
+    )
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/search/sources', methods=['GET'])
+def import_search_sources_route():
+    payload, status = _import_search_sources()
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/album/match', methods=['POST'])
+def import_album_match():
+    payload, status = _import_album_match(_build_import_route_runtime(), request.get_json() or {})
+    return jsonify(payload), status
+
+
+def _process_import(kind, data):
+    runtime = _build_import_route_runtime()
+    def operation():
+        if kind == 'album':
+            return _import_album_process(runtime, data)
+        return _import_singles_process(runtime, data.get('files', []))
+    if request.headers.get('Prefer') != 'respond-async':
+        payload, status = operation()
+    else:
+        from core.imports.jobs import import_jobs
+        key = request.headers.get('Idempotency-Key', '')
+        if not key or len(key) > 128:
+            return jsonify(success=False, error='A valid Idempotency-Key is required'), 400
+        app = current_app._get_current_object()
+        def background():
+            with app.app_context():
+                return operation()
+        payload, status = import_jobs.submit(get_current_profile_id(), key, kind, data, background)
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/jobs/<job_id>', methods=['GET'])
+def import_job_status(job_id):
+    from core.imports.jobs import import_jobs
+    payload, status = import_jobs.get(get_current_profile_id(), job_id)
+    if payload.get('state') == 'complete' and (payload.get('status') or 200) >= 400:
+        # Preserve HTTPError/error_code semantics (notably disconnected media
+        # servers) used by the browser to stop the rest of an import batch.
+        return jsonify(payload['result']), payload['status']
+    return jsonify(payload), status
+
+
+@bp.route('/api/import/album/process', methods=['POST'])
+def import_album_process():
+    return _process_import('album', request.get_json() or {})
+
+
+@bp.route('/api/import/search/tracks', methods=['GET'])
+def import_search_tracks():
+    payload, status = _import_search_tracks(
+        _build_import_route_runtime(),
+        request.args.get('q', ''),
+        request.args.get('limit', 10),
+    )
+    return jsonify(payload), status
+
+
+def _process_single_import_file(file_info, profile_id=None):
+    runtime = _build_import_route_runtime()
+    if profile_id and not runtime.profile_id:
+        runtime.profile_id = profile_id
+    return _import_process_single_import_file(runtime, file_info)
+
+
+@bp.route('/api/import/singles/process', methods=['POST'])
+def import_singles_process():
+    data = request.get_json() or {}
+    return _process_import('singles', data)
+
+
+# Auto-Import Worker
+auto_import_worker = None
+
+
+def _boot_auto_import_worker():
+    """runs from configure(): the worker needs the injected deps, so it
+    cannot boot at import time like it did as web_server top-level code."""
+    global auto_import_worker
+    try:
+        from core.auto_import_worker import AutoImportWorker
+        _ai_db = get_database()
+        _ai_staging = docker_resolve_path(config_manager.get('import.staging_path', './Staging'))
+        _ai_transfer = docker_resolve_path(config_manager.get('soulseek.transfer_path', './Transfer'))
+        auto_import_worker = AutoImportWorker(
+            database=_ai_db,
+            staging_path=_ai_staging,
+            transfer_path=_ai_transfer,
+            process_callback=_post_process_matched_download,
+            config_manager=config_manager,
+            automation_engine=automation_engine,
+        )
+        if config_manager.get('auto_import.enabled', False):
+            auto_import_worker.start()
+            logger.info("Auto-import worker started")
+        else:
+            logger.info("Auto-import worker initialized (disabled)")
+    except Exception as _ai_err:
+        logger.error(f"Auto-import worker init failed: {_ai_err}")
+
+
+# /api/auto-import* endpoints: lifted to api/auto_import.py.
+@bp.route('/api/import/staging/suggestions', methods=['GET'])
+def import_staging_suggestions():
+    payload, status = _import_staging_suggestions()
+    return jsonify(payload), status

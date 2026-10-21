@@ -14,6 +14,20 @@ class _FakeWishlistDatabase:
         self.add_calls.append(kwargs)
         return True
 
+    def add_to_wishlist_detailed(self, **kwargs):
+        self.add_calls.append(kwargs)
+        return self._wishlist_outcome("created", kwargs.get("track_data", {}).get("id"))
+
+    @staticmethod
+    def _wishlist_outcome(status, track_id=None, reason=None):
+        return {
+            "status": status,
+            "created": status in ("created", "satisfied"),
+            "applied": status in ("created", "updated", "satisfied"),
+            "track_id": track_id,
+            "reason": reason,
+        }
+
     def get_wishlist_tracks(self, limit=None, profile_id=1):
         self.track_queries.append(("get_wishlist_tracks", limit, profile_id))
         tracks = list(self.tracks)
@@ -111,6 +125,23 @@ def test_add_spotify_track_to_wishlist_accepts_track_data_alias():
     assert fake_db.add_calls[0]["profile_id"] == 2
 
 
+def test_failed_track_forwards_embedded_quality_profile():
+    fake_db = _FakeWishlistDatabase()
+    service = _build_service(fake_db)
+
+    assert service.add_failed_track_from_modal({
+        "quality_profile_id": 42,
+        "spotify_track": {
+            "id": "sp-42",
+            "name": "Profiled Song",
+            "artists": [{"name": "Artist"}],
+            "album": {"name": "Album"},
+        },
+    }) is True
+
+    assert fake_db.add_calls[0]["quality_profile_id"] == 42
+
+
 def test_get_wishlist_tracks_for_download_formats_modal_shape():
     fake_db = _FakeWishlistDatabase(
         tracks=[
@@ -164,6 +195,10 @@ def test_get_wishlist_tracks_for_download_formats_modal_shape():
             "artist_name": "Artist One",
             "album_name": "Album One",
             "provider": None,
+            # #1508: the row's metadata source is carried to the flat level so
+            # get_import_source() can see it (None here — this row has no
+            # source in its nested data).
+            "_source": None,
             "spotify_data": {
                 "id": "sp-1",
                 "name": "Song One",
@@ -182,11 +217,10 @@ def test_get_wishlist_tracks_for_download_formats_modal_shape():
             "last_attempted": "2024-01-02",
             "source_type": "playlist",
             "source_info": {"playlist_name": "Playlist One"},
+            # H10: formatted tracks carry their owner so cycles can batch
+            # per-profile instead of stamping every batch with the runtime's.
+            "profile_id": 7,
             "quality_profile_id": None,
-            # Which Music Library the track is destined for. None = the default
-            # library, which is where every wishlist track went before
-            # libraries existed — so an untouched row keeps its old behaviour.
-            "root_folder_id": None,
             "id": "sp-1",
             "name": "Song One",
             "artists": [{"name": "Artist One"}],
@@ -199,6 +233,91 @@ def test_get_wishlist_tracks_for_download_formats_modal_shape():
             "disc_number": 2,
         }
     ]
+
+
+def test_format_track_for_download_carries_row_source_to_flat_level():
+    # #1508: a Deezer-sourced row keeps _source only inside the nested
+    # spotify_data; the flat track must expose it (and provider) so
+    # get_import_source() resolves "deezer" and the Deezer contributors
+    # upgrade in extract_source_metadata() can run on the wishlist path.
+    from core.imports.context import get_import_source
+
+    row = {
+        "id": "wl-dz",
+        "spotify_track_id": "3519562401",
+        "spotify_data": {
+            "id": "3519562401",
+            "name": "Number One",
+            "_source": "deezer",
+            "artists": [{"name": "Duquesa"}],
+            "album": {"name": "SIX."},
+            "duration_ms": 200000,
+        },
+        "failure_reason": None,
+        "retry_count": 0,
+        "date_added": "2024-01-01",
+        "last_attempted": None,
+        "source_type": "discography",
+        "source_info": {},
+    }
+    formatted = WishlistService.format_track_for_download(row)
+    assert formatted["_source"] == "deezer"
+    assert formatted["provider"] == "deezer"
+    context = {"track_info": formatted, "original_search_result": formatted}
+    assert get_import_source(context) == "deezer"
+
+    # A row with no source anywhere must not invent one.
+    plain = dict(row)
+    plain["spotify_data"] = {"id": "x", "name": "T", "artists": []}
+    flat = WishlistService.format_track_for_download(plain)
+    assert flat["_source"] in (None, "")
+    assert flat["provider"] in (None, "")
+
+
+def test_format_track_for_download_source_precedence():
+    # #1508 (hostile-review pin): one precedence — provider, then source,
+    # then _source — so the flat "provider" and "_source" keys always agree
+    # and consumers can never disagree about the same track's source.
+    base = {
+        "id": "wl-s",
+        "spotify_track_id": "sp-9",
+        "failure_reason": None,
+        "retry_count": 0,
+        "date_added": "2024-01-01",
+        "last_attempted": None,
+        "source_type": "manual",
+        "source_info": {},
+    }
+
+    def fmt(track_data):
+        row = dict(base)
+        row["spotify_data"] = track_data
+        return WishlistService.format_track_for_download(row)
+
+    # provider-first: an explicit provider wins over both source keys.
+    f = fmt({"id": "sp-9", "name": "T", "artists": [],
+             "provider": "spotify", "source": "deezer", "_source": "tidal"})
+    assert f["provider"] == "spotify"
+    assert f["_source"] == "spotify"
+
+    # source beats _source (mirrors get_import_source's source-first read).
+    f = fmt({"id": "sp-9", "name": "T", "artists": [],
+             "source": "deezer", "_source": "tidal"})
+    assert f["provider"] == "deezer"
+    assert f["_source"] == "deezer"
+
+    # non-deezer provider passthrough stays intact.
+    f = fmt({"id": "sp-9", "name": "T", "artists": [],
+             "provider": "spotify", "_source": "spotify"})
+    assert f["provider"] == "spotify"
+    assert f["_source"] == "spotify"
+
+    # JSON-string track_data is normalized upstream and carries _source.
+    import json
+    f = fmt(json.dumps({"id": "sp-9", "name": "T", "artists": [],
+                        "_source": "deezer"}))
+    assert f["provider"] == "deezer"
+    assert f["_source"] == "deezer"
 
 
 def test_check_track_in_wishlist_and_find_matching_wishlist_track_handle_id_variants():

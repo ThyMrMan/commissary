@@ -96,11 +96,6 @@ def sync_show(db, show_id: int) -> dict:
             "local data on a possibly-failed read. Run a Deep Scan if the show "
             "is really empty now.")
 
-    # Resolve which configured Library this show belongs to when the source could
-    # tell us (Plex always can here; Jellyfin can't cheaply — root_folder_id is an
-    # enrichment-protected column so the upsert just preserves the prior value then).
-    tree["root_folder_id"] = db.root_folder_id_for(
-        row["server_source"], "show", tree.pop("_server_title", None))
     db.upsert_show_tree(row["server_source"], tree, preserve_enrichment=True)
 
     # Healed key: the source found the show under a NEW server id (Plex re-key).
