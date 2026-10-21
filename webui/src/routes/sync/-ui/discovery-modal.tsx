@@ -42,6 +42,9 @@ import type { ReactNode } from 'react';
 
 import { useState } from 'react';
 
+// Commissary: mark a row "Not available"
+import { AvailabilityButton } from '@/commissary/discovery-unavailable';
+
 import type { SourceVerticalConfig } from '../-sync.sources';
 import type { SourcePlaylistState } from '../-sync.state';
 import type { DiscoveryRow } from '../-sync.transform';
@@ -100,6 +103,8 @@ export interface DiscoveryModalProps {
   /** The Fix Track Match intents — implemented by the P4b fix modal. */
   onFixTrack?: (row: DiscoveryRow) => void;
   onUnmatchTrack?: (row: DiscoveryRow) => void;
+  /** Commissary: mark a row "Not available", or available again. */
+  onAvailabilityTrack?: (row: DiscoveryRow, unavailable: boolean) => void;
   /**
    * Rendered INSIDE the overlay. The vanilla nests the fix overlay in the
    * discovery modal ('Discovery Fix Modal (nested inside)', sync-services.js
@@ -169,11 +174,17 @@ function RowActions({
   row,
   onFixTrack,
   onUnmatchTrack,
+  onAvailabilityTrack,
 }: {
   row: DiscoveryRow;
   onFixTrack?: (row: DiscoveryRow) => void;
   onUnmatchTrack?: (row: DiscoveryRow) => void;
+  onAvailabilityTrack?: (row: DiscoveryRow, unavailable: boolean) => void;
 }) {
+  // Commissary: a "Not available" row offers only "Available again"
+  if (row.status_class === 'unavailable' && onAvailabilityTrack) {
+    return <AvailabilityButton row={row} onAvailability={onAvailabilityTrack} />;
+  }
   const action = discoveryRowAction(row);
   if (action === 'none' || !onFixTrack) return <span>-</span>;
   if (action === 'rematch') {
@@ -200,18 +211,22 @@ function RowActions({
     );
   }
   return (
-    <button
-      type="button"
-      className="fix-match-btn"
-      title={
-        action === 'fix-wing-it'
-          ? 'Search for a proper metadata match'
-          : 'Manually search for this track'
-      }
-      onClick={() => onFixTrack(row)}
-    >
-      🔧 Fix
-    </button>
+    <>
+      <button
+        type="button"
+        className="fix-match-btn"
+        title={
+          action === 'fix-wing-it'
+            ? 'Search for a proper metadata match'
+            : 'Manually search for this track'
+        }
+        onClick={() => onFixTrack(row)}
+      >
+        🔧 Fix
+      </button>
+      {/* Commissary: beside Fix, mark it "Not available" */}
+      <AvailabilityButton row={row} onAvailability={onAvailabilityTrack} />
+    </>
   );
 }
 
@@ -441,6 +456,7 @@ function FooterActions(props: DiscoveryModalProps) {
 
 export function DiscoveryModal(props: DiscoveryModalProps) {
   const { config, state, mirroredSource, onClose, onFixTrack, onUnmatchTrack, children } = props;
+  const { onAvailabilityTrack } = props; // Commissary
   const fakeHash = state.fakeHash;
 
   const sourceLabel = modalSourceLabel(config.id, fakeHash, mirroredSource);
@@ -539,6 +555,7 @@ export function DiscoveryModal(props: DiscoveryModalProps) {
                         row={row}
                         onFixTrack={onFixTrack}
                         onUnmatchTrack={onUnmatchTrack}
+                        onAvailabilityTrack={onAvailabilityTrack}
                       />
                     </td>
                   </tr>

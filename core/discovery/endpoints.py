@@ -761,7 +761,9 @@ def update_discovery_match(
             result['wing_it_fallback'] = False
             result['manual_match'] = True
 
-            if old_status != 'found' and old_status != 'Found':
+            # Commissary: a guess the tab already counted is no new match
+            from core.commissary.discovery_fixes import fix_adds_a_match
+            if fix_adds_a_match(old_status, source_log_label):
                 state['spotify_matches'] = state.get('spotify_matches', 0) + 1
 
             logger.info(f"Manual match updated: {source_log_label} - {identifier} - track {track_index}")

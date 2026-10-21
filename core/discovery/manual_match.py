@@ -148,4 +148,7 @@ def should_rediscover(extra_data: Optional[Dict[str, Any]]) -> bool:
 
     if extra.get('unmatched_by_user'):
         return False
+    # Commissary: nor a track the user marked "Not available"
+    if extra.get('unavailable'):
+        return False
     return True

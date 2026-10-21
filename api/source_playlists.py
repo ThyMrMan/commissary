@@ -4106,7 +4106,9 @@ def unmatch_discovery_track():
         result['manual_match'] = False
 
         # Update match count
-        if old_status in ('found', 'Found', 'wing-it', 'Wing It'):
+        # Commissary: a guess lowers it only where the tab counted it
+        from core.commissary.discovery_fixes import platform_of_path, unmatch_removes_a_match
+        if unmatch_removes_a_match(old_status, platform_of_path(path)):
             state['spotify_matches'] = max(0, state.get('spotify_matches', 0) - 1)
         if old_status in ('wing-it', 'Wing It'):
             state['wing_it_count'] = max(0, state.get('wing_it_count', 0) - 1)
@@ -4164,7 +4166,9 @@ def _update_itunes_link_discovery_result(identifier, track_index, spotify_track)
     result['spotify_data'] = _build_fix_modal_spotify_data(spotify_track)
     result['wing_it_fallback'] = False
     result['manual_match'] = True
-    if old_status not in ('found', 'Found'):
+    # Commissary: a guess the tab already counted is no new match
+    from core.commissary.discovery_fixes import fix_adds_a_match
+    if fix_adds_a_match(old_status, 'itunes_link'):
         state['spotify_matches'] = state.get('spotify_matches', 0) + 1
     return result, None
 
@@ -4394,6 +4398,9 @@ def update_youtube_discovery_match():
         result['wing_it_fallback'] = False
 
         result['manual_match'] = True  # Flag for tracking
+        # Commissary: fixed by hand, so available again
+        from core.commissary.discovery_unavailable import clear_on_fix
+        clear_on_fix(state, result)
 
         # Update match count if status changed from not found/error
         if old_status != 'found' and old_status != 'Found':
@@ -5058,6 +5065,9 @@ def update_ytmusic_discovery_match():
         result['spotify_data'] = _build_fix_modal_spotify_data(spotify_track)
         result['wing_it_fallback'] = False
         result['manual_match'] = True
+        # Commissary: fixed by hand, so available again
+        from core.commissary.discovery_unavailable import clear_on_fix
+        clear_on_fix(state, result)
 
         if old_status != 'found' and old_status != 'Found':
             state['spotify_matches'] = state.get('spotify_matches', 0) + 1

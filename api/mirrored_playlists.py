@@ -1139,6 +1139,12 @@ def prepare_mirrored_discovery(playlist_id):
 
         for idx, track in enumerate(tracks):
             extra = track.get('extra_data')
+            # Commissary: a track marked "Not available" reopens as one, not as
+            # a retry (core/commissary/discovery_unavailable.py)
+            from core.commissary.discovery_unavailable import is_marked, unavailable_row
+            if is_marked(extra):
+                pre_discovered_results.append(unavailable_row(idx, track))
+                continue
             if extra and extra.get('discovered'):
                 cached_provider = extra.get('provider', 'spotify')
 

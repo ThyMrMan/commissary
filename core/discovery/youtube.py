@@ -116,6 +116,13 @@ def run_youtube_discovery_worker(url_hash, deps: YoutubeDiscoveryDeps):
                 if track.get('skip_discovery'):
                     continue
 
+                # Commissary: a track the user marked "Not available" keeps its row
+                # and is never searched (core/commissary/discovery_unavailable.py)
+                from core.commissary.discovery_unavailable import is_track_unavailable, unavailable_row
+                if is_track_unavailable(track):
+                    state['discovery_results'].append(unavailable_row(i, track))
+                    continue
+
                 # Search for track using active provider
                 cleaned_title = track['name']
                 cleaned_artist = track['artists'][0] if track['artists'] else 'Unknown Artist'

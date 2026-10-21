@@ -136,3 +136,38 @@ def rematch_key(entry: Optional[Dict[str, Any]], engine: Any, original_title: st
             "normalized_artist": engine.clean_artist(original_artist) if original_artist else "",
             "provider": active_provider,
             "original_title": original_title, "original_artist": original_artist}
+
+
+# The tabs whose discovery workers count a Wing It guess as a match
+# (state['spotify_matches'] = successful_discoveries, guesses included). YouTube,
+# YouTube Music, mirrored playlists and ListenBrainz count only real matches.
+GUESSES_COUNT_AS_MATCHES = frozenset({"tidal", "deezer", "qobuz", "spotify_public", "spotify-public",
+                                      "itunes_link", "itunes-link", "beatport"})
+_FOUND = ("found", "Found")
+_GUESS = ("wing-it", "Wing It")
+
+
+def counts_guesses(platform: str) -> bool:
+    return str(platform or "").lower() in GUESSES_COUNT_AS_MATCHES
+
+
+def fix_adds_a_match(old_status: Any, platform: str) -> bool:
+    """Whether fixing a row raises the match count. A guess the tab already
+    counted is not a new match - the tab Fix routes counted it twice."""
+    if old_status in _FOUND:
+        return False
+    return not (old_status in _GUESS and counts_guesses(platform))
+
+
+def unmatch_removes_a_match(old_status: Any, platform: str) -> bool:
+    """Whether unmatching a row lowers the match count: a real match always, a
+    guess only where the tab counted it (unmatch lowered it everywhere)."""
+    if old_status in _FOUND:
+        return True
+    return old_status in _GUESS and counts_guesses(platform)
+
+
+def platform_of_path(path: str) -> str:
+    """'deezer' for /api/deezer/discovery/unmatch, and so on."""
+    parts = [p for p in str(path or "").split("/") if p]
+    return parts[1] if len(parts) > 1 and parts[0] == "api" else ""

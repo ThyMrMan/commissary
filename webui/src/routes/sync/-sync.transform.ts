@@ -172,7 +172,10 @@ export function toDiscoveryRow(
 ): DiscoveryRow {
   const isWingIt = Boolean(r.wing_it_fallback || r.status_class === 'wing-it');
   const isError = r.status === 'error' || r.status_class === 'error' || r.status === '❌ Error';
+  // Commissary: a track the user marked "Not available"
+  const isUnavailable = r.status_class === 'unavailable';
   const isFound =
+    !isUnavailable &&
     !isWingIt &&
     !isError &&
     Boolean(
@@ -196,8 +199,24 @@ export function toDiscoveryRow(
     index: preferAuthoritativeIndex && r.index !== undefined ? r.index : positionIndex,
     yt_track: track,
     yt_artist: artist,
-    status: isWingIt ? '🎯 Wing It' : isError ? '❌ Error' : isFound ? '✅ Found' : '❌ Not Found',
-    status_class: isWingIt ? 'wing-it' : isError ? 'error' : isFound ? 'found' : 'not-found',
+    status: isUnavailable // Commissary
+      ? '🚫 Not available'
+      : isWingIt
+        ? '🎯 Wing It'
+        : isError
+          ? '❌ Error'
+          : isFound
+            ? '✅ Found'
+            : '❌ Not Found',
+    status_class: isUnavailable // Commissary
+      ? 'unavailable'
+      : isWingIt
+        ? 'wing-it'
+        : isError
+          ? 'error'
+          : isFound
+            ? 'found'
+            : 'not-found',
     spotify_track: r.spotify_data ? (r.spotify_data.name ?? '-') : r.spotify_track || '-',
     spotify_artist: spotifyArtistText(r),
     spotify_album: spotifyAlbumText(r),

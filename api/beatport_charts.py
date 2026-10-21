@@ -214,7 +214,9 @@ def update_beatport_discovery_match():
         result['manual_match'] = True  # Flag for tracking
 
         # Update match count if status changed from not found/error
-        if old_status != 'found' and old_status != 'Found':
+        # Commissary: a guess the chart already counted is no new match
+        from core.commissary.discovery_fixes import fix_adds_a_match
+        if fix_adds_a_match(old_status, 'beatport'):
             state['spotify_matches'] = state.get('spotify_matches', 0) + 1
 
         logger.info(f"Manual match updated: beatport - {identifier} - track {track_index}")

@@ -12207,6 +12207,10 @@ _release_picker.register(
 # Commissary: the Import page's folder picker (core/commissary/import_folders.py)
 from core.commissary.import_folders import register as _register_import_folders  # noqa: E402
 _register_import_folders(app)
+
+# Commissary: mark a discovery track "Not available" (core/commissary/discovery_unavailable.py)
+from core.commissary.discovery_unavailable import register as _register_discovery_unavailable  # noqa: E402
+_register_discovery_unavailable(app)
 _register_track_inspector(
     app, inspect_stream=lambda *a, **k: _inspect_sources_stream(*a, **k),
     pinned_batch=_pinned_batch, pinned_deps=lambda: _pinned_batch_deps(),

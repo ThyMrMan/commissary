@@ -15,6 +15,9 @@
 
 import { useCallback, useState } from 'react';
 
+// Commissary: mark a row "Not available"
+import { applyAvailability, postAvailability } from '@/commissary/discovery-unavailable';
+
 import type { FixTrack } from '../-sync.fix';
 import type { SourceVerticalConfig } from '../-sync.sources';
 import type { SourcePlaylistState } from '../-sync.state';
@@ -166,6 +169,25 @@ export function SourceModals({
     [config, vertical, openId],
   );
 
+  // Commissary: mark a row "Not available", or available again
+  const onAvailabilityTrack = useCallback(
+    async (row: DiscoveryRow, unavailable: boolean) => {
+      if (openId === null) return;
+      try {
+        const data = await postAvailability(config, openId, row.index, unavailable);
+        if (data.success) {
+          vertical.patchState(openId, (s) => applyAvailability(s, config, row.index, data));
+          window.showToast?.(unavailable ? 'Marked not available' : 'Available again', 'success');
+        } else {
+          window.showToast?.(data.error || 'Could not change the track', 'error');
+        }
+      } catch {
+        window.showToast?.('Could not change the track', 'error');
+      }
+    },
+    [config, vertical, openId],
+  );
+
   const onFixed = useCallback(
     (trackIndex: number, track: FixTrack) => {
       if (openId === null) return;
@@ -212,6 +234,7 @@ export function SourceModals({
         }
         onFixTrack={(row) => setFixRow(row)}
         onUnmatchTrack={(row) => void onUnmatchTrack(row)}
+        onAvailabilityTrack={(row, unavailable) => void onAvailabilityTrack(row, unavailable)}
       >
         {fixRow && (
           <FixModal

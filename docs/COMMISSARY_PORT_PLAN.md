@@ -198,6 +198,15 @@ AcoustID's `client=` included).
     the entry under its own key and provider; Pool Fix Match searches every source (active first).
     Deferred to 10c: completing a pick from its own source (fix_pick) - it matters once picks come from
     any source.
+  - 10b **done**. Counts: a Wing It guess is a match on the Tidal/Deezer/Qobuz/Spotify-link/iTunes-link/Beatport
+    tabs (their workers count it) and not on YouTube/YouTube Music/mirrored/ListenBrainz - Fix no longer counts a
+    counted guess twice, unmatch no longer lowers the count for an uncounted one. "Not available"
+    (core/commissary/discovery_unavailable.py, POST /api/commissary/discovery/unavailable,
+    webui/src/commissary/discovery-unavailable.tsx): a 🚫 beside Fix in the discovery modal, "↺ Available
+    again" on a marked row; clears the match and guess, saved in a mirrored track's extra_data; the YouTube
+    worker (YouTube, YouTube Music, mirrored), the Pipeline's should_rediscover and reopening a mirrored
+    playlist respect it; a Fix clears it. On the other tabs the mark lasts until that playlist is discovered
+    again (their workers are separate copies upstream - not hooked).
 
 ## Decisions (2026-10-20)
 
