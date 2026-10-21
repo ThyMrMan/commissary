@@ -12191,6 +12191,18 @@ def _commissary_mark_override(task_ids):
 
 
 from core.commissary.track_inspector import register as _register_track_inspector  # noqa: E402
+from core.commissary import release_picker as _release_picker  # noqa: E402
+
+
+def _commissary_release_pin(data, is_album_download):
+    """Commissary: the album release picker's pick, for an album batch only."""
+    return _release_picker.pinned_release(data.get('commissary_pinned_release')) if is_album_download else None
+
+
+_release_picker.register(
+    app, orchestrator=lambda: download_orchestrator,
+    check_permission=lambda: check_download_permission(),
+)
 _register_track_inspector(
     app, inspect_stream=lambda *a, **k: _inspect_sources_stream(*a, **k),
     pinned_batch=_pinned_batch, pinned_deps=lambda: _pinned_batch_deps(),
@@ -19415,6 +19427,8 @@ def start_missing_tracks_process(playlist_id):
             # therefore also onto any failed-download Wishlist row (P1-01).
             'requested_quality_profile_id': requested_quality_profile_id,
             'playlist_source': playlist_source,
+            # Commissary: a release picked in the album release picker
+            'commissary_pinned_release': _commissary_release_pin(data, is_album_download),
         }
 
     # Record sync history — derive source_page from context

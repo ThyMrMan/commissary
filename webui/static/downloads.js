@@ -1923,6 +1923,8 @@ async function startMissingTracksProcess(playlistId) {
             requestBody.is_album_download = _isAlbumContext; // false for single track search results
             requestBody.album_context = process.album;   // Full Spotify album object
             requestBody.artist_context = process.artist; // Full Spotify artist object
+            // Commissary: the release picked in Choose Release (commissary-release-picker.js)
+            if (process.commissaryPinnedRelease) requestBody.commissary_pinned_release = process.commissaryPinnedRelease;
             console.log(`🎵 [${_isAlbumContext ? 'Album' : 'Single Track'}] Sending context: ${process.album?.name} by ${process.artist?.name}`);
         } else {
             // For playlists/wishlists, use the virtual playlist name

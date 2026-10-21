@@ -146,6 +146,13 @@ AcoustID's `client=` included).
     (`/api/commissary/inspect/download`), like upstream's wishlist pick. Hooks: one line in downloads.js
     `renderModalTrackPlaylistButton`, the inspector host's mount, a route registration in web_server.py.
     At ~1024px wide the three row icons leave little room for the track name.
+  - 5c **done** (core/commissary/release_picker.py, commissary-release-picker.js): a "Choose Release" button in
+    the album Download Missing Tracks window lists whole-album releases from torrent, usenet and Soulseek
+    (`POST /api/commissary/album-releases`, NDJSON per source; torrent/usenet run the album download's own
+    "artist album" search and mark upstream's auto-pick). A pick starts the album with
+    `commissary_pinned_release` on the batch: the master tries only that source, the torrent/usenet plugins take
+    that candidate (by candidate-store token, never a URL) and fail visibly if it's gone, Soulseek gets the
+    folder and skips its pre-flight. "Let SoulSync choose" is Begin Analysis.
   - React note: `webui/static/dist` is NOT committed - the Dockerfile builds it from `webui/src`, so a fork React
     change is an ordinary source edit (fork components in `webui/src/commissary/`).
 - Prefer explicit for structured sources (M) — **done** (core/commissary/explicit_preference.py). Deezer, HiFi,

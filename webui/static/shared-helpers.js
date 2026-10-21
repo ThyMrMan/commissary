@@ -1943,6 +1943,8 @@ async function openDownloadMissingModalForArtistAlbum(virtualPlaylistId, playlis
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
+                    ${/* Commissary: choose the album's release (commissary-release-picker.js) */
+                      typeof window.commissaryChooseReleaseButton === 'function' ? window.commissaryChooseReleaseButton(virtualPlaylistId) : ''}
                     ${_isBeatportPlaylistId(virtualPlaylistId) ? `
                     <button class="download-control-btn sync-to-server-btn" id="sync-server-btn-${virtualPlaylistId}" onclick="syncPlaylistToServer('${virtualPlaylistId}')" ${_isSoulsyncStandalone ? 'style="display:none"' : ''}>
                         Sync to Server

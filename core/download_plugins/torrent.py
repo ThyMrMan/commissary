@@ -724,6 +724,7 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         progress_callback=None,
         quality_profile_id=None,
         expected_duration_seconds=None,
+        preferred_release=None,  # Commissary: a release picked by hand
     ) -> Dict[str, Any]:
         """One-shot album download: search Prowlarr for the whole
         release, pick the best torrent, fetch it, extract if needed,
@@ -803,6 +804,14 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             fallback_enabled=fallback_enabled,
             expected_duration_seconds=expected_duration_seconds,
         )
+        # Commissary: the release chosen in the album release picker - that one
+        # or none, never a different one (core/commissary/release_picker.py)
+        if preferred_release:
+            from core.commissary.release_picker import PIN_GONE, pick_pinned
+            picked = pick_pinned('torrent', candidates, preferred_release)
+            if picked is None:
+                result['error'] = PIN_GONE
+                return result
         if picked is None:
             # No candidate matched the requested album, or none had a live
             # swarm. Fall back to the per-track flow rather than downloading a

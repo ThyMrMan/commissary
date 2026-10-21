@@ -575,6 +575,7 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
         progress_callback=None,
         quality_profile_id=None,
         expected_duration_seconds=None,
+        preferred_release=None,  # Commissary: a release picked by hand
     ) -> Dict[str, Any]:
         """Usenet sibling of ``TorrentDownloadPlugin.download_album_to_staging``.
         See that method's docstring for the contract."""
@@ -632,6 +633,14 @@ class UsenetDownloadPlugin(DownloadSourcePlugin):
             fallback_enabled=fallback_enabled,
             expected_duration_seconds=expected_duration_seconds,
         )
+        # Commissary: the release chosen in the album release picker - that one
+        # or none, never a different one (core/commissary/release_picker.py)
+        if preferred_release:
+            from core.commissary.release_picker import PIN_GONE, pick_pinned
+            picked = pick_pinned('usenet', candidates, preferred_release)
+            if picked is None:
+                result['error'] = PIN_GONE
+                return result
         if picked is None:
             # No candidate matched the requested album (or none passed filtering).
             # Fall back to per-track rather than grabbing a wrong album (#730).

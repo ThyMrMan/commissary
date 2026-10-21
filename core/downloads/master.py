@@ -1102,6 +1102,12 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         # owned album would still trigger a release download.
         _bundle_state = _BatchStateAccessImpl()
         _album_bundle_sources = _resolve_album_bundle_sources(deps.config_manager)
+        # Commissary: a release picked in the album release picker - only its
+        # source, carrying the pick (core/commissary/release_picker.py)
+        from core.commissary.release_picker import bundle_pin as _commissary_bundle_pin
+        _pin_source, _pin_kwargs = _commissary_bundle_pin(batch.get('commissary_pinned_release'))
+        if _pin_source:
+            _album_bundle_sources = [_pin_source]
         _album_bundle_staged = batch_private_album_bundle
 
         def _configured_bundle_plugin(source):
@@ -1156,6 +1162,7 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             _duration = expected_release_duration_seconds(tracks_json)
             if _duration:
                 kwargs['expected_duration_seconds'] = _duration
+            kwargs.update(_pin_kwargs or {})  # Commissary: the picked release
             return kwargs or None
 
         def _dispatch_bundle_sources(sources):
@@ -1229,7 +1236,8 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             and not batch_private_album_bundle
         )
         if (batch_is_album and batch_album_context and batch_artist_context
-                and soulseek_is_source and not batch_private_album_bundle):
+                and soulseek_is_source and not batch_private_album_bundle
+                and not _pin_source):  # Commissary: a picked folder needs no pre-flight
             artist_name = batch_artist_context.get('name', '')
             album_name = batch_album_context.get('name', '')
             if artist_name and album_name:
