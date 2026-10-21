@@ -215,6 +215,8 @@ AcoustID's `client=` included).
     release date, track count - the id only when the album is complete) before upstream's update_match saves
     it, so none of the eight Fix routes changed. Not ported: the length delta (a row carries no source
     duration except ListenBrainz).
+  - 10d suggestions and 10e Review mode / match-quality chips - **dropped** (2026-10-21, item 10 stops at 10c
+    to keep the fork simpler to maintain).
 
 ## Decisions (2026-10-20)
 
