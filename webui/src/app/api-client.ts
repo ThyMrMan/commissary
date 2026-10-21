@@ -2,6 +2,8 @@ import type { ResponsePromise } from 'ky';
 
 import ky, { HTTPError } from 'ky';
 
+// Commissary: the Import page's chosen folder rides on Import requests
+import { commissaryImportFolderHook } from '@/commissary/import-folder';
 import { appURL } from '@/platform/url-base';
 
 const apiBaseUrl =
@@ -16,6 +18,7 @@ const shellBaseUrl =
 export const apiClient = ky.create({
   baseUrl: apiBaseUrl,
   retry: 0,
+  hooks: { beforeRequest: [commissaryImportFolderHook] }, // Commissary
 });
 
 export const shellClient = ky.create({

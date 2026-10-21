@@ -110,10 +110,13 @@ def _get_allowed_import_roots() -> list[str]:
     from core.settings import config_manager
     from core.imports.paths import docker_resolve_path
 
+    # Commissary: the torrent / usenet / transfer folders too, so a release
+    # imported where its client left it is accepted (core/commissary/import_folders.py)
+    from core.commissary.import_folders import extra_import_roots
     return [
         _get_staging_path(),
         docker_resolve_path(config_manager.get("soulseek.download_path", "./downloads")),
-    ]
+    ] + extra_import_roots()
 
 
 @dataclass

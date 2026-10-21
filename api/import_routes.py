@@ -76,7 +76,14 @@ def _build_import_route_runtime():
             file_info, profile_id=runtime.profile_id),
         logger=logger,
         profile_id=_request_profile_id(),
+        # Commissary: scan a chosen download folder (core/commissary/import_folders.py)
+        **_commissary_import_folder(),
     )
+
+
+def _commissary_import_folder():
+    from core.commissary.import_folders import runtime_overrides
+    return runtime_overrides()
 
 
 def _request_profile_id():

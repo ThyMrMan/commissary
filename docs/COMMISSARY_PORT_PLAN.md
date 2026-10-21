@@ -174,7 +174,15 @@ AcoustID's `client=` included).
   Deezer, artist-checked - before the cache or any title search. Not ported: the old fork's "Deezer by ISRC
   whatever the discovery source" for iTunes users (it stored a Deezer match under another provider and needed
   its own album completion and drift exemptions); with iTunes as the source the title search runs as before.
-- Import from any download folder — new route + React import inbox UI (M).
+- Import from any download folder — new route + React import inbox UI (M) — **done**
+  (core/commissary/import_folders.py, webui/src/commissary/import-folder*.ts(x)). "Scan another folder" in the
+  Import page's status strip browses the Import folder and every download folder (Soulseek download/transfer,
+  torrent/usenet completed; not the music library) and scans the chosen one: a ky `beforeRequest` hook on the
+  shared api client adds `scan_path` to every /api/import/ request except uploads, and the Import cache is
+  reset on a change. Server: one hook in api/import_routes `_build_import_route_runtime` (admin-only, the folder
+  must resolve inside a root - realpath + commonpath, symlinks and lookalike siblings refused) and one in
+  core/imports/routes `_get_allowed_import_roots` (the download folders accepted by upstream's move check).
+  The choice lasts until a page reload.
 - Purchased tracking — `api/purchased.py` + React `routes/purchased` + artist-detail hooks (L).
 - Discovery: Fix dialog searching every source, suggestions/unavailable, match-quality chips (React, M–L).
 

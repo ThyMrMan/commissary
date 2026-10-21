@@ -3,6 +3,8 @@ import { Link, useNavigate } from '@tanstack/react-router';
 import clsx from 'clsx';
 import { useEffect, useRef, useState } from 'react';
 
+// Commissary: scan any download folder
+import { CommissaryImportFolder } from '@/commissary/import-folder-picker';
 import { Button, Checkbox, Switch } from '@/components/form/form';
 import { Notice } from '@/components/primitives';
 import { browserSafeImageUrl } from '@/platform/artwork-thumb';
@@ -627,6 +629,8 @@ function StatusStrip({
             ? 'Reading import folder…'
             : payload?.staging_path || 'Import folder not configured'}
       </span>
+      {/* Commissary: scan any download folder (core/commissary/import_folders.py) */}
+      <CommissaryImportFolder />
       {summary ? (
         <span className={styles.stripStat} id="import-page-staging-stats">
           <strong>{summary.items}</strong> {summary.items === 1 ? 'item' : 'items'} ·{' '}

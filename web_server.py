@@ -12203,6 +12203,10 @@ _release_picker.register(
     app, orchestrator=lambda: download_orchestrator,
     check_permission=lambda: check_download_permission(),
 )
+
+# Commissary: the Import page's folder picker (core/commissary/import_folders.py)
+from core.commissary.import_folders import register as _register_import_folders  # noqa: E402
+_register_import_folders(app)
 _register_track_inspector(
     app, inspect_stream=lambda *a, **k: _inspect_sources_stream(*a, **k),
     pinned_batch=_pinned_batch, pinned_deps=lambda: _pinned_batch_deps(),
