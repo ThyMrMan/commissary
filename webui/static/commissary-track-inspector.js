@@ -52,6 +52,20 @@
             + '3.5-7.5-7.5 3.5-3.5 7.5zm5.5-6.6a1.1 1.1 0 1 1 0 2.2 1.1 1.1 0 0 1 0-2.2z"/></svg></button>';
     }
 
+    // A failed / not found / cancelled row's Actions cell: a Sources button
+    // opening upstream's own search modal for that task (the same one a click
+    // on the status cell opens - nothing showed that it could be clicked).
+    function sourcesButton(task, quarantined) {
+        if (!task || quarantined || !task.task_id) return '';
+        if (['failed', 'not_found', 'cancelled'].indexOf(task.status) === -1) return '';
+        if (typeof window.showCandidatesModal !== 'function') return '';
+        var id = (typeof escapeForInlineJs === 'function') ? escapeForInlineJs(task.task_id) : String(task.task_id);
+        return '<button class="approve-quarantine-inline-btn commissary-sources-btn" '
+            + 'onclick="event.stopPropagation(); window.showCandidatesModal(\'' + id + '\')" '
+            + 'title="Search the sources and pick a file by hand">Sources</button>';
+    }
+
     window.commissaryInspectButton = inspectButton;
+    window.commissarySourcesButton = sourcesButton;
     window.commissaryInspectModalTrack = inspectModalTrack;
 })();

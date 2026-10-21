@@ -3622,6 +3622,10 @@ function processModalStatusUpdate(playlistId, data) {
                 }
             } else if (actionsEl && ['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
                 actionsEl.innerHTML = '-'; // No actions available for terminal or processing states
+                // Commissary: a failed row says it can be picked by hand (commissary-track-inspector.js)
+                if (typeof window.commissarySourcesButton === 'function') {
+                    actionsEl.innerHTML = window.commissarySourcesButton(task, isQuarantinedTask) || '-';
+                }
             }
         });
 

@@ -10,6 +10,11 @@
  * standing up a modal.
  */
 
+// Commissary: the every-source picker opens on a track click
+import type { CommissaryInspectTrack } from '@/commissary/track-inspector';
+
+import { openPickerFirst } from '@/commissary/search-picker';
+
 import type { SearchAlbum, SearchTrack } from './-search.types';
 
 import { lockSectionType } from '../artist-detail/-artist-detail.open-release';
@@ -289,6 +294,8 @@ export async function openSearchTrack(track: SearchTrack): Promise<void> {
       virtualId,
       track.artist,
     );
+    // Commissary: the every-source picker opens on top (commissary/search-picker.ts)
+    openPickerFirst(enrichSingleTrack(track) as CommissaryInspectTrack);
   } catch (error) {
     window.showToast?.(`Error opening track: ${(error as Error).message}`, 'error');
   } finally {

@@ -60,8 +60,14 @@ failure logging. Retries already stay on their own transport upstream.
 
 Security: legacy 2.4.2's log API-key redaction — now done, see "Security" under Phase 2.
 
-Deferred to Phase 3: rest of 1.9.8 (picker open by default, Sources button on
-failed rows, album release picker).
+Rest of 1.9.8, done in Phase 3: album release picker (item 5c); the picker open by
+default - a track clicked on the Search page opens the every-source Interactive Search
+on top of upstream's one-track download window, closing it leaves Begin Analysis as
+the automatic path, a profile that requests keeps upstream's flow
+(webui/src/commissary/search-picker.ts, one hook in -search.actions.ts openSearchTrack);
+a Sources button in a failed / not found / cancelled row's Actions cell opens upstream's
+own search modal for that task, the one its status cell already opened unannounced
+(commissary-track-inspector.js, one hook in downloads.js; quarantined rows keep Approve).
 
 ## Phase 2 — video features (dependency order)
 
