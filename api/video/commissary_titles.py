@@ -99,4 +99,11 @@ def register_routes(bp):
             for kind, libs in out.items():
                 for lib in libs:
                     lib["count"] = counts.get(kind, {}).get(lib["id"], 0)
+        elif request.args.get("scope") == "history":
+            # completed grabs per Library, for the Download History's tabs
+            from core.commissary.video_libraries import history_tab_counts
+            counts = history_tab_counts(db)
+            for kind, libs in out.items():
+                for lib in libs:
+                    lib["count"] = counts.get(kind, {}).get(lib["id"], 0)
         return jsonify(out)

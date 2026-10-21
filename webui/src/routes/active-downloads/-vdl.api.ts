@@ -103,11 +103,13 @@ export async function fetchVideoHistory(
   search: string,
   page: number,
   limit = 40,
+  library: number | null = null, // Commissary: a Library tab
 ): Promise<VdlHistoryPage> {
   const empty: VdlHistoryPage = { items: [], counts: {}, totalPages: 1 };
   try {
     const params: Record<string, string | number> = { page, limit, search };
     if (tab !== 'all') params.kind = tab;
+    if (library != null && tab !== 'all') params.library = library; // Commissary
     const data = await readJson<{
       success?: boolean;
       items?: VdlHistoryItem[];

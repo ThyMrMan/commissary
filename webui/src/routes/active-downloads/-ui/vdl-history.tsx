@@ -8,6 +8,9 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+// Commissary: video Library tabs (commissary/history-library-tabs.tsx)
+import { HistoryLibraryTabs, useHistoryLibraries } from '@/commissary/history-library-tabs';
+
 import type { VdlHistoryItem, VdlHistoryTab } from '../-vdl.types';
 
 import {
@@ -232,13 +235,21 @@ export function VdlHistoryModal({
    * in-flight guard, newer requests are never silently dropped while the
    * user is already looking at the new tab. */
   const reqSeqRef = useRef(0);
+  const libs = useHistoryLibraries(open); // Commissary
+  const libraryFor = libs.libraryFor;
 
   const load = useCallback(
     async (nextPage: number, nextSearch: string, nextTab: VdlHistoryTab, append: boolean) => {
       const seq = ++reqSeqRef.current;
       setLoading(true);
       try {
-        const data = await fetchVideoHistory(nextTab, nextSearch, nextPage);
+        const data = await fetchVideoHistory(
+          nextTab,
+          nextSearch,
+          nextPage,
+          undefined,
+          libraryFor(nextTab), // Commissary
+        );
         if (seq !== reqSeqRef.current) return; // superseded — discard stale response
         setCounts({
           movie: data.counts.movie ?? 0,
@@ -253,7 +264,7 @@ export function VdlHistoryModal({
         if (seq === reqSeqRef.current) setLoading(false);
       }
     },
-    [onCountChange],
+    [onCountChange, libraryFor],
   );
 
   /* open → reset and load; close → release the scroll lock */
@@ -321,6 +332,7 @@ export function VdlHistoryModal({
     toast(`Cleared ${Number(r?.removed ?? 0)} from history`, 'info');
     setPage(1);
     void load(1, search, tab, false);
+    void libs.refresh(); // Commissary
   };
 
   const toggleRow = (id: string) => {
@@ -433,6 +445,16 @@ export function VdlHistoryModal({
             Clear
           </button>
         </div>
+        {/* Commissary: one video Library of this kind */}
+        <HistoryLibraryTabs
+          libs={libs}
+          tab={tab}
+          kindCount={tab === 'movie' ? counts.movie : counts.show}
+          onPicked={() => {
+            setPage(1);
+            void load(1, search, tab, false);
+          }}
+        />
         <div className={`vdh-body${loading && !items.length ? ' vdh-body--loading' : ''}`}>
           {items.length === 0 && !loading ? (
             <div className="vdh-empty">

@@ -638,7 +638,8 @@ def register_routes(bp):
                 kind=kind if kind in ("movie", "show", "youtube") else None,
                 search=request.args.get("search", ""),
                 outcome=request.args.get("outcome") or None,
-                page=request.args.get("page", 1), limit=request.args.get("limit", 40))
+                page=request.args.get("page", 1), limit=request.args.get("limit", 40),
+                library=request.args.get("library") or None)   # Commissary: a Library tab
             return jsonify({"success": True, "counts": db.download_history_counts(), **res})
         except Exception:
             logger.exception("Failed to list video download history")

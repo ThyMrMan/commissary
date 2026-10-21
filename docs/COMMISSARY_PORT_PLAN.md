@@ -116,9 +116,13 @@ own search modal for that task, the one its status cell already opened unannounc
     that must carry the title, never results[0] on trust (tmdb_match.py).
 12. Per-Library UI surfaces (L, rebuild; history is React now) — **Library page + Wishlist done**
     (commissary-library-tabs.js; `?library=` on /api/video/library and /api/video/wishlist; member-readable
-    /api/video/commissary/library-tabs with counts, no paths). Not done: Download History (a compiled React
-    bundle - a fork change means rebuilding/committing static/dist, which conflicts on every upstream UI
-    update), Library dashboard tiles, per-Library enrichment priority.
+    /api/video/commissary/library-tabs with counts, no paths). Download History **done** (Phase 3 follow-up,
+    webui/src/commissary/history-library-tabs.tsx; static/dist is built by the Dockerfile, not committed): a
+    second tab row under Movies / TV, counts of completed grabs per Library (?scope=history), ?library= on
+    /api/video/downloads/history. A grab's Library is the folder its file landed in (longest first), else its
+    title's Library (owned, by library row or TMDB id), else the wish / follow choice
+    (video_libraries.history_library_sql); YouTube and unplaceable failed grabs show only under All.
+    Not done: Library dashboard tiles, per-Library enrichment priority.
 
 Security: log API-key redaction (legacy 2.4.2) — **done** (core/commissary/log_redaction.py, installed when
 utils/logging_config is imported; wraps logging.Formatter.format so every formatter redacts, side logs and

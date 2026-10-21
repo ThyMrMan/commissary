@@ -732,3 +732,75 @@ def tabs(db, server=None) -> dict:
         out[kind] = [{"id": r["id"], "label": r["label"], "count": counts.get(r["id"], 0)}
                      for r in rows]
     return out
+
+
+# ── Download History, per Library ────────────────────────────────────────────
+
+_HISTORY_YT = "(COALESCE(source,'') = 'youtube' OR kind = 'youtube')"
+
+
+def history_library_sql(db) -> tuple[str, list]:
+    """(SQL, params) for the Library a ``video_download_history`` row belongs to.
+
+    Where its file landed first: a path inside a Library's folder (the longest
+    folder wins, as in ``for_path``). A row with no file (a failed grab) falls
+    back to its title's Library - the owned title by library id or TMDB id -
+    and then to the choice made when it was wished or followed. YouTube rows
+    have no Library."""
+    folders = []
+    for r in all_rows(db):
+        p = str(r.get("path") or "").strip().replace("\\", "/").rstrip("/").lower()
+        if p and r.get("content_kind") in ("movie", "show"):
+            folders.append((len(p), p, r["id"]))
+    folders.sort(reverse=True)
+    dest = "REPLACE(LOWER(COALESCE(dest_path,'')), '\\', '/')"
+    parts, params = [], []
+    if folders:
+        whens = []
+        for _n, p, rid in folders:
+            whens.append(f"WHEN {dest} = ? OR substr({dest}, 1, ?) = ? THEN ?")
+            params += [p, len(p) + 1, p + "/", rid]
+        parts.append("CASE " + " ".join(whens) + " END")
+
+    def title(table):
+        return (f"(SELECT t.root_folder_id FROM {table} t WHERE t.root_folder_id IS NOT NULL AND ("
+                "(media_source = 'library' AND t.id = CAST(media_id AS INTEGER)) OR "
+                "(media_source = 'tmdb' AND t.tmdb_id = CAST(media_id AS INTEGER))) LIMIT 1)")
+
+    parts.append(f"CASE WHEN kind = 'movie' THEN {title('movies')} ELSE {title('shows')} END")
+    parts.append("(SELECT w.root_folder_id FROM video_wishlist w WHERE media_source = 'tmdb' "
+                 "AND w.tmdb_id = CAST(media_id AS INTEGER) AND w.root_folder_id IS NOT NULL "
+                 "AND (w.kind = 'movie') = (kind = 'movie') LIMIT 1)")
+    parts.append("CASE WHEN kind <> 'movie' THEN (SELECT f.root_folder_id FROM video_watchlist f "
+                 "WHERE f.kind = 'show' AND media_source = 'tmdb' "
+                 "AND f.tmdb_id = CAST(media_id AS INTEGER) AND f.root_folder_id IS NOT NULL LIMIT 1) END")
+    sql = f"(CASE WHEN {_HISTORY_YT} THEN NULL ELSE COALESCE(" + ", ".join(parts) + ") END)"
+    return sql, params
+
+
+def history_library_where(db, where: list, args: list, library) -> None:
+    """Narrow upstream's Download History query to one Library (its Library
+    tabs). Nothing chosen, or junk: unchanged."""
+    if library in (None, ""):
+        return
+    try:
+        lib = int(library)
+    except (TypeError, ValueError):
+        return
+    sql, params = history_library_sql(db)
+    where.append(sql + " = ?")
+    args.extend(params + [lib])
+
+
+def history_tab_counts(db) -> dict:
+    """{movie: {lib_id: n}, show: {lib_id: n}} of completed grabs - the rows
+    upstream's own History tab badges count."""
+    sql, params = history_library_sql(db)
+    out = {"movie": {}, "show": {}}
+    for r in _rows(db, f"SELECT CASE WHEN kind = 'movie' THEN 'movie' ELSE 'show' END AS k, "
+                       f"{sql} AS lib, COUNT(*) AS n FROM video_download_history "
+                       "WHERE outcome = 'completed' AND cleared_at IS NULL "
+                       f"AND NOT {_HISTORY_YT} GROUP BY k, lib", tuple(params)):
+        if r["lib"] is not None:
+            out[r["k"]][r["lib"]] = r["n"]
+    return out

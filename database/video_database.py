@@ -3579,7 +3579,7 @@ class VideoDatabase:
             conn.close()
 
     def query_download_history(self, *, kind=None, search=None, outcome=None,
-                               page=1, limit=40) -> dict:
+                               page=1, limit=40, library=None) -> dict:  # Commissary: + library
         """Paged history slice for the modal. ``kind`` ∈ movie|show (None=all);
         ``outcome`` filters by result. Newest first. {items, pagination}."""
         try:
@@ -3600,6 +3600,7 @@ class VideoDatabase:
             where.append(_yt)
         if outcome:
             where.append("outcome = ?"); args.append(outcome)
+        _vlib_sql.history_library_where(self, where, args, library)  # Commissary: a Library tab
         s = (search or "").strip()
         if s:
             where.append("(title LIKE ? OR release_title LIKE ?) COLLATE NOCASE")
