@@ -2124,7 +2124,9 @@ function renderModalTrackPlayButton(playlistId, trackIndex) {
 // the add-to-playlist picker lives in the react bundle (features/playlists),
 // so this only hands it the row's artist + title
 function renderModalTrackPlaylistButton(playlistId, trackIndex) {
-    return `<button class="modal-track-play-btn modal-track-add-btn" onclick="event.stopPropagation(); addDownloadModalTrackToPlaylist('${escapeForInlineJs(playlistId)}', ${trackIndex}, this)" title="Add to playlist" aria-label="Add to playlist"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z"/></svg></button>`;
+    return `<button class="modal-track-play-btn modal-track-add-btn" onclick="event.stopPropagation(); addDownloadModalTrackToPlaylist('${escapeForInlineJs(playlistId)}', ${trackIndex}, this)" title="Add to playlist" aria-label="Add to playlist"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z"/></svg></button>`
+        // Commissary: search every source for this track (commissary-track-inspector.js)
+        + (typeof window.commissaryInspectButton === 'function' ? window.commissaryInspectButton(playlistId, trackIndex) : '');
 }
 
 function addDownloadModalTrackToPlaylist(playlistId, trackIndex, button) {

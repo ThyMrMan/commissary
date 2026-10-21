@@ -4,6 +4,9 @@ import { createRoot } from 'react-dom/client';
 import type { GrabRule, InspectorCandidate, InspectorSearchMeta } from './inspector';
 import type { SourceColumnData } from './inspector-columns';
 
+// Commissary: the inspector for any track in the download window
+import { installCommissaryTrackInspector } from '@/commissary/track-inspector';
+
 import { bestCandidateIndex, streamInspection } from './inspector';
 import { SourceColumn } from './inspector-columns';
 
@@ -338,4 +341,6 @@ export function mountCandidateInspectorHost(): void {
   document.body.appendChild(el);
   createRoot(el).render(<CandidateInspectorHost />);
   window.openDownloadTaskInspector = openDownloadTaskInspector;
+  // Commissary: the inspector for any track in the download window
+  installCommissaryTrackInspector();
 }

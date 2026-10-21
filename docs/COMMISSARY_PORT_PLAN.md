@@ -139,6 +139,13 @@ AcoustID's `client=` included).
     Files picker offer every configured source, the download order first ("Your download order" / "Other
     sources"), in any mode. Upstream's Candidate Inspector already searched every source. Note: upstream's Files
     tab still opens Settings while Soulseek itself is unconfigured.
+  - 5b **done** (core/commissary/track_inspector.py, commissary-track-inspector.js, webui/src/commissary/
+    track-inspector.ts): every row of the Download Missing Tracks window (every album, every Search page track)
+    gets a compass button beside upstream's play / add-to-playlist ones. It opens upstream's Candidate Inspector
+    for that track (`POST /api/commissary/inspect`); a pick starts that exact file as a pinned one-task batch
+    (`/api/commissary/inspect/download`), like upstream's wishlist pick. Hooks: one line in downloads.js
+    `renderModalTrackPlaylistButton`, the inspector host's mount, a route registration in web_server.py.
+    At ~1024px wide the three row icons leave little room for the track name.
   - React note: `webui/static/dist` is NOT committed - the Dockerfile builds it from `webui/src`, so a fork React
     change is an ordinary source edit (fork components in `webui/src/commissary/`).
 - Prefer explicit for structured sources (M) — **done** (core/commissary/explicit_preference.py). Deezer, HiFi,

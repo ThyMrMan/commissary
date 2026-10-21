@@ -12181,6 +12181,26 @@ def download_wishlist_pick():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+# Commissary: the inspector for any track in the download window, on the same
+# stream and pinned batches as above (core/commissary/track_inspector.py)
+def _commissary_mark_override(task_ids):
+    with tasks_lock:
+        for task_id in task_ids:
+            if task_id in download_tasks:
+                download_tasks[task_id]['_override_quality'] = True
+
+
+from core.commissary.track_inspector import register as _register_track_inspector  # noqa: E402
+_register_track_inspector(
+    app, inspect_stream=lambda *a, **k: _inspect_sources_stream(*a, **k),
+    pinned_batch=_pinned_batch, pinned_deps=lambda: _pinned_batch_deps(),
+    check_permission=lambda: check_download_permission(),
+    profile_id=lambda: get_current_profile_id(),
+    add_activity=lambda *a: add_activity_item(*a),
+    mark_override=_commissary_mark_override,
+)
+
+
 @app.route('/api/library/artist/<artist_id>/sync', methods=['POST'])
 @admin_only
 def sync_artist_library(artist_id):
