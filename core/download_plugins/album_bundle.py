@@ -1513,6 +1513,15 @@ def resolve_reported_save_path(
         if best is not None:
             return best
 
+    # Commissary: deeper category folders - '<root>/complete/Music/<release>'
+    # (core/commissary/download_depth.py)
+    from core.commissary import download_depth as _depth
+    _deep = _depth.find_release(
+        _candidate_download_roots(config_get), tail_parts[-1] if tail_parts else None,
+        config_get, accept=lambda c: _exists(c) and _contains_expected(c))
+    if _deep:
+        return _deep
+
     # 4. The roots THEMSELVES. A torrent client reports its save DIRECTORY
     #    (e.g. '/downloads'), not a per-release folder — in the shared-mount
     #    setup the release lands as '<SoulSync download root>/<name>', so the
@@ -1530,6 +1539,11 @@ def resolve_reported_save_path(
                 if _is_file(target):
                     return str(target)
                 return str(root)
+        # Commissary: ...and the release in a category folder under a root
+        _holder = _depth.find_holder(_candidate_download_roots(config_get), expect_name,
+                                     config_get, contains=_contains_expected)
+        if _holder:
+            return _holder
 
     # Nothing verifiably better — hand back the reported path unchanged so
     # the caller's "no audio found" error can name it honestly.

@@ -161,7 +161,13 @@ AcoustID's `client=` included).
   fall back to "(Clean)"/"(Explicit)" in the name). Also fixed what left the legacy version inert: the worker
   rebuilt the wanted track without its flag and the wishlist saved tracks without it (rows saved before this
   have none). Upstream's own Soulseek filename preference (#923) is unchanged.
-- Multiple completed-download paths + depth search (M).
+- Multiple completed-download paths + depth search (M) — **done**. Several folders per setting was Phase 0
+  (core/commissary/paths.py). The depth search is core/commissary/download_depth.py, hooked into upstream's
+  `resolve_reported_save_path` after its own `<root>/<release>` and `<root>/<parent>/<release>` checks: a
+  release under category folders (`<root>/complete/Music/<release>`) resolves, breadth-first across every root
+  (shallowest wins, newest within a level), `download_source.import_search_depth` levels (default 3, 1..6, no
+  UI - as in the old fork), 400 folders per root at most; and a client reporting only its save folder finds
+  the category folder holding the release. Shared by music, video and audiobooks.
 - Qobuz ISRC into upstream `isrc_match` (M).
 - Import from any download folder — new route + React import inbox UI (M).
 - Purchased tracking — `api/purchased.py` + React `routes/purchased` + artist-detail hooks (L).
