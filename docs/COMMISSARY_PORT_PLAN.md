@@ -122,7 +122,7 @@ own search modal for that task, the one its status cell already opened unannounc
     /api/video/downloads/history. A grab's Library is the folder its file landed in (longest first), else its
     title's Library (owned, by library row or TMDB id), else the wish / follow choice
     (video_libraries.history_library_sql); YouTube and unplaceable failed grabs show only under All.
-    Not done: Library dashboard tiles, per-Library enrichment priority.
+    Dropped (2026-10-21, to keep the fork smaller): Library dashboard tiles, per-Library enrichment priority.
 
 Security: log API-key redaction (legacy 2.4.2) — **done** (core/commissary/log_redaction.py, installed when
 utils/logging_config is imported; wraps logging.Formatter.format so every formatter redacts, side logs and
