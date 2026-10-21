@@ -784,6 +784,7 @@ class TidalDownloadClient(DownloadSourcePlugin):
                 'isrc': track.isrc or None,
                 'bpm': track.bpm if track.bpm and track.bpm > 0 else None,
                 'copyright': track.copyright or None,
+                'explicit': getattr(track, 'explicit', None),  # Commissary: explicit preference
             },
         )
 

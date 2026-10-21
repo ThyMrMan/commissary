@@ -771,6 +771,11 @@ def _score_streaming_candidates(results, spotify_track, why=None):
     if scored:
         # Sort by confidence (best match first)
         scored.sort(key=lambda x: x.confidence, reverse=True)
+        # Commissary: the explicit cut first when the wanted track is explicit -
+        # ranking only, the gate above read the true confidence
+        # (core/commissary/explicit_preference.py)
+        from core.commissary.explicit_preference import rank as _explicit_rank
+        _explicit_rank(scored, spotify_track, source_label)
         best = scored[0]
         logger.info(f"[{source_label}] {len(scored)}/{len(results)} candidates passed validation "
               f"(best: {best.confidence:.2f} '{best.artist} - {best.title}')")

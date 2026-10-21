@@ -884,6 +884,7 @@ class DeezerDownloadClient(DownloadSourcePlugin):
                 'track_id': track_id,
                 'artist_id': str(artist_obj.get('id') or '') or None,
                 'album_id': str(album_obj.get('id') or '') or None,
+                'explicit': item.get('explicit_lyrics'),  # Commissary: explicit preference
             },
         )
         # Stamp CD-quality FLAC (16/44.1) so lossless ranks correctly.

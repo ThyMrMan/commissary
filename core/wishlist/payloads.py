@@ -134,7 +134,9 @@ def ensure_wishlist_track_format(track_info):
     }
     if track_info.get('quality_profile_id') is not None:
         normalized['quality_profile_id'] = track_info.get('quality_profile_id')
-    return normalized
+    # Commissary: keep the explicit flag (core/commissary/explicit_preference.py)
+    from core.commissary.explicit_preference import keep_flag
+    return keep_flag(normalized, track_info)
 
 
 def ensure_spotify_track_format(track_info):

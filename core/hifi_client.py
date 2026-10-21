@@ -1025,6 +1025,7 @@ class HiFiClient(DownloadSourcePlugin):
                 'isrc': track.get('isrc'),
                 'bpm': track.get('bpm'),
                 'copyright': track.get('copyright'),
+                'explicit': track.get('explicit'),  # Commissary: explicit preference
             },
         )
 

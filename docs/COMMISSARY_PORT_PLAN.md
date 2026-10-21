@@ -132,9 +132,15 @@ AcoustID's `client=` included).
   carries an album alone). Staging claims a batch track's file the same way, reading a straight-through
   offset off the staged files, and keeps the task's own disc/track number. The staging scan now carries
   each file's length (upstream's reader had it, the list dropped it).
-- Edition preference — fold download/consistency/bundle gates onto upstream `edition_grouping` (M).
+- Edition preference — **dropped** (2026-10-20): the legacy `wishlist.prefer_deluxe_editions` was off on the
+  live instance, and upstream's `watchlist.edition_preference` ("one_complete") covers watchlist + discography.
 - Every source searchable + "search all sources" + album release picker (M–L; backend + vanilla downloads.js, React search chips).
-- Prefer explicit for structured sources (M).
+- Prefer explicit for structured sources (M) — **done** (core/commissary/explicit_preference.py). Deezer, HiFi,
+  Qobuz and Tidal candidates carry their explicit flag in `_source_metadata`; validation's sort puts the explicit
+  cut first when the wanted track is explicit (ranking only, never the 0.60 gate; torrent/usenet/YouTube/Amazon
+  fall back to "(Clean)"/"(Explicit)" in the name). Also fixed what left the legacy version inert: the worker
+  rebuilt the wanted track without its flag and the wishlist saved tracks without it (rows saved before this
+  have none). Upstream's own Soulseek filename preference (#923) is unchanged.
 - Multiple completed-download paths + depth search (M).
 - Qobuz ISRC into upstream `isrc_match` (M).
 - Import from any download folder — new route + React import inbox UI (M).

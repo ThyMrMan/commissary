@@ -422,6 +422,9 @@ def download_track_worker(task_id: str, batch_id: Optional[str], deps: TaskWorke
             duration_ms=track_data.get('duration_ms', 0),
             popularity=track_data.get('popularity', 0),
         )
+        # Commissary: the track's explicit flag, for the explicit preference
+        from core.commissary.explicit_preference import wanted_flag
+        track.explicit = wanted_flag(track_data)
         logger.info(f"[Modal Worker] Starting download task for: {track.name} by {track.artists[0] if track.artists else 'Unknown'}")
 
         # Initialize task state tracking (like GUI's parallel_search_tracking)
