@@ -27,6 +27,17 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
+// Commissary: the Fix dialog searches every source
+import type { SourcedTrack } from '@/commissary/fix-search';
+
+import {
+  completePick,
+  FixCardSource,
+  FixSourceChips,
+  searchEverySource,
+  SOURCE_KEY,
+} from '@/commissary/fix-search';
+
 import type { FixTrack } from '../-sync.fix';
 import type { SourceVerticalConfig } from '../-sync.sources';
 import type { DiscoveryRow } from '../-sync.transform';
@@ -35,11 +46,8 @@ import { formatDuration } from '../-sync.core';
 import {
   buildUpdateMatchBody,
   lookupMbRecording,
-  orderedFixSearchSources,
   parseMusicBrainzMbid,
   postUpdateMatch,
-  searchFixTracks,
-  sortFixResults,
 } from '../-sync.fix';
 import { metadataSourceLabel } from '../-sync.modal-core';
 
@@ -80,9 +88,10 @@ export function FixModal({ config, sourceId, row, onClose, onFixed }: FixModalPr
   const [trackQuery, setTrackQuery] = useState(row.yt_track);
   const [artistQuery, setArtistQuery] = useState(row.yt_artist);
   const [mbidQuery, setMbidQuery] = useState('');
-  const [results, setResults] = useState<FixTrack[]>([]);
+  const [results, setResults] = useState<SourcedTrack[]>([]);
   const [statusText, setStatusText] = useState('');
   const searchToken = useRef(0);
+  const [sourceFilter, setSourceFilter] = useState('all'); // Commissary: source chips
 
   const runSearch = useCallback(async (track: string, artist: string) => {
     const trimmedTrack = track.trim();
@@ -92,25 +101,23 @@ export function FixModal({ config, sourceId, row, onClose, onFixed }: FixModalPr
       return;
     }
     const token = ++searchToken.current;
-    const sources = orderedFixSearchSources(metadataSourceLabel());
+    // Commissary: every source at once, merged and ranked as each answers
+    // (commissary/fix-search.tsx) - upstream stopped at the first with results
     setResults([]);
-    setStatusText(`🔍 Searching ${sources[0].label}...`);
-    for (let i = 0; i < sources.length; i++) {
-      try {
-        const tracks = await searchFixTracks(sources[i].endpoint, trimmedTrack, trimmedArtist);
+    setSourceFilter('all');
+    setStatusText('🔍 Searching every source...');
+    const found = await searchEverySource(
+      trimmedTrack,
+      trimmedArtist,
+      metadataSourceLabel(),
+      (merged) => {
         if (token !== searchToken.current) return; // a newer search superseded this one
-        if (tracks.length > 0) {
-          setResults(sortFixResults(tracks));
-          setStatusText('');
-          return;
-        }
-        if (i < sources.length - 1) setStatusText(`🔍 Trying ${sources[i + 1].label}...`);
-      } catch {
-        // A failing source is skipped, exactly like the vanilla (255-257).
-      }
-    }
+        setResults(merged);
+        setStatusText('');
+      },
+    );
     if (token !== searchToken.current) return;
-    setStatusText('No matches found on any source. Try different search terms.');
+    if (!found.length) setStatusText('No matches found on any source. Try different search terms.');
   }, []);
 
   // Auto-search with the prefilled values on open (153).
@@ -163,14 +170,16 @@ export function FixModal({ config, sourceId, row, onClose, onFixed }: FixModalPr
       });
       if (!confirmed) return;
       try {
-        const body = buildUpdateMatchBody(sourceId, row.index, row.yt_track, row.yt_artist, track);
+        // Commissary: completed from its own source before it's saved
+        const picked = await completePick(track);
+        const body = buildUpdateMatchBody(sourceId, row.index, row.yt_track, row.yt_artist, picked);
         const data = await postUpdateMatch(config, body);
         if (data.error) {
           window.showToast?.(`Failed to update: ${data.error}`, 'error');
           return;
         }
         window.showToast?.('Match updated successfully!', 'success');
-        onFixed(row.index, track);
+        onFixed(row.index, picked);
         onClose();
       } catch {
         window.showToast?.('Failed to update match', 'error');
@@ -269,27 +278,33 @@ export function FixModal({ config, sourceId, row, onClose, onFixed }: FixModalPr
                   {statusText}
                 </div>
               )}
-              {results.map((track, index) => (
-                <div
-                  key={track.id ?? index}
-                  className="fix-result-card"
-                  onClick={() => void selectTrack(track)}
-                >
-                  <div className="fix-result-card-content">
-                    <div className="fix-result-title">{track.name || 'Unknown Track'}</div>
-                    {track.disambiguation && (
-                      <div className="fix-result-disambiguation">
-                        Recording note: {track.disambiguation}
+              {/* Commissary: narrow to one source */}
+              <FixSourceChips results={results} filter={sourceFilter} onFilter={setSourceFilter} />
+              {results
+                .filter((t) => sourceFilter === 'all' || t[SOURCE_KEY] === sourceFilter)
+                .map((track, index) => (
+                  <div
+                    key={`${track[SOURCE_KEY] ?? ''}:${track.id ?? index}`}
+                    className="fix-result-card"
+                    onClick={() => void selectTrack(track)}
+                  >
+                    {/* Commissary: artwork and source */}
+                    <FixCardSource track={track} />
+                    <div className="fix-result-card-content">
+                      <div className="fix-result-title">{track.name || 'Unknown Track'}</div>
+                      {track.disambiguation && (
+                        <div className="fix-result-disambiguation">
+                          Recording note: {track.disambiguation}
+                        </div>
+                      )}
+                      <div className="fix-result-artist">{artistsText(track)}</div>
+                      <div className="fix-result-album">{albumText(track)}</div>
+                      <div className="fix-result-duration">
+                        {formatDuration(track.duration_ms || 0)}
                       </div>
-                    )}
-                    <div className="fix-result-artist">{artistsText(track)}</div>
-                    <div className="fix-result-album">{albumText(track)}</div>
-                    <div className="fix-result-duration">
-                      {formatDuration(track.duration_ms || 0)}
                     </div>
                   </div>
-                </div>
-              ))}
+                ))}
             </div>
           </div>
         </div>

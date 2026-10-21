@@ -207,6 +207,14 @@ AcoustID's `client=` included).
     worker (YouTube, YouTube Music, mirrored), the Pipeline's should_rediscover and reopening a mirrored
     playlist respect it; a Fix clears it. On the other tabs the mark lasts until that playlist is discovered
     again (their workers are separate copies upstream - not hooked).
+  - 10c **done** (webui/src/commissary/fix-search.tsx, core/commissary/fix_pick.py): the Sync page's Fix dialog
+    asks Spotify, Deezer, iTunes and MusicBrainz in parallel through upstream's own search_tracks endpoints
+    (no new search backend), merges as each answers, ranks by title closeness (live/remix/cover/karaoke last,
+    then the active source), source chips with counts, artwork + source on each card. A Deezer or iTunes pick
+    is completed from its own source (POST /api/commissary/fix-pick/complete: track/disc number, album id,
+    release date, track count - the id only when the album is complete) before upstream's update_match saves
+    it, so none of the eight Fix routes changed. Not ported: the length delta (a row carries no source
+    duration except ListenBrainz).
 
 ## Decisions (2026-10-20)
 

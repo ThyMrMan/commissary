@@ -43,6 +43,7 @@ function modal(rows: DiscoveryRow[], onAvailabilityTrack = vi.fn()) {
     <DiscoveryModal
       config={SYNC_SOURCES.youtube}
       state={state}
+      standalone={false}
       onClose={() => {}}
       onStartDiscovery={() => {}}
       onStartSync={() => {}}
@@ -85,7 +86,7 @@ describe('Not available', () => {
     vi.stubGlobal(
       'fetch',
       vi.fn(async (_url: string, init: RequestInit) => {
-        calls.push(JSON.parse(String(init.body)));
+        calls.push(JSON.parse(init.body as string));
         return new Response(
           JSON.stringify({
             success: true,

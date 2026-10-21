@@ -12211,6 +12211,10 @@ _register_import_folders(app)
 # Commissary: mark a discovery track "Not available" (core/commissary/discovery_unavailable.py)
 from core.commissary.discovery_unavailable import register as _register_discovery_unavailable  # noqa: E402
 _register_discovery_unavailable(app)
+
+# Commissary: a Fix pick completed from its own source (core/commissary/fix_pick.py)
+from core.commissary.fix_pick import register as _register_fix_pick  # noqa: E402
+_register_fix_pick(app)
 _register_track_inspector(
     app, inspect_stream=lambda *a, **k: _inspect_sources_stream(*a, **k),
     pinned_batch=_pinned_batch, pinned_deps=lambda: _pinned_batch_deps(),
