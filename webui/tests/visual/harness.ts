@@ -52,6 +52,8 @@ export function renderIndex() {
     'initial_reduce_effects | tojson': 'false',
     'initial_max_performance | tojson': 'false',
     soulsync_base_version: '0.0.0',
+    // Commissary: no fork head CSS, so pages compare against upstream's baselines
+    commissary_head: '',
   };
   const flags: Record<string, boolean> = {
     initial_reduce_effects: false,

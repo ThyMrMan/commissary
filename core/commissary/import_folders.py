@@ -70,7 +70,7 @@ def roots() -> List[Tuple[str, str]]:
     try:
         add("Import folder", get_staging_path())
     except Exception:  # noqa: BLE001 - no Import folder is just one root fewer
-        pass
+        logger.debug("no Import folder to offer", exc_info=True)
     for label, key in _LABELLED_KEYS:
         for i, path in enumerate(split_paths(config_manager.get(key, "") or "")):
             add(label if i == 0 else f"{label} {i + 1}", path)

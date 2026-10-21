@@ -1,9 +1,10 @@
+// Commissary: grouped source options (every configured source is searchable)
+import { CommissarySourceOptions } from '@/commissary/source-options';
+
 import type { BasicSource } from '../-basic.types';
 
 import { sourceLabel } from '../-basic.api';
 import styles from './basic.module.css';
-// Commissary: grouped source options (every configured source is searchable)
-import { CommissarySourceOptions } from '@/commissary/source-options';
 
 /**
  * The one search control: source picker, input, Search (or Cancel while a

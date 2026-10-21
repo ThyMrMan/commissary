@@ -240,7 +240,8 @@ def rank(scored: list, wanted: Any, source_label: str = "") -> None:
             from utils.logging_config import get_logger
             get_logger("commissary.explicit_preference").info("[%s] %s", source_label, note)
     except Exception:  # noqa: BLE001 - a preference must never break a search
-        pass
+        from utils.logging_config import get_logger
+        get_logger("commissary.explicit_preference").debug("explicit ranking skipped", exc_info=True)
 
 
 __all__ = ["MATCH", "CENSORED", "UNKNOWN", "wanted_is_explicit",
