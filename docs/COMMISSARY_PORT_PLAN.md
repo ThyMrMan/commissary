@@ -183,7 +183,9 @@ AcoustID's `client=` included).
   must resolve inside a root - realpath + commonpath, symlinks and lookalike siblings refused) and one in
   core/imports/routes `_get_allowed_import_roots` (the download folders accepted by upstream's move check).
   The choice lasts until a page reload.
-- Purchased tracking — `api/purchased.py` + React `routes/purchased` + artist-detail hooks (L).
+- Purchased tracking — **dropped** (2026-10-20, to keep the fork simpler to maintain). The legacy
+  `tracks.purchased_at` / `to_be_purchased` columns stay in the live DB (640 tracks marked, July 2026),
+  unused and harmless; nothing reads or writes them.
 - Discovery: Fix dialog searching every source, suggestions/unavailable, match-quality chips (React, M–L).
 
 ## Decisions (2026-10-20)
