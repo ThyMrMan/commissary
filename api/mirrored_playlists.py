@@ -1045,6 +1045,9 @@ def rematch_discovery_pool_track():
             return jsonify({"error": "cache_id required"}), 400
 
         database = get_database()
+        # Commissary: the entry's own key, read before it's replaced
+        from core.commissary.discovery_fixes import cache_entry as _cache_entry
+        _rematched_entry = _cache_entry(database, cache_id)
 
         # If no spotify_track provided, just delete the cache entry (phase 1 of rematch)
         if not spotify_track:
@@ -1076,16 +1079,13 @@ def rematch_discovery_pool_track():
         # Save to discovery cache. keyed by the ACTIVE discovery source like
         # the fix endpoint and the lookup, or a deezer user's rematch was
         # saved under 'spotify' and never read back (#1565).
-        normalized_title = _matching_engine().normalize_string(original_title) if original_title else ''
-        normalized_artist = _matching_engine().normalize_string(original_artist) if original_artist else ''
+        # Commissary: saved where discovery looks - the replaced entry's own key
+        # and provider (core/commissary/discovery_fixes.py)
+        from core.commissary.discovery_fixes import rematch_key
         database.save_discovery_cache_match(
-            normalized_title=normalized_title,
-            normalized_artist=normalized_artist,
-            provider=_get_active_discovery_source(),
-            confidence=1.0,
-            matched_data=matched_data,
-            original_title=original_title,
-            original_artist=original_artist,
+            confidence=1.0, matched_data=matched_data,
+            **rematch_key(_rematched_entry, _matching_engine(), original_title, original_artist,
+                          _get_active_discovery_source()),
         )
 
         return jsonify({"success": True, "action": "rematched", "name": spotify_track.get('name', '')})
@@ -1190,6 +1190,12 @@ def prepare_mirrored_discovery(playlist_id):
                     'matched_data': matched,
                     'spotify_data': matched,
                 }
+                # Commissary: a Wing It guess reopens as one, and is no match on a
+                # mirror (core/commissary/discovery_fixes.py)
+                from core.commissary.discovery_fixes import as_wing_it_row, is_wing_it_guess
+                if is_wing_it_guess(extra):
+                    pre_discovered_results.append(as_wing_it_row(result, track, _current_provider))
+                    continue
                 if extra.get('manual_match'):
                     result['manual_match'] = True
                 pre_discovered_results.append(result)

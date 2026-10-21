@@ -1974,14 +1974,10 @@ async function searchPoolFix() {
         if (trackVal) params.set('track', trackVal);
         if (artistVal) params.set('artist', artistVal);
         params.set('limit', '20');
-        const res = await fetch(`/api/spotify/search_tracks?${params.toString()}`);
-        const data = await res.json().catch(() => ({}));
-
-        // Surface the real failure instead of masking every error (auth, 500, an
-        // upstream connection abort) as a bland "No results found".
-        if (!res.ok || data.error) {
-            const msg = data.error || res.statusText || `request failed (${res.status})`;
-            resultsContainer.innerHTML = `<div class="pool-fix-empty">Search error: ${_esc(msg)}</div>`;
+        // Commissary: every metadata source, not Spotify alone (commissary-pool-fix.js)
+        const data = await window.commissaryPoolFixSearch(params);
+        if (!(data.tracks || []).length && (data.errors || []).length) {
+            resultsContainer.innerHTML = `<div class="pool-fix-empty">Search error: ${_esc(data.errors.join('; '))}</div>`;
             return;
         }
 

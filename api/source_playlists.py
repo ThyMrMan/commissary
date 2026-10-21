@@ -1742,7 +1742,10 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
             db_track_id = None
 
             # Method 1: match by source track ID
-            source_track = result.get('tidal_track') or result.get('source_track') or {}
+            # Commissary: every tab's own key - Deezer and Qobuz results carry
+            # 'deezer_track' / 'qobuz_track', which this never read
+            from core.commissary.discovery_fixes import result_source_track
+            source_track = result_source_track(result)
             source_tid = str(source_track.get('id', '')) if source_track else ''
             if source_tid and source_id_to_db_id.get(source_tid):
                 # hand the rows out in order so each duplicate gets one result,
@@ -1753,8 +1756,10 @@ def _sync_discovery_results_to_mirrored(source_type, source_playlist_id, discove
             # Method 2: match by position/index
             if not db_track_id:
                 idx = result.get('index')
-                if idx is not None and idx in position_to_db_id:
-                    db_track_id = position_to_db_id[idx]
+                # Commissary: results count from 0, mirrored positions from 1 -
+                # this wrote every result onto the track before its own
+                if idx is not None and idx + 1 in position_to_db_id:
+                    db_track_id = position_to_db_id[idx + 1]
 
             if not db_track_id:
                 continue
@@ -4068,7 +4073,10 @@ def unmatch_discovery_track():
         elif '/beatport/' in path:
             state = beatport_chart_states.get(identifier)
         elif '/listenbrainz/' in path:
-            state = listenbrainz_playlist_states.get(identifier)
+            # Commissary: ListenBrainz states are keyed '<profile>:<mbid>'
+            # (api/listenbrainz_routes._lb_state_key), so the bare mbid was a 404
+            state = (listenbrainz_playlist_states.get(identifier)
+                     or listenbrainz_playlist_states.get(f"{get_current_profile_id()}:{identifier}"))
         elif '/qobuz/' in path:
             state = qobuz_discovery_states.get(identifier)
 
@@ -4410,14 +4418,10 @@ def update_youtube_discovery_match():
 
         # Save manual fix to discovery cache so it appears in discovery pool
         try:
-            # Get original track name from the YouTube/source track data
-            original_track = result.get('youtube_track', result.get('tidal_track', result.get('deezer_track', {})))
-            original_name = original_track.get('name', spotify_track['name'])
-            original_artists = original_track.get('artists', [])
-            if original_artists:
-                original_artist = original_artists[0] if isinstance(original_artists[0], str) else original_artists[0].get('name', '')
-            else:
-                original_artist = ''
+            # Commissary: key the fix the way discovery looks it up - no result
+            # has a 'youtube_track' (core/commissary/discovery_fixes.py)
+            from core.commissary.discovery_fixes import fix_source_key
+            original_name, original_artist = fix_source_key(state, track_index, data, result, spotify_track)
 
             cache_key = _get_discovery_cache_key(original_name, original_artist)
             # Normalize artists to plain strings for cache consistency
@@ -5068,13 +5072,10 @@ def update_ytmusic_discovery_match():
         matched_data = None
 
         try:
-            original_track = result.get('youtube_track', {})
-            original_name = original_track.get('name', spotify_track['name'])
-            original_artists = original_track.get('artists', [])
-            if original_artists:
-                original_artist = original_artists[0] if isinstance(original_artists[0], str) else original_artists[0].get('name', '')
-            else:
-                original_artist = ''
+            # Commissary: key the fix the way discovery looks it up - no result
+            # has a 'youtube_track' (core/commissary/discovery_fixes.py)
+            from core.commissary.discovery_fixes import fix_source_key
+            original_name, original_artist = fix_source_key(state, track_index, data, result, spotify_track)
 
             cache_key = _get_discovery_cache_key(original_name, original_artist)
             artists_list = spotify_track['artists']

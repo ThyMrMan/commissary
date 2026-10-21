@@ -187,6 +187,17 @@ AcoustID's `client=` included).
   `tracks.purchased_at` / `to_be_purchased` columns stay in the live DB (640 tracks marked, July 2026),
   unused and harmless; nothing reads or writes them.
 - Discovery: Fix dialog searching every source, suggestions/unavailable, match-quality chips (React, M–L).
+  The Sync page and its discovery/Fix modals are React now (webui/src/routes/sync); the Discovery / Wing It
+  Pools are still vanilla (stats-automations.js). Done in batches:
+  - 10a **done** (core/commissary/discovery_fixes.py, commissary-pool-fix.js): iTunes searches wait once
+    (search_tracks/search_albums lost their outer @rate_limited); a YouTube / YouTube Music / mirrored Fix is
+    cached under the playlist track's own name + artist (was a `youtube_track` no result has); the mirrored
+    write-back reads deezer_track/qobuz_track/beatport_track ids and maps index 0.. onto position 1..; a
+    Wing It guess / unmatched / "Not available" track never reads as "Provider changed", and a mirrored guess
+    reopens as a Wing It row; ListenBrainz unmatch finds its '<profile>:<mbid>' state; a Pool Rematch replaces
+    the entry under its own key and provider; Pool Fix Match searches every source (active first).
+    Deferred to 10c: completing a pick from its own source (fix_pick) - it matters once picks come from
+    any source.
 
 ## Decisions (2026-10-20)
 

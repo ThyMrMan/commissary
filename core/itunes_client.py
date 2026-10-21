@@ -382,7 +382,9 @@ class iTunesClient:
     
     # ==================== Track Methods ====================
     
-    @rate_limited
+    # Commissary: no @rate_limited here - _search waits where its request is made;
+    # this one checks the metadata cache first, so a search waited twice and a
+    # cached one waited for a request it never sent
     def search_tracks(self, query: str, limit: int = 20, country: Optional[str] = None) -> List[Track]:
         """Search for tracks using iTunes API. `country` searches another store."""
         # another store's results are cached under their own key
@@ -597,7 +599,7 @@ class iTunesClient:
     
     # ==================== Album Methods ====================
     
-    @rate_limited
+    # Commissary: no @rate_limited here, as search_tracks above
     def search_albums(self, query: str, limit: int = 20) -> List[Album]:
         """Search for albums using iTunes API.
 

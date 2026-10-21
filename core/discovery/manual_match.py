@@ -78,6 +78,11 @@ def is_drifted_for_redo(
         return False
     if extra_data.get('manual_match'):
         return False
+    # Commissary: a Wing It guess, an unmatched or "Not available" track has no
+    # source to drift from (core/commissary/discovery_fixes.py)
+    from core.commissary.discovery_fixes import never_drifts
+    if never_drifts(extra_data):
+        return False
     cached_provider = extra_data.get('provider', 'spotify')
     return cached_provider != active_provider
 
