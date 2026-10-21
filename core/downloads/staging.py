@@ -370,6 +370,17 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
             best_score = combined
             best_match = sf
 
+    # Commissary: nothing claimed by name - its place in the album and its
+    # length can still pick out the file (core/commissary/position_pairing.py)
+    _position_matched = False
+    if not best_match or best_score < 0.75:
+        from core.commissary.position_pairing import staged_file_by_place
+        _placed = staged_file_by_place(task_id, batch_id, track, staging_files, deps.get_batch_field)
+        if _placed is not None:
+            best_match, best_score, _position_matched = _placed, 0.75, True
+            logger.info("[Staging] %s claims %s by its place in the album and its length",
+                        _track_label, os.path.basename(_placed.get('full_path', '?')))
+
     # Require high confidence to avoid false positives
     if not best_match or best_score < 0.75:
         # Log the rejection with the best near-miss so we can see why
@@ -542,7 +553,9 @@ def try_staging_match(task_id, batch_id, track, deps: StagingDeps):
             _extract_explicit_track_number(best_match.get('full_path', ''))
         )
         file_disc_number = _coerce_positive_int(best_match.get('disc_number'), 0)
-        if _private_album_bundle_staging:
+        # Commissary: a position match knows its place from the task; the
+        # file's own number may count straight through the discs
+        if _private_album_bundle_staging and not _position_matched:
             track_number = (
                 file_track_number or
                 _coerce_positive_int(track_info.get('track_number'), 0) or

@@ -16606,6 +16606,7 @@ def _get_staging_file_cache(batch_id):
                 'album': meta['album'] or '',
                 'track_number': meta.get('track_number'),
                 'disc_number': meta.get('disc_number'),
+                'duration_ms': meta.get('duration_ms') or 0,  # Commissary: staging pairs by length
                 'extension': ext,
             })
 

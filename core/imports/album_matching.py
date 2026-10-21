@@ -706,6 +706,12 @@ def match_files_to_tracks(
             'confidence': round(best_score, 3),
         })
 
+    # Commissary: what titles couldn't pair, by place in the album and length
+    # (core/commissary/position_pairing.py)
+    from core.commissary.position_pairing import add_position_pairs
+    add_position_pairs(deduped, file_tags, tracks, target_album=target_album,
+                       matches=matches, used_files=used_files)
+
     # Diagnostic surface — when the matcher returns 0 matches against
     # a non-trivial input, it's nearly always one of: duration gate too
     # strict, title agreement too low, or wrong tracks list passed in.

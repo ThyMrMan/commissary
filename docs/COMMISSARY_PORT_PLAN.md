@@ -126,7 +126,12 @@ AcoustID's `client=` included).
   labels a language version (staging and AcoustID verification compare those labels), the Soulseek
   scorer rejects another language (whole path + requested album), and album import's title scoring
   and staging skip a file in another language (title, album tag or filename).
-- Foreign-language position+duration pairing (M).
+- Foreign-language position+duration pairing (M) — **done** (core/commissary/position_pairing.py). Album
+  import pairs what titles left over by place in the album (per disc, straight through, or a "CD2" folder)
+  where lengths agree within 3 s, once two places confirm the numbering (confidence 0.7, below the 0.8 that
+  carries an album alone). Staging claims a batch track's file the same way, reading a straight-through
+  offset off the staged files, and keeps the task's own disc/track number. The staging scan now carries
+  each file's length (upstream's reader had it, the list dropped it).
 - Edition preference — fold download/consistency/bundle gates onto upstream `edition_grouping` (M).
 - Every source searchable + "search all sources" + album release picker (M–L; backend + vanilla downloads.js, React search chips).
 - Prefer explicit for structured sources (M).
