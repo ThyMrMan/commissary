@@ -50,7 +50,9 @@ describe('isSingleSourceMode', () => {
     ];
     expect(isSingleSourceMode({ mode: 'hybrid', sources: two })).toBe(false);
     expect(isSingleSourceMode({ mode: 'hybrid', sources: two.slice(0, 1) })).toBe(true);
-    expect(isSingleSourceMode({ mode: 'soulseek', sources: two })).toBe(true);
+    // Commissary: every configured source is searchable in any mode
+    expect(isSingleSourceMode({ mode: 'soulseek', sources: two })).toBe(false);
+    expect(isSingleSourceMode({ mode: 'soulseek', sources: two.slice(0, 1) })).toBe(true);
     expect(isSingleSourceMode({ mode: '', sources: [] })).toBe(true);
   });
 });

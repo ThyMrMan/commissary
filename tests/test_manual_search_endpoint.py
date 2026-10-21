@@ -254,6 +254,9 @@ def test_manual_search_soundcloud_link_errors_when_not_connected(manual_search_c
     useless text search of the raw URL."""
     client, ctx = manual_search_client
     # Default hybrid_order has no soundcloud → it's not an available source.
+    # Commissary: every configured source is searchable now, so "not connected"
+    # has to mean unconfigured (core/commissary/search_sources.py)
+    ctx['plugins']['soundcloud'].is_configured.return_value = False
     resp = client.post('/api/downloads/task/task-abc/manual-search',
                        json={'query': 'https://soundcloud.com/artist/track', 'source': 'all'})
     assert resp.status_code == 400
@@ -460,7 +463,8 @@ def test_manual_search_streams_one_event_per_source(manual_search_client):
     plugins = ctx['plugins']
 
     import web_server
-    for src_name in ('soulseek', 'youtube', 'qobuz', 'hifi', 'deezer'):
+    # Commissary: soundcloud is configured, so it is searched too
+    for src_name in ('soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'):
         new_plugin = _make_plugin(
             search_results=[_fake_track_result(f'{src_name}_song.mp3', src_name)]
         )
@@ -475,11 +479,11 @@ def test_manual_search_streams_one_event_per_source(manual_search_client):
     msgs = _consume_ndjson(resp)
     source_events = [m for m in msgs if m.get('type') == 'source_results']
     seen_sources = {m['source'] for m in source_events}
-    assert seen_sources == {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer'}
+    assert seen_sources == {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'}
     # One header + one per source + one done terminator
     assert msgs[0]['type'] == 'header'
     assert msgs[-1]['type'] == 'done'
-    assert msgs[-1]['total'] == 5
+    assert msgs[-1]['total'] == 6
 
 
 def test_manual_search_skips_unconfigured_sources(manual_search_client):
@@ -586,7 +590,10 @@ def test_manual_search_single_source_mode_only_offers_one_source(monkeypatch, ma
     header = msgs[0]
     assert header['download_mode'] == 'soulseek'
     available_ids = [s['id'] for s in header['available_sources']]
-    assert available_ids == ['soulseek']
+    # Commissary: the mode's source leads, every other configured source follows
+    # (core/commissary/search_sources.py)
+    assert available_ids[0] == 'soulseek'
+    assert set(available_ids) == {'soulseek', 'youtube', 'qobuz', 'hifi', 'deezer', 'soundcloud'}
 
 
 def test_manual_search_handles_plugin_exception_gracefully(manual_search_client):

@@ -6277,6 +6277,9 @@ def search_sources():
     """
     if not download_orchestrator:
         return jsonify({"mode": "soulseek", "sources": [{"name": "soulseek", "display_name": "Soulseek"}]})
+    # Commissary: every configured source, the chain first (core/commissary/search_sources.py)
+    from core.commissary.search_sources import search_page_sources
+    return jsonify(search_page_sources(download_orchestrator))
     mode = download_orchestrator.mode
     if mode == 'hybrid':
         chain = download_orchestrator._resolve_source_chain()
@@ -7808,6 +7811,12 @@ def _list_available_download_sources() -> tuple:
     """
     if not download_orchestrator:
         return 'soulseek', []
+
+    # Commissary: every configured source, the chain first - the chain is
+    # what the automatic cascade tries, not what you may search
+    # (core/commissary/search_sources.py)
+    from core.commissary.search_sources import manual_search_sources
+    return manual_search_sources(download_orchestrator, config_manager)
 
     download_mode = config_manager.get('download_source.mode', 'soulseek')
     sources = []

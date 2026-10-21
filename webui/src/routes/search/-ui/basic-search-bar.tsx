@@ -2,6 +2,8 @@ import type { BasicSource } from '../-basic.types';
 
 import { sourceLabel } from '../-basic.api';
 import styles from './basic.module.css';
+// Commissary: grouped source options (every configured source is searchable)
+import { CommissarySourceOptions } from '@/commissary/source-options';
 
 /**
  * The one search control: source picker, input, Search (or Cancel while a
@@ -119,11 +121,8 @@ function SourcePicker({
             value={current.name}
             onChange={(event) => onSelect(event.target.value)}
           >
-            {sources.map((source) => (
-              <option key={source.name} value={source.name}>
-                {sourceLabel(source)}
-              </option>
-            ))}
+            {/* Commissary: the download order first, other sources grouped below */}
+            <CommissarySourceOptions sources={sources} />
           </select>
         </>
       )}

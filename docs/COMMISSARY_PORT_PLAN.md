@@ -135,6 +135,12 @@ AcoustID's `client=` included).
 - Edition preference — **dropped** (2026-10-20): the legacy `wishlist.prefer_deluxe_editions` was off on the
   live instance, and upstream's `watchlist.edition_preference` ("one_complete") covers watchlist + discography.
 - Every source searchable + "search all sources" + album release picker (M–L; backend + vanilla downloads.js, React search chips).
+  - 5a **done** (core/commissary/search_sources.py): the candidates window's manual search and the Search page's
+    Files picker offer every configured source, the download order first ("Your download order" / "Other
+    sources"), in any mode. Upstream's Candidate Inspector already searched every source. Note: upstream's Files
+    tab still opens Settings while Soulseek itself is unconfigured.
+  - React note: `webui/static/dist` is NOT committed - the Dockerfile builds it from `webui/src`, so a fork React
+    change is an ordinary source edit (fork components in `webui/src/commissary/`).
 - Prefer explicit for structured sources (M) — **done** (core/commissary/explicit_preference.py). Deezer, HiFi,
   Qobuz and Tidal candidates carry their explicit flag in `_source_metadata`; validation's sort puts the explicit
   cut first when the wanted track is explicit (ranking only, never the 0.60 gate; torrent/usenet/YouTube/Amazon

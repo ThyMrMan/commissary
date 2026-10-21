@@ -2848,7 +2848,9 @@ function _renderCandidatesModal(data) {
     const downloadMode = data.download_mode || 'soulseek';
     const availableSources = Array.isArray(data.available_sources) ? data.available_sources : [];
     // Hybrid mode shows the dropdown; everything else implies a single source.
-    const isHybrid = downloadMode === 'hybrid';
+    // Commissary: every configured source is offered, so more than one shows
+    // the dropdown and the source badges in any mode (core/commissary/search_sources.py)
+    const isHybrid = downloadMode === 'hybrid' || availableSources.length > 1;
 
     let tableRows = '';
     if (candidates.length === 0) {
@@ -2865,10 +2867,15 @@ function _renderCandidatesModal(data) {
     // ----- Manual search bar -----
     let sourceControl;
     if (isHybrid && availableSources.length > 0) {
+        // Commissary: the download chain first, the other sources grouped below it
+        const _opt = s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`;
+        const _chain = availableSources.filter(s => s.in_chain !== false);
+        const _others = availableSources.filter(s => s.in_chain === false);
         const optionsHtml = ['<option value="all">All sources</option>']
-            .concat(availableSources.map(s =>
-                `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`
-            ))
+            .concat(_others.length && _chain.length
+                ? [`<optgroup label="Your download order">${_chain.map(_opt).join('')}</optgroup>`,
+                   `<optgroup label="Other sources">${_others.map(_opt).join('')}</optgroup>`]
+                : availableSources.map(_opt))
             .join('');
         sourceControl = `<select class="candidates-manual-source" id="candidates-manual-source">${optionsHtml}</select>`;
     } else {

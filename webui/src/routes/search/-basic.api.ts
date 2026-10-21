@@ -28,7 +28,9 @@ export async function fetchBasicSources(): Promise<BasicSourcesResponse> {
  * were searching, but disabled it.
  */
 export function isSingleSourceMode(response: BasicSourcesResponse): boolean {
-  return response.mode !== 'hybrid' || response.sources.length < 2;
+  // Commissary: every configured source is searchable, so any mode with two or
+  // more is a picker (core/commissary/search_sources.py)
+  return response.sources.length < 2;
 }
 
 /**

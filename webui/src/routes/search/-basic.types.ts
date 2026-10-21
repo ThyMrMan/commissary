@@ -72,6 +72,8 @@ export function isAlbum(result: BasicResult): result is BasicAlbum {
 export interface BasicSource {
   name: string;
   display_name: string;
+  /** Commissary: false for a source outside the download order. */
+  in_chain?: boolean;
 }
 
 export interface BasicSourcesResponse {
