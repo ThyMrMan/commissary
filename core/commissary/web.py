@@ -55,9 +55,6 @@ _VLIB_CSS = (
     # next slot along from upstream's own card buttons and take their styles.
     # Bottom-right: the top row (status pill + three buttons) has no room for a
     # fourth on a narrow card without covering the pill.
-    ".vwsh-movie-art .vwsh-hunt.commissary-vlib-btn{top:auto;bottom:8px;right:8px}"
-    ".vwsh-nebula .wl-orb-group>.commissary-vlib-btn{right:26px}"
-    ".vwsh-nebula .wl-orb-group>.commissary-vlib-btn:hover{background:rgba(var(--accent-rgb),.85);color:#fff}"
     # Watchlist: looks like upstream's .vwl-btn (its row neighbour) but must not
     # BE one, since upstream toggles the watchlist on any .vwl-btn click.
     ".commissary-vlib-wbtn{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;"

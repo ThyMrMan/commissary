@@ -1,5 +1,6 @@
 // Commissary: grouped source options (every configured source is searchable)
 import { CommissarySourceOptions } from '@/commissary/source-options';
+import { Spinner } from '@/components/primitives';
 
 import type { BasicSource } from '../-basic.types';
 
@@ -67,7 +68,7 @@ export function BasicSearchBar({
       />
       {searching ? (
         <>
-          <span className={styles.spinner} role="status" aria-label="Searching" />
+          <Spinner className={styles.spinner} label="Searching" />
           <button
             id="downloads-cancel-btn"
             className={styles.cancelButton}

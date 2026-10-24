@@ -1,10 +1,11 @@
 /**
  * Commissary: "which video Library does this title go to?" pickers.
  *
- *   Wishlist movie cards     a folder button beside the search buttons (vwsh-hunt)
- *   Wishlist show orbs       a folder button beside the orb's remove button
  *   Watchlist show cards     a folder button in the card's control row (vwl-btn look)
  *   Manage panel (owned)     a "Library" field under Acquisition (vmg-field)
+ *
+ * The Wishlist (React since 3.5.9) has its own, in a title's side panel:
+ * webui/src/commissary/wishlist-libraries.tsx.
  *
  * Only for admins (the endpoints are admin-only), only for a kind with more
  * than one library, and only for titles not yet owned on the cards: an owned
@@ -157,21 +158,7 @@
 
     function decorate() {
         if (!state) return;
-        if (hasChoice('movie')) {
-            document.querySelectorAll('.vwsh-movie[data-vwsh-src="tmdb"][data-vwsh-open-movie]')
-                .forEach(function (card) {
-                    var art = card.querySelector('.vwsh-movie-art');
-                    if (art) refresh(art, 'vwsh-hunt', { where: 'wishlist', kind: 'movie',
-                                                         tmdb: card.getAttribute('data-vwsh-open-movie') });
-                });
-        }
         if (hasChoice('show')) {
-            document.querySelectorAll('.wl-orb-group[data-vwsh-source="tmdb"][data-vwsh-tmdb]')
-                .forEach(function (g) {
-                    if (!g.querySelector('.wl-orb-label[data-vwsh-src="tmdb"]')) return;   // owned
-                    refresh(g, 'wl-orb-remove', { where: 'wishlist', kind: 'show',
-                                                  tmdb: g.getAttribute('data-vwsh-tmdb') });
-                });
             // First in the card's own control row (watch / get), as one of them.
             document.querySelectorAll('a.vwlp-card[data-vwlp-open="show"][data-vwlp-source="tmdb"]')
                 .forEach(function (card) {
@@ -265,7 +252,7 @@
         setTimeout(function () {
             pending = false;
             wrapManage();
-            if (document.querySelector('[data-vwsh-open-movie], [data-vwsh-tmdb], a.vwlp-card') &&
+            if (document.querySelector('a.vwlp-card') &&
                 !document.querySelector('.commissary-vlib-btn')) {
                 load().then(decorate);
             } else if (state) {
