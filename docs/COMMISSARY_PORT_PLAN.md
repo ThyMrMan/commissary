@@ -247,6 +247,8 @@ AcoustID's `client=` included).
   - Re-identify grouping: upstream #1567 now splits every `[reid-...]` copy into
     its own candidate, so the fork's split (rematch_grouping) was dropped; the
     "asked again" retry stays (one hook).
+  - Usenet job-folder cleanup (upstream #1815) works with the fork's settle gate, one
+    monitor tick later: its two end-to-end tests tick twice (`# Commissary:`).
   - Download window's compass button reads `globalThis.commissaryInspectButton`
     (upstream's download-modal-body test renders the row with no `window`).
 

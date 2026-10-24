@@ -153,7 +153,7 @@ def test_a_tick_persists_the_row_then_removes_the_file_then_the_folder(tmp_path,
                                           "season": 1, "episode": 1}}
     order = []
     db = Mock()
-    db.get_active_video_downloads.side_effect = [[row], []]
+    db.get_active_video_downloads.side_effect = [[row], [row], [], []]
 
     def persist(key, **patch):
         order.append(("persist", video.exists(), job.exists()))
@@ -169,6 +169,7 @@ def test_a_tick_persists_the_row_then_removes_the_file_then_the_folder(tmp_path,
     monkeypatch.setattr(client, "_get_status", lambda source, ref: _St(
         state="completed", progress=1.0, save_path=str(job), name=job.name))
     monitor._tick(db)
+    monitor._tick(db)   # Commissary: the settle gate imports on the second identical reading
     assert row["status"] == "completed"
     assert order and order[0] == ("persist", True, True)       # row saved while both still exist
     assert not video.exists() and not job.exists()
@@ -294,6 +295,7 @@ def test_real_import_with_sab_file_storage_removes_the_folder_in_the_same_tick(t
     monkeypatch.setattr(client, "_get_status", lambda source, ref: _St(
         state="completed", progress=1.0, save_path=str(video), name=REL))
     monitor._tick(vdb)
+    monitor._tick(vdb)   # Commissary: the settle gate imports on the second identical reading
     row = vdb.get_video_download(dl_id)
     assert row["status"] == "completed", row
     placed = [f for _d, _s, fs in os.walk(lib) for f in fs if f.endswith(".mkv")]
