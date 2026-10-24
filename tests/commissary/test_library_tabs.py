@@ -108,7 +108,6 @@ def test_the_pages_hand_their_tab_to_the_script():
     root = Path(__file__).resolve().parents[2]
     read = lambda rel: (root / rel).read_text(encoding="utf-8")  # noqa: E731
     assert "CommissaryLibraryTabs.apply(params, apiKind)" in read("webui/static/video/video-library.js")
-    assert "CommissaryLibraryTabs.applyWishlist(params, state.tab)" in read("webui/static/video/video-wishlist.js")
     assert "filename='commissary-library-tabs.js'" in read("webui/index.html")
 
 

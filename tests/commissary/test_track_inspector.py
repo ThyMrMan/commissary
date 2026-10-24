@@ -102,6 +102,6 @@ def test_a_profile_without_download_rights_is_refused(server, monkeypatch):
 
 def test_every_download_window_row_offers_it():
     downloads = (_ROOT / "webui" / "static" / "downloads.js").read_text(encoding="utf-8")
-    assert "window.commissaryInspectButton(playlistId, trackIndex)" in downloads
+    assert "globalThis.commissaryInspectButton(playlistId, trackIndex)" in downloads
     index = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
     assert "filename='commissary-track-inspector.js'" in index

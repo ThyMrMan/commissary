@@ -53,7 +53,7 @@ SPLIT_MODULES = [
 ]
 
 # Other JS files that exist in static/ but are NOT part of the split
-NON_SPLIT_JS = {"setup-wizard.js", "docs.js", "helper.js", "particles.js", "worker-orbs.js",
+NON_SPLIT_JS = {"docs.js", "helper.js", "particles.js", "worker-orbs.js",
                 "enrichment-manager.js",
                 "config-migration.js", "video/video-service-status.js"}
 
@@ -76,7 +76,6 @@ def _shell_window_exports() -> set[str]:
 # regressions from the split — they should be deduplicated in a follow-up.
 KNOWN_CROSS_FILE_DUPES = {
     "escapeHtml",        # downloads.js, shared-helpers.js
-    "formatDuration",    # sync-spotify.js, wishlist-tools.js, sync-services.js
     "_escAttr",          # downloads.js, stats-automations.js
     "_formatDuration",   # stats-automations.js, wishlist-tools.js
                          # (pages-extra.js declared a THIRD, millisecond-based

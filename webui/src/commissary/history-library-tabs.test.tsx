@@ -50,7 +50,9 @@ const lastLibrary = () => fetchVideoHistory.mock.calls.at(-1)?.[4];
 describe('Download History Library tabs', () => {
   it("narrows a kind to one Library, and keeps each kind's pick", async () => {
     render(<VdlHistoryModal open onClose={() => {}} onCountChange={() => {}} />);
-    await waitFor(() => expect(fetchVideoHistory).toHaveBeenCalled());
+    // the open load, then the search box's delayed first load: let both land
+    // before clicking, or the late one (for the All tab) reads as the last call
+    await waitFor(() => expect(fetchVideoHistory).toHaveBeenCalledTimes(2));
     expect(document.querySelector('[data-commissary-history-lib]')).toBeNull(); // All: none
 
     fireEvent.click(screen.getByRole('tab', { name: /^Movies 3$/ }));

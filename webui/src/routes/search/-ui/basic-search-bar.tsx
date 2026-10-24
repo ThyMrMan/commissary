@@ -1,9 +1,11 @@
+// Commissary: grouped source options (every configured source is searchable)
+import { CommissarySourceOptions } from '@/commissary/source-options';
+import { Spinner } from '@/components/primitives';
+
 import type { BasicSource } from '../-basic.types';
 
 import { sourceLabel } from '../-basic.api';
 import styles from './basic.module.css';
-// Commissary: grouped source options (every configured source is searchable)
-import { CommissarySourceOptions } from '@/commissary/source-options';
 
 /**
  * The one search control: source picker, input, Search (or Cancel while a
@@ -66,7 +68,7 @@ export function BasicSearchBar({
       />
       {searching ? (
         <>
-          <span className={styles.spinner} role="status" aria-label="Searching" />
+          <Spinner className={styles.spinner} label="Searching" />
           <button
             id="downloads-cancel-btn"
             className={styles.cancelButton}

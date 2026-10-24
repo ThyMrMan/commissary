@@ -398,8 +398,12 @@ def place_folder(db, row: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any
     plan, err = resolve(found, body.get("season"), absolute_lookup(db, media_id))
     if err:
         return {"success": False, "error": err}
-    paths = {k: db.get_setting(k) or "" for k in ("movies_path", "tv_path", "youtube_path")}
-    target = manual_target(db, "show", body) or target_dir_for("show", paths)
+    from api.video.downloads import _PATH_KEYS, _series_type_for
+    paths = {k: db.get_setting(k) or "" for k in _PATH_KEYS}
+    # the Library first; without Libraries, upstream's anime folder for an anime show
+    target = manual_target(db, "show", body) or target_dir_for(
+        "show", paths, _series_type_for(db, "show", {"media_id": media_id,
+                                                     "media_source": body.get("media_source") or "tmdb"}))
     settings = organization.load(db)
     prober = probe if settings.get("verify_with_ffprobe", True) else None
     identity = naming_identity(db, "show", media_id)

@@ -1,12 +1,12 @@
 /*
- * Commissary — video Library tabs on the Library page and the Wishlist.
+ * Commissary — video Library tabs on the Library page.
  *
  * A kind with two or more video Libraries (Movies + Anime-Movies, TV + Anime)
  * gets a second row under that page's own kind tabs: "All Movies", then each
- * Library with its count (titles on the Library page, wished titles on the
- * Wishlist - shows counted as shows, like the TV tab). Picking one narrows the
- * list (?library=<id>, added through one hook in each page's load()). A kind
- * with one Library shows nothing new; YouTube has no Libraries.
+ * Library with its count of titles. Picking one narrows the list
+ * (?library=<id>, added through one hook in the page's load()). A kind with one
+ * Library shows nothing new; YouTube has no Libraries. The Wishlist (React since
+ * 3.5.9) has its own: webui/src/commissary/wishlist-libraries.tsx.
  *
  * Each page's own tab classes, but never its data-*-tab attribute, so the
  * page's tab handlers ignore these buttons.
@@ -17,9 +17,6 @@
         library: { kinds: '.video-library-tabs', attr: 'data-video-lib-tab', on: 'active',
                    btn: 'video-lib-tab', badge: null, scope: '',
                    map: { movies: 'movie', shows: 'show' }, all: { movies: 'All Movies', shows: 'All Shows' } },
-        wishlist: { kinds: '.vwsh-tabs', attr: 'data-vwsh-tab', on: 'vwsh-tab--on',
-                    btn: 'vwsh-tab', badge: 'vwsh-tab-n', scope: 'wishlist',
-                    map: { movie: 'movie', show: 'show' }, all: { movie: 'All Movies', show: 'All TV' } },
     };
     var state = {};   // surface -> {tabs, picked: {tab: id}, current}
 
@@ -37,9 +34,7 @@
         s.current = tab;
         var id = s.picked[tab];
         if (id != null && cfg.map[tab]) params.set('library', String(id));
-        // the Wishlist's counts change as titles are wished; refresh with each load
-        if (name === 'wishlist') fetchTabs(name);
-        else render(name);
+        render(name);
     }
 
     function render(name) {
@@ -119,7 +114,6 @@
 
     window.CommissaryLibraryTabs = {
         apply: function (params, tab) { apply('library', params, tab); },
-        applyWishlist: function (params, tab) { apply('wishlist', params, tab); },
     };
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start);
     else start();

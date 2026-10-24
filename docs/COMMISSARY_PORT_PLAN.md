@@ -228,6 +228,30 @@ AcoustID's `client=` included).
   - 10d suggestions and 10e Review mode / match-quality chips - **dropped** (2026-10-21, item 10 stops at 10c
     to keep the fork simpler to maintain).
 
+## Upstream updates
+
+- **3.5.9** (2026-10-24, from the 3.5.7 base: 326 upstream commits) -> `3.5.9-c.1`.
+  - Conflicts (6): the version line; web_server's template hooks (upstream's
+    profile-gate rules beside the fork's); index.html scripts (upstream's
+    profile-api-gate.js first, the fork's after, commissary-auth-hold.js still the
+    outermost fetch wrapper); the search bar's imports; video manual-import targets.
+  - Anime folder (upstream #1820): episodes of anime shows go to `anime_path`. With
+    video Libraries set up the fork's Library still decides (manual imports, folder
+    placement, and the drain's enqueue, which already overrode the folder); without
+    them upstream's anime routing applies, the fork's folder placement included.
+  - Video Wishlist rebuilt in React (upstream): the old page's Library tabs and card
+    folder buttons are gone. Re-added as webui/src/commissary/wishlist-libraries.tsx
+    (a Library tab row under Movies / TV; a "Library" choice in a title's side
+    panel), with hooks in -video.api.ts, video-wishlist.tsx, video-sheets.tsx. The
+    vanilla scripts keep the Library page, Watchlist and Manage panel.
+  - Re-identify grouping: upstream #1567 now splits every `[reid-...]` copy into
+    its own candidate, so the fork's split (rematch_grouping) was dropped; the
+    "asked again" retry stays (one hook).
+  - Usenet job-folder cleanup (upstream #1815) works with the fork's settle gate, one
+    monitor tick later: its two end-to-end tests tick twice (`# Commissary:`).
+  - Download window's compass button reads `globalThis.commissaryInspectButton`
+    (upstream's download-modal-body test renders the row with no `window`).
+
 ## Decisions (2026-10-20)
 
 - Versioning follows upstream: `<upstream version>-c.<n>`, e.g. `3.5.7-c.1`.

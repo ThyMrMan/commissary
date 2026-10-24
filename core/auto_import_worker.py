@@ -972,7 +972,7 @@ class AutoImportWorker:
                        f"folder's owner against the container's PUID/PGID.")
 
     def _scan_directory(self, directory: str, candidates: List[FolderCandidate], staging_root: str = '',
-                        problems: Optional[List[Dict[str, str]]] = None, rematch_keys=None):
+                        problems: Optional[List[Dict[str, str]]] = None):
         """Recursively scan a directory for album folders and loose audio files.
 
         Loose-file handling:
@@ -997,10 +997,6 @@ class AutoImportWorker:
         """
         if problems is None:
             problems = []
-        # Commissary: pending Re-identify hints, read once per scan (see core/commissary/rematch_grouping.py).
-        if rematch_keys is None:
-            from core.commissary.rematch_grouping import pending_rematch_keys
-            rematch_keys = pending_rematch_keys(getattr(self, 'database', None))
         try:
             entries = sorted(os.listdir(directory))
         except OSError as e:
@@ -1036,13 +1032,6 @@ class AutoImportWorker:
             if disc_files:
                 disc_files_by_num[disc_num] = disc_files
 
-        # Commissary: a hinted Re-identify copy is its own candidate, never part of an album-tag group.
-        from core.commissary.rematch_grouping import split_rematch_copies
-        loose_files, rematch_copies = split_rematch_copies(loose_files, rematch_keys)
-        for copy_path in rematch_copies:
-            is_root = bool(staging_root) and os.path.normpath(directory) == os.path.normpath(staging_root)
-            self._build_loose_file_candidates(directory, [copy_path], {}, candidates, is_root=is_root)
-
         if loose_files:
             is_root = bool(staging_root) and os.path.normpath(directory) == os.path.normpath(staging_root)
             self._build_loose_file_candidates(
@@ -1073,8 +1062,7 @@ class AutoImportWorker:
         # beside loose tracks get silently ignored (the bug a chaotic
         # staging root surfaced on 2026-05-09).
         for _sub_name, sub_path in non_disc_subdirs:
-            self._scan_directory(sub_path, candidates, staging_root=staging_root, problems=problems,
-                                 rematch_keys=rematch_keys)  # Commissary: hints read once per scan
+            self._scan_directory(sub_path, candidates, staging_root=staging_root, problems=problems)
 
     def _build_loose_file_candidates(
         self,
@@ -1104,6 +1092,17 @@ class AutoImportWorker:
           behavior — so single-album staging with parallel disc folders
           (the user's Mr. Morale layout) keeps working unchanged.
         """
+        # a re-identify copy is always its own single, whatever its tags say.
+        # its hint names the release, and the hint is only read on a
+        # one-file candidate (#1567)
+        from core.imports.rematch_apply import is_reidentify_copy
+        for f in [f for f in loose_files if is_reidentify_copy(f)]:
+            candidates.append(FolderCandidate(
+                path=f, name=os.path.basename(f), audio_files=[f],
+                folder_hash=_compute_folder_hash([f]), is_single=True,
+            ))
+        loose_files = [f for f in loose_files if not is_reidentify_copy(f)]
+
         # Group by normalised album tag
         groups: Dict[str, List[str]] = {}
         untagged: List[str] = []
@@ -2220,6 +2219,10 @@ class AutoImportWorker:
                 gate = {'decision': 'uncertain', 'reason': 'library check failed — imported'}
             match['import_reason'] = gate.get('reason')
             if gate.get('decision') == DECISION_SKIP_OWNED:
+                # same as a kept copy below: for a re-identify this is where
+                # it landed, or replace deletes it as the old track (#1567)
+                if gate.get('library_path'):
+                    reid_final_paths.append(gate['library_path'])
                 match['import_status'] = 'skipped_owned'
                 skipped += 1
                 logger.info(f"[Auto-Import] Already in library, left alone: {track_number}. {track_name}")
@@ -2380,6 +2383,11 @@ class AutoImportWorker:
                 # that copy. that's "already in library", not a failure: it
                 # used to fail every track of an album you already own.
                 if kept_existing_library_file(context):
+                    # a re-identify counts this as where it landed. without it
+                    # the replace cleanup can't see the kept file and deletes
+                    # it as the old track when it's the same file (#1567)
+                    if final_path:
+                        reid_final_paths.append(final_path)
                     match['import_status'] = 'skipped_owned'
                     match['import_reason'] = 'already in library at the same spot, kept the library copy'
                     skipped += 1
@@ -2439,6 +2447,7 @@ class AutoImportWorker:
                 })
                 self._automation_engine.emit('batch_complete', {
                     'playlist_name': f'Import: {album_name}',
+                    'artist': artist_name,
                     'total_tracks': str(len(match_result.get('matches', []))),
                     'completed_tracks': str(processed),
                     'failed_tracks': str(len(errors)),

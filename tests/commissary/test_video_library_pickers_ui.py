@@ -21,14 +21,6 @@ def test_the_pickers_are_loaded_on_the_page():
     assert "filename='commissary-video-library-pickers.js'" in _read("webui/index.html")
 
 
-def test_upstream_wishlist_still_carries_the_hooks():
-    wishlist = _read("webui/static/video/video-wishlist.js")
-    for hook in ('data-vwsh-open-movie="', 'data-vwsh-src="', "data-vwsh-tmdb=",
-                 "data-vwsh-source=", "class=\"vwsh-movie-art\"", "'<div class=\"wl-orb-group\"",
-                 "class=\"wl-orb-label\""):
-        assert hook in wishlist, hook
-
-
 def test_upstream_watchlist_and_manage_panel_still_carry_the_hooks():
     assert "data-vwlp-open=\"' + kind" in _read("webui/static/video/video-watchlist.js")
     assert ".vcard-ctrls" in _read("webui/static/video/video-side.css")

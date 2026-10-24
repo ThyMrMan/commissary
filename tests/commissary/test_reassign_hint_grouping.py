@@ -9,7 +9,9 @@ reassign of two or more tracks became ONE multi-file candidate.
 was ignored: the files were identified from their old tags and filed back where
 they came from, and the hints stayed pending for good.
 
-Ported from the legacy fork (Release 2.3.6). These run the real reassign
+Ported from the legacy fork (Release 2.3.6). Upstream 3.5.9 (#1567) now splits
+every ``[reid-...]`` copy out itself, so the fork's own split was dropped; these
+tests stay as a check that upstream's covers the same cases. These run the real reassign
 staging, the real scanner over real tagged FLACs and the real hint table, and
 drive the real scan -> process path with only identification and matching --
 the network edges -- stubbed.
@@ -206,24 +208,6 @@ def test_a_copy_gets_the_candidate_it_would_have_had_alone(db, staging, library)
     assert vars(beside) == vars(alone)
 
 
-def test_only_a_pending_hint_splits_a_file_out(db, staging, library):
-    """A consumed hint is history: the files it once named group as usual."""
-    intro = _stage_copy(staging, library, 101, 1, "Intro")
-    song = _stage_copy(staging, library, 102, 2, "Song")
-    hint_id = _add_hint(db, intro, 1, "Intro")
-    conn = db._get_connection()
-    try:
-        consume_hint(conn.cursor(), hint_id)
-        conn.commit()
-    finally:
-        conn.close()
-    worker = AutoImportWorker(database=db, staging_path=staging)
-
-    candidates = worker._enumerate_folders(staging)
-
-    assert [sorted(c.audio_files) for c in candidates] == [sorted([intro, song])]
-
-
 def test_a_hint_recorded_under_another_spelling_of_the_staging_folder_still_splits(
         db, staging, library):
     """The apply route and the worker resolve the staging folder separately (a
@@ -239,35 +223,6 @@ def test_a_hint_recorded_under_another_spelling_of_the_staging_folder_still_spli
 
     assert sorted(c.audio_files for c in candidates) == [[intro], [song]]
     assert all(worker._resolve_rematch_hint(c)[0] is not None for c in candidates)
-
-
-def test_pending_hints_are_read_once_per_scan(db, staging, monkeypatch):
-    """Not once per folder -- a staging tree can hold hundreds of them."""
-    for name in ("A", "B", "C"):
-        folder = os.path.join(staging, name)
-        os.mkdir(folder)
-        _write_flac(os.path.join(folder, "01.flac"), album=name, track=1)
-    import core.commissary.rematch_grouping as grouping
-    calls = []
-    real = grouping.pending_staged_keys
-    monkeypatch.setattr(grouping, "pending_staged_keys",
-                        lambda cursor: calls.append(1) or real(cursor))
-    worker = AutoImportWorker(database=db, staging_path=staging)
-
-    worker._enumerate_folders(staging)
-
-    assert len(calls) == 1
-
-
-def test_a_lookup_error_leaves_the_scan_as_it_was(staging, library):
-    """No database at all: the scan groups by tag exactly as upstream does."""
-    intro = _stage_copy(staging, library, 101, 1, "Intro")
-    song = _stage_copy(staging, library, 102, 2, "Song")
-    worker = AutoImportWorker(database=None, staging_path=staging)
-
-    candidates = worker._enumerate_folders(staging)
-
-    assert [sorted(c.audio_files) for c in candidates] == [sorted([intro, song])]
 
 
 # ── what the user sees: reassign, scan, then process ─────────────────────────

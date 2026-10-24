@@ -1,11 +1,11 @@
 import { useEffect, useState, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
 
-import type { GrabRule, InspectorCandidate, InspectorSearchMeta } from './inspector';
-import type { SourceColumnData } from './inspector-columns';
-
 // Commissary: the inspector for any track in the download window
 import { installCommissaryTrackInspector } from '@/commissary/track-inspector';
+
+import type { GrabRule, InspectorCandidate, InspectorSearchMeta } from './inspector';
+import type { SourceColumnData } from './inspector-columns';
 
 import { bestCandidateIndex, streamInspection } from './inspector';
 import { SourceColumn } from './inspector-columns';
