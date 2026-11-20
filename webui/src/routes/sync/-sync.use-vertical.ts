@@ -357,11 +357,15 @@ export function useSourceVertical(
         const response = await startSourceDiscovery(config, sourceId, body);
         if (response.error) {
           // The beatport/LB pattern: revert to fresh on a failed start (4700, 11304).
+          // and say why, or the modal just quietly goes back to Start Identifying
           patch(sourceId, (s) => ({ ...s, phase: 'fresh' }));
+          window.showToast?.(`Couldn't start identifying: ${response.error}`, 'error');
           return;
         }
-      } catch {
+      } catch (error) {
         patch(sourceId, (s) => ({ ...s, phase: 'fresh' }));
+        const message = error instanceof Error ? error.message : 'unknown error';
+        window.showToast?.(`Couldn't start identifying: ${message}`, 'error');
         return;
       }
       startDiscoveryPoll(sourceId);
@@ -471,11 +475,9 @@ export function useSourceVertical(
   }, []);
 
   /**
-   * Memoised because the PAGE builds nine of these (-sync.verticals.ts) and
-   * hands each one down as a prop. A fresh object literal per render would
-   * give every tab a new `vertical` prop on every page re-render — and the
-   * page re-renders on each selection toggle, tab switch, sequential-sync
-   * progress step and log frame — re-running any consumer effect or callback
+   * Memoised because the page hands it down as a prop, to three tabs. A
+   * fresh object literal per render would give every tab a new `vertical`
+   * prop on every page re-render, re-running any consumer effect or callback
    * keyed on it. Every member below is already stable (all useCallback), so
    * the identity now changes only when `states` actually changes.
    */

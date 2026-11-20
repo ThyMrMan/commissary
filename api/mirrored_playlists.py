@@ -9,10 +9,11 @@ matching_engine / the automation deps became getters.
 """
 
 import json
+import os
 import threading
 import time
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, g, jsonify, request, send_file
 
 from api.source_playlists import (
     _get_discovery_cache_key,
@@ -220,8 +221,40 @@ def _stamp_track_statuses(database, playlist):
         for t in tracks:
             t['status'] = track_status(t, wishlisted)
         playlist['status_counts'] = status_counts(t['status'] for t in tracks)
+        # how many the detail's library check should look at (#1910): the
+        # unchecked ones plus its own stale misses
+        from core.playlists.library_check import unchecked_rows
+        playlist['library_check_due'] = len(unchecked_rows(tracks))
     except Exception as e:
         logger.debug(f"track statuses unavailable for mirror {playlist.get('id')}: {e}")
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/check-library', methods=['POST'])
+def check_mirrored_playlist_library_endpoint(playlist_id):
+    """check the tracks nobody has checked against the library yet (#1910).
+
+    stamps the same in_library fields a sync does, so the track statuses stop
+    reading "not checked yet" for a playlist that was never synced through the
+    pipeline. a slice per call (remaining says how many are left), read-only
+    toward the wishlist, downloads and the server playlist."""
+    try:
+        from core.playlists.library_check import check_mirror_tracks
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        tracks = database.get_mirrored_playlist_tracks(playlist_id)
+        active = config_manager.get_active_media_server() if config_manager else None
+        result = check_mirror_tracks(
+            database, tracks,
+            profile_id=int(playlist.get('profile_id') or get_current_profile_id() or 1),
+            source=playlist.get('source'),
+            active_server=active,
+        )
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        logger.error(f"Error checking mirrored playlist {playlist_id} against the library: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @bp.route('/api/mirrored-playlists/<int:playlist_id>', methods=['GET'])
@@ -325,6 +358,117 @@ def update_mirrored_playlist_custom_name_endpoint(playlist_id):
     except Exception as e:
         logger.error(f"Error updating mirrored playlist custom name: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+# ── generated cover art (pollinations) ──────────────────────────────────────
+
+def _cover_art_error(err):
+    body = {"error": str(err)}
+    if err.retry_after:
+        body["retry_after"] = err.retry_after
+    return jsonify(body), err.status
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/cover-art', methods=['POST'])
+def generate_mirrored_cover_art(playlist_id):
+    """make one cover from what the playlist sounds like. it's a preview,
+    the playlist keeps its cover until /apply."""
+    from core.playlists import cover_art
+    try:
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        data = request.get_json(silent=True) or {}
+        attempt = parse_strict_int(data.get('attempt')) or 0
+        api_key = config_manager.get('pollinations.api_key', '') if config_manager else ''
+        result = cover_art.make_preview(
+            database, playlist, api_key=api_key, attempt=max(0, attempt),
+            show_name=data.get('show_name') is not False, base_dir=_cover_base_dir(),
+        )
+        return jsonify({"success": True, **result})
+    except cover_art.CoverArtError as e:
+        return _cover_art_error(e)
+    except Exception as e:
+        logger.error(f"Error generating cover art for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Couldn't make a cover"}), 500
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/cover-art/preview', methods=['GET'])
+def get_mirrored_cover_art_preview(playlist_id):
+    from core.playlists import cover_art
+    try:
+        database = get_database()
+        if not _owned_mirrored_playlist(database, playlist_id):
+            return jsonify({"error": "Playlist not found"}), 404
+        path = cover_art.preview_path(playlist_id, _cover_base_dir(), mkdir=False)
+        if not os.path.isfile(path):
+            return jsonify({"error": "No preview"}), 404
+        resp = send_file(path, mimetype="image/webp", max_age=0)
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+    except Exception as e:
+        logger.error(f"Error serving cover art preview for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Failed to load preview"}), 500
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/cover-art/name', methods=['POST'])
+def set_mirrored_cover_art_name(playlist_id):
+    """the playlist's name on the preview, or off it. redraws the same image,
+    so it never spends the free tier's one image every 45s."""
+    from core.playlists import cover_art
+    try:
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        data = request.get_json(silent=True) or {}
+        result = cover_art.set_preview_name(
+            playlist, data.get('show_name') is not False, base_dir=_cover_base_dir())
+        return jsonify({"success": True, **result})
+    except cover_art.CoverArtError as e:
+        return _cover_art_error(e)
+    except Exception as e:
+        logger.error(f"Error changing the cover art name for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Couldn't change the cover"}), 500
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/cover-art/apply', methods=['POST'])
+def apply_mirrored_cover_art(playlist_id):
+    from core.playlists import cover_art
+    try:
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        image_url = cover_art.apply_preview(database, playlist, base_dir=_cover_base_dir())
+        return jsonify({"success": True, "image_url": image_url})
+    except cover_art.CoverArtError as e:
+        return _cover_art_error(e)
+    except Exception as e:
+        logger.error(f"Error applying cover art for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Couldn't save the cover"}), 500
+
+
+@bp.route('/api/mirrored-playlists/<int:playlist_id>/cover-art', methods=['DELETE'])
+def restore_mirrored_cover_art(playlist_id):
+    """back to the source's own cover. a preview that was never used goes too."""
+    from core.playlists import cover_art
+    try:
+        database = get_database()
+        playlist = _owned_mirrored_playlist(database, playlist_id)
+        if not playlist:
+            return jsonify({"error": "Playlist not found"}), 404
+        cover_art.discard_preview(playlist_id, _cover_base_dir())
+        if request.args.get('preview_only') == '1':
+            return jsonify({"success": True})
+        if _up.is_user_playlist(playlist) or not playlist.get('custom_cover'):
+            return jsonify({"error": "No generated cover to undo"}), 400
+        cover_art.restore_original(database, playlist, base_dir=_cover_base_dir())
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error(f"Error restoring cover for playlist {playlist_id}: {e}")
+        return jsonify({"error": "Couldn't restore the cover"}), 500
 
 
 @bp.route('/api/mirrored-playlists/<int:playlist_id>/preferences', methods=['PATCH'])

@@ -187,32 +187,11 @@ def client(env):
     return app.test_client()
 
 
-def test_preview_and_apply_through_the_endpoints(client, env):
-    db, movies, tv = env
-    show_id, _mid, _eps, _m = _seed(db, movies, tv)
-    d = client.get("/api/video/libraries/rename/show/%d?template=%s" % (show_id, NEW_EP)).get_json()
-    assert len(d["entries"]) == 2 and d["template"] == OLD_EP and d["rendered_with"] == NEW_EP
-    toks = {t["token"]: t for t in d["tokens"]}
-    assert toks["{Series Title}"]["example"] == "Silo" and toks["$series"]["example"] == "Silo"
-    assert toks["{MediaInfo VideoBitDepth}"]["import_only"] is True
-    one = d["entries"][0]["key"]
-    r = client.post("/api/video/libraries/rename/show/%d" % show_id,
-                    json={"keys": [one], "template": NEW_EP}).get_json()
-    assert r["renamed"] == 1
+def test_the_rename_first_setting_through_its_endpoint(client, env):
     assert client.get("/api/video/libraries/naming/rename-first").get_json() == {"enabled": True}
     assert client.post("/api/video/libraries/naming/rename-first",
                        json={"enabled": False}).get_json() == {"enabled": False}
-
-
-def test_the_rename_endpoints_are_admin_only(client, env):
-    from flask import g
-
-    @client.application.before_request
-    def _member():
-        g.is_admin = False
-
-    assert client.get("/api/video/libraries/rename/show/1").status_code == 403
-    assert client.post("/api/video/libraries/rename/show/1", json={}).status_code == 403
+    assert client.post("/api/video/libraries/naming/rename-first", json={}).status_code == 400
 
 
 def test_the_sweep_never_removes_a_library_root(env):
@@ -223,20 +202,3 @@ def test_the_sweep_never_removes_a_library_root(env):
     assert not (tv / "Old Name").exists() and tv.exists(), "emptied folders go, the root stays"
     naming.sweep_empty_parents(db, str(movies))
     assert movies.exists()
-
-
-def test_the_panel_harness_passes_and_the_page_wires_it():
-    import shutil
-    import subprocess
-    from pathlib import Path
-    root = Path(__file__).resolve().parents[2]
-    node = shutil.which("node") or shutil.which("node.exe")
-    if node is None:
-        pytest.skip("node not available")
-    res = subprocess.run([node, "tests/js/commissary_rename_panel_harness.mjs"], cwd=str(root),
-                         capture_output=True, text=True, timeout=120)
-    assert res.returncode == 0 and "all assertions passed" in res.stdout, res.stdout + res.stderr
-    detail = (root / "webui/static/video/video-detail.js").read_text(encoding="utf-8")
-    assert "CommissaryRename.applies(d)" in detail
-    assert "which === 'commissary-rename') CommissaryRename.open(data)" in detail
-    assert "filename='commissary-rename-panel.js'" in (root / "webui/index.html").read_text(encoding="utf-8")

@@ -570,7 +570,7 @@ Audible's published runtime is compared against the measured audio duration (ffp
 
 - **Import When Runtime Reaches:** (default **92**) — the tolerance. Books coming up short are **staged, not failed**: **Held back** with the reason shown (e.g. part 1 of 5) until the staging deadline.
 - **Give Up On A Short Book After:** (default **7** days) — the staging deadline, after which the book fails back to the wishlist.
-- Overshoot beyond **1.6×** is rejected as the wrong folder.
+- Overshoot beyond **1.6×** is the wrong release (another book with the same words in its title, or a whole series). It fails right away instead of staging, the release is blocked for that book and the next one is tried.
 
 ## Organization & post-processing
 
@@ -624,6 +624,7 @@ Backend defaults: format order m4b → m4a → mp3 → opus → ogg → flac; mi
 | Control (exact label) | Notes |
 |----------------------|-------|
 | **Audiobooks Folder (output):** | "Where downloaded audiobooks are saved and organized. Keep this separate from your music library so a media server does not index chapter files as albums." |
+| **More audiobook folders:** | Extra folders for an existing collection on another drive. Scanned, matched, covered and deletable like the main folder, but new books always land in the **Audiobooks Folder**. An unplugged drive is skipped and its books stay in your library until it's back. A folder inside (or around) one already listed is ignored, so nothing is read twice. In Docker, mount each at its own container path, like \`/app/audiobooks2\`. |
 | **Audiobook Path Template:** | Variables \`$author\`, \`$authorletter\`, \`$narrator\`, \`$title\`, \`$series\`, \`$seriespos\` (01), \`$year\`, \`$asin\`. Default \`$author/$series/$seriespos - $title\`; series-less books collapse the folder cleanly. |
 
 ## Spoken-word artists

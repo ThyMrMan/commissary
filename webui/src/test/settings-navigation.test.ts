@@ -24,7 +24,8 @@ beforeEach(() => {
 });
 it('uses one category bar instead of a second sidebar', () => {
   expect(document.querySelectorAll('.stg-category-nav .stg-tabbar')).toHaveLength(1);
-  expect(document.querySelectorAll('.stg-category-nav .stg-tab')).toHaveLength(8);
+  // #1822: Discovery got its own tab, everything else regrouped into the eight
+  expect(document.querySelectorAll('.stg-category-nav .stg-tab')).toHaveLength(9);
   expect(document.querySelector('.stg-nav-rail')).toBeNull();
 });
 it('search leaves mounted forms and their visibility unchanged until selecting a result', () => {
@@ -33,7 +34,7 @@ it('search leaves mounted forms and their visibility unchanged until selecting a
   input.value = '/unsaved';
   const section = input.closest('[data-stg]') as HTMLElement;
   const display = section.style.display;
-  nav.filterSettings('Additional Movie Libraries');
+  nav.filterSettings('More movie folders');
   expect(section.style.display).toBe(display);
   expect(document.getElementById('video-movies-path')).toBe(input);
   const shown = vi.fn();

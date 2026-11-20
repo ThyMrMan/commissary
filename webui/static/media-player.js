@@ -100,6 +100,11 @@ function extractTrackTitle(filename) {
     const sepIdx = title.indexOf('||');
     if (sepIdx >= 0) {
         title = title.slice(sepIdx + 2);
+        // soundcloud keys carry the permalink too, id||url||name (#1911)
+        const urlEnd = title.indexOf('||');
+        if (urlEnd >= 0 && /^https?:\/\//.test(title)) {
+            title = title.slice(urlEnd + 2);
+        }
     }
 
     // Remove file extension
@@ -146,6 +151,8 @@ function setTrackInfo(track) {
     try {
         if (typeof window.__ssNowPlaying === 'function') window.__ssNowPlaying(track);
     } catch (e) { /* chat not loaded / not in a room */ }
+    // any page that marks the playing song (the library's songs) listens here
+    window.dispatchEvent(new CustomEvent('ss:now-playing', { detail: track }));
 
     const trackTitleElement = document.getElementById('track-title');
     const trackTitle = _stripSourceIdPrefix(track.title) || 'Unknown Track';
@@ -259,6 +266,7 @@ function clearTrack() {
     try {
         if (typeof window.__ssNowPlaying === 'function') window.__ssNowPlaying(null);
     } catch (e) { /* chat not loaded */ }
+    window.dispatchEvent(new CustomEvent('ss:now-playing', { detail: null }));
     npSetPlayContext('');   // hide "Playing from" when nothing's playing
 
     const trackTitleElement = document.getElementById('track-title');
@@ -1199,12 +1207,31 @@ async function _npLyricsLoadForTrack(track) {
             }
         }
         const content = document.getElementById('np-lyrics-content');
-        if (content) content.innerHTML = '<div class="np-lyrics-empty">No lyrics found</div>';
+        if (content) {
+            // A failed lookup (LRCLib rate-limited / 503 / rejected,
+            // #1879) is NOT necessarily "no lyrics" — when the endpoint
+            // returns an LRCLib reason, show that instead of the generic
+            // copy. Anything else (a definitive miss, a raw server
+            // error) keeps the old "No lyrics found" text.
+            const empty = document.createElement('div');
+            empty.className = 'np-lyrics-empty';
+            empty.textContent = (data && data.error && (data.retryable || data.error.startsWith('LRCLib')))
+                ? data.error : 'No lyrics found';
+            content.replaceChildren(empty);
+        }
+        if (data && data.retryable && _npLyricsState.trackKey === key) {
+            // Transient failure (#1879): don't let the already-loaded
+            // guard pin this track as "done" forever — clearing the key
+            // lets the next load attempt (this track starting again)
+            // retry the fetch.
+            _npLyricsState.trackKey = null;
+        }
         if (status) status.textContent = '';
     } catch (e) {
         console.debug('lyrics fetch failed:', e);
         const content = document.getElementById('np-lyrics-content');
         if (content) content.innerHTML = '<div class="np-lyrics-empty">Lyrics unavailable</div>';
+        if (_npLyricsState.trackKey === key) _npLyricsState.trackKey = null;  // network error is transient too
         if (status) status.textContent = '';
     } finally {
         _npLyricsState.fetchInFlight = false;

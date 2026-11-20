@@ -248,7 +248,7 @@ def test_the_automatic_organizer_passes_the_library_identity(monkeypatch, tmp_pa
     monkeypatch.setattr(importer, "plan_import", fake_plan)
     monkeypatch.setattr(importer, "run_import", lambda *a, **k: {"status": "import_failed"})
     monkeypatch.setattr(ni, "library_identity", lambda db, dl: {"title": "From Library"})
-    monkeypatch.setattr(monitor, "_owned_library_dir", lambda db, dl: None)
+    monkeypatch.setattr(monitor, "_owned_library_dir", lambda db, dl, settings=None: None)
     monkeypatch.setattr(monitor, "_expected_duration_sec", lambda db, dl: None)
 
     class _DB:

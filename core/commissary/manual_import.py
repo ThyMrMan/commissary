@@ -382,10 +382,8 @@ def start(dl_id, work, grace: float = GRACE_SECONDS) -> Dict[str, Any]:
 def place_folder(db, row: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
     """Every episode in the folder, as the one show the user chose."""
     from core.commissary.naming_identity import naming_identity
-    from core.commissary.video_libraries import manual_target
     from core.video import organization
     from core.video.download_monitor import _reclaim_source
-    from core.video.download_pipeline import target_dir_for
     from core.video.importer import plan_import, real_fs, run_import
     from core.video.mediainfo import probe
     from core.video.recycle import discarder
@@ -398,12 +396,11 @@ def place_folder(db, row: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any
     plan, err = resolve(found, body.get("season"), absolute_lookup(db, media_id))
     if err:
         return {"success": False, "error": err}
-    from api.video.downloads import _PATH_KEYS, _series_type_for
-    paths = {k: db.get_setting(k) or "" for k in _PATH_KEYS}
-    # the Library first; without Libraries, upstream's anime folder for an anime show
-    target = manual_target(db, "show", body) or target_dir_for(
-        "show", paths, _series_type_for(db, "show", {"media_id": media_id,
-                                                     "media_source": body.get("media_source") or "tmdb"}))
+    from api.video.downloads import _target_for
+    # the Library first (inside _target_for); without Libraries, upstream's anime
+    # folder for an anime show and its 4K folder by quality profile
+    target = _target_for(db, "show", {**body, "media_id": media_id,
+                                      "media_source": body.get("media_source") or "tmdb"})
     settings = organization.load(db)
     prober = probe if settings.get("verify_with_ffprobe", True) else None
     identity = naming_identity(db, "show", media_id)

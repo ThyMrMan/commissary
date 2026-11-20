@@ -28,7 +28,7 @@
 
 .shortcut {
   padding: 5px 12px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid var(--white-a10);
   background: var(--white-a04);
   color: var(--white-a80);
@@ -37,8 +37,8 @@
 }
 
 .shortcut[data-active] {
-  border-color: var(--accent, #1db954);
-  color: #fff;
+  border-color: var(--accent);
+  color: var(--text-primary);
 }
 
 .list {
@@ -48,7 +48,7 @@
   max-height: 50vh;
   overflow-y: auto;
   border: 1px solid var(--white-a08);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
 }
 
 .row {
@@ -79,6 +79,6 @@
 
 .error {
   margin: 8px 0;
-  color: var(--danger, #ef4444);
+  color: var(--danger);
   font-size: 13px;
 }

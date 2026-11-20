@@ -250,8 +250,8 @@ def test_the_detail_panel_explains_a_below_cutoff_removal_honestly(db, worker):
     is untrue of a row include_below_cutoff caught — that one IS being chased.
     The renderer branches on details.reason, so the two strings must agree."""
     import pathlib
-    js = (pathlib.Path(__file__).resolve().parents[2] / "webui" / "static" / "video"
-          / "video-repair.js").read_text(encoding="utf-8")
+    tsx = (pathlib.Path(__file__).resolve().parents[2] / "webui" / "src" / "routes" / "tools"
+           / "-ui" / "video-finding-detail.tsx").read_text(encoding="utf-8")
 
     _seed_show(db, tmdb=88, resolution="720p")
     _wish_ep(db, 88)
@@ -259,10 +259,10 @@ def test_the_detail_panel_explains_a_below_cutoff_removal_honestly(db, worker):
     worker._run_job("wishlist_audit", forced=True)
     reason = _pending(db)[0]["details"]["reason"]
 
-    branch = js.split("function staleDetailHTML(", 1)[1].split("\n    }", 1)[0]
+    branch = tsx.split("function StaleWishlistDetail(", 1)[1].split("\n}", 1)[0]
     assert "d.reason === '%s'" % reason in branch, \
         "the renderer branches on a reason string the job no longer emits"
-    assert "ends " in branch and "the hunt for a better copy" in branch
+    assert "ends the hunt for a better copy" in branch
 
 
 def test_quality_unreadable_rows_are_still_flagged_by_default(db, worker):
