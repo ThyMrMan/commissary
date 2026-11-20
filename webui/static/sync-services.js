@@ -1147,10 +1147,11 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
                             <span>Organize by Playlist (Downloads/Playlist/Artist - Track.ext)</span>
                         </label>`}
                     </div>
+                    <p class="music-get-off-note" role="note">Getting music isn't part of your profile. You can still see what's here and what you already have. Ask your admin if you'd like it.</p>
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
-                    <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
+                    <button class="download-control-btn" data-request-action id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
@@ -1177,8 +1178,6 @@ async function openDownloadMissingModalForTidal(virtualPlaylistId, playlistName,
     }
     modal.style.display = 'flex';
     hideLoadingOverlay();
-    // owned/missing per track straight away, not after Begin Analysis (#1910)
-    if (typeof previewModalOwnership === 'function') void previewModalOwnership(virtualPlaylistId);
 }
 
 
@@ -7422,12 +7421,12 @@ function generateTableRowsFromState(state, urlHash) {
 
             return `
             <tr id="discovery-row-${urlHash}-${result.index}">
-                <td class="yt-track">${trackName}</td>
-                <td class="yt-artist">${artistName}</td>
+                <td class="yt-track">${escapeHtml(trackName)}</td>
+                <td class="yt-artist">${escapeHtml(artistName)}</td>
                 <td class="discovery-status ${result.status_class}">${result.status}</td>
-                <td class="spotify-track">${result.spotify_track || '-'}</td>
-                <td class="spotify-artist">${result.spotify_artist || '-'}</td>
-                <td class="spotify-album">${result.spotify_album || '-'}</td>
+                <td class="spotify-track">${escapeHtml(result.spotify_track || '-')}</td>
+                <td class="spotify-artist">${escapeHtml(result.spotify_artist || '-')}</td>
+                <td class="spotify-album">${escapeHtml(result.spotify_album || '-')}</td>
                 <td class="discovery-actions">${generateDiscoveryActionButton(result, urlHash, platform)}</td>
             </tr>
         `;
@@ -7455,8 +7454,8 @@ function generateInitialTableRows(tracks, isTidal = false, urlHash = '', isBeatp
 
         return `
         <tr id="discovery-row-${urlHash}-${index}">
-            <td class="yt-track">${trackName}</td>
-            <td class="yt-artist">${artistName}</td>
+            <td class="yt-track">${escapeHtml(trackName)}</td>
+            <td class="yt-artist">${escapeHtml(artistName)}</td>
             <td class="discovery-status">🔍 Pending...</td>
             <td class="spotify-track">-</td>
             <td class="spotify-artist">-</td>
@@ -7557,7 +7556,7 @@ function updateYouTubeDiscoveryModal(urlHash, status) {
             row = document.createElement('tr');
             row.id = `discovery-row-${urlHash}-${result.index}`;
             row.innerHTML =
-                `<td class="yt-track">${trackName}</td>` +
+                `<td class="yt-track">${escapeHtml(trackName)}</td>` +
                 '<td class="yt-artist"></td>' +
                 '<td class="discovery-status"></td>' +
                 '<td class="spotify-track">-</td>' +
@@ -8009,7 +8008,14 @@ async function cancelYouTubeSync(urlHash) {
     try {
         console.log('❌ Cancelling YouTube sync:', urlHash);
 
-        const response = await fetch(`/api/youtube/sync/cancel/${urlHash}`, {
+        // a ListenBrainz playlist has its own cancel; the YouTube one looked
+        // the mbid up in the YouTube states and answered 404
+        const isListenBrainz = typeof listenbrainzPlaylistStates !== 'undefined'
+            && !!listenbrainzPlaylistStates[urlHash];
+        const cancelUrl = isListenBrainz
+            ? `/api/listenbrainz/sync/cancel/${urlHash}`
+            : `/api/youtube/sync/cancel/${urlHash}`;
+        const response = await fetch(cancelUrl, {
             method: 'POST'
         });
 

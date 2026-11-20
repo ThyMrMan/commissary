@@ -65,6 +65,12 @@ def _isoformat(val) -> Optional[str]:
     return str(val)
 
 
+def _id_or_none(val):
+    """A library id as the v1 API has always typed it: a string. Library v2
+    catalogue ids are integers in the database (#1062 review)."""
+    return None if val is None else str(val)
+
+
 def _bool_or_none(val):
     """Convert to bool, returning None if val is None."""
     if val is None:
@@ -86,7 +92,7 @@ def serialize_artist(obj, fields: Optional[Set[str]] = None) -> dict:
     """Full artist serialization — all columns."""
     d = _to_dict(obj)
     result = {
-        "id": d.get("id"),
+        "id": _id_or_none(d.get("id")),
         "name": d.get("name"),
         "thumb_url": d.get("thumb_url"),
         "banner_url": d.get("banner_url"),
@@ -174,8 +180,8 @@ def serialize_album(obj, fields: Optional[Set[str]] = None) -> dict:
     """Full album serialization — all columns."""
     d = _to_dict(obj)
     result = {
-        "id": d.get("id"),
-        "artist_id": d.get("artist_id"),
+        "id": _id_or_none(d.get("id")),
+        "artist_id": _id_or_none(d.get("artist_id")),
         "title": d.get("title"),
         "year": d.get("year"),
         # Full release date (YYYY-MM-DD when known), unlike the year alone.
@@ -277,9 +283,9 @@ def serialize_track(obj, fields: Optional[Set[str]] = None) -> dict:
     """Full track serialization — all columns."""
     d = _to_dict(obj)
     result = {
-        "id": d.get("id"),
-        "album_id": d.get("album_id"),
-        "artist_id": d.get("artist_id"),
+        "id": _id_or_none(d.get("id")),
+        "album_id": _id_or_none(d.get("album_id")),
+        "artist_id": _id_or_none(d.get("artist_id")),
         "title": d.get("title"),
         # Per-track performer credit (compilations, featured artists).
         "track_artist": d.get("track_artist"),
@@ -423,13 +429,27 @@ def serialize_watchlist_artist(obj, fields: Optional[Set[str]] = None) -> dict:
         "include_eps": bool(d.get("include_eps", True)),
         "include_singles": bool(d.get("include_singles", True)),
         "include_live": bool(d.get("include_live", False)),
+        # #2082: never set = it follows include_live
+        "include_live_tracks": bool(d.get("include_live", False)
+                                    if d.get("include_live_tracks") is None
+                                    else d.get("include_live_tracks")),
         "include_remixes": bool(d.get("include_remixes", False)),
         "include_acoustic": bool(d.get("include_acoustic", False)),
         "include_compilations": bool(d.get("include_compilations", False)),
         # #1822: true = the release rules come from the watchlist defaults
         "follow_defaults": bool(d.get("follow_defaults", False)),
+        # #2175: the artist's own MusicBrainz release statuses, null = the
+        # library-wide ones
+        "release_statuses": release_statuses_out(d.get("allowed_release_statuses")),
     }
     return filter_fields(result, fields)
+
+
+def release_statuses_out(stored):
+    """#2175: a stored status list as a list, None when it follows the library."""
+    from core.release_statuses import parse_statuses
+    statuses = parse_statuses(stored)
+    return list(statuses) if statuses else None
 
 
 def serialize_wishlist_track(obj, fields: Optional[Set[str]] = None) -> dict:
@@ -579,7 +599,8 @@ _METASYNC_ARTIST_IDS = (
 )
 
 _METASYNC_ALBUM_IDS = (
-    "musicbrainz_release_id", "spotify_album_id", "itunes_album_id",
+    "musicbrainz_release_id", "musicbrainz_release_group_id",
+    "spotify_album_id", "itunes_album_id",
     "deezer_id", "discogs_id", "amazon_id", "tidal_id", "qobuz_id",
     "audiodb_id", "jiosaavn_id", "bandcamp_url", "upc",
 )
@@ -596,6 +617,7 @@ _METASYNC_TRACK_IDS = (
 _METASYNC_ID_PROVIDER = {
     "musicbrainz_id": "musicbrainz", "musicbrainz_release_id": "musicbrainz",
     "musicbrainz_recording_id": "musicbrainz",
+    "musicbrainz_release_group_id": "musicbrainz",
     "spotify_artist_id": "spotify", "spotify_album_id": "spotify",
     "spotify_track_id": "spotify",
     "itunes_artist_id": "itunes", "itunes_album_id": "itunes",

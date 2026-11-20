@@ -52,7 +52,7 @@ async function loadServerPlaylists() {
         if (!Array.isArray(historyNames)) historyNames = [];
 
         if (!data.success || !data.playlists) {
-            if (container) container.innerHTML = `<div class="playlist-placeholder">${data.error || 'Could not load server playlists'}</div>`;
+            if (container) container.innerHTML = `<div class="playlist-placeholder">${escapeHtml(data.error || 'Could not load server playlists')}</div>`;
             return;
         }
 
@@ -149,7 +149,7 @@ async function loadServerPlaylists() {
         container.innerHTML = html;
 
     } catch (e) {
-        if (container) container.innerHTML = `<div class="playlist-placeholder">Error: ${e.message}</div>`;
+        if (container) container.innerHTML = `<div class="playlist-placeholder">Error: ${escapeHtml(e.message)}</div>`;
     } finally {
         if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh'; }
     }
@@ -879,7 +879,7 @@ async function _serverSearchExecute() {
         }).join('');
 
     } catch (e) {
-        results.innerHTML = `<div class="server-search-hint">Error: ${e.message}</div>`;
+        results.innerHTML = `<div class="server-search-hint">Error: ${escapeHtml(e.message)}</div>`;
     }
 }
 
@@ -1078,6 +1078,11 @@ async function openSyncDetailModal(entryId) {
 
         const entry = data.entry;
         const trackResults = entry.track_results || [];
+        // Run results are historical. The API adds current scoped file and
+        // server evidence so a later download no longer appears as a miss.
+        const currentStatus = t => Object.hasOwn(t, 'current_library_match')
+            ? (t.current_library_match?.server_id ? 'matched' : t.current_library_match ? 'owned' : 'unmatched')
+            : (t.status === 'found' ? 'matched' : 'unmatched');
         const name = entry.artist_name
             ? `${entry.artist_name} — ${entry.album_name || entry.playlist_name}`
             : entry.playlist_name || 'Unknown';
@@ -1087,16 +1092,16 @@ async function openSyncDetailModal(entryId) {
         overlay.className = 'discog-modal-overlay';
         overlay.id = 'sync-detail-overlay';
 
-        const found = entry.tracks_found || 0;
+        const found = entry.current_tracks_recognized ?? entry.tracks_found ?? 0;
         const total = entry.total_tracks || 0;
         const downloaded = entry.tracks_downloaded || 0;
 
         let trackRowsHtml = '';
         if (trackResults.length > 0) {
             trackRowsHtml = trackResults.map((t, i) => {
-                const statusIcon = t.status === 'found' ? '✅' : '❌';
-                const statusClass = t.status === 'found' ? 'matched' : 'unmatched';
-                const confPct = Math.round((t.confidence || 0) * 100);
+                const statusClass = currentStatus(t);
+                const statusIcon = statusClass === 'matched' ? '✅' : statusClass === 'owned' ? '⏳' : '❌';
+                const confPct = t.current_library_match ? 100 : Math.round((t.confidence || 0) * 100);
                 const confClass = confPct >= 80 ? 'conf-high' : confPct >= 50 ? 'conf-mid' : 'conf-low';
                 let dlIcon = '';
                 if (t.download_status === 'completed') dlIcon = '✅';
@@ -1105,7 +1110,9 @@ async function openSyncDetailModal(entryId) {
                 else if (t.download_status === 'cancelled') dlIcon = '🚫';
 
                 let dlDisplay = dlIcon;
-                if (!dlDisplay && t.download_status === 'wishlist') {
+                if (t.current_library_match) {
+                    dlDisplay = statusClass === 'matched' ? 'In library' : 'In library · Awaiting server scan';
+                } else if (!dlDisplay && t.download_status === 'wishlist') {
                     // Wing-it fallback stubs (no real metadata) were never actually
                     // wishlisted by the sync — show them as plain, non-clickable.
                     const isWingIt = String(t.source_track_id || '').startsWith('wing_it_');
@@ -1121,7 +1128,7 @@ async function openSyncDetailModal(entryId) {
                 }
 
                 return `
-                    <tr class="sync-detail-row ${statusClass}">
+                    <tr class="sync-detail-row ${statusClass}" data-downloaded="${t.download_status === 'completed'}">
                         <td class="sync-detail-num">${i + 1}</td>
                         <td class="sync-detail-art">
                             ${t.image_url ? `<img src="${t.image_url}" alt="" loading="lazy">` : '<div class="sync-detail-art-empty"></div>'}
@@ -1161,8 +1168,9 @@ async function openSyncDetailModal(entryId) {
         }
 
         // Count stats for filter bar
-        const matchedCount = trackResults.filter(t => t.status === 'found').length;
-        const unmatchedCount = trackResults.filter(t => t.status !== 'found').length;
+        const matchedCount = trackResults.filter(t => currentStatus(t) === 'matched').length;
+        const unmatchedCount = trackResults.filter(t => currentStatus(t) === 'unmatched').length;
+        const ownedCount = trackResults.filter(t => currentStatus(t) === 'owned').length;
         const downloadedCount = trackResults.filter(t => t.download_status === 'completed').length;
 
         overlay.innerHTML = `
@@ -1180,6 +1188,7 @@ async function openSyncDetailModal(entryId) {
                         <button class="discog-filter active" data-filter="all" onclick="_syncDetailFilter(this, 'all')">All (${total})</button>
                         <button class="discog-filter" data-filter="matched" onclick="_syncDetailFilter(this, 'matched')">Matched (${matchedCount})</button>
                         <button class="discog-filter" data-filter="unmatched" onclick="_syncDetailFilter(this, 'unmatched')">Unmatched (${unmatchedCount})</button>
+                        ${ownedCount > 0 ? `<button class="discog-filter" data-filter="owned" onclick="_syncDetailFilter(this, 'owned')">Awaiting scan (${ownedCount})</button>` : ''}
                         ${downloadedCount > 0 ? `<button class="discog-filter" data-filter="downloaded" onclick="_syncDetailFilter(this, 'downloaded')">Downloaded (${downloadedCount})</button>` : ''}
                     </div>
                 </div>
@@ -1192,7 +1201,7 @@ async function openSyncDetailModal(entryId) {
                                 <th>Track</th>
                                 <th>Artist</th>
                                 <th>Album</th>
-                                <th>Match</th>
+                                <th>Library match</th>
                                 <th>Conf.</th>
                                 <th>Status</th>
                             </tr>
@@ -1203,7 +1212,7 @@ async function openSyncDetailModal(entryId) {
                     </table>
                 </div>
                 <div class="discog-footer">
-                    <div class="discog-footer-info">${found} matched · ${downloaded} downloaded · ${total} total</div>
+                    <div class="discog-footer-info">${found} matched${ownedCount ? ` · ${ownedCount} awaiting scan` : ''} · ${total} total${entry.current_tracks_recognized != null ? `<br>Last sync: ${entry.tracks_found || 0} matched · ${downloaded} downloaded` : ` · ${downloaded} downloaded`}</div>
                     <div class="discog-footer-actions">
                         <button class="discog-cancel-btn" onclick="document.getElementById('sync-detail-overlay')?.remove()">Close</button>
                     </div>
@@ -1233,9 +1242,10 @@ function _syncDetailFilter(btn, filter) {
             row.style.display = row.classList.contains('matched') ? '' : 'none';
         } else if (filter === 'unmatched') {
             row.style.display = row.classList.contains('unmatched') ? '' : 'none';
+        } else if (filter === 'owned') {
+            row.style.display = row.classList.contains('owned') ? '' : 'none';
         } else if (filter === 'downloaded') {
-            const dlCell = row.querySelector('.sync-detail-dl');
-            row.style.display = dlCell && dlCell.textContent.trim() === '✅' ? '' : 'none';
+            row.style.display = row.dataset.downloaded === 'true' ? '' : 'none';
         }
     });
 }
@@ -1247,3 +1257,356 @@ function _syncDetailFilter(btn, filter) {
 // _adlOpenBatchModal moved to core.js as window.openDownloadBatchModal
 // rather than being deleted: it reads activeDownloadProcesses,
 // rehydrateModal and WishlistModalState, which are script-scoped there.
+
+// ==================================================================================
+// Moved from settings.js (SETTINGS_PORT.md step V4a): none of these belong to the
+// Settings page, and settings.js goes when that page is React.
+// ==================================================================================
+
+// ===============================
+// SUPPORT MODAL
+// ===============================
+
+function showSupportModal() {
+    const overlay = document.getElementById('support-modal-overlay');
+    if (overlay) overlay.classList.remove('hidden');
+}
+
+function closeSupportModal() {
+    const overlay = document.getElementById('support-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+}
+
+async function copyAddress(address, cryptoName) {
+    try {
+        // navigator.clipboard requires HTTPS — use fallback for HTTP (Docker)
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(address);
+        } else {
+            const textarea = document.createElement('textarea');
+            textarea.value = address;
+            textarea.style.position = 'fixed';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+        }
+        showToast(`${cryptoName} address copied to clipboard`, 'success');
+    } catch (error) {
+        console.error('Failed to copy address:', error);
+        // Show the address so user can copy manually
+        showToast(`${cryptoName}: ${address}`, 'info');
+    }
+}
+
+// ── Hydrabase Functions ──
+
+let _hydrabaseConnected = false;
+
+async function hydrabaseToggleConnection() {
+    if (_hydrabaseConnected) {
+        await hydrabaseDisconnect();
+    } else {
+        await hydrabaseConnect();
+    }
+}
+
+async function hydrabaseConnect() {
+    const url = document.getElementById('hydra-ws-url').value.trim();
+    const apiKey = document.getElementById('hydra-api-key').value.trim();
+    if (!url || !apiKey) {
+        showToast('URL and API key required', 'error');
+        return;
+    }
+    const statusEl = document.getElementById('hydra-connection-status');
+    const btn = document.getElementById('hydra-connect-btn');
+    statusEl.textContent = 'Connecting...';
+    statusEl.style.color = '#f0ad4e';
+    try {
+        const response = await fetch('/api/hydrabase/connect', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ url, api_key: apiKey })
+        });
+        const data = await response.json();
+        if (data.success) {
+            _hydrabaseConnected = true;
+            statusEl.textContent = 'Connected';
+            statusEl.style.color = 'rgb(var(--accent-light-rgb))';
+            btn.textContent = 'Disconnect';
+            showToast('Connected to Hydrabase', 'success');
+        } else {
+            statusEl.textContent = 'Failed';
+            statusEl.style.color = '#f44336';
+            showToast(data.error || 'Connection failed', 'error');
+        }
+    } catch (e) {
+        statusEl.textContent = 'Error';
+        statusEl.style.color = '#f44336';
+        showToast('Connection error', 'error');
+    }
+}
+
+async function hydrabaseDisconnect() {
+    try {
+        await fetch('/api/hydrabase/disconnect', { method: 'POST' });
+    } catch (e) { }
+    _hydrabaseConnected = false;
+    document.getElementById('hydra-connection-status').textContent = 'Disconnected';
+    document.getElementById('hydra-connection-status').style.color = '#888';
+    document.getElementById('hydra-connect-btn').textContent = 'Connect';
+    // Dev mode is disabled on disconnect — hide Hydrabase nav and update settings status
+    window.dispatchEvent(new CustomEvent('ss:dev-mode', { detail: { enabled: false } }));
+    document.getElementById('hydrabase-nav').style.display = 'none';
+    // Orb visibility rides the dispatch (React-owned since the flip), and so
+    // does the System tab's dev mode status (system-tab.tsx)
+    showToast('Disconnected — dev mode disabled', 'success');
+    navigateToPage('settings');
+}
+
+async function loadHydrabaseComparisons() {
+    const container = document.getElementById('hydra-comparisons-container');
+    if (!container) return;
+    try {
+        const response = await fetch('/api/hydrabase/comparisons');
+        const data = await response.json();
+        if (!data.success || !data.comparisons?.length) {
+            container.innerHTML = '<p style="color: #666; font-size: 13px;">No comparisons yet. Search with Hydrabase active to generate comparisons.</p>';
+            return;
+        }
+        let html = '';
+        for (const comp of data.comparisons) {
+            const time = new Date(comp.timestamp * 1000).toLocaleTimeString();
+            html += `<div style="background: rgba(30, 30, 30, 0.6); border-radius: 8px; padding: 10px; margin-bottom: 8px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+                    <strong style="color: #fff;">"${comp.query}"</strong>
+                    <span style="color: #666; font-size: 11px;">${time}</span>
+                </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; font-size: 12px;">
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(99, 102, 241, 0.15); border: 1px solid rgba(99, 102, 241, 0.3);">
+                        <div style="color: rgba(139, 92, 246, 1); font-weight: 600; margin-bottom: 2px;">Hydrabase</div>
+                        <div style="color: #aaa;">${comp.hydrabase?.tracks || 0}T / ${comp.hydrabase?.artists || 0}A / ${comp.hydrabase?.albums || 0}Al</div>
+                    </div>
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(29, 185, 84, 0.15); border: 1px solid rgba(29, 185, 84, 0.3);">
+                        <div style="color: rgb(var(--accent-light-rgb)); font-weight: 600; margin-bottom: 2px;">Spotify</div>
+                        <div style="color: #aaa;">${comp.spotify?.tracks || 0}T / ${comp.spotify?.artists || 0}A / ${comp.spotify?.albums || 0}Al</div>
+                    </div>
+                    <div style="padding: 6px 8px; border-radius: 6px; background: rgba(251, 93, 93, 0.15); border: 1px solid rgba(251, 93, 93, 0.3);">
+                        <div style="color: #fb5d5d; font-weight: 600; margin-bottom: 2px;">${comp.fallback_source === 'deezer' ? 'Deezer' : 'iTunes'}</div>
+                        <div style="color: #aaa;">${(comp.fallback || comp.itunes)?.tracks || 0}T / ${(comp.fallback || comp.itunes)?.artists || 0}A / ${(comp.fallback || comp.itunes)?.albums || 0}Al</div>
+                    </div>
+                </div>
+            </div>`;
+        }
+        container.innerHTML = html;
+    } catch (e) {
+        container.innerHTML = '<p style="color: #f44336; font-size: 13px;">Failed to load comparisons.</p>';
+    }
+}
+
+async function hydrabaseSendRaw(textareaId) {
+    const textarea = document.getElementById(textareaId);
+    const raw = textarea.value.trim();
+    if (!raw) {
+        showToast('Payload is empty', 'error');
+        return;
+    }
+    if (!_hydrabaseConnected) {
+        showToast('Not connected to Hydrabase', 'error');
+        return;
+    }
+    let payload;
+    try {
+        payload = JSON.parse(raw);
+    } catch (e) {
+        showToast('Invalid JSON payload', 'error');
+        return;
+    }
+    // Auto-inject a fresh nonce if not set or zero
+    if (!payload.nonce) {
+        payload.nonce = Date.now();
+    }
+    const responseArea = document.getElementById('hydra-response');
+    responseArea.textContent = 'Sending...';
+    try {
+        const response = await fetch('/api/hydrabase/send', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ payload })
+        });
+        const data = await response.json();
+        if (data.success) {
+            responseArea.textContent = JSON.stringify(data.data, null, 2);
+        } else {
+            responseArea.textContent = 'Error: ' + (data.error || 'Unknown error');
+            if (data.error && data.error.includes('Not connected')) {
+                _hydrabaseConnected = false;
+                document.getElementById('hydra-connection-status').textContent = 'Disconnected';
+                document.getElementById('hydra-connection-status').style.color = '#888';
+                document.getElementById('hydra-connect-btn').textContent = 'Connect';
+            }
+        }
+    } catch (e) {
+        responseArea.textContent = 'Error: ' + e.message;
+    }
+}
+
+// Dashboard-specific test functions that create activity items
+async function testDashboardConnection(service) {
+    // 'spotify_free' is a display-only label for the no-auth composite; the real
+    // service to test is 'spotify'.
+    if (service === 'spotify_free') service = 'spotify';
+    try {
+        showLoadingOverlay(`Testing ${service} service...`);
+
+        const response = await fetch(API.testDashboardConnection, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ service })
+        });
+
+        const result = await response.json();
+
+        if (result.success) {
+            // Use backend's message which contains dynamic source name
+            showToast(result.message || `${service} service verified`, 'success');
+            // Refresh status indicators immediately so UI reflects the new state
+            fetchAndUpdateServiceStatus();
+        } else {
+            showToast(`${service} service check failed: ${result.error}`, 'error');
+        }
+    } catch (error) {
+        console.error(`Error testing ${service} service:`, error);
+        showToast(`Failed to test ${service} service`, 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+// ── Spotify Rate Limit Handling ───────────────────────────────────────────
+let _spotifyRateLimitShown = false;
+let _spotifyInCooldown = false;
+let _rateLimitModalOpen = false;
+let _rateLimitCountdownInterval = null;
+let _rateLimitExpiresAt = 0;
+
+function handleSpotifyRateLimit(rateLimitInfo) {
+    // the ban, its modal and the restored toast are the admin's (#2208).
+    // every path that raises the modal comes through here
+    if (typeof _statusViewerIsAdmin === 'function' && !_statusViewerIsAdmin()) {
+        if (_spotifyRateLimitShown) { _spotifyRateLimitShown = false; closeRateLimitModal(); }
+        return;
+    }
+    if (!rateLimitInfo || !rateLimitInfo.active) {
+        if (_spotifyRateLimitShown) {
+            _spotifyRateLimitShown = false;
+            closeRateLimitModal();
+            showToast('Spotify access restored', 'success');
+            // Refresh discover page if user is on it — data source switched back to Spotify
+            if (currentPage === 'discover') {
+                console.log('Spotify restored — refreshing discover page data');
+                if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
+            }
+        }
+        return;
+    }
+    // Update countdown if modal is open (status pushes every 10s keep it accurate)
+    if (_rateLimitModalOpen && rateLimitInfo.remaining_seconds) {
+        _rateLimitExpiresAt = Date.now() + (rateLimitInfo.remaining_seconds * 1000);
+    }
+    if (!_spotifyRateLimitShown) {
+        _spotifyRateLimitShown = true;
+        _spotifyInCooldown = false;
+        showRateLimitModal(rateLimitInfo);
+        // Refresh discover page if user is on it — data source switched to iTunes
+        if (currentPage === 'discover') {
+            console.log('Spotify rate limited — refreshing discover page with iTunes data');
+            if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
+        }
+    }
+}
+
+function showRateLimitModal(rateLimitInfo) {
+    const overlay = document.getElementById('rate-limit-modal-overlay');
+    if (!overlay) return;
+
+    // disconnecting spotify is install-wide, so the button is the admin's
+    const disconnectBtn = overlay.querySelector('.rate-limit-disconnect-btn');
+    if (disconnectBtn) {
+        const admin = typeof currentProfile === 'undefined' || !currentProfile || !!currentProfile.is_admin;
+        disconnectBtn.style.display = admin ? '' : 'none';
+    }
+
+    // Populate details
+    const banDuration = document.getElementById('rate-limit-ban-duration');
+    const endpoint = document.getElementById('rate-limit-endpoint');
+    const countdown = document.getElementById('rate-limit-countdown');
+
+    banDuration.textContent = formatRateLimitDuration(rateLimitInfo.retry_after || rateLimitInfo.remaining_seconds);
+    endpoint.textContent = rateLimitInfo.endpoint || 'unknown';
+    countdown.textContent = formatRateLimitDuration(rateLimitInfo.remaining_seconds);
+
+    // Set expiry for live countdown
+    _rateLimitExpiresAt = Date.now() + (rateLimitInfo.remaining_seconds * 1000);
+
+    // Start live countdown timer
+    if (_rateLimitCountdownInterval) clearInterval(_rateLimitCountdownInterval);
+    _rateLimitCountdownInterval = setInterval(() => {
+        const remaining = Math.max(0, Math.round((_rateLimitExpiresAt - Date.now()) / 1000));
+        countdown.textContent = formatRateLimitDuration(remaining);
+        if (remaining <= 0) {
+            clearInterval(_rateLimitCountdownInterval);
+            _rateLimitCountdownInterval = null;
+        }
+    }, 1000);
+
+    overlay.classList.remove('hidden');
+    _rateLimitModalOpen = true;
+}
+
+function closeRateLimitModal() {
+    const overlay = document.getElementById('rate-limit-modal-overlay');
+    if (overlay) overlay.classList.add('hidden');
+    if (_rateLimitCountdownInterval) {
+        clearInterval(_rateLimitCountdownInterval);
+        _rateLimitCountdownInterval = null;
+    }
+    _rateLimitModalOpen = false;
+}
+
+async function disconnectSpotifyFromRateLimit() {
+    closeRateLimitModal();
+    try {
+        showLoadingOverlay('Disconnecting Spotify...');
+        const response = await fetch('/api/spotify/disconnect', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+            _spotifyRateLimitShown = false;
+            showToast(data.message || 'Spotify disconnected.', 'success');
+            // React's metadata source picker (connections-metadata.tsx), on window
+            window.syncMetadataSourceSelection?.(data.source || 'deezer');
+            await fetchAndUpdateServiceStatus();
+            if (currentPage === 'discover') {
+                if (typeof loadDiscoverPage === 'function') loadDiscoverPage();
+            }
+        } else {
+            showToast(`Failed to disconnect: ${data.error}`, 'error');
+        }
+    } catch (error) {
+        console.error('Error disconnecting Spotify:', error);
+        showToast('Failed to disconnect Spotify', 'error');
+    } finally {
+        hideLoadingOverlay();
+    }
+}
+
+function formatRateLimitDuration(seconds) {
+    if (!seconds || seconds <= 0) return '0s';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    if (h > 0) return `${h}h ${m}m`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+}

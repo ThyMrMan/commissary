@@ -148,20 +148,47 @@ describe('AdlUnverifiedRow', () => {
   });
 
   it('puts what we asked for beside what we got, the difference lit', () => {
+    // in-app chat (makiel): the two columns came out reversed. the row's
+    // title is the ask, got_* is what the source handed over.
     const { container } = render(
       <AdlUnverifiedRow
         dl={dl({
-          title: 'Chun-Li Theme',
+          title: 'Chun-Li: Woman of Vengeance',
+          artist: 'Aphex Twin',
           expected_title: 'Chun-Li: Woman of Vengeance',
           expected_artist: 'Aphex Twin',
+          got_title: 'Chun-Li Theme',
+          got_artist: 'Aphex Twin',
         })}
         open
         onToggle={vi.fn()}
         handlers={handlers()}
       />,
     );
+    const cells = [...container.querySelectorAll('.dlc-compare > span')].map((d) => d.textContent);
+    // header row, then Title | asked | got
+    expect(cells.slice(0, 6)).toEqual([
+      '',
+      'Asked for',
+      'Got',
+      'Title',
+      'Chun-Li: Woman of Vengeance',
+      'Chun-Li Theme',
+    ]);
     const diffs = [...container.querySelectorAll('.dlc-compare-diff')].map((d) => d.textContent);
     expect(diffs).toEqual(['Chun-Li Theme']);
+  });
+
+  it('shows no comparison when the source side was never recorded', () => {
+    const { container } = render(
+      <AdlUnverifiedRow
+        dl={dl({ title: 'Xtal', expected_title: 'Xtal', expected_artist: 'Aphex Twin' })}
+        open
+        onToggle={vi.fn()}
+        handlers={handlers()}
+      />,
+    );
+    expect(container.querySelector('.dlc-compare')).toBeNull();
   });
 
   it('toggles on a row click, never on an action click', () => {
@@ -369,6 +396,43 @@ describe('AdlQuarantineRow', () => {
     );
     // "03 Xtal.flac" is the same track as "Xtal": nothing lit
     expect(container.querySelector('.dlc-compare-diff')).toBeNull();
+  });
+
+  it('puts the expected length beside the file length, a different cut lit (#2001)', () => {
+    const { container } = render(
+      <AdlQuarantineRow
+        entry={entry({ expected_length_s: 266, actual_length_s: 784 })}
+        open
+        onToggle={vi.fn()}
+        handlers={handlers()}
+      />,
+    );
+    const text = container.querySelector('.dlc-compare')?.textContent || '';
+    expect(text).toContain('Length');
+    expect(text).toContain('4:26');
+    expect(container.querySelector('.dlc-compare-diff')?.textContent).toBe('13:04');
+  });
+
+  it('leaves the length out when either side is unknown, and a near match unlit', () => {
+    const unknown = render(
+      <AdlQuarantineRow
+        entry={entry({ expected_length_s: 266, actual_length_s: null })}
+        open
+        onToggle={vi.fn()}
+        handlers={handlers()}
+      />,
+    );
+    expect(unknown.container.querySelector('.dlc-compare')?.textContent).not.toContain('Length');
+    unknown.unmount();
+    const close = render(
+      <AdlQuarantineRow
+        entry={entry({ expected_length_s: 266, actual_length_s: 270 })}
+        open
+        onToggle={vi.fn()}
+        handlers={handlers()}
+      />,
+    );
+    expect(close.container.querySelector('.dlc-compare-diff')).toBeNull();
   });
 });
 

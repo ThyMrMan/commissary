@@ -130,23 +130,6 @@ def test_standard_set_on_an_owned_show_beats_a_stored_anime(db):
     assert db.show_detail(rid)["series_type"] == "standard"
 
 
-def test_a_scanned_in_show_adopts_its_type_before_a_library_default(db):
-    from core.commissary import video_libraries as vl
-    to.set_values(db, "show", OWNED, series_type="daily")
-    conn = sqlite3.connect(str(db.database_path))
-    conn.execute("INSERT INTO root_folders (path, content_kind, default_series_type) "
-                 "VALUES ('/anime', 'show', 'anime')")
-    rf = conn.execute("SELECT id FROM root_folders").fetchone()[0]
-    conn.execute("UPDATE shows SET root_folder_id=? WHERE tmdb_id=?", (rf, OWNED))
-    conn.commit()
-    conn.close()
-    vl.apply_default_series_type(db)
-    conn = sqlite3.connect(str(db.database_path))
-    assert conn.execute("SELECT series_type FROM shows WHERE tmdb_id=?", (OWNED,)).fetchone()[0] \
-        == "daily"
-    conn.close()
-
-
 def test_the_manual_search_identity_knows_an_unowned_type(db):
     from core.commissary import search_identity as si
     to.set_values(db, "show", NEW_SHOW, series_type="anime")

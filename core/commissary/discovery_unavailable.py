@@ -164,7 +164,10 @@ def mark(state: Dict[str, Any], platform: str, identifier: str, track_index: int
 def register(app) -> None:
     from flask import jsonify, request
 
+    from core.permissions import requires
+
     @app.route("/api/commissary/discovery/unavailable", methods=["POST"])
+    @requires("music.playlist_sync")   # as upstream's Fix routes
     def commissary_discovery_unavailable():
         data = request.get_json(silent=True) or {}
         identifier = str(data.get("identifier") or "")

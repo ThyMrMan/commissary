@@ -127,7 +127,9 @@ def test_approve_makes_rows_downloadable_and_tells_the_requester(asker, notes):
     album = next(g for g in _pending_for(admin, pid) if g['kind'] == 'album')
     r = admin.post('/api/requests/music/approve', json={'profile_id': pid, 'key': album['key']})
     assert r.get_json()['approved'] == 2
-    approved = {t['spotify_track_id'] for t in db.get_wishlist_tracks(profile_id=pid, approved_only=True)}
+    # this branch keys every row <track>::<album> (core/wishlist/identity.py)
+    approved = {t['spotify_track_id'].split('::')[0]
+                for t in db.get_wishlist_tracks(profile_id=pid, approved_only=True)}
     assert approved == {f'{tag}a', f'{tag}b'}
     assert [g['kind'] for g in _pending_for(admin, pid)] == ['track']
     assert any(p == pid and 'approved' in m for p, k, m in notes)
@@ -150,6 +152,23 @@ def test_decline_removes_and_ignore_lists_the_rows(asker, notes):
     hist = db.list_music_requests(profile_id=pid, status='declined')
     assert hist and hist[0]['admin_response'] == 'not on this server'
     assert any(p == pid and 'not on this server' in m for p, k, m in notes)
+
+
+def test_decline_drops_the_wish_so_it_never_comes_back_approved(asker, notes, monkeypatch):
+    """second v2 review (W1): decline removed the rows but left the lib2
+    wanted rule. the hourly reconcile re-added the track once the ignore aged
+    out, and for a profile with its own library the mirror filed it approved:
+    it downloaded. the release runs for the requester's profile"""
+    pid, tag = asker
+    released = []
+    monkeypatch.setattr("core.library2.monitor_sync.sync_wishlist_removal",
+                        lambda _db, _cfg, descriptors, profile_id=1: released.append(
+                            (profile_id, sorted(d['spotify_track_id'].split('::')[0] for d in descriptors))))
+    admin = _client_as(1)
+    single = next(g for g in _pending_for(admin, pid) if g['kind'] == 'track')
+    assert admin.post('/api/requests/music/decline',
+                      json={'profile_id': pid, 'key': single['key']}).get_json()['success']
+    assert released == [(pid, [f'{tag}s'])]
 
 
 def test_member_can_withdraw_a_waiting_request(asker):

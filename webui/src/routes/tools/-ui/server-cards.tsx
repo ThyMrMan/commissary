@@ -260,6 +260,7 @@ export function MediaScanCard() {
   return (
     <ToolCard
       id="media-scan-card"
+      icon="server"
       title="Media Server Scan"
       helpTool="media-scan"
       hidden={server !== 'plex'}
@@ -281,7 +282,6 @@ export function MediaScanCard() {
           disabled={busy}
           onClick={() => void onClick()}
         >
-          <span className="scan-icon">&#128225;</span>
           <span className="scan-text">Scan Library</span>
         </button>
       }
@@ -302,9 +302,9 @@ export function MediaScanCard() {
 // ── Metadata Updater (Plex + Jellyfin) ───────────────────────────────────────
 
 const JELLYFIN_DESCRIPTION =
-  'Download and upload high-quality artist images from Spotify to your Jellyfin server for artists without photos.';
+  'HD artist photos and backgrounds from fanart.tv, TheAudioDB and Deezer, plus genres, for Jellyfin artists missing them.';
 const PLEX_DESCRIPTION =
-  'Download and upload high-quality artist images from Spotify to your Plex server for artists without photos.';
+  'HD artist photos and backgrounds from fanart.tv, TheAudioDB and Deezer, plus genres, album art and biographies, for Plex artists missing them.';
 const DEFAULT_DESCRIPTION = 'Updates artist photos, genres, and album art from Spotify.';
 
 export function MetadataUpdaterCard() {
@@ -398,6 +398,7 @@ export function MetadataUpdaterCard() {
   return (
     <ToolCard
       id="metadata-updater-card"
+      icon="sparkle"
       title={serverName ? `${serverName} Metadata Updater` : 'Metadata Updater'}
       helpTool="metadata-updater"
       hidden={server !== null && server !== 'plex' && server !== 'jellyfin'}
@@ -539,6 +540,7 @@ export function BackupManagerCard() {
   return (
     <ToolCard
       id="backup-manager-card"
+      icon="backup"
       title="Backup Manager"
       helpTool="backup-manager"
       info="Create, download, restore and manage database backups"
@@ -585,9 +587,9 @@ export function BackupManagerCard() {
                   className="backup-dl-btn"
                   href={backupDownloadUrl(backup.filename)}
                   download={backup.filename}
-                  title="Download"
+                  title="Download this backup"
                 >
-                  DL
+                  Download
                 </a>
                 <button
                   type="button"
@@ -600,10 +602,10 @@ export function BackupManagerCard() {
                 <button
                   type="button"
                   className="backup-delete-btn"
-                  title="Delete"
+                  title="Delete this backup"
                   onClick={() => void onDelete(backup.filename)}
                 >
-                  Del
+                  Delete
                 </button>
               </div>
             </div>

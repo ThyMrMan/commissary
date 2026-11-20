@@ -27,9 +27,6 @@ from datetime import datetime
 
 from utils.logging_config import get_logger
 
-# Commissary: records which video Library each scanned movie/show is in.
-from core.commissary.video_libraries import ScanTracker as _VlibTracker
-
 logger = get_logger("video_scanner")
 
 VALID_MODES = ("incremental", "full", "deep")
@@ -224,8 +221,7 @@ class VideoLibraryScanner:
             if do_movies:
                 self._set(phase="scanning movies", total=total, percent=pct())
                 consec = 0
-                _vlib_movies = _VlibTracker()  # Commissary: record each item's library
-                for item in _vlib_movies.track(source.iter_movies(incremental=incremental, since=since)):
+                for item in source.iter_movies(incremental=incremental, since=since):
                     if self._cancel:
                         return self._finish_cancelled(movies, 0, 0)
                     sid = str(item["server_id"])
@@ -257,7 +253,6 @@ class VideoLibraryScanner:
                     if movies % 10 == 0:
                         self._set(movies=movies, percent=pct())
                 self._set(movies=movies, percent=pct())
-                _vlib_movies.stamp(self.db, server, "movie")  # Commissary
                 # Prune ONLY on a deep scan, and only when we actually saw items —
                 # so a transient empty response can never wipe the library. The prune
                 # runs AFTER the bar fills, and a big cleanup (many orphaned rows +
@@ -276,8 +271,7 @@ class VideoLibraryScanner:
             if do_shows:
                 self._set(phase="scanning shows")
                 consec = 0
-                _vlib_shows = _VlibTracker()  # Commissary: record each item's library
-                for show in _vlib_shows.track(source.iter_shows(incremental=incremental, since=since)):
+                for show in source.iter_shows(incremental=incremental, since=since):
                     if self._cancel:
                         return self._finish_cancelled(movies, shows, episodes)
                     sid = str(show["server_id"])
@@ -307,12 +301,28 @@ class VideoLibraryScanner:
                     episodes += sum(len(s.get("episodes", [])) for s in show.get("seasons", []))
                     processed += 1
                     self._set(shows=shows, episodes=episodes, percent=pct())
-                _vlib_shows.stamp(self.db, server, "show")  # Commissary
                 # Final prune (the one that delays "done" on a deep scan) — show it.
                 if do_prune and seen_shows:
                     self._set(phase="cleaning up removed shows", percent=100)
                 removed_s = (self.db.prune_missing("shows", server, seen_shows)
                              if do_prune and seen_shows else 0)
+                # Commissary: a series type chosen before a show was owned becomes its own
+                from core.commissary.title_overrides import adopt_after_scan
+                adopt_after_scan(self.db)
+
+            # Profiles linked to their own Plex account get their own watch state
+            # (#1941): the scan above read the server account's. Same libraries,
+            # same window: an incremental reads what was viewed since the last
+            # scan, anything else reads it all.
+            if server == "plex":
+                self._set(phase="reading members' watch state")
+                try:
+                    from core.video.member_watch import sync_member_watch_state
+                    sync_member_watch_state(self.db, source,
+                                            since=since if incremental else None,
+                                            media_type=media_type)
+                except Exception:   # noqa: BLE001 - never fails the scan itself
+                    logger.exception("video scan: member watch state pass failed")
 
             # Record the scan baseline (its START time, so a change made mid-scan is
             # caught next run) — the next incremental deltas from here. Only when the
@@ -324,6 +334,13 @@ class VideoLibraryScanner:
                 except Exception:
                     logger.debug("video scan: could not persist last-scan baseline", exc_info=True)
 
+            # which video library (#2029) each title's files sit in, by folder
+            try:
+                from core.video.libraries import attribute_files
+                attribute_files(self.db)
+            except Exception:   # noqa: BLE001 - never fails the scan itself
+                logger.exception("video scan: library attribution failed")
+
             self._set(state="done", phase="complete", finished_at=time.time(),
                       movies=movies, shows=shows, episodes=episodes, percent=100,
                       removed=removed_m + removed_s)
@@ -333,6 +350,15 @@ class VideoLibraryScanner:
             logger.exception("Video library scan failed")
             self._set(state="error", phase="failed", error=str(e))
         finally:
+            # the library manager's summed-up rows describe the library the
+            # scan just changed underneath them
+            try:
+                from core.video import library_manager
+                # the old rows keep answering while each side is summed again
+                # in the background: the open page never waits on a cold build
+                library_manager.expire()
+            except Exception:   # noqa: BLE001 - a stale page is not a failed scan
+                logger.debug("library manager not told about the scan", exc_info=True)
             if paused:
                 self._resume_after_scan()
 

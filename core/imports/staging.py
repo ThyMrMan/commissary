@@ -114,12 +114,17 @@ def available_import_sources() -> List[Dict[str, Any]]:
     return out
 
 
-def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -> Dict[str, Any]:
-    """Read common audio tag metadata from a staging file."""
-    try:
-        from mutagen import File as MutagenFile
+def read_staging_file_metadata(file_path: str, filename: Optional[str] = None, *, filename_fallback: bool = True) -> Dict[str, Any]:
+    """Read common audio tag metadata from a staging file.
 
-        tags = MutagenFile(file_path, easy=True)
+    Disable filename_fallback when the caller must distinguish embedded values
+    from guesses before merging them with request/filename metadata.
+    """
+    try:
+        # AIFF/WAV carry raw ID3 the easy view can't map (#1919)
+        from core.metadata.easy_tags import open_easy
+
+        tags = open_easy(file_path)
     except Exception:
         tags = None
 
@@ -147,7 +152,7 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
     albumartist = _first_tag("albumartist")
     album = _first_tag("album")
 
-    if not title:
+    if not title and filename_fallback:
         title = stem
     if not albumartist:
         albumartist = artist
@@ -158,7 +163,7 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
     # will then fall through to authoritative metadata (track_info from
     # the original Spotify / API source) rather than locking the import
     # to track_number=1 for every file in the bundle.
-    track_number = extract_explicit_track_number(filename or file_path)
+    track_number = extract_explicit_track_number(filename or file_path) if filename_fallback else 0
     try:
         tag_track_number = _first_tag("tracknumber", "track_number")
         if tag_track_number:
@@ -168,7 +173,7 @@ def read_staging_file_metadata(file_path: str, filename: Optional[str] = None) -
     except (TypeError, ValueError):
         pass
 
-    disc_number = 1
+    disc_number = 1 if filename_fallback else 0
     try:
         tag_disc_number = _first_tag("discnumber", "disc_number")
         if tag_disc_number:
@@ -441,9 +446,9 @@ def _normalize_track_result(track: Any, source: str) -> Dict[str, Any]:
 
 def _read_staging_audio_tags(file_path: str) -> Tuple[Optional[str], Optional[str]]:
     try:
-        from mutagen import File as MutagenFile
+        from core.metadata.easy_tags import open_easy
 
-        tags = MutagenFile(file_path, easy=True)
+        tags = open_easy(file_path)
         if not tags:
             return None, None
 
@@ -537,6 +542,22 @@ def search_import_albums(query: str, limit: int = 12, source_override: Optional[
             break
 
     return results[:limit]
+
+
+def lookup_import_album_link(query: str) -> Optional[Dict[str, Any]]:
+    """A pasted release link or MBID, looked up by id (#2203).
+
+    None for ordinary text. Else ``{"source", "albums", "message"}`` with the
+    albums in the search's own shape, so the matcher shows the release as a
+    candidate like any other."""
+    from core.imports.album_link import lookup_album_link
+
+    found = lookup_album_link(query, client_for=get_client_for_source)
+    if found is None:
+        return None
+    source = found["source"]
+    found["albums"] = [_normalize_album_result(album, source) for album in found["albums"]]
+    return found
 
 
 def search_import_tracks(query: str, limit: int = 30) -> List[Dict[str, Any]]:

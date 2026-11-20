@@ -1,288 +1,303 @@
-"""Dead File Cleaner Job — finds DB track entries where the file no longer exists."""
+"""Dead File Cleaner — native Library-v2 missing-lifecycle review."""
+
+from __future__ import annotations
 
 import os
 
-from core.library.path_resolver import resolve_library_file_path
 from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob
+from core.repair_jobs.base import JobContext, JobResult, RepairJob, scoped_file_subjects
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.dead_files")
 
-
-def _active_media_server(config_manager) -> str:
-    if not config_manager:
-        return 'unknown'
-    try:
-        getter = getattr(config_manager, 'get_active_media_server', None)
-        if callable(getter):
-            return getter() or 'unknown'
-        return config_manager.get('active_media_server', 'unknown') or 'unknown'
-    except Exception:
-        return 'unknown'
+# files per rescan call: Stop / Pause are honoured between them
+_CHUNK = 500
+# 3.6.1's guard: from this many files on, half of them unreachable at once is
+# a mount or path-mapping problem, not that many deleted files
+_GUARD_MIN_FILES = 25
+_GUARD_SHARE = 0.5
 
 
-def _path_mapping_hint(config_manager) -> str:
-    active = _active_media_server(config_manager)
-    if str(active).lower() == 'navidrome':
-        return (
-            'Active media server: navidrome. In Navidrome, open Profile → Players → '
-            'SoulSync and enable "Report Real Path", then run a full database refresh. '
-            'Also confirm Settings → Library → Music Paths contains the path SoulSync can read.'
+UNREACHABLE_TYPE = "library_unreachable"
+
+
+def _file_unreachable_finding(context, *, missing: int, checked: int, sample) -> None:
+    """one finding that asks the question the guard can't answer: a dropped
+    mount, or files deleted on purpose? (#2005: someone who emptied their
+    library had no way to say so, and it never cleared.)"""
+    if not context.create_finding:
+        return
+    context.create_finding(
+        job_id="dead_file_cleaner",
+        finding_type=UNREACHABLE_TYPE,
+        severity="warning",
+        entity_type="library",
+        entity_id="unreachable",
+        file_path=None,
+        title=f"{missing} of {checked} files can't be reached",
+        description=(
+            "This many files missing at once is usually a disconnected drive or "
+            "a path mapping, so nothing was marked missing. If you deleted them, "
+            "say so here and they are cleared."
+        ),
+        # counts move from run to run; they are not what the finding is about
+        details={"outage": {"unreachable": missing, "checked": checked,
+                            "example_path": sample}},
+    )
+
+
+def file_dead_findings(create_finding, subjects, check_stop=None):
+    """A Dead Files finding for each confirmed-missing file. Returns
+    ``(created, already_listed)``."""
+    from core.library2.maintenance_subjects import subject_details
+
+    created = skipped = 0
+    for subject in subjects:
+        if check_stop and check_stop():
+            break
+        details = {
+            "track_id": subject["track_id"],
+            "artist_id": subject.get("artist_id"),
+            "title": subject.get("title"),
+            "artist": subject.get("artist_name"),
+            "album": subject.get("album_title"),
+            "original_path": subject.get("path"),
+            "album_thumb_url": subject.get("album_image"),
+            "artist_thumb_url": subject.get("artist_image"),
+        }
+        details.update(subject_details(subject))
+        inserted = create_finding(
+            job_id="dead_file_cleaner",
+            finding_type="dead_file",
+            severity="warning",
+            entity_type="track",
+            entity_id=f"lib2:{subject['track_id']}",
+            file_path=subject.get("path"),
+            title=f"Missing file: {subject.get('title') or 'Unknown'}",
+            description=(
+                f'"{subject.get("title") or "Unknown"}" by '
+                f'{subject.get("artist_name") or "Unknown"} was missing '
+                "during two healthy storage scans."
+            ),
+            details=details,
         )
-    return (
-        f'Active media server: {active}. Check Docker volume mapping and '
-        'Settings → Library → Music Paths.'
-    )
+        if inserted:
+            created += 1
+        else:
+            skipped += 1
+    return created, skipped
 
 
-def _resolve_file_path(file_path, transfer_folder, download_folder=None, config_manager=None):
-    """Backwards-compat wrapper. Use ``resolve_library_file_path`` directly."""
-    return resolve_library_file_path(
-        file_path,
-        transfer_folder=transfer_folder,
-        download_folder=download_folder,
-        config_manager=config_manager,
-    )
+def confirm_unreachable_gone(db, config_manager, create_finding) -> dict:
+    """The person's answer to an unreachable-library finding: the files are
+    gone. Every file that still can't be reached is confirmed missing and
+    listed under Dead Files. A file that is back is left alone."""
+    from core.library2.maintenance_subjects import active_file_subjects
+    from core.library2.paths import resolve_lib2_path
+    from core.library2.scan import rescan_files
+
+    def _gone(subject) -> bool:
+        path = subject.get("path")
+        resolved = resolve_lib2_path(path, config_manager=config_manager) if path else None
+        return not resolved or not os.path.exists(resolved)
+
+    waiting = [s for s in active_file_subjects(db, config_manager, include_missing=True)
+               if (s.get("file_state") or "active") in ("active", "missing_suspected")
+               and _gone(s)]
+    if not waiting:
+        return {"success": False,
+                "error": "Every file can be reached now, so there is nothing to clear. "
+                         "Dismiss this or run Dead File Cleaner again."}
+    file_ids = [int(s["file_id"]) for s in waiting]
+    confirmed = released = 0
+    for start in range(0, len(file_ids), _CHUNK):
+        stats = rescan_files(db, file_ids=file_ids[start:start + _CHUNK],
+                             confirmed_gone=True, source="dead_file_cleaner")
+        confirmed += int(stats.get("missing_confirmed") or 0)
+        released += int(stats.get("released") or 0)
+    wanted = set(file_ids)
+    dead = [s for s in active_file_subjects(db, config_manager, include_missing=True)
+            if s.get("file_state") == "missing_confirmed" and int(s["file_id"]) in wanted]
+    file_dead_findings(create_finding, dead)
+    noun = "file" if confirmed == 1 else "files"
+    message = (f"{confirmed} {noun} marked missing. They are under Dead Files, "
+               f"to download again or remove.")
+    if released:
+        message += f" {released} track{'s are' if released != 1 else ' is'} no longer wanted."
+    logger.info("Dead file cleaner: %d files confirmed gone by hand (%d of %d asked)",
+                confirmed, len(dead), len(file_ids))
+    return {"success": True, "action": "confirmed_missing", "message": message,
+            "confirmed": confirmed}
+
+
+def _unreachable_report(context, *, missing: int, checked: int, deferred: int,
+                        before: list) -> str:
+    """Say why a run with most of the library out of reach found nothing,
+    the way 3.6.1 did: how many, one example path, and what to check. The
+    scan itself already holds off on marking any of them missing."""
+    from core.library2.paths import resolve_lib2_path
+    from core.repair_worker import _path_mapping_hint
+
+    sample = None
+    for subject in before[:200]:
+        path = subject.get("path")
+        if path and not resolve_lib2_path(path, config_manager=context.config_manager):
+            sample = path
+            break
+    hint = _path_mapping_hint(context.config_manager)
+    reason = (f"{missing} of {checked} files point to paths SoulSync can't reach, which is "
+              f"almost always a path-mapping or mount problem, not deleted files. Nothing was "
+              f"marked missing. Example path: {sample or 'unknown'}. {hint}")
+    logger.error("Dead file scan: %s (%d deferred as a storage outage)", reason, deferred)
+    if context.report_progress:
+        context.report_progress(phase="Stopped: too many unreachable paths",
+                                log_line=reason, log_type="error")
+    _file_unreachable_finding(context, missing=missing, checked=checked, sample=sample)
+    return reason
+
+
+def _count_unreachable(context: JobContext, subjects: list):
+    """how many of these files can't be reached, read only (no state is
+    written). None when the run was stopped while looking."""
+    from core.library2.paths import resolve_lib2_path
+    unreachable = 0
+    for index, subject in enumerate(subjects):
+        if index % 500 == 0 and (context.check_stop() or context.wait_if_paused()):
+            return None
+        path = subject.get("path")
+        resolved = resolve_lib2_path(path, config_manager=context.config_manager) if path else None
+        if not resolved or not os.path.exists(resolved):
+            unreachable += 1
+    return unreachable
 
 
 @register_job
 class DeadFileCleanerJob(RepairJob):
-    job_id = 'dead_file_cleaner'
-    display_name = 'Dead File Cleaner'
-    description = 'Finds database entries pointing to missing files'
+    job_id = "dead_file_cleaner"
+    display_name = "Dead File Cleaner"
+    description = "Confirms indexed files that are no longer reachable"
     help_text = (
-        'Checks every track in your database to verify the actual audio file still exists '
-        'on disk. If a file has been moved, renamed, or deleted outside of SoulSync, the '
-        'database entry becomes a "dead" reference.\n\n'
-        'Each dead reference is reported as a finding. You can then resolve it by re-downloading '
-        'the track or dismiss it to clean up the database entry.\n\n'
-        'This job only scans and reports — it never deletes database entries automatically.'
+        "Runs the Library's storage-health-aware file scan. The first healthy "
+        "miss is recorded as 'checking missing'; only a second consecutive "
+        "healthy miss creates a review finding. An unavailable storage root "
+        "never creates a destructive finding. Approve a finding to remove the "
+        "stale file reference or re-queue a monitored track."
     )
-    icon = 'repair-icon-deadfile'
+    icon = "repair-icon-deadfile"
     default_enabled = True
     default_interval_hours = 24
-    default_settings = {
-        # Mass-false-positive guard: if at least this fraction of tracks resolve
-        # to no file on disk, treat it as a path-mapping/mount problem (SoulSync
-        # can't SEE the library — e.g. Docker, or library.music_paths unset for
-        # this environment) rather than thousands of individually-deleted files,
-        # and abort without creating findings. Mirrors the transfer-folder abort.
-        'max_unresolved_fraction': 0.5,
-        # ...but only once the library is at least this big — a small library can
-        # legitimately have a high dead fraction.
-        'min_tracks_for_guard': 25,
-    }
+    # 3.6.1's guard settings: from this many files on, this share unreachable
+    # at once is a mount or mapping problem
+    default_settings = {'max_unresolved_fraction': _GUARD_SHARE,
+                        'min_tracks_for_guard': _GUARD_MIN_FILES}
     auto_fix = False
+    supports_file_scope = True
 
-    def _setting_float(self, context: JobContext, key: str, default: float) -> float:
-        """A float setting. The Tools page saves job settings as one dict under
-        ``repair.jobs.<id>.settings``; this job used to read only the flat
-        ``repair.jobs.<id>.<key>``, so a value set in the UI never applied.
-        Both are read, the dict first."""
-        cm = getattr(context, 'config_manager', None)
-        if cm is None:
-            return default
-        saved = cm.get(self.get_config_key('settings'), {})
-        value = saved.get(key) if isinstance(saved, dict) else None
-        if value is None:
-            value = cm.get(self.get_config_key(key), None)
+    def _guard_settings(self, context: JobContext):
+        """The saved guard values, the 3.6.1 defaults when absent or garbage."""
+        saved = {}
         try:
-            return default if value is None else float(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _setting_int(self, context: JobContext, key: str, default: int) -> int:
-        """An int setting — same dict-first lookup as :meth:`_setting_float`."""
-        cm = getattr(context, 'config_manager', None)
-        if cm is None:
-            return default
-        saved = cm.get(self.get_config_key('settings'), {})
-        value = saved.get(key) if isinstance(saved, dict) else None
-        if value is None:
-            value = cm.get(self.get_config_key(key), None)
+            raw = context.config_manager.get(self.get_config_key('settings'), {}) \
+                if context.config_manager else {}
+            saved = raw if isinstance(raw, dict) else {}
+        except Exception as e:  # noqa: BLE001
+            logger.debug("dead file cleaner settings not read: %s", e)
         try:
-            return default if value is None else int(value)
+            share = float(saved.get('max_unresolved_fraction', _GUARD_SHARE))
+            share = share if 0 < share <= 1 else _GUARD_SHARE
         except (TypeError, ValueError):
-            return default
+            share = _GUARD_SHARE
+        try:
+            minimum = int(saved.get('min_tracks_for_guard', _GUARD_MIN_FILES))
+            minimum = minimum if minimum >= 0 else _GUARD_MIN_FILES
+        except (TypeError, ValueError):
+            minimum = _GUARD_MIN_FILES
+        return share, minimum
 
     def scan(self, context: JobContext) -> JobResult:
         result = JobResult()
-
-        # Safety: abort if transfer folder doesn't exist — prevents mass false positives
-        if not context.transfer_folder or not os.path.isdir(context.transfer_folder):
-            logger.error("Transfer folder not found: %s — aborting dead file scan to avoid false positives",
-                         context.transfer_folder)
-            result.errors += 1
-            if context.report_progress:
-                context.report_progress(
-                    phase='Aborted — transfer folder not found',
-                    log_line=f'Transfer folder does not exist: {context.transfer_folder}',
-                    log_type='error'
-                )
-            return result
-
-        # Fetch all tracks with file paths, joining to get artist/album names
-        tracks = []
-        conn = None
         try:
-            conn = context.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT t.id, t.title, ar.name, al.title, t.file_path,
-                       al.thumb_url, ar.thumb_url, ar.id
-                FROM tracks t
-                LEFT JOIN artists ar ON ar.id = t.artist_id
-                LEFT JOIN albums al ON al.id = t.album_id
-                WHERE t.file_path IS NOT NULL AND t.file_path != ''
-            """)
-            tracks = cursor.fetchall()
-        except Exception as e:
-            logger.error("Error fetching tracks from DB: %s", e, exc_info=True)
+            from core.library2.maintenance_subjects import active_file_subjects
+            from core.library2.scan import rescan_files
+
+            before = scoped_file_subjects(context, active_file_subjects(
+                context.db, context.config_manager, include_missing=True,
+            ))
+            if not before:
+                return result
+            file_ids = [int(subject["file_id"]) for subject in before]
+            # in chunks, so Stop and Pause work and the run shows progress, as
+            # 3.6.1's did: one rescan_files call over the whole library ran to
+            # the end with neither, however long it took
+            total_files = len(file_ids)
+            if context.report_progress:
+                context.report_progress(phase=f'Checking {total_files} files...', total=total_files)
+            # 3.6.1's guard, before anything is written: look first (read
+            # only), and stop when too much of the set is out of reach. the
+            # rescan below marks files missing as it goes, so a guard after
+            # it only described what had already happened
+            # (only files live now: one already marked missing is a known
+            # miss waiting for review, not a sign of an outage)
+            share, minimum = self._guard_settings(context)
+            live = [s for s in before
+                    if (s.get("file_state") or "active") == "active"]
+            unreachable = _count_unreachable(context, live)
+            if unreachable is None:
+                return result
+            if len(live) >= minimum and live and unreachable >= len(live) * share:
+                result.stopped_early = _unreachable_report(
+                    context, missing=unreachable, checked=len(live), deferred=0, before=live)
+                return result
+            missing = deferred = 0
+            for start in range(0, total_files, _CHUNK):
+                if context.check_stop() or context.wait_if_paused():
+                    return result
+                scan = rescan_files(context.db, file_ids=file_ids[start:start + _CHUNK])
+                result.scanned += int(scan.get("scanned") or 0)
+                missing += int(scan.get("missing") or 0)
+                deferred += int(scan.get("mass_missing_deferred") or 0)
+                done = min(start + _CHUNK, total_files)
+                if context.update_progress:
+                    context.update_progress(done, total_files)
+                if context.report_progress:
+                    context.report_progress(scanned=done, total=total_files)
+            checked = result.scanned + missing
+            # the scan's own storage-outage deferral (its writes held back)
+            if deferred:
+                result.stopped_early = _unreachable_report(
+                    context, missing=missing, checked=checked, deferred=deferred, before=before)
+                # 3.6.1: a run that tripped the guard files nothing. files a
+                # healthy run confirmed missing earlier wait for the next one,
+                # so a review never opens while the library is out of reach
+                return result
+            after = scoped_file_subjects(context, active_file_subjects(
+                context.db, context.config_manager, include_missing=True,
+            ))
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Native dead-file scan failed: %s", exc, exc_info=True)
             result.errors += 1
             return result
-        finally:
-            if conn:
-                conn.close()
 
-        total = len(tracks)
-        if context.update_progress:
-            context.update_progress(0, total)
-
-        # Get download folder for path resolution fallback
-        download_folder = None
-        if context.config_manager:
-            download_folder = context.config_manager.get('soulseek.download_path', '')
-
-        # Mass-false-positive guard thresholds (see default_settings).
-        # The Tools page saves these as one dict under
-        # repair.jobs.dead_file_cleaner.settings (dict first, flat key fallback).
-        max_unresolved_fraction = self._setting_float(
-            context, 'max_unresolved_fraction', 0.5)
-        min_tracks_for_guard = self._setting_int(
-            context, 'min_tracks_for_guard', 25)
-
-        if context.report_progress:
-            context.report_progress(phase=f'Checking {total} tracks...', total=total)
-
-        # Collect unresolvable tracks first; decide whether they're genuine dead
-        # files or a systemic path problem AFTER the full pass (below). A "None"
-        # from the resolver means "couldn't find it at any known base dir" — which
-        # for a mis-mounted library is EVERY track, not a real deletion.
-        dead_rows = []
-
-        for i, row in enumerate(tracks):
-            if context.check_stop():
-                return result
-            if i % 200 == 0 and context.wait_if_paused():
-                return result
-
-            track_id, title, artist_name, album_title, file_path, album_thumb, artist_thumb, artist_id = row
-            result.scanned += 1
-
-            if context.report_progress and i % 50 == 0:
-                context.report_progress(
-                    scanned=i + 1, total=total,
-                    phase=f'Checking {i + 1} / {total}',
-                    log_line=f'Checking: {title or "Unknown"} — {artist_name or "Unknown"}',
-                    log_type='info'
-                )
-
-            # Use the same path resolution logic as library playback
-            resolved = _resolve_file_path(file_path, context.transfer_folder, download_folder,
-                                           config_manager=context.config_manager)
-
-            if resolved is None:
-                dead_rows.append(row)
-
-            if context.update_progress and (i + 1) % 100 == 0:
-                context.update_progress(i + 1, total)
-
-        # Mass-false-positive guard: a large fraction of unresolvable paths almost
-        # always means SoulSync can't SEE the library (Docker mount, or
-        # Settings → Library → Music Paths not set for this environment), NOT that
-        # thousands of files were individually deleted. Refuse to flag and say so
-        # — same principle as the transfer-folder abort above. (#828: a Plex-on-
-        # macOS user in Docker had all 5,250 tracks flagged because their stored
-        # /Volumes/... paths don't exist inside the container.)
-        if (dead_rows
-                and result.scanned >= min_tracks_for_guard
-                and len(dead_rows) >= result.scanned * max_unresolved_fraction):
-            sample_path = dead_rows[0][4] if dead_rows and len(dead_rows[0]) > 4 else None
-            hint = _path_mapping_hint(context.config_manager)
-            logger.error(
-                "Dead file scan: %d/%d tracks unresolvable (>= %.0f%%) — aborting without "
-                "creating findings; this is a path-mapping/mount problem, not deleted files. "
-                "Example DB path: %r. %s",
-                len(dead_rows), result.scanned, max_unresolved_fraction * 100, sample_path, hint)
-            result.errors += 1
-            if context.report_progress:
-                context.report_progress(
-                    phase='Aborted — too many unreachable paths',
-                    log_line=(f"{len(dead_rows)} of {result.scanned} tracks point to paths SoulSync "
-                              f"can't reach — almost always a path-mapping issue, not deleted files. "
-                              f"No findings created. Example DB path: {sample_path or 'unknown'}. {hint}"),
-                    log_type='error'
-                )
-            if context.update_progress:
-                context.update_progress(total, total)
-            return result
-
-        # A small fraction unresolvable — treat as genuine dead files and report.
-        for row in dead_rows:
-            track_id, title, artist_name, album_title, file_path, album_thumb, artist_thumb, artist_id = row
-            if context.report_progress:
-                context.report_progress(
-                    log_line=f'Missing: {title or "Unknown"} — {os.path.basename(file_path)}',
-                    log_type='error'
-                )
-            if context.create_finding:
-                try:
-                    inserted = context.create_finding(
-                        job_id=self.job_id,
-                        finding_type='dead_file',
-                        severity='warning',
-                        entity_type='track',
-                        entity_id=str(track_id),
-                        file_path=file_path,
-                        title=f'Missing file: {title or "Unknown"}',
-                        description=f'Track "{title}" by {artist_name or "Unknown"} points to a file that no longer exists',
-                        details={
-                            'track_id': track_id,
-                            'title': title,
-                            'artist': artist_name,
-                            'album': album_title,
-                            'original_path': file_path,
-                            'album_thumb_url': album_thumb or None,
-                            'artist_thumb_url': artist_thumb or None,
-                            'artist_id': artist_id,
-                        }
-                    )
-                    if inserted:
-                        result.findings_created += 1
-                    else:
-                        result.findings_skipped_dedup += 1
-                except Exception as e:
-                    logger.debug("Error creating dead file finding for track %s: %s", track_id, e)
-                    result.errors += 1
-
+        confirmed = [
+            subject for subject in after
+            if subject.get("file_state") == "missing_confirmed"
+        ]
+        total = len(after)
         if context.update_progress:
             context.update_progress(total, total)
-
-        logger.info("Dead file scan: %d tracks checked, %d missing files found",
-                     result.scanned, result.findings_created)
+        if context.create_finding:
+            created, skipped = file_dead_findings(
+                context.create_finding, confirmed, check_stop=context.check_stop)
+            result.findings_created += created
+            result.findings_skipped_dedup += skipped
         return result
 
     def estimate_scope(self, context: JobContext) -> int:
-        conn = None
         try:
-            conn = context.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM tracks WHERE file_path IS NOT NULL AND file_path != ''")
-            row = cursor.fetchone()
-            return row[0] if row else 0
+            from core.library2.maintenance_subjects import active_file_subjects
+
+            return len(scoped_file_subjects(context, active_file_subjects(
+                context.db, context.config_manager, include_missing=True,
+            )))
         except Exception:
             return 0
-        finally:
-            if conn:
-                conn.close()

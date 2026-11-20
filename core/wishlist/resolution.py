@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional
 
@@ -20,7 +21,7 @@ from core.wishlist.removal_guard import (
     explain_refusal,
     may_remove,
 )
-from core.wishlist.service import get_wishlist_service
+from core.wishlist.service import get_wishlist_service, wishlist_rows_for_sweep as _rows_for_sweep
 from database.music_database import get_database
 from utils.logging_config import get_logger
 
@@ -74,7 +75,7 @@ def _all_profile_wishlist_tracks(wishlist_service, database=None,
         ids = [profile["id"] for profile in database.get_all_profiles()]
     wishlist_tracks: List[Dict[str, Any]] = []
     for pid in ids:
-        for row in wishlist_service.get_wishlist_tracks_for_download(profile_id=pid):
+        for row in _rows_for_sweep(wishlist_service, pid):
             row = dict(row)
             row.setdefault("_profile_id", pid)
             wishlist_tracks.append(row)
@@ -111,7 +112,7 @@ def _profiles_owning_path(published_path: Any, database=None) -> List[Any]:
         return []
 
     shared_root: Optional[str] = None
-    owners: List[Any] = []
+    owners: List[Any] = []  # (root length, profile id)
     for profile in profiles:
         pid = profile.get("id") if isinstance(profile, dict) else None
         if pid is None:
@@ -134,8 +135,11 @@ def _profiles_owning_path(published_path: Any, database=None) -> List[Any]:
             except (OSError, ValueError):
                 continue
         if root_n and (path_n == root_n or path_n.startswith(root_n + os.sep)):
-            owners.append(pid)
-    return owners
+            owners.append((len(root_n), pid))
+    # an own folder inside the shared one holds its own files, not everyone's:
+    # the deepest root that contains the path is the library it is in
+    deepest = max((n for n, _pid in owners), default=0)
+    return [pid for n, pid in owners if n == deepest]
 
 
 def _log_removal(event: str, *, quiet: bool = False, **fields: Any) -> None:
@@ -256,6 +260,9 @@ def check_and_remove_from_wishlist(
                     log_prefix="[Wishlist]")
 
         if track_id:
+            if not (batch_id or context.get("batch_id")):
+                _queue_playlist_sync_for_lone_download(
+                    wishlist_service, database, match_profiles, track_id)
             logger.info("[Wishlist] Attempting to remove track from wishlist: %s", track_id)
             removed = wishlist_service.mark_track_download_result(
                 track_id, success=True,
@@ -284,6 +291,37 @@ def check_and_remove_from_wishlist(
     except Exception as exc:
         logger.error("[Wishlist] Error in wishlist removal check: %s", exc)
         return False
+
+
+def _queue_playlist_sync_for_lone_download(wishlist_service, database, profile_ids, track_id) -> None:
+    """A wishlist song grabbed on its own (the wishlist's Search, a manual pick)
+    finishes as a quick download with no batch, and only a batch re-synced its
+    playlist. so a playlist song fetched that way never showed up in the
+    playlist on the media server (#1981). read the row's playlist before it's
+    removed and queue that playlist the way a finished batch does."""
+    try:
+        rows = _all_profile_wishlist_tracks(wishlist_service, database=database,
+                                            profile_ids=profile_ids)
+        wanted = str(track_id)
+        row = next((r for r in rows if wanted in {
+            str(r.get("track_id") or ""), str(r.get("spotify_track_id") or ""),
+            str(r.get("id") or "")}), None)
+        if not row or row.get("source_type") != "playlist":
+            return
+        source_info = row.get("source_info") or {}
+        if isinstance(source_info, str):
+            source_info = json.loads(source_info or "{}")
+        if not isinstance(source_info, dict):
+            return
+        if not (source_info.get("playlist_id") or source_info.get("playlist_name")):
+            return
+        from core.sync.post_download_sync import register_completed_playlist_batch
+        profile_id = int(row.get("_profile_id") or 1)
+        register_completed_playlist_batch({"profile_id": profile_id}, tasks_snapshot={
+            "lone": {"status": "completed", "track_info": {
+                "source_type": "playlist", "source_info": source_info, "profile_id": profile_id}}})
+    except Exception as exc:  # noqa: BLE001 - the download is done, the re-sync is extra
+        logger.debug("[Wishlist] playlist re-sync for a lone download not queued: %s", exc)
 
 
 def _match_by_metadata(wishlist_tracks: List[Dict[str, Any]], track_name: str,

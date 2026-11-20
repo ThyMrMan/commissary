@@ -11,6 +11,8 @@ from flask import Blueprint, jsonify, request
 
 from core.library import deleted_quarantine
 from utils.logging_config import get_logger
+from core.permissions import requires
+from core.profile_context import admin_only
 
 logger = get_logger("api.deleted_files")
 
@@ -41,7 +43,19 @@ def _keep_days() -> float:
 def create_blueprint() -> Blueprint:
     bp = Blueprint('deleted_files', __name__)
 
+
+    @bp.before_request
+    def _admin_manages_this():
+        """Restoring and purging deleted files is the admin's to change (Nov 13 2026). Reading stays open: the
+        pages that show it are not admin pages."""
+        from flask import jsonify as _jsonify, request as _request
+        from core.profile_context import is_admin_request
+        if _request.method in ("POST", "PUT", "PATCH", "DELETE") and not is_admin_request():
+            return _jsonify({"success": False, "error": "Admin access required"}), 403
+        return None
+
     @bp.route('/api/deleted-files', methods=['GET'])
+    @requires("music.access")
     def list_deleted_files():
         try:
             keep_days = _keep_days()
@@ -53,6 +67,7 @@ def create_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": str(e)}), 500
 
     @bp.route('/api/deleted-files/restore', methods=['POST'])
+    @admin_only
     def restore_deleted_files():
         try:
             payload = request.get_json(silent=True) or {}
@@ -67,6 +82,7 @@ def create_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": str(e)}), 500
 
     @bp.route('/api/deleted-files/purge', methods=['POST'])
+    @admin_only
     def purge_deleted_files():
         try:
             payload = request.get_json(silent=True) or {}
@@ -83,6 +99,7 @@ def create_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": str(e)}), 500
 
     @bp.route('/api/deleted-files/retention', methods=['POST'])
+    @admin_only
     def set_deleted_retention():
         try:
             payload = request.get_json(silent=True) or {}

@@ -1,5 +1,6 @@
 registerDocsSection({
     id: 'sync',
+    needs: 'music.playlist_sync',
     title: 'Playlist Sync',
     icon: '🔄',
     pages: [
@@ -10,7 +11,7 @@ registerDocsSection({
             body: `
 The Sync page imports playlists from **Spotify**, **YouTube**, **YouTube Music**, **Tidal**, **Qobuz**, **Deezer**, **Beatport**, **iTunes** links, **ListenBrainz**, and **Last.fm** — as well as **Server Playlists** from your connected media server and track lists from files. Once imported, playlists are **mirrored** — they persist in your SoulSync instance and can be refreshed, discovered, and synced to your wishlist for downloading.
 
-![Playlist sync page](sync-overview.jpg)
+![The Sync page's Mirrored view with the mirrored playlists and source filter chips](sync-overview.jpg)
 
 ## The sync lifecycle
 
@@ -41,7 +42,7 @@ If Spotify is connected, opening the Spotify panel from **+ Add playlist** lists
 - Nothing is imported until you ask: loading the list doesn't create any mirrors
 - **Keep your own copy** (the button on a playlist's cover) puts it in **My Playlists** instead of Mirrored: an editable playlist that never refreshes from the source, so **Sync & download** leaves its songs as they are. Good as a base to build on. The songs remember where they came from, so identifying them stays exact. Offered on the account, link, ListenBrainz and Last.fm tabs; Beatport has its own frozen copy, **Save snapshot**
 
-![Spotify playlists loaded](sync-spotify.jpg)
+![The Spotify tab before sign-in, reporting no playlists found](sync-spotify.jpg)
 
 > [!TIP]
 > Spotify-sourced playlists are auto-discovered at confidence 1.0 during refresh — no separate discovery step needed.
@@ -53,6 +54,8 @@ If Spotify is connected, opening the Spotify panel from **+ Add playlist** lists
             lede: 'Sync any public Spotify playlist or album by URL — no Spotify account or OAuth required.',
             body: `
 Sync Spotify playlists and albums **without OAuth credentials**. Paste any public Spotify playlist or album URL and SoulSync will load the tracks for download. Useful when you don't want to connect a Spotify account, or want to sync from someone else's public playlist.
+
+![The Add a playlist modal with its paste-a-link field for public playlist URLs](sync-spotify-public.jpg)
 
 - Paste any \`open.spotify.com/playlist/...\` or \`open.spotify.com/album/...\` URL
 - Works without Spotify API credentials
@@ -67,7 +70,7 @@ Sync Spotify playlists and albums **without OAuth credentials**. Paste any publi
             body: `
 Paste a YouTube playlist URL into the input field and click **Parse Playlist**. SoulSync extracts the track list, imports it, and opens it under **Mirrored**, where each track is matched to official metadata in the background.
 
-![YouTube playlist import](sync-youtube.jpg)
+![Mirrored playlists filtered to YouTube, showing the Morning Run playlist](sync-youtube.jpg)
 
 > [!WARNING]
 > YouTube titles are often non-standard (e.g. "Artist - Song (Official Video)"). The [discovery pipeline](#sync-discovery) handles most of these, but edge cases may need manual fixes.
@@ -79,6 +82,8 @@ Paste a YouTube playlist URL into the input field and click **Parse Playlist**. 
             lede: 'Load your Tidal playlists once Tidal is authenticated in Settings.',
             body: `
 Requires Tidal authentication in Settings. Once connected, click **Refresh** to list your Tidal playlists, then **Import** the ones you want (or **Import all**). Refresh only lists them; nothing is fetched or mirrored until you import.
+
+![Mirrored playlists filtered to Tidal, showing the Focus Flow playlist](sync-tidal.jpg)
 
 Like YouTube playlists, Tidal playlists go through the [discovery pipeline](#sync-discovery) to match tracks to official metadata before syncing.
 
@@ -92,6 +97,8 @@ Like YouTube playlists, Tidal playlists go through the [discovery pipeline](#syn
             lede: 'Your personal Deezer playlists, loaded with the same ARL token you use for downloads.',
             body: `
 If you have a **Deezer ARL token** configured (Settings → Connections → Sources), the Deezer panel, opened from **+ Add playlist**, lists your personal playlists, working just like Spotify's.
+
+![The Deezer tab asking for an ARL token in Settings before playlists can load](sync-deezer.jpg)
 
 - Requires an ARL token (a browser cookie from deezer.com, configured in Settings → Connections → Sources)
 - **Import** loads the playlist's tracks (a big one takes a while, with progress shown) and opens it under **Mirrored**
@@ -107,6 +114,8 @@ If you have a **Deezer ARL token** configured (Settings → Connections → Sour
             lede: 'Import any public Deezer playlist by URL — no ARL token needed.',
             body: `
 Import any public Deezer playlist by URL without needing an ARL token. Paste a Deezer playlist URL and click **Load Playlist**: SoulSync loads it, imports it and opens it under **Mirrored**.
+
+![The Add a playlist modal with a Deezer playlist URL pasted and recognised](sync-deezer-link.jpg)
 
 - Paste any \`deezer.com/playlist/...\` URL or raw playlist ID
 - Pasting one that's already in opens it instead of loading it again
@@ -124,7 +133,9 @@ If ListenBrainz is configured in Settings, **+ Add playlist** opens a ListenBrai
 - **Collaborative** — playlists shared with you by other users
 - **Created For You** — auto-generated playlists based on your listening history
 
-Each playlist has an **Import** button (or **Open** once it's in), and **Import all** brings in everything not in yet. Importing opens it under **Mirrored**, where it identifies itself in the background. A weekly series (Weekly Jams, Weekly Exploration) is one playlist in SoulSync: importing any week files it under the series, and refreshing it picks up the newest week. **Last.fm Radio** works the same way.
+![Mirrored playlists filtered to ListenBrainz, showing the Weekly Discovery playlist](sync-listenbrainz.jpg)
+
+Each playlist has an **Import** button (or **Open** once it's in), and **Import all** brings in everything not in yet. Importing opens it under **Mirrored**, where it identifies itself in the background. A rolling series (Daily Jams, Weekly Jams, Weekly Exploration) is one playlist in SoulSync: importing any day or week files it under the series, and refreshing it picks up the newest one. **Last.fm Radio** works the same way.
 
 ListenBrainz tracks are matched against Spotify/iTunes using a **4-strategy search**: direct match, swapped artist/title, album-based lookup, and extended fuzzy search. Discovered tracks sync to your library like any other playlist.
 `
@@ -159,7 +170,7 @@ Top 100 and Hype charts with full track listings.
 
 Opening a chart, top 10 or release list imports it into SoulSync and lands you on it under **Mirrored**, where it identifies itself like any other playlist. Opening one that's already in just opens it. A live list (Top 100, Hype 100, a genre's top 10) stays live: refreshing the playlist pulls today's list. To keep today's version as it is, use **⋯ → Save snapshot** in the playlist's window; that saves a copy that never changes.
 
-![Beatport genre browser](sync-beatport.jpg)
+![The Beatport tab with its chart carousel, Top 100 and Hype entries and Top 10 lists](sync-beatport.jpg)
 
 > [!NOTE]
 > Beatport data is cached for 24 hours (not configurable). The system automation **Refresh Beatport Cache** runs every 24 hours to keep content fresh.
@@ -172,8 +183,10 @@ Opening a chart, top 10 or release list imports it into SoulSync and lands you o
             body: `
 Import track lists from **CSV, TSV, M3U/M3U8, or plain text files**, or your playlists from a **NewPipe backup**. Drag and drop a file or click to browse. SoulSync parses the file, lets you preview and map columns, then creates a mirrored playlist for discovery and download.
 
+![The Add a playlist modal's import-from-file option for CSV, TSV, TXT and M3U files](sync-import-file.jpg)
+
 - **CSV/TSV** — auto-detects columns; map Artist, Title, and Album from dropdowns
-- **M3U/M3U8** — read automatically: artist, title, and duration come from \`#EXTINF\` lines (or the file name for simple playlists). Round-trips with SoulSync's own M3U export
+- **M3U/M3U8** — read automatically: artist, title, and duration come from \`#EXTINF\` lines (or the file name for simple playlists). Players disagree on the order of an \`#EXTINF\` line: most write Artist - Title, iTunes writes Title - Artist. SoulSync works out which from the file paths and shows it above the preview as **Lines read as**, where you can turn it round. Round-trips with SoulSync's own M3U export
 - **Text files** — one track per line; choose Artist–Title or Title–Artist order and separator (dash, tab, pipe, etc.)
 - **NewPipe backup** — the ZIP from NewPipe's *Settings → Backup and restore → Export* (or the \`newpipe.db\` inside it). Every local playlist is listed; tick the ones you want and each becomes its own mirrored playlist. Importing a newer backup later **updates** those mirrors instead of adding copies. Bookmarked YouTube playlists are only a link in the backup, so add those from the YouTube tab
 - Preview parsed tracks before importing
@@ -192,7 +205,7 @@ Every playlist you import is **mirrored**. The Mirrored tab is where playlists a
 - Download progress survives page refresh
 - Each profile has its own mirrored playlists
 
-![Mirrored playlist cards](sync-mirror.jpg)
+![The mirrored playlist grid with source-branded cards and live status](sync-mirror.jpg)
 
 ## Where each track stands
 
@@ -210,6 +223,18 @@ Open a playlist and the line under its title says where its tracks are: **in lib
 - **Download Missing Tracks** opens the download window. It shows straight away which songs you have and which are missing, and **Add to Wishlist** only queues the missing ones (turn on **Force Download All** to queue everything). The server playlist picks up the new songs on the next push or sync
 - **Clear & re-identify** in a card's **⋯** menu throws the identification away and opens the window to run it again
 
+## Server playlists
+
+The **Server** tab lists the playlists on your media server. Open one to compare it with the SoulSync playlist that syncs to it: matched, missing and extra tracks side by side, with Find & Add, swap, unmatch, reorder and M3U export. When two source tracks match the same song in your library (a playlist that lists a song twice, or its album and single cuts), the server holds it once, so its count is lower than the source's with nothing missing: those rows are marked **Same song as #N**, and the **Same song** pill shows only them.
+
+On Plex, an admin also gets **Tag in Plex**: it adds a mood (the playlist's name, or one you type) to every song on the playlist, in Plex only, never in your files. Then make a Plex smart playlist on *Mood is <tag>* and add rules on top, like dropping songs rated under three stars and adding ones rated three and up.
+
+**Open editor** is also on a mirrored playlist and on its card in the source tab it came from. For a playlist that hasn't synced yet there is no server playlist to edit, so the editor shows each song next to the library track it will sync as instead. Swap any of them for another version you have (the extended mix over the radio edit), pick one for a song it didn't find, or mark one as *not this one* so the sync downloads it. Your picks are used when you sync.
+
+- **Adopt into My Playlists**: a playlist made on the server instead of in SoulSync offers to be adopted. It becomes one of your playlists under the same name, each track stays paired with the server track it came from (so a sync never drops one it can't match), and syncing it updates that same server playlist
+- Smart playlists, and any playlist the server won't let you edit, are never offered for adoption. The server builds those, so they stay as they are
+- On Jellyfin, a playlist SoulSync makes is private to the account it syncs as. To share one with everyone, open it in Jellyfin and turn on public there: later syncs update it in place and leave that alone. Playlists older versions made are public; change them the same way if you want them private
+
 ## Cover art
 
 Pick **Generate cover art** from a playlist card's **⋯** menu, or the **⋯** inside an open playlist. SoulSync reads the playlist's genres, mood and era from your library (and the playlist's name) and asks [Pollinations](https://pollinations.ai) for an image.
@@ -220,9 +245,34 @@ Pick **Generate cover art** from a playlist card's **⋯** menu, or the **⋯** 
 - **Restore original cover** in the same menu puts the source's own cover back
 - Free with no setup: one image every 45 seconds, with a small Pollinations mark in the corner. A key from enter.pollinations.ai in **Settings → Pollinations** removes both
 
+## Rotating playlists
+
+Some playlists change on their own: a weekly chart, a discovery mix, a Beatport top 100. Turn on **Rotating** in a playlist's **Settings** (the gear inside the playlist, or **Settings** in its **⋯** menu) and SoulSync cleans up after it: a song this playlist downloaded is removed from your library once it leaves the playlist.
+
+- It only touches files this playlist downloaded. Music that was already in your library is never removed
+- A song is kept if it is still in any other playlist you mirror (on any profile), if you played it twice or more, or if anyone on your media server favourited it, rated it or put it in a playlist
+- If SoulSync can't tell (the play count is unknown, the playlist's track list is empty), the song is kept
+- The Settings row shows what it will do before you turn it on: how many downloaded songs have left, how many will be removed, and why the rest stay
+- It runs through the **Expired Download Cleaner** on the Tools page, which turns on with the first rotating playlist. **Dry run** is on by default, so removals show up as findings for you to approve. Turn dry run off there to have files deleted automatically
+- **Rotating keep played** in the cleaner's settings decides whether listening keeps a song. It is on by default. Turn it off and a song that left the playlist is removed however often you played it. Favourites, ratings and other playlists still keep it
+- **Rotating playlist wait** in the cleaner's settings is how long a song must be gone before it is removed. The default is one day, so a sync that came back short can't cost you files
+- Works on mirrored playlists and on **My Playlists**, where removing a song by hand counts as leaving. Request lists and Liked Songs can't be rotating
+- Use **Reconcile** or **Replace** sync mode with Rotating. **Append only** keeps every song in the server playlist, and a song in a server playlist is kept while curation signals are on
+
+## Bootlegs, edits and unofficial remixes
+
+Some tracks are in no catalog: a bootleg, a DJ edit, an unofficial remix. Discovery can't match them, so they wait in the **Wing It Pool**, and picking the original there would download the wrong recording. Turn on **Find uncatalogued tracks** in a playlist's **Settings** and SoulSync looks for them by the playlist's own artist and title instead.
+
+- It searches the same sources your downloads use, on every sync and again whenever the wishlist runs, until the track turns up
+- A file is only taken when its name says it is that exact version: the whole title, the credit in brackets ("MIZE Remix"), and one of the artists. A file that names another version (a different remix, live, slowed, instrumental) is passed over, and so is the original
+- When the playlist gives a length, the file has to be within seven seconds of it
+- The file is tagged from the playlist's text and is not looked up by name afterwards, so a remix is never retagged as the studio release
+- It is off by default and set per playlist. Tracks a catalog does have are matched and downloaded as before
+- A track that isn't found stays in the playlist and in the pool, where **Fix Match** still works
+
 ## Auto-sync schedules
 
-Mirrored playlists can refresh and re-sync on a schedule from the **Bulk schedule** button:
+Mirrored playlists can refresh and re-sync on a schedule from **More → Bulk schedule** in the page header:
 
 - Pick an interval per playlist — from every hour up to weekly (1, 2, 4, 8, 12, 16, 24, 48, 72, or 168 hours)
 - Weekly schedules let you choose specific days
@@ -234,7 +284,9 @@ Mirrored playlists can refresh and re-sync on a schedule from the **Bulk schedul
             title: 'Sync History',
             lede: 'A log of every sync operation — what ran, when, and how it went.',
             body: `
-The **Activity** button in the page header opens a modal with two tabs. **Syncs you ran** shows every playlist sync, album download, and wishlist processing operation with timestamps, track counts, and completion status; **Scheduled runs** covers auto-sync pipeline runs.
+**More → Activity** in the page header opens a modal with two tabs. **Syncs you ran** shows every playlist sync, album download, and wishlist processing operation with timestamps, track counts, and completion status; **Scheduled runs** covers auto-sync pipeline runs.
+
+![The Activity modal's Syncs you ran tab with found, downloaded and failed counts for each run](sync-history.jpg)
 
 - Shows playlist name, source, track count, and completion stats
 - Filter by source (Spotify, YouTube, Tidal, etc.)
@@ -247,6 +299,8 @@ The **Activity** button in the page header opens a modal with two tabs. **Syncs 
             lede: 'Export any mirrored playlist as an M3U file for external players and media servers.',
             body: `
 Export any mirrored playlist as an **M3U file** for use in external media players or media servers. Open **Download Missing** on a playlist and use the **📋 Export as M3U** button in the download-missing modal.
+
+![A mirrored playlist's card menu with the Export option](sync-m3u.jpg)
 
 M3U files reference the actual file paths in your library, so they work with any M3U-compatible player.
 
@@ -264,6 +318,8 @@ M3U files reference the actual file paths in your library, so they work with any
             body: `
 For non-Spotify playlists (YouTube, Tidal, Deezer links, files), tracks need to be **discovered** before syncing. Discovery matches raw titles to official Spotify/iTunes metadata using fuzzy matching with a 0.7 confidence threshold.
 
+![The Wing It Pool: discovery's best-effort guesses linking source tracks to catalogue metadata, held for review before they stick. Late Night Drive has 20 guesses waiting and none resolved yet](sync-discovery.jpg)
+
 ::: steps
 1. Import a playlist (YouTube, Tidal, or any non-Spotify source)
 2. Click **Discover** on the playlist card (or automate it with the "Discover Playlist" action)
@@ -279,10 +335,15 @@ A track identification couldn't find is skipped by a download too. **Download Mi
         },
         {
             id: 'sync-explorer',
+            needs: 'music.explorer',
             title: 'Playlist Explorer',
             lede: 'Browse every playlist across all sources in one visual tree.',
             body: `
 A visual tree-based browser for exploring playlists across all sources. Navigate through your server playlists, Spotify playlists, and mirrored playlists in a unified interface.
+
+It opens from the **Playlists** page: the tree button at the top right, beside Playlist tools. **Playlists** at the top of the explorer takes you back. It has no entry of its own in the sidebar.
+
+![The Playlist Explorer listing every playlist with its track counts per source](sync-explorer.jpg)
 
 Click any playlist to expand and view its tracks, then download or sync directly — without jumping between tabs.
 `

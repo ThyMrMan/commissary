@@ -23,6 +23,7 @@ from core.imports.staging import (
     get_primary_source as _get_primary_source,
     get_primary_source_label as _get_primary_source_label,
     get_staging_path as _get_staging_path,
+    lookup_import_album_link as _lookup_import_album_link,
     read_staging_file_metadata as _read_staging_file_metadata,
     refresh_import_suggestions_cache as _refresh_import_suggestions_cache,
     search_import_albums as _search_import_albums,
@@ -35,9 +36,10 @@ module_logger = get_logger("imports.routes")
 
 
 def _default_read_tags(file_path: str):
-    from mutagen import File as MutagenFile
+    # AIFF/WAV carry raw ID3 the easy view can't map (#1919)
+    from core.metadata.easy_tags import open_easy
 
-    return MutagenFile(file_path, easy=True)
+    return open_easy(file_path)
 
 
 def _get_single_track_import_context(*args, **kwargs):
@@ -130,6 +132,7 @@ class ImportRouteRuntime:
     get_primary_source: Callable[[], str] = _get_primary_source
     get_primary_source_label: Callable[[], str] = _get_primary_source_label
     search_import_albums: Callable[..., list] = _search_import_albums
+    lookup_album_link: Callable[[str], Optional[Dict[str, Any]]] = _lookup_import_album_link
     search_import_tracks: Callable[..., list] = _search_import_tracks
     build_album_import_match_payload: Callable[..., Dict[str, Any]] = build_album_import_match_payload
     resolve_album_artist_context: Callable[..., Any] = resolve_album_artist_context
@@ -815,6 +818,59 @@ def _scanning_history_rows(worker: Any, staging_path: str,
     return kept, problems
 
 
+# The worker's walk of staging, kept with the records scan it belongs to. It
+# lists every folder and reads the tags of loose files; done on every poll, a
+# bulk staging load took longer than the poll interval, polls piled up behind
+# each other and the page timed out (#1955). It is rebuilt off the request
+# thread whenever the records change, and a poll in between gets the last
+# walk. An import (the scan generation moving) never serves the old walk.
+_INBOX_WALK_GRACE_SECONDS = 3.0
+_inbox_walk_lock = threading.Lock()
+_inbox_walk_cache: Dict[str, Any] = {"path": None, "generation": None, "records": None,
+                                      "candidates": None, "problems": None}
+_inbox_walk_jobs: Dict[str, threading.Thread] = {}
+
+
+def _inbox_walk(worker: Any, staging_path: str, records: Any, generation: int):
+    """``(candidates, problems)`` for the inbox, or None while the first walk
+    since the last import is still running (the caller answers "scanning")."""
+    cache = _inbox_walk_cache
+    with _inbox_walk_lock:
+        current = cache["path"] == staging_path and cache["generation"] == generation
+        if current and cache["records"] is records:
+            return cache["candidates"], cache["problems"]
+        job = _inbox_walk_jobs.get(staging_path)
+        if job is None or not job.is_alive():
+            job = threading.Thread(target=_run_inbox_walk, name="inbox-walk", daemon=True,
+                                   args=(worker, staging_path, records, generation))
+            _inbox_walk_jobs[staging_path] = job
+            job.start()
+    # a folder of normal size finishes inside the grace, so the reply is the
+    # folder as it is now; a huge one past it gets the last walk (or, right
+    # after an import, the scanning reply) instead of holding the request
+    job.join(timeout=_INBOX_WALK_GRACE_SECONDS)
+    with _inbox_walk_lock:
+        if cache["path"] == staging_path and cache["generation"] == generation:
+            return cache["candidates"], cache["problems"]
+    return None
+
+
+def _run_inbox_walk(worker: Any, staging_path: str, records: Any, generation: int) -> None:
+    try:
+        if worker is None:
+            from core.auto_import_worker import AutoImportWorker
+            worker = AutoImportWorker.__new__(AutoImportWorker)
+        candidates, problems = worker.enumerate_candidates(staging_path)
+    except Exception as exc:  # noqa: BLE001 - the next poll tries again
+        module_logger.error("Import inbox walk failed: %s", exc)
+        return
+    with _inbox_walk_lock:
+        if _staging_scan_generation["value"] == generation:
+            _inbox_walk_cache.update({"path": staging_path, "generation": generation,
+                                      "records": records, "candidates": candidates,
+                                      "problems": problems})
+
+
 def _scanning_inbox_payload(scanning: Dict[str, Any], staging_path: str,
                             worker: Any) -> Dict[str, Any]:
     """What the inbox can honestly say while the staging scan is still running (#1671).
@@ -925,13 +981,17 @@ def inbox(runtime: ImportRouteRuntime, worker: Any) -> tuple[Dict[str, Any], int
         from core.imports.inbox import build_inbox, summarize
 
         problems = list(_staging_scan_problems)
-        candidates: list = []
         history: list = []
         status: Dict[str, Any] = {}
+        walked = _inbox_walk(worker, staging_path, records, build_generation)
+        if walked is None:
+            return _scanning_inbox_payload(
+                {"success": True, "scanning": True, "staging_path": staging_path,
+                 "progress": {"scanned": 0, "total": 0}}, staging_path, worker), 200
+        candidates, walk_problems = walked
+        seen = {(p["path"], p["error"]) for p in problems}
+        problems.extend(p for p in walk_problems if (p["path"], p["error"]) not in seen)
         if worker is not None:
-            candidates, walk_problems = worker.enumerate_candidates(staging_path)
-            seen = {(p["path"], p["error"]) for p in problems}
-            problems.extend(p for p in walk_problems if (p["path"], p["error"]) not in seen)
             history = worker.get_results(limit=200)
             status = worker.get_status()
             # #1289: a stale terminal row (e.g. 'partial') older than the
@@ -940,11 +1000,6 @@ def inbox(runtime: ImportRouteRuntime, worker: Any) -> tuple[Dict[str, Any], int
             # of retryable 'failed'. Backfill per-candidate lookups for any
             # candidate the window missed.
             history = _backfill_stale_history(worker, candidates, history)
-        else:
-            from core.auto_import_worker import AutoImportWorker
-            bare = AutoImportWorker.__new__(AutoImportWorker)
-            candidates, walk_problems = bare.enumerate_candidates(staging_path)
-            problems.extend(walk_problems)
 
         rows = build_inbox(candidates, records, history, status.get("active_imports") or [],
                            staging_root=staging_path)
@@ -1106,6 +1161,14 @@ def search_albums(runtime: ImportRouteRuntime, query: str, limit: int = 12,
             return {"success": False, "error": "Missing query parameter"}, 400
 
         limit = min(int(limit), 50)
+        # #2203: a pasted release link or MBID is looked up by id, on the
+        # source the link names (the picker doesn't apply to a link)
+        linked = runtime.lookup_album_link(query)
+        if linked is not None:
+            return {"success": True, "albums": linked["albums"][:50],
+                    "primary_source": runtime.get_primary_source_label(),
+                    "source_override": None,
+                    "link": {"source": linked["source"], "message": linked["message"]}}, 200
         source_override = (source or "").strip().lower() or None
         primary_source = runtime.get_primary_source()
         if not source_override and primary_source == "hydrabase" and runtime.hydrabase_worker and runtime.dev_mode_enabled:
@@ -1127,10 +1190,41 @@ def search_sources() -> tuple[Dict[str, Any], int]:
     a live client, the primary one flagged 'active'. Same shape as
     /api/reidentify/sources (core.imports.rematch_search.available_sources)."""
     try:
-        return {"success": True, "sources": _available_import_sources()}, 200
+        sources = _available_import_sources()
+        return {"success": True, "sources": sources,
+                "default_source": import_default_search_source(sources)}, 200
     except Exception as exc:
         module_logger.error("Error listing import search sources: %s", exc)
         return {"success": False, "error": str(exc), "sources": []}, 500
+
+
+DEFAULT_SEARCH_SOURCE_KEY = "import.default_search_source"
+
+
+def import_default_search_source(sources: Optional[list] = None) -> str:
+    """The source the import matcher's picker opens on (#2203): '' is Any
+    source. A saved source that has no live client right now reads as ''
+    too, so the picker never opens on a choice it can't show."""
+    from core.settings import config_manager
+
+    saved = str(config_manager.get(DEFAULT_SEARCH_SOURCE_KEY, "") or "").strip().lower()
+    if not saved:
+        return ""
+    if sources is None:
+        sources = _available_import_sources()
+    return saved if any(s.get("source") == saved for s in sources) else ""
+
+
+def set_import_default_search_source(source: Any) -> tuple[Dict[str, Any], int]:
+    """Save the import matcher's default search source; '' is Any source."""
+    from core.metadata.registry import METADATA_SOURCE_PRIORITY
+    from core.settings import config_manager
+
+    value = str(source or "").strip().lower()
+    if value and value not in METADATA_SOURCE_PRIORITY:
+        return {"success": False, "error": f"Unknown source: {value}"}, 400
+    config_manager.set(DEFAULT_SEARCH_SOURCE_KEY, value)
+    return {"success": True, "default_source": value}, 200
 
 
 def _get_import_db(runtime) -> Any:
@@ -1143,6 +1237,15 @@ def _get_import_db(runtime) -> Any:
         return get_database()
     except Exception as exc:                                # noqa: BLE001
         runtime.logger.debug("[Library Check] database unavailable: %s", exc)
+        return None
+
+
+def _import_profile_id():
+    """The profile a manual import runs for; its library decides ownership."""
+    try:
+        from core.profile_context import get_current_profile_id
+        return get_current_profile_id()
+    except Exception:  # noqa: BLE001 - outside a request: the shared library
         return None
 
 
@@ -1186,6 +1289,7 @@ def _annotate_library_status(runtime: ImportRouteRuntime,
             album_name=resolved_album_name,
             quality_profile=quality_profile,
             quiet=True,  # presentation only; enforcement re-checks and logs
+            profile_id=_import_profile_id(),
         )
     return payload
 
@@ -1423,7 +1527,9 @@ def fingerprint_files(runtime: ImportRouteRuntime, file_paths: list,
             client = client_factory()
         except Exception as exc:  # noqa: BLE001
             return {"success": False, "error": f"AcoustID is not available: {exc}"}, 503
-        available, reason = client.is_available()
+        # a button someone pressed: the download verification setting is not
+        # about this (#2042)
+        available, reason = getattr(client, 'can_fingerprint', client.is_available)()
         if not available:
             return {"success": False, "error": reason or "AcoustID is not set up", "code": "acoustid_unavailable"}, 503
 
@@ -1475,6 +1581,12 @@ def album_preview(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
         data = data or {}
         album = data.get("album") or {}
         matches = data.get("matches") or []
+        # #2068: the album's explicit flag over every matched track, so $explicit
+        # in a folder is the same for the whole album
+        from core.imports.paths import album_explicit_flag
+        if album:
+            album = {**album, "explicit": album_explicit_flag(
+                album, [m.get("track") or {} for m in matches if isinstance(m, dict)])}
         source = str(album.get("source") or data.get("source") or "").strip().lower()
         if not album or not matches:
             return {"success": False, "error": "album and matches are required"}, 400
@@ -1569,6 +1681,12 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
         data = data or {}
         album = data.get("album", {})
         matches = data.get("matches", [])
+        # #2068: the album's explicit flag over every matched track, so $explicit
+        # in a folder is the same for the whole album
+        from core.imports.paths import album_explicit_flag
+        if album:
+            album = {**album, "explicit": album_explicit_flag(
+                album, [m.get("track") or {} for m in matches if isinstance(m, dict)])}
 
         if not album or not matches:
             return {"success": False, "error": "Missing album or matches data"}, 400
@@ -1652,6 +1770,7 @@ def album_process(runtime: ImportRouteRuntime, data: Dict[str, Any]) -> tuple[Di
                 source_hint=source,
                 album_name=album_name,
                 quality_profile=gate_profile,
+                profile_id=_import_profile_id(),
             )
             decision = status["decision"]
             if decision == DECISION_SKIP_OWNED:
@@ -1833,6 +1952,25 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
     # picked, same as it did before this flag existed.)
     from_own_tags = file_info.get("from_own_tags") is True and not manual_match
 
+    if from_own_tags:
+        # The inbox/request can be stale, or contain a filename-derived artist.
+        # Re-read the validated file, never a client-supplied filename/path.
+        embedded = _read_staging_file_metadata(file_path, filename_fallback=False)
+        title = embedded.get("title") or title
+        artist = embedded.get("artist") or artist
+        file_info = dict(file_info)
+        if embedded.get("title") or embedded.get("artist") or embedded.get("album"):
+            # A blank embedded album is meaningful (an album-less remix).
+            file_info["album"] = embedded.get("album", "")
+            file_info["albumartist"] = embedded.get("albumartist") or artist
+        for key in ("track_number", "disc_number", "duration_ms"):
+            if embedded.get(key):
+                file_info[key] = embedded[key]
+
+        if not artist or artist.strip().casefold() == 'unknown artist':
+            parsed = runtime.parse_filename_metadata(os.path.basename(file_path))
+            artist = parsed.get('artist') or artist
+
     if not title and not manual_match:
         parsed = runtime.parse_filename_metadata(file_info.get("filename", ""))
         title = parsed.get("title") or os.path.splitext(file_info.get("filename", "Unknown"))[0]
@@ -1854,6 +1992,13 @@ def process_single_import_file(runtime: ImportRouteRuntime, file_info: Dict[str,
             duration_ms=file_info.get("duration_ms"),
         )
         context = runtime.normalize_import_context(resolved["context"])
+        if from_own_tags:
+            # Keep the file's frames/art/custom tags, and retain the album
+            # credit separately from the performing artist (compilations).
+            context['_preserve_embedded_tags'] = True
+            album_artist = file_info.get("albumartist")
+            if isinstance(album_artist, str) and album_artist.strip():
+                context['album']['artists'] = [{'name': album_artist.strip()}]
         context['is_local_import'] = True  # user's own file, not an slskd transfer (#804)
         # Manual import = the user explicitly matched this exact file to this
         # track, so the quality profile has no veto here (#1017). AcoustID,
@@ -1966,12 +2111,20 @@ def finalize_manual_rematch_replace(runtime, staged_path: str, context: Dict[str
                         return None
 
                 delete_replaced_track(cursor, hint.replace_track_id,
-                                      resolve_fn=_resolve_old, new_paths=new_paths)
+                                      resolve_fn=_resolve_old, new_paths=new_paths,
+                                      id_space=hint.replace_id_space,
+                                      file_id=hint.replace_file_id)
                 runtime.logger.info(
                     "Manual import honoured a re-identify replace for library track %s",
                     hint.replace_track_id)
         consume_hint(cursor, hint.id)
         conn.commit()
+        if hint.replace_track_id:
+            try:
+                from core.library2.mirror_outbox import drain_soon
+                drain_soon(get_database())
+            except Exception as exc:  # noqa: BLE001 - the outbox catches up later
+                runtime.logger.debug("outbox drain after re-identify skipped: %s", exc)
     except Exception as exc:
         runtime.logger.warning("Manual re-identify cleanup failed (import still succeeded): %s", exc)
     finally:

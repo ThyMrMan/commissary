@@ -49,11 +49,14 @@ def test_a_download_in_the_second_category_folder_is_found(tmp_path):
     assert os.path.normpath(got) == os.path.normpath(str(music / "Artist - Album"))
 
 
-def test_the_settings_box_shows_a_legacy_list_joined_not_comma_mangled():
-    """Assigning an array to an <input> stringifies it as 'a,b', and saving
-    that back would write a single bogus path."""
+def test_the_settings_box_shows_a_legacy_list_joined_not_blank():
+    """Upstream's text() shows a list as an empty box; saving that would drop
+    every path. Both folder boxes go through the fork's pathsText."""
     from pathlib import Path
 
-    js = (Path(__file__).resolve().parents[2] / "webui" / "static" / "settings.js").read_text(encoding="utf-8")
-    assert "[].concat(settings.download_source?.torrent_download_path || []).join('; ')" in js
-    assert "[].concat(settings.download_source?.usenet_download_path || []).join('; ')" in js
+    root = Path(__file__).resolve().parents[2] / "webui" / "src"
+    tsx = (root / "features" / "settings" / "tabs" / "source-panels-more.tsx").read_text(encoding="utf-8")
+    assert "value={pathsText(d.torrent_download_path)}" in tsx
+    assert "value={pathsText(d.usenet_download_path)}" in tsx
+    helper = (root / "commissary" / "download-paths.ts").read_text(encoding="utf-8")
+    assert ".join('; ')" in helper

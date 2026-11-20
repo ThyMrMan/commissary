@@ -35,10 +35,13 @@ CREATE TABLE rematch_hints (
     exempt_dedup INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'pending',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, consumed_at TIMESTAMP
 );
-CREATE TABLE tracks (
-    id INTEGER PRIMARY KEY, album_id INTEGER, artist_id INTEGER, title TEXT,
-    track_number INTEGER, file_path TEXT
-);
+CREATE TABLE lib2_tracks (id INTEGER PRIMARY KEY, title TEXT);
+CREATE TABLE lib2_track_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, track_id INTEGER, path TEXT,
+    file_state TEXT DEFAULT 'active', is_primary INTEGER DEFAULT 1,
+    primary_manual INTEGER DEFAULT 0, profile_rank INTEGER,
+    format TEXT, bit_depth INTEGER, sample_rate INTEGER, bitrate INTEGER,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
 """
 
 
@@ -57,6 +60,11 @@ def _hint(**kw):
                 artist_name="Artist", album_type="album", track_number=5, disc_number=1)
     base.update(kw)
     return RematchHint(**base)
+
+
+def _file(cur, track_id, path):
+    cur.execute("INSERT OR IGNORE INTO lib2_tracks(id,title) VALUES(?,'Song')", (track_id,))
+    cur.execute("INSERT INTO lib2_track_files(track_id,path) VALUES(?,?)", (track_id, path))
 
 
 # ── pure: identification mapping ──────────────────────────────────────────────
@@ -86,24 +94,23 @@ def test_build_identification_single_release_still_forces_album_fetch():
 # ── pure: safe replacement ────────────────────────────────────────────────────
 def test_delete_replaced_track_removes_row_and_file(conn):
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (7, '/lib/EP1/05 - Song.flac')")
+    _file(cur, 7, '/lib/EP1/05 - Song.flac')
     removed = []
     out = delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p))
     assert out == "/lib/EP1/05 - Song.flac"
     assert removed == ["/lib/EP1/05 - Song.flac"]   # file removed (we faked existence below)
-    cur.execute("SELECT 1 FROM tracks WHERE id = 7")
-    assert cur.fetchone() is None                    # row gone
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=7").fetchone()[0] == 'deleted'
+    assert cur.execute("SELECT 1 FROM lib2_tracks WHERE id=7").fetchone()  # catalogue survives
 
 
 def test_delete_replaced_track_keeps_file_if_another_row_points_at_it(conn):
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (7, '/lib/shared.flac')")
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (8, '/lib/shared.flac')")
+    _file(cur, 7, '/lib/shared.flac')
+    _file(cur, 8, '/lib/shared.flac')
     removed = []
     out = delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p))
     assert out is None and removed == []             # row 8 still references it → no unlink
-    cur.execute("SELECT 1 FROM tracks WHERE id = 7")
-    assert cur.fetchone() is None                     # but row 7 still deleted
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=7").fetchone()[0] == 'deleted'
 
 
 def test_delete_replaced_track_noops_on_missing_id(conn):
@@ -116,33 +123,31 @@ def test_delete_replaced_track_same_home_is_noop(conn):
     # THE data-loss bug: re-identify to the release it's already in → the import
     # reuses the same file/row, so deleting it would orphan the file. Guard: no-op.
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (7, '/lib/Album1/05 - Song.flac')")
+    _file(cur, 7, '/lib/Album1/05 - Song.flac')
     removed = []
     out = delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p),
                                 new_paths=['/lib/Album1/05 - Song.flac'])
     assert out is None and removed == []           # NOTHING unlinked
-    cur.execute("SELECT 1 FROM tracks WHERE id = 7")
-    assert cur.fetchone() is not None              # row PRESERVED (it's the re-imported track)
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=7").fetchone()[0] == 'active'
 
 
 def test_delete_replaced_track_different_home_still_deletes(conn):
     # Genuinely re-homed (new path differs) → old row + file removed as intended.
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (7, '/lib/EP1/05 - Song.flac')")
+    _file(cur, 7, '/lib/EP1/05 - Song.flac')
     removed = []
     out = delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p),
                                 new_paths=['/lib/Album1/05 - Song.flac'])
     assert out == '/lib/EP1/05 - Song.flac'
     assert removed == ['/lib/EP1/05 - Song.flac']
-    cur.execute("SELECT 1 FROM tracks WHERE id = 7")
-    assert cur.fetchone() is None
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=7").fetchone()[0] == 'deleted'
 
 
 def test_delete_replaced_track_resolves_path_before_unlink(conn):
     # The stored path is a server/Docker view this process can't read literally;
     # resolve_fn maps it to the real file so we unlink the RIGHT path (not orphan it).
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (7, '/mnt/serverview/Song.flac')")
+    _file(cur, 7, '/mnt/serverview/Song.flac')
     removed = []
     out = delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p),
                                 resolve_fn=lambda stored: '/real/local/Song.flac')
@@ -205,13 +210,124 @@ def test_resolve_is_failsafe_on_db_error():
 def test_finalize_consumes_and_replaces(conn, monkeypatch):
     monkeypatch.setattr("core.imports.rematch_hints.quick_file_signature", lambda p: None)
     cur = conn.cursor()
-    cur.execute("INSERT INTO tracks (id, file_path) VALUES (42, '/lib/EP1/05 - Song.flac')")
+    _file(cur, 42, '/lib/EP1/05 - Song.flac')
     hid = create_hint(cur, _hint(replace_track_id=42))
     conn.commit()
     w = _worker(conn)
     hint = find_hint_for_file(conn.cursor(), "/staging/Song.flac")
     w._finalize_rematch_hint(hint)
-    # old row deleted, hint consumed
-    cur.execute("SELECT 1 FROM tracks WHERE id = 42")
-    assert cur.fetchone() is None
+    # old file retired, catalogue identity retained, hint consumed
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=42").fetchone()[0] == 'deleted'
     assert find_hint_for_file(conn.cursor(), "/staging/Song.flac") is None   # consumed
+
+
+# ── a hint from 3.6.1 (third #1062 review, G06-1) ──────────────────────────────
+def test_a_delete_refuses_an_id_from_another_space(conn):
+    """a pending 3.6.1 hint names a Plex ratingKey; read as a lib2 id it was an
+    unrelated track whose file got deleted"""
+    cur = conn.cursor()
+    _file(cur, 7, '/lib/unrelated.flac')
+    removed = []
+    assert delete_replaced_track(cur, 7, unlink=lambda p: removed.append(p), id_space=None) is None
+    assert removed == []
+    assert cur.execute("SELECT file_state FROM lib2_track_files WHERE track_id=7").fetchone()[0] == 'active'
+
+
+def test_a_new_hint_records_that_it_names_a_lib2_track(conn):
+    cur = conn.cursor()
+    create_hint(cur, _hint(replace_track_id=7))
+    assert cur.execute("SELECT replace_id_space FROM rematch_hints").fetchone()[0] == 'lib2'
+
+
+def test_a_pending_3_6_1_hint_is_mapped_or_loses_only_its_replace(conn):
+    from core.imports.rematch_hints import carry_legacy_rematch_hints, ensure_replace_id_space_column
+    cur = conn.cursor()
+    ensure_replace_id_space_column(cur)
+    cur.execute("ALTER TABLE lib2_tracks ADD COLUMN legacy_track_id INTEGER")
+    cur.execute("ALTER TABLE lib2_track_files ADD COLUMN legacy_track_id INTEGER")
+    cur.execute("INSERT INTO lib2_tracks(id, title, legacy_track_id) VALUES(31, 'Song', 48213)")
+    for staged, legacy in (("/staging/a.flac", 48213), ("/staging/b.flac", 99999)):
+        cur.execute("INSERT INTO rematch_hints(staged_path, source, replace_track_id) VALUES(?, 'spotify', ?)",
+                    (staged, legacy))
+    conn.commit()
+
+    assert carry_legacy_rematch_hints(conn) == 1
+
+    rows = dict(cur.execute("SELECT staged_path, replace_track_id || ':' || COALESCE(replace_id_space,'-') "
+                            "FROM rematch_hints").fetchall())
+    assert rows == {"/staging/a.flac": "31:lib2", "/staging/b.flac": None}
+
+
+@pytest.mark.parametrize("v2_ran", [True, False])
+def test_a_hint_written_by_earlier_v2_code_is_never_carried_as_legacy(conn, v2_ran):
+    """review 4 R4-D-1: a hint pending from library v2 code that predates the
+    id-space column holds a lib2 id. read as a 3.6.1 legacy id, it mapped onto
+    whichever unrelated track had that legacy id, and the import deleted it"""
+    from core.imports.rematch_hints import carry_legacy_rematch_hints, ensure_replace_id_space_column
+    cur = conn.cursor()
+    cur.execute("ALTER TABLE lib2_tracks ADD COLUMN legacy_track_id INTEGER")
+    cur.execute("ALTER TABLE lib2_track_files ADD COLUMN legacy_track_id INTEGER")
+    cur.execute("INSERT INTO lib2_tracks(id, title, legacy_track_id) VALUES(31, 'Song', NULL)")
+    cur.execute("INSERT INTO lib2_tracks(id, title, legacy_track_id) VALUES(77, 'Other', 31)")
+    if v2_ran:
+        cur.execute("CREATE TABLE lib2_bootstrap_state (id INTEGER PRIMARY KEY, status TEXT, started_at TEXT)")
+        cur.execute("INSERT INTO lib2_bootstrap_state VALUES(1, 'done', '2026-10-29T00:00:00')")
+    cur.execute("INSERT INTO rematch_hints(staged_path, source, replace_track_id) VALUES('/s/a.flac', 'spotify', 31)")
+    conn.commit()
+
+    ensure_replace_id_space_column(cur)
+    carry_legacy_rematch_hints(conn)
+
+    row = cur.execute("SELECT replace_track_id, replace_id_space FROM rematch_hints").fetchone()
+    if v2_ran:
+        # ambiguous: the import stays, the replace (and any delete) goes
+        assert tuple(row) == (None, "lib2")
+    else:
+        # a real 3.6.1 database: the legacy id still maps
+        assert tuple(row) == (77, "lib2")
+
+
+# ── review 5 W2-WD-3: the replace retires the staged library's copy only ──────
+@pytest.fixture
+def two_library_conn():
+    from core.library2.schema import ensure_library_v2_schema
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    ensure_library_v2_schema(c)
+    c.execute("INSERT INTO lib2_artists(id, name) VALUES(1, 'Band')")
+    c.execute("INSERT INTO lib2_albums(id, title, primary_artist_id) VALUES(1, 'Record', 1)")
+    c.execute("INSERT INTO lib2_tracks(id, album_id, title) VALUES(7, 1, 'Song')")
+    # profile 3's own library imported it first: its copy holds the one primary flag
+    c.execute("INSERT INTO lib2_track_files(id, track_id, path, is_primary, file_state, owner_profile_id)"
+              " VALUES(10, 7, '/profiles/3/Band/Record/01 Song.flac', 1, 'active', 3)")
+    c.execute("INSERT INTO lib2_track_files(id, track_id, path, is_primary, file_state, owner_profile_id)"
+              " VALUES(11, 7, '/music/Band/Record/01 Song.flac', 0, 'active', NULL)")
+    c.commit()
+    yield c
+    c.close()
+
+
+@pytest.mark.parametrize("staged,kept", [(11, 10), (10, 11)])
+def test_replace_retires_exactly_the_staged_copy(two_library_conn, staged, kept):
+    removed = []
+    delete_replaced_track(two_library_conn.cursor(), 7, unlink=removed.append,
+                          new_paths=["/elsewhere/01 Song.flac"], file_id=staged)
+    states = dict(two_library_conn.execute("SELECT id, file_state FROM lib2_track_files").fetchall())
+    assert states == {staged: 'deleted', kept: 'active'}
+    path = two_library_conn.execute("SELECT path FROM lib2_track_files WHERE id=?", (staged,)).fetchone()[0]
+    assert removed == [path]
+
+
+def test_a_hint_without_its_file_keeps_copies_in_two_libraries(two_library_conn):
+    removed = []
+    out = delete_replaced_track(two_library_conn.cursor(), 7, unlink=removed.append,
+                                new_paths=["/elsewhere/01 Song.flac"])
+    assert out is None and removed == []
+    assert {r[0] for r in two_library_conn.execute("SELECT file_state FROM lib2_track_files")} == {'active'}
+
+
+def test_the_hint_keeps_the_file_it_replaces(conn):
+    cur = conn.cursor()
+    hint_id = create_hint(cur, _hint(replace_track_id=7, replace_file_id=11))
+    assert find_hint_for_file(cur, "/staging/Song.flac").replace_file_id == 11
+    assert hint_id

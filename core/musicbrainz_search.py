@@ -15,6 +15,19 @@ from utils.logging_config import get_logger
 
 logger = get_logger("musicbrainz_search")
 
+# MBIDs get_album found to be releases, not release groups, so it stops
+# asking for them as groups. bounded, oldest out first; ids don't change type
+_RELEASE_NOT_GROUP: "dict[str, None]" = {}
+_RELEASE_NOT_GROUP_MAX = 5000
+_release_lock = threading.Lock()
+
+
+def _remember_release_id(mbid: str) -> None:
+    with _release_lock:
+        _RELEASE_NOT_GROUP[mbid] = None
+        while len(_RELEASE_NOT_GROUP) > _RELEASE_NOT_GROUP_MAX:
+            _RELEASE_NOT_GROUP.pop(next(iter(_RELEASE_NOT_GROUP)))
+
 COVER_ART_ARCHIVE_URL = "https://coverartarchive.org"
 
 
@@ -530,6 +543,15 @@ class MusicBrainzSearchClient:
         albums.sort(key=self._release_variant_key)
         return albums[:limit]
 
+    def release_group_editions(self, release_group_mbid: str, artist_name: str = '',
+                               limit: int = 100) -> List[Album]:
+        """Every release (edition) in one release group, from one browse call.
+        what picard calls "other versions" (#2145)."""
+        if not release_group_mbid:
+            return []
+        return self._release_group_releases_to_albums({'id': release_group_mbid},
+                                                      artist_name, limit)
+
     def search_albums(self, query: str, limit: int = 10) -> List[Album]:
         """Search MusicBrainz for releases (albums).
 
@@ -728,7 +750,7 @@ class MusicBrainzSearchClient:
         # what tells versioned recordings apart when titles are identical.
         recording_disambiguation = (r.get('disambiguation') or '').strip() or None
 
-        return Track(
+        track = Track(
             id=mbid,
             name=title,
             artists=artists if artists else ['Unknown Artist'],
@@ -743,6 +765,68 @@ class MusicBrainzSearchClient:
             album_id=album_id,
             disambiguation=recording_disambiguation,
         )
+        # every release the recording is on, for track_on_album. a plain
+        # attribute, not a field: nothing that stores a Track should carry it
+        track._mb_releases = releases
+        return track
+
+    def track_on_album(self, track: Track, album_name: str, agree) -> Optional[Track]:
+        """This recording, filed under the release named ``album_name``.
+
+        A recording is on many releases (the album, a best-of, a soundtrack)
+        and a Track names one of them. A caller that knows which album it
+        wants (#2067: the album Spotify files the song under) asks here
+        whether the recording is on it. ``agree(a, b)`` is the caller's own
+        album-name comparison. None when no release agrees."""
+        if agree(track.album, album_name):
+            return track
+        from dataclasses import replace
+        for rel in getattr(track, '_mb_releases', None) or []:
+            if not agree(rel.get('title', ''), album_name):
+                continue
+            rg = rel.get('release-group', {}) or {}
+            release_id = rel.get('id', '') or ''
+            moved = replace(
+                track,
+                album=rel.get('title', '') or track.album,
+                album_id=release_id,
+                release_date=rel.get('date', '') or '',
+                album_type=_map_release_type(rg.get('primary-type', '') or '',
+                                             rg.get('secondary-types', []) or []),
+                total_tracks=sum(m.get('track-count', 0) for m in rel.get('media', []) or []),
+                image_url=self._cached_art(release_id, rg.get('id', '') or '') if release_id else None,
+            )
+            moved._mb_releases = track._mb_releases
+            return moved
+        return None
+
+    def track_by_isrc(self, isrc: str, artists=()) -> Optional[Track]:
+        """The recording an ISRC names, or None (#2067).
+
+        ``/isrc/<code>`` answers with the recording alone, so the releases it
+        is on come from a second, fielded search for that recording id. When
+        that search has nothing (an index still building on a self-hosted
+        server) the bare recording is still returned."""
+        from core.discovery.isrc_match import artists_agree
+        recordings = self._client.lookup_recordings_by_isrc(isrc)
+        wanted = list(artists or [])
+        chosen = next((r for r in recordings
+                       if artists_agree(wanted, _extract_artist_credit(r.get('artist-credit', [])))),
+                      None)
+        if chosen is None or not chosen.get('id'):
+            return None
+        try:
+            response = self._client._get('/recording', params={
+                'query': f'rid:{chosen["id"]}', 'fmt': 'json', 'limit': 1})
+            response.raise_for_status()
+            found = (response.json().get('recordings') or [None])[0]
+            if found and found.get('id') == chosen['id']:
+                releases = found.get('releases') or []
+                releases.sort(key=self._release_preference_key)
+                chosen = {**chosen, 'releases': releases}
+        except Exception as e:  # noqa: BLE001 - the recording alone is still a match
+            logger.debug("MusicBrainz release lookup for recording %s failed: %s", chosen['id'], e)
+        return self._recording_to_track(chosen, '')
 
     def search_tracks(self, query: str, limit: int = 10) -> List[Track]:
         """Search MusicBrainz for recordings (tracks).
@@ -1140,8 +1224,11 @@ class MusicBrainzSearchClient:
         representative release and then fetch its tracklist.
         """
         try:
-            # Path A: release-group MBID (new browse-based search default)
-            rg = self._client.get_release_group(
+            # Path A: release-group MBID (new browse-based search default).
+            # Skipped for an id already shown to be a release: the library's
+            # post-import reconcile asks by release id, album after album, and
+            # each one paid a 404 (a second at the rate limit) before path B.
+            rg = None if album_mbid in _RELEASE_NOT_GROUP else self._client.get_release_group(
                 album_mbid, includes=['releases', 'artist-credits']
             )
             if rg:
@@ -1166,6 +1253,8 @@ class MusicBrainzSearchClient:
 
             # Path B: release MBID (text-search fallback path)
             album = self._render_release_as_album(album_mbid)
+            if album and rg is None:
+                _remember_release_id(album_mbid)
             if album and not include_tracks:
                 album.pop('tracks', None)
             return album

@@ -106,8 +106,9 @@
     }
 
     function followBtn(following) {
+        // not following yet: hidden for a profile with downloads off (body.downloads-disabled)
         return '<button class="vyt-follow' + (following ? ' vyt-follow--on' : '') + '" type="button" ' +
-            'data-vyt-follow>' + (following ? '✓ Following' : '+ Follow') + '</button>';
+            (following ? '' : 'data-download-action ') + 'data-vyt-follow>' + (following ? '✓ Following' : '+ Follow') + '</button>';
     }
 
     // A pasted-playlist result chip (mirrors searchCard): cover, title, owner +
@@ -128,7 +129,7 @@
                     (sub.length ? '<span class="vyt-chip-sub">' + sub.join(' · ') + '</span>' : '') +
                 '</div>' +
                 '<button class="library-artist-watchlist-btn' + (following ? ' watching' : '') + '" type="button" ' +
-                'data-vyt-follow-playlist>' +
+                (following ? '' : 'data-download-action ') + 'data-vyt-follow-playlist>' +
                     '<span class="watchlist-icon">' + (following ? '✓' : '＋') + '</span>' +
                     '<span class="watchlist-text">' + (following ? 'In Watchlist' : 'Add to Watchlist') + '</span>' +
                 '</button>' +
@@ -142,13 +143,28 @@
 
     // Following a channel WATCHLISTS it (like a show) — it doesn't auto-wish all
     // its videos, so we send only the channel fields, not its video list.
+    // following wishes new uploads to download, so a profile with downloads
+    // off can't follow (the server refuses it too)
+    function downloadsOff() {
+        // youtube has its own mode (#2166); until it's loaded, the old switch
+        var vr = window.VideoRequests;
+        var can = (vr && typeof vr.canGet === 'function') ? vr.canGet('youtube')
+            : (typeof canDownload !== 'function' || canDownload());
+        if (can) return false;
+        if (typeof showToast === 'function') {
+            showToast('Downloads are off for this profile, so it can\'t follow channels or playlists.', 'info');
+        }
+        return true;
+    }
     function follow(channel) {
+        if (downloadsOff()) return Promise.resolve(null);
         var ch = channel || {};
         return post('/api/video/youtube/follow',
             { channel: { youtube_id: ch.youtube_id, title: ch.title, avatar_url: ch.avatar_url } });
     }
     function unfollow(youtubeId) { return post('/api/video/youtube/unfollow', { youtube_id: youtubeId }); }
     function followPlaylist(pl) {
+        if (downloadsOff()) return Promise.resolve(null);
         var p = pl || {};
         return post('/api/video/youtube/playlist/follow', { playlist: {
             playlist_id: p.playlist_id, title: p.title, thumbnail_url: p.thumbnail_url, videos: p.videos } });
@@ -233,6 +249,13 @@
         b = b || {};
         var noun = kind === 'playlist' ? 'playlist' : 'channel';
         return '' +
+            // #2008: follow without downloading (channels; a playlist mirror downloads by design)
+            (kind === 'playlist' ? '' :
+                '<label class="vyt-cset-toggle"><input type="checkbox" data-cset-auto' +
+                    (s.auto_download === false ? '' : ' checked') + '> Download new uploads</label>' +
+                '<div class="vyt-cset-hint">Off: the channel stays followed but nothing downloads on its own. ' +
+                    'Pick videos from the channel page. Turning it off also takes back the videos the follow ' +
+                    'and the scan added that haven’t downloaded yet.</div>') +
             '<label class="vyt-cset-lbl">Show name (folder)</label>' +
             '<input class="vyt-cset-in" data-cset-name type="text" value="' + esc(s.custom_name || '') +
                 '" placeholder="' + esc(title || '') + '">' +
@@ -311,8 +334,11 @@
             .catch(function () { body.innerHTML = 'Could not load settings.'; });
 
         saveBtn.addEventListener('click', function () {
+            if (downloadsOff()) return;
             var nameEl = body.querySelector('[data-cset-name]');
             var payload = { custom_name: (nameEl ? nameEl.value : '').trim() };
+            var autoEl = body.querySelector('[data-cset-auto]');
+            if (autoEl) payload.auto_download = autoEl.checked;
             var inc = body.querySelector('[data-cset-inc]');
             var exc = body.querySelector('[data-cset-exc]');
             var minm = body.querySelector('[data-cset-minm]');
@@ -342,8 +368,18 @@
                 { method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
                   body: JSON.stringify(payload) })
                 .then(function (r) { return r.json(); })
-                .then(function () {
-                    if (typeof showToast === 'function') showToast((kind === 'playlist' ? 'Playlist' : 'Channel') + ' settings saved', 'success');
+                .then(function (d) {
+                    // review 4 R4-E-6: a refused save is not "saved" (a failed
+                    // "download new uploads" off kept downloads coming)
+                    if (!d || d.success === false || d.error) {
+                        saveBtn.disabled = false;
+                        if (typeof showToast === 'function') showToast((d && d.error) || 'Save failed', 'error');
+                        return;
+                    }
+                    var dropped = (d && d.dropped) || 0;
+                    var msg = (kind === 'playlist' ? 'Playlist' : 'Channel') + ' settings saved' +
+                        (dropped ? '. ' + dropped + ' video' + (dropped === 1 ? '' : 's') + ' taken off your wishlist' : '');
+                    if (typeof showToast === 'function') showToast(msg, 'success');
                     close();
                 })
                 .catch(function () { saveBtn.disabled = false; if (typeof showToast === 'function') showToast('Save failed', 'error'); });

@@ -70,6 +70,16 @@ export interface MirroredPlaylistRow {
    */
   organize_by_playlist?: boolean;
   /**
+   * rotating (#2039): a song this playlist downloaded is removed once it
+   * leaves the playlist. the Expired Download Cleaner does the removing.
+   */
+  rotating?: boolean;
+  /**
+   * find uncatalogued tracks (#2097): a track no catalog has is searched for
+   * by this playlist's own artist and title instead of waiting in the pool.
+   */
+  allow_uncatalogued?: boolean;
+  /**
    * this playlist's own sync mode (#1704). null = the global Settings mode,
    * so an append-only mirror can live next to a Daily Mix that reconciles.
    */
@@ -334,8 +344,12 @@ export function mirroredPhaseLine(
     case 'discovered':
       // The track_count fallback is renderMirroredCard's (561), not the
       // live writer's — see the unification note above.
+      // The live state only knows a count while this session watched the
+      // discovery run. A playlist identified earlier (or one whose tracks came
+      // with ids, like a Deezer mirror) has its count on the row: without it a
+      // fully identified playlist of 1,583 read "Discovered 0/1583".
       return {
-        text: `Discovered ${state?.spotifyMatches ?? 0}/${state?.spotifyTotal || row.track_count || 0}`,
+        text: `Discovered ${state?.spotifyMatches || row.discovered_count || 0}/${state?.spotifyTotal || row.track_count || 0}`,
         color: '#22c55e',
       };
     case 'syncing':
@@ -495,8 +509,11 @@ export function trackStatusSegments(
   });
 }
 
-/** the card's link text, or null when nothing needs a match. */
+/** the card's link text, or null when there's nothing to review. it counts
+ *  every unconfirmed wing it guess, the pool it opens, including ones already
+ *  downloaded. it said "need a match", the playlist page's word for a song
+ *  nothing will download, so one playlist read 1239 here and 6 there (Storm) */
 export function needsMatchLabel(row: { needs_match_count?: number }): string | null {
   const n = row.needs_match_count ?? 0;
-  return n > 0 ? `${n} need${n === 1 ? 's' : ''} a match` : null;
+  return n > 0 ? `${n} guess${n === 1 ? '' : 'es'} to review` : null;
 }

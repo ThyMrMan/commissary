@@ -203,7 +203,9 @@ def test_process_wishlist_automatically_toggles_cycle_when_no_tracks_match_curre
     assert executor.submissions == []
     assert music_db.cycle_value == "singles"
     assert music_db.commits == 1
-    assert any("No albums tracks in wishlist" in msg for msg in logger.warning_messages)
+    # a cycle with nothing in it is routine too
+    assert any("No albums tracks in wishlist" in msg for msg in logger.info_messages)
+    assert not any("No albums tracks in wishlist" in msg for msg in logger.warning_messages)
     assert guard_events == ["enter", "exit"]
     assert [kwargs.get("progress") for _args, kwargs in progress_calls if "progress" in kwargs] == [10, 25, 40]
 
@@ -243,6 +245,194 @@ def test_process_wishlist_automatically_creates_batch_for_matching_tracks():
     assert guard_events == ["enter", "exit"]
     # Track has no album id/name → falls to residual batch path
     assert any("Starting wishlist residual batch" in msg for msg in logger.info_messages)
+
+
+def test_playlist_scope_dispatches_only_matching_wishlist_tracks_without_cycle_mutation():
+    batch_map = {}
+    runtime, _service, _profiles_db, music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[
+            {
+                "name": "In selected playlist",
+                "track_id": "selected::album-a",
+                "spotify_track_id": "selected::album-a",
+                "artists": [{"name": "Artist A"}],
+                "spotify_data": {"id": "selected", "album": {"album_type": "album"}},
+            },
+            {
+                "name": "Global wishlist only",
+                "track_id": "unrelated",
+                "spotify_track_id": "unrelated",
+                "artists": [{"name": "Artist B"}],
+                "spotify_data": {"id": "unrelated", "album": {"album_type": "single"}},
+            },
+        ],
+        cycle_value="albums",
+        count=2,
+        batch_map=batch_map,
+    )
+
+    process_wishlist_automatically(
+        runtime,
+        automation_id="playlist-run",
+        track_ids=["selected"],
+        profile_ids=[1],
+    )
+
+    assert len(executor.submissions) == 1
+    submitted_tracks = executor.submissions[0][1][2]
+    assert [track["track_id"] for track in submitted_tracks] == ["selected::album-a"]
+    assert music_db.duplicate_removals == []
+    assert music_db.cycle_value == "albums"
+    batch = next(iter(batch_map.values()))
+    assert batch["current_cycle"] == "playlist"
+    assert batch["wishlist_scope"] == "playlist"
+    assert batch["toggle_wishlist_cycle"] is False
+
+
+def test_playlist_scope_does_not_dispatch_a_track_the_library_sweep_removed(monkeypatch):
+    """review 5 R5-J-1: the scoped run read its rows before the cycle-start
+    library sweep, so a track the sweep removed as owned was still sent and
+    the force_download_all batch downloaded it again"""
+    def _row(tid, name):
+        return {"name": name, "track_id": tid, "spotify_track_id": tid,
+                "artists": [{"name": "Artist A"}],
+                "spotify_data": {"id": tid, "album": {"album_type": "album"}}}
+
+    runtime, service, _profiles_db, _music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[_row("owned", "Owned Song"), _row("missing", "Missing Song")],
+        count=2,
+    )
+
+    def sweep(*_a, **_k):
+        # the library owns "owned": the sweep deletes its wishlist row
+        service._tracks = [t for t in service._tracks if t["track_id"] != "owned"]
+        return 1
+
+    monkeypatch.setattr(processing, "remove_tracks_already_in_library", sweep)
+
+    process_wishlist_automatically(
+        runtime, automation_id="playlist-run", track_ids=["owned", "missing"], profile_ids=[1])
+
+    sent = [t["track_id"] for _fn, args, _kw in executor.submissions for t in args[2]]
+    assert sent == ["missing"]
+
+
+def test_playlist_composite_scope_does_not_dispatch_same_track_from_other_album():
+    batch_map = {}
+    runtime, _service, _profiles_db, _music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[
+            {
+                "name": "Album A",
+                "track_id": "same::album-a",
+                "spotify_track_id": "same::album-a",
+                "artists": [{"name": "Artist"}],
+                "spotify_data": {"id": "same", "album": {"id": "album-a", "album_type": "album"}},
+            },
+            {
+                "name": "Album B",
+                "track_id": "same::album-b",
+                "spotify_track_id": "same::album-b",
+                "artists": [{"name": "Artist"}],
+                "spotify_data": {"id": "same", "album": {"id": "album-b", "album_type": "album"}},
+            },
+        ],
+        count=2,
+        batch_map=batch_map,
+    )
+
+    process_wishlist_automatically(
+        runtime,
+        automation_id="playlist-album-a",
+        track_ids=["same::album-a"],
+        profile_ids=[1],
+    )
+
+    submitted = executor.submissions[0][1][2]
+    assert [track["track_id"] for track in submitted] == ["same::album-a"]
+
+
+def test_playlist_legacy_bare_scope_fails_closed_when_album_is_ambiguous():
+    runtime, _service, _profiles_db, _music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[
+            {"track_id": "same::album-a", "spotify_track_id": "same::album-a", "spotify_data": {"id": "same"}},
+            {"track_id": "same::album-b", "spotify_track_id": "same::album-b", "spotify_data": {"id": "same"}},
+        ],
+        count=2,
+    )
+
+    process_wishlist_automatically(
+        runtime,
+        automation_id="ambiguous-bare",
+        track_ids=["same"],
+        profile_ids=[1],
+    )
+
+    assert executor.submissions == []
+
+
+def test_playlist_scope_with_multiple_profiles_dispatches_one_batch_per_profile():
+    """A6 (library-overhaul-branch-review): a "Run Pipeline" playlist scope
+    spanning more than one wishlist profile must not collapse every profile's
+    tracks into a single batch stamped with whatever runtime.profile_id last
+    happened to be — each profile gets its own batch under its own id."""
+    batch_map = {}
+
+    class _MultiProfileWishlistService:
+        def __init__(self):
+            self.tracks_by_profile = {
+                1: [{
+                    "name": "P1 Track",
+                    "track_id": "p1::track",
+                    "spotify_track_id": "p1::track",
+                    "artists": [{"name": "Artist A"}],
+                    "spotify_data": {"id": "p1::track", "album": {"album_type": "single"}},
+                }],
+                2: [{
+                    "name": "P2 Track",
+                    "track_id": "p2::track",
+                    "spotify_track_id": "p2::track",
+                    "artists": [{"name": "Artist B"}],
+                    "spotify_data": {"id": "p2::track", "album": {"album_type": "single"}},
+                }],
+            }
+
+        def get_wishlist_count(self, profile_id=1):
+            return len(self.tracks_by_profile.get(profile_id, []))
+
+        def get_wishlist_tracks_for_download(self, profile_id=1):
+            return list(self.tracks_by_profile.get(profile_id, []))
+
+        def mark_track_download_result(self, spotify_track_id, success, error_message=None, profile_id=1):
+            return True
+
+    runtime, _service, _profiles_db, music_db, executor, _logger, _progress, _guards = _build_runtime(
+        tracks=[],
+        cycle_value="albums",
+        count=0,
+        profiles=[{"id": 1}, {"id": 2}],
+        batch_map=batch_map,
+    )
+    processing.get_wishlist_service = lambda: _MultiProfileWishlistService()
+
+    process_wishlist_automatically(
+        runtime,
+        automation_id="playlist-multi-profile",
+        track_ids=["p1", "p2"],
+        profile_ids=[1, 2],
+    )
+
+    assert len(executor.submissions) == 2
+    assert len(batch_map) == 2
+    batches_by_profile = {batch["profile_id"]: batch for batch in batch_map.values()}
+    assert set(batches_by_profile.keys()) == {1, 2}
+    for submitted_fn, submitted_args, submitted_kwargs in executor.submissions:
+        submitted_tracks = submitted_args[2]
+        track_id = submitted_tracks[0]["track_id"]
+        expected_profile = 1 if track_id == "p1::track" else 2
+        # Whichever batch this submission belongs to must carry the same
+        # profile_id as the track it's actually downloading.
+        batch_id = submitted_args[0]
+        assert batch_map[batch_id]["profile_id"] == expected_profile
 
 
 def test_wishlist_albums_cycle_splits_into_per_album_batches():
@@ -439,7 +629,9 @@ def test_process_wishlist_automatically_returns_early_when_no_tracks_are_availab
     assert music_db.duplicate_removals == []
     assert guard_events == ["enter", "exit"]
     assert [kwargs.get("progress") for _args, kwargs in progress_calls if "progress" in kwargs] == [10]
-    assert any("No tracks in wishlist for auto-processing" in msg for msg in logger.warning_messages)
+    # an empty wishlist is routine, so it is said at info, not as a warning
+    assert any("No tracks in wishlist for auto-processing" in msg for msg in logger.info_messages)
+    assert not any("No tracks in wishlist" in msg for msg in logger.warning_messages)
 
 
 def test_process_wishlist_automatically_skips_when_wishlist_batch_is_already_active():

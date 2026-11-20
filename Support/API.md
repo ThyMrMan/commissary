@@ -8,7 +8,7 @@ SoulSync includes a full REST API at `/api/v1/` that lets you control everything
 
 Go to **Settings** in the SoulSync web UI and find the **SoulSync API** section. Click **Generate API Key**, give it a label, and copy the key immediately — it's only shown once.
 
-Alternatively, if no keys exist yet, use the bootstrap endpoint:
+Alternatively, if no keys exist yet, use the bootstrap endpoint. It needs no key, but only the admin may call it: on a single-profile install with no login or launch PIN that's any request, otherwise send your signed-in admin session cookie (or just use Settings).
 
 ```bash
 curl -X POST http://localhost:8008/api/v1/api-keys/bootstrap \
@@ -97,7 +97,7 @@ Keys are generated as `sk_` followed by a random token. Only the SHA-256 hash is
 
 ## Rate Limiting
 
-Requests are rate-limited to **60 per minute** per IP address.
+Requests with a valid API key are rate-limited to **600 per minute**, counted per key. Requests with no key or an invalid key are rate-limited to **60 per minute** per IP address.
 
 Exceeding the limit returns `429 RATE_LIMITED`.
 
@@ -123,6 +123,39 @@ SoulSync supports multiple user profiles. Profile-scoped endpoints (watchlist, w
 | Query  | `?profile_id=2` |
 
 If omitted, defaults to profile 1 (admin). Profile scoping applies to: watchlist, wishlist, and discovery endpoints.
+
+### What a member's session gets (web UI routes)
+
+What the server is doing is the admin's. A member's session is refused (`403`) these, and the web UI never asks:
+
+- `GET /api/system/stats` (downloads across the server, speed, uptime, memory) and its push, `dashboard:stats`, which only the admins' sockets get
+- `GET /api/repair/progress`, `GET /api/video/health`, `GET /api/video/bulk/status`
+- the enrichment workers, music and video: every `/api/enrichment/*` and `/api/video/enrichment/*` route (status, breakdown, unmatched, priority, pause, resume, retry), `GET /api/soulid/status`, `GET /api/hydrabase-worker/status`, and the `enrichment:<worker>` pushes, which only the admins' sockets get (`enrichment:repair` stays everyone's, the Tools page reads it)
+- the diagnostics: `GET /api/debug-info`, `GET /api/logs/tail`, `/api/settings/log-level`, `/api/help/health`, `/api/help/bundle`, `/api/help/logs*`
+- the spotify ban and the api rates: `GET /api/spotify/rate-limit-status`, `GET /api/rate-monitor/history/<service>`, and the `rate-monitor:update` push, which only the admins' sockets get
+
+Some answer a member with less instead of a `403`:
+
+- `GET /status` and the `status:update` push: a member's copy has no spotify ban (`rate_limited` false, `rate_limit` null, `post_ban_cooldown` 0) and no `enrichment`. The admins' sockets get the whole push, every member socket the trimmed one
+- `GET /api/database/stats` gives a member `artists`, `albums` and `tracks` of the library they browse, nothing else; the `dashboard:db_stats` push (size, path, scan times) only the admins' sockets get
+- `GET /api/video/dashboard` leaves `library.size_bytes` out for a member
+
+`GET /api/automations/progress` and the `automation:progress` push give a member the runs of their own automations only, never a system one.
+
+In the music library, `POST /api/library/v2/<entity>/<id>/search` (Automatic Search) and `/enhance` (Enhance Quality, Upgrade) download right away, so a profile that asks first is refused them; its way in is the Wishlist. `GET /api/library/v2/enabled` says what the caller may do: `can_wish`, `can_download`, and `can_grab` (an Interactive Search pick for a library row).
+
+### Approved requests that wait for a release pick (web UI routes)
+
+Each kind (music, movies, TV, audiobooks) can be set to have an admin pick the release instead of grabbing the best match. Everything starts on automatic. Music videos, YouTube videos and podcast episodes always download right away.
+
+- `GET /api/requests/acquisition`: `{modes: {music, movie, tv, audiobook}}`, each `auto` or `manual`, plus `may_change`. `PUT` (admin only) with `{modes: {movie: "manual"}}` changes the kinds it names; an unknown kind or mode is a `400`.
+- Every approve route takes `{"acquisition": "auto" | "manual"}` for that one request: `POST /api/requests/music/approve`, `POST /api/requests/media/<id>/approve` (books only, an episode is never held), `POST /api/video/requests/<id>/approve`. Approve all always uses the settings.
+- A held music request keeps its wishlist rows with `request_status = 'awaiting_selection'` and its history row in that status. A held book is a `media_requests` row in `awaiting_selection` and isn't on the wishlist yet. A held movie or episode is on the requester's wishlist with `awaiting_selection = 1`, its request row says `acquisition: "manual"`, and a held show doesn't join their watchlist. No automatic path takes a held row: the wishlist runs, retries, rss, search all and the download monitor's retries all leave it alone.
+- `GET /api/requests/awaiting` (admins, moderators): `{music: [groups], media: [books]}`, what the caller may pick (a moderator never their own). `GET /api/video/requests/awaiting`: `{titles: [{id, kind, tmdb_id, title, requesters, approved_at, seasons, downloading}]}`.
+- Music picks: `POST /api/requests/music/pick/inspect` `{profile_id, track_id}` streams every source's hits for one held track (searched as the requester), and `POST /api/requests/music/pick/download` `{profile_id, track_id, candidate, override?}` downloads that file into their library. The row stays held until the file lands, so a failed pick can be picked again.
+- Books: the release picker grabs with `POST /api/audiobooks/grab`, then `POST /api/requests/media/<id>/picked` moves the request on. Movies and TV: the video release picker's own `POST /api/video/downloads/grab`.
+- Download automatically instead: `POST /api/requests/music/awaiting/auto` `{profile_id, key}`, `POST /api/requests/media/<id>/auto`, `POST /api/video/requests/<id>/auto` (a show joins the watchlist then).
+- The requester's list says it too: music and book rows in status `awaiting_selection`, video rows with `awaiting_selection: true` (nothing picked yet) or `picking: true` (a picked release is downloading).
 
 ---
 
@@ -194,6 +227,40 @@ In the request app, set the Lidarr URL to `http://<host>:8008/lidarr` and paste 
 ### Supported routes
 
 All under `/lidarr/api/v1`: `system/status`, `qualityprofile`, `metadataprofile`, `rootfolder`, `tag`, `artist` (list, lookup, add, edit, editor, delete), `album` (list, lookup, add, edit, monitor, delete), `track`, `trackfile`, `command` (`AlbumSearch`, `ArtistSearch`, `RefreshArtist`; other commands are accepted and do nothing), `queue`, `history` and `wanted/missing`.
+
+---
+
+## Seerr compatible API
+
+Apps built for Seerr (Jellyseerr, Overseerr) can use SoulSync's video side instead. They browse and search through SoulSync's TMDB data, see what's already in your library, and their movie and show requests land on SoulSync's video wishlist. Built for **Litefin** and its Jellyfin plugin.
+
+### Turn it on
+
+Go to **Settings > System > SoulSync API > Seerr Compatible API**:
+
+1. Tick **Answer as Seerr at /seerr**. While it's off, every `/seerr` route answers `404`.
+2. Pick **Jellyfin users with no profile request as**.
+
+### Connect the app
+
+In the app, set the Seerr URL to `http://<host>:8008/seerr` and paste a SoulSync **admin** API key as the Seerr API key. For Litefin that's the **Seerr Integration** on the Litefin plugin's page in your Jellyfin dashboard. A read key gets `403`. The app talks to `/seerr/api/v1` like it would to a real Seerr.
+
+### Who asks
+
+Each Jellyfin user requests as the SoulSync profile that picked that Jellyfin user under **Settings > Connections**, else the profile with the same name, else the profile picked above. A profile without the video side can't request, and a kids profile can't request a title over its rating cap.
+
+### What happens
+
+- A profile that can download gets it straight away: a movie goes on its video wishlist, and for a show every aired episode of the seasons asked for that isn't in the library yet. Asking for the newest season also follows the show, so its next episodes come too.
+- A profile that can't download files a video request that waits on the **Requests** page. SoulSync requests pick a whole-show policy, so when the seasons asked for aren't all, the first or the newest, the request asks for every season and the note says which ones were picked. The admin can change it when approving.
+- Request limits apply like they do in SoulSync.
+- Cards show **Available** when it's in your library, **Partially available** for a show with episodes missing, **Processing** when it's on a wishlist, followed, approved or downloading, and **Pending** while a request waits. It's the same status the video pages show on their posters.
+- Asking for something already on its way answers `409`, like Seerr does for a duplicate.
+- Downloads use your normal quality profiles. There are no Radarr or Sonarr servers to pick and no separate 4K request.
+
+### Supported routes
+
+All under `/seerr/api/v1`: `status`, `auth/me`, `user`, `discover/trending`, `discover/movies` (plus `upcoming`, `studio`, `genre`), `discover/tv` (plus `upcoming`, `network`, `genre`), `discover/genreslider`, `search`, `movie` and `tv` (details, `similar`, `recommendations`), `person` (with `combined_credits`), `collection`, `request` (list, create, cancel) and `media`. Seerr's watch-later list, outside ratings and Radarr/Sonarr service lists answer empty, since SoulSync doesn't keep them.
 
 ---
 
@@ -1180,11 +1247,13 @@ List all watched artists for the current profile.
 | `include_albums` | bool | Monitor for new albums |
 | `include_eps` | bool | Monitor for new EPs |
 | `include_singles` | bool | Monitor for new singles |
-| `include_live` | bool | Include live recordings |
+| `include_live` | bool | Include live albums (concert recordings, unplugged sets) |
+| `include_live_tracks` | bool | Include a live version on any other release, like a live bonus track. Follows `include_live` until it is set once |
 | `include_remixes` | bool | Include remixes |
 | `include_acoustic` | bool | Include acoustic versions |
 | `include_compilations` | bool | Include compilations |
 | `follow_defaults` | bool | The artist uses the watchlist defaults. The `include_*` fields then show the defaults, which are the rules a scan applies |
+| `release_statuses` | string[]? | The MusicBrainz release statuses this artist lets through (`official`, `promotion`, `bootleg`, `pseudo-release`, `withdrawn`, `expunged`, `cancelled`). `null` = the library-wide list from the watchlist defaults |
 
 #### `POST /api/v1/watchlist`
 
@@ -1209,7 +1278,9 @@ Update content type filters for a watched artist without having to remove and re
 }
 ```
 
-Accepts any combination of: `include_albums`, `include_eps`, `include_singles`, `include_live`, `include_remixes`, `include_acoustic`, `include_compilations`, `follow_defaults`.
+Accepts any combination of: `include_albums`, `include_eps`, `include_singles`, `include_live`, `include_live_tracks`, `include_remixes`, `include_acoustic`, `include_compilations`, `follow_defaults`, `release_statuses`.
+
+`release_statuses` is a list of MusicBrainz statuses the artist lets through, or `null` to follow the library-wide list. A release group passes when any of its releases has one of them; a release from another source, or with no status, always passes. An empty list or an unknown status is a 400.
 
 Send `"follow_defaults": true` to put an artist back on the watchlist defaults. Sending release rules for an artist that follows the defaults gives it its own rules, starting from the defaults it was getting, so the fields you leave out keep the values a scan was already using.
 
@@ -1670,11 +1741,40 @@ Delete a profile and all its per-profile data (watchlist, wishlist, discovery po
 }
 ```
 
+#### Own library on Navidrome: `GET /api/profiles/me/navidrome-libraries`
+
+Session route (#2031). For the signed-in profile: `own_library` (the admin gave it a library of its own), `supported` (the active server can: Plex, Jellyfin, or Navidrome 0.58+), `message` (why not, or what is missing, e.g. no Navidrome login yet), `selected` (the picked library id) and `folders`: the Navidrome libraries the profile's own login sees (`getMusicFolders` as that user), each `{id, name, shared}`. `folders` is empty unless the profile has an own library on a supported server.
+
+The pick is saved with `POST /api/profiles/me/server-library` and `{"server_type": "navidrome", "library_id": "2"}`. The id must be one the profile's own login sees and not the shared library's folder; otherwise `400`. For Jellyfin, `{"server_type": "jellyfin", "user_id": "..."}` must name a user the Jellyfin server lists (`400` otherwise, `503` when it can't be checked) that no other profile already is (`409`). `POST /api/profiles/me/plex-home-user` likewise answers `409` for a Plex home user another profile is linked to.
+
+`GET /api/profiles` also returns `own_library_unsupported_reason` (null when own libraries work on the active server). Turning a profile to `library_mode: "own"` on Navidrome needs Navidrome 0.58+ and the shared library's music folder picked in Settings.
+
+#### What a profile shows: `GET` / `POST /api/profiles/me/features`
+
+Session routes (the signed-in browser, not an API key) behind **Customize** in the sidebar. Each profile hides the parts of SoulSync it doesn't use. This is a preference, not access: hidden pages still open from a link and their background jobs keep running. Page access stays with `allowed_pages`.
+
+`GET` returns `chosen` (false until this profile saves anything, which is when the sidebar offers the picker once), the list of features that can be hidden (`features`, each with `id`, `label`, `desc`, `group` and the page ids it owns), the `groups`, the `presets`, what is `off` for this profile, which `preset` that matches (`full`, `simple` or `custom`) and the resulting `hidden_pages`.
+
+`POST` takes one of:
+
+| Body | Effect |
+|------|--------|
+| `{"off": ["podcasts", "video"]}` | exactly these off, unknown ids dropped |
+| `{"preset": "simple"}` | `simple` (music, Discover, playlist sync and import) or `full` (everything) |
+| `{"purposes": ["music", "podcasts"]}` | what first-run setup asks; hides podcasts, audiobooks or video when they weren't picked |
+
+and answers with the same shape as `GET`. Admins also get `background`: for `podcasts` and `audiobooks`, whether their jobs are `paused` and whether `everyone_hid` them.
+
+`POST /api/profiles/me/features/background` (admin only) takes `{"feature": "podcasts", "paused": true}`. A paused part's scheduled and event automations are skipped only while every profile has it hidden (a profile that can't open the page counts as hidden); turning it back on for anyone resumes them. Run now still runs. The video side's jobs have their own master switch on the video Automations page. Feature ids: `discover`, `playlists`, `explorer`, `import`, `stats`, `music_videos`, `sample_studio`, `podcasts`, `audiobooks`, `video`, `video_discover`, `video_calendar`, `chat`, `automations`, `tools`. Search, library, watchlist, wishlist, downloads and settings can't be hidden, on either side.
+
 ---
 
 ### Retag Queue
 
 Browse and manage the retag queue — albums/tracks pending metadata corrections.
+The queue is the Library Re-tag job's pending findings: a group is an album with
+pending findings (`id` = the album's id), a track is one finding (`id` = the
+finding's id), and deleting a group dismisses its findings.
 
 #### `GET /api/v1/retag/groups`
 
@@ -1719,7 +1819,7 @@ List all retag groups with track counts. Groups are ordered by artist name (asce
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Group ID (auto-increment) |
+| `id` | int | Group ID (the album's id) |
 | `group_type` | string | Type of retag group (currently always `album`) |
 | `artist_name` | string | Artist name for this retag group |
 | `album_name` | string | Album name for this retag group |
@@ -1797,7 +1897,7 @@ Get a retag group with its full track list. Tracks are ordered by disc number th
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `id` | int | Track ID (auto-increment) |
+| `id` | int | Track ID (the Re-tag finding's id) |
 | `group_id` | int | Parent retag group ID (foreign key) |
 | `track_number` | int? | Track number on disc |
 | `disc_number` | int | Disc number (default 1) |
@@ -1806,11 +1906,11 @@ Get a retag group with its full track list. Tracks are ordered by disc number th
 | `file_format` | string? | Audio format (`flac`, `mp3`, `opus`, etc.) |
 | `spotify_track_id` | string? | Spotify track ID for metadata lookup |
 | `itunes_track_id` | string? | iTunes/Apple Music track ID for metadata lookup |
-| `created_at` | string | ISO 8601 timestamp when track was added to queue |
+| `created_at` | string | When the Re-tag finding was raised |
 
 #### `DELETE /api/v1/retag/groups/<group_id>`
 
-Delete a specific retag group and all its tracks (cascade delete).
+Dismiss a retag group: every pending Re-tag finding of that album.
 
 ```json
 {
@@ -1822,7 +1922,7 @@ Delete a specific retag group and all its tracks (cascade delete).
 
 #### `DELETE /api/v1/retag/groups`
 
-Clear all retag groups and tracks from the queue.
+Dismiss every pending Re-tag finding; the message counts the groups (albums) cleared.
 
 ```json
 {
@@ -2326,7 +2426,7 @@ Titles in the video library. `kind=movies|shows` (default `movies`), plus `searc
 
 #### `GET /api/v1/video/<kind>/<id>/library`
 
-What you own of one library movie or show (`kind=movie|show`, `id` is the library id). Every file with its resolution, quality, codecs, audio, size, runtime and path, whether SoulSync can reach it, the subtitles beside it and whether its name matches your naming template; the title's match (`tmdb_id`, `imdb_id`, `tvdb_id`, `fixed`); and the quality verdict against its profile. For a show, every season with `owned`, `missing`, `upcoming`, `size_bytes`, `res_mix` and `monitored`, plus the folders the show lives in. `?season=<n>` adds the disk checks (reachability, subtitles, naming) for that season's files; without it a show is a database read.
+What you own of one library movie or show (`kind=movie|show`, `id` is the library id). Every file with its resolution, quality, codecs, audio, size, runtime and path, whether SoulSync can reach it, the subtitles beside it and whether its name matches your naming template; the title's match (`tmdb_id`, `imdb_id`, `tvdb_id`, `fixed`); and the quality verdict against its profile. For a show, every season with `owned`, `missing`, `upcoming`, `size_bytes`, `res_mix` and `monitored`, plus the folders the show lives in (each with `root`, `name`, `files`, `size_bytes` and `main` on the fullest). `extra_copies` (`titles`, `files`, `size_bytes`) counts the copies beyond the best one of each movie or episode, a file SoulSync downloaded carries `source` (`release`, `via`, `indexer`, `at`), and `below_cutoff` marks a file under the profile's target. `?season=<n>` adds the disk checks (reachability, subtitles, naming) for that season's files; without it a show is a database read.
 
 #### `POST /api/v1/video/<kind>/<id>/identify`
 
@@ -2391,6 +2491,83 @@ Video downloads, active rows first then newest (the latest 100). `status` filter
 
 #### `GET /api/v1/video/downloads/history`
 
+#### Who may do what on the video downloads (web UI session API)
+
+- `GET /api/video/downloads/active`, `/downloads/history` and `/downloads/status?id=`: a member gets the grabs they started, an admin everyone's. Queue rows carry `can_cancel`.
+- `POST /api/video/downloads/cancel`: an admin any download, a member only one they started (`403` otherwise). An automatic grab has no owner, so it's the admin's.
+- `POST /downloads/clear`, `/downloads/remove`, `/downloads/recycle/restore`, `/downloads/recycle/purge`, `/downloads/history/clear`, `DELETE /downloads/history/{id}`, `POST /scan/request`, `/scan/stop`, `/scan/server`, and writes to `/discover/languages` and `/discover/providers-pref`: admin only.
+- `POST /youtube/follow`, `/youtube/playlist/follow`, `/youtube/subscriptions/import` and `/youtube/channel/{id}/settings`: need download rights.
+- A kids profile's rating cap holds on requests, wishlist and watchlist adds, manual search and grab, and the title reads (acquisition, history, title status, posters).
+- The video request limit counts every ask made in its window, so withdrawing or clearing one doesn't hand it back.
+
+#### Release ranking (web UI session API)
+
+The video search the web UI runs (`POST /api/video/downloads/search`, `/downloads/search/start` and `GET /downloads/search/poll`) returns each result with:
+
+- `breakdown`: every factor that scored it, `[{group, label, points}]`. `group` is `quality`, `formats` or `tiebreak`.
+- `rank`: the values it's compared on, best first: `[accepted, quality, formats, tiebreak, size_fit, availability, size_bytes]`. Results come back sorted by it, and the wishlist, RSS sync, upgrades and download retries sort by the same values.
+- `score` is still the total of the three groups, and `format_score` / `formats` are unchanged.
+
+A `query` in the search body (`/downloads/search/start`, `/downloads/search`) is run as typed on every source: one text search, no ids or structured search added. Leave it out for the usual search.
+
+The quality profile (`GET/POST /api/video/downloads/quality` and the named profiles) adds `preferred_movie_gb` and `preferred_episode_gb`: a tie-break, closer ranks higher, in tenths of a GB, `0` = off (the default), clamped to the max size.
+
+#### Video libraries (web UI session API, admin)
+
+Named movie and TV libraries, each with its own folder (#2029). The main and 4K folders are libraries too (`builtin` `main` / `4k`); their folders stay in the folder settings (`movies_path`, `movies_4k_path` + `movies_4k_enabled`, ...).
+
+- `GET /api/video/libraries/folders`: `{libraries: [...], genres: [...]}`. Each library: `id`, `kind` (`movie` / `show`), `name`, `path`, `builtin` (`main`, `4k` or null), `enabled`, `usable` (on and has a folder), `is_default`, `rules` (`{genres: [], keywords: []}`) and `options`. `genres` are the genre names your library knows, for the rule picker.
+- `POST /api/video/libraries/folders`: add one. Body: `{kind, name, path, rules?, enabled?, is_default?}`. `400` with a message for a missing name or folder, or a folder another library (or the anime / YouTube folder) already uses.
+- `PUT /api/video/libraries/folders/<id>`: change `name`, `rules`, `options`, and for a custom library `path` and `enabled`. A builtin's folder is changed in its own setting (`400`). `is_default: true` makes it the default.
+- `POST /api/video/libraries/folders/<id>/default`: the default for its kind (needs a folder and to be on).
+- `DELETE /api/video/libraries/folders/<id>`: remove a custom library. Its files stay; titles picked for it go back to the rules and the default; a removed default hands the kind to the main library. The builtins can't be removed (`400`).
+
+**The library manager** (admin, the web UI's own routes under `/api/video/manager`):
+
+- `GET /titles?kind=movies|shows&page=&limit=&sort=&dir=` and `GET /files`: one page of rows. Filters: `search`, `needs` (comma list of `missing`, `below_cutoff`, `copies`, `unmatched`, `no_subtitles`, `unprobed`, `unmonitored`, `unwatched`, `not_owned`), `status`, `monitored`, `locked`, `resolution`, `codec`, `hdr`, `audio_language`, `subtitle_language`, `drive`, `genre`, `video_library`, `quality_profile`, `year_from`, `year_to`. `GET /ids` returns every id the filters match, `GET /facets` what there is to filter by.
+- `GET /rename-preview`, `GET /delete-preview`, `GET /move-preview?kind=&ids=&library_id=`: what the operation would do. Nothing is changed.
+- `POST /api/video/bulk/start` body `{kind, ids, action, params}` runs one in the background; `GET /api/video/bulk/status` follows it. Actions: `monitored`, `watched`, `content_rating`, `genre_add`, `genre_remove`, `refresh_art`, `quality_profile`, `rename`, `wish` (`mode`: `missing` / `upgrade`), `subtitles`, `rematch`, `series_type`, `lock` (`value`: true / false), `move` (`library_id`), `delete` (`confirm`: the number of ids). The status carries `held` (padlocked titles left alone) and `batch` (the file changes of a rename or move, for undo).
+- `GET /history?kind=&id=&limit=&offset=`: file changes, newest first, for one title or all. `POST /history/<id>/undo` puts one back; `POST /history/undo-batch` body `{batch}` puts back a whole run. `409` with a plain reason when it can't be (the file moved on, the old path is taken, the recycle folder was emptied).
+- `GET /views` and `PUT /views` body `{views: [{name, state}]}`: the saved views.
+- `GET /libraries?kind=`: each usable library with `folders: [{path, primary, free_bytes}]`. A library can sit on many drives: the main library is its own folder plus the additional folders and the mapped server folders of its kind, its own folder first. `GET /move-preview` and the `move` action take `folder` (one of that library's folders, `409` otherwise) to move to that drive; without it the library's own folder is used.
+- `GET /move-preview` takes `by_hand=1`, and the `move` action takes `params.by_hand: true`, for one title moved from its own page: a padlock holds a sweep, not that.
+- `GET /episodes/<show_id>`: seasons, episodes and the files under each. `POST /renumber/<show_id>` body `{file_ids, season, start_episode, apply?}`: files the chosen files under consecutive episodes of that season. Without `apply` it answers with the plan.
+
+**Keeping a title current** (any profile that can see the title; `force` is admin only):
+
+- `POST /api/video/detail/<movie|show>/<id>/freshen` body `{force?}`: asks the sources whose answer has gone stale and returns `{changed, asked: [source...], notes: {source: reason}, gone, moved_to, sources: {server|metadata|ratings: {age_seconds, ttl_seconds, stale}}}`. `server` re-reads that one title from the media server (files, watch state), `metadata` asks the provider for what changes after a match, `ratings` asks for the scores. `changed` is true only when something the page shows moved. `gone` means the media server no longer has the title; nothing is removed (`POST .../sync` does that). `moved_to` is the title's new row when the server re-keyed it. A second call while one is running answers `running: true` and asks nothing.
+- `GET` on the same path: `{sources}` only.
+- Clocks: the server every 10 minutes; metadata daily and ratings every 3 days for a show that has not ended or a movie within 90 days of its release, otherwise 14 and 30 days. A source that could not answer waits out its clock, unless a library scan or a spent ratings quota was in the way.
+
+**Managing files from a title's page** (admin):
+
+- `GET /api/video/files/rename-preview?file_ids=1,2,3`: `{files, to_rename, already_named, unreachable, changes: [{file_id, current, expected}], more}`. Nothing is renamed.
+- `GET /api/video/files/delete-preview?file_ids=1,2,3`: `{files, size_bytes, unreachable, emptied, recycle, items: [{file_id, label, filename, size_bytes, reachable}], more}`. `emptied` is how many episodes or movies would be left with no copy. A file SoulSync can't reach is listed and is not counted as going.
+- `POST /api/video/files/bulk` body `{action: rename|delete, file_ids, kind, id?, stop_hunting?}`: answers with `batch` (what `POST /api/video/manager/history/undo-batch` puts back). With `stop_hunting` on a delete, the episodes left with no copy stop being monitored, and `unmonitored` says how many.
+- `POST /api/video/files/<id>/rename`, `/delete` (body `{stop_hunting?}`) and `/reassign` answer with `batch` too, when something changed that can be put back.
+- `POST /api/video/detail/show/<id>/episodes/monitor` body `{episode_ids, monitored}`: hunt, or stop hunting, a picked set of that show's episodes. `404` when none of them are that show's.
+- `POST /api/video/detail/<movie|show>/<id>/padlock` body `{locked}`: the padlock on one title. `GET /api/video/detail/<kind>/<id>/library` carries `locked`.
+
+Which library a new title files into: a library picked for the grab (`video_library_id` on `POST /api/video/downloads/grab` and the manual import), else one picked for the title, else the 4K library when its quality profile saves to 4K, else the first library whose rules match its genres or TMDB keywords (a keyword also matches inside its name), else the kind's default. The anime folder still takes anime shows unless a library was picked for the title.
+
+- `GET /api/video/downloads/quality/for` adds `libraries` (`[{id, name, builtin}]`, the usable ones of the title's kind), `library` (`{id, name, why}`, where it files now; `why` is `picked`, `assigned`, `profile`, `rule: ...` or `default`) and `library_assigned` (the title's own pick, `0` = none).
+- A library's `sources` (ordered, any of `soulseek`, `usenet`, `torrent`, `extto`; `[]` = the global order), `torrent_category` and `usenet_category` (`''` = the client's own; letters, digits, space, `.`, `_`, `-`, up to 64) set where its automatic searches look and the category its client jobs get.
+- A library's `indexer_ids` (Prowlarr indexer ids, `[]` = every one) limit its searches: the wishlist, search now, retries, manual search and RSS sync.
+- A library's `quality_profile_id` (on create / `PUT`, `0` = none) is the profile titles in it are judged by when they have none of their own, before the kind's default.
+- `POST /api/video/downloads/quality/copies` (admin): want a second copy of a movie in another library. Body: `{media_id, media_source, tmdb_id, library_id, title, year?, poster_url?, quality_profile_id?}`. Adds its own wishlist row there, judged by that library's default profile. `400` for the library the title already files into. `DELETE` with `{media_id, media_source, tmdb_id, library_id}` stops wanting it (`404` when there's no such copy). `GET /downloads/quality/for` lists a movie's `copies` as `[{library_id, name, wished, owned}]`.
+- Wishlist movie rows (`GET /api/video/wishlist?kind=movie`) carry `video_library_id` (null = the title's own row) and `video_library_name`. `POST /api/video/wishlist/remove`, `/wishlist/search` and `/wishlist/retry` take an optional `video_library_id` for a movie (`0` = the title's own row only); removing a copy's row stops wanting that copy. Left out, they act on every row as before.
+- A library's `auto_search` (default `true`; `false` = the drain and RSS sync skip its titles) and `upgrades` (default `true`; `false` = owned titles there aren't upgraded).
+- `GET /api/video/library/video-libraries`: `{libraries: [{id, name, kind}]}`, the usable ones, readable by any profile with video access (for the filters). `GET /api/video/library?kind=movies|shows&video_library=<id>` lists only titles whose files sit in that library. `GET /api/video/wishlist?kind=movie|show&video_library=<id>` lists only wishes that file there (a copy's library, else the title's pick, else where its last search filed it). `GET /api/video/downloads/active` rows carry `video_library_id` / `video_library_name` (by target folder).
+- `POST /api/video/downloads/quality/library` (admin): pick a title's library. Body: `{kind, media_id, media_source, tmdb_id, library_id}`, `library_id: 0` clears the pick. Answers with the same three fields.
+
+**Shelf Life** (admin only, every route under `/api/video/repair` is):
+
+- `POST /api/video/repair/shelf-life/plan` body `{target_gb?, ids?}`: the titles a cleanup would delete, lowest score first. With `target_gb` it stops once the total reaches it and never reaches over the line to make the number; with `ids` (finding ids) it plans exactly those. Every open finding is checked again as it plans (gathered and scored with the job's settings as they are now), and one that a gate holds or that no longer scores under today's threshold is left out. Answers `{items: [{id, kind, item_id, title, year, score, size_bytes}], total_bytes, target_bytes, short_bytes, candidates, skipped: [{id, title, year, reason}], threshold, enabled, recycling, keep_days, phrase}`. `score` is the fresh one and `size_bytes` is every copy the delete takes. While the job is switched off, `items` is empty and `error` says so. `400` for a `target_gb` that isn't a number over 0, or `ids` that isn't a list.
+- `POST /api/video/repair/shelf-life/delete` body `{ids, phrase}`: delete a batch in the background, each title through Delete Title (to the recycle bin). `phrase` must be exactly `delete N titles` (`delete 1 title` for one) with N the number of ids. Every id must be an open Shelf Life finding, the job must be on, and every title is checked again first: if any no longer holds, nothing starts and the `400` names each one and why. Answers `{started, total}`; follow it on `GET /api/video/repair/bulk-fix/status`. Right before each delete the server is asked again whether anyone is playing it.
+- `GET /api/video/repair/shelf-life/<movie|show>/<id>`: one title's stored result for its page: `{scored, score, gate, gate_text, reasons: [{signal, text}], scored_at, threshold, enabled, keep, can_keep}`. `404` when it isn't in the library.
+- `POST /api/video/repair/shelf-life/<movie|show>/<id>/keep` body `{keep: true|false}`: mark the title Keep (held by its TMDB id, so it survives a rescan) or take it off. Keep retires its open finding at once. `400` when `keep` isn't a boolean or the title has no TMDB match yet.
+- A single finding is approved with `POST /api/video/repair/findings/<id>/fix` body `{fix_action: "<the title, typed exactly>"}`. The generic bulk fix routes refuse a single `fix_action` for Shelf Life findings: one typed title never confirms more than one title.
+
 #### `GET /api/v1/video/calendar`
 
 Upcoming and recent episodes and releases. `start` and `end` as ISO dates.
@@ -2404,6 +2581,8 @@ For a calendar app, use the iCal feed instead: `GET /api/video/calendar/feed/<to
 File a request for an admin to approve. Body: `{"kind": "movie|show", "tmdb_id": 27205, "title": "Inception", "year"?: 2010, "note"?: "..."}`.
 
 #### `POST /api/v1/video/requests/<id>/approve`
+
+Optional body: `{"acquisition": "auto" | "manual"}` decides how this one gets its release. Left out, the kind's setting decides (see below). `manual` holds the request until someone picks a release. The answer says which way it went: `"acquisition": "auto" | "manual"`.
 
 #### `POST /api/v1/video/requests/<id>/deny`
 
@@ -2461,7 +2640,7 @@ Revoke an API key by its UUID.
 
 #### `POST /api/v1/api-keys/bootstrap`
 
-Generate the first API key when none exist. **No authentication required.** Returns `403` if keys already exist.
+Generate the first API key when none exist. No API key needed, but the caller must be the admin: a signed-in admin session, or any request on a single-profile install with no login or launch PIN. Returns `403` if keys already exist or the caller isn't the admin.
 
 ```json
 {
@@ -2753,4 +2932,4 @@ curl -H "Authorization: Bearer sk_..." \
 | GET | `/api-keys` | List API keys |
 | POST | `/api-keys` | Generate new key |
 | DELETE | `/api-keys/<id>` | Revoke key |
-| POST | `/api-keys/bootstrap` | Bootstrap first key (no auth) |
+| POST | `/api-keys/bootstrap` | Bootstrap first key (no key, admin only) |

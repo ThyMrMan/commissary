@@ -10,9 +10,146 @@ from datetime import datetime, timedelta
 from collections import Counter
 import random
 import json
+import threading
 from utils.logging_config import get_logger
 
 logger = get_logger("personalized_playlists")
+
+
+# "Do I already own this?" against Library v2 (docs §50.4.4.17).
+#
+# Legacy compared three plain columns. lib2 promotes only Spotify to a column of
+# its own and keeps every other provider in ``external_ids``, so two thirds of
+# this test became a JSON lookup. Written inline it would run ``json_extract``
+# over the whole track table once per discovery candidate — and this filter runs
+# *before* the LIMIT, so on a large library that is the whole table many times
+# over. ``AS MATERIALIZED`` pins it to one pass: the JSON is unpacked once into
+# a narrow three-column table the NOT EXISTS then scans.
+#
+# Ownership requires an active physical file; provenance alone must not hide a
+# missing/provider track from discovery. The column-name asymmetry survives on the
+# discovery side: ``discovery_pool.deezer_track_id``, not ``deezer_id``.
+_OWNED_PROVIDER_IDS_SQL = """
+                    SELECT t.spotify_id AS spotify_id,
+                           json_extract(t.external_ids, '$.itunes') AS itunes_id,
+                           json_extract(t.external_ids, '$.deezer') AS deezer_id
+                    FROM lib2_tracks t
+                    WHERE EXISTS (SELECT 1 FROM lib2_track_files f WHERE f.track_id=t.id
+                                  AND f.file_state='active' AND TRIM(f.path)<>'')
+                      AND (t.spotify_id IS NOT NULL OR t.external_ids NOT IN ('', '{}'))"""
+
+# the provider ids of every track you own, which every discover shelf leaves
+# out. building them walks the whole catalogue (~4s on a big library).
+#
+# they used to be kept in temp tables "per pooled connection", refilled after
+# five minutes. the pool drops a connection's temp tables when it is handed
+# back (database/connection_pool.py), so nothing was ever kept: every shelf of
+# every page load rebuilt them, 7-60s each on a busy 319k-track library, five
+# shelves at once (Nov 13 2026). what is kept now is the answer, once per
+# process: the ids of the pool rows you already own. a connection gets them
+# as one small temp table (~30ms) and the shelves leave those rows out.
+_OWNED_IDS_TTL = 300.0
+# a new file still rebuilds them, but not more than once a minute: during a
+# download run every file moved the stamp and every shelf paid a ~4s rebuild
+_OWNED_IDS_MIN_AGE = 60.0
+
+# the three id lists, as the old per-connection filter read them. a pool row
+# is owned when any of its three ids is in the matching list.
+_OWNED_BY_PROVIDER_ID = """
+        NOT ((discovery_pool.spotify_track_id IS NULL OR discovery_pool.spotify_track_id NOT IN (
+                  SELECT v FROM temp.owned_spotify))
+         AND (discovery_pool.itunes_track_id IS NULL OR discovery_pool.itunes_track_id NOT IN (
+                  SELECT v FROM temp.owned_itunes))
+         AND (discovery_pool.deezer_track_id IS NULL OR discovery_pool.deezer_track_id NOT IN (
+                  SELECT v FROM temp.owned_deezer)))"""
+
+_owned_pool_guard = threading.Lock()
+_owned_pool_builds: Dict[str, threading.Lock] = {}
+# database file -> (stamp, built at, ids of owned pool rows in order)
+_owned_pool_cache: Dict[str, Tuple[Any, float, Tuple[int, ...]]] = {}
+
+
+def clear_owned_pool_cache() -> None:
+    with _owned_pool_guard:
+        _owned_pool_cache.clear()
+
+
+def _owned_pool_stamp(conn) -> tuple:
+    """Moves when a file is added or the pool gains rows."""
+    return (conn.execute("SELECT MAX(id) FROM lib2_track_files").fetchone()[0],
+            conn.execute("SELECT MAX(id) FROM discovery_pool").fetchone()[0])
+
+
+def _build_owned_pool_ids(conn) -> Tuple[int, ...]:
+    """The ids of the discovery pool rows whose track is already owned."""
+    names = ('owned_spotify', 'owned_itunes', 'owned_deezer')
+    try:
+        conn.execute("DROP TABLE IF EXISTS temp.owned_all")
+        conn.execute(f"CREATE TEMP TABLE owned_all AS {_OWNED_PROVIDER_IDS_SQL}")
+        for name, column in zip(names, ('spotify_id', 'itunes_id', 'deezer_id'), strict=True):
+            conn.execute(f"CREATE TEMP TABLE IF NOT EXISTS {name} (v PRIMARY KEY) WITHOUT ROWID")
+            conn.execute(f"DELETE FROM temp.{name}")
+            # sorted: in-order inserts into the key's b-tree are ~3x cheaper
+            # than the catalogue's own order (0.7s against 2.2s for ~700k ids)
+            conn.execute(f"INSERT OR IGNORE INTO temp.{name} "
+                         f"SELECT DISTINCT {column} FROM temp.owned_all "
+                         f"WHERE {column} IS NOT NULL ORDER BY {column}")
+        return tuple(int(row[0]) for row in conn.execute(
+            f"SELECT discovery_pool.id FROM discovery_pool WHERE {_OWNED_BY_PROVIDER_ID} "
+            f"ORDER BY discovery_pool.id"))
+    finally:
+        for name in ('owned_all',) + names:
+            conn.execute(f"DROP TABLE IF EXISTS temp.{name}")
+
+
+def _owned_pool_ids(conn) -> Tuple[Any, Tuple[int, ...]]:
+    """(build token, ids): from the process cache while it is fresh, else
+    built once however many shelves ask at the same moment."""
+    import time as _time
+    db_file = str(conn.execute("PRAGMA database_list").fetchone()[2] or "")
+    if not db_file:  # an in-memory database is its connection: nothing to share
+        return object(), _build_owned_pool_ids(conn)
+    stamp = _owned_pool_stamp(conn)
+
+    def fresh(hit):
+        age = _time.monotonic() - hit[1]
+        return age < _OWNED_IDS_TTL and (hit[0] == stamp or age < _OWNED_IDS_MIN_AGE)
+
+    hit = _owned_pool_cache.get(db_file)
+    if hit is not None and fresh(hit):
+        return hit[1], hit[2]
+    with _owned_pool_guard:
+        building = _owned_pool_builds.setdefault(db_file, threading.Lock())
+    # one build at a time. while it runs, a shelf that has an older answer
+    # uses it; only the very first ask has to wait
+    if not building.acquire(blocking=hit is None):
+        return hit[1], hit[2]
+    try:
+        hit = _owned_pool_cache.get(db_file)
+        if hit is not None and fresh(hit):
+            return hit[1], hit[2]
+        ids = _build_owned_pool_ids(conn)
+        hit = (stamp, _time.monotonic(), ids)
+        _owned_pool_cache[db_file] = hit
+        return hit[1], hit[2]
+    finally:
+        building.release()
+
+
+def _ensure_owned_ids(conn) -> None:
+    """Fill temp.owned_pool on this connection with the ids of the discovery
+    pool rows the library already has."""
+    token, ids = _owned_pool_ids(conn)
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS owned_pool (id INTEGER PRIMARY KEY)")
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS owned_pool_version (token)")
+    current = conn.execute("SELECT token FROM temp.owned_pool_version").fetchone()
+    if current is not None and current[0] == token:
+        return  # a connection that was not handed back in between
+    conn.execute("DELETE FROM temp.owned_pool")
+    conn.executemany("INSERT OR IGNORE INTO temp.owned_pool VALUES (?)", ((i,) for i in ids))
+    conn.execute("DELETE FROM temp.owned_pool_version")
+    if isinstance(token, float):
+        conn.execute("INSERT INTO temp.owned_pool_version VALUES (?)", (token,))
 
 
 def _blocklist_profile() -> int:
@@ -55,6 +192,7 @@ def rank_library_genres(rows) -> List[Tuple[str, int]]:
             labels.setdefault(key, label)
             totals[key] += int(weight or 1)
     return [(labels[key], count) for key, count in totals.most_common()]
+
 
 class PersonalizedPlaylistsService:
     """Service for generating personalized playlists from library and discovery pool"""
@@ -198,6 +336,7 @@ class PersonalizedPlaylistsService:
                     if near_names else "0")
         try:
             with self.database._get_connection() as conn:
+                _ensure_owned_ids(conn)
                 ids = conn.execute(
                     f"""SELECT id, {near_sql} FROM discovery_pool
                         {self._POOL_WHERE}
@@ -292,27 +431,14 @@ class PersonalizedPlaylistsService:
         'source',
     )
 
-    # Note column-name asymmetry: discovery_pool.deezer_track_id but
-    # tracks.deezer_id. Don't refactor without checking.
-    #
-    # Split into three single-column NOT EXISTS checks (one per ID space)
-    # instead of one OR'd clause: SQLite cannot use an index for the OR'd
-    # correlated subquery and falls back to a full scan of `tracks` for every
-    # discovery_pool row, which pins the CPU for minutes on large pools (issue
-    # #1350). Each subquery is guarded by an IS NULL test on the pool side — a
-    # NULL ID can never match the original clause either (equality against
-    # NULL is never true), so this changes nothing semantically and skips the
-    # index probe entirely for rows without that ID.
+    # The pool rows the library already has, by row id (_ensure_owned_ids, run
+    # on the connection first). They are worked out once per process from three
+    # uncorrelated NOT IN lists, one per id space, instead of one OR'd
+    # correlated NOT EXISTS: SQLite cannot index the OR'd subquery and scans
+    # every owned row for every discovery_pool row, which pins the CPU for
+    # minutes on large pools (issue #1350).
     _OWNED_CLAUSE = """
-                  AND (discovery_pool.spotify_track_id IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM tracks t
-                      WHERE t.spotify_track_id = discovery_pool.spotify_track_id))
-                  AND (discovery_pool.itunes_track_id IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM tracks t
-                      WHERE t.itunes_track_id = discovery_pool.itunes_track_id))
-                  AND (discovery_pool.deezer_track_id IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM tracks t
-                      WHERE t.deezer_id = discovery_pool.deezer_track_id))"""
+                  AND discovery_pool.id NOT IN (SELECT id FROM temp.owned_pool)"""
 
     # the gate every pool read shares: this source, this profile's pool, a
     # usable id, no artist this profile blocked. params: (source, profile, profile)
@@ -406,6 +532,8 @@ class PersonalizedPlaylistsService:
             params = (source, profile, profile) + tuple(extra_params) + (fetch_limit,)
 
             with self.database._get_connection() as conn:
+                if exclude_owned:
+                    _ensure_owned_ids(conn)
                 cursor = conn.cursor()
                 cursor.execute(query, params)
                 rows = cursor.fetchall()
@@ -899,55 +1027,60 @@ class PersonalizedPlaylistsService:
             with self.database._get_connection() as conn:
                 cursor = conn.cursor()
 
-                # Try to get genres from tracks or albums
-                cursor.execute("PRAGMA table_info(tracks)")
-                columns = [row['name'] for row in cursor.fetchall()]
+                # lib2 keeps genres on the release, not the recording: a track
+                # inherits its album's list, which is where the importer and
+                # every provider worker write it (docs §50.4.4.17).
+                # Weighted by how many of your tracks each album holds.
+                cursor.execute("""
+                    SELECT al.genres AS genres, COUNT(t.id) AS weight
+                    FROM lib2_albums al
+                    JOIN lib2_tracks t ON t.album_id = al.id
+                    WHERE al.genres IS NOT NULL AND al.genres NOT IN ('', '[]')
+                      AND EXISTS (SELECT 1 FROM lib2_track_files f WHERE f.track_id=t.id
+                                  AND f.file_state='active' AND TRIM(f.path)<>'')
+                    GROUP BY al.id
+                """)
 
-                if 'genres' in columns:
-                    # Get genres directly from tracks
-                    cursor.execute("""
-                        SELECT genres, 1 AS weight FROM tracks WHERE genres IS NOT NULL
-                    """)
-                    ranked = rank_library_genres(
-                        (row['genres'], row['weight']) for row in cursor.fetchall())
-                    if ranked:
-                        return ranked[:limit]
+                ranked = rank_library_genres(
+                    (row['genres'], row['weight']) for row in cursor.fetchall())
+                if ranked:
+                    return ranked[:limit]
 
-                # tracks has no genres column on real installs, the genres live
-                # on artists. weight each artist's genres by how many of your
-                # tracks they have. before this it jumped straight to artist
-                # names, and get_genre_playlist then searched the discovery
-                # pool for a *genre* called "Louis Armstrong": every Daily Mix
-                # came back empty.
-                cursor.execute("PRAGMA table_info(artists)")
-                artist_columns = [row['name'] for row in cursor.fetchall()]
-                if 'genres' in artist_columns:
-                    cursor.execute("""
-                        SELECT ar.genres AS genres, COUNT(t.id) AS weight
-                        FROM tracks t
-                        JOIN artists ar ON t.artist_id = ar.id
-                        WHERE ar.genres IS NOT NULL AND ar.genres NOT IN ('', '[]')
-                        GROUP BY ar.id
-                    """)
-                    ranked = rank_library_genres(
-                        (row['genres'], row['weight']) for row in cursor.fetchall())
-                    if ranked:
-                        return ranked[:limit]
+                # no album carries genres yet: the artists' genres, weighted by
+                # how many of your tracks they have. Jumping straight to artist
+                # names made get_genre_playlist search the discovery pool for a
+                # *genre* called "Louis Armstrong": every Daily Mix came back
+                # empty.
+                cursor.execute("""
+                    SELECT ar.genres AS genres, COUNT(t.id) AS weight
+                    FROM lib2_tracks t
+                    JOIN lib2_albums al ON al.id = t.album_id
+                    JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                    WHERE ar.genres IS NOT NULL AND ar.genres NOT IN ('', '[]')
+                      AND EXISTS (SELECT 1 FROM lib2_track_files f WHERE f.track_id=t.id
+                                  AND f.file_state='active' AND TRIM(f.path)<>'')
+                    GROUP BY ar.id
+                """)
+                ranked = rank_library_genres(
+                    (row['genres'], row['weight']) for row in cursor.fetchall())
+                if ranked:
+                    return ranked[:limit]
 
                 # last resort, no genre data anywhere: artist names as categories
                 logger.warning("No genre data in library - using top artists as categories")
                 cursor.execute("""
-                    SELECT ar.name, COUNT(*) as count
-                    FROM tracks t
-                    LEFT JOIN artists ar ON t.artist_id = ar.id
-                    WHERE ar.name IS NOT NULL
+                    SELECT ar.name AS name, COUNT(*) AS count
+                    FROM lib2_tracks t
+                    JOIN lib2_albums al ON al.id = t.album_id
+                    JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                    WHERE ar.name IS NOT NULL AND ar.name != ''
+                      AND EXISTS (SELECT 1 FROM lib2_track_files f WHERE f.track_id=t.id
+                                  AND f.file_state='active' AND TRIM(f.path)<>'')
                     GROUP BY ar.name
                     ORDER BY count DESC
                     LIMIT ?
                 """, (limit,))
-
-                rows = cursor.fetchall()
-                return [(row['name'], row['count']) for row in rows]
+                return [(row['name'], row['count']) for row in cursor.fetchall()]
 
         except Exception as e:
             logger.error(f"Error getting top genres: {e}")
@@ -1100,7 +1233,7 @@ class PersonalizedPlaylistsService:
         1. Get similar artists for each seed artist (max 25 total)
         2. Get albums from those similar artists
         3. Select 20 random albums
-        4. Build playlist from tracks in those albums (max 50 tracks)
+        4. Build the playlist out of those albums' tracks (max 50)
 
         Args:
             seed_artist_ids: List of 1-5 artist IDs (Spotify or iTunes)
@@ -1228,7 +1361,7 @@ class PersonalizedPlaylistsService:
 
             logger.info(f"Selected {len(selected_albums)} random albums")
 
-            # Step 4: Build playlist from tracks in those albums
+            # Step 4: Build the playlist out of those albums' tracks
             all_tracks = []
             if use_spotify:
                 for album in selected_albums:

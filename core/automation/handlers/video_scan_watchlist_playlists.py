@@ -116,6 +116,12 @@ def _profile() -> int:
 
 def _default_fetch_playlists() -> List[Dict[str, Any]]:
     from api.video import get_video_db
+    from core.owner_gate import OwnerGate
+    # a followed playlist wishes new videos to download, so a profile with
+    # downloads off has nothing to scan for (asked each pass)
+    if not OwnerGate(_profile(), label="playlist scan").may_youtube():
+        logger.info("playlist scan: profile %s may not get new uploads, skipped", _profile())
+        return []
     return get_video_db().list_watchlist_playlists(profile_id=_profile())
 
 
@@ -193,7 +199,7 @@ def _default_add_videos(playlist: Dict[str, Any], videos: List[Dict[str, Any]]) 
     from api.video import get_video_db
     from core.video.sources import resolve_video_server
     return get_video_db().add_videos_to_wishlist(
-        playlist, videos, server_source=resolve_video_server(), profile_id=_profile())
+        playlist, videos, server_source=resolve_video_server(), profile_id=_profile(), auto=True)
 
 
 def auto_video_scan_watchlist_playlists(

@@ -5,15 +5,15 @@ without booting the Flask app, Spotify client, Soulseek connection, etc.
 
 Two concepts live here:
 
-  * ``SOURCE_ID_FIELD`` — the per-source column on the ``artists`` table that
-    stores the external service ID (Spotify track ID, Deezer artist ID, …).
-    This map is what ties a result clicked in the source-aware Search results
-    back to a library record so we can serve the richer library view.
+  * ``SOURCE_ID_FIELD`` — the field name each source's external service ID
+    (Spotify artist ID, Deezer artist ID, …) travels under. It names the
+    sources eligible for a library upgrade, and it is the key the source-only
+    artist payload stamps its id under so the right service badge renders.
 
   * ``find_library_artist_for_source`` — given a source-aware click (e.g.
     ``deezer:525046``), try to locate a matching library artist. First by
-    direct column match against the source's ID column, then by case-
-    insensitive name match scoped to the active media server.
+    direct match against wherever the catalogue keeps that source's id, then
+    by folded name match scoped to the active media server.
 """
 
 from __future__ import annotations
@@ -63,18 +63,30 @@ def find_library_artist_for_source(
 
     Returns ``None`` on miss or on any database error.
     """
-    column = SOURCE_ID_FIELD.get(source)
-    if not column:
+    from core.library2.provider_ids import indexed_provider_id_sql
+
+    if source not in SOURCE_ID_FIELD:
+        return None
+    # the indexed form: the bare json_extract scanned every artist per click
+    # and never matched an id stored as a JSON number
+    id_expression = indexed_provider_id_sql(source, alias="a")
+    if not id_expression:
         return None
 
     try:
         with database._get_connection() as conn:
             cursor = conn.cursor()
-            scope_sql, scope_params = database._current_scope_sql()
             # LIMIT 2 so we can tell a unique match from an ambiguous one.
+            # only an artist of the caller's library is theirs to open
+            # (#1199). filtered BEFORE the LIMIT 2: two libraries each holding
+            # the artist are not a corrupt mapping, as the 3.6.1 query (scoped
+            # the same way) knew
+            from core.library2.sql_util import scope_visibility_sql
+            visible = scope_visibility_sql("artist", "a")
             cursor.execute(
-                f"SELECT id FROM artists WHERE {column} = ? AND {scope_sql} LIMIT 2",
-                (str(source_artist_id), *scope_params),
+                f"SELECT a.id FROM lib2_artists a WHERE {id_expression} = ?"
+                f"{(' AND ' + visible) if visible else ''} LIMIT 2",
+                (str(source_artist_id),),
             )
             rows = cursor.fetchall()
             if len(rows) == 1:
@@ -90,10 +102,22 @@ def find_library_artist_for_source(
                 )
 
             if artist_name and active_server:
+                from core.library2.importer import normalize_name
+                from core.library2.sql_util import scope_visibility_sql
+
+                # `name_key` is the stored casefold. SQLite's LOWER() only
+                # folds A-Z, so a searched "björk" never met a stored "Björk".
+                # the caller's library is filtered before LIMIT 1, as 3.6.1
+                # did: another library's same-named artist must not take the
+                # one slot and hide this profile's own
+                visible = scope_visibility_sql("artist", "a")
                 cursor.execute(
-                    "SELECT id FROM artists "
-                    f"WHERE LOWER(name) = LOWER(?) AND server_source = ? AND {scope_sql} LIMIT 1",
-                    (artist_name, active_server, *scope_params),
+                    "SELECT a.id FROM lib2_artists a "
+                    "WHERE a.name_key = ? AND (a.server_source = ? OR EXISTS ("
+                    "SELECT 1 FROM lib2_media_server_mappings m "
+                    "WHERE m.entity_type='artist' AND m.entity_id=a.id "
+                    f"AND m.server_source=?)){(' AND ' + visible) if visible else ''} LIMIT 1",
+                    (normalize_name(artist_name), active_server, active_server),
                 )
                 row = cursor.fetchone()
                 if row:

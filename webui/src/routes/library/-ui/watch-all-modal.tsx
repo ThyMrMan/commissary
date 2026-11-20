@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
+import { useModalA11y } from '@/components/dialog/use-modal-a11y';
+
 import type { WatchAllArtist, WatchAllResult } from '../-library.watch-all';
 
 import {
@@ -9,10 +11,23 @@ import {
 } from '../-library.watch-all';
 
 /**
- * Watch All Unwatched (openWatchAllUnwatchedModal, library.js:15): loads every
- * unwatched artist (paginated with a live count), splits ready-to-watch from
- * no-provider-id, then one confirm adds them all. Closing after a successful
- * add announces `ss:library-changed` so the React list refreshes.
+ * Monitor All Unmonitored (openWatchAllUnwatchedModal, library.js:15): loads
+ * every unmonitored artist (paginated with a live count), splits
+ * ready-to-monitor from no-provider-id, then a confirmed action adds them all.
+ * Closing after a successful add announces `ss:library-changed` so the React
+ * list refreshes.
+ *
+ * "Watch" is the word for it, dev's Watchlist. The feature, the API
+ * (`/api/library/watchlist-all-unwatched`), the tables and every identifier
+ * below stay `watchlist`/`watch` -- renaming those would be a migration, and
+ * the Watchlist page still calls itself that. Only what the user reads on this
+ * page changes.
+ *
+ * The confirm is deliberately TWO clicks. It is a single irreversible action
+ * over the entire library -- potentially thousands of artists, each of which
+ * then starts fetching discographies -- sitting next to Automatic Search in
+ * the header, so a mis-click has to be impossible rather than merely unlikely.
+ * The first click arms; the second fires; anything else disarms.
  */
 export function WatchAllModal({ onClose }: { onClose: () => void }) {
   const sourceName = window.currentMusicSourceName || 'Spotify';
@@ -20,12 +35,14 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
   const [data, setData] = useState<{
     eligible: WatchAllArtist[];
     ineligible: WatchAllArtist[];
+    otherSource: number;
   } | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [filter, setFilter] = useState('');
   const [ineligibleOpen, setIneligibleOpen] = useState(false);
   const [adding, setAdding] = useState(false);
   const [result, setResult] = useState<WatchAllResult | null>(null);
+  const [armed, setArmed] = useState(false);
   const [retrySeq, setRetrySeq] = useState(0);
   const openRef = useRef(true);
 
@@ -54,14 +71,25 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
     onClose();
   };
 
+  // Escape must DISARM before it closes: arming is the safety step, so the
+  // reflex "press Escape to back out" has to undo it rather than skip past it.
+  const a11yRef = useModalA11y<HTMLDivElement>(() => {
+    if (armed && !result) setArmed(false);
+    else close();
+  });
+
   const confirm = async () => {
     if (!data || adding) return;
+    if (!armed) {
+      setArmed(true);
+      return;
+    }
     setAdding(true);
     try {
       setResult(await watchAllUnwatchedRequest());
     } catch (error) {
       console.error('Error in watch all:', error);
-      window.showToast?.('Failed to add artists to watchlist', 'error');
+      window.showToast?.('Could not add these artists to your Watchlist', 'error');
       setAdding(false);
     }
   };
@@ -75,18 +103,26 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
     <div
       id="watch-all-modal-overlay"
       className="modal-overlay"
+      role="presentation"
       onClick={(e) => {
         if (e.target === e.currentTarget) close();
       }}
     >
-      <div className="watch-all-modal">
+      <div
+        ref={a11yRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Add every artist to your Watchlist"
+        className="watch-all-modal"
+      >
         <div className="watch-all-header">
           <div className="watch-all-header-content">
             <div className="watch-all-header-icon">👁</div>
             <div>
               <h2 className="watch-all-title">Watch All Unwatched</h2>
               <p className="watch-all-subtitle">
-                Add unwatched artists with {sourceName} IDs to your watchlist
+                Add every unwatched artist that has a provider ID to your Watchlist
               </p>
             </div>
           </div>
@@ -99,11 +135,11 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
             <div className="watch-all-results">
               <div className="watch-all-results-icon">✓</div>
               <div className="watch-all-results-title">
-                Added {result.added} artist{result.added !== 1 ? 's' : ''} to watchlist
+                Added {result.added} artist{result.added !== 1 ? 's' : ''} to your Watchlist
               </div>
               {result.skipped_already > 0 ? (
                 <div className="watch-all-results-detail">
-                  {result.skipped_already} already watched
+                  {result.skipped_already} already on it
                 </div>
               ) : null}
               {result.skipped_no_id > 0 ? (
@@ -138,7 +174,7 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
           ) : data.eligible.length === 0 && data.ineligible.length === 0 ? (
             <div className="watch-all-empty-state">
               <div className="watch-all-empty-icon">🎵</div>
-              <div>No unwatched artists found</div>
+              <div>Every artist is already on your Watchlist</div>
             </div>
           ) : (
             <>
@@ -149,7 +185,7 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
                 </div>
                 <div className="watch-all-stat-card ineligible">
                   <div className="watch-all-stat-value">{data.ineligible.length}</div>
-                  <div className="watch-all-stat-label">No {sourceName} ID</div>
+                  <div className="watch-all-stat-label">No provider ID</div>
                 </div>
                 <div className="watch-all-stat-card total">
                   <div className="watch-all-stat-value">
@@ -158,6 +194,13 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
                   <div className="watch-all-stat-label">Total unwatched</div>
                 </div>
               </div>
+
+              {data.otherSource > 0 ? (
+                <div className="watch-all-empty-hint">
+                  {data.otherSource} of them {data.otherSource === 1 ? 'uses' : 'use'} another
+                  source&apos;s ID, not {sourceName}&apos;s
+                </div>
+              ) : null}
 
               {data.eligible.length > 10 ? (
                 <div className="watch-all-search-wrap">
@@ -184,7 +227,7 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
               ) : (
                 <div className="watch-all-empty-state">
                   <div className="watch-all-empty-icon">🔌</div>
-                  <div>None of your unwatched artists have a {sourceName} ID yet</div>
+                  <div>None of the artists off your Watchlist have a provider ID yet</div>
                   <div className="watch-all-empty-hint">
                     The background enrichment worker will match them over time.
                   </div>
@@ -201,14 +244,14 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
                       <span className="watch-all-ineligible-icon">⚠</span>
                       <span>
                         {data.ineligible.length} artist
-                        {data.ineligible.length !== 1 ? 's' : ''} without {sourceName} ID
+                        {data.ineligible.length !== 1 ? 's' : ''} without a provider ID
                       </span>
                     </div>
                     <span className="watch-all-chevron">▼</span>
                   </div>
                   <div className="watch-all-ineligible-body">
                     <div className="watch-all-ineligible-hint">
-                      These artists haven't been matched to {sourceName} yet. The background
+                      These artists haven't been matched to any source yet. The background
                       enrichment worker will match them over time.
                     </div>
                     <div className="watch-all-grid" id="watch-all-ineligible-grid">
@@ -223,12 +266,22 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
           )}
         </div>
         <div className="watch-all-footer">
-          <button className="watch-all-btn watch-all-btn-cancel" type="button" onClick={close}>
-            {result ? 'Close' : 'Cancel'}
+          {armed && !result ? (
+            <span className="watch-all-confirm-hint" role="status">
+              This adds {data?.eligible.length ?? 0} artists to your Watchlist at once. Click again
+              to confirm.
+            </span>
+          ) : null}
+          <button
+            className="watch-all-btn watch-all-btn-cancel"
+            type="button"
+            onClick={() => (armed && !result ? setArmed(false) : close())}
+          >
+            {result ? 'Close' : armed ? 'Back' : 'Cancel'}
           </button>
           {!result ? (
             <button
-              className="watch-all-btn watch-all-btn-primary"
+              className={`watch-all-btn watch-all-btn-primary${armed ? ' armed' : ''}`}
               id="watch-all-confirm-btn"
               type="button"
               disabled={!data || data.eligible.length === 0 || adding}
@@ -236,9 +289,11 @@ export function WatchAllModal({ onClose }: { onClose: () => void }) {
             >
               {adding
                 ? 'Adding...'
-                : data && data.eligible.length > 0
-                  ? `Watch All (${data.eligible.length})`
-                  : 'Watch All'}
+                : !data || data.eligible.length === 0
+                  ? 'Watch All'
+                  : armed
+                    ? `Yes, watch ${data.eligible.length}`
+                    : `Watch All (${data.eligible.length})`}
             </button>
           ) : null}
         </div>

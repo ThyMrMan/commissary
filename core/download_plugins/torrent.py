@@ -48,11 +48,12 @@ Limitations:
 
 from __future__ import annotations
 
-import asyncio
+from core.async_utils import run_blocking
 import re
 import threading
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -121,6 +122,12 @@ _FILENAME_SEP = '||'
 # fetched from the URL, and fall back to the magnet only if that fetch fails
 # (#1139). A control character no URL can contain keeps the split unambiguous.
 _CANDIDATE_SEP = '\x1f'
+
+
+def _cancel_requested(row: Optional[Dict[str, Any]]) -> bool:
+    """a gone row or a cancel asked for (review 5 W2-WC-5, as usenet does)"""
+    return row is None or bool(row.get('cancel_requested')) \
+        or row.get('state') == 'Cancelled'
 
 
 def _encode_candidate(download_url: str, magnet: Optional[str]) -> str:
@@ -212,7 +219,10 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         results = await prowlarr_track_search(
             self._prowlarr, query, "torrent", timeout=timeout,
         )
-        return self._project_results(results)
+        # off the shared loop: projecting writes two candidate-store rows per
+        # release (a SQLite transaction each), and ~100 releases of that on
+        # the loop thread stalled every page and worker waiting on it
+        return await run_blocking(self._project_results, results)
 
     def _project_results(
         self, results: List[ProwlarrSearchResult], *, release_evidence=None
@@ -243,12 +253,24 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             # The filename crosses to the browser in search responses and
             # comes back on grab. Indexer URLs can carry API keys / signed
             # params, so only an opaque server-side token travels (P0-03).
-            token = get_candidate_store().put(
+            # Ours: a token is bound to the result KIND it was minted for, so
+            # a track candidate cannot be grabbed as an album. Upstream's
+            # delta ported onto both: the indexer's categories travel with the
+            # candidate, because `evaluate_release` judges on that evidence
+            # before it falls back to parsing the title.
+            candidate_metadata = {'categories': list(evidence.categories or []),
+                                  'release_title': evidence.title}
+            track_token = get_candidate_store().put(
                 _encode_candidate(download_url, result.magnet_uri),
-                metadata={'categories': list(evidence.categories or []),
-                          'release_title': evidence.title},
+                result_kind="track",
+                metadata=candidate_metadata,
             )
-            filename = f"{token}{_FILENAME_SEP}{result.title}"
+            album_token = get_candidate_store().put(
+                _encode_candidate(download_url, result.magnet_uri),
+                result_kind="album",
+                metadata=candidate_metadata,
+            )
+            filename = f"{track_token}{_FILENAME_SEP}{result.title}"
             audio_quality = audio_quality_from_release(
                 evidence.title,
                 evidence.categories,
@@ -273,8 +295,11 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                 # Pre-fill artist + title so TrackResult.__post_init__
                 # doesn't auto-parse the filename — our filename starts
                 # with the indexer download URL, which would otherwise
-                # show up as "by download?apikey=..." in the UI.
-                artist=parsed_artist or result.indexer_name or 'Torrent',
+                # show up as "by download?apikey=..." in the UI. The
+                # indexer (e.g. "NZBGeek") is metadata about WHERE the
+                # result came from, never a substitute artist name — it
+                # only ever goes into _source_metadata below.
+                artist=parsed_artist or 'Unknown Artist',
                 title=parsed_title or result.title,
                 album=parsed_title or None,
                 track_number=None,
@@ -301,6 +326,8 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                 for source in self._project_results([raw], release_evidence=evidence)[0]
             ]
             tracks.append(tr)
+            album_track = replace(
+                tr, filename=f"{album_token}{_FILENAME_SEP}{result.title}")
             albums.append(AlbumResult(
                 username='torrent',
                 album_path=f"torrent/{result.guid}",
@@ -308,7 +335,7 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
                 artist=parsed_artist or None,
                 track_count=1,    # unknown until download finishes
                 total_size=result.size,
-                tracks=[tr],
+                tracks=[album_track],
                 dominant_quality=quality,
                 year=None,
             ))
@@ -399,6 +426,9 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         if adapter is None or not adapter.is_configured():
             self._mark_error(download_id, "No torrent client configured")
             return
+        # the same dict the cancel marks, kept even if the ui drops the row
+        with self._lock:
+            submission_row = self.active_downloads.get(download_id) or {}
 
         try:
             from core.torrent_clients.base import ReleaseRejected, add_torrent_smart
@@ -435,9 +465,21 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 
         with self._lock:
             row = self.active_downloads.get(download_id)
-            if row is not None:
+            cancelled = _cancel_requested(row)
+            if not cancelled:
                 row['torrent_hash'] = torrent_hash
                 row['state'] = 'InProgress, Downloading'
+        if cancelled:
+            # review 5 W2-WC-5: cancelled while the add was in flight, so the
+            # cancel had no hash to remove. retire the late torrent here
+            try:
+                run_async(adapter.remove(
+                    torrent_hash,
+                    delete_files=bool(submission_row.get('cancel_remove_files', row is None))))
+            except Exception as e:
+                logger.warning("Torrent late-cancel cleanup on %s failed: %s",
+                               torrent_hash[:8], e)
+            return
 
         deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
         last_save_path: Optional[str] = None
@@ -454,6 +496,9 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         while time.monotonic() < deadline:
             if self.shutdown_check and self.shutdown_check():
                 return
+            with self._lock:
+                if _cancel_requested(self.active_downloads.get(download_id)):
+                    return
             try:
                 status = run_async(adapter.get_status(torrent_hash))
             except Exception as e:
@@ -474,12 +519,15 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
 
             with self._lock:
                 row = self.active_downloads.get(download_id)
+                if _cancel_requested(row):
+                    # cancelled while this poll was out: never back to life
+                    return
                 if row is not None:
                     row['progress'] = status.progress * 100.0
                     row['transferred'] = status.downloaded
                     row['speed'] = status.download_speed
                     row['size'] = status.size or row.get('size', 0)
-                    row['state'] = _adapter_state_to_display(status.state)
+                    row['state'] = _poll_display_state(status.state)
                     row['error'] = status.error
             if status.save_path:
                 last_save_path = status.save_path
@@ -601,6 +649,8 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         completed_hash = None
         with self._lock:
             row = self.active_downloads.get(download_id)
+            if _cancel_requested(row):
+                return
             if row is not None:
                 row['state'] = 'Completed, Succeeded'
                 row['progress'] = 100.0
@@ -621,7 +671,8 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         logger.error("Torrent download %s failed: %s", download_id[:8], message)
         with self._lock:
             row = self.active_downloads.get(download_id)
-            if row is not None:
+            # a cancelled row stays cancelled (review 5 W2-WC-5)
+            if row is not None and not _cancel_requested(row):
                 row['state'] = 'Completed, Errored'
                 row['error'] = message
                 row['failure_kind'] = failure_kind
@@ -687,6 +738,12 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         with self._lock:
             row = self.active_downloads.get(download_id)
             torrent_hash = row.get('torrent_hash') if row else None
+            if row is not None and not str(row.get('state', '')).startswith('Completed'):
+                # review 5 W2-WC-5: a cancel before the client returned the
+                # hash removes nothing here; the worker retires the late
+                # torrent and stops polling when it sees this
+                row['cancel_requested'] = True
+                row['cancel_remove_files'] = remove
             # an errored row was already dealt with in the client when it gave
             # up: removed (abandon) or paused (pause, "leave it for me"). the
             # monitor cancels errored rows before retrying, and that used to
@@ -726,7 +783,6 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
         progress_callback=None,
         quality_profile_id=None,
         expected_duration_seconds=None,
-        preferred_release=None,  # Commissary: a release picked by hand
     ) -> Dict[str, Any]:
         """One-shot album download: search Prowlarr for the whole
         release, pick the best torrent, fetch it, extract if needed,
@@ -806,14 +862,6 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             fallback_enabled=fallback_enabled,
             expected_duration_seconds=expected_duration_seconds,
         )
-        # Commissary: the release chosen in the album release picker - that one
-        # or none, never a different one (core/commissary/release_picker.py)
-        if preferred_release:
-            from core.commissary.release_picker import PIN_GONE, pick_pinned
-            picked = pick_pinned('torrent', candidates, preferred_release)
-            if picked is None:
-                result['error'] = PIN_GONE
-                return result
         if picked is None:
             # No candidate matched the requested album, or none had a live
             # swarm. Fall back to the per-track flow rather than downloading a
@@ -996,8 +1044,14 @@ class TorrentDownloadPlugin(DownloadSourcePlugin):
             return result
         logger.info("[Torrent album] Staged %d audio files for '%s'", len(copied), album_name)
         _emit('staged', count=len(copied))
+        # review 5 W2-WC-6: album torrents get the seed policy too (client
+        # share limits or the seeding sweep), like every per-track torrent.
+        # without it they seeded forever whatever goals the user set
+        self._apply_seed_policy(torrent_id, torrent_name or picked.title)
         result['success'] = True
         result['files'] = copied
+        result['client_job_id'] = torrent_id
+        result['client_job_label'] = picked.title
         return result
 
 
@@ -1267,6 +1321,10 @@ async def prowlarr_track_search(
     artist = str(hint.get('artist') or '').strip()
     album = str(hint.get('album') or '').strip()
     title = str(hint.get('title') or '').strip()
+    if hint.get('catalogue_context') and not hint.get('_catalogue_hydrated'):
+        from core.library2.download_catalogue import hydrate_download_album
+        await run_blocking(hydrate_download_album, hint['catalogue_context'])
+        hint['_catalogue_hydrated'] = True
     additional = []
     if artist and album and album.casefold() not in ('unknown album', title.casefold()):
         additional.append(f"{artist} {album}")
@@ -1487,6 +1545,23 @@ def _adapter_state_to_display(state: str) -> str:
         'error':       'Completed, Errored',
     }
     return mapping.get(state, state.title())
+
+
+def _poll_display_state(state: str) -> str:
+    """What a poll of the client may write on the row.
+
+    A poll never announces completion. "Completed, Succeeded" is the download
+    monitor's cue to start post-processing, and that needs the row's
+    ``audio_files``, which only ``_finalize_download`` fills in. A torrent the
+    client already holds complete is adopted and reads "seeding" on the very
+    first poll: written straight through, the monitor picked the row up in the
+    gap before the files were collected, found none, and failed the track with
+    "No matching audio file found in torrent release", on every retry (#2064).
+    So a finished transfer stays in progress here until the finalizer, which
+    sets the files and the state together, says otherwise."""
+    if state in _COMPLETE_STATES:
+        return 'InProgress, Downloading'
+    return _adapter_state_to_display(state)
 
 
 def _row_to_status(row: Dict[str, Any]) -> DownloadStatus:

@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from core.amazon_outage import amazon_enrichment_should_run
+from core.amazon_outage import amazon_enrichment_should_run, amazon_host_configured
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,6 +48,21 @@ def test_a_self_hosted_instance_still_respects_pause():
     assert amazon_enrichment_should_run(cfg) is False
 
 
+@pytest.mark.parametrize("base, expected", [
+    (None, False), ("https://t2tunes.site", False), ("http://192.168.1.5:8080", True),
+])
+def test_only_a_self_hosted_instance_counts_as_configured(base, expected):
+    """the native enrichment sweep walks every "configured" provider; the dead
+    default host cost 50 errors per run and never matched once."""
+    cfg = _Cfg() if base is None else _Cfg({"amazon.base_url": base})
+    assert amazon_host_configured(cfg) is expected
+
+
+def test_enrichment_status_asks_the_host_check():
+    block = _read("web_server.py").split("configured_checks = {", 1)[1].split("\n    }", 1)[0]
+    assert "'amazon_enrichment': lambda: _amazon_host_configured(config_manager)" in block
+
+
 def test_boot_asks_the_gate():
     src = _read("web_server.py")
     block = src.split("amazon_worker = AmazonWorker(", 1)[1].split("except Exception", 1)[0]
@@ -56,22 +71,30 @@ def test_boot_asks_the_gate():
 
 
 def test_amazon_is_not_a_pickable_download_source():
-    js = _read("webui/static/settings.js")
+    # the registry and the pool's groups are React now (SETTINGS_PORT.md
+    # steps 7a and 7b); settings.js no longer has a copy
+    model = _read("webui/src/features/settings/tabs/sources-model.ts")
+    js = _read("webui/src/features/settings/shell.ts")
     index = _read("webui/index.html")
-    hybrid = re.findall(r"id: '([a-z_]+)'", js.split("const HYBRID_SOURCES", 1)[1].split("];", 1)[0])
-    groups = js.split("const DLCHAIN_GROUPS", 1)[1].split("];", 1)[0]
-    secondary = js.split("function updateHybridSecondaryOptions(", 1)[1].split("\n}", 1)[0]
-    assert "amazon" not in hybrid
+    assert "const HYBRID_SOURCES" not in js
+    hybrid = re.findall(r"id: '([a-z_]+)'", model.split("HYBRID_SOURCES", 1)[1].split("];", 1)[0])
+    assert hybrid and "amazon" not in hybrid
+    groups = model.split("export const DLCHAIN_GROUPS", 1)[1].split("];", 1)[0]
     assert "'amazon'" not in groups
-    assert "'amazon'" not in secondary
+    # the legacy primary/secondary pair only ever offered these
+    legacy = model.split("const LEGACY_SELECT_SOURCES", 1)[1].split("];", 1)[0]
+    assert "'amazon'" not in legacy
     assert '<option value="amazon"' not in index
     assert 'id="amazon-download-settings-container"' not in index
 
 
 def test_a_saved_chain_naming_amazon_drops_it_on_load():
-    js = _read("webui/static/settings.js")
-    assert "const RETIRED_DOWNLOAD_SOURCES = new Set(['amazon'])" in js
-    fn = js.split("function loadHybridSourceOrder(", 1)[1].split("\n}", 1)[0]
-    # both the chain and the legacy primary/secondary pair
-    assert fn.count("RETIRED_DOWNLOAD_SOURCES.has(id)") == 2
-    assert "RETIRED_DOWNLOAD_SOURCES.has(_savedMode)" in js
+    model = _read("webui/src/features/settings/tabs/sources-model.ts")
+    assert "export const RETIRED_DOWNLOAD_SOURCES = new Set(['amazon'])" in model
+    fn = model.split("export function musicFromSettings(", 1)[1].split("\n}", 1)[0]
+    # both the chain and the legacy primary/secondary pair, and the mode
+    assert fn.count("!RETIRED_DOWNLOAD_SOURCES.has(id)") == 2
+    assert "RETIRED_DOWNLOAD_SOURCES.has(savedMode) ? 'soulseek' : savedMode" in fn
+    # and the next save writes the chain that works
+    load = model.split("    load(settings) {", 1)[1].split("\n    },", 1)[0]
+    assert "if (cleaned) {" in load and "store.patch('download_source'" in load

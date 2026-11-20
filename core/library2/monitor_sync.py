@@ -1,0 +1,1542 @@
+"""Library-v2 ↔ legacy Watchlist/Wishlist synchronisation (§69.1).
+
+The forward edges (a lib2 monitor toggle mirrors into the legacy Watchlist /
+Wishlist) are outbox-backed and live in ``mirror_outbox`` / ``wishlist_mirror``.
+They fire only on an explicit toggle, which leaves three gaps this module closes:
+
+1. **Watchlist → Library demonitor** (event-driven). When the user removes an
+   artist from the legacy Watchlist (single, batch, or a full clear), the
+   matching monitored lib2 artist stays ``monitored`` — the states diverge.
+   ``demonitor_lib2_artists_for_removed_watchlist`` flips the matching lib2
+   artist(s) back to unmonitored and pulls any now-unwanted tracks from the
+   Wishlist. It must be called ONLY from the user-facing removal endpoints,
+   never from the forward mirror's own ``remove_artist_from_watchlist`` call
+   (that path removes the row BECAUSE lib2 demonitored — re-entering here would
+   loop and re-record rules).
+
+2. **Wishlist → Library track demonitor** (event-driven). A user-facing
+   single, album, batch or full clear is an explicit unmonitor decision for the
+   represented Library-v2 tracks. Internal post-download cleanup deliberately
+   bypasses this module so monitoring survives a successful download.
+
+3. **Wanted projection → Wishlist re-assertion** (reconcile). The Wishlist is a
+   volatile queue: entries leave when downloaded, cleared, or aged out. Nothing
+   re-adds a still-``wanted`` + missing track once its entry is gone, because
+   the mirror is edge-triggered. ``reconcile_track_wishlist`` re-derives the
+   authoritative wanted projection and mirrors it into the Wishlist — adding
+   wanted+missing tracks back and pruning entries whose track is no longer
+   wanted. Idempotent; respects the ignore-list (``user_initiated=False``).
+
+Both operate on the admin profile (ADR-01). Never touches files.
+"""
+
+from __future__ import annotations
+
+import json
+from contextlib import closing
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
+
+from core.library2.sql_util import select_existing_ids
+from utils.logging_config import get_logger
+
+logger = get_logger("library2.monitor_sync")
+
+# tracks per committed batch of a full wanted recompute (the quality-profile
+# refresh uses the same size)
+_RECOMPUTE_BATCH = 2000
+
+
+# ---------------------------------------------------------------------------
+# Watchlist → Library demonitor (event-driven reverse edge)
+# ---------------------------------------------------------------------------
+
+
+_WATCHLIST_ID_COLUMNS = {
+    "spotify_artist_id": "spotify",
+    "itunes_artist_id": "itunes",
+    "deezer_artist_id": "deezer",
+    "discogs_artist_id": "discogs",
+    "amazon_artist_id": "amazon",
+    "musicbrainz_artist_id": "musicbrainz",
+}
+
+
+def _artist_identity_matches(
+    candidate_name: Optional[str],
+    candidate_ids: Mapping[str, Any],
+    watchlist_name: Optional[str],
+    watchlist_ids: Mapping[str, Any],
+) -> bool:
+    """Namespace-aware artist match with conflict-safe name fallback."""
+    from core.library2.importer import normalize_name
+
+    candidate = {
+        str(source).lower(): str(value).strip()
+        for source, value in (candidate_ids or {}).items() if str(value or "").strip()
+    }
+    watched = {
+        str(source).lower(): str(value).strip()
+        for source, value in (watchlist_ids or {}).items() if str(value or "").strip()
+    }
+    shared = set(candidate) & set(watched)
+    if any(candidate[source] == watched[source] for source in shared):
+        return True
+    # A same-name fallback must never overrule a contradictory strong id in
+    # the same namespace (two artists called the same thing, different Spotify ids).
+    if any(candidate[source] != watched[source] for source in shared):
+        return False
+    return bool(
+        normalize_name(candidate_name)
+        and normalize_name(candidate_name) == normalize_name(watchlist_name)
+    )
+
+
+def _clean_ids(ids: Mapping[str, Any]) -> Dict[str, str]:
+    return {str(source).lower(): str(value).strip()
+            for source, value in (ids or {}).items() if str(value or "").strip()}
+
+
+class _WatchlistIndex:
+    """``_artist_identity_matches`` against every watchlist entry at once.
+
+    The reconcile asked it once per (artist, entry) pair while holding the
+    write lock: 20k artists times 2k watchlist rows is 40M comparisons an
+    hour. Same answer, through two lookups: a shared provider id, or the same
+    normalized name with no contradicting id in a shared namespace.
+
+    ``artists`` (identity, name, ids) narrows the name fallback the way
+    R5-F-2 narrowed the removal: a name stands in for an entry only when no
+    other lib2 artist already holds the entry's id and only one artist carries
+    that name. the watched US Nirvana (spotify id) otherwise also watched a
+    UK Nirvana that carries only a MusicBrainz id (review 5 W2-WF-2). an
+    identity is the canonical row, so an alias of the watched artist is not
+    a namesake of it."""
+
+    def __init__(self, entries, artists=None) -> None:
+        from core.library2.importer import normalize_name
+
+        self._normalize = normalize_name
+        self._by_id: Dict[tuple, List[int]] = {}
+        self._by_name: Dict[str, List[tuple]] = {}
+        for index, entry in enumerate(entries or ()):
+            ids = _clean_ids(entry.get("provider_ids") or {})
+            for pair in ids.items():
+                self._by_id.setdefault(pair, []).append(index)
+            key = normalize_name(entry.get("name"))
+            if key:
+                self._by_name.setdefault(key, []).append((index, ids))
+        self._claimed: Dict[int, set] = {}
+        self._namesakes: Dict[str, set] = {}
+        for identity, name, ids in artists or ():
+            key = normalize_name(name)
+            if key:
+                self._namesakes.setdefault(key, set()).add(identity)
+            for pair in _clean_ids(ids).items():
+                for index in self._by_id.get(pair, ()):
+                    self._claimed.setdefault(index, set()).add(identity)
+
+    def matching_entries(self, name: Optional[str], ids: Mapping[str, Any],
+                         identity: Any = None) -> List[int]:
+        """Indexes of the entries this artist is. ``identity`` turns on the
+        narrowed name fallback (needs ``artists``)."""
+        candidate = _clean_ids(ids)
+        found = {index for pair in candidate.items()
+                 for index in self._by_id.get(pair, ())}
+        key = self._normalize(name)
+        if key and not (identity is not None
+                        and len(self._namesakes.get(key, ())) > 1):
+            for index, watched in self._by_name.get(key, ()):
+                if index in found or any(
+                        candidate[source] != watched[source]
+                        for source in set(candidate) & set(watched)):
+                    continue
+                if identity is not None and self._claimed.get(index, set()) - {identity}:
+                    continue
+                found.add(index)
+        return sorted(found)
+
+    def matches(self, name: Optional[str], ids: Mapping[str, Any],
+                identity: Any = None) -> bool:
+        return bool(self.matching_entries(name, ids, identity))
+
+
+class _Lib2ArtistIndex:
+    """Every lib2 artist's identity, read and parsed once.
+
+    a removal used to read and json-parse the whole artist table and run the
+    identity match against every row, once per removed artist: a bulk
+    removal of 57 artists did that 57 times (#2200). the index answers the
+    same two questions through lookups: who holds this provider id, who
+    carries this normalized name."""
+
+    def __init__(self, conn) -> None:
+        from core.library2.importer import normalize_name
+        from core.library2.provider_ids import source_ids_from_values
+
+        self._normalize = normalize_name
+        self.by_pair: Dict[tuple, List[int]] = {}
+        self.by_value: Dict[str, List[int]] = {}
+        self.by_name: Dict[str, List[tuple]] = {}
+        for row in conn.execute(
+                "SELECT id, name, spotify_id, musicbrainz_id, external_ids FROM lib2_artists"):
+            artist_id = int(row["id"])
+            candidate_ids = source_ids_from_values(
+                spotify_id=row["spotify_id"],
+                musicbrainz_id=row["musicbrainz_id"],
+                external_ids=row["external_ids"],
+            )
+            cleaned = _clean_ids(candidate_ids)
+            for pair in cleaned.items():
+                self.by_pair.setdefault(pair, []).append(artist_id)
+            for value in {str(value) for value in candidate_ids.values()}:
+                self.by_value.setdefault(value, []).append(artist_id)
+            key = normalize_name(row["name"])
+            if key:
+                self.by_name.setdefault(key, []).append((artist_id, cleaned))
+
+    def normalize(self, name: Optional[str]) -> str:
+        return self._normalize(name)
+
+
+def _match_lib2_artists(
+    conn, external_ids: Any, name: Optional[str],
+    index: Optional[_Lib2ArtistIndex] = None,
+) -> List[int]:
+    """lib2 artist ids matching a removed Watchlist row.
+
+    Strong match first: any of the Watchlist row's provider ids equals a lib2
+    artist's ``spotify_id`` / ``musicbrainz_id`` or appears as a value in its
+    ``external_ids`` JSON. Only when no provider id matches does the normalized
+    name act as a fallback (the same name-equality the legacy manual-match
+    bridge accepts, ``web_server._watchlist_row_matches_legacy_artist``).
+
+    ``index`` is the artist table read once; a batch removal passes one so
+    the table is not read again for every artist (#2200).
+    """
+    qualified = (
+        {str(k).lower(): str(v) for k, v in external_ids.items() if v}
+        if isinstance(external_ids, Mapping) else {}
+    )
+    exts = [str(e) for e in (external_ids or []) if e] if not qualified else []
+    ids: set[int] = set()
+    if qualified or exts:
+        index = index if index is not None else _Lib2ArtistIndex(conn)
+    if qualified:
+        # review 5 R5-F-2: a shared provider id first. the name fallback ran
+        # alongside it, so removing the US Nirvana (spotify id) demonitored a
+        # UK Nirvana that carries only a MusicBrainz id. a name is used only
+        # when no id matched, and only when it names one artist (A9 below)
+        watched = _clean_ids(qualified)
+        for pair in watched.items():
+            ids.update(index.by_pair.get(pair, ()))
+        by_name: set[int] = set()
+        key = index.normalize(name)
+        if key:
+            for artist_id, candidate in index.by_name.get(key, ()):
+                if artist_id in ids or any(
+                        candidate[source] != watched[source]
+                        for source in set(candidate) & set(watched)):
+                    continue
+                by_name.add(artist_id)
+        if not ids and len(by_name) > 1:
+            logger.warning(
+                "Watchlist removal name fallback matched %d lib2 artists for "
+                "%r — ambiguous, skipping rather than risk demonitoring the "
+                "wrong artist", len(by_name), name,
+            )
+        elif not ids:
+            ids |= by_name
+    elif exts:
+        # Backward compatibility for descriptors captured by older builds.
+        for value in set(exts):
+            ids.update(index.by_value.get(value, ()))
+    if name and not ids and not qualified:
+        # A9: a bare name match is a weak fallback — only usable when it
+        # resolves to exactly ONE lib2 artist. Two rows sharing the removed
+        # watchlist name (genuine same-name artists, or an unmerged
+        # duplicate — see duplicate-artist-name-ordering) must not both get
+        # demonitored/dropped from the Wishlist just because the user
+        # intended only one of them.
+        name_matches = {
+            int(row["id"])
+            for row in conn.execute(
+                "SELECT id FROM lib2_artists WHERE LOWER(name) = LOWER(?)",
+                (str(name),),
+            )
+        }
+        if len(name_matches) > 1:
+            logger.warning(
+                "Watchlist removal name fallback matched %d lib2 artists for "
+                "%r — ambiguous, skipping rather than risk demonitoring the "
+                "wrong artist", len(name_matches), name,
+            )
+        else:
+            ids |= name_matches
+    return sorted(ids)
+
+
+def demonitor_lib2_artists_for_removed_watchlist(
+    db,
+    external_ids: Sequence[str],
+    name: Optional[str] = None,
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Demonitor the lib2 artist(s) behind a removed Watchlist artist (§69.1).
+
+    One removal of :func:`demonitor_lib2_artists_for_removed_watchlists`.
+    """
+    return demonitor_lib2_artists_for_removed_watchlists(
+        db, [(external_ids, name)], profile_id=profile_id)
+
+
+def demonitor_lib2_artists_for_removed_watchlists(
+    db,
+    removals: Sequence[tuple],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Demonitor the lib2 artists behind removed Watchlist artists (§69.1).
+
+    ``removals`` is ``(external_ids, name)`` per removed Watchlist row.
+
+    Idempotent: records a ``user_explicit`` unmonitor rule even when a stale
+    compatibility flag was already off, because the Watchlist removal is the
+    authoritative user decision. Records the flag/rule change
+    (removing an artist from the Watchlist is a deliberate decision about that
+    artist), recomputes the wanted projection for the artists' tracks, and
+    mirrors the projection so any track that was wanted only via the artist tier
+    is pulled from the Wishlist. A newer ``watchlist_remove`` is enqueued even
+    though the row is already gone: it must supersede any older pending add that
+    survived a crash or transient DB failure.
+
+    A batch is one pass (#2200): the artist table is read once, the rules go
+    in, then one recompute and one mirror over every affected track, one
+    commit and one drain. 57 artists one by one took 70 s, 46 s of it cpu.
+
+    Best-effort by contract: raises nothing the caller can't ignore, but returns
+    counts so the endpoint can log/observe.
+    """
+    from core.library2.monitor_rules import PROVENANCE_USER, record_rule
+    from core.library2.wanted import entity_track_ids, recompute_wanted
+
+    if not removals:
+        return {"matched": 0, "demonitored": 0}
+    admin = _is_admin_profile(profile_id)
+    with closing(db._get_connection()) as conn:
+        index = _Lib2ArtistIndex(conn)
+        artist_ids: List[int] = []
+        demonitored = 0
+        for external_ids, name in removals:
+            for artist_id in _match_lib2_artists(conn, external_ids, name, index=index):
+                # the global column is the shared library's (the admin's); a
+                # household member's removal is their own rule only
+                if admin:
+                    cur = conn.execute(
+                        "UPDATE lib2_artists SET monitored=0, updated_at=CURRENT_TIMESTAMP "
+                        "WHERE id=? AND monitored=1",
+                        (artist_id,),
+                    )
+                    demonitored += int(cur.rowcount)
+                else:
+                    demonitored += 1
+                record_rule(conn, "artist", artist_id, False, PROVENANCE_USER,
+                            profile_id=profile_id)
+                if artist_id not in artist_ids:
+                    artist_ids.append(artist_id)
+        if not artist_ids:
+            return {"matched": 0, "demonitored": 0}
+
+        track_ids: set = set()
+        for artist_id in artist_ids:
+            track_ids.update(entity_track_ids(conn, "artist", artist_id))
+        track_ids = sorted(track_ids)
+        recompute_wanted(conn, profile_id=profile_id, track_ids=track_ids)
+
+        from core.library2.mirror_outbox import (
+            drain,
+            enqueue_artist_watchlist,
+            enqueue_projected_tracks,
+        )
+        outbox_ids: List[int] = []
+        for artist_id in artist_ids:
+            outbox_ids.extend(enqueue_artist_watchlist(
+                conn, artist_id, False, profile_id=profile_id,
+            ))
+        # review 4 R4-B-3: a shared-library member's wishes were never
+        # seeded as track rules (the import seeds the admin's and each own
+        # library's), so their projection reads "not wanted" for every wish
+        # and mirroring it deleted their whole wishlist for the artist. 3.6.1
+        # never touched wishlist rows on a watchlist removal; neither does
+        # a member's, now
+        from core.library_scope import own_library_ids
+        projection_owns_wishlist = (admin
+                                    or int(profile_id) in set(own_library_ids()))
+        if track_ids and projection_owns_wishlist:
+            # Mirroring every affected projection is intentional: explicit
+            # album/track rules remain wanted and are reasserted; artist-tier
+            # tracks become removes. The final state is therefore authoritative
+            # even when older pending outbox rows are replayed first.
+            outbox_ids.extend(enqueue_projected_tracks(
+                conn, track_ids, profile_id=profile_id, user_initiated=False,
+            ))
+        conn.commit()
+        if outbox_ids:
+            drain(db, ids=outbox_ids)
+        mirrored = _completed_outbox_count(conn, outbox_ids)
+        logger.info(
+            "watchlist→library demonitor: %d matched, %d demonitored, %d tracks mirrored",
+            len(artist_ids), demonitored, mirrored,
+        )
+        return {"matched": len(artist_ids), "demonitored": demonitored,
+                "tracks_mirrored": mirrored}
+
+
+# ---------------------------------------------------------------------------
+# Wishlist → Library demonitor (event-driven reverse edge)
+# ---------------------------------------------------------------------------
+
+
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, Mapping) else {}
+    return {}
+
+
+def _provider_ids(value: Any) -> Dict[str, str]:
+    return {
+        str(source).strip().lower(): str(provider_id).strip()
+        for source, provider_id in _as_mapping(value).items()
+        if str(source).strip() and str(provider_id).strip()
+    }
+
+
+def _add_qualified_provider_id(
+    qualified_ids: Dict[str, set[str]],
+    source: Any,
+    provider_id: Any,
+) -> None:
+    source_key = str(source or "").strip().lower()
+    value = str(provider_id or "").strip()
+    if source_key and value and source_key != "library_v2":
+        qualified_ids.setdefault(source_key, set()).add(value)
+
+
+def _descriptor_lib2_track_ids(
+    conn: Any, descriptors: Sequence[Mapping[str, Any]],
+) -> List[int]:
+    """Resolve each removed Wishlist row without widening composite identity.
+
+    Embedded lib2/stable ids are terminal. Provider fallbacks are accepted
+    only when unique, or when the composite album suffix uniquely identifies
+    one release of a shared recording.
+    """
+    matched: set[int] = set()
+    # review 5 R5-F-1: no whole-catalogue read. this loaded and parsed every
+    # track (18 s on 316k; Clear Wishlist held the write lock for it) even
+    # when the row named its lib2 track. each id is looked up through the
+    # column or expression index that serves it; only a provider with no
+    # index falls back to the full index, built once, on first need
+    select = ("SELECT t.id, t.spotify_id, t.musicbrainz_id, t.external_ids, "
+              "t.isrc, t.stable_id, al.spotify_id AS album_spotify_id, "
+              "al.musicbrainz_id AS album_musicbrainz_id, "
+              "al.external_ids AS album_external_ids, al.stable_id AS album_stable_id "
+              "FROM lib2_tracks t JOIN lib2_albums al ON al.id=t.album_id ")
+    from core.library2.provider_ids import external_id_sql
+    indexed_ext = ("spotify", "deezer", "tidal", "qobuz", "itunes", "audiodb", "jiosaavn")
+    full_index: Dict[str, Any] = {}
+
+    def _full():
+        if not full_index:
+            qualified: Dict[tuple, List[Any]] = {}
+            generic: Dict[str, List[Any]] = {}
+            for row in conn.execute(select).fetchall():
+                row_ids = _provider_ids(row["external_ids"])
+                if row["spotify_id"]:
+                    row_ids.setdefault("spotify", str(row["spotify_id"]))
+                if row["musicbrainz_id"]:
+                    row_ids.setdefault("musicbrainz", str(row["musicbrainz_id"]))
+                if row["isrc"]:
+                    row_ids.setdefault("isrc", str(row["isrc"]))
+                for source, value in row_ids.items():
+                    qualified.setdefault((source, value), []).append(row)
+                    generic.setdefault(value, []).append(row)
+            full_index.update(qualified=qualified, generic=generic)
+        return full_index
+
+    def _where(sql_expr: str, value: str) -> List[Any]:
+        return conn.execute(select + f"WHERE {sql_expr} = ?", (value,)).fetchall()
+
+    def _lookup(source: str, value: str) -> List[Any]:
+        """the rows carrying this source's id, the way the old index keyed
+        them (external_ids first, then the dedicated columns)"""
+        rows: List[Any] = []
+        if source in indexed_ext:
+            rows += _where(external_id_sql("t.external_ids", source), value)
+        if source == "spotify":
+            rows += _where("t.spotify_id", value)
+        elif source == "musicbrainz":
+            rows += _where("t.musicbrainz_id", value)
+        elif source == "isrc":
+            rows += _where("t.isrc", value)
+        elif source not in indexed_ext:
+            return list(_full()["qualified"].get((source, value), ()))
+        return rows
+
+    def _lookup_any(value: str) -> List[Any]:
+        """a bare id from any provider. the indexed ones are asked directly;
+        an id only an unindexed provider carries is not looked for"""
+        rows: List[Any] = []
+        for source in (*indexed_ext, "musicbrainz", "isrc"):
+            rows += _lookup(source, value)
+        return rows
+
+    for descriptor in descriptors:
+        if not isinstance(descriptor, Mapping):
+            continue
+        source_info = _as_mapping(descriptor.get("source_info"))
+        track_data = _as_mapping(
+            descriptor.get("track_data") or descriptor.get("spotify_data")
+        )
+        raw_lib2_id = source_info.get("lib2_track_id") or descriptor.get("lib2_track_id")
+        try:
+            if raw_lib2_id is not None:
+                direct = conn.execute(
+                    "SELECT id FROM lib2_tracks WHERE id=?", (int(raw_lib2_id),)
+                ).fetchone()
+                if direct:
+                    matched.add(int(direct[0]))
+                    continue
+        except (TypeError, ValueError):
+            pass
+
+        qualified_ids: Dict[str, set[str]] = {}
+        generic_ids: set[str] = set()
+
+        for values in (
+            source_info.get("track_provider_ids"),
+            track_data.get("provider_ids"),
+            track_data.get("external_ids"),
+        ):
+            for source, provider_id in _provider_ids(values).items():
+                _add_qualified_provider_id(qualified_ids, source, provider_id)
+
+        raw_id = (
+            descriptor.get("spotify_track_id")
+            or descriptor.get("track_id")
+            or track_data.get("id")
+        )
+        raw_key = str(raw_id or "").strip()
+        raw_id, _, album_identity = raw_key.partition("::")
+        raw_id = raw_id.strip()
+        album_identity = album_identity.strip()
+        if not album_identity:
+            album_data = _as_mapping(track_data.get("album"))
+            album_candidates = [
+                album_data.get("id"),
+                source_info.get("album_id"),
+                descriptor.get("album_id"),
+            ]
+            album_candidates.extend(_provider_ids(
+                album_data.get("provider_ids") or album_data.get("external_ids")
+            ).values())
+            album_identity = next(
+                (str(value).strip() for value in album_candidates
+                 if str(value or "").strip()),
+                "",
+            )
+        if raw_id.startswith("lib2-track:"):
+            stable = raw_id.removeprefix("lib2-track:")
+            direct = conn.execute(
+                "SELECT id FROM lib2_tracks WHERE stable_id=? LIMIT 2", (stable,)
+            ).fetchall()
+            # G09-4: an id two rows share (minted before they were told
+            # apart) names neither; the provider lookup below decides
+            if len(direct) == 1:
+                matched.add(int(direct[0][0]))
+                continue
+        elif raw_id:
+            source = (
+                track_data.get("provider")
+                or track_data.get("source")
+                or descriptor.get("provider")
+                or source_info.get("metadata_source")
+            )
+            if source:
+                _add_qualified_provider_id(qualified_ids, source, raw_id)
+            else:
+                generic_ids.add(raw_id)
+
+        # Same membership test as before, resolved through the prebuilt index.
+        # `seen` keeps the result a de-duplicated list of rows, because one row
+        # is reachable through several of its own provider ids.
+        seen: set[int] = set()
+        candidates = []
+        for source, provider_values in qualified_ids.items():
+            for value in provider_values:
+                for row in _lookup(source, value):
+                    if int(row["id"]) not in seen:
+                        seen.add(int(row["id"]))
+                        candidates.append(row)
+        for value in generic_ids:
+            for row in _lookup_any(value):
+                if int(row["id"]) not in seen:
+                    seen.add(int(row["id"]))
+                    candidates.append(row)
+
+        if len(candidates) > 1 and album_identity:
+            narrowed = []
+            for row in candidates:
+                album_ids = set(_provider_ids(row["album_external_ids"]).values())
+                album_ids.update(str(value) for value in (
+                    row["album_spotify_id"], row["album_musicbrainz_id"],
+                    row["album_stable_id"],
+                ) if value)
+                if album_identity in album_ids:
+                    narrowed.append(row)
+            candidates = narrowed
+        if len(candidates) == 1:
+            matched.add(int(candidates[0]["id"]))
+        elif len(candidates) > 1:
+            logger.warning(
+                "Wishlist removal identity %r matched %d Library tracks; "
+                "skipping ambiguous provider fallback", raw_key, len(candidates),
+            )
+    return sorted(matched)
+
+
+def _completed_outbox_count(conn: Any, outbox_ids: Sequence[int]) -> int:
+    if not outbox_ids:
+        return 0
+    marks = ",".join("?" for _ in outbox_ids)
+    row = conn.execute(
+        f"SELECT COUNT(*) FROM lib2_mirror_outbox "
+        f"WHERE id IN ({marks}) AND status='done'",
+        list(outbox_ids),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def release_removed_wishes(conn: Any, track_ids: Sequence[int], *,
+                           profile_id: int = 1) -> Dict[str, int]:
+    """Apply "the user dropped these wishes" to monitoring. Does not commit.
+
+    A wish is not ownership: a track with a live file keeps its monitoring, so
+    a quality upgrade stays possible (the ignore-list written with the removal
+    keeps it out of the queue meanwhile). Tracks without a file are explicitly
+    unmonitored, and a release left with no file and nothing wanted is
+    released too, unless the user or "monitor new releases" asked for it.
+    """
+    from core.library2.monitor_rules import (
+        PROVENANCE_CASCADE, PROVENANCE_NEW_RELEASE, PROVENANCE_USER, record_rule,
+    )
+    from core.library2.sql_util import owned_sql
+    from core.library2.wanted import entity_track_ids, recompute_wanted
+
+    ids = sorted({int(t) for t in track_ids or ()})
+    stats = {"matched": len(ids), "demonitored": 0, "kept_owned": 0, "albums_released": 0}
+    if not ids:
+        return stats
+    marks = ",".join("?" for _ in ids)
+    owned = {row[0] for row in conn.execute(
+        f"SELECT t.id FROM lib2_tracks t WHERE t.id IN ({marks}) AND {owned_sql('track', 't')}",
+        ids)}
+    stats["kept_owned"] = len(owned)
+    for track_id in (t for t in ids if t not in owned):
+        if int(profile_id) == 1:
+            conn.execute("UPDATE lib2_tracks SET monitored=0, updated_at=CURRENT_TIMESTAMP "
+                         "WHERE id=?", (track_id,))
+        record_rule(conn, "track", track_id, False, PROVENANCE_USER, profile_id=profile_id)
+        stats["demonitored"] += 1
+    recompute_wanted(conn, profile_id=profile_id, track_ids=ids)
+    albums = [row[0] for row in conn.execute(
+        f"""SELECT DISTINCT al.id FROM lib2_albums al
+              JOIN lib2_tracks t ON t.album_id=al.id AND t.id IN ({marks})
+              LEFT JOIN lib2_monitor_rules r ON r.entity_type='album'
+                   AND r.entity_id=al.id AND r.profile_id=?
+             WHERE COALESCE(r.provenance,'') NOT IN (?, ?)
+               AND NOT {owned_sql('album', 'al')}
+               AND NOT EXISTS (SELECT 1 FROM lib2_tracks wt JOIN lib2_wanted_tracks w
+                                   ON w.track_id=wt.id AND w.profile_id=? AND w.wanted=1
+                                WHERE wt.album_id=al.id)""",
+        [*ids, int(profile_id), PROVENANCE_USER, PROVENANCE_NEW_RELEASE, int(profile_id)])]
+    for album_id in albums:
+        if int(profile_id) == 1:
+            conn.execute("UPDATE lib2_albums SET monitored=0, updated_at=CURRENT_TIMESTAMP "
+                         "WHERE id=?", (album_id,))
+        record_rule(conn, "album", album_id, False, PROVENANCE_CASCADE, profile_id=profile_id)
+        recompute_wanted(conn, profile_id=profile_id,
+                         track_ids=entity_track_ids(conn, "album", album_id))
+    stats["albums_released"] = len(albums)
+    return stats
+
+
+def demonitor_lib2_tracks_for_removed_wishlist(
+    db: Any,
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Apply a user-facing Wishlist removal (see :func:`release_removed_wishes`).
+
+    The caller must capture descriptors before deleting the Wishlist rows.
+    Successful-download cleanup calls the database layer directly and never
+    invokes this function.
+    """
+    with closing(db._get_connection()) as conn:
+        track_ids = _descriptor_lib2_track_ids(conn, descriptors)
+        if not track_ids:
+            return {"matched": 0, "demonitored": 0, "tracks_mirrored": 0}
+        stats = release_removed_wishes(conn, track_ids, profile_id=profile_id)
+        from core.library2.mirror_outbox import drain, enqueue_projected_tracks
+        outbox_ids = enqueue_projected_tracks(
+            conn, track_ids, profile_id=profile_id, user_initiated=False,
+        )
+        conn.commit()
+        if outbox_ids:
+            drain(db, ids=outbox_ids)
+        stats["tracks_mirrored"] = _completed_outbox_count(conn, outbox_ids)
+        logger.info("wishlist→library release: %s", stats)
+        return stats
+
+
+def monitor_lib2_tracks_for_added_wishlist(
+    db: Any,
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Apply a user-facing Wishlist addition as explicit track monitoring.
+
+    dd28-12: the mirror was asymmetric. Wishlist *removal* had a reverse edge
+    into lib2 (:func:`demonitor_lib2_tracks_for_removed_wishlist`), but
+    Wishlist *addition* had none — the API route and the wishlist service only
+    ever wrote the legacy table. A track that maps onto a lib2 row but owns no
+    lib2 rule making it wanted therefore ended up in the hourly reconciler's
+    ``prune`` set and was removed again within the hour. Failed downloads
+    silently stopped being retried, which is the one job the Wishlist has.
+
+    Guide §2.2 makes this the right direction, not just a patch: a wishlisted
+    track IS track-level monitoring intent.
+    """
+    from core.library2.monitor_rules import PROVENANCE_USER, record_rule
+    from core.library2.wanted import recompute_wanted
+
+    with closing(db._get_connection()) as conn:
+        track_ids = _descriptor_lib2_track_ids(conn, descriptors)
+        if not track_ids:
+            return {"matched": 0, "monitored": 0}
+        marks = ",".join("?" for _ in track_ids)
+        cur = conn.execute(
+            f"UPDATE lib2_tracks SET monitored=1, updated_at=CURRENT_TIMESTAMP "
+            f"WHERE id IN ({marks}) AND monitored=0",
+            track_ids,
+        )
+        monitored = int(cur.rowcount)
+        for track_id in track_ids:
+            record_rule(
+                conn, "track", track_id, True, PROVENANCE_USER,
+                profile_id=profile_id,
+            )
+        recompute_wanted(conn, profile_id=profile_id, track_ids=track_ids)
+        conn.commit()
+        logger.info(
+            "wishlist→library monitor: %d matched, %d newly monitored",
+            len(track_ids), monitored,
+        )
+        return {"matched": len(track_ids), "monitored": monitored}
+
+
+# ---------------------------------------------------------------------------
+# Feature-gated route adapters
+# ---------------------------------------------------------------------------
+
+
+def _is_admin_profile(profile_id: int) -> bool:
+    try:
+        from core.library2 import ADMIN_PROFILE_ID
+        return int(profile_id) == int(ADMIN_PROFILE_ID)
+    except (TypeError, ValueError):
+        return False
+
+
+def sync_watchlist_removal(
+    db,
+    config_manager,
+    descriptor: Optional[Dict[str, Any]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Feature-gated, best-effort entry point for the removal endpoints.
+
+    ``descriptor`` is the removed row's identity from
+    ``db.get_watchlist_artist_descriptor`` (captured BEFORE the delete). Never
+    raises — a reverse-sync hiccup must not fail the user's watchlist removal.
+    """
+    try:
+        # every profile: a household member's watchlist is theirs (their
+        # own rule), the admin's also carries the shared column
+        if not descriptor:
+            return {"matched": 0, "demonitored": 0}
+        return demonitor_lib2_artists_for_removed_watchlist(
+            db,
+            descriptor.get("provider_ids") or descriptor.get("external_ids") or [],
+            descriptor.get("name"),
+            profile_id=profile_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("watchlist reverse-sync skipped: %s", e)
+        return {"matched": 0, "demonitored": 0}
+
+
+def sync_watchlist_removals(
+    db,
+    descriptors: Sequence[Optional[Dict[str, Any]]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """``sync_watchlist_removal`` for many removed rows in one pass (#2200).
+
+    Same end state as calling it once per descriptor; the recompute, the
+    mirror, the commit and the drain run once for the lot. Never raises.
+    """
+    try:
+        removals = [
+            (d.get("provider_ids") or d.get("external_ids") or [], d.get("name"))
+            for d in descriptors or () if d
+        ]
+        if not removals:
+            return {"matched": 0, "demonitored": 0}
+        return demonitor_lib2_artists_for_removed_watchlists(
+            db, removals, profile_id=profile_id)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("watchlist reverse-sync (batch) skipped: %s", e)
+        return {"matched": 0, "demonitored": 0}
+
+
+def sync_watchlist_addition(
+    db: Any,
+    *,
+    name: Optional[str],
+    provider_id: Optional[str] = None,
+    source: Optional[str] = None,
+    profile_id: int = 1,
+) -> Optional[int]:
+    """The add half of the Watchlist → Library edge (see ``sync_watchlist_removal``).
+
+    A user-facing Watchlist add monitors the artist in Library v2 right away:
+    its catalogue row is resolved or created, flagged monitored, given an
+    explicit rule and its wanted projection recomputed, which is exactly what
+    Library v2's "Monitor artist" does. Without it an artist added from the
+    artist page or Discover had no catalogue row until a download created one,
+    so the artist page kept treating it as unknown.
+
+    ``provider_id`` is only a lookup hint and may be None: pass it only when
+    its source is known, because a wrong namespace would stick to the row.
+    The forward mirror is not enqueued, since the Watchlist row this reacts to
+    exists already. A household member writes their own rule; only the admin the shared column and catalogue rows (ADR-01). Never raises;
+    returns the lib2 artist id or None.
+    """
+    try:
+        admin = _is_admin_profile(profile_id)
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            return None
+        from core.library2.autolink import find_or_create_artist
+        from core.library2.monitor_rules import PROVENANCE_USER, record_rule
+        from core.library2.wanted import recompute_wanted_for_entity
+
+        with closing(db._get_connection()) as conn:
+            # a household member links to the library's artists; only the
+            # admin's watchlist adds catalogue rows and the shared column
+            artist_id = find_or_create_artist(
+                conn, clean_name,
+                spotify_id=(str(provider_id).strip() or None) if provider_id else None,
+                source=source or None, create=admin)
+            if artist_id is None:
+                return None
+            if admin:
+                conn.execute("UPDATE lib2_artists SET monitored=1 WHERE id=?", (artist_id,))
+            record_rule(conn, "artist", artist_id, True, PROVENANCE_USER, profile_id=profile_id)
+            recompute_wanted_for_entity(conn, "artists", artist_id, profile_id=profile_id)
+            conn.commit()
+            return int(artist_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("watchlist forward-sync skipped: %s", exc)
+        return None
+
+
+def sync_wishlist_removal(
+    db: Any,
+    config_manager: Any,
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Feature-gated, best-effort adapter for user-facing Wishlist removes."""
+    try:
+        # every profile: a removal that left the wish behind came back once
+        # the ignore aged out (the reconcile re-adds wanted tracks), for an
+        # own-library profile too. release_removed_wishes only ever touches
+        # that profile's own rules
+        if not descriptors:
+            return {"matched": 0, "demonitored": 0, "tracks_mirrored": 0}
+        return demonitor_lib2_tracks_for_removed_wishlist(
+            db, descriptors, profile_id=profile_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("wishlist reverse-sync skipped: %s", exc)
+        return {"matched": 0, "demonitored": 0, "tracks_mirrored": 0}
+
+
+def sync_wishlist_addition(
+    db: Any,
+    config_manager: Any,
+    descriptors: Sequence[Mapping[str, Any]],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Feature-gated, best-effort adapter for user-facing Wishlist adds (dd28-12).
+
+    Database writes now materialize intent transactionally. This adapter
+    remains for callers that supply descriptors; projection mirrors bypass
+    materialization so inherited rules are not turned into explicit intent.
+    """
+    try:
+        if not _is_admin_profile(profile_id) or not descriptors:
+            return {"matched": 0, "monitored": 0}
+        return monitor_lib2_tracks_for_added_wishlist(
+            db, descriptors, profile_id=profile_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("wishlist forward-sync skipped: %s", exc)
+        return {"matched": 0, "monitored": 0}
+
+
+# ---------------------------------------------------------------------------
+# Artist monitoring ↔ Watchlist repair
+# ---------------------------------------------------------------------------
+
+
+def _watchlist_artist_snapshot(
+    conn: Any, *, profile_id: int,
+) -> tuple[bool, list[dict[str, Any]]]:
+    """Return per-row namespaced identities from the Watchlist."""
+    try:
+        columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(watchlist_artists)")
+        }
+        if not columns:
+            return False, []
+        id_columns = [column for column in _WATCHLIST_ID_COLUMNS if column in columns]
+        select = ["artist_name", *id_columns]
+        sql = f"SELECT {', '.join(select)} FROM watchlist_artists"
+        params: tuple[Any, ...] = ()
+        if "profile_id" in columns:
+            sql += " WHERE profile_id=?"
+            params = (int(profile_id),)
+        rows = conn.execute(sql, params).fetchall()
+    except Exception:  # noqa: BLE001 - fresh/test DB without legacy tables
+        return False, []
+    entries = [{
+        "name": row["artist_name"],
+        "provider_ids": {
+            _WATCHLIST_ID_COLUMNS[column]: str(row[column]).strip()
+            for column in id_columns
+            if row[column] is not None and str(row[column]).strip()
+        },
+    } for row in rows]
+    return True, entries
+
+
+def artist_is_watchlisted(
+    conn: Any,
+    name: Optional[str],
+    provider_ids: Optional[Mapping[str, Any]] = None,
+    *,
+    profile_id: int = 1,
+) -> bool:
+    """Return the real Watchlist state for a newly materialized artist.
+
+    This is the insert-time counterpart to ``reconcile_artist_watchlist``.
+    Missing legacy tables fail closed to unmonitored; provider identity wins,
+    with the same case-insensitive name fallback used by the repair pass.
+    """
+    available, watchlist_entries = _watchlist_artist_snapshot(
+        conn, profile_id=profile_id,
+    )
+    if not available:
+        return False
+    candidate = _clean_ids(provider_ids or {})
+    if any(_artist_identity_matches(None, candidate, None, entry["provider_ids"])
+           for entry in watchlist_entries):
+        return True
+    named = [entry for entry in watchlist_entries
+             if _artist_identity_matches(name, candidate, entry["name"], entry["provider_ids"])]
+    if not named:
+        return False
+    # review 5 W2-WF-2: R5-F-2's rule at insert time. a name is not enough
+    # when a lib2 artist of that name already exists (autolink only mints a
+    # second one for a different artist), or when another artist already
+    # holds the watched entry's id: that one is the watched artist
+    if _name_is_taken(conn, name):
+        return False
+    return any(not any(_provider_id_is_held(conn, source, value)
+                       for source, value in _clean_ids(entry["provider_ids"]).items())
+               for entry in named)
+
+
+def _name_is_taken(conn: Any, name: Optional[str]) -> bool:
+    from core.library2.importer import normalize_name
+
+    key = normalize_name(name)
+    if not key:
+        return False
+    if conn.execute("SELECT 1 FROM lib2_artists WHERE name_key=? LIMIT 1", (key,)).fetchone():
+        return True
+    # rows no keyed write produced (the startup backfill keys them)
+    return any(normalize_name(row[0]) == key for row in conn.execute(
+        "SELECT name FROM lib2_artists WHERE name_key IS NULL"))
+
+
+def _provider_id_is_held(conn: Any, source: str, value: str) -> bool:
+    from core.library2.provider_ids import external_id_sql
+
+    if source == "spotify":
+        where = "spotify_id = ?"
+    elif source == "musicbrainz":
+        where = "musicbrainz_id = ?"
+    else:
+        try:
+            where = f"{external_id_sql('external_ids', source)} = ?"
+        except ValueError:
+            return False
+    return conn.execute(
+        f"SELECT 1 FROM lib2_artists WHERE {where} LIMIT 1", (value,)).fetchone() is not None
+
+
+def reconcile_artist_watchlist(
+    db: Any,
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Repair the Artist-monitor ⇄ Watchlist invariant.
+
+    A direct Library-v2 artist decision (``user_explicit``) wins and is
+    reasserted into the Watchlist. For imported/default rows without such a
+    decision, the Watchlist remains the source of truth; this also clears old
+    ``monitored=1`` schema-default drift instead of legitimizing it by adding
+    every phantom artist to the Watchlist.
+    """
+    from core.library2.importer import normalize_name
+    from core.library2.monitor_rules import PROVENANCE_LEGACY, PROVENANCE_USER, record_rule
+    from core.library2.provider_ids import source_ids_from_values
+    from core.library2.wanted import entity_track_ids, recompute_wanted
+
+    with closing(db._get_connection()) as conn:
+        watchlist_available, watchlist_entries = _watchlist_artist_snapshot(
+            conn, profile_id=profile_id,
+        )
+        if not watchlist_available:
+            return {
+                "scanned": 0,
+                "monitor_flags_changed": 0,
+                "watchlist_mirrors": 0,
+                "track_mirrors": 0,
+                "unmirrorable": 0,
+                "mirrored": 0,
+            }
+        rows = conn.execute(
+            """SELECT ar.id, ar.name, ar.monitored, ar.spotify_id,
+                      ar.musicbrainz_id, ar.external_ids, ar.canonical_artist_id,
+                      rule.monitored AS rule_monitored,
+                      rule.provenance AS rule_provenance
+                 FROM lib2_artists ar
+                 LEFT JOIN lib2_monitor_rules rule
+                   ON rule.entity_type='artist' AND rule.entity_id=ar.id
+                  AND rule.profile_id=?""",
+            (int(profile_id),),
+        ).fetchall()
+        from core.library2.mirror_outbox import (
+            drain,
+            enqueue_artist_watchlist,
+            enqueue_projected_tracks,
+        )
+        stats = {
+            "scanned": len(rows),
+            "monitor_flags_changed": 0,
+            "watchlist_mirrors": 0,
+            "track_mirrors": 0,
+            "unmirrorable": 0,
+        }
+        affected_tracks: set[int] = set()
+        outbox_ids: List[int] = []
+        shared_intent = int(profile_id) == 1
+        artists = [(
+            int(row["canonical_artist_id"] or row["id"]),
+            row["name"],
+            source_ids_from_values(
+                spotify_id=row["spotify_id"],
+                musicbrainz_id=row["musicbrainz_id"],
+                external_ids=row["external_ids"],
+            ),
+        ) for row in rows]
+        watchlist_index = _WatchlistIndex(watchlist_entries, artists)
+        for row, (identity, _name, ids) in zip(rows, artists, strict=True):
+            artist_id = int(row["id"])
+            on_watchlist = watchlist_index.matches(row["name"], ids, identity)
+            explicit = row["rule_provenance"] == PROVENANCE_USER
+            desired = bool(row["rule_monitored"]) if explicit else on_watchlist
+
+            # the global flag is the shared library's intent; a profile with
+            # a library of its own has only its rules (#1199)
+            current = bool(row["monitored"]) if shared_intent else bool(row["rule_monitored"])
+            if current != desired:
+                if shared_intent:
+                    conn.execute(
+                        "UPDATE lib2_artists SET monitored=?, "
+                        "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (1 if desired else 0, artist_id),
+                    )
+                stats["monitor_flags_changed"] += 1
+                affected_tracks.update(entity_track_ids(conn, "artist", artist_id))
+            if not shared_intent and row["rule_provenance"] is None and not desired:
+                continue  # no rule already reads "not monitored" there
+            if not explicit:
+                # Skip the no-op rewrite when the legacy rule already matches
+                # (right provenance AND value): a full hourly reconcile
+                # otherwise re-upserts EVERY non-explicit artist's rule,
+                # bumping updated_at and churning the index for nothing
+                # (review Teil B). A differently-provenanced non-user rule
+                # (e.g. wishlist_import) is still normalized to legacy, same
+                # as before.
+                rule_already_matches = (
+                    row["rule_provenance"] == PROVENANCE_LEGACY
+                    and bool(row["rule_monitored"]) == desired
+                )
+                if not rule_already_matches:
+                    record_rule(
+                        conn,
+                        "artist",
+                        artist_id,
+                        desired,
+                        PROVENANCE_LEGACY,
+                        profile_id=profile_id,
+                    )
+
+            # Explicit V2 intent wins in either direction. Imported/default
+            # rows already mirror the Watchlist and need no outgoing op.
+            if explicit and desired != on_watchlist:
+                created = enqueue_artist_watchlist(
+                    conn, artist_id, desired, profile_id=profile_id,
+                )
+                if created:
+                    outbox_ids.extend(created)
+                    stats["watchlist_mirrors"] += len(created)
+                else:
+                    stats["unmirrorable"] += 1
+
+        if affected_tracks:
+            track_ids = sorted(affected_tracks)
+            recompute_wanted(conn, profile_id=profile_id, track_ids=track_ids)
+            track_ops = enqueue_projected_tracks(
+                conn, track_ids, profile_id=profile_id, user_initiated=False,
+            )
+            outbox_ids.extend(track_ops)
+            stats["track_mirrors"] = len(track_ops)
+        conn.commit()
+        if outbox_ids:
+            drain(db, ids=outbox_ids)
+        stats["mirrored"] = _completed_outbox_count(conn, outbox_ids)
+        logger.info(
+            "artist/watchlist reconcile: %d scanned, %d flags changed, %d mirrors",
+            stats["scanned"], stats["monitor_flags_changed"], stats["mirrored"],
+        )
+        return stats
+
+
+def _tracks_without_file(conn, track_ids: Sequence[int]) -> set:
+    """Tracks with no usable file in the caller's library (same rule as the
+    Wishlist payload's ``has_file``)."""
+    from core.library2.sql_util import owner_clause
+    owned = set()
+    ids = list(track_ids)
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        owned.update(r[0] for r in conn.execute(
+            f"""SELECT DISTINCT tf.track_id FROM lib2_track_files tf
+                 WHERE tf.track_id IN ({','.join('?' for _ in chunk)})
+                   AND tf.path IS NOT NULL AND tf.path <> ''
+                   AND COALESCE(tf.file_state,'active') NOT IN ('missing_confirmed','deleted')
+                   {owner_clause(column='tf.owner_profile_id')}""", chunk))
+    return set(ids) - owned
+
+
+def shared_intent_profiles(conn, profile_id: int) -> tuple:
+    """Whose Wishlist rows a library's intent covers: the profile itself, and
+    for the shared (admin) library every profile without a library of its own."""
+    from core.library2 import ADMIN_PROFILE_ID
+    if int(profile_id) != ADMIN_PROFILE_ID:
+        return (int(profile_id),)
+    try:
+        from core.library_scope import own_library_ids
+        own = {int(pid) for pid in own_library_ids()}
+        ids = tuple(int(r[0]) for r in conn.execute("SELECT id FROM profiles") if int(r[0]) not in own)
+    except Exception:  # noqa: BLE001 - no profiles table (fresh/test DB)
+        ids = ()
+    return ids or (ADMIN_PROFILE_ID,)
+
+
+def _wishlisted_lib2_track_ids(conn, *, profile_id: int) -> List[int]:
+    """lib2 track ids currently represented in the legacy Wishlist.
+
+    New rows carry ``lib2_track_id`` in ``source_info``. Older rows can contain
+    a bare or album-qualified provider id without that marker, so feed every
+    available identity field through the same ambiguity-safe resolver used by
+    reverse Wishlist sync. Otherwise each reconcile run re-adds an already
+    present legacy row under a second identity.
+    """
+    try:
+        columns = {
+            str(row["name"])
+            for row in conn.execute("PRAGMA table_info(wishlist_tracks)").fetchall()
+        }
+        wanted_columns = (
+            "spotify_track_id", "spotify_data", "source_info",
+        )
+        selected = [name for name in wanted_columns if name in columns]
+        if "spotify_track_id" not in selected:
+            return []
+        profiles = shared_intent_profiles(conn, profile_id)
+        rows = conn.execute(
+            f"SELECT {', '.join(selected)} FROM wishlist_tracks "
+            f"WHERE profile_id IN ({','.join('?' for _ in profiles)})", profiles,
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — table absent (fresh install / test DB)
+        return []
+    return _descriptor_lib2_track_ids(conn, [dict(row) for row in rows])
+
+
+def reconcile_track_wishlist(
+    db,
+    *,
+    profile_id: int = 1,
+    batch: int = 200,
+    should_stop: Optional[Callable[[], bool]] = None,
+    progress: Optional[Callable[[int, int], None]] = None,
+    upgrades_per_run: int = 0,
+    upgrade_retry_days: float = 7,
+) -> Dict[str, int]:
+    """Re-assert the authoritative wanted projection into the Wishlist (§69.1).
+
+    Recomputes the full projection, then mirrors two sets through the same
+    outbox path the toggles use:
+
+    * every currently-``wanted`` track with no file — re-adds any wanted+missing
+      track whose Wishlist entry was downloaded/cleared/aged away (the reported
+      gap: a monitored missing track that never re-enters the Wishlist). A
+      track that has a file is not re-added by this rule, however far below
+      its quality target the file is (#2060);
+    * up to ``upgrades_per_run`` owned tracks below their quality target that
+      are due another try (``core.library2.upgrade_attempts``): each attempt
+      is remembered, the wait doubles while nothing better turns up, and an
+      attempt that found nothing in its window is withdrawn again;
+    * every existing lib2 track currently in the Wishlist that is no longer
+      wanted — prunes stale entries (the "und umgekehrt" half).
+
+    ``user_initiated=False`` so a deliberate user cancel/ignore keeps sticking.
+    Returns ``{scanned, wanted, wishlisted, added, pruned, refreshed,
+    mirrored}``. Does not touch files.
+
+    **Pruning is skipped while a Library-v2 bootstrap is alive.** The prune set
+    is "in the Wishlist but not wanted", which is only meaningful if the wanted
+    projection is complete. During a migration it is being built, so every
+    not-yet-imported track looks unwanted and this would delete exactly the
+    entries the user is waiting for — silently, an hour after every restart,
+    with the next run putting them back. Adding stays enabled: a superfluous
+    Wishlist row costs a search, a wrongly pruned one costs the download.
+    """
+    from core.library2.wanted import recompute_wanted, wanted_track_ids
+    from core.library2.wishlist_mirror import mirror_projected_tracks_wishlist
+
+    stats = {"scanned": 0, "wanted": 0, "wishlisted": 0,
+             "added": 0, "pruned": 0, "refreshed": 0, "mirrored": 0, 'intent_repaired': 0, 'intent_failed': 0,
+             "upgrades_queued": 0, "upgrades_waiting": 0, "upgrades_withdrawn": 0}
+    try:
+        from core.library2.bootstrap import bootstrap_is_active
+        pruning_allowed = not bootstrap_is_active(db)
+    except Exception as exc:  # noqa: BLE001 — an unknown state is not a licence to delete
+        logger.debug("bootstrap activity check unavailable: %s", exc)
+        pruning_allowed = False
+    with closing(db._get_connection()) as conn:
+        # Recover old external queue entries before deriving the prune set.
+        # Library-v2 outbox entries retain the authoritative Library decision.
+        conn.execute('BEGIN IMMEDIATE')
+        columns = {r[1] for r in conn.execute('PRAGMA table_info(wishlist_tracks)')}
+        if {'id', 'spotify_data', 'source_info', 'quality_profile_id', 'profile_id'} <= columns:
+            from core.library2.materialize import materialize_wishlist_row
+            for row in conn.execute('SELECT id FROM wishlist_tracks WHERE profile_id=?', (profile_id,)).fetchall():
+                if should_stop and should_stop():
+                    conn.commit()
+                    return stats
+                before = conn.total_changes
+                conn.execute('SAVEPOINT wl_row')  # one bad row must not abort the queue
+                try:
+                    materialize_wishlist_row(conn, row['id'], profile_id=profile_id)
+                    stats['intent_repaired'] += int(conn.total_changes > before)
+                except Exception as exc:  # noqa: BLE001
+                    conn.execute('ROLLBACK TO wl_row')
+                    stats['intent_failed'] += 1
+                    logger.warning("wishlist row %s: intent not restored: %s", row['id'], exc)
+                conn.execute('RELEASE wl_row')
+        conn.commit()
+        # in batches, committed as it goes: one full recompute in a single
+        # transaction held the write lock ~23s on a 313k-track library at
+        # every start, and chat, enrichment and caches all queued behind it.
+        # each batch reads before it writes, and only changed rows are written
+        recompute_stats = recompute_wanted(
+            conn, profile_id=profile_id, batch_size=_RECOMPUTE_BATCH,
+            on_batch=lambda _done, _total: conn.commit())
+        conn.commit()
+        from core.library2.validation import notify_changes
+        notify_changes()
+        changed_set = set(recompute_stats.get("changed_track_ids") or [])
+
+        wanted = wanted_track_ids(conn, profile_id=profile_id)
+        wanted_set = set(wanted)
+        stats["wanted"] = len(wanted)
+
+        # Only prune tracks that still exist in lib2 (track_wanted_states raises
+        # on unknown ids); orphaned wishlist rows are the delete path's concern.
+        # `wishlisted` scales with the library, so the existence check goes
+        # through the chunk-safe helper — a raw `IN (?, …)` over every
+        # wishlisted id would blow SQLite's variable limit on a large library.
+        wishlisted = _wishlisted_lib2_track_ids(conn, profile_id=profile_id)
+        wishlisted_set = set(wishlisted)
+        stats["wishlisted"] = len(wishlisted)
+        if pruning_allowed:
+            existing = select_existing_ids(conn, "lib2_tracks", wishlisted)
+            prune = [t for t in wishlisted if t in existing and t not in wanted_set]
+        else:
+            prune = []
+            logger.info(
+                "wishlist reconcile (profile %s): pruning skipped, a Library "
+                "bootstrap is running and the wanted projection is incomplete",
+                profile_id,
+            )
+
+        # Only mirror tracks whose Wishlist membership or projected state
+        # actually needs to change:
+        #   * wanted tracks NOT yet in the Wishlist — re-add the missing/upgrade-
+        #     eligible ones (a wanted track already present is already queued;
+        #     add_to_wishlist upserts, so rebuilding its ~6-query payload every
+        #     hour just to re-write an unchanged row is the waste review Teil B
+        #     flagged — several 100k idle queries/hour at 100k tracks);
+        #   * wishlisted tracks no longer wanted — prune;
+        #   * wanted tracks already wishlisted whose projection just changed
+        #     (e.g. a quality-profile reassignment) — recompute_wanted's
+        #     upsert only touches rows it actually changed, so this re-mirrors
+        #     exactly the tracks whose cached wishlist payload (quality
+        #     target, etc.) would otherwise go stale until the track happens
+        #     to leave and re-enter `wanted`, without re-touching every
+        #     genuinely-unchanged row.
+        # A wanted track that has its file and is no upgrade candidate is
+        # simply owned; mirroring it only to learn that cost ~66 s per hourly
+        # run on a 200k-track library.
+        # Profile edits change which copy of a multi-file track is primary.
+        from core.library2.track_files import rank_files_by_profile
+        rank_files_by_profile(conn)
+        # #2060: a track with NO file is put back whenever it is wanted. One
+        # that HAS a file below its quality target used to be put back the
+        # same way, every hour, and the wishlist's own "already in your
+        # library" sweep took each one straight out again before it was ever
+        # tried: with a source that can only deliver below the target (a 128k
+        # fallback under a 320k profile), every song just downloaded came
+        # back on the Wishlist each hour and no upgrade ever came of it.
+        queueable = _tracks_without_file(conn, wanted)
+        adds = [t for t in wanted if t not in wishlisted_set and t in queueable]
+        # Upgrades are asked for a few at a time and remembered, so a track is
+        # tried again only after a wait that grows while nothing better turns
+        # up, and a try that found nothing steps aside (upgrade_attempts).
+        upgrades: List[int] = []
+        if upgrades_per_run > 0:
+            from core.library2 import upgrade_attempts
+            from core.library2.wishlist_mirror import upgrade_candidate_track_ids
+            expired = upgrade_attempts.expired_wishes(
+                conn, shared_intent_profiles(conn, profile_id))
+            for start in range(0, len(expired), 500):
+                chunk = expired[start:start + 500]
+                conn.execute(
+                    f"DELETE FROM wishlist_tracks WHERE id IN ({','.join('?' for _ in chunk)})",
+                    chunk)
+            stats["upgrades_withdrawn"] = len(expired)
+            if expired:
+                logger.info(
+                    "wishlist reconcile: %d upgrade search(es) found nothing better "
+                    "in %dh and step aside until their next turn",
+                    len(expired), upgrade_attempts.WINDOW_HOURS)
+            below_target = [
+                t for t in upgrade_candidate_track_ids(
+                    conn, profile_id=profile_id, definite_only=True)
+                if t not in wishlisted_set]
+            upgrades = upgrade_attempts.due_tracks(
+                conn, below_target, retry_days=upgrade_retry_days,
+                limit=int(upgrades_per_run))
+            upgrade_attempts.stamp_tracks(conn, upgrades)
+            conn.commit()
+            stats["upgrades_queued"] = len(upgrades)
+            stats["upgrades_waiting"] = len(below_target) - len(upgrades)
+        refresh = [t for t in wanted if t in wishlisted_set and t in changed_set]
+        stats["added"] = len(adds)
+        stats["refreshed"] = len(refresh)
+        stats["pruned"] = len(prune)
+        if prune:
+            # An entry vanishing from the Wishlist is invisible after the fact;
+            # naming the tracks is the difference between a report we can
+            # answer and "my entries are gone again".
+            logger.info("wishlist reconcile: pruning %d no-longer-wanted track(s): %s",
+                        len(prune), prune[:50])
+
+        target = sorted(set(adds) | set(prune) | set(refresh) | set(upgrades))
+        total = len(target)
+        for start in range(0, total, max(1, batch)):
+            if should_stop and should_stop():
+                break
+            chunk = target[start:start + max(1, batch)]
+            stats["mirrored"] += mirror_projected_tracks_wishlist(
+                db, conn, chunk, profile_id=profile_id, user_initiated=False)
+            stats["scanned"] += len(chunk)
+            if progress:
+                progress(stats["scanned"], total)
+        logger.info(
+            "wishlist reconcile (profile %s): %d wanted, %d wishlisted, "
+            "%d added, %d pruned, %d refreshed, %d upgrade(s) asked for "
+            "(%d more below their profile wait their turn), %d mirror ops",
+            profile_id, stats["wanted"], stats["wishlisted"], stats["added"],
+            stats["pruned"], stats["refreshed"], stats["upgrades_queued"],
+            stats["upgrades_waiting"], stats["mirrored"],
+        )
+        return stats
+
+
+def sync_scanned_tracks_wishlist(
+    db,
+    track_ids: List[int],
+    *,
+    profile_id: int = 1,
+) -> Dict[str, int]:
+    """Mirror the wanted projection for tracks a scan just changed.
+
+    "Refresh & Scan" is the moment the catalogue learns a file is gone or has
+    come back, and acquisition is the consumer of exactly that fact. Leaving it
+    for the hourly reconcile to rediscover meant a track could sit missing and
+    monitored for an hour without anything looking for it — and made the button
+    feel like it had done nothing, because the visible consequence arrived much
+    later than the click.
+
+    Scoped on purpose: this recomputes and mirrors only the handed-in tracks,
+    so an artist refresh costs an artist's worth of work, not a library's.
+    """
+    from core.library2.wanted import recompute_wanted
+    from core.library2.wishlist_mirror import mirror_projected_tracks_wishlist
+
+    ids = sorted({int(t) for t in track_ids if t})
+    stats = {"tracks": len(ids), "mirrored": 0}
+    if not ids:
+        return stats
+    with closing(db._get_connection()) as conn:
+        recompute_wanted(conn, profile_id=profile_id, track_ids=ids)
+        conn.commit()
+        stats["mirrored"] = mirror_projected_tracks_wishlist(
+            db, conn, ids, profile_id=profile_id, user_initiated=False)
+        logger.info("post-scan wishlist sync: %d track(s), %d mirror op(s)",
+                    stats["tracks"], stats["mirrored"])
+        return stats
+
+
+__all__ = [
+    "artist_is_watchlisted",
+    "demonitor_lib2_artists_for_removed_watchlist",
+    "demonitor_lib2_tracks_for_removed_wishlist",
+    "reconcile_artist_watchlist",
+    "reconcile_track_wishlist",
+    "sync_scanned_tracks_wishlist",
+    "sync_watchlist_addition",
+    "sync_watchlist_removal",
+    "sync_wishlist_removal",
+]
+
+
+_MEMBER_WATCHLISTS_MARKER = "_lib2_member_watchlists_carried"
+
+
+def carry_member_watchlists(conn: Any) -> Dict[str, int]:
+    """once: each household member's 3.6.1 watchlist becomes their own watch
+    state in Library v2, so the Library's cards and filter show what they
+    watch (not the admin's). only the rule: their wishlist and the watchlist
+    scanner go on as before, nothing is queued. never raises, does commit."""
+    stats = {"profiles": 0, "artists": 0}
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+                        (_MEMBER_WATCHLISTS_MARKER,)).fetchone():
+            return stats
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='lib2_artists'").fetchone():
+            return stats
+        from core.library2.dedup_repair import _stored_ids
+        from core.library2.importer import normalize_name
+        from core.library2.monitor_rules import PROVENANCE_LEGACY, record_rule
+
+        by_id: Dict[tuple, int] = {}
+        by_name: Dict[str, set] = {}
+        for row in conn.execute("SELECT id, name, spotify_id, musicbrainz_id, external_ids, "
+                                "COALESCE(canonical_artist_id, id) AS canon FROM lib2_artists"):
+            canon = int(row["canon"])
+            for source, value in _stored_ids(row).items():
+                if value:
+                    by_id.setdefault((source, str(value)), canon)
+            key = normalize_name(row["name"])
+            if key:
+                by_name.setdefault(key, set()).add(canon)
+
+        try:
+            members = [int(r[0]) for r in conn.execute(
+                "SELECT id FROM profiles WHERE id <> 1 AND COALESCE(is_admin, 0) = 0")]
+        except Exception:  # noqa: BLE001 - no profiles table: nobody to carry
+            members = []
+        for profile_id in members:
+            available, entries = _watchlist_artist_snapshot(conn, profile_id=profile_id)
+            if not available or not entries:
+                continue
+            stats["profiles"] += 1
+            have = {int(r[0]) for r in conn.execute(
+                "SELECT entity_id FROM lib2_monitor_rules WHERE entity_type='artist' AND profile_id=?",
+                (profile_id,))}
+            for entry in entries:
+                artist_id = next((by_id[(s, v)] for s, v in entry["provider_ids"].items()
+                                  if (s, v) in by_id), None)
+                if artist_id is None:
+                    named = by_name.get(normalize_name(entry["name"] or ""), set())
+                    artist_id = next(iter(named)) if len(named) == 1 else None
+                # a rule the member already has (one they made) stays theirs
+                if artist_id is None or artist_id in have:
+                    continue
+                record_rule(conn, "artist", artist_id, True, PROVENANCE_LEGACY, profile_id=profile_id)
+                have.add(artist_id)
+                stats["artists"] += 1
+        conn.execute(f"CREATE TABLE {_MEMBER_WATCHLISTS_MARKER} (applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+        conn.commit()
+        if stats["artists"]:
+            logger.info("household watchlists carried into the Library: %s", stats)
+    except Exception as exc:  # noqa: BLE001 - a watch badge is never a blocker
+        logger.warning("household watchlists not carried: %s", exc)
+        try:
+            conn.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001 - the error above is the one that matters
+            logger.debug("rollback after a failed carry: %s", rollback_exc)
+    return stats

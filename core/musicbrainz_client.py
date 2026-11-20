@@ -43,6 +43,22 @@ ADAPTIVE_START_RPS = 10.0
 ADAPTIVE_MIN_RPS = 0.5
 ADAPTIVE_GROWTH_WINDOW = 10.0
 MAX_REDIRECTS = 3
+# the entities MusicBrainz merges, and so redirects a lookup by MBID for
+_MERGEABLE_ENTITIES = frozenset({
+    'artist', 'recording', 'release', 'release-group', 'work', 'label',
+    'area', 'place', 'event', 'series', 'instrument', 'genre', 'url',
+})
+
+
+def _same_entity_redirect(api_root: str, asked_path: str, target_path: str) -> bool:
+    """True when both paths are ``<api root>/<entity>/<id>`` for one entity kind."""
+    root = api_root.rstrip('/') + '/'
+    if not asked_path.startswith(root) or not target_path.startswith(root):
+        return False
+    asked = asked_path[len(root):].split('/')
+    target = target_path[len(root):].split('/')
+    return (len(asked) == 2 and len(target) == 2 and all(asked) and all(target)
+            and asked[0] == target[0] and asked[0] in _MERGEABLE_ENTITIES)
 DEFAULT_READ_TIMEOUT = 30.0
 DEFAULT_CONNECT_TIMEOUT = 5.0
 DEFAULT_MAX_RETRIES = 2
@@ -316,13 +332,18 @@ class MusicBrainzClient:
                     location = response.headers.get('Location', '')
                     target = urljoin(getattr(response, 'url', None) or request_url, location)
                     parsed = urlsplit(target)
-                    # Merged MBIDs redirect to another recording on this server.
-                    # Never send mirror requests to another host or a new API root.
+                    # A merged MBID redirects to the entity it was merged into:
+                    # same server, same kind of entity. That is true of every
+                    # kind, not only recordings: a merged release-group was
+                    # refused here, so its album failed on every start with
+                    # "configure its final base URL" (Nov 13 2026).
+                    # Never send mirror requests to another host, a new API
+                    # root, or a different kind of entity.
                     if (response.status_code not in (301, 308)
                             or parsed.scheme != origin.scheme
                             or parsed.netloc != origin.netloc
-                            or not parsed.path.startswith(origin.path.rstrip('/') + '/recording/')
-                            or not urlsplit(request_url).path.startswith(origin.path.rstrip('/') + '/recording/')
+                            or not _same_entity_redirect(
+                                origin.path, urlsplit(request_url).path, parsed.path)
                             or redirect_count == MAX_REDIRECTS):
                         raise requests.HTTPError(
                             "MusicBrainz API redirected; configure its final base URL", response=response)
@@ -726,6 +747,49 @@ class MusicBrainzClient:
             logger.error(f"Error browsing releases for release-group {release_group_mbid}: {e}")
             return []
 
+    def browse_artist_releases(self, artist_mbid: str, limit: int = 100,
+                               offset: int = 0) -> Optional[List[Dict[str, Any]]]:
+        """Browse an artist's concrete releases with each one's status and
+        release group (#2175: a release group's statuses). None on an error,
+        so a caller can tell "MusicBrainz didn't answer" from "no releases"."""
+        try:
+            response = self._get("/release", params={
+                'artist': artist_mbid,
+                'fmt': 'json',
+                'limit': min(limit, 100),
+                'offset': offset,
+                'inc': 'release-groups',
+            })
+            response.raise_for_status()
+            return response.json().get('releases', [])
+        except Exception as e:
+            logger.error(f"Error browsing releases for artist {artist_mbid}: {e}")
+            return None
+
+    def browse_recording_releases(self, recording_mbid: str, limit: int = 100,
+                                  offset: int = 0) -> List[Dict[str, Any]]:
+        """Browse the releases one recording is on, with each one's release
+        group and credits (#2077).
+
+        A lookup of the recording itself (``inc=releases``) stops at 25, and a
+        hit's compilations fill those 25 before its own album appears. The
+        browse pages through all of them."""
+        try:
+            params = {
+                'recording': recording_mbid,
+                'fmt': 'json',
+                'limit': min(limit, 100),
+                'offset': offset,
+                # media: the format and disc count, to pick a standard edition
+                'inc': 'release-groups+artist-credits+media',
+            }
+            response = self._get("/release", params=params)
+            response.raise_for_status()
+            return response.json().get('releases', [])
+        except Exception as e:
+            logger.error(f"Error browsing releases for recording {recording_mbid}: {e}")
+            return []
+
     def search_labels(self, label_name: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Search record labels by name (labels feature). Each hit has `id`
         (MBID), `name`, `disambiguation`, `type` (imprint/production/etc.),
@@ -882,7 +946,12 @@ class MusicBrainzClient:
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.error(f"Error fetching release-group {mbid}: {e}")
+            # a 404 is how get_album finds out an id is a release, not a
+            # group, which it asks about all the time: not an error
+            if http_error_status(e) == 404:
+                logger.debug(f"release-group {mbid} not found")
+            else:
+                logger.error(f"Error fetching release-group {mbid}: {e}")
             return None
 
     def get_recording(self, mbid: str, includes: Optional[List[str]] = None,

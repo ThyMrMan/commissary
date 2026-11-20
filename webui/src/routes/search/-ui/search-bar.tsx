@@ -46,7 +46,7 @@ export function SearchBar({
   onSubmit: () => void;
   /** the ✕ CLEARS the box, it does not cancel a search */
   onClear: () => void;
-  /** the source pill that sits inside the field */
+  /** the source pill at the end of the field */
   picker?: React.ReactNode;
   searching?: boolean;
   placeholder?: string;
@@ -68,8 +68,12 @@ export function SearchBar({
   }, [query]);
 
   return (
-    <div className={styles.searchBox} id="enhanced-search-bar" role="search">
-      {picker}
+    <div
+      className={styles.searchBox}
+      id="enhanced-search-bar"
+      role="search"
+      data-tour="search.field"
+    >
       <input
         ref={inputRef}
         id="enhanced-search-input"
@@ -104,6 +108,10 @@ export function SearchBar({
           ×
         </button>
       ) : null}
+      {/* where the results come from sits at the end of the box (#1909). up
+          front it was the first thing a new user read, and they came to type,
+          not to pick a catalogue */}
+      {picker}
     </div>
   );
 }

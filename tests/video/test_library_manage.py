@@ -207,8 +207,30 @@ def test_show_tab_counts_seasons_and_only_probes_the_asked_season(db, tmp_path):
     f2 = s2["episodes"][0]["files"][0]
     assert f1["reachable"] is True          # the asked season gets the disk checks
     assert "reachable" not in f2            # the rest stay database reads
-    assert tab["summary"]["folders"] == [{"path": str(tmp_path / "TV/Breaking Bad").replace("\\", "/"), "files": 2}]
+    assert [(f["path"], f["files"]) for f in tab["summary"]["folders"]] == [
+        (str(tmp_path / "TV/Breaking Bad").replace("\\", "/"), 2)]
     assert tab["quality"]["below_cutoff"] == 1 and s2["below_cutoff"] == 1
+
+
+def test_show_tab_counts_unmonitored_gaps_apart_from_missing(db, tmp_path):
+    # #2177: an old season left unmonitored on purpose read as "273 missing".
+    # missing is what SoulSync hunts (monitored, aired, no file); the rest is
+    # counted on its own so the page can still say it, quieter.
+    sid, eps = _show(db, tmp_path)
+    db.set_season_monitored(sid, 1, False)          # S01E01 + S01E02, both aired
+    tab = library_manage.show_library(db, sid, today="2026-10-25")
+    s1, s2 = tab["seasons"][0], tab["seasons"][1]
+    assert (s1["missing"], s1["missing_unmonitored"]) == (0, 2)
+    assert (s2["missing"], s2["missing_unmonitored"], s2["upcoming"]) == (1, 0, 1)
+    sm = tab["summary"]
+    assert (sm["missing"], sm["missing_unmonitored"], sm["upcoming"]) == (1, 2, 1)
+
+    # an episode unmonitored by hand inside a monitored season counts the same
+    db.set_episode_monitored(1396, 2, 1, False)
+    sm = library_manage.show_library(db, sid, today="2026-10-25")["summary"]
+    assert (sm["missing"], sm["missing_unmonitored"]) == (0, 3)
+    # the not-yet-aired one is never a gap, monitored or not
+    assert sm["upcoming"] == 1
 
 
 # ── file actions ─────────────────────────────────────────────────────────────

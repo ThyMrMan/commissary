@@ -9,6 +9,7 @@ import { ReidentifyModal } from './reidentify-modal';
  */
 
 afterEach(() => {
+  localStorage.clear();
   vi.unstubAllGlobals();
   delete window.showToast;
   cleanup();
@@ -30,6 +31,32 @@ function mount() {
 }
 
 describe('ReidentifyModal', () => {
+  it('renders on document.body, not inside the cell that opened it (#2197)', () => {
+    // the library album page mounts it in a track-table cell whose wrapper is
+    // a size container: a fixed overlay inside it is pinned to the table, not
+    // the screen, and inherits the cell's right alignment
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response(JSON.stringify({ sources: [] }))),
+    );
+    const { container } = render(
+      <div className="cell">
+        <ReidentifyModal
+          trackId={9}
+          trackTitle="Xtal"
+          artistName="Aphex Twin"
+          albumTitle="SAW 85-92"
+          imageUrl=""
+          onClose={() => {}}
+        />
+      </div>,
+    );
+    const overlay = document.getElementById('reid-modal-overlay');
+    expect(overlay).not.toBeNull();
+    expect(container.contains(overlay)).toBe(false);
+    expect(overlay?.parentElement).toBe(document.body);
+  });
+
   it('auto-searches the ACTIVE source and ranks ISRC hits first', async () => {
     const calls: string[] = [];
     vi.stubGlobal(
@@ -113,6 +140,46 @@ describe('ReidentifyModal', () => {
       ),
     );
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it('#2114: the move-the-file choice is remembered for the next modal', async () => {
+    const bodies: unknown[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith('/sources')) {
+          return new Response(JSON.stringify({ sources: [{ source: 'spotify', active: true }] }));
+        }
+        if (url.includes('/search')) {
+          return new Response(
+            JSON.stringify({
+              results: [
+                { track_title: 'Xtal', album_name: 'SAW', source: 'spotify', track_id: 't1' },
+              ],
+            }),
+          );
+        }
+        bodies.push(JSON.parse(String(init?.body)));
+        return new Response(JSON.stringify({ success: true, album_name: 'SAW' }));
+      }),
+    );
+    window.showToast = vi.fn() as never;
+    mount();
+    await screen.findByText('SAW');
+    const box = document.getElementById('reid-replace') as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    expect(box.checked).toBe(false);
+    cleanup();
+
+    const { onClose } = mount();
+    await screen.findByText('SAW');
+    expect((document.getElementById('reid-replace') as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(document.querySelector('.reid-result') as HTMLElement);
+    fireEvent.click(document.getElementById('reid-confirm-btn') as HTMLButtonElement);
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(bodies[0]).toMatchObject({ replace: false });
   });
 
   it('no configured sources → the empty state, no search', async () => {

@@ -2,20 +2,15 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { extractFunction } from './vanilla-extract';
+import { extractFunction, extractVar } from './vanilla-extract';
 
 /**
- * The season action bar.
+ * The bar over a YouTube channel's year, or a playlist.
  *
- * Grab / manual search / wishlist only mean something when episodes are
- * missing, so they stay conditional. Monitoring and stale-failure resets are
- * management, and they matter just as much on a season you own in full - a
- * complete season you no longer want hunted still needs the toggle. The bar
- * used to render only when something was missing, which put both of those out
- * of reach exactly when the season was healthy.
- *
- * Oct 2026 (Boulder: "so many buttons"): every action is still offered, but
- * only Grab sits on the bar; the rest are behind one ⋯ menu.
+ * A TV season's bar is React now (features/video-library/episode-list.tsx,
+ * tested beside it). What video-detail.js still draws is the YouTube one:
+ * acquisition only, because a channel has no episodes to monitor and no
+ * release to pick.
  */
 
 const SRC = readFileSync(resolve(process.cwd(), 'static/video/video-detail.js'), 'utf8');
@@ -29,6 +24,7 @@ function bar(season: Record<string, unknown>, ctx: Ctx = {}): HTMLElement {
     tmdb_id: ctx.tmdb_id === undefined ? 1396 : ctx.tmdb_id,
   };
   const preamble = `
+    ${extractVar('DL_IC', SRC)}
     var data = ${JSON.stringify(data)};
     var ytFilter = { q: ${JSON.stringify(ctx.q ?? '')}, state: 'all', duration: 'all' };
     window.VideoGrab = ${ctx.grab === false ? 'undefined' : '{}'};
@@ -41,18 +37,6 @@ function bar(season: Record<string, unknown>, ctx: Ctx = {}): HTMLElement {
   const host = document.createElement('div');
   host.innerHTML = build(season);
   return host;
-}
-
-/** Two episodes, both owned. `mon` = how many are monitored. */
-function complete(mon = 2) {
-  return {
-    season_number: 1,
-    episode_monitored: mon,
-    episodes: [
-      { episode_number: 1, owned: true },
-      { episode_number: 2, owned: true },
-    ],
-  };
 }
 
 function partial(mon = 2) {
@@ -68,53 +52,13 @@ function partial(mon = 2) {
 
 /** every action the bar offers, visible or behind its ⋯ menu (not the toggle). */
 function buttons(host: HTMLElement): string[] {
-  return Array.from(host.querySelectorAll('button:not([data-vd-pop])')).map(
+  // the Monitored switch is not one of the action buttons; it has its own test
+  return Array.from(host.querySelectorAll('button:not([data-vd-pop]):not([role="switch"])')).map(
     (b) => b.querySelector('.discog-btn-text')?.textContent ?? '',
   );
 }
 
-describe('the season action bar', () => {
-  it('offers management on a season with nothing missing', () => {
-    // This is the case the old bar dropped entirely.
-    expect(buttons(bar(complete()))).toEqual(['Monitored', 'Clear failures']);
-  });
-
-  it('adds the acquisition actions when episodes are missing', () => {
-    expect(buttons(bar(partial()))).toEqual([
-      'Grab season',
-      'Manual search',
-      'Wishlist season',
-      'Monitored',
-      'Clear failures',
-    ]);
-    expect(bar(partial()).textContent).toContain('1 missing');
-  });
-
-  it('states which way the monitor toggle will flip', () => {
-    const on = bar(complete(2)).querySelector('[data-vd-season-monitor]') as HTMLElement;
-    expect(on.getAttribute('data-vd-season-monitor')).toBe('0'); // monitored -> turn off
-    expect(on.className).toContain('vd-season-mon--on');
-
-    const off = bar(complete(0)).querySelector('[data-vd-season-monitor]') as HTMLElement;
-    expect(off.getAttribute('data-vd-season-monitor')).toBe('1'); // unmonitored -> turn on
-    expect(off.className).not.toContain('vd-season-mon--on');
-    expect(off.textContent).toContain('Unmonitored');
-  });
-
-  it('hides clear-failures when there is no tmdb id to retry against', () => {
-    // The retry endpoint keys on tmdb_id; without one the button could only fail.
-    expect(buttons(bar(complete(), { tmdb_id: null }))).toEqual(['Monitored']);
-  });
-
-  it('offers no management on a preview, which has no library row', () => {
-    expect(bar(complete(), { source: 'tmdb' }).innerHTML).toBe('');
-    expect(buttons(bar(partial(), { source: 'tmdb' }))).toEqual([
-      'Grab season',
-      'Manual search',
-      'Wishlist season',
-    ]);
-  });
-
+describe('the youtube bar', () => {
   it('gives a youtube year acquisition only, never monitoring', () => {
     const host = bar(partial(), { source: 'youtube', kind: 'channel' });
     // No manual search on YouTube: the video IS the release, there is nothing to pick.
@@ -139,19 +83,7 @@ describe('the season action bar', () => {
     );
   });
 
-  it('drops the grab buttons when the grab module never loaded', () => {
-    expect(buttons(bar(partial(), { grab: false }))).toEqual(['Monitored', 'Clear failures']);
-  });
-
-  it('shows only Grab on the bar and keeps the rest one click away', () => {
-    const host = bar(partial());
-    const visible = Array.from(
-      host.querySelectorAll('.vd-season-actions > button .discog-btn-text'),
-    ).map((b) => b.textContent);
-    expect(visible).toEqual(['Grab season']);
-    const menu = host.querySelector('[data-vd-pop-menu]') as HTMLElement;
-    expect(menu.hidden).toBe(true);
-    expect(menu.querySelector('[data-vd-season-monitor]')).not.toBeNull();
-    expect(host.querySelector('[data-vd-pop]')?.getAttribute('aria-haspopup')).toBe('menu');
+  it('draws nothing for a show: that bar is the React list’s', () => {
+    expect(bar(partial()).innerHTML).toBe('');
   });
 });

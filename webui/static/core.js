@@ -382,19 +382,28 @@ window.openDownloadBatchModal = function (batchId, playlistId, batchName) {
  * why the vanilla deliberately never called this from its own poll — the poll
  * caps at 300 rows and would under-report a bigger queue.
  */
-function _updateDlNavBadge(count) {
+function _updateDlNavBadge(count, quarantined) {
     // the downloads page's Music | Video switch shows this same number while
     // you're on the video side, so hand it over too
     window.__soulsyncMusicActiveDownloads = count;
     document.dispatchEvent(new CustomEvent('soulsync:music-active-downloads', { detail: count }));
+    // nothing downloading but files waiting in quarantine: say so, in its own
+    // colour, for whoever can act on it. a download that got quarantined used
+    // to leave no trace anywhere you'd look (#2001)
+    const review = (typeof currentProfile !== 'undefined' && currentProfile
+        && (currentProfile.is_admin || currentProfile.id === 1)) ? (quarantined || 0) : 0;
     const badge = document.getElementById('dl-nav-badge');
     if (badge) {
-        if (count > 0) {
-            badge.textContent = count;
+        const showReview = !(count > 0) && review > 0;
+        if (count > 0 || showReview) {
+            badge.textContent = count > 0 ? count : review;
             badge.classList.remove('hidden');
         } else {
             badge.classList.add('hidden');
         }
+        badge.classList.toggle('dl-nav-badge--review', showReview);
+        if (showReview) badge.title = review + ' waiting in Review';
+        else badge.removeAttribute('title');
     }
     const dlBtn = document.querySelector('.nav-button[data-page="active-downloads"]');
     if (dlBtn) {
@@ -483,7 +492,7 @@ function cleanupBeatportContent() {
 
     // the sliders went with beatport-ui.js; the react tab owns that view now
     stopBeatportDiscoveryAndSyncPolling();
-
+    // React BeatportSlider releases its autoplay timer when it unmounts.
     beatportContentState.loadingPromise = null;
     beatportContentState.loaded = false;
 
@@ -699,6 +708,24 @@ function _isMassOrphanFix(jobId, count) {
 // ===============================
 let socket = null;
 let socketConnected = false;
+
+// The live log viewer on Settings > Logs is React (src/features/settings/tabs/
+// logs-tab.tsx, SETTINGS_PORT.md step 3). `socket` is a script-scoped let a
+// module cannot reach, so the tab subscribes through these. Same calls the
+// vanilla viewer made.
+window.soulsyncLogStream = {
+    subscribe(source, onLive) {
+        if (!socket || !socket.connected) return false;
+        socket.emit('logs:subscribe', { source });
+        socket.on('logs:live', onLive);
+        return true;
+    },
+    unsubscribe(onLive) {
+        if (!socket) return;
+        socket.off('logs:live', onLive);
+        socket.emit('logs:unsubscribe', {});
+    },
+};
 // Mirrored onto window so the React dashboard's fallback pollers can apply the
 // SAME socket gate the vanilla poller twins do (`socketConnected` is a
 // script-scoped `let` no module can read). Kept in lockstep at every write.
@@ -757,9 +784,13 @@ window.refreshMusicRequestsBadge = refreshMusicRequestsBadge;
 let _requestAdminName = null;
 function announceWishlistRequest() {
     if (typeof canDownload !== 'function' || canDownload()) return false;
+    // with a limit, the toast says what's left ("2 of 5 asks left this week")
     const say = (name) => {
-        if (typeof showToast === 'function') showToast(`Sent to ${name || 'your admin'} as a request`, 'info');
+        const sent = `Sent to ${name || 'your admin'} as a request`;
         refreshMusicRequestsBadge();
+        _musicAsksLeftLine().then((left) => {
+            if (typeof showToast === 'function') showToast(left ? `${sent}. ${left}` : sent, 'info');
+        });
     };
     if (_requestAdminName) { say(_requestAdminName); return true; }
     fetch('/api/profiles', { headers: { 'Accept': 'application/json' } })
@@ -780,11 +811,53 @@ window.announceWishlistRequest = announceWishlistRequest;
 // resolves true when the add should go ahead (and on any doubt).
 function _requestLimitMessage(quota) {
     const days = Number(quota.days) || 7;
-    const noun = Number(quota.limit) === 1 ? 'request' : 'requests';
+    // music, movies and TV each have their own limit: this one is music's
+    const noun = Number(quota.limit) === 1 ? 'music request' : 'music requests';
     const span = days === 1 ? 'for today' : days === 7 ? 'for this week' : days === 30 ? 'for this month' : `for the last ${days} days`;
     return `You've used your ${quota.limit} ${noun} ${span}`;
 }
+// "3 of 5 music asks left this week", or '' with no limit (or on any doubt)
+function _musicAsksLeftLine() {
+    if (typeof canDownload !== 'function' || canDownload()) return Promise.resolve('');
+    return fetch('/api/requests/music/quota', { headers: { 'Accept': 'application/json' } })
+        .then(r => (r.ok ? r.json() : null))
+        .then((d) => {
+            const q = d && d.quota;
+            const limit = q ? Number(q.limit) || 0 : 0;
+            if (!limit) return '';
+            const days = Number(q.days) || 7;
+            const span = days === 1 ? 'today' : days === 7 ? 'this week' : days === 30 ? 'this month' : `in the last ${days} days`;
+            const left = Math.max(0, Number(q.remaining) || 0);
+            if (left <= 0) return `No music asks left ${span}`;
+            return `${left} of ${limit} ${limit === 1 ? 'music ask' : 'music asks'} left ${span}`;
+        })
+        .catch(() => '');
+}
+window.musicAsksLeftLine = _musicAsksLeftLine;
+
+// "3 of 5 asks left this week" next to a modal's Request button. only for a
+// profile that asks first; everyone else's placeholder stays empty (hidden)
+function fillMusicAsksLeft(root) {
+    const spots = root ? root.querySelectorAll('[data-asks-left]') : [];
+    if (!spots.length) return;
+    const perms = window.SoulSyncPerms;
+    const asks = perms ? perms.mode('music') === 'ask' : (typeof canDownload === 'function' && !canDownload());
+    spots.forEach((el) => { el.textContent = ''; });
+    if (!asks) return;
+    _musicAsksLeftLine().then((line) => {
+        spots.forEach((el) => { el.textContent = line; });
+    });
+}
+window.fillMusicAsksLeft = fillMusicAsksLeft;
+
 async function checkMusicRequestQuota() {
+    // getting music isn't part of this profile: the control should not be
+    // there at all (a stale page after an admin's change); say so calmly
+    const perms = window.SoulSyncPerms;
+    if (perms && perms.mode('music') === 'none') {
+        if (typeof showToast === 'function') showToast("Getting music isn't part of your profile. Ask your admin if you'd like it.", 'info', null, { history: false });
+        return false;
+    }
     if (typeof canDownload !== 'function' || canDownload()) return true;
     try {
         const res = await fetch('/api/requests/music/quota', { headers: { 'Accept': 'application/json' } });
@@ -921,6 +994,7 @@ function initializeWebSocket() {
     socket.on('enrichment:repair', (data) => updateRepairStatusFromData(data));
     socket.on('enrichment:soulid', (data) => updateSoulIDStatusFromData(data));
     socket.on('enrichment:listening-stats', () => { }); // Status only, no UI update needed
+    socket.on('library:changed', (data) => window.dispatchEvent(new CustomEvent('ss:library-changed', { detail: data })));
     socket.on('repair:progress', (data) => { qaSignal('tools'); updateRepairJobProgressFromData(data); if (typeof updateMusicRepairTask === 'function') updateMusicRepairTask(data); });
     // Server Activity live push — feed the open drawer (Tautulli replacement)
     socket.on('activity:update', (data) => {
@@ -1077,15 +1151,8 @@ function handleServiceStatusUpdate(data) {
     // Cache for library status card
     _lastStatusPayload = data;
 
-    if (typeof syncSpotifySettingsAuthState === 'function') {
-        syncSpotifySettingsAuthState(data?.spotify || null);
-    }
-    if (typeof syncPrimaryMetadataSourceAvailability === 'function') {
-        syncPrimaryMetadataSourceAvailability(data?.spotify || null);
-    }
-    if (typeof sanitizeMetadataSourceSelection === 'function') {
-        sanitizeMetadataSourceSelection({ quiet: true });
-    }
+    // the Settings metadata source picker and Spotify card follow the
+    // dispatch above (connections-metadata.tsx)
 
     // The dashboard service cards are React-rendered from the dispatch above
     // since the flip (service-cards.tsx) — only the sidebar half survives here.
@@ -1094,7 +1161,7 @@ function handleServiceStatusUpdate(data) {
     updateSidebarServiceStatus('soulseek', data.soulseek);
 
     // Update downloads nav badge from status push
-    if (data.active_downloads !== undefined) _updateDlNavBadge(data.active_downloads);
+    if (data.active_downloads !== undefined) _updateDlNavBadge(data.active_downloads, data.quarantined);
 
     // Hide sync buttons (not the page) for standalone mode — playlists still browsable/downloadable
     const isSoulsyncStandalone = data.media_server?.type === 'soulsync';
@@ -1130,6 +1197,14 @@ function handleServiceStatusUpdate(data) {
     // The ban itself is untouched — it still suppresses calls and still
     // protects against hammering. This only stops it interrupting people it
     // does not apply to.
+    // and only the admin (#2208): the ban is the server's operational state.
+    // the server already sends a member a payload without it, this is the
+    // second guard. a modal raised before a profile switch goes with it.
+    if (!_statusViewerIsAdmin()) {
+        if (_spotifyRateLimitShown) { _spotifyRateLimitShown = false; closeRateLimitModal(); }
+        _spotifyInCooldown = false;
+        return;
+    }
     const _spotifyMattersHere = (data.metadata_source?.source || 'spotify') === 'spotify';
     if (data.spotify?.rate_limited && data.spotify.rate_limit && _spotifyMattersHere) {
         handleSpotifyRateLimit(data.spotify.rate_limit);
@@ -1156,6 +1231,14 @@ function handleServiceStatusUpdate(data) {
             handleSpotifyRateLimit(null);
         }
     }
+}
+
+// is the profile on this page an admin? the server's room and payload rules
+// are the real gate; this keeps backend notices off a member's screen if one
+// slips through. nobody loaded yet counts as admin, like the rest of the shell
+function _statusViewerIsAdmin() {
+    if (typeof currentProfile === 'undefined' || !currentProfile) return true;
+    return !!currentProfile.is_admin || currentProfile.id === 1;
 }
 
 function handleWatchlistCountUpdate(data) {
@@ -1494,12 +1577,10 @@ const API = {
     playlists: '/api/playlists',
     sync: '/api/sync',
     search: '/api/search',
-    artists: '/api/artists',
     activity: '/api/activity',
     stream: {
         start: '/api/stream/start',
         status: '/api/stream/status',
-        toggle: '/api/stream/toggle',
         stop: '/api/stream/stop'
     }
 };
@@ -1569,6 +1650,16 @@ async function openDiscoverDownloadModal(playlistId) {
     } else {
         console.warn(`⚠️ [DOWNLOAD BAR] No download or process found for: ${playlistId}`);
     }
+}
+
+// A download batch's tracks in playlist order, in the shape the rehydrate
+// mapping reads (track_data_json = the track as it was queued).
+function _tracksFromBatchTasks(batch) {
+    const tasks = (batch && Array.isArray(batch.tasks)) ? [...batch.tasks] : [];
+    tasks.sort((a, b) => (a.track_index ?? 0) - (b.track_index ?? 0));
+    return tasks
+        .filter(task => task && task.track_info && typeof task.track_info === 'object')
+        .map(task => ({ track_data_json: { ...task.track_info } }));
 }
 
 async function rehydrateDiscoverDownloadModal(playlistId) {
@@ -1682,6 +1773,7 @@ async function rehydrateDiscoverDownloadModal(playlistId) {
 
         // Determine API endpoint based on playlist ID
         let apiEndpoint;
+        let prefetchedTracks = null;
         if (playlistId === 'discover_release_radar') {
             apiEndpoint = '/api/discover/release-radar';
         } else if (playlistId === 'discover_discovery_weekly') {
@@ -1695,7 +1787,13 @@ async function rehydrateDiscoverDownloadModal(playlistId) {
         } else if (playlistId === 'discover_discovery_shuffle') {
             apiEndpoint = '/api/discover/personalized/discovery-shuffle';
         } else if (playlistId === 'build_playlist_custom') {
-            apiEndpoint = '/api/discover/build-playlist';
+            // a built playlist lives only in its download batch, whose tasks
+            // carry every track; /api/discover/build-playlist never existed
+            prefetchedTracks = _tracksFromBatchTasks(batch);
+            if (!prefetchedTracks.length) {
+                console.log('⚠️ [REHYDRATE] Built playlist batch has no tracks to show');
+                return false;
+            }
         } else if (playlistId.startsWith('discover_lb_')) {
             // ListenBrainz playlist - fetch from cache
             const identifier = playlistId.replace('discover_lb_', '');
@@ -1822,21 +1920,25 @@ async function rehydrateDiscoverDownloadModal(playlistId) {
             return false;
         }
 
-        // Fetch tracks from API
-        console.log(`📡 [REHYDRATE] Fetching tracks from ${apiEndpoint}...`);
-        const response = await fetch(apiEndpoint);
-        if (!response.ok) {
-            console.error(`❌ [REHYDRATE] Failed to fetch tracks: ${response.status}`);
-            return false;
-        }
+        let tracks;
+        if (prefetchedTracks) {
+            tracks = prefetchedTracks;
+        } else {
+            // Fetch tracks from API
+            console.log(`📡 [REHYDRATE] Fetching tracks from ${apiEndpoint}...`);
+            const response = await fetch(apiEndpoint);
+            if (!response.ok) {
+                console.error(`❌ [REHYDRATE] Failed to fetch tracks: ${response.status}`);
+                return false;
+            }
 
-        const data = await response.json();
-        if (!data.success || !data.tracks) {
-            console.error(`❌ [REHYDRATE] Invalid track data:`, data);
-            return false;
+            const data = await response.json();
+            if (!data.success || !data.tracks) {
+                console.error(`❌ [REHYDRATE] Invalid track data:`, data);
+                return false;
+            }
+            tracks = data.tracks;
         }
-
-        const tracks = data.tracks;
         console.log(`✅ [REHYDRATE] Retrieved ${tracks.length} tracks`);
 
         // Transform tracks to Spotify format

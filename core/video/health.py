@@ -295,6 +295,13 @@ def collect(db) -> dict:
     from core.video.library_roots import four_k_path
     roots = [(key, label, str(db.get_setting(key) or "").strip()) for key, label in _ROOTS]
     roots += [(key, label, four_k_path(db, kind)) for kind, key, label in _FOUR_K_ROOTS]
+    # custom libraries (#2029): each one's folder is checked like the main ones
+    try:
+        from core.video.libraries import list_libraries
+        roots += [("library_%d" % lib["id"], "%s library" % lib["name"], lib["path"])
+                  for lib in list_libraries(db) if not lib["builtin"] and lib["usable"]]
+    except Exception:   # noqa: BLE001 - a bad row never hides the main checks
+        pass
     for key, label, path in roots:
         if not path:
             continue
@@ -316,10 +323,6 @@ def collect(db) -> dict:
             elif free is not None and free < 2:
                 checks.append(_check(key + "_space", label, "warning",
                                      "%.1f GB free — the drive is nearly full" % free))
-
-    # Commissary: the same checks for every video Library's folder.
-    from core.commissary.video_libraries import health_checks as _vlib_health
-    checks.extend(_vlib_health(db, settings.get("min_free_disk_gb")))
 
     from core.video.library_roots import ADDITIONAL_KEYS, additional_paths
     for key in ADDITIONAL_KEYS:
@@ -350,7 +353,9 @@ def collect(db) -> dict:
     try:
         from core.video import download_monitor as mon
         active = db.get_active_video_downloads() or []
-        slskd_active = [d for d in active if str(d.get("source") or "").lower() != "youtube"]
+        # import folder rows run on their own thread, not the monitor's (#2129)
+        slskd_active = [d for d in active
+                        if str(d.get("source") or "").lower() not in ("youtube", "import")]
         if slskd_active and not mon._started:
             checks.append(_check("monitor", "Download monitor", "warning",
                                  f"{len(slskd_active)} download(s) in flight but the monitor "

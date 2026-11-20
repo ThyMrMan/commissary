@@ -28,5 +28,7 @@ def test_every_manual_search_path_sends_the_identity():
     head = view.split("function searchInto(container, resultsEl, params, triggerRows, onDone) {")[1][:400]
     assert "CommissarySearchIdentity.apply(container, params)" in head
     grab = _read("webui/static/video/video-grab.js")
-    assert grab.count("media_id: opts.mediaId, media_source: opts.mediaSource") >= 4, \
-        "episode + season-pack searches and their grabs"
+    # upstream 3.6.8 sends the identity itself (#2027): tmdb_id, which the
+    # fork's Identity reads first (core/commissary/search_identity.tmdb_for)
+    assert "if (opts.tmdbId != null) out.tmdb_id = opts.tmdbId;" in grab
+    assert grab.count("identityParams(opts)") >= 2, "episode + season-pack searches"

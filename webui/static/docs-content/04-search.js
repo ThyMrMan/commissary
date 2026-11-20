@@ -1,5 +1,6 @@
 registerDocsSection({
     id: 'search',
+    needs: 'music.search',
     title: 'Music Downloads',
     icon: '⬇️',
     pages: [
@@ -9,6 +10,10 @@ registerDocsSection({
             lede: 'The default way to find music — type an artist, album, or track and browse categorized results from your metadata sources.',
             body: `
 Type an artist, album, or track name and results appear in a categorized dropdown as you type. Results come from your primary metadata source (Deezer by default).
+
+## Browse tiles
+
+With nothing typed, the page offers browse tiles (Top trending, New releases and six genres). They show what's charting on Deezer right now (its public charts, no account needed, refreshed every few hours), with a genre tile blending its Deezer genres. When Deezer is off, unreachable or has nothing for a tile (Ambient has no Deezer genre), the tile falls back to what your own metadata sources know. Everything opens in the normal result cards, so preview and download work the same.
 
 ## Result categories
 
@@ -25,11 +30,12 @@ Type an artist, album, or track name and results appear in a categorized dropdow
 - Click a **track** to open the download modal for that specific song
 - **Preview tracks** — the play button on track results streams a short preview from your download source before you commit to a download
 - **Mode tabs** — switch what you search with the tabs above the results: **Catalog** (metadata search), **Videos**, or **Files** (raw file search). Within Catalog, pick the metadata source from the **Search with** dropdown (Spotify, iTunes, Deezer, and more). Each source has its own catalog, so a track missing on one may appear on another
+- **All sources** — the first entry in **Search with** asks every source you have set up at the same moment and shows one list. Results appear as each source answers, and a line above them says who has answered and who is still searching. The same artist, album or track found on several sources is shown once, with a small logo for each source that has it; it opens from your primary source when that source has it. What several sources agree on is listed first. Two releases only share a card when artist, title, kind (album against single or EP), year and length all line up, so a remaster, a deluxe edition or a remix keeps its own card. It is never the default: pick it when one source comes up short
 
-![Enhanced search results](dl-enhanced-search.jpg)
+![Enhanced Search results for Neon Orchard, grouped into library matches, artists, albums, singles and tracks](dl-enhanced-search.jpg)
 
 > [!TIP]
-> If a search comes up empty, try a different metadata source in the **Search with** dropdown first — catalogs differ between Spotify, iTunes, and Deezer, especially for regional or older releases.
+> If a search comes up empty, try **All sources** or a different metadata source in the **Search with** dropdown first — catalogs differ between Spotify, iTunes, and Deezer, especially for regional or older releases.
 `
         },
         {
@@ -47,7 +53,7 @@ Narrow results by:
 - **Format** — FLAC, MP3, OGG, AAC, WMA
 - **Sort** — Relevance, Quality, Size, Name, Uploader, Bitrate, or Duration
 
-![Basic search results](dl-basic-search.jpg)
+![The search entry view with the Catalog, Videos and Files tabs, a source picker and browse tiles](dl-basic-search.jpg)
 
 > [!NOTE]
 > Basic Search is ideal when you care about the *file* rather than the *release* — for example, hunting a specific lossless rip or checking what's actually shared for an obscure album.
@@ -55,6 +61,7 @@ Narrow results by:
         },
         {
             id: 'search-sources',
+            needs: 'admin',
             title: 'Download Sources',
             lede: 'Ten download sources plus Hybrid mode — configure them in Settings and let SoulSync pick the best one.',
             body: `
@@ -75,6 +82,8 @@ SoulSync downloads from multiple sources. Connect each source in **Settings → 
 | **Hybrid** | Tries your primary source first, then falls back through alternates automatically | Best overall success rate |
 
 Torrent and Usenet search each Prowlarr indexer on its own, so one slow or broken indexer never costs you the others' results. When some indexers fail, a note above the results names them (click **Details** for each one's error), so you know the list may be missing releases.
+
+![Download source settings with the hybrid chain, Soulseek first and YouTube as fallback](dl-sources.jpg)
 
 > [!TIP]
 > **Hybrid mode** is recommended for most users. It tries your primary source first, then falls back through your configured priority order. Order all sources via drag-and-drop in Settings → Downloads.
@@ -97,6 +106,7 @@ Tidal, Qobuz, HiFi, and Deezer have no per-source quality setting in SoulSync �
         },
         {
             id: 'search-downloading',
+            needs: 'music.get',
             title: 'Downloading Music',
             lede: 'Pick an album or track, choose exactly what you want, and watch each track move through the pipeline.',
             body: `
@@ -105,6 +115,8 @@ When you select an album or track to download, a modal appears with:
 - **Album hero** — cover art, title, artist, year, track count
 - **Track list** with checkboxes to select or deselect individual tracks
 - **Download progress** with per-track status indicators: searching, downloading, processing, complete, failed
+
+![The album download modal with the per-track checklist and quality profile picker](dl-downloading.jpg)
 
 Downloads can be started from many places: Enhanced Search results, artist discography pages, the Download Missing modal, wishlist auto-processing, and playlist sync.
 
@@ -125,6 +137,7 @@ If a download fails — or no suitable file is found — you can open the cached
         },
         {
             id: 'search-postprocess',
+            needs: 'admin',
             title: 'Post-Processing Pipeline',
             lede: 'Every download is verified, tagged, organized, and scanned into your library automatically.',
             body: `
@@ -134,13 +147,13 @@ After a file finishes downloading, it moves through an automatic pipeline before
 1. **AcoustID fingerprint verification** — if AcoustID is configured, the file is fingerprinted and compared against the expected track. Title and artist are fuzzy-matched (title ≥ 70% similarity, artist ≥ 60%). Files that fail verification are **quarantined** instead of added to your library. AcoustID is skipped for streaming sources (Tidal, Qobuz, Deezer, HiFi) since those download by exact track ID — but streaming search results are still verified by artist/title matching *before* download to prevent wrong-track matches.
 2. **Metadata tagging** — the file is tagged with official metadata: title, artist, album artist, album, track and disc numbers, year, genre, and composer. Tags are written with Mutagen (supports MP3, FLAC, OGG, M4A).
 3. **Cover art embedding** — album artwork is downloaded from the metadata source and embedded directly into the audio file.
-4. **File organization** — the file is renamed and moved to your output path following customizable templates. Separate templates exist for albums, singles, and playlists. Available variables include \`$artist\`, \`$album\`, \`$title\`, \`$track\`, \`$year\`, \`$quality\`, and \`$albumtype\` (resolves to Album, Single, EP, or Compilation). For **multi-disc albums**, a \`Disc N/\` subfolder is created automatically when the album has more than one disc — or use \`$disc\` (zero-padded "01") / \`$discnum\` (unpadded "1") in your template for manual control.
+4. **File organization** — the file is renamed and moved to your output path following customizable templates. Separate templates exist for albums, singles, and playlists. Available variables include \`$artist\`, \`$album\`, \`$title\`, \`$track\`, \`$year\`, \`$quality\`, and \`$albumtype\` (resolves to Album, Single, EP, or Compilation). For **multi-disc albums**, a \`Disc N/\` subfolder is created automatically when the album has more than one disc — or use \`$disc\` (zero-padded "01") / \`$discnum\` (unpadded "1") in your template for manual control. Both drop out on a single-disc album, so its files are not stamped "01-". If you want the disc on every album, one disc or five, use \`$discalways\` ("01") or \`$discnumalways\` ("1").
 5. **Lyrics (LRC)** — synced lyrics are fetched from the LRClib API and saved as \`.lrc\` sidecar files next to the audio. Compatible players (foobar2000, MusicBee, Plex, etc.) display time-synced lyrics automatically, falling back to plain-text lyrics when synced versions aren't available.
 6. **Lossy copy** — if enabled in settings, a lower-bitrate copy is created alongside the original (useful for mobile device syncing).
 7. **Media server scan** — your media server (Plex/Jellyfin) is notified to scan for the new file. Navidrome auto-detects changes.
 :::
 
-![Post-processing pipeline](dl-post-processing.jpg)
+![The pipeline is configured in Settings, on the Library tab: the post-processing master toggle, cover art and lyrics options, and per-service tag embedding](settings-processing.jpg)
 
 > [!NOTE]
 > **Quarantine**: files that fail AcoustID verification are moved to a quarantine folder instead of your library. Review quarantined files and manually approve or delete them. The automation engine can notify you when files are quarantined.
@@ -148,6 +161,7 @@ After a file finishes downloading, it moves through an automatic pipeline before
         },
         {
             id: 'search-quality',
+            needs: 'admin',
             title: 'Quality Profiles',
             lede: 'Tell SoulSync what "good enough" means — from strict audiophile to space-saving.',
             body: `
@@ -161,7 +175,7 @@ Configure your quality preferences in **Settings → Quality → Music Quality**
 
 Each format has configurable bitrate ranges and a priority order. Enable **Fallback** ("Accept off-list quality when nothing in the list is available") to accept a quality outside your ranked targets when nothing in the list is available.
 
-![Quality profile settings](dl-quality-profiles.jpg)
+![The Quality Profiles panel with the default profile and its upgrade rules](dl-quality-profiles.jpg)
 
 > [!TIP]
 > **Streaming source quality**: Tidal, Qobuz, HiFi, and Deezer follow this same profile — there are no separate per-source quality settings. Pick **Audiophile** when you never want a lossy file.
@@ -169,10 +183,13 @@ Each format has configurable bitrate ranges and a priority order. Enable **Fallb
         },
         {
             id: 'search-manager',
+            needs: 'music.downloads',
             title: 'Download Manager',
             lede: 'Every active and completed download in one place, with live progress and per-track status.',
             body: `
 Open the **Active Downloads** page to see all active and completed downloads. Each download shows real-time progress: track name, format, speed, ETA, and a cancel button.
+
+![The Active Downloads page with no transfers running](dl-manager.jpg)
 
 Use **Clear Completed** on the Active Downloads page to clean up finished items and keep the list tidy.
 
@@ -190,6 +207,7 @@ Use **Clear Completed** on the Active Downloads page to clean up finished items 
 
 registerDocsSection({
     id: 'hydrabase',
+    needs: 'admin',
     title: 'Hydrabase',
     icon: '🌐',
     pages: [
@@ -199,6 +217,8 @@ registerDocsSection({
             lede: 'A P2P metadata network: search metadata over a shared WebSocket instead of Spotify/iTunes.',
             body: `
 Hydrabase is a **P2P metadata client**. It sends search requests over a shared WebSocket connection and returns results normalized to the same Track / Artist / Album types the Spotify and iTunes clients use — so the rest of the app can't tell the difference.
+
+![The Hydrabase page with its connection status, API Calls console and Response panel](hydra-overview.jpg)
 
 When enabled and connected, it **replaces Spotify/iTunes as the primary metadata source for searches** (the app calls it "Hydrabase (P2P mirror)" in places).
 
@@ -218,6 +238,8 @@ The dedicated Hydrabase page is **dev-mode only** — its nav item is hidden unt
             title: 'The Hydrabase Page',
             lede: 'Dev-mode console: connect, fire raw API calls, and compare sources side by side.',
             body: `
+![The Hydrabase console's API payload editors, Response panel and Network card](hydra-console.jpg)
+
 ## Connecting
 
 The header shows a status span (**Disconnected** in gray by default) and a **Connect** button. Below it, the **Connection Config** card holds **WebSocket URL** (default \`ws://localhost:4545\`) and **API Key** ("Your Hydrabase API key"). Connecting requires both — otherwise you get a **"URL and API key required"** toast.
@@ -249,6 +271,8 @@ The left **API Calls** panel has five cards — **Tracks**, **Albums**, **Artist
             title: 'Network & Mirroring',
             lede: 'How Hydrabase plugs into search, what the mirror worker does, and the Settings behind it all.',
             body: `
+![Hydrabase connection settings with the WebSocket URL, API key and auto-connect options](hydra-settings.jpg)
+
 ## As the active metadata source
 
 Hydrabase becomes the primary source when the WebSocket is connected **and** dev mode is enabled. Then searches query Hydrabase first, and every search also triggers a background comparison against Spotify and your fallback source (iTunes or Deezer) — that's what feeds the Source Comparisons card.
@@ -272,7 +296,7 @@ Worker controls (\`GET /api/hydrabase-worker/status\`, \`POST /api/hydrabase-wor
 - **Connect** button — saves settings first, then toggles the connection. Connecting adds a **"Hydrabase (P2P)"** option to the **Primary metadata source** dropdown; disconnecting removes it (resetting the dropdown to iTunes if it was selected).
 - Status line: **"URL and API Key required"**, **Disconnected**, **Connected** (green), or the error text.
 
-The connection test reports **"Hydrabase connected"** or **"Hydrabase not connected. Configure URL + API key and click Connect."**, and debug info includes a \`hydrabase_connected\` flag.
+The connection test reports **"Hydrabase connected"** or **"Hydrabase not connected. Configure URL + API key and click Connect."**, and the diagnostics from [Report a problem](#ts-debug) include a \`hydrabase_connected\` flag.
 
 > [!NOTE]
 > There are no bandwidth caps, sharing toggles, or privacy switches anywhere in the Hydrabase UI or settings — the only knobs are connect/disconnect, auto-connect, the raw API sender, and worker pause/resume.

@@ -26,6 +26,13 @@ class Config:
 MBID = "b9ca7096-68de-455f-8a36-1f1ebb2abf2a"
 
 
+@pytest.fixture(autouse=True)
+def _no_artwork_lookups(monkeypatch):
+    """the backfill also looks up poster/background art (#2138): never online here."""
+    import core.metadata.artist_artwork as artwork
+    monkeypatch.setattr(artwork, "candidates", lambda *a, **k: {"photos": [], "backgrounds": []})
+
+
 # ---------------------------------------------------------------------------
 # build_artist_nfo
 # ---------------------------------------------------------------------------
@@ -220,9 +227,10 @@ class TestEnsureArtistNfoForTrack:
         ok, detail = ensure_artist_nfo_for_track("/nonexistent/x.mp3", Config(**{"library.write_artist_nfo": True}))
         assert not ok
 
-    def test_skips_when_derived_folder_is_library_root(self, tmp_path, monkeypatch):
-        """Flat layout: track directly in the artist folder means the derived
-        folder IS the library root — never plant artist.nfo there."""
+    def test_flat_artist_track_layout_writes_into_artist_not_root(self, tmp_path, monkeypatch):
+        """Flat layout: track directly in the artist folder. "one up" was the
+        library root (#1449 refused it); the template level finds the artist
+        folder itself (#2138). Never the root."""
         from core.library.artist_nfo import ensure_artist_nfo_for_track
         artist = tmp_path / "Mammoth"
         artist.mkdir()
@@ -236,7 +244,21 @@ class TestEnsureArtistNfoForTrack:
             "library.music_paths": [str(tmp_path)],
         })
         ok, detail = ensure_artist_nfo_for_track(str(track), cfg)
-        assert not ok and "library root" in detail
+        assert ok, detail
+        assert (artist / "artist.nfo").exists()
+        assert not (tmp_path / "artist.nfo").exists()
+
+    def test_loose_track_in_library_root_never_writes_there(self, tmp_path, monkeypatch):
+        """#1449: a track loose in the root has no artist folder at all."""
+        from core.library.artist_nfo import ensure_artist_nfo_for_track
+        track = tmp_path / "track.mp3"
+        track.write_bytes(b"fake-audio")
+        self._stub_tags(monkeypatch, {"available": True, "tags": {
+            "album_artist": "Mammoth", "musicbrainz_albumartistid": MBID}})
+        cfg = Config(**{"library.write_artist_nfo": True,
+                        "library.music_paths": [str(tmp_path)]})
+        ok, _detail = ensure_artist_nfo_for_track(str(track), cfg)
+        assert not ok
         assert not (tmp_path / "artist.nfo").exists()
 
     def test_fallback_mbid_used_when_tags_lack_it(self, tmp_path, monkeypatch):
@@ -330,12 +352,12 @@ class TestArtistNfoBackfillJob:
         album.mkdir(parents=True)
         track = album / "01 - Track.mp3"
         track.write_bytes(b"fake-audio")  # tag reads are stubbed below
+        from tests import lib2_seed
         with db._get_connection() as conn:
-            conn.execute("INSERT INTO artists (id, name, musicbrainz_id) VALUES (1, 'Mammoth', ?)", (MBID,))
-            conn.execute("INSERT INTO albums (id, title, artist_id) VALUES (1, 'Mammoth', 1)")
-            conn.execute("INSERT INTO tracks (id, title, file_path, artist_id, album_id) VALUES (1, 'T', ?, 1, 1)", (str(track),))
+            lib2_seed.artist(conn, 'Mammoth', musicbrainz_id=MBID)
+            lib2_seed.track(conn, 'Mammoth', 'Mammoth', 'T', path=str(track))
             # artist without MBID — must be skipped, not crash
-            conn.execute("INSERT INTO artists (id, name) VALUES (2, 'No MBID')")
+            lib2_seed.track(conn, 'No MBID', 'Other', 'U', path=str(track))
             conn.commit()
         return db, str(artist)
 
@@ -402,6 +424,26 @@ class TestArtistNfoBackfillJob:
         rows = ArtistNfoBackfillJob()._candidates(self._context(db, tmp_path))
         assert len(rows) == 1
         assert rows[0][1] == "Mammoth" and rows[0][2] == MBID
+
+    def test_candidates_include_an_alias_artists_folder(self, tmp_path, monkeypatch):
+        """3.6.1 gave every artist row its nfo. v2 skipped alias rows (a
+        second spelling merged under a canonical artist), so the folder filed
+        under that spelling never got one."""
+        from core.repair_jobs.artist_nfo_backfill import ArtistNfoBackfillJob
+        from database.music_database import MusicDatabase
+        from tests import lib2_seed
+        db = MusicDatabase(str(tmp_path / "alias.db"))
+        with db._get_connection() as conn:
+            canonical = lib2_seed.artist(conn, 'Mammoth WVH', musicbrainz_id=MBID)
+            lib2_seed.track(conn, 'Mammoth WVH', 'Mammoth II', 'A', path='/m/Mammoth WVH/II/01.mp3')
+            alias = lib2_seed.artist(conn, 'Mammoth', canonical_artist_id=canonical)
+            lib2_seed.track(conn, 'Mammoth', 'Mammoth', 'B', path='/m/Mammoth/I/01.mp3')
+            conn.commit()
+        rows = ArtistNfoBackfillJob()._candidates(self._context(db, tmp_path))
+        by_name = {r[1]: (r[2], r[3]) for r in rows}
+        assert by_name['Mammoth'] == (MBID, '/m/Mammoth/I/01.mp3')
+        assert by_name['Mammoth WVH'][0] == MBID
+        assert alias != canonical
 
     def test_backfill_uses_db_mbid_when_tags_lack_it(self, tmp_path, monkeypatch):
         """Files predating MB tag embedding: the DB row's musicbrainz_id

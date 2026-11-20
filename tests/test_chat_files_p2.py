@@ -80,23 +80,43 @@ class _FakeClient:
 @pytest.fixture()
 def files_app(tmp_path, monkeypatch):
     from database.music_database import MusicDatabase
+    from core.library2.importer import normalize_name
     db = MusicDatabase(str(tmp_path / "m.db"))
     media = tmp_path / "media"
     media.mkdir()
     track_file = media / "song.flac"
     track_file.write_bytes(b"x" * 4096)
+    ids = {}
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('AR1', 'Muse', 'test')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, server_source) "
-                     "VALUES ('AL1', 'AR1', 'The Resistance', 'test')")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_size, server_source) "
-                     "VALUES ('T1', 'AL1', 'AR1', 'Uprising', ?, 4096, 'test')", (str(track_file),))
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path, server_source) "
-                     "VALUES ('T2', 'AL1', 'AR1', 'Ghost Track', '/nowhere/gone.flac', 'test')")
+        artist = conn.execute(
+            "INSERT INTO lib2_artists(name, name_key) VALUES(?,?)",
+            ("Muse", normalize_name("Muse"))).lastrowid
+        album = conn.execute(
+            "INSERT INTO lib2_albums(primary_artist_id, title, origin) VALUES(?,?,'library')",
+            (artist, "The Resistance")).lastrowid
+        for title, path, size in (
+            ("Uprising", str(track_file), 4096),
+            ("Ghost Track", "/nowhere/gone.flac", None),
+        ):
+            track = conn.execute(
+                "INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+                (album, title)).lastrowid
+            conn.execute(
+                "INSERT INTO lib2_track_artists(track_id, artist_id) VALUES(?,?)",
+                (track, artist))
+            conn.execute(
+                "INSERT INTO lib2_track_files(track_id, path, size, is_primary) "
+                "VALUES(?,?,?,1)", (track, path, size))
+            ids[title] = track
+        # A track the catalogue knows and the disk does not: no file row at all,
+        # which is what "we never got this one" looks like in v2 (ADR-03).
+        ids["Fileless"] = conn.execute(
+            "INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+            (album, "Fileless Song")).lastrowid
         conn.commit()
 
     client = _FakeClient()
-    state = {"client": client, "admin": True,
+    state = {"client": client, "admin": True, "ids": ids, "db": db,
              "config": {"soulseek.chat_filepost_key": "K123"}}
     uploads = []
 
@@ -127,7 +147,8 @@ def files_app(tmp_path, monkeypatch):
 
 def test_library_track_upload_resolves_path(files_app):
     http, state, client, uploads = files_app
-    r = http.post("/api/chat/files/upload", json={"track_id": "T1"})
+    r = http.post("/api/chat/files/upload",
+                  json={"track_id": state["ids"]["Uprising"]})
     body = r.get_json()
     assert body["ok"] is True
     assert body["url"].endswith("song.flac")
@@ -137,7 +158,18 @@ def test_library_track_upload_resolves_path(files_app):
 
 def test_unreachable_track_404s_without_uploading(files_app):
     http, state, client, uploads = files_app
-    r = http.post("/api/chat/files/upload", json={"track_id": "T2"})
+    r = http.post("/api/chat/files/upload",
+                  json={"track_id": state["ids"]["Ghost Track"]})
+    assert r.status_code == 404
+    assert uploads == []
+
+
+def test_track_without_a_file_row_404s(files_app):
+    """A v2 track carries no path of its own — the file is a separate row
+    (ADR-03). A track the library knows but never got a file for has none."""
+    http, state, client, uploads = files_app
+    r = http.post("/api/chat/files/upload",
+                  json={"track_id": state["ids"]["Fileless"]})
     assert r.status_code == 404
     assert uploads == []
 
@@ -156,7 +188,8 @@ def test_browser_file_upload(files_app):
 def test_no_key_means_503(files_app):
     http, state, client, uploads = files_app
     state["config"]["soulseek.chat_filepost_key"] = ""
-    r = http.post("/api/chat/files/upload", json={"track_id": "T1"})
+    r = http.post("/api/chat/files/upload",
+                  json={"track_id": state["ids"]["Uprising"]})
     assert r.status_code == 503
     assert uploads == []
 
@@ -164,7 +197,8 @@ def test_no_key_means_503(files_app):
 def test_expiry_setting_travels(files_app):
     http, state, client, uploads = files_app
     state["config"]["soulseek.chat_filepost_expiry"] = "7d"
-    http.post("/api/chat/files/upload", json={"track_id": "T1"})
+    http.post("/api/chat/files/upload",
+              json={"track_id": state["ids"]["Uprising"]})
     assert uploads[0]["expiry"] == "7d"
 
 
@@ -173,6 +207,59 @@ def test_library_search_only_tracks_with_files(files_app):
     body = http.get("/api/chat/files/library-search?q=upri").get_json()
     assert [t["title"] for t in body["tracks"]] == ["Uprising"]
     assert http.get("/api/chat/files/library-search?q=x").get_json()["tracks"] == []
+
+
+def test_library_search_ids_are_what_upload_resolves(files_app):
+    """The search is the only producer of the ids this route's sibling
+    consumes, so they speak the same id space by construction."""
+    http, state, client, uploads = files_app
+    found = http.get("/api/chat/files/library-search?q=upri").get_json()["tracks"][0]
+    assert found["id"] == state["ids"]["Uprising"]
+    assert found["artist"] == "Muse" and found["album"] == "The Resistance"
+    assert found["size"] == 4096
+    assert http.post("/api/chat/files/upload",
+                     json={"track_id": found["id"]}).get_json()["ok"] is True
+
+
+def test_library_search_finds_a_track_by_its_artist(files_app):
+    """Both of Muse's tracks have a file row — whether the file is still on
+    disk is the upload's problem, exactly as it was when the path hung off the
+    track row."""
+    http, state, client, uploads = files_app
+    body = http.get("/api/chat/files/library-search?q=muse").get_json()
+    assert [t["title"] for t in body["tracks"]] == ["Ghost Track", "Uprising"]
+
+
+def test_library_search_folds_accents(files_app):
+    """SQLite's LIKE folds ASCII case only, so a stored 'Björk' never answered
+    a typed 'bjork' — the same fold the rest of the library search uses."""
+    http, state, client, uploads = files_app
+    from core.library2.importer import normalize_name
+    with state["db"]._get_connection() as conn:
+        artist = conn.execute(
+            "INSERT INTO lib2_artists(name, name_key) VALUES(?,?)",
+            ("Björk", normalize_name("Björk"))).lastrowid
+        album = conn.execute(
+            "INSERT INTO lib2_albums(primary_artist_id, title, origin)"
+            " VALUES(?,?,'library')", (artist, "Post")).lastrowid
+        track = conn.execute(
+            "INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+            (album, "Hyperballad")).lastrowid
+        conn.execute("INSERT INTO lib2_track_artists(track_id, artist_id)"
+                     " VALUES(?,?)", (track, artist))
+        conn.execute("INSERT INTO lib2_track_files(track_id, path, is_primary)"
+                     " VALUES(?,'/m/hyper.flac',1)", (track,))
+        conn.commit()
+
+    body = http.get("/api/chat/files/library-search?q=bjork").get_json()
+    assert [t["title"] for t in body["tracks"]] == ["Hyperballad"]
+
+
+def test_library_search_treats_wildcards_as_text(files_app):
+    """`%` and `_` are LIKE syntax; typed into a search box they are letters."""
+    http, state, client, uploads = files_app
+    assert http.get("/api/chat/files/library-search?q=%25").get_json()["tracks"] == []
+    assert http.get("/api/chat/files/library-search?q=_p").get_json()["tracks"] == []
 
 
 def test_wanted_resolve_share_matches_album(files_app):
@@ -314,15 +401,23 @@ def test_media_server_path_resolves_via_music_paths(files_app, tmp_path, monkeyp
     # ...but the DB records the MEDIA-SERVER path, which doesn't exist here
     db = MusicDatabase(str(tmp_path / "m2.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('AR9','A','test')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, server_source) VALUES ('AL9','AR9','Album','test')")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path, file_size, server_source) "
-                     "VALUES ('T9','AL9','AR9','Song','/mnt/musicBackup/Artist/Album/07 - Song.flac',2048,'test')")
+        artist = conn.execute(
+            "INSERT INTO lib2_artists(name, name_key) VALUES('A','a')").lastrowid
+        album = conn.execute(
+            "INSERT INTO lib2_albums(primary_artist_id, title, origin)"
+            " VALUES(?,'Album','library')", (artist,)).lastrowid
+        track_id = conn.execute(
+            "INSERT INTO lib2_tracks(album_id, title) VALUES(?,'Song')",
+            (album,)).lastrowid
+        conn.execute(
+            "INSERT INTO lib2_track_files(track_id, path, size, is_primary)"
+            " VALUES(?,'/mnt/musicBackup/Artist/Album/07 - Song.flac',2048,1)",
+            (track_id,))
         conn.commit()
     monkeypatch.setattr(chat_api, "_db", lambda: db)
 
     # without a music-paths mapping → unreachable (honest 404 pointing at the fix)
-    r = http.post("/api/chat/files/upload", json={"track_id": "T9"})
+    r = http.post("/api/chat/files/upload", json={"track_id": track_id})
     assert r.status_code == 404
     assert "Music Paths" in r.get_json()["error"]
 
@@ -330,7 +425,7 @@ def test_media_server_path_resolves_via_music_paths(files_app, tmp_path, monkeyp
     prev = config_manager.get("library.music_paths", [])
     try:
         config_manager.set("library.music_paths", [str(mount)])
-        r = http.post("/api/chat/files/upload", json={"track_id": "T9"})
+        r = http.post("/api/chat/files/upload", json={"track_id": track_id})
         body = r.get_json()
         assert body["ok"] is True
         assert body["url"].endswith("07 - Song.flac")
@@ -525,3 +620,176 @@ def test_every_room_send_path_carries_the_channel_envelope():
     # the composer path delegates rather than duplicating the tag logic
     assert js.count("payload.chan = state.channel") == 1, \
         "channel tagging exists in more than one place — the copies WILL drift"
+
+
+def test_library_search_reads_the_song_index_once_it_is_built(files_app, monkeypatch):
+    """the folded LIKE read every track per keystroke; with the Songs index
+    built the search reads its matches and answers the same tracks"""
+    from core.library2 import song_search
+
+    http, state, client, uploads = files_app
+    assert song_search.rebuild(state["db"]) is True
+    used = []
+    # the search reads the index through indexed_ids now, capped (review 5 W3-TB-1)
+    real = song_search.indexed_ids
+    def spy(conn, q, limit=None):
+        hits = real(conn, q, limit=limit)
+        used.append((q, hits is not None))
+        return hits
+
+    monkeypatch.setattr(song_search, "indexed_ids", spy)
+
+    body = http.get("/api/chat/files/library-search?q=muse").get_json()
+
+    assert used == [("muse", True)]  # the index answered, not the fallback
+    assert [t["title"] for t in body["tracks"]] == ["Ghost Track", "Uprising"]
+    assert [t["title"] for t in http.get(
+        "/api/chat/files/library-search?q=upri").get_json()["tracks"]] == ["Uprising"]
+
+
+
+# ── review 5 W3-TB-1: the share search picks its 20 before it decorates ──────
+
+_SHARE_TITLES = ("Zebra Muse", "'Apostrophe", "alpha", "Bravo", "charlie", "Delta",
+                 "echo", "Foxtrot", "golf", "Hotel", "india", "Juliet", "kilo",
+                 "Lima", "mike", "November", "oscar", "Papa", "quebec", "Romeo",
+                 "sierra", "Tango", "uniform", "Victor", "whiskey", "X-ray",
+                 "yankee", "Zulu", "(Bracketed)", "...Dots")
+
+
+def _seed_share_library(db):
+    """thirty Muse songs with a file, inserted out of A-Z order, plus a
+    song by someone else, one with a deleted file and one with no path"""
+    with db._get_connection() as conn:
+        muse = conn.execute("SELECT id FROM lib2_artists WHERE name='Muse'").fetchone()[0]
+        album = conn.execute("INSERT INTO lib2_albums(primary_artist_id, title, origin)"
+                             " VALUES(?,?,'library')", (muse, "Drones")).lastrowid
+        other = conn.execute("INSERT INTO lib2_artists(name, name_key) VALUES('Nobody','nobody')").lastrowid
+        other_album = conn.execute("INSERT INTO lib2_albums(primary_artist_id, title, origin)"
+                                   " VALUES(?,?,'library')", (other, "Elsewhere")).lastrowid
+        for title in _SHARE_TITLES:
+            t = conn.execute("INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+                             (album, title)).lastrowid
+            conn.execute("INSERT INTO lib2_track_files(track_id, path, size) VALUES(?,?,10)",
+                         (t, f"/m/{t}.flac"))
+        t = conn.execute("INSERT INTO lib2_tracks(album_id, title, track_artist) VALUES(?,?,?)",
+                         (other_album, "Plain Song", "Mu Feat")).lastrowid
+        conn.execute("INSERT INTO lib2_track_files(track_id, path, size) VALUES(?,?,10)",
+                     (t, f"/m/{t}.flac"))
+        t = conn.execute("INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+                         (album, "Aaa Deleted")).lastrowid
+        conn.execute("INSERT INTO lib2_track_files(track_id, path, size, file_state)"
+                     " VALUES(?,?,10,'deleted')", (t, f"/m/{t}.flac"))
+        t = conn.execute("INSERT INTO lib2_tracks(album_id, title) VALUES(?,?)",
+                         (album, "Aaa Pathless")).lastrowid
+        conn.execute("INSERT INTO lib2_track_files(track_id, path, size) VALUES(?,'',10)", (t,))
+        conn.commit()
+
+
+def _expected_share_hits(db, query):
+    """the answer worked out in python: a match on title, track artist or
+    album artist, a live file with a path, A to Z by the Songs key, 20 max"""
+    from database.music_database import _LIBRARY_SORT_STRIP_CHARS
+    q = query.lower()
+    with db._get_connection() as conn:
+        rows = conn.execute(
+            """SELECT t.id, t.title, t.track_artist, ar.name,
+                      EXISTS (SELECT 1 FROM lib2_track_files f WHERE f.track_id = t.id
+                               AND COALESCE(f.file_state,'active') <> 'deleted'
+                               AND COALESCE(f.path,'') <> '') AS live
+                 FROM lib2_tracks t JOIN lib2_albums al ON al.id = t.album_id
+                 LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id""").fetchall()
+    hits = [r for r in rows if r[4] and any(q in (v or "").lower() for v in (r[1], r[2], r[3]))]
+    hits.sort(key=lambda r: (r[1].lstrip(_LIBRARY_SORT_STRIP_CHARS).lower(), r[0]))
+    return [r[0] for r in hits[:20]]
+
+
+@pytest.mark.parametrize("mode", ["sorted", "walked", "walk_ran_out", "index_not_built"])
+@pytest.mark.parametrize("query", ["mu", "muse", "o", "ra", "zzz"])
+def test_library_search_answers_the_same_on_every_path(files_app, monkeypatch, mode, query):
+    """the short match list is sorted, a broad one walked A to Z, and a walk
+    that runs out (few files here) sorts every match; before the index exists
+    the library is folded live. all four give the same 20, in the same order"""
+    from core.library2 import song_search
+
+    http, state, client, uploads = files_app
+    db = state["db"]
+    _seed_share_library(db)
+    if mode != "index_not_built":
+        assert song_search.rebuild(db) is True
+        # a rename after the build: the index row is stale, the track is dirty
+        with db._get_connection() as conn:
+            conn.execute("UPDATE lib2_tracks SET title='Amuse Bouche' WHERE title='Plain Song'")
+            conn.commit()
+    else:
+        with db._get_connection() as conn:
+            conn.execute("UPDATE lib2_tracks SET title='Amuse Bouche' WHERE title='Plain Song'")
+            conn.commit()
+    if mode == "walked":
+        monkeypatch.setattr(chat_api, "_SHARE_SORT_CAP", 1)
+        monkeypatch.setattr(chat_api, "_SHARE_WALK_CHUNK", 4)
+    elif mode == "walk_ran_out":
+        monkeypatch.setattr(chat_api, "_SHARE_SORT_CAP", 1)
+        monkeypatch.setattr(chat_api, "_SHARE_WALK_CHUNK", 2)
+        monkeypatch.setattr(chat_api, "_SHARE_WALK_CHUNKS", 2)
+
+    body = http.get(f"/api/chat/files/library-search?q={query}").get_json()
+
+    expected = _expected_share_hits(db, query) if len(query) >= 2 else []
+    assert [t["id"] for t in body["tracks"]] == expected
+    if query == "muse":
+        assert len(expected) == 20  # the cap is exercised, not just a short list
+
+
+@pytest.mark.parametrize("query", ["mu", "muse"])
+def test_library_search_decorates_only_the_twenty_it_returns(files_app, query):
+    """the file, credit and album lookups ran for every match before the
+    LIMIT, over the whole library for two letters (13.8 s live). now no
+    statement scans the tracks or albums table and the decorating one gets
+    the 20 picked ids"""
+    import json as _json
+    import re as _re
+    from core.library2 import song_search
+
+    http, state, client, uploads = files_app
+    db = state["db"]
+    _seed_share_library(db)
+    assert song_search.rebuild(db) is True
+    seen = []
+    real = db._get_connection
+
+    def traced():
+        conn = real()
+        conn.set_trace_callback(seen.append)
+        return conn
+
+    db._get_connection = traced
+    try:
+        body = http.get(f"/api/chat/files/library-search?q={query}").get_json()
+    finally:
+        db._get_connection = real
+    assert len(body["tracks"]) == 20
+
+    scan = _re.compile(r"^SCAN (t|lib2_tracks|al|lib2_albums)( |$)")
+    statements = [s for s in seen if s.lstrip().upper().startswith("SELECT")]
+    with real() as conn:
+        for sql in statements:
+            plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql)]
+            bad = [step for step in plan if scan.match(step) and "COVERING INDEX" not in step]
+            assert bad == [], (sql, plan)
+    decorate = [s for s in statements if "lib2_track_artists" in s]
+    assert len(decorate) == 1
+    ids = _json.loads(_re.search(r"json_each\('(\[[^']*\])'\)", decorate[0]).group(1))
+    assert len(ids) == 20
+
+
+def test_attach_search_drops_an_answer_to_an_older_query():
+    """the box asks per keystroke; an older, slower answer landing last used
+    to replace the newer list (review 5 W3-TB-1)"""
+    js = (_ROOT / "webui" / "static" / "chat.js").read_text(encoding="utf-8")
+    body = js.split("function attachLibrarySearch")[1].split("\n    function ")[0]
+    assert "var seq = ++_attachSearchSeq;" in body
+    assert "seq !== _attachSearchSeq" in body
+    # the bump comes before the short-query return, so clearing the box also
+    # retires an answer still in flight
+    assert body.index("++_attachSearchSeq") < body.index("qstr.length < 2")

@@ -124,3 +124,78 @@ def test_library_export_endpoint_wiring(client):
     r2 = client.get('/api/library/artists/export?format=csv&contents=1')
     header = r2.data.decode().splitlines()[0]
     assert 'album_count' in header and 'track_count' in header
+
+
+def test_contents_counts_come_from_the_v2_catalogue(client):
+    """`contents=1` must count the owned v2 catalogue, not the legacy tables.
+
+    The cutover ported this endpoint's main query to `lib2_artists` but left the
+    counts roll-up reading legacy `albums`/`tracks`. Those tables still exist
+    (created empty on every fresh install), so the query succeeded and returned
+    nothing -- every artist exported with a null count and no error, because the
+    roll-up is best-effort. The wiring test above never caught it: it asserts the
+    columns are present, never that they carry a number.
+
+    Ownership matters as much as the table name. `lib2_albums` also holds
+    discography rows the user does not have on disk, so a bare COUNT(*) would
+    over-report where legacy could not -- legacy WAS the owned library by
+    construction (see core/library2/sql_util.owned_sql).
+    """
+    db = web_server.get_database()
+    conn = db._get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO lib2_artists (name) VALUES ('Export Counts Fixture')")
+        artist_id = cur.lastrowid
+        # Owned: one album with one track backed by a live file.
+        cur.execute("INSERT INTO lib2_albums (primary_artist_id, title) VALUES (?, 'Owned')",
+                    (artist_id,))
+        owned_album = cur.lastrowid
+        cur.execute("INSERT INTO lib2_tracks (album_id, title) VALUES (?, 'Owned Track')",
+                    (owned_album,))
+        cur.execute("INSERT INTO lib2_track_files (track_id, path, file_state) "
+                    "VALUES (?, '/music/owned.flac', 'active')", (cur.lastrowid,))
+        # Not owned: a discography-only release with a track but no file on disk.
+        cur.execute("INSERT INTO lib2_albums (primary_artist_id, title) VALUES (?, 'Wanted')",
+                    (artist_id,))
+        cur.execute("INSERT INTO lib2_tracks (album_id, title) VALUES (?, 'Missing Track')",
+                    (cur.lastrowid,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get('/api/library/artists/export?format=json&contents=1')
+    assert r.status_code == 200
+    row = next(a for a in json.loads(r.data.decode()) if a['name'] == 'Export Counts Fixture')
+    assert row['album_count'] == 1, "counted discography rows or read the empty legacy table"
+    assert row['track_count'] == 1, "counted missing tracks or read the empty legacy table"
+
+
+def test_a_featured_credit_alone_is_not_an_exported_library_artist(client):
+    """review 5 W3-TD-3: the roster counted any artist featured on one owned
+    track as an artist you have. the release artist is exported, the guest
+    is not."""
+    db = web_server.get_database()
+    conn = db._get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO lib2_artists (name) VALUES ('Export Lead Fixture')")
+        lead = cur.lastrowid
+        cur.execute("INSERT INTO lib2_artists (name) VALUES ('Export Guest Fixture')")
+        guest = cur.lastrowid
+        cur.execute("INSERT INTO lib2_albums (primary_artist_id, title) VALUES (?, 'Lead LP')", (lead,))
+        cur.execute("INSERT INTO lib2_tracks (album_id, title) VALUES (?, 'Lead Song')", (cur.lastrowid,))
+        track = cur.lastrowid
+        cur.execute("INSERT INTO lib2_track_files (track_id, path, file_state) "
+                    "VALUES (?, '/music/lead.flac', 'active')", (track,))
+        cur.execute("INSERT INTO lib2_track_artists (track_id, artist_id, role, position) "
+                    "VALUES (?, ?, 'featured', 1)", (track, guest))
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get('/api/library/artists/export?format=json')
+    assert r.status_code == 200
+    names = {a['name'] for a in json.loads(r.data.decode())}
+    assert 'Export Lead Fixture' in names
+    assert 'Export Guest Fixture' not in names

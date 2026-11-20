@@ -31,11 +31,13 @@ def db(tmp_path, monkeypatch):
         ("1", "Nirvana", US, "dz-us", '["grunge"]'),
         ("2", "Nirvana", UK, "dz-uk", "[]"),
         ("3", "Culture", CULTURE, "dz-culture", '["reggae", "roots reggae"]'),
-        ("4", "Nirvana", US, None, None),   # the same us band on a second server
+        ("4", "Nirvana", US, None, None),   # the same us band, a twin not folded yet
     ]
+    # lib2 port: deezer's id lives in external_ids
     for artist_id, name, mbid, dz, genres in rows:
-        conn.execute("INSERT INTO artists (id, name, musicbrainz_id, deezer_id, genres) "
-                     "VALUES (?, ?, ?, ?, ?)", (artist_id, name, mbid, dz, genres))
+        conn.execute("INSERT INTO lib2_artists (id, name, name_key, musicbrainz_id, external_ids, genres) "
+                     "VALUES (?, ?, ?, ?, ?, ?)", (artist_id, name, name.lower(), mbid,
+                                                   json.dumps({"deezer": dz} if dz else {}), genres or "[]"))
     payloads = {
         US: {"disambiguation": "US grunge band", "country": "US"},
         UK: {"disambiguation": "UK 60s band", "country": "GB",
@@ -194,3 +196,172 @@ def test_web_server_template_copy_never_keeps_a_literal_token(db):
          "track_number": 1, "disc_number": 1})
     assert "$" not in out
     assert out.startswith("Culture (JM)/")
+
+
+# ── #1953 / #1954: one artist, one folder through a bulk import ──────────────
+
+class _FakeMB:
+    """match_artist the way the real one leaves things: the search result
+    cached under the chosen id."""
+
+    def __init__(self, db, mbid, payload):
+        self.db, self.mbid, self.payload, self.asked = db, mbid, payload, []
+
+    def match_artist(self, name, owned_titles=None):
+        self.asked.append((name, owned_titles))
+        conn = self.db._get_connection()
+        conn.execute("INSERT INTO musicbrainz_cache (entity_type, entity_name, musicbrainz_id, "
+                     "metadata_json) VALUES ('artist', ?, ?, ?)",
+                     (name, self.mbid, json.dumps(self.payload)))
+        conn.commit()
+        conn.close()
+        return {"mbid": self.mbid, "name": name, "confidence": 100}
+
+
+@pytest.fixture()
+def online(db, monkeypatch):
+    import core.musicbrainz_service as mbs
+    monkeypatch.setattr(facts_mod, "ONLINE_LOOKUP", True)
+    fake = _FakeMB(db, "mbid-lab", {"disambiguation": "New Zealand band", "country": "NZ"})
+    monkeypatch.setattr(mbs, "get_musicbrainz_service", lambda: fake)
+    return fake
+
+
+def test_a_new_artist_gets_its_disambiguation_from_the_first_album(db, template, online):
+    # enrichment hasn't reached the artist yet: the first albums of a bulk
+    # import used to go to a plain folder and the rest to the tagged one
+    root = template("$albumartist ($albumartistdisambiguation)/$album/$track - $title")
+    first = _import_destination("L.A.B", "dz-lab", "Under the Sun")
+    facts_mod._cache.clear()  # past the 30s facts cache
+    second = _import_destination("L.A.B", "dz-lab", "Why Do You Love")
+    assert first == str(root / "L.A.B (New Zealand band)" / "Under the Sun" / "01 - Song.flac")
+    assert second.startswith(str(root / "L.A.B (New Zealand band)"))
+    # asked once, with the album that tells same-named artists apart
+    assert online.asked == [("L.A.B", ["Under the Sun"])]
+
+
+def test_a_failed_ask_is_not_repeated_for_every_track(db, monkeypatch):
+    import core.musicbrainz_service as mbs
+    monkeypatch.setattr(facts_mod, "ONLINE_LOOKUP", True)
+    calls = []
+
+    class _Down:
+        def match_artist(self, name, owned_titles=None):
+            calls.append(name)
+            raise ConnectionError("musicbrainz down")
+
+    monkeypatch.setattr(mbs, "get_musicbrainz_service", lambda: _Down())
+    for _ in range(3):
+        facts_mod._cache.clear()
+        assert artist_facts("Nobody", album="Debut")["disambiguation"] == ""
+    assert calls == ["Nobody"]
+
+
+def test_no_album_no_ask(db, online):
+    # without an album nothing tells same-named artists apart: keep what the library knows
+    assert artist_facts("Nobody")["disambiguation"] == ""
+    assert online.asked == []
+
+
+def test_a_collab_album_lands_in_the_same_folder_as_a_solo_one(db, template):
+    # "first listed" took the raw list name: "L.A.B." for the collab album,
+    # sanitized "L.A.B" for the solo one, two folders (#1954)
+    # text after the name in the same folder keeps a mid-folder dot, so the
+    # two spellings only part there, as in "L.A.B. (New Zealand band)"
+    root = template("$albumartist (NZ)/$album/$track - $title")
+
+    def dest(album, artists):
+        context = {
+            "artist": {"name": "L.A.B.", "id": "dz-lab"},
+            "album": {"name": album, "id": album, "release_date": "2020-01-01", "total_tracks": 10,
+                      "total_discs": 1, "total_discs_declared": True, "album_type": "album",
+                      "artists": artists},
+            "track_info": {"name": "Song", "id": "t", "track_number": 1, "disc_number": 1,
+                           "artists": artists},
+            "original_search_result": {"title": "Song", "clean_title": "Song", "clean_album": album,
+                                       "clean_artist": "L.A.B.", "artists": artists},
+            "source": "deezer", "is_album_download": True,
+        }
+        path, _ = build_final_path_for_track(
+            context, {"name": "L.A.B.", "id": "dz-lab"},
+            {"is_album": True, "album_name": album, "track_number": 1, "disc_number": 1},
+            ".flac", create_dirs=False)
+        return path
+
+    solo = dest("Solo", [{"name": "L.A.B."}])
+    collab = dest("Collab", [{"name": "L.A.B."}, {"name": "Someone"}])
+    assert solo.startswith(str(root / "L.A.B (NZ)" / "Solo"))
+    assert collab.startswith(str(root / "L.A.B (NZ)" / "Collab"))
+
+
+def test_web_server_template_copy_sanitizes_the_listed_primary(db, monkeypatch):
+    import web_server
+    monkeypatch.setattr(web_server.config_manager, "get",
+                        lambda key, default=None: "first" if key == "file_organization.collab_artist_mode" else default)
+    out = web_server._apply_path_template(
+        "$albumartist (NZ)/$album/$title",
+        {"artist": "L.A.B.", "albumartist": "L.A.B.", "album": "B", "title": "C",
+         "track_number": 1, "disc_number": 1,
+         "_artists_list": [{"name": "L.A.B."}, {"name": "AC/DC"}]})
+    assert out.startswith("L.A.B (NZ)/B")
+
+
+def test_the_name_lookup_rides_the_lowercase_name_index(db):
+    """review 5 R5-D-4: name = ? COLLATE NOCASE had no index and range-scanned
+    every artist with an mbid"""
+    conn = db._get_connection()
+    try:
+        plan = []
+        real = conn.cursor()
+
+        class _Explain:
+            def execute(self, sql, params=()):
+                plan.extend(r[3] for r in real.execute("EXPLAIN QUERY PLAN " + sql, params))
+                return real.execute(sql, params)
+
+            def fetchall(self):
+                return real.fetchall()
+
+        assert sorted(facts_mod._mbids_named(_Explain(), "nIrVaNa")) == [UK, US]
+    finally:
+        conn.close()
+    assert any("idx_lib2_artists_name_lower" in step for step in plan), plan
+
+
+class _ByAlbumMB:
+    """musicbrainz that picks the artist by the album, as match_artist's
+    owned_titles hint does, with each answer's payload already cached."""
+
+    def __init__(self, db):
+        self.asked = []
+        conn = db._get_connection()
+        for mbid, payload in (("mbid-new-us", {"disambiguation": "new US band"}),
+                              ("mbid-new-uk", {"disambiguation": "new UK band"})):
+            conn.execute("INSERT INTO musicbrainz_cache (entity_type, entity_name, musicbrainz_id, "
+                         "metadata_json) VALUES ('artist', 'Newband', ?, ?)",
+                         (mbid, json.dumps(payload)))
+        conn.commit()
+        conn.close()
+
+    def match_artist(self, name, owned_titles=None):
+        self.asked.append((name, owned_titles))
+        return {"mbid": "mbid-new-uk" if "UK Record" in (owned_titles or []) else "mbid-new-us"}
+
+
+@pytest.mark.parametrize("ids", [False, True])
+def test_two_same_named_new_artists_are_not_one_cached_answer(db, monkeypatch, ids):
+    # review 5 W3-TD-5: the ask was cached by name only, so the second of two
+    # same-named new artists in one import got the first one's identity
+    import core.musicbrainz_service as mbs
+    monkeypatch.setattr(facts_mod, "ONLINE_LOOKUP", True)
+    fake = _ByAlbumMB(db)
+    monkeypatch.setattr(mbs, "get_musicbrainz_service", lambda: fake)
+    us_ids = {"source": "deezer", "source_id": "dz-new-us"} if ids else {}
+    uk_ids = {"source": "deezer", "source_id": "dz-new-uk"} if ids else {}
+
+    us = artist_facts("Newband", album="US Record", **us_ids)
+    uk = artist_facts("Newband", album="UK Record", **uk_ids)
+
+    assert us["disambiguation"] == "new US band"
+    assert uk["disambiguation"] == "new UK band"
+    assert len(fake.asked) == 2

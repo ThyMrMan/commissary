@@ -56,7 +56,9 @@ def _prepare(items: List[Dict[str, Any]], media_type: str, *, user_initiated: bo
     if any(it.get("owned") for it in items) and not user_initiated:
         per_item = vpw._cutoff_rank_for_item if any(
             it.get("quality_profile_id") for it in items) else None
-        items = vpw.annotate_upgrades(items, _cutoff_rank(), cutoff_for=per_item)
+        from api.video import get_video_db as _held_db
+        items = vpw.annotate_upgrades(items, _cutoff_rank(), cutoff_for=per_item,
+                                      held=vpw.held_titles(_held_db()))
     active = set(vpw._default_active_keys(media_type) or set())
     todo = []
     with _lock:
@@ -89,8 +91,10 @@ def _all_source_search(item: Dict[str, Any], media_type: str):
             skips.append("%s skipped — %s" % (src, err or "search didn't run"))
             continue
         out.extend(cands or [])
-    out.sort(key=lambda c: (1 if c.get("accepted") else 0, int(c.get("score") or 0), c.get("_avail") or 0),
-             reverse=True)
+    # the same rank every picker uses (#2033). this sort read the flat score
+    # and an _avail that _evaluate_hits had already dropped
+    from core.video.release_rank import sort_ranked
+    out = sort_ranked(out)
     if out:
         return out, "; ".join(skips) or None
     if len(skips) == len(chain):
@@ -151,9 +155,10 @@ def _one(item: Dict[str, Any], media_type: str, target: str, *, all_sources: boo
             logger.info("manual search: no acceptable release for %s",
                         item.get("title") or item.get("show_title"))
             return False
+        folder = vpw.grab_target_dir(item, media_type, target)   # before the slot is held
         if not budget.claim():
             return False
-        ok = bool(vpw._default_enqueue(item, best, cands or [], media_type, target))
+        ok = bool(vpw._default_enqueue(item, best, cands or [], media_type, folder))
         if not ok:
             budget.give_back()
         return ok
@@ -164,13 +169,15 @@ def _one(item: Dict[str, Any], media_type: str, target: str, *, all_sources: boo
 
 
 def _run_batch(todo: List[Dict[str, Any]], media_type: str, *, all_sources: bool = False,
-               cap=None) -> None:
+               cap=None) -> int:
+    """Search and grab each item; the number grabbed."""
+    grabbed = 0
     try:
         target = vpw._default_target_dir(media_type)
         if not target:
             logger.warning("manual search: no %s library folder set — dropping %d item(s)",
                            media_type, len(todo))
-            return
+            return 0
         budget = _Budget(cap)
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="wl-manual") as ex:
             grabbed = sum(1 for ok in ex.map(
@@ -180,21 +187,38 @@ def _run_batch(todo: List[Dict[str, Any]], media_type: str, *, all_sources: bool
                     (", %d skipped (stopped by cancel all)" % budget.stopped) if budget.stopped else "")
     finally:
         _finish(todo, media_type)
+    return grabbed
 
 
 def manual_search(scope: str, tmdb_id, season_number=None, episode_number=None,
-                  *, all_sources: bool = False, profile_id: int = 1) -> Dict[str, Any]:
+                  *, all_sources: bool = False, profile_id: int = 1,
+                  wait: bool = False, quality_profile_id=None,
+                  video_library_id=None) -> Dict[str, Any]:
     """Kick a background search for one wished item (or a season/show of
     episodes). Returns immediately: {queued, skipped, total}. 'skipped' =
-    already downloading / already being searched."""
+    already downloading / already being searched.
+
+    ``wait`` runs the search on the calling thread instead and adds
+    'grabbed', for a caller that has to know whether anything was taken (the
+    monitor's next-release retry, which says so when nothing was).
+
+    ``quality_profile_id`` ranks under that quality profile whatever the
+    wishlist row says: the next-release retry keeps the profile the failed
+    grab was ranked by (SeadogsBooty's retry fell back to Default)."""
     from api.video import get_video_db
+    from database.video_database import ANY_LIBRARY
     media_type = "movie" if scope == "movie" else "episode"
+    # ``video_library_id``: one copy's row (#2029; 0 = the title's own one).
+    # None searches every library's row of the title
     items = get_video_db().wishlist_manual_search_items(
         scope, tmdb_id, season_number=season_number, episode_number=episode_number,
-        profile_id=profile_id)
+        profile_id=profile_id,
+        video_library_id=ANY_LIBRARY if video_library_id is None else video_library_id)
     if media_type == "episode":
         from core.video.numbering import annotate
         items = annotate(items)
+    if quality_profile_id:
+        items = [dict(it, quality_profile_id=int(quality_profile_id)) for it in items]
     if not items:
         return {"queued": 0, "skipped": 0, "total": 0}
     todo = _prepare(items, media_type, user_initiated=True)
@@ -202,6 +226,10 @@ def manual_search(scope: str, tmdb_id, season_number=None, episode_number=None,
         _finish(todo, media_type)
         return {"queued": 0, "skipped": len(items) - len(todo), "total": len(items),
                 "missing_target": media_type}
+    if todo and wait:
+        grabbed = _run_batch(todo, media_type, all_sources=all_sources)
+        return {"queued": len(todo), "skipped": len(items) - len(todo), "total": len(items),
+                "grabbed": grabbed}
     if todo:
         threading.Thread(target=_run_batch, args=(todo, media_type), kwargs={"all_sources": all_sources},
                          daemon=True, name="wishlist-manual-search").start()

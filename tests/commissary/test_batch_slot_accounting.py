@@ -193,7 +193,8 @@ def test_a_refused_retry_is_terminal_and_notifies_once(monkeypatch, runtime, not
 def test_a_successful_import_notifies_exactly_once(monkeypatch, runtime, notified, task, tmp_path):
     final = tmp_path / "done.flac"
     final.write_bytes(b"x")
-    _run(monkeypatch, runtime, inner=lambda ctx: ctx.update({"_final_processed_path": str(final)}))
+    _run(monkeypatch, runtime, inner=lambda ctx: ctx.update({"_final_processed_path": str(final),
+                                                  "_pipeline_import_succeeded": True}))
     assert notified == [(BATCH, TASK, True)]
 
 

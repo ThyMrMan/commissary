@@ -66,7 +66,8 @@ afterEach(() => {
 });
 
 /** The page is on screen once its title has painted. */
-const settled = () => screen.findByText('Downloads');
+// the page name: the first view's pill is called Downloads too
+const settled = () => screen.findByRole('heading', { level: 1, name: 'Downloads' });
 
 describe('the active-downloads route', () => {
   it('renders without the shell’s .page class', async () => {
@@ -216,6 +217,27 @@ describe('the active-downloads route', () => {
     expect(container.querySelector('.dlc-tag-bad')?.textContent).toBe('Failed integrity check');
   });
 
+  it('?open=recycle lands on the music recycle bin, then drops the param (#2128)', async () => {
+    server.use(
+      http.get('/api/deleted-files', () =>
+        HttpResponse.json({ success: true, entries: [], total: 0, retention_days: 30 }),
+      ),
+    );
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({
+      initialEntries: ['/active-downloads?media=music&open=recycle'],
+    });
+    const router = createAppRouter({ history, queryClient });
+    const { container } = render(<AppRouterProvider router={router} queryClient={queryClient} />);
+    await settled();
+    await waitFor(() => expect(container.querySelector('#verif-subview-banner')).not.toBeNull());
+    await waitFor(() => {
+      const on = container.querySelector('#verif-subview-banner [aria-selected="true"]');
+      expect(on?.textContent).toContain('Deleted');
+    });
+    await waitFor(() => expect(router.state.location.search).toEqual({ media: 'music' }));
+  });
+
   it('collapses to quarantine-only when require_verified is on', async () => {
     // Not just when AcoustID is off — with require_verified the unverified
     // queue can never have anything in it.
@@ -275,6 +297,52 @@ describe('the active-downloads route', () => {
     expect(document.querySelector('.lib-menu .dlh-act-clear')?.textContent).toContain(
       'Clear finished (1)',
     );
+  });
+
+  it('clears failed rows without asking, and without retrying them', async () => {
+    const posted: unknown[] = [];
+    server.use(
+      http.post('/api/downloads/clear-completed', async ({ request }) => {
+        posted.push(await request.json());
+        return HttpResponse.json({ success: true, cleared: 1, total_cleared: 1 });
+      }),
+    );
+    const confirm = vi.fn(async () => true);
+    window.showConfirmDialog = confirm;
+    stub({
+      downloads: [
+        row({ task_id: 'f1', status: 'failed', error: 'No sources' }),
+        row({ task_id: 'c1', status: 'completed' }),
+      ],
+    });
+    const { container } = renderRoute();
+    await settled();
+    await waitFor(() => expect(container.querySelector('#adl-actions .dlc-more')).not.toBeNull());
+    fireEvent.click(container.querySelector('#adl-actions .dlc-more') as HTMLElement);
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Clear failed (1)' }));
+    await waitFor(() => expect(posted).toEqual([{ scope: 'failed' }]));
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it('offers Remove from list on a failed row and posts its task id', async () => {
+    const posted: unknown[] = [];
+    server.use(
+      http.post('/api/downloads/remove', async ({ request }) => {
+        posted.push(await request.json());
+        return HttpResponse.json({ success: true });
+      }),
+    );
+    stub({ downloads: [row({ task_id: 'f1', status: 'failed', error: 'No sources' })] });
+    const { container } = renderRoute();
+    await settled();
+    const failedRow = await waitFor(() => {
+      const el = container.querySelector('[data-task-id="f1"]');
+      expect(el).not.toBeNull();
+      return el as HTMLElement;
+    });
+    fireEvent.click(failedRow.querySelector('.dlc-more') as HTMLElement);
+    fireEvent.click(screen.getByRole('menuitem', { name: 'Remove from list' }));
+    await waitFor(() => expect(posted).toEqual([{ task_id: 'f1' }]));
   });
 
   it('survives every endpoint failing', async () => {

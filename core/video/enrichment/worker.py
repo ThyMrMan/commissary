@@ -331,8 +331,21 @@ class VideoEnrichmentWorker:
                         # already numbers them TMDB's way.
                         from core.video.numbering import regroup_season
                         groups, moved = regroup_season(self.db, tvdb_id, snum, data["episodes"])
-                        if moved and self.db.server_has_episodes(show_id, snum, list(moved)):
-                            groups, moved = {snum: data["episodes"]}, {}
+                    if not moved and self.service == "tmdb":
+                        # no TVDB key, or TVDB didn't split it: the anime id map
+                        # and AniList's episode counts know the same split
+                        from core.video.numbering import anilist_regroup
+                        groups, moved = anilist_regroup(
+                            snum, data["episodes"], self.db.anime_entries("show", show_id))
+                    kept = {}
+                    if moved and self.db.server_has_episodes(show_id, snum, list(moved)):
+                        # the season stays as the server has it, and the split
+                        # numbers are written down: nothing is released or
+                        # subtitled as S01E48, so search and subtitles ask for
+                        # S03E01 (Thibs)
+                        kept, groups, moved = moved, {snum: data["episodes"]}, {}
+                    if self.service == "tmdb":
+                        self.db.set_scene_numbers(show_id, snum, kept)
                     for gnum, eps in groups.items():
                         if not eps:
                             continue

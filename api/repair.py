@@ -15,10 +15,23 @@ import time
 from flask import Blueprint, jsonify, request
 
 from utils.logging_config import get_logger
+from core.permissions import requires
+from core.profile_context import admin_only
 
 logger = get_logger("api.repair")
 
 bp = Blueprint("repair", __name__)
+
+
+@bp.before_request
+def _admin_manages_this():
+    """Running repair jobs and acting on findings is the admin's to change (Nov 13 2026). Reading stays open: the
+    pages that show it are not admin pages."""
+    from flask import jsonify as _jsonify, request as _request
+    from core.profile_context import is_admin_request
+    if _request.method in ("POST", "PUT", "PATCH", "DELETE") and not is_admin_request():
+        return _jsonify({"success": False, "error": "Admin access required"}), 403
+    return None
 
 _worker_getter = lambda: None   # noqa: E731 - replaced by configure()
 # web_server helpers a couple of handlers call (injected — importing web_server
@@ -52,9 +65,24 @@ def create_blueprint():
     return bp
 
 
+_VIEW_KEYS = ('job_id', 'status', 'severity', 'finding_type', 'q',
+              'group_by', 'group_artist', 'group_album')
+
+
+def _view_filters(data) -> dict:
+    """The filters of the view a selection was made in (``scope`` in the
+    body). Fix Selected and Dismiss Selected act only on ids that view still
+    lists, checked here, not trusted from the client (review 5 W3-TT)."""
+    scope = data.get('scope') if isinstance(data, dict) else None
+    if not isinstance(scope, dict):
+        scope = {}
+    return {key: (scope.get(key) or None) for key in _VIEW_KEYS}
+
+
 # --- Repair Worker API Endpoints ---
 
 @bp.route('/api/repair/status', methods=['GET'])
+@requires("music.access")
 def repair_status():
     """Get repair worker status"""
     try:
@@ -78,6 +106,7 @@ def repair_status():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/toggle', methods=['POST'])
+@admin_only
 def repair_toggle():
     """Toggle master enable/disable"""
     try:
@@ -93,6 +122,7 @@ def repair_toggle():
 
 # Backward compat aliases
 @bp.route('/api/repair/pause', methods=['POST'])
+@admin_only
 def repair_pause():
     try:
         if _repair_worker() is None:
@@ -103,6 +133,7 @@ def repair_pause():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/resume', methods=['POST'])
+@admin_only
 def repair_resume():
     try:
         if _repair_worker() is None:
@@ -113,6 +144,7 @@ def repair_resume():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/jobs', methods=['GET'])
+@requires("music.access")
 def repair_jobs_list():
     """Get all jobs with config and last run info"""
     try:
@@ -125,6 +157,7 @@ def repair_jobs_list():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/jobs/<job_id>/toggle', methods=['POST'])
+@admin_only
 def repair_job_toggle(job_id):
     """Enable/disable a specific job"""
     try:
@@ -147,6 +180,7 @@ def repair_job_toggle(job_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/jobs/<job_id>/settings', methods=['PUT'])
+@admin_only
 def repair_job_settings(job_id):
     """Update job interval and/or settings"""
     try:
@@ -165,20 +199,51 @@ def repair_job_settings(job_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/jobs/<job_id>/run', methods=['POST'])
+@admin_only
 def repair_job_run(job_id):
-    """Trigger immediate run of a specific job"""
+    """Trigger immediate run of a specific job.
+
+    Optional JSON body ``{"artist_id": 1, "artist_name": "..."}`` resolves a
+    Library-v2 artist to an exact file allowlist. Jobs that move/delete files
+    enforce that path scope; metadata-only jobs use the accompanying name.
+    Other jobs ignore the scope and run library-wide."""
     try:
         if _repair_worker() is None:
             return jsonify({'error': 'Repair worker not initialized'}), 400
 
-        _repair_worker().run_job_now(job_id)
-        logger.info("Repair job %s triggered manually via UI", job_id)
-        return jsonify({'success': True, 'job_id': job_id}), 200
+        body = request.get_json(silent=True) or {}
+        artist_name = str(body.get('artist_name') or '').strip()
+        artist_id = body.get('artist_id')
+        scope = None
+        if artist_id is not None:
+            from core.repair_jobs.base import build_artist_file_scope
+            scope = build_artist_file_scope(_repair_worker().db, artist_id, artist_name)
+            artist_name = scope['artist_name']
+        elif artist_name:
+            scope = {'artist_name': artist_name}
+        # E-14: a run started by hand covers the library the caller has
+        # selected. Only where there is more than one to choose between.
+        from core.library_scope import any_own_library_exists, current_library_scope
+        if any_own_library_exists():
+            scope = dict(scope or {})
+            scope['library'] = current_library_scope()
+        _repair_worker().run_job_now(job_id, scope=scope)
+        logger.info("Repair job %s triggered manually via UI%s", job_id,
+                    f" (artist scope: {artist_name})" if artist_name else "")
+        return jsonify({
+            'success': True,
+            'job_id': job_id,
+            'scoped_to': artist_name or None,
+            'scope_files': len(scope.get('file_paths', [])) if scope else None,
+        }), 200
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
         logger.error(f"Error running repair job {job_id}: {e}")
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/jobs/<job_id>/stop', methods=['POST'])
+@admin_only
 def repair_job_stop(job_id):
     """Stop a running (or queued) job — signals its scan loop to unwind (#970)."""
     try:
@@ -193,6 +258,7 @@ def repair_job_stop(job_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings', methods=['GET'])
+@requires("admin.tools")
 def repair_findings_list():
     """Get paginated findings with filters"""
     try:
@@ -208,14 +274,26 @@ def repair_findings_list():
         page = _safe_int(request.args.get('page'), 0)
         limit = _safe_int(request.args.get('limit'), 50)
 
+        # one album's (or artist's) rows by the grid's own key, for the
+        # album tray (review 5 W3-TU-1); only sent when asked for
+        group = {}
+        if request.args.get('group_by'):
+            group = {'group_by': request.args.get('group_by'),
+                     'group_artist': request.args.get('group_artist'),
+                     'group_album': request.args.get('group_album')}
+
         result = _repair_worker().get_findings(
             job_id=job_id, status=status, severity=severity,
             page=page, limit=limit, finding_type=finding_type,
-            sort=sort, q=q
+            sort=sort, q=q, **group
         )
 
         # Fix Plex/Jellyfin relative thumb URLs in finding details
         for item in result.get('items', []):
+            # the row's own pictures (core.repair_worker.attach_finding_art)
+            for key in ('album_thumb_url', 'artist_thumb_url'):
+                if item.get(key):
+                    item[key] = fix_artist_image_url(item[key])
             details = item.get('details')
             if details and isinstance(details, dict):
                 for key in ('album_thumb_url', 'artist_thumb_url'):
@@ -227,7 +305,85 @@ def repair_findings_list():
         logger.error(f"Error getting repair findings: {e}")
         return jsonify({'error': str(e)}), 500
 
+@bp.route('/api/repair/findings/<int:finding_id>/cover', methods=['GET'])
+@requires("admin.tools")
+def repair_finding_cover(finding_id):
+    """#2169: a cover finding's library, files and folder as they are now,
+    the found cover and its source, and what Apply Art would do in each"""
+    try:
+        if _repair_worker() is None:
+            return jsonify({'success': False, 'error': 'Repair worker not initialized'}), 400
+        state = _repair_worker().cover_finding_state(finding_id)
+        if state is None:
+            return jsonify({'success': False, 'error': 'Not a cover finding for an album in the library'}), 404
+        return jsonify({'success': True, **state}), 200
+    except Exception as e:
+        logger.error(f"Error reading cover state for finding {finding_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/repair/findings/<int:finding_id>/cover-image', methods=['GET'])
+@requires("admin.tools")
+def repair_finding_cover_image(finding_id):
+    """the cover in one place (library, files or folder), for the tiles"""
+    from flask import Response
+    try:
+        if _repair_worker() is None:
+            return '', 404
+        data = _repair_worker().cover_finding_image(finding_id, request.args.get('place') or '')
+        if not data:
+            return '', 404
+        mime = ('image/png' if data[:8] == b'\x89PNG\r\n\x1a\n'
+                else 'image/webp' if data[8:12] == b'WEBP' else 'image/jpeg')
+        response = Response(data, mimetype=mime)
+        # what is on disk now: never a cached answer from before an apply
+        response.headers['Cache-Control'] = 'no-store'
+        return response
+    except Exception as e:
+        logger.error(f"Error reading cover image for finding {finding_id}: {e}")
+        return '', 404
+
+@bp.route('/api/repair/findings/<int:finding_id>/keep-best-preview', methods=['GET'])
+@requires("admin.tools")
+def repair_finding_keep_best_preview(finding_id):
+    """#2172: what Keep Best would do for a duplicate finding, nothing
+    changed. ``action`` is the fix action it would send (keep_best,
+    file-<id>, with :confirmed / :move / :nomove)"""
+    try:
+        if _repair_worker() is None:
+            return jsonify({'success': False, 'error': 'Repair worker not initialized'}), 400
+        preview = _repair_worker().duplicate_finding_preview(
+            finding_id, request.args.get('action') or 'keep_best')
+        if preview is None:
+            return jsonify({'success': False, 'error': 'Not a duplicate finding'}), 404
+        return jsonify(preview), 200
+    except Exception as e:
+        logger.error(f"Error previewing Keep Best for finding {finding_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@bp.route('/api/repair/findings/keep-best-summary', methods=['GET'])
+@requires("admin.tools")
+def repair_findings_keep_best_summary():
+    """#2179: what a bulk Keep Best over the open duplicate findings would
+    do, before it runs: how many go through and how many need you, why,
+    with moving playlist entries off and on. ``ids`` narrows it to a
+    selection (comma separated)"""
+    try:
+        if _repair_worker() is None:
+            return jsonify({'success': False, 'error': 'Repair worker not initialized'}), 400
+        ids = [int(part) for part in (request.args.get('ids') or '').split(',') if part.strip().isdigit()]
+        summary = _repair_worker().keep_best_summary(
+            job_id=request.args.get('job_id') or None,
+            severity=request.args.get('severity') or None,
+            finding_ids=ids or None)
+        if summary is None:
+            return jsonify({'success': False, 'error': 'Could not read the duplicate findings'}), 500
+        return jsonify({'success': True, **summary}), 200
+    except Exception as e:
+        logger.error(f"Error summarising Keep Best: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @bp.route('/api/repair/findings/counts', methods=['GET'])
+@requires("admin.tools")
 def repair_findings_counts():
     """Get findings counts by status"""
     try:
@@ -241,6 +397,7 @@ def repair_findings_counts():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/groups', methods=['GET'])
+@requires("admin.tools")
 def repair_findings_groups():
     """Findings folded to one row per TYPE — what the inbox renders.
 
@@ -250,12 +407,21 @@ def repair_findings_groups():
     try:
         if _repair_worker() is None:
             return jsonify({'groups': []}), 200
-        return jsonify({'groups': _repair_worker().get_finding_groups()}), 200
+        # the inbox's job and severity filters: each row counts what its
+        # bulk buttons act on (review 5 W3-TT)
+        groups = _repair_worker().get_finding_groups(
+            job_id=request.args.get('job_id') or None,
+            severity=request.args.get('severity') or None)
+        for group in groups:
+            if group.get('art'):
+                group['art'] = [fix_artist_image_url(url) for url in group['art']]
+        return jsonify({'groups': groups}), 200
     except Exception as e:
         logger.error(f"Error grouping repair findings: {e}")
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/albums', methods=['GET'])
+@requires("admin.tools")
 def repair_findings_albums():
     """Findings folded to one row per album (or artist), worst audio first.
 
@@ -289,7 +455,58 @@ def repair_findings_albums():
         logger.error(f"Error grouping repair findings by album: {e}")
         return jsonify({'error': str(e)}), 500
 
+@bp.route('/api/repair/findings/album-action', methods=['POST'])
+@admin_only
+def repair_findings_album_action():
+    """Resolve Album / Dismiss All for one album (or artist) group.
+
+    the server decides which findings belong to the group, so an id the
+    client sends from another album is refused, not acted on (review 5
+    W3-TU-1).
+    """
+    try:
+        if _repair_worker() is None:
+            return jsonify({'error': 'Repair worker not initialized'}), 400
+        data = request.get_json(silent=True) or {}
+        action = data.get('action')
+        group_by = data.get('group_by') or 'album'
+        if action not in ('fix', 'dismiss'):
+            return jsonify({'error': 'action must be fix or dismiss'}), 400
+        if group_by not in ('album', 'artist'):
+            return jsonify({'error': 'group_by must be album or artist'}), 400
+        ids = data.get('ids')
+        if ids is not None:
+            if not isinstance(ids, list):
+                return jsonify({'error': 'ids must be a list'}), 400
+            try:
+                ids = [int(i) for i in ids]
+            except (TypeError, ValueError):
+                return jsonify({'error': 'ids must be numbers'}), 400
+        result = _repair_worker().album_group_action(
+            action, group_by, data.get('artist'), data.get('album'),
+            finding_ids=ids, job_id=data.get('job_id') or None,
+            finding_type=data.get('finding_type') or None)
+        return jsonify({'success': not result.get('error'), **result}), 200
+    except Exception as e:
+        logger.error(f"Error running album action: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@bp.route('/api/repair/findings/<int:finding_id>/undo', methods=['POST'])
+@admin_only
+def repair_finding_undo(finding_id):
+    """Put back the tags a fix changed, from the before values kept on the
+    finding, and reopen it."""
+    try:
+        if _repair_worker() is None:
+            return jsonify({'success': False, 'error': 'Repair worker not initialized'}), 400
+        result = _repair_worker().undo_finding(finding_id)
+        return jsonify(result), 200 if result.get('success') else 400
+    except Exception as e:
+        logger.error(f"Error undoing finding {finding_id}: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @bp.route('/api/repair/findings/<int:finding_id>/reopen', methods=['POST'])
+@admin_only
 def repair_finding_reopen(finding_id):
     """Put a resolved/dismissed finding back to pending — the undo half of
     dismiss, which is otherwise permanent by design."""
@@ -306,6 +523,7 @@ def repair_finding_reopen(finding_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/reopen-all', methods=['POST'])
+@admin_only
 def repair_findings_reopen_all():
     """Bulk reopen dismissed findings, optionally filtered by
     job_id and/or finding_type. The bulk undo for dismiss. Only
@@ -316,13 +534,16 @@ def repair_findings_reopen_all():
         data = request.get_json(silent=True) or {}
         job_id = data.get('job_id')
         finding_type = data.get('finding_type')
-        count = _repair_worker().reopen_findings_bulk(job_id=job_id, finding_type=finding_type)
+        count = _repair_worker().reopen_findings_bulk(
+            job_id=job_id, finding_type=finding_type,
+            severity=data.get('severity') or None)
         return jsonify({'success': True, 'reopened': count}), 200
     except Exception as e:
         logger.error(f"Error bulk reopening findings: {e}")
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/finding-types', methods=['GET'])
+@requires("admin.tools")
 def repair_finding_types():
     """The finding-type catalog: label, verb, fixable, destructive, job_ids.
 
@@ -339,6 +560,7 @@ def repair_finding_types():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/cache-health', methods=['GET'])
+@requires("music.access")
 def repair_cache_health():
     """Get metadata cache health stats for the repair dashboard"""
     try:
@@ -349,6 +571,7 @@ def repair_cache_health():
         return jsonify({}), 500
 
 @bp.route('/api/repair/findings/<int:finding_id>/fix', methods=['POST'])
+@admin_only
 def repair_finding_fix(finding_id):
     """Execute the actual fix action for a finding"""
     try:
@@ -357,6 +580,13 @@ def repair_finding_fix(finding_id):
 
         data = request.get_json(silent=True) or {}
         fix_action = data.get('fix_action')  # e.g. 'staging' or 'delete' for orphan files
+        if data.get('bulk'):
+            # Fix Selected: only a row the view it was picked from still lists
+            # (the library on screen and every filter), never a stale one
+            # from another library or album (review 5 W3-TT)
+            if not _repair_worker().ids_in_view([finding_id], **_view_filters(data)):
+                return jsonify({'success': False, 'refused': True,
+                                'error': 'Not in the list you picked it from any more'}), 409
         # This route is the single-finding fix, so it is the one place
         # that may declare a fix explicit — and only when the caller
         # does not declare itself bulk: a "Fix Selected" loop posts here
@@ -371,6 +601,7 @@ def repair_finding_fix(finding_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/<int:finding_id>/resolve', methods=['POST'])
+@admin_only
 def repair_finding_resolve(finding_id):
     """Resolve a finding with optional action"""
     try:
@@ -386,6 +617,7 @@ def repair_finding_resolve(finding_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/<int:finding_id>/dismiss', methods=['POST'])
+@admin_only
 def repair_finding_dismiss(finding_id):
     """Dismiss a finding"""
     try:
@@ -399,6 +631,7 @@ def repair_finding_dismiss(finding_id):
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/bulk-fix', methods=['POST'])
+@admin_only
 def repair_findings_bulk_fix():
     """Bulk fix all pending fixable findings matching filters"""
     try:
@@ -429,6 +662,7 @@ def repair_findings_bulk_fix():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/bulk-fix-start', methods=['POST'])
+@admin_only
 def repair_findings_bulk_fix_start():
     """Start a background bulk-fix run (Fix All at library scale).
 
@@ -459,6 +693,7 @@ def repair_findings_bulk_fix_start():
         return jsonify({'started': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/bulk-fix/status', methods=['GET'])
+@requires("admin.tools")
 def repair_bulk_fix_status():
     """Progress of the current (or most recent) background bulk fix."""
     try:
@@ -470,6 +705,7 @@ def repair_bulk_fix_status():
         return jsonify({'running': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/bulk-fix/stop', methods=['POST'])
+@admin_only
 def repair_bulk_fix_stop():
     """Stop a running background bulk fix after its current item."""
     try:
@@ -482,6 +718,7 @@ def repair_bulk_fix_stop():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/bulk', methods=['POST'])
+@admin_only
 def repair_findings_bulk():
     """Bulk resolve or dismiss findings"""
     try:
@@ -499,19 +736,30 @@ def repair_findings_bulk():
         if not finding_ids and finding_type:
             if action != 'dismiss':
                 return jsonify({'error': 'Only dismiss is supported for a type-scoped bulk'}), 400
-            count = _repair_worker().dismiss_findings_by_type(finding_type)
+            # the inbox's job / severity filters, so Dismiss all reaches only
+            # the rows its row counted (review 5 W3-TT)
+            count = _repair_worker().dismiss_findings_by_type(
+                finding_type, job_id=data.get('job_id') or None,
+                severity=data.get('severity') or None)
             return jsonify({'success': True, 'updated': count}), 200
 
         if not finding_ids:
             return jsonify({'error': 'No finding IDs provided'}), 400
+        if not isinstance(finding_ids, list):
+            return jsonify({'error': 'ids must be a list'}), 400
 
-        count = _repair_worker().bulk_update_findings(finding_ids, action)
-        return jsonify({'success': True, 'updated': count}), 200
+        # only ids the view they were picked in still lists: the library on
+        # screen plus every filter (review 5 W3-TT)
+        allowed = _repair_worker().ids_in_view(finding_ids, **_view_filters(data))
+        refused = len({str(i) for i in finding_ids}) - len(allowed)
+        count = _repair_worker().bulk_update_findings(allowed, action) if allowed else 0
+        return jsonify({'success': True, 'updated': count, 'refused': max(0, refused)}), 200
     except Exception as e:
         logger.error(f"Error bulk updating findings: {e}")
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/findings/clear', methods=['POST'])
+@admin_only
 def repair_findings_clear():
     """Clear (delete) findings, optionally filtered by job_id and/or status"""
     try:
@@ -528,15 +776,22 @@ def repair_findings_clear():
         finding_type = data.get('finding_type')
         q = data.get('q')
 
+        # a drilled-in album or artist card is a filter too (review 5 W3-TT-2)
+        group = {}
+        if data.get('group_by'):
+            group = {'group_by': data.get('group_by'),
+                     'group_artist': data.get('group_artist'),
+                     'group_album': data.get('group_album')}
         count = _repair_worker().clear_findings(
             job_id=job_id, status=status, severity=severity,
-            finding_type=finding_type, q=q)
+            finding_type=finding_type, q=q, **group)
         return jsonify({'success': True, 'deleted': count}), 200
     except Exception as e:
         logger.error(f"Error clearing findings: {e}")
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/history', methods=['GET'])
+@requires("admin.tools")
 def repair_history():
     """Get job run history"""
     try:
@@ -552,6 +807,7 @@ def repair_history():
         return jsonify({'error': str(e)}), 500
 
 @bp.route('/api/repair/progress', methods=['GET'])
+@admin_only
 def repair_job_progress():
     """Get current repair job progress states (for initial page load)"""
     try:

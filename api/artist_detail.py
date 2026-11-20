@@ -24,6 +24,7 @@ from api.source_playlists import (
     _get_metadata_fallback_source,
 )
 from core.metadata import normalize_image_url as fix_artist_image_url
+from core.library2.provider_ids import ARTIST_IDS_SQL as _ARTIST_IDS_SQL
 from core.edition_grouping import (
     EDITION_PREFERENCE_ALL,
     EDITION_PREFERENCE_ONE_COMPLETE,
@@ -34,8 +35,9 @@ from core.edition_grouping import (
 from core.search import by_id as _search_by_id
 from core.search import orchestrator as _search_orchestrator
 from core.metadata.cache import get_metadata_cache
-from core.profile_context import get_current_profile_id
+from core.profile_context import admin_only, get_current_profile_id
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("web_server")
 
@@ -71,6 +73,14 @@ from core.artist_source_lookup import (
     find_library_artist_for_source as _core_find_library_artist_for_source,
     sources_resolvable_in_library as _core_sources_resolvable_in_library,
 )
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
 
 
 def _find_library_artist_for_source(database, source, source_artist_id, artist_name=None):
@@ -149,11 +159,14 @@ def _annotate_edition_preference(discography):
         releases = discography.get(bucket)
         if not isinstance(releases, list):
             continue
-        if preference == EDITION_PREFERENCE_ALL:
+        if preference == EDITION_PREFERENCE_ALL and not prefer_explicit:
             for release in releases:
                 if isinstance(release, dict):
                     release['edition_preferred'] = True
             continue
+        # with every edition wanted, the clean copy of an album listed
+        # uncensored too is still not pre-checked while explicit is preferred
+        # (#2081): reduce_edition_group leaves it out in any mode
         groups = {}
         for release in releases:
             if not isinstance(release, dict):
@@ -205,7 +218,7 @@ def _annotate_gap_edition_preference(base, gaps):
     def _title(release):
         return str(release.get('name') or release.get('title') or '')
 
-    if preference == EDITION_PREFERENCE_ALL:
+    if preference == EDITION_PREFERENCE_ALL and not prefer_explicit:
         for bucket in ('albums', 'eps', 'singles'):
             for release in _bucket(gaps, bucket):
                 if isinstance(release, dict):
@@ -333,306 +346,80 @@ def _build_source_only_artist_detail(artist_id, artist_name, source):
     return jsonify(payload), status
 
 
+@bp.route('/api/artist-detail/library/<int:artist_id>/identity')
+@requires("music.access")
+def get_library_artist_identity(artist_id):
+    """A catalogue artist's provider identity, so a profile that may search but
+    may not open the library still gets the provider artist page for it, the
+    way dev let library OR search profiles open artist detail. names and ids
+    only, nothing from the library itself."""
+    try:
+        database = get_database()
+        with database._get_connection() as conn:
+            row = conn.execute(
+                f"SELECT name, {_ARTIST_IDS_SQL} FROM lib2_artists WHERE id = ?",
+                (artist_id,)).fetchone()
+        if row is None:
+            return jsonify({"success": False, "error": "artist not found"}), 404
+        row = dict(row)
+        # every source the provider artist page can open (core.artist_source_detail)
+        for source, key in (("spotify", "spotify_artist_id"), ("deezer", "deezer_id"),
+                            ("itunes", "itunes_artist_id"), ("musicbrainz", "musicbrainz_id"),
+                            ("discogs", "discogs_id"), ("amazon", "amazon_id")):
+            value = str(row.get(key) or "").strip()
+            if value:
+                return jsonify({"success": True, "name": row.get("name") or "",
+                                "source": source, "provider_id": value})
+        return jsonify({"success": True, "name": row.get("name") or "",
+                        "source": None, "provider_id": None})
+    except Exception as e:
+        logger.error(f"Error reading library artist identity: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @bp.route('/api/artist-detail/<artist_id>')
+@requires("music.access")
 def get_artist_detail(artist_id):
-    """Get artist detail data.
+    """Artist detail for an artist the catalogue does NOT hold.
 
-    For library artists, `artist_id` is the local DB primary key and the full
-    library-aware path runs (owned releases + merged source discography + per-
-    service enrichment coverage).
+    ``artist_id`` is a provider's id and ``?source=<provider>&name=<name>`` says
+    whose — the response is synthesized from that source (name + image +
+    discography) so Library V2's discovery mode can render an artist it has no
+    row for (ldp-02).
 
-    For source artists (Spotify/Deezer/iTunes/etc. that aren't in the library
-    yet), pass `?source=<source>&name=<artist_name>` and the endpoint synthesizes
-    a response directly from the metadata source — no owned releases, just name +
-    image + discography so the artist-detail page can still render.
+    There is no library branch any more. It used to look ``artist_id`` up as a
+    catalogue row first, which was both dead (every owned artist opens in
+    Library V2, which resolves it there) and wrong: a numeric provider id can
+    collide with a catalogue id, and the endpoint then answered with a stranger's
+    library (the iss29-B04c family).
     """
     try:
         source_param = (request.args.get('source', '') or '').strip().lower()
         artist_name_arg = (request.args.get('name', '') or '').strip()
-        if source_param:
-            from core.metadata.registry import experimental_source_rejected
-            if experimental_source_rejected(source_param):
-                return jsonify({
-                    "success": False,
-                    "error": f"{source_param} is not enabled",
-                }), 503
-
-        _mark_request_free_ok_for_spotify(source_param)
-        logger.info(
-            f"Getting artist detail for ID: {artist_id} "
-            f"(source={source_param or 'library'})"
-        )
-
-        # Get database instance
-        database = get_database()
-
-        # Get artist discography from database
-        db_result = database.get_artist_discography(artist_id)
-
-        # Library upgrade: if direct ID lookup missed AND we have a source hint,
-        # check whether the user already owns this artist in the library under
-        # a different ID (e.g. clicking a Deezer search result for an artist
-        # they have indexed in Plex). Prefer the library record so they get
-        # all their owned releases + enrichment instead of a bare source view.
-        if not db_result.get('success') and source_param in _SOURCE_ONLY_ARTIST_SOURCES:
-            library_pk = _find_library_artist_for_source(
-                database, source_param, artist_id, artist_name_arg
-            )
-            # URL-driven navigation carries no name, so a duplicated/corrupt
-            # source id (one Deezer id on several artists) can't be matched by
-            # the id alone — it's ambiguous and the lookup bails. Resolve the
-            # artist's name from the source and retry so an owned artist still
-            # gets the rich library view instead of the bare source one.
-            if not library_pk and not artist_name_arg:
-                resolved_name = _resolve_source_artist_name(source_param, artist_id)
-                if resolved_name:
-                    artist_name_arg = resolved_name
-                    library_pk = _find_library_artist_for_source(
-                        database, source_param, artist_id, artist_name_arg
-                    )
-            if library_pk:
-                logger.info(
-                    f"Source-id {source_param}:{artist_id} matched library artist "
-                    f"PK={library_pk} — upgrading to library response"
-                )
-                db_result = database.get_artist_discography(library_pk)
-
-        if not db_result.get('success'):
-            # Library lookup still failed. If a metadata source was specified,
-            # fall back to a source-only response so the page can render a
-            # non-library artist.
-            if source_param in _SOURCE_ONLY_ARTIST_SOURCES:
-                return _build_source_only_artist_detail(
-                    artist_id, artist_name_arg, source_param
-                )
-
-            logger.error(f"Database returned error: {db_result}")
+        if not source_param:
             return jsonify({
                 "success": False,
-                "error": db_result.get('error', 'Artist not found')
-            }), 404
+                "error": "source is required: an artist in your library opens on the Library page",
+            }), 400
 
-        artist_info = db_result['artist']
-        owned_releases = db_result['owned_releases']
+        from core.metadata.registry import experimental_source_rejected
+        if experimental_source_rejected(source_param):
+            return jsonify({
+                "success": False,
+                "error": f"{source_param} is not enabled",
+            }), 503
 
-        logger.info(f"Found artist: {artist_info['name']} with {len(owned_releases['albums'])} albums")
-
-        # Fix artist image URL.
-        # NOTE: don't log image_url or the full artist_info dict here.
-        # The fixed URL embeds the media-server token (and the proxy
-        # variant URL-encodes it), so logging at INFO writes the token
-        # straight into app.log. Issue: tokens leaked to disk on every
-        # artist-page render until this was scrubbed.
-        if artist_info.get('image_url'):
-            artist_info['image_url'] = fix_artist_image_url(artist_info['image_url'])
-        else:
-            logger.warning(f"No artist image URL found for {artist_info['name']}")
-
-        # Fix image URLs for all albums
-        for album in owned_releases['albums']:
-            if album.get('image_url'):
-                album['image_url'] = fix_artist_image_url(album['image_url'])
-
-        # Fix image URLs for EPs and singles (currently empty but for future use)
-        for ep in owned_releases['eps']:
-            if ep.get('image_url'):
-                ep['image_url'] = fix_artist_image_url(ep['image_url'])
-
-        for single in owned_releases['singles']:
-            if single.get('image_url'):
-                single['image_url'] = fix_artist_image_url(single['image_url'])
-
-        # Get source-priority discography for proper categorization and missing releases
-        artist_detail_discography = None
-        provider_error = None
-        try:
-            from core.metadata.lookup import MetadataLookupOptions
-            from core.metadata.discography_strict import get_artist_detail_discography as _get_artist_detail_discography
-            from core.source_ids import source_id_map
-
-            # Per-source artist IDs, read via the canonical source-ID registry
-            # (same columns as before: spotify_artist_id / deezer_id /
-            # itunes_artist_id / discogs_id / soul_id / amazon_id).
-            artist_source_ids = source_id_map(
-                artist_info, 'artist',
-                providers=('spotify', 'deezer', 'itunes', 'discogs', 'hydrabase', 'amazon'),
-            )
-
-            artist_detail_discography = _get_artist_detail_discography(
-                artist_id,
-                artist_name=artist_info['name'],
-                options=MetadataLookupOptions(
-                    # The user navigated here FROM a specific source's artist
-                    # card — show THAT source's catalog, not the primary's
-                    # (#1026, QT3496): when the artist was already owned, the
-                    # library upgrade discarded the clicked source, so an
-                    # Apple Music card rendered Deezer's 2-album view. The
-                    # override puts the clicked source at the head of the
-                    # chain; the normal priority still backstops it when that
-                    # source has nothing. Library-page opens carry no source
-                    # param → primary as before.
-                    source_override=source_param or None,
-                    allow_fallback=True,
-                    skip_cache=False,
-                    max_pages=0,
-                    # Match the Download Discography endpoint cap (200)
-                    # so the artist detail view sees the same release
-                    # set the modal lists. Spotify already paginates
-                    # all; Deezer/iTunes/Discogs/Hydrabase respect the
-                    # outer limit. 200 matches iTunes/Discogs internal
-                    # caps and covers prolific catalogues.
-                    limit=200,
-                    artist_source_ids=artist_source_ids,
-                    # #1450: the edition preference needs BOTH variants
-                    # present so _annotate_edition_preference can pick the
-                    # preferred one. The upstream variant dedup collapses
-                    # same-year variants with a hardcoded plain-title-wins
-                    # policy (e.g. Cracker Island deluxe never survives to
-                    # annotation), silently defeating the preference on
-                    # library pages. Under "all" keep today's default (True).
-                    dedup_variants=_read_edition_settings()[0] not in (
-                        EDITION_PREFERENCE_ONE_STANDARD,
-                        EDITION_PREFERENCE_ONE_COMPLETE,
-                    ),
-                ),
-            )
-
-            if artist_detail_discography.get('state') == 'error':
-                provider_error = {
-                    "state": "error",
-                    "error": artist_detail_discography.get(
-                        "error", "Could not access the discography provider"
-                    ),
-                    "source": artist_detail_discography.get("source", "unknown"),
-                    "status_code": int(
-                        artist_detail_discography.get("status_code") or 502
-                    ),
-                }
-                logger.warning(
-                    "Discography provider failed for owned artist %s; "
-                    "returning library releases: %s",
-                    artist_info['name'],
-                    provider_error['error'],
-                )
-                merged_discography = owned_releases
-            elif artist_detail_discography['success']:
-                logger.debug(
-                    "Source-priority discography found - "
-                    f"Albums: {len(artist_detail_discography['albums'])}, "
-                    f"EPs: {len(artist_detail_discography['eps'])}, "
-                    f"Singles: {len(artist_detail_discography['singles'])}"
-                )
-                merged_discography = artist_detail_discography
-            else:
-                logger.debug(f"Source-priority discography not found: {artist_detail_discography.get('error', 'Unknown error')}")
-                merged_discography = owned_releases
-        except Exception as detail_error:
-            logger.error(f"Error fetching source-priority discography: {detail_error}")
-            merged_discography = owned_releases
-
-        spotify_artist_data = None
-        if artist_info.get('spotify_artist_id'):
-            spotify_artist_data = {
-                'spotify_artist_id': artist_info.get('spotify_artist_id'),
-                'spotify_artist_name': artist_info.get('name'),
-                'artist_image': artist_info.get('image_url')
-            }
-
-        # Compute per-artist track enrichment coverage
-        enrichment_coverage = {}
-        try:
-            with database._get_connection() as conn:
-                cursor = conn.cursor()
-                artist_name = artist_info['name']
-                server_source = artist_info.get('server_source', '')
-                cursor.execute("""
-                    SELECT COUNT(*) FROM tracks t
-                    JOIN albums al ON al.id = t.album_id
-                    JOIN artists ar ON ar.id = al.artist_id
-                    WHERE ar.name = ? AND ar.server_source = ?
-                """, (artist_name, server_source))
-                total = (cursor.fetchone() or [0])[0]
-                if total > 0:
-                    for svc, col in [('spotify', 'spotify_track_id'), ('musicbrainz', 'musicbrainz_recording_id'),
-                                     ('deezer', 'deezer_id'), ('lastfm', 'lastfm_url'),
-                                     ('itunes', 'itunes_track_id'), ('audiodb', 'audiodb_id'),
-                                     ('genius', 'genius_id'), ('tidal', 'tidal_id'),
-                                     ('qobuz', 'qobuz_id'),
-                                     # bandcamp_url, not bandcamp_id: the URL is Bandcamp's
-                                     # canonical match signal and is always written on a match,
-                                     # whereas bandcamp_id stays null on url-only/manual matches
-                                     # (which showed a match badge but 0% coverage). PR #968 review.
-                                     ('bandcamp', 'bandcamp_url')]:
-                        try:
-                            cursor.execute(f"""
-                                SELECT COUNT(*) FROM tracks t
-                                JOIN albums al ON al.id = t.album_id
-                                JOIN artists ar ON ar.id = al.artist_id
-                                WHERE ar.name = ? AND ar.server_source = ?
-                                  AND t.{col} IS NOT NULL AND t.{col} != ''
-                            """, (artist_name, server_source))
-                            matched = (cursor.fetchone() or [0])[0]
-                            enrichment_coverage[svc] = round(matched / total * 100, 1)
-                        except Exception:
-                            enrichment_coverage[svc] = 0
-                    enrichment_coverage['total_tracks'] = total
-
-                # Bandcamp has no artist-level enrichment (no artists.bandcamp_id
-                # column), so derive an artist badge link from any owned album/track's
-                # release URL instead — Bandcamp release URLs are always
-                # https://<artist>.bandcamp.com/album|track/<slug>, so the origin
-                # doubles as the artist's Bandcamp page.
-                cursor.execute("""
-                    SELECT al.bandcamp_url FROM albums al
-                    JOIN artists ar ON ar.id = al.artist_id
-                    WHERE ar.name = ? AND ar.server_source = ?
-                      AND al.bandcamp_url IS NOT NULL AND al.bandcamp_url != ''
-                    UNION ALL
-                    SELECT t.bandcamp_url FROM tracks t
-                    JOIN albums al ON al.id = t.album_id
-                    JOIN artists ar ON ar.id = al.artist_id
-                    WHERE ar.name = ? AND ar.server_source = ?
-                      AND t.bandcamp_url IS NOT NULL AND t.bandcamp_url != ''
-                    LIMIT 1
-                """, (artist_name, server_source, artist_name, server_source))
-                bandcamp_row = cursor.fetchone()
-                if bandcamp_row and bandcamp_row[0]:
-                    parsed_bandcamp_url = urlparse(bandcamp_row[0])
-                    if parsed_bandcamp_url.scheme and parsed_bandcamp_url.netloc:
-                        artist_info['bandcamp_url'] = f"{parsed_bandcamp_url.scheme}://{parsed_bandcamp_url.netloc}/"
-        except Exception as e:
-            logger.debug("enrichment coverage build failed: %s", e)
-
-        response_data = {
-            "success": True,
-            "artist": artist_info,
-            # #1450: stamp edition_preferred for the Download Discography
-            # modal's pre-checks. On a provider error this is the raw
-            # owned_releases dict -- the buckets may carry DB rows, but the
-            # helper only touches dict releases and leaves the rest alone.
-            "discography": _annotate_edition_preference(merged_discography),
-            "enrichment_coverage": enrichment_coverage
-        }
-
-        if provider_error is not None:
-            response_data["provider_error"] = provider_error
-
-        # Add Spotify artist data if available
-        if spotify_artist_data:
-            response_data["spotify_artist"] = spotify_artist_data
-
-        return jsonify(response_data)
-
+        _mark_request_free_ok_for_spotify(source_param)
+        logger.info(f"Getting artist detail for {source_param}:{artist_id}")
+        return _build_source_only_artist_detail(
+            artist_id, artist_name_arg, source_param
+        )
     except Exception as e:
-        logger.error(f"Error in get_artist_detail: {e}")
-        import traceback
-        traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
+        logger.error(f"Error getting artist detail: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/library/debug-photos')
+@admin_only
 def debug_library_photos():
     """Debug endpoint to check artist photo URLs"""
     try:
@@ -641,11 +428,14 @@ def debug_library_photos():
         with database._get_connection() as conn:
             cursor = conn.cursor()
 
-            # Get first 10 artists with their photo URLs
+            # Library v2 is the catalogue here: the legacy `artists` table is
+            # empty, so the upstream version of this endpoint reported "no
+            # artists have photos" on every install. `thumb_url` is kept as the
+            # response key because that is the name the debug output documents.
             cursor.execute("""
-                SELECT name, thumb_url, server_source
-                FROM artists
-                WHERE thumb_url IS NOT NULL AND thumb_url != ''
+                SELECT name, image_url AS thumb_url, server_source
+                FROM lib2_artists
+                WHERE image_url IS NOT NULL AND image_url != ''
                 LIMIT 10
             """)
 
@@ -653,9 +443,9 @@ def debug_library_photos():
 
             # Get first 10 artists without photos
             cursor.execute("""
-                SELECT name, thumb_url, server_source
-                FROM artists
-                WHERE thumb_url IS NULL OR thumb_url = ''
+                SELECT name, image_url AS thumb_url, server_source
+                FROM lib2_artists
+                WHERE image_url IS NULL OR image_url = ''
                 LIMIT 10
             """)
 
@@ -672,13 +462,24 @@ def debug_library_photos():
         return jsonify({"error": str(e)}), 500
 
 @bp.route('/api/artist/similar/<path:artist_name>/stream')
+@requires("music.access")
 def get_similar_artists_stream(artist_name):
     """Stream MusicMap similar artists using source-priority metadata matching."""
+    from core.metadata.similar_artists import iter_fallback_similar_artist_events
     from core.metadata_service import iter_musicmap_similar_artist_events
 
     def generate():
         logger.info(f"Streaming similar artists for: {artist_name}")
         for event in iter_musicmap_similar_artist_events(artist_name, limit=20):
+            # MusicMap has no page for many smaller and newer artists ("Gizmo
+            # & Mac" is a 404 there). the page sat on "Finding similar
+            # artists..." for good; the providers' own lists answer instead
+            if event.get('type') == 'error' and int(event.get('status_code') or 0) in (400, 404):
+                for fallback in iter_fallback_similar_artist_events(artist_name, limit=20):
+                    yield f"data: {json.dumps(fallback)}\n\n"
+                    if fallback.get('artist'):
+                        time.sleep(0.1)
+                return
             yield f"data: {json.dumps(event)}\n\n"
             if event.get('artist'):
                 time.sleep(0.1)
@@ -686,6 +487,7 @@ def get_similar_artists_stream(artist_name):
     return Response(generate(), mimetype='text/event-stream')
 
 @bp.route('/api/artist/similar/<path:artist_name>')
+@requires("music.access")
 def get_similar_artists(artist_name):
     """Get MusicMap similar artists using source-priority metadata matching."""
     from core.metadata_service import get_musicmap_similar_artists
@@ -720,6 +522,7 @@ def get_similar_artists(artist_name):
         }), 500
 
 @bp.route('/api/artist/<artist_id>/write-image-to-disk', methods=['POST'])
+@admin_only
 def write_artist_image_to_disk(artist_id):
     """Write `artist.jpg` to the artist's folder on disk.
 
@@ -749,7 +552,6 @@ def write_artist_image_to_disk(artist_id):
     """
     try:
         from core.library.artist_image import (
-            download_image_bytes,
             find_artist_folder,
             write_artist_jpg,
         )
@@ -807,7 +609,9 @@ def write_artist_image_to_disk(artist_id):
             return jsonify({"success": False,
                             "error": "No artist image URL found from metadata sources."}), 404
 
-        image_bytes = download_image_bytes(image_url)
+        # the guarded fetch: a pasted image_url is fetched by the server, so
+        # never a lan, loopback or metadata address
+        image_bytes = _download_art(image_url)
         if not image_bytes:
             return jsonify({"success": False,
                             "error": f"Failed to download image from {image_url}"}), 502
@@ -843,6 +647,7 @@ def write_artist_image_to_disk(artist_id):
 
 
 @bp.route('/api/artist/<artist_id>/image', methods=['GET'])
+@requires("music.access")
 def get_artist_image(artist_id):
     """Get an artist image URL using source-aware metadata resolution."""
     try:
@@ -874,42 +679,8 @@ def get_artist_image(artist_id):
         logger.error(f"Error fetching artist image: {e}")
         return jsonify({"success": False, "image_url": None, "error": str(e)})
 
-@bp.route('/api/artist/<artist_id>/appears-on', methods=['GET'])
-def get_artist_appears_on(artist_id):
-    """albums and tracks this library artist is credited on that are filed
-    under someone else (collab albums, features), from the credits the
-    enrichment workers keep. a track on one of those albums is left out of
-    the tracks, the album already has it."""
-    try:
-        from core.library.artist_credits import appears_on, appears_on_albums
-        try:
-            limit = max(1, min(int(request.args.get('limit', 200)), 500))
-        except (TypeError, ValueError):
-            limit = 200
-        database = get_database()
-        track_scope, track_params = database._current_scope_sql('t.owner_profile_id')
-        album_scope, album_params = database._current_scope_sql('al.owner_profile_id')
-        with database._get_connection() as conn:
-            cursor = conn.cursor()
-            albums = appears_on_albums(cursor, artist_id, scope_sql=album_scope,
-                                       scope_params=album_params)
-            tracks = appears_on(cursor, artist_id, limit=limit,
-                                scope_sql=track_scope, scope_params=track_params)
-        on_albums = {str(a['id']) for a in albums}
-        tracks = [t for t in tracks if str(t.get('album_id')) not in on_albums]
-        for a in albums:
-            if a.get('thumb_url'):
-                a['thumb_url'] = fix_artist_image_url(a['thumb_url'])
-        for t in tracks:
-            if t.get('album_thumb_url'):
-                t['album_thumb_url'] = fix_artist_image_url(t['album_thumb_url'])
-        return jsonify({'success': True, 'albums': albums, 'tracks': tracks})
-    except Exception as e:
-        logger.error(f"Error getting appears-on tracks for artist {artist_id}: {e}")
-        return jsonify({'success': False, 'error': str(e), 'tracks': []}), 500
-
-
 @bp.route('/api/artist/<artist_id>/top-tracks', methods=['GET'])
+@requires("music.access")
 def get_artist_top_tracks_endpoint(artist_id):
     """Return an artist's top-N tracks via the primary metadata source.
 
@@ -949,17 +720,7 @@ def get_artist_top_tracks_endpoint(artist_id):
             _conn = _db._get_connection()
             try:
                 _cur = _conn.cursor()
-                _cur.execute("""
-                    SELECT spotify_artist_id, deezer_id
-                    FROM artists
-                    WHERE id = ?
-                       OR spotify_artist_id = ?
-                       OR itunes_artist_id = ?
-                       OR deezer_id = ?
-                       OR musicbrainz_id = ?
-                    LIMIT 1
-                """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-                _row = _cur.fetchone()
+                _row = _library_artist_for_id(_cur, artist_id)
                 if _row:
                     if primary_source == 'spotify' and _row['spotify_artist_id']:
                         resolved_id = str(_row['spotify_artist_id'])
@@ -1011,6 +772,46 @@ def get_artist_top_tracks_endpoint(artist_id):
         return jsonify({"success": False, "error": str(e), "tracks": []}), 500
 
 
+_ARTIST_ID_COLUMNS = """SELECT a.spotify_id AS spotify_artist_id,
+           json_extract(a.external_ids, '$.itunes') AS itunes_artist_id,
+           json_extract(a.external_ids, '$.deezer') AS deezer_id,
+           a.musicbrainz_id
+      FROM lib2_artists a"""
+
+
+def _library_artist_for_id(cursor, artist_id):
+    """The library artist a URL id names: a provider id (spotify, itunes,
+    deezer, musicbrainz), never a bare catalogue row id. 3.6.1's ``artists.id``
+    was the media server's own id; ``lib2_artists.id`` is 1..N, so a Deezer id
+    like 13 used to hit catalogue row 13 (a stranger). A catalogue id is only
+    taken spelled ``lib2:<n>``. Among rows sharing a provider id, the
+    canonical row with files wins."""
+    raw = str(artist_id or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("lib2:") and raw[5:].isdigit():
+        cursor.execute(f"{_ARTIST_ID_COLUMNS} WHERE a.id = ?", (int(raw[5:]),))
+        return cursor.fetchone()
+    from core.library2.provider_ids import indexed_provider_id_sql
+    for source in ("spotify", "itunes", "deezer", "musicbrainz"):
+        expression = indexed_provider_id_sql(source, alias="a")
+        if not expression:
+            continue
+        cursor.execute(
+            f"""{_ARTIST_ID_COLUMNS} WHERE {expression} = ?
+                ORDER BY (a.canonical_artist_id IS NOT NULL),
+                         NOT EXISTS (SELECT 1 FROM lib2_album_artists aa
+                                       JOIN lib2_tracks t ON t.album_id = aa.album_id
+                                       JOIN lib2_track_files f ON f.track_id = t.id
+                                      WHERE aa.artist_id = a.id LIMIT 1),
+                         a.id
+                LIMIT 1""", (raw,))
+        row = cursor.fetchone()
+        if row:
+            return row
+    return None
+
+
 def _resolve_artist_source_ids(artist_id) -> dict:
     """Per-source artist ids from the enriched library row, keyed by source.
 
@@ -1025,18 +826,7 @@ def _resolve_artist_source_ids(artist_id) -> dict:
         _conn = _db._get_connection()
         try:
             _cur = _conn.cursor()
-            _cur.execute("""
-                SELECT spotify_artist_id, itunes_artist_id,
-                       deezer_id, musicbrainz_id
-                FROM artists
-                WHERE id = ?
-                   OR spotify_artist_id = ?
-                   OR itunes_artist_id = ?
-                   OR deezer_id = ?
-                   OR musicbrainz_id = ?
-                LIMIT 1
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-            _row = _cur.fetchone()
+            _row = _library_artist_for_id(_cur, artist_id)
             if _row:
                 if _row['spotify_artist_id']:
                     artist_source_ids['spotify'] = str(_row['spotify_artist_id'])
@@ -1057,7 +847,55 @@ def _resolve_artist_source_ids(artist_id) -> dict:
     return artist_source_ids
 
 
+def _catalogue_release_cards(library_artist_id):
+    """What the Library artist page lists for this artist, as discography
+    buckets: every release filed under the artist or one of its alias rows.
+    None when the artist is not in the catalogue."""
+    try:
+        artist_pk = int(library_artist_id)
+    except (TypeError, ValueError):
+        return None
+    conn = get_database()._get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(canonical_artist_id, id) FROM lib2_artists WHERE id = ?",
+                    (artist_pk,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        root = int(row[0])
+        cur.execute("SELECT id FROM lib2_artists WHERE id = ? OR canonical_artist_id = ?",
+                    (root, root))
+        group = [int(r[0]) for r in cur.fetchall()]
+        marks = ','.join('?' for _ in group)
+        cur.execute(
+            f"""SELECT al.id, al.title, al.album_type, al.year, al.release_date,
+                       COALESCE(al.expected_track_count, al.track_count, 0) AS tracks,
+                       al.explicit
+                  FROM lib2_albums al
+                 WHERE al.primary_artist_id IN ({marks})
+                    OR al.id IN (SELECT album_id FROM lib2_album_artists
+                                  WHERE artist_id IN ({marks}))""", group + group)
+        buckets = {'albums': [], 'eps': [], 'singles': []}
+        for r in cur.fetchall():
+            kind = str(r[2] or 'album').lower()
+            bucket = 'singles' if kind == 'single' else 'eps' if kind == 'ep' else 'albums'
+            buckets[bucket].append({
+                'id': f'lib2:{r[0]}', 'title': r[1] or '', 'name': r[1] or '',
+                'album_type': kind, 'year': r[3], 'release_date': r[4] or '',
+                'total_tracks': int(r[5] or 0), 'track_count': int(r[5] or 0),
+                'explicit': bool(r[6]) if r[6] is not None else None,
+            })
+        return buckets
+    except Exception as exc:  # noqa: BLE001 - falls back to the provider base
+        logger.debug("catalogue cards not read for gap-fill: %s", exc)
+        return None
+    finally:
+        conn.close()
+
+
 @bp.route('/api/artist/<artist_id>/discography/gap-fill', methods=['GET'])
+@requires("music.access")
 def get_artist_discography_gap_fill(artist_id):
     """Releases OTHER metadata sources know that the base source's
     discography doesn't (#1067 — the hybrid/gap-fill view option).
@@ -1074,6 +912,18 @@ def get_artist_discography_gap_fill(artist_id):
         base_source = (request.args.get('base_source', '') or '').strip().lower()
 
         artist_source_ids = _resolve_artist_source_ids(artist_id)
+
+        # #2050: the Library artist page lists the CATALOGUE, not a provider's
+        # live discography. Diffing against a provider base skipped releases
+        # the page never had (the base source's own, which it was assumed to
+        # show) and added ones it already had (owned ones the base lacks). So
+        # that page names its artist, the base is what it lists, and every
+        # source with a verified id is asked, the catalogue's own included.
+        library_artist = (request.args.get('library_artist', '') or '').strip()
+        catalogue = _catalogue_release_cards(library_artist) if library_artist else None
+        if catalogue is not None:
+            artist_source_ids = (_resolve_artist_source_ids(f'lib2:{library_artist}')
+                                 or artist_source_ids)
 
         from core.metadata.discography_gapfill import gap_fill_buckets
         from core.metadata.lookup import MetadataLookupOptions
@@ -1119,7 +969,9 @@ def get_artist_discography_gap_fill(artist_id):
             EDITION_PREFERENCE_ONE_STANDARD,
             EDITION_PREFERENCE_ONE_COMPLETE,
         )
-        if base_source:
+        if catalogue is not None:
+            base, resolved_base = catalogue, 'library'
+        elif base_source:
             base = _fetch(base_source, artist_source_ids.get(base_source) or artist_id,
                           name=artist_name, dedup_variants=base_dedup_variants)
             resolved_base = base_source
@@ -1178,6 +1030,7 @@ def get_artist_discography_gap_fill(artist_id):
 
 
 @bp.route('/api/artist/<artist_id>/discography', methods=['GET'])
+@requires("music.access")
 def get_artist_discography(artist_id):
     """Get an artist's complete discography (albums and singles)"""
     try:
@@ -1321,13 +1174,16 @@ def get_artist_discography(artist_id):
                 try:
                     cur_lib = conn_lib.cursor()
                     cur_lib.execute("""
-                        SELECT id, summary, genres, thumb_url,
-                               spotify_artist_id, musicbrainz_id, deezer_id, itunes_artist_id,
-                               audiodb_id, discogs_id, tidal_id, qobuz_id, genius_id, soul_id,
-                               lastfm_bio, lastfm_listeners, lastfm_playcount, lastfm_tags,
-                               lastfm_url, genius_url, style, mood, label
-                        FROM artists WHERE name COLLATE NOCASE = ? LIMIT 1
-                    """, (artist_name,))
+                        SELECT id, summary, genres, image_url AS thumb_url,
+                               soul_id, style, mood, label,
+                               json_extract(enrichment, '$.lastfm.bio') AS lastfm_bio,
+                               json_extract(enrichment, '$.lastfm.listeners') AS lastfm_listeners,
+                               json_extract(enrichment, '$.lastfm.playcount') AS lastfm_playcount,
+                               json_extract(enrichment, '$.lastfm.tags') AS lastfm_tags,
+                               enrichment,
+                               {_ARTIST_IDS_SQL}
+                        FROM lib2_artists WHERE name_key = ? LIMIT 1
+                    """.format(_ARTIST_IDS_SQL=_ARTIST_IDS_SQL), (_catalogue_name_key(artist_name),))
                     lib_row = cur_lib.fetchone()
                     if lib_row:
                         lib = dict(lib_row)
@@ -1365,6 +1221,10 @@ def get_artist_discography(artist_id):
                         # Bio fallback from summary
                         if not artist_info.get('lastfm_bio') and lib.get('summary'):
                             artist_info['bio'] = lib['summary']
+                        # bio/tags/numbers from the free sources when last.fm
+                        # has none, each with its source
+                        from core.library2.artist_about import resolve_artist_about
+                        artist_info['about'] = resolve_artist_about(lib.get('enrichment'))
                 finally:
                     conn_lib.close()
         except Exception as e:
@@ -1399,6 +1259,7 @@ def _looks_like_image(data: bytes) -> bool:
 
 
 @bp.route('/api/album/<album_id>/art-options', methods=['GET'])
+@requires("music.access")
 def get_album_art_options(album_id):
     """Candidate cover-art images for an album, for the art picker (read-only).
 
@@ -1465,15 +1326,32 @@ def _derive_album_folder(db, album_id):
 
 def _download_art(url):
     """the chosen image's bytes, or None when the download fails. best-effort on
-    purpose: hotlink-protected art still renders in the browser."""
-    import urllib.request  # not bound at module level (only urllib.parse is); matches the local-import pattern used elsewhere
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "SoulSync/1.0", "Accept": "image/*"})
-        with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (user-chosen art URL)
-            return resp.read() or None
-    except Exception as exc:
-        logger.warning("[set-art] image download failed: %s", exc)
-        return None
+    purpose: hotlink-protected art still renders in the browser.
+
+    the server fetches this url, so it goes through the library's guarded
+    artwork fetch: http/https to public addresses only (every redirect hop and
+    the connected peer re-checked), a size cap and timeouts. a lan, loopback or
+    cloud-metadata address is never fetched."""
+    from core.library2.artwork import _download_remote_artwork
+    return _download_remote_artwork(url)
+
+
+# the guarded fetch's reasons that mean "this url is not usable", as opposed to
+# a site that refused a hotlink (that pick still stands, the browser loads it)
+_ART_URL_REFUSALS = (
+    "That link is not a public",
+    "That link opens a web page",
+    "That link is not an image",
+    "That image is too large",
+    "That link redirects",
+)
+
+
+def _art_url_refusal(url):
+    """why the last _download_art of this url can't be used, or None."""
+    from core.library2.artwork import remote_artwork_failure
+    reason = remote_artwork_failure(url)
+    return reason if reason and reason.startswith(_ART_URL_REFUSALS) else None
 
 
 def _write_cover_jpg(data, folder):
@@ -1486,20 +1364,53 @@ def _write_cover_jpg(data, folder):
     return True
 
 
-def _server_album(client, album_id):
+def _album_server_id(album_id, server_source):
+    """The active server's own id for a catalogue album, or None.
+
+    Upstream can pass the row id straight to the client, because there the
+    album row IS the server's item ("the row id IS the rating key"). Here the
+    row is a lib2 album and the server's id is held beside it in
+    lib2_media_server_mappings, with server_source/server_id on the row as the
+    compatibility projection — the same two places get_all_album_ids_for_server
+    reads. Without this the poster push looked up a lib2 integer on the server,
+    found nothing, and reported server_updated: false forever.
+    """
+    if not server_source:
+        return None
+    try:
+        db = get_database()
+        with db._get_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE("
+                "  (SELECT m.server_id FROM lib2_media_server_mappings m"
+                "    WHERE m.entity_type='album' AND m.entity_id=a.id"
+                "      AND m.server_source=? LIMIT 1),"
+                "  CASE WHEN a.server_source=? THEN a.server_id END)"
+                " FROM lib2_albums a WHERE a.id=?",
+                (str(server_source), str(server_source), album_id)).fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception as exc:
+        logger.debug("[set-art] server id lookup failed for album %s: %s", album_id, exc)
+        return None
+
+
+def _server_album(client, album_id, server_source=None):
     """the media server's own album object for a library row, or None.
 
-    plex: the row id IS the rating key. jellyfin: the item id. navidrome's
-    poster update is a documented no-op, so nothing is fetched for it.
+    jellyfin: the item id. plex: the rating key. navidrome's poster update is a
+    documented no-op, so nothing is fetched for it.
     """
     if client is None:
         return None
+    server_id = _album_server_id(album_id, server_source)
+    if not server_id:
+        return None
     try:
         if hasattr(client, 'get_album_by_id'):                      # Jellyfin / Navidrome
-            return client.get_album_by_id(str(album_id))
+            return client.get_album_by_id(server_id)
         server = getattr(client, 'server', None)                    # Plex
         if server is not None and hasattr(server, 'fetchItem'):
-            return server.fetchItem(f'/library/metadata/{album_id}')
+            return server.fetchItem(f'/library/metadata/{server_id}')
     except Exception as exc:
         logger.debug("[set-art] server album lookup failed for %s: %s", album_id, exc)
     return None
@@ -1515,7 +1426,7 @@ def _push_album_poster(album_id, image_bytes):
         client = media_server_engine.client(active)
         if not client or not hasattr(client, 'update_album_poster'):
             return False
-        server_album = _server_album(client, album_id)
+        server_album = _server_album(client, album_id, active)
         if server_album is None:
             return False
         return bool(client.update_album_poster(server_album, image_bytes))
@@ -1525,6 +1436,7 @@ def _push_album_poster(album_id, image_bytes):
 
 
 @bp.route('/api/album/<album_id>/art', methods=['POST'])
+@admin_only
 def set_album_art(album_id):
     """Apply a cover chosen in the picker, the same three places the artist twin writes to:
 
@@ -1544,6 +1456,9 @@ def set_album_art(album_id):
             return jsonify({"error": "url is required"}), 400
 
         image_bytes = _download_art(url)
+        refusal = _art_url_refusal(url) if image_bytes is None else None
+        if refusal:
+            return jsonify({"error": refusal}), 400
         if image_bytes is not None and not _looks_like_image(image_bytes):
             return jsonify({"error": "That URL doesn't point to an image"}), 400
 
@@ -1571,7 +1486,29 @@ def set_album_art(album_id):
         return jsonify({"error": str(e)}), 500
 
 
+@bp.route('/api/album/<album_id>/metadata-lock', methods=['GET'])
+@requires("music.access")
+def get_album_metadata_lock(album_id):
+    """Whether a lib2 album was hand-tagged from basic search, so the library
+    view can offer the unlock only where there is something to unlock."""
+    try:
+        db = get_database()
+        keys = db.manual_path_keys()
+        if not keys:
+            return jsonify({"success": True, "album_id": album_id, "metadata_locked": False})
+        with db._get_connection() as conn:
+            paths = conn.execute(
+                "SELECT f.path FROM lib2_track_files f JOIN lib2_tracks t ON t.id = f.track_id"
+                " WHERE t.album_id = ?", (album_id,)).fetchall()
+        locked = any(fp and db.manual_path_key(fp) in keys for (fp,) in paths)
+        return jsonify({"success": True, "album_id": album_id, "metadata_locked": locked})
+    except Exception as e:
+        logger.error("[manual] lock read failed for album %s: %s", album_id, e, exc_info=True)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @bp.route('/api/album/<album_id>/metadata-lock', methods=['DELETE'])
+@admin_only
 def clear_album_metadata_lock(album_id):
     """Unlock a hand-tagged album. it was tagged by hand from basic search
     ("tag it yourself") and locked so nothing rematched it to a studio release.
@@ -1588,6 +1525,7 @@ def clear_album_metadata_lock(album_id):
 
 
 @bp.route('/api/album/<album_id>/art', methods=['DELETE'])
+@admin_only
 def clear_album_art_lock(album_id):
     """Hand this album's cover back to the media server.
 
@@ -1606,6 +1544,7 @@ def clear_album_art_lock(album_id):
 
 
 @bp.route('/api/artist/<artist_id>/art', methods=['DELETE'])
+@admin_only
 def clear_artist_art_lock(artist_id):
     """Hand this artist's photo back to the media server. See the album twin."""
     try:
@@ -1624,6 +1563,7 @@ def clear_artist_art_lock(artist_id):
 
 
 @bp.route('/api/artist/<artist_id>/art-options', methods=['GET'])
+@requires("music.access")
 def get_artist_art_options(artist_id):
     """Candidate artist photos for the artist image picker (read-only).
 
@@ -1694,7 +1634,114 @@ def _artist_track_paths_on_disk(db, albums, limit=None):
                     return
 
 
+def push_album_art_outbound(album_id, image_bytes) -> dict:
+    """a picked cover beyond SoulSync, as 3.6.1 did: the active server's
+    poster, and cover.jpg in every folder of the album (Navidrome reads cover.*
+    before embedded art). best effort; says what happened."""
+    out = {"server_updated": False, "cover_written": False}
+    if not image_bytes:
+        return out
+    out["server_updated"] = _push_album_poster(album_id, image_bytes)
+    try:
+        from contextlib import closing
+        from core.library2.artwork import _album_folders
+        db = get_database()
+        with closing(db._get_connection()) as conn:
+            folders = _album_folders(conn, config_manager, int(album_id))
+        for folder in folders or []:
+            try:
+                if folder and os.path.isdir(folder) and _write_cover_jpg(image_bytes, folder):
+                    out["cover_written"] = True
+            except Exception as exc:  # noqa: BLE001 - one folder, not the rest
+                logger.warning("[set-art] cover.jpg write failed in %s: %s", folder, exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[set-art] cover.jpg for album %s skipped: %s", album_id, exc)
+    return out
+
+
+def _artist_server_id(artist_id, server_source):
+    """the active server's own id for a catalogue artist, or None. the same
+    two places _album_server_id reads (review 4 R4-D-5: the push asked
+    Jellyfin for a lib2 row id and never found the artist)"""
+    if not server_source:
+        return None
+    try:
+        with get_database()._get_connection() as conn:
+            row = conn.execute(
+                "SELECT COALESCE("
+                "  (SELECT m.server_id FROM lib2_media_server_mappings m"
+                "    WHERE m.entity_type='artist' AND m.entity_id=a.id"
+                "      AND m.server_source=? LIMIT 1),"
+                "  CASE WHEN a.server_source=? THEN a.server_id END)"
+                " FROM lib2_artists a WHERE a.id=?",
+                # no int(): the key's integer affinity matches a digit string,
+                # and a text id must never 400 the picker (#1069)
+                (str(server_source), str(server_source), artist_id)).fetchone()
+        return str(row[0]) if row and row[0] else None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("[set-artist-art] server id lookup failed for artist %s: %s", artist_id, exc)
+        return None
+
+
+def push_artist_art_outbound(artist_id, image_bytes) -> dict:
+    """a picked artist photo beyond SoulSync, as 3.6.1 did: the active
+    server's poster, artist.jpg in the artist's folder, and a Navidrome scan
+    nudge. best effort; says what happened."""
+    out = {"server_updated": False, "disk_written": False, "disk_skipped": None}
+    if not image_bytes:
+        return out
+    db = get_database()
+    artist_row = db.get_artist(str(artist_id))
+    artist_name = getattr(artist_row, 'name', '') or '' if artist_row is not None else ''
+    if media_server_engine:
+        try:
+            active = config_manager.get_active_media_server()
+            client = media_server_engine.client(active)
+            if client and hasattr(client, 'update_artist_poster'):
+                server_artist = None
+                server_id = _artist_server_id(artist_id, active)
+                if hasattr(client, '_search_artists_by_name'):        # Plex
+                    server = getattr(client, 'server', None)
+                    if server_id and server is not None and hasattr(server, 'fetchItem'):
+                        try:
+                            server_artist = server.fetchItem(f'/library/metadata/{server_id}')
+                        except Exception:  # noqa: BLE001 - gone on the server: by name
+                            server_artist = None
+                    if server_artist is None:
+                        # 3.6.1's way, for an artist with no mapping yet
+                        matches = client._search_artists_by_name(title=artist_name, limit=1)
+                        server_artist = matches[0] if matches else None
+                elif hasattr(client, 'get_artist_by_id') and server_id:  # Jellyfin
+                    server_artist = client.get_artist_by_id(server_id)
+                if server_artist is not None:
+                    out["server_updated"] = bool(client.update_artist_poster(server_artist, image_bytes))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[set-artist-art] server poster update failed: %s", exc)
+    try:
+        from core.library.artist_image import find_artist_folder, write_artist_jpg
+        albums = db.get_albums_by_artist(str(artist_id)) or []
+        artist_folder = find_artist_folder(_artist_track_paths_on_disk(db, albums), artist_name)
+        if not artist_folder and next(iter(_artist_track_paths_on_disk(db, albums, limit=1)), None):
+            out["disk_skipped"] = _NO_ARTIST_FOLDER
+        if artist_folder:
+            ok, detail = write_artist_jpg(artist_folder, image_bytes, overwrite=True)
+            out["disk_written"] = bool(ok)
+            if not ok:
+                logger.warning("[set-artist-art] artist.jpg write failed: %s", detail)
+            elif media_server_engine and config_manager.get_active_media_server() == 'navidrome':
+                nav = media_server_engine.client('navidrome')
+                if nav:
+                    try:
+                        nav.trigger_library_scan()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("[set-artist-art] navidrome scan nudge failed", exc_info=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[set-artist-art] disk write failed: %s", exc)
+    return out
+
+
 @bp.route('/api/artist/<artist_id>/art', methods=['POST'])
+@admin_only
 def set_artist_art(artist_id):
     """Apply a photo chosen in the artist image picker — everywhere:
 
@@ -1727,15 +1774,10 @@ def set_artist_art(artist_id):
         # validate: a custom URL that resolves to an HTML page must abort
         # before anything is pinned. A failed download stays best-effort —
         # hotlink-protected art can still render in the browser.
-        image_bytes = None
-        try:
-            import urllib.request
-            req = urllib.request.Request(url, headers={"User-Agent": "SoulSync/1.0",
-                                                       "Accept": "image/*"})
-            with urllib.request.urlopen(req, timeout=15) as resp:   # noqa: S310 (user-chosen art URL)
-                image_bytes = resp.read() or None
-        except Exception as exc:
-            logger.warning("[set-artist-art] image download failed: %s", exc)
+        image_bytes = _download_art(url)
+        refusal = _art_url_refusal(url) if image_bytes is None else None
+        if refusal:
+            return jsonify({"error": refusal}), 400
         if image_bytes is not None and not _looks_like_image(image_bytes):
             return jsonify({"error": "That URL doesn't point to an image"}), 400
 
@@ -1804,6 +1846,7 @@ def set_artist_art(artist_id):
 
 
 @bp.route('/api/graph/library', methods=['GET'])
+@requires("music.discover")
 def get_library_graph():
     """Library "Taste Map": EVERY library artist as a node, grouped by genre + wired by similarity.
 
@@ -1814,20 +1857,12 @@ def get_library_graph():
     """
     try:
         from core.graph.artist_graph import build_genre_grouped_map
+        from core.graph.library_artists import load_library_artists
         db = get_database()
         conn = db._get_connection()
         try:
             cur = conn.cursor()
-            owned = set()
-            meta = {}
-            artists = []
-            for name, thumb, genres, aid, source in cur.execute(
-                "SELECT name, thumb_url, genres, id, server_source FROM artists"
-            ):
-                key = (name or "").strip().lower()
-                owned.add(key)
-                meta[key] = {"thumb_url": thumb, "genres": genres}
-                artists.append((name, genres, thumb, aid, source))
+            owned, meta, artists = load_library_artists(cur)
             rows = cur.execute(
                 "SELECT source_artist_id, similar_artist_name, similar_artist_spotify_id, "
                 "similar_artist_deezer_id, similar_artist_itunes_id, occurrence_count, popularity "
@@ -1848,6 +1883,7 @@ def get_library_graph():
 
 
 @bp.route('/api/graph/discovery', methods=['GET'])
+@requires("music.discover")
 def get_discovery_graph():
     """Discovery Web: owned artists as anchors + their UNOWNED similar artists as discovery candidates.
 
@@ -1902,12 +1938,9 @@ def _discovery_load_inputs(cur):
     popularity) — enriching from metadata_cache_entities instead measured 18-250s per request
     (random reads into a 1.3M-row table), for data these rows already have.
     """
-    owned = set()
-    owned_meta = {}
-    for name, thumb, genres, aid in cur.execute("SELECT name, thumb_url, genres, id FROM artists"):
-        key = (name or "").strip().lower()
-        owned.add(key)
-        owned_meta[key] = {"thumb_url": thumb, "genres": genres, "id": aid}
+    from core.graph.library_artists import load_library_artists
+
+    owned, owned_meta, _nodes = load_library_artists(cur)
     rows = cur.execute(
         "SELECT source_artist_id, similar_artist_name, similar_artist_spotify_id, "
         "similar_artist_deezer_id, similar_artist_itunes_id, occurrence_count, popularity, "
@@ -1918,6 +1951,7 @@ def _discovery_load_inputs(cur):
 
 
 @bp.route('/api/graph/discovery/expand', methods=['POST'])
+@requires("music.discover")
 def expand_discovery_graph():
     """Expand-on-click for the Discovery Web: one node's similar artists, minus what's on screen.
 
@@ -1953,6 +1987,7 @@ def expand_discovery_graph():
 
 
 @bp.route('/api/graph/discovery/preview/<deezer_id>', methods=['GET'])
+@requires("music.discover")
 def get_discovery_preview(deezer_id):
     """30-second Deezer preview for a discovery candidate's top track (hear it before you add it).
 
@@ -1982,6 +2017,7 @@ def get_discovery_preview(deezer_id):
 
 
 @bp.route('/api/library/artist/<int:artist_id>/thumb', methods=['GET'])
+@requires("music.access")
 def get_library_artist_thumb(artist_id):
     """Browser-loadable thumb URL for ONE library artist, by library DB id.
 
@@ -1998,7 +2034,7 @@ def get_library_artist_thumb(artist_id):
         conn = db._get_connection()
         try:
             cur = conn.cursor()
-            row = cur.execute("SELECT thumb_url FROM artists WHERE id = ?", (artist_id,)).fetchone()
+            row = cur.execute("SELECT image_url AS thumb_url FROM lib2_artists WHERE id = ?", (artist_id,)).fetchone()
         finally:
             conn.close()
         thumb = row['thumb_url'] if row else None
@@ -2010,6 +2046,7 @@ def get_library_artist_thumb(artist_id):
 
 
 @bp.route('/api/library/export/m3u', methods=['GET'])
+@requires("music.access")
 def export_library_m3u():
     """Download an extended-M3U playlist of the entire library. Always current (built on request)."""
     try:
@@ -2031,6 +2068,7 @@ def export_library_m3u():
 
 
 @bp.route('/api/album/<album_id>/tracks', methods=['GET'])
+@requires("music.access")
 def get_album_tracks(album_id):
     """Get tracks for specific album formatted for download missing tracks modal"""
     try:
@@ -2079,6 +2117,7 @@ def get_album_tracks(album_id):
         return jsonify({"error": str(e)}), 500
 
 @bp.route('/api/artist/<artist_id>/concerts', methods=['GET'])
+@requires("music.access")
 def artist_concerts(artist_id):
     """Upcoming dates and recent setlists for one artist.
 
@@ -2117,6 +2156,7 @@ def artist_concerts(artist_id):
 
 
 @bp.route('/api/artist/<artist_id>/record', methods=['GET'])
+@requires("music.access")
 def get_artist_db_record(artist_id):
     """Return the COMPLETE database record for a library artist — every column of
     the ``artists`` row (all source IDs + match statuses, cached bios / tags /
@@ -2131,7 +2171,7 @@ def get_artist_db_record(artist_id):
         conn = database._get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("SELECT * FROM artists WHERE id = ?", (str(artist_id),))
+            cur.execute("SELECT * FROM lib2_artists WHERE id = ?", (str(artist_id),))
             row = cur.fetchone()
             if row is None:
                 return jsonify({"success": False, "error": "Artist not found in library"}), 404
@@ -2148,13 +2188,39 @@ def get_artist_db_record(artist_id):
                             pass
                 record[key] = val
 
+            # Owned counts off the v2 catalogue. Tracks hang off albums, not off
+            # the artist row, so the track count walks album -> track rather than
+            # reading a legacy tracks.artist_id that does not exist here.
+            # owned only: a wanted album with nothing downloaded is a slot,
+            # not something you have (3.6.1's tables held owned rows only)
+            from core.library2.sql_util import owned_sql
             counts = {}
-            for label, table in (('albums', 'albums'), ('tracks', 'tracks')):
+            count_sql = {
+                'albums': ("SELECT COUNT(*) FROM lib2_albums al "
+                           f"WHERE al.primary_artist_id = ? AND {owned_sql('album', 'al')}"),
+                'tracks': ("SELECT COUNT(*) FROM lib2_tracks t "
+                           "JOIN lib2_albums al ON al.id = t.album_id "
+                           f"WHERE al.primary_artist_id = ? AND {owned_sql('track', 't')}"),
+            }
+            for label, sql in count_sql.items():
                 try:
-                    cur.execute(f"SELECT COUNT(*) FROM {table} WHERE artist_id = ?", (str(artist_id),))
+                    cur.execute(sql, (str(artist_id),))
                     counts[label] = cur.fetchone()[0]
                 except Exception:
                     counts[label] = None
+            # the hero's format tags (FLAC, MP3...): what the live files are
+            formats = []
+            try:
+                cur.execute(
+                    "SELECT DISTINCT UPPER(TRIM(f.format)) FROM lib2_track_files f "
+                    "JOIN lib2_tracks t ON t.id = f.track_id "
+                    "JOIN lib2_albums al ON al.id = t.album_id "
+                    "WHERE al.primary_artist_id = ? AND f.format IS NOT NULL "
+                    "AND TRIM(f.format) <> '' AND COALESCE(f.file_state, 'active') = 'active'",
+                    (str(artist_id),))
+                formats = sorted(r[0] for r in cur.fetchall() if r[0])
+            except Exception:  # noqa: BLE001 - the record matters more than its tags
+                formats = []
         finally:
             conn.close()
 
@@ -2162,6 +2228,7 @@ def get_artist_db_record(artist_id):
             "success": True,
             "artist_id": str(artist_id),
             "counts": counts,
+            "formats": formats,
             "record": record,
         })
     except Exception as e:
@@ -2169,7 +2236,37 @@ def get_artist_db_record(artist_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@bp.route('/api/artist/<artist_id>/quality-profile', methods=['GET'])
+@requires("music.access")
+def get_artist_quality_profile(artist_id):
+    """The Quality Profile a download of this artist's release starts on (#2022).
+
+    The album download dialog preselects it, so a release opened from the
+    artist's discography matches what Download Discography queues. Same
+    resolver: catalogue track/album, the watchlist row, the catalogue artist.
+    ``quality_profile_id`` null means the app default.
+    """
+    try:
+        from core.quality.artist_profile import ArtistQualityProfile
+        from database.music_database import MusicDatabase
+
+        name = (request.args.get('name') or '').strip()
+        source = (request.args.get('source') or '').strip().lower() or None
+        album_id = (request.args.get('album_id') or '').strip()
+        resolver = ArtistQualityProfile(
+            MusicDatabase(), artist_id=artist_id, artist_name=name, source=source,
+            profile_id=get_current_profile_id())
+        return jsonify({
+            "success": True,
+            "quality_profile_id": resolver.profile_for(album_ids=[album_id] if album_id else []),
+        })
+    except Exception as e:
+        logger.error(f"Error resolving artist quality profile: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @bp.route('/api/artist/<artist_id>/download-discography', methods=['POST'])
+@requires("music.access")
 def download_discography(artist_id):
     """Add selected albums from an artist's discography to the wishlist.
 
@@ -2277,6 +2374,23 @@ def download_discography(artist_id):
             owned_candidate_tracks = []
             candidates_exhaustive = False
 
+        # #2022: the artist's own Quality Profile (catalogue track/album, the
+        # watchlist row, the catalogue artist), not the app default. one
+        # resolver per artist: the your-albums batch mixes artists, and the
+        # url's id only names the artist the envelope does.
+        from core.quality.artist_profile import ArtistQualityProfile
+        quality_resolvers = {}
+
+        def quality_resolver(name, source):
+            key = (str(name or '').casefold(), source)
+            if key not in quality_resolvers:
+                same_artist = str(name or '').casefold() == str(artist_name or '').casefold()
+                quality_resolvers[key] = ArtistQualityProfile(
+                    db, artist_id=artist_id if same_artist else '',
+                    artist_name=name, source=source if same_artist else None,
+                    profile_id=profile_id)
+            return quality_resolvers[key]
+
         total_added = 0
         total_skipped = 0
         total_skipped_artist = 0
@@ -2287,6 +2401,9 @@ def download_discography(artist_id):
         # without this list they vanish silently. The completion line carries
         # them back with everything the client needs to retry the release.
         failed_releases = []
+
+        from core.metadata import deezer_credits
+        deezer_album_credits = {}
 
         def generate_ndjson():
             nonlocal total_added, total_skipped, total_skipped_artist, total_skipped_filter, total_skipped_owned
@@ -2374,8 +2491,10 @@ def download_discography(artist_id):
                     )
                     ownership_candidates = (owned_candidate_tracks if release_tracks is None
                                             else release_tracks)
+                    track_profiles = quality_resolver(hint_artist, artist_source).for_release(
+                        [album_id, resolved_album_id], tracks)
 
-                    for track in tracks:
+                    for track, track_profile in zip(tracks, track_profiles, strict=True):
                         track_name = track.get('name', '')
                         if not track_name:
                             continue
@@ -2386,7 +2505,14 @@ def download_discography(artist_id):
                         # artist isn't in the track's artists list
                         # (cross-artist compilation / appears_on
                         # contamination). Keeps features.
-                        if not track_artist_matches(track_artists, hint_artist):
+                        if not track_artist_matches(track_artists, hint_artist) and not (
+                                # deezer's tracklist names only a track's first
+                                # artist; a co-main artist is on the album's or
+                                # the track's own credits (#2104)
+                                resolved_source == 'deezer'
+                                and deezer_credits.credits_artist(
+                                    hint_artist, album_id=resolved_album_id,
+                                    track_id=track_id, memo=deezer_album_credits)):
                             skipped_artist += 1
                             continue
 
@@ -2394,7 +2520,12 @@ def download_discography(artist_id):
                         # filters (live / remix / acoustic / instrumental)
                         # for one-off discography downloads too — same
                         # contract as the discography backfill repair job.
-                        skip_reason = content_type_skip_reason(track_name, album_name, content_settings)
+                        # #2082: every release here is one the person picked,
+                        # so what the release itself is (a live album, a remix
+                        # album) is not a reason to skip its tracks. picking
+                        # MTV Unplugged with Live off added nothing
+                        skip_reason = content_type_skip_reason(
+                            track_name, album_name, content_settings, requested=True)
                         if skip_reason:
                             skipped_filter += 1
                             # name it: a count alone hid #1381's wrong skips
@@ -2459,6 +2590,7 @@ def download_discography(artist_id):
                                     'source': resolved_source,
                                 }),
                                 profile_id=profile_id,
+                                quality_profile_id=track_profile,
                             )
                             if was_added:
                                 added += 1
@@ -2533,6 +2665,7 @@ def download_discography(artist_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/artist/<artist_id>/completion', methods=['POST'])
+@requires("music.access")
 def check_artist_discography_completion(artist_id):
     """Check completion status for artist's albums and singles"""
     try:
@@ -2556,6 +2689,7 @@ def check_artist_discography_completion(artist_id):
         return jsonify({"error": str(e)}), 500
 
 @bp.route('/api/artist/<artist_id>/completion-stream', methods=['POST'])
+@requires("music.access")
 def check_artist_discography_completion_stream(artist_id):
     """Stream completion status for artist's albums and singles one by one"""
     # Capture request data BEFORE the generator function
@@ -2599,3 +2733,16 @@ def check_artist_discography_completion_stream(artist_id):
             'Access-Control-Allow-Headers': 'Cache-Control'
         }
     )
+
+
+@bp.route('/api/artist/<int:artist_id>/appears-on', methods=['GET'])
+@requires("music.access")
+def get_artist_appears_on(artist_id):
+    from contextlib import closing
+    from core.library2.artist_page import appears_on_payload
+    try:
+        with closing(get_database()._get_connection()) as conn:
+            return jsonify(appears_on_payload(conn, artist_id))
+    except Exception as e:  # noqa: BLE001 - the section answers JSON, never an HTML 500
+        logger.error("appears-on for artist %s failed: %s", artist_id, e, exc_info=True)
+        return jsonify({"success": False, "error": str(e), "albums": [], "tracks": []}), 500

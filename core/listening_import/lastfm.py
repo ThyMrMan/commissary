@@ -14,13 +14,20 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
-from core.lastfm_client import LastFMClient
+from core.lastfm_client import LASTFM_IMPORT_REJECTED_MESSAGE, LastFMClient, LastFMKeyRejected, key_rejection
 from core.listening_import.dedup import insert_import_events
 from core.listening_import.profiles import ProfileImportWorkers
 from core.listening_scope import SHARED_OWNER, owner_key
 from utils.logging_config import get_logger
 
 logger = get_logger("lastfm_import")
+
+
+def _name_key(name: Any) -> str:
+    """The catalogue's folded artist key (indexed, and not ASCII-only)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
 
 STATE_KEY = "lastfm_listening_import_state"
 SOURCE = "lastfm"
@@ -32,6 +39,8 @@ TRANSIENT_PAGE_RETRY_BASE_SECONDS = 5
 
 
 def _safe_error_message(error: Exception) -> str:
+    if isinstance(error, LastFMKeyRejected):
+        return LASTFM_IMPORT_REJECTED_MESSAGE
     return re.sub(r"([?&]api_key=)[^&\s]+", r"\1REDACTED", str(error))
 
 
@@ -105,6 +114,11 @@ class LastFMListeningImportWorker:
                 return {"status": "error", "error": state["error"], **state}
             if not self.config_manager.get("lastfm.api_key", ""):
                 state = self._set_state(status="error", error="Last.fm API key not configured")
+                return {"status": "error", "error": state["error"], **state}
+            # a key last.fm refused lately (pro only from 1 december 2026):
+            # say so now instead of starting a crawl that cannot read a page
+            if key_rejection(self.config_manager.get("lastfm.api_key", "")):
+                state = self._set_state(status="error", error=LASTFM_IMPORT_REJECTED_MESSAGE)
                 return {"status": "error", "error": state["error"], **state}
 
             self._thread = threading.Thread(
@@ -311,6 +325,9 @@ class LastFMListeningImportWorker:
         for attempt in range(1, TRANSIENT_PAGE_RETRIES + 1):
             try:
                 return client.get_user_recent_tracks(username, page=page, limit=PAGE_LIMIT, from_ts=from_ts)
+            except LastFMKeyRejected:
+                # not a hiccup: retrying cannot help
+                raise
             except Exception as e:
                 if attempt >= TRANSIENT_PAGE_RETRIES:
                     raise
@@ -373,33 +390,39 @@ class LastFMListeningImportWorker:
             return ""
 
     def _resolve_db_track_ids(self, events: List[Dict[str, Any]]) -> None:
-        pairs = sorted({
-            ((ev.get("title") or "").strip().lower(), (ev.get("artist") or "").strip().lower())
-            for ev in events if ev.get("title")
-        })
+        """Point every scrobble at its catalogue row (``lib2_track_id``).
+
+        Library v2 is the catalogue (docs §32.3.1), so this reads
+        ``lib2_tracks`` — the legacy ``tracks``/``artists`` pair this arrived
+        against no longer exists here. The artist half matches on the indexed
+        ``name_key`` fold rather than ``LOWER(name)``: SQLite's ``LOWER()`` is
+        ASCII-only, so an accented artist never matched (iss29-D13). Same
+        query as ``listening_stats_worker._resolve_db_track_ids_batch``, which
+        fills the identical column for the media-server importer.
+        """
+        from core.library2.title_match import resolve_title_artist_pairs, title_fold
+
+        pairs = {(ev.get("title"), _name_key(ev.get("artist")))
+                 for ev in events if ev.get("title")}
         if not pairs:
             return
         conn = self.db._get_connection()
         try:
-            cursor = conn.cursor()
-            found: Dict[tuple[str, str], int] = {}
-            for i in range(0, len(pairs), 400):
-                chunk = pairs[i:i + 400]
-                placeholders = ",".join(["(?,?)"] * len(chunk))
-                args = [v for pair in chunk for v in pair]
-                cursor.execute(
-                    f"""
-                    SELECT LOWER(t.title), LOWER(ar.name), t.id
-                    FROM tracks t
-                    JOIN artists ar ON ar.id = t.artist_id
-                    WHERE (LOWER(t.title), LOWER(ar.name)) IN ({placeholders})
-                    """,
-                    args,
-                )
-                for title_l, artist_l, track_id in cursor.fetchall():
-                    found.setdefault((title_l, artist_l), track_id)
+            # review 5 R5-H-5: sqlite's LOWER() folds only A-Z, so a title
+            # like 'WÖRLDENDER' never matched a python-lowered key
+            found = resolve_title_artist_pairs(conn.cursor(), pairs)
             for ev in events:
-                ev["db_track_id"] = found.get(((ev.get("title") or "").strip().lower(), (ev.get("artist") or "").strip().lower()))
+                # INT-01: this resolves against `lib2_tracks`, so the id is a
+                # CATALOGUE id and belongs in `lib2_track_id` — the column every
+                # stats reader joins on. Writing it to `db_track_id` (the media
+                # server's own id namespace) left Last.fm plays with no cover,
+                # no artist link and no genre, and the startup backfill then read
+                # the same value as a LEGACY track id, so a numeric collision
+                # could link the play to a completely different track.
+                ev["lib2_track_id"] = found.get((
+                    title_fold(ev.get("title")),
+                    _name_key(ev.get("artist")),
+                ))
         finally:
             conn.close()
 
@@ -447,7 +470,7 @@ def normalize_lastfm_scrobble(track: Dict[str, Any]) -> Optional[Dict[str, Any]]
         "played_at": _iso_from_ts(uts),
         "duration_ms": _int(track.get("duration"), 0),
         "server_source": SOURCE,
-        "db_track_id": None,
+        "lib2_track_id": None,
         # an attested Last.fm play: may be forwarded to ListenBrainz, just
         # never back to Last.fm (dedup marks scrobbled_lastfm on insert).
         "scrobble_eligible": 1,

@@ -13,7 +13,7 @@ import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 from urllib.parse import urlparse
 
 import requests
@@ -26,6 +26,16 @@ logger = get_logger("image_cache")
 
 DEFAULT_TTL_SECONDS = 30 * 24 * 60 * 60
 DEFAULT_FAILED_TTL_SECONDS = 6 * 60 * 60
+# A `pending` row is a REGISTRATION, not an image: `cache_url_for` writes one
+# every time a URL is handed to a browser, and it only becomes `ok`/`failed` if
+# something actually requests it. Those rows used to be written with
+# `expires_at = 0`, and `prune()` only ever deleted rows with `expires_at > 0`,
+# so a registration nobody ever loaded was immortal — with the size cap
+# disabled (`max_cache_mb = 0`) nothing else could reclaim it either. A
+# production cache was measured at 857 rows of which 602 were pending, i.e. the
+# majority of the index was garbage. A registration is trivially recreated by
+# the next render, so it gets a short life of its own.
+DEFAULT_PENDING_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_MAX_DOWNLOAD_BYTES = 15 * 1024 * 1024
 
 # Ceiling for the cache as a whole. Until this existed the cache had a TTL it
@@ -121,6 +131,7 @@ class ImageCache:
         *,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
         failed_ttl_seconds: int = DEFAULT_FAILED_TTL_SECONDS,
+        pending_ttl_seconds: int = DEFAULT_PENDING_TTL_SECONDS,
         max_download_bytes: int = DEFAULT_MAX_DOWNLOAD_BYTES,
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
         fetch_timeout: float = DEFAULT_FETCH_TIMEOUT,
@@ -129,6 +140,7 @@ class ImageCache:
         self.cache_dir = Path(cache_dir)
         self.ttl_seconds = int(ttl_seconds)
         self.failed_ttl_seconds = int(failed_ttl_seconds)
+        self.pending_ttl_seconds = int(pending_ttl_seconds)
         self.max_download_bytes = int(max_download_bytes)
         self.max_cache_bytes = int(max_cache_bytes)
         # A slow CDN must never hold a page open. Short by default, and
@@ -233,13 +245,21 @@ class ImageCache:
                         INSERT INTO image_cache
                             (key, original_url, status, created_at, updated_at, last_accessed,
                              expires_at, size, mime_type, file_path, last_error, variant)
-                        VALUES (?, ?, 'pending', ?, ?, ?, 0, 0, '', '', '', ?)
+                        VALUES (?, ?, 'pending', ?, ?, ?, ?, 0, '', '', '', ?)
                         ON CONFLICT(key) DO UPDATE SET
                             original_url=excluded.original_url,
                             last_accessed=excluded.last_accessed,
-                            variant=COALESCE(NULLIF(excluded.variant, ''), variant)
+                            variant=COALESCE(NULLIF(excluded.variant, ''), variant),
+                            -- A row that already holds a real image keeps its own
+                            -- TTL: `ok` carries the full one, `failed` its shorter
+                            -- one. Only a still-`pending` registration has its
+                            -- (short) lease renewed by being re-offered.
+                            expires_at=CASE WHEN image_cache.status='pending'
+                                            THEN excluded.expires_at
+                                            ELSE image_cache.expires_at END
                         """,
-                        [(key, url, ts, ts, ts, variant) for key, (url, variant, ts) in pending.items()])
+                        [(key, url, ts, ts, ts, ts + self.pending_ttl_seconds, variant)
+                         for key, (url, variant, ts) in pending.items()])
         except Exception as e:
             logger.debug("image cache registration flush failed (%d entries): %s", len(pending), e)
             # a lost registration only costs a 404 until the page registers it again
@@ -267,6 +287,33 @@ class ImageCache:
 
     def get_url(self, url: str) -> CachedImage:
         return self._healing(lambda: self._get_url(url))
+
+    def original_urls_for(self, keys) -> Dict[str, str]:
+        """The original url behind each key the cache still knows, unsent
+        registrations included. A key it has forgotten is left out."""
+        wanted = {str(k) for k in keys or () if k}
+        found: Dict[str, str] = {}
+        if not wanted:
+            return found
+        with self._pending_touches_lock:
+            for key in wanted:
+                pending = self._pending_registrations.get(key)
+                if pending and pending[0]:
+                    found[key] = str(pending[0])
+        rest = [k for k in wanted if k not in found]
+        try:
+            with self._db() as conn:
+                for start in range(0, len(rest), 500):
+                    chunk = rest[start:start + 500]
+                    marks = ",".join("?" for _ in chunk)
+                    for row in conn.execute(
+                            f"SELECT key, original_url FROM image_cache WHERE key IN ({marks})",
+                            chunk):
+                        if row["original_url"]:
+                            found[row["key"]] = str(row["original_url"])
+        except Exception as exc:
+            logger.debug("original url lookup failed: %s", exc)
+        return found
 
     def get_original_url(self, key: str) -> Optional[str]:
         """Look up the original registered URL for a cache key (or variant key),
@@ -366,7 +413,8 @@ class ImageCache:
                     "SELECT COUNT(*) AS entries, "
                     "       COALESCE(SUM(CASE WHEN status='ok' THEN size ELSE 0 END), 0) AS bytes, "
                     "       COALESCE(SUM(status='ok'), 0) AS ok, "
-                    "       COALESCE(SUM(status='failed'), 0) AS failed "
+                    "       COALESCE(SUM(status='failed'), 0) AS failed, "
+                    "       COALESCE(SUM(status='pending'), 0) AS pending "
                     "FROM image_cache"
                 ).fetchone()
         return {
@@ -374,8 +422,14 @@ class ImageCache:
             "bytes": int(row["bytes"] or 0),
             "ok": int(row["ok"] or 0),
             "failed": int(row["failed"] or 0),
+            # Reported explicitly rather than left to be inferred by
+            # subtraction: a runaway pending count is the visible symptom of
+            # URLs whose cache key keeps changing, and it should be readable
+            # straight off the status endpoint.
+            "pending": int(row["pending"] or 0),
             "max_bytes": self.max_cache_bytes,
             "ttl_seconds": self.ttl_seconds,
+            "pending_ttl_seconds": self.pending_ttl_seconds,
         }
 
     def _delete_rows(self, conn, keys: list[str]) -> int:
@@ -413,6 +467,17 @@ class ImageCache:
                     r["key"] for r in conn.execute(
                         "SELECT key FROM image_cache WHERE expires_at > 0 AND expires_at < ?",
                         (now,)).fetchall()
+                ])
+                # Registrations written before pending rows had an expiry of
+                # their own are stuck at `expires_at = 0` and the query above
+                # cannot see them. Age them out on `last_accessed` instead, so
+                # an existing cache drains its backlog on the next prune rather
+                # than carrying it forever.
+                expired += self._delete_rows(conn, [
+                    r["key"] for r in conn.execute(
+                        "SELECT key FROM image_cache "
+                        "WHERE status='pending' AND expires_at <= 0 AND last_accessed < ?",
+                        (now - self.pending_ttl_seconds,)).fetchall()
                 ])
 
                 if self.max_cache_bytes > 0:
@@ -1085,6 +1150,8 @@ def get_image_cache() -> ImageCache:
                 cache_dir,
                 ttl_seconds=int(config_manager.get("image_cache.ttl_seconds", DEFAULT_TTL_SECONDS)),
                 failed_ttl_seconds=int(config_manager.get("image_cache.failed_ttl_seconds", DEFAULT_FAILED_TTL_SECONDS)),
+                pending_ttl_seconds=int(config_manager.get(
+                    "image_cache.pending_ttl_seconds", DEFAULT_PENDING_TTL_SECONDS)),
                 max_download_bytes=int(config_manager.get("image_cache.max_download_mb", 15)) * 1024 * 1024,
                 max_cache_bytes=int(config_manager.get(
                     "image_cache.max_cache_mb", DEFAULT_MAX_CACHE_BYTES // (1024 * 1024))) * 1024 * 1024,
@@ -1119,6 +1186,32 @@ def thumbnails_enabled() -> bool:
     down everyone who is already benefiting from it. This flag gates only the
     new work: decoding and re-encoding every image the browser asks for."""
     return config_manager.get("image_cache.thumbnails", False) is True
+
+
+def cache_key_of(url: str | None) -> Optional[str]:
+    """The cache key in a ``/api/image-cache/<key>`` link, else None."""
+    match = re.match(r"^/api/image-cache/([a-f0-9]{64})(?:[?#].*)?$", str(url or ""))
+    return match.group(1) if match else None
+
+
+def durable_image_url(url: str | None) -> str | None:
+    """The url to SAVE for an image: never a cache link.
+
+    a cache link only lives as long as its cache entry. entries expire after
+    30 days and the prune drops them, original url and all, so a saved link
+    goes dead for good (the discover hero went blank on Nov 5 when 14k
+    expired at once). save the original and let readers cache it again. a
+    link whose original the cache has forgotten is None, so the row gets a
+    fresh image instead of keeping a dead one.
+    """
+    key = cache_key_of(url)
+    if not key:
+        return url
+    try:
+        return get_image_cache().original_urls_for([key]).get(key)
+    except Exception as exc:
+        logger.debug("durable image url lookup failed: %s", exc)
+        return url
 
 
 def cached_image_url(url: str | None) -> str | None:

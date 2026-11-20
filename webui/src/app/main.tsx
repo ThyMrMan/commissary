@@ -2,12 +2,18 @@ import '@vitejs/plugin-react/preamble';
 import { createRoot } from 'react-dom/client';
 
 import { mountCandidateInspectorHost } from '@/features/downloads/inspector-modal';
+import { mountFeaturePickerHost } from '@/features/feature-picker/host';
+import { mountHelpHost } from '@/features/help/host';
 import { mountOnboardingHost } from '@/features/onboarding/host';
 import { mountAddToPlaylistHost } from '@/features/playlists/add-to-playlist';
-import { mountLibraryDiscographySourceSelector } from '@/features/settings/library-discography-source';
+import { mountServerActivityHost } from '@/features/server-activity/host';
+import { mountSettingsHost } from '@/features/settings/host';
+import { mountPersonEditorHost } from '@/features/settings/tabs/people/editor';
 import { mountVideoLibraryTabHost } from '@/features/video-library/host';
-import { bindWindowWebRouter } from '@/platform/shell/bridge';
+import { mountVideoLibraryManagerHost } from '@/features/video-manager/host';
+import { bindWindowWebRouter, SHELL_LIBRARY_SCOPE_CHANGED_EVENT } from '@/platform/shell/bridge';
 import { ROUTER_ROOT_ID } from '@/platform/shell/route-controllers';
+import { openDownloadTaskSearch } from '@/routes/library/-ui/interactive-search-host';
 
 import { createAppQueryClient } from './query-client';
 import { AppRouterProvider, createAppRouter } from './router';
@@ -52,6 +58,15 @@ export async function bootstrapApp() {
   const router = createAppRouter({ queryClient });
 
   bindWindowWebRouter(router);
+  // #1199: another library was picked in the header. Every cached answer --
+  // lists, "already in your library", download targets -- was for the old one.
+  window.addEventListener(SHELL_LIBRARY_SCOPE_CHANGED_EVENT, () => {
+    // the shared GET dedupe (static/fetch-dedupe.js) would replay old answers
+    (
+      window as { _apiGetDedupe?: { entries?: Map<string, unknown> } }
+    )._apiGetDedupe?.entries?.clear();
+    void queryClient.invalidateQueries();
+  });
   createRoot(container).render(<AppRouterProvider router={router} queryClient={queryClient} />);
 
   return { queryClient, router };
@@ -59,8 +74,20 @@ export async function bootstrapApp() {
 
 // before init.js's DOMContentLoaded handler, which opens it on first run
 mountOnboardingHost();
-void mountLibraryDiscographySourceSelector();
 mountCandidateInspectorHost();
+// A failed download's Interactive Search is the library's when it is for a library track.
+window.openDownloadTaskInspector = (taskId, track) => void openDownloadTaskSearch(taskId, track);
 mountAddToPlaylistHost();
 mountVideoLibraryTabHost();
+mountVideoLibraryManagerHost();
+// make soulsync yours (#1909): window.openFeaturePicker
+mountFeaturePickerHost();
+// the people & permissions sheet (#2166): window.openPersonEditor
+mountPersonEditorHost();
+// the Settings tabs ported to React (SETTINGS_PORT.md): window.SoulSyncSettings
+mountSettingsHost();
+// the server activity drawer (#2155: the shell opens it for admins only)
+mountServerActivityHost();
+// the help sheet the ? button opens (scrap/help/PLAN.md): window.SoulSyncHelp
+mountHelpHost();
 void bootstrapApp();

@@ -1,0 +1,736 @@
+"""The Music Assistant client against a fake of the server's API.
+
+The fake answers the commands the client sends with the shapes Music
+Assistant 2.10.6 returns (library items with provider mappings, external
+ids, images; playlist writes as background tasks). The tests pin: file
+paths come from the Local files mapping joined to the source folder,
+tracks without one are skipped, a failed page never reads as an empty
+library, playlist writes wait for their task, and the wrappers satisfy
+the shared item contract."""
+
+from __future__ import annotations
+
+import pytest
+
+from core.media_server import items
+from core.media_server.contract import Capability
+from core.music_assistant_client import (
+    MusicAssistantAlbum,
+    MusicAssistantArtist,
+    MusicAssistantClient,
+    MusicAssistantError,
+    MusicAssistantTrack,
+)
+
+SRC = 'filesystem_local--abc'
+
+
+def _mapping(rel, instance=SRC, domain='filesystem_local', **fmt):
+    return {'item_id': rel, 'provider_domain': domain, 'provider_instance': instance,
+            'audio_format': {'content_type': 'flac', 'bit_rate': 900, 'sample_rate': 44100, 'bit_depth': 16, **fmt}}
+
+
+ARTIST = {'item_id': 7, 'provider': 'library', 'name': 'Artist A', 'uri': 'library://artist/7',
+          'external_ids': [['musicbrainz_artistid', 'mb-artist']],
+          'metadata': {'description': 'bio', 'genres': ['rock'],
+                       'images': [{'type': 'thumb', 'path': 'Artist A/folder.jpg', 'provider': SRC,
+                                   'remotely_accessible': False}]},
+          'date_added': '2026-01-02T03:04:05Z', 'provider_mappings': [{'item_id': 'Artist A', 'provider_domain': 'filesystem_local', 'provider_instance': SRC}]}
+ALBUM = {'item_id': 70, 'provider': 'library', 'name': 'Album B', 'year': 2001, 'uri': 'library://album/70',
+         'artists': [{'item_id': 7, 'name': 'Artist A'}],
+         'external_ids': [['musicbrainz_albumid', 'mb-album']],
+         'metadata': {'images': [{'type': 'thumb', 'path': 'https://cdn/x.jpg', 'provider': 'url', 'remotely_accessible': True}]},
+         'date_added': '2026-01-02T03:04:05Z'}
+TRACK = {'item_id': 700, 'provider': 'library', 'name': 'Song C', 'uri': 'library://track/700', 'duration': 61,
+         'track_number': 3, 'disc_number': 2, 'album': {'item_id': 70, 'name': 'Album B', 'year': 2001},
+         'artists': [{'item_id': 7, 'name': 'Artist A'}, {'item_id': 8, 'name': 'Artist D'}],
+         'external_ids': [['musicbrainz_recordingid', 'mb-rec'], ['isrc', 'US123']],
+         'provider_mappings': [_mapping('Artist A/Album B/03 Song C.flac')],
+         'date_added': '2026-01-02T03:04:05Z'}
+STREAM_ONLY = {'item_id': 701, 'provider': 'library', 'name': 'Stream only', 'duration': 10,
+               'album': {'item_id': 70}, 'artists': [], 'external_ids': [],
+               'provider_mappings': [{'item_id': 'sp1', 'provider_domain': 'spotify', 'provider_instance': 'spotify--x'}]}
+CUE = {'item_id': 702, 'provider': 'library', 'name': 'Cue part', 'duration': 10, 'album': {'item_id': 70},
+       'artists': [], 'external_ids': [], 'provider_mappings': [_mapping('Artist A/Album B/all.flac::2')]}
+
+
+BUILTIN_MAPPING = {'item_id': 'x', 'provider_domain': 'builtin', 'provider_instance': 'builtin'}
+
+
+class Fake:
+    """Records every command; answers from a script keyed by command."""
+
+    def __init__(self):
+        self.calls = []
+        self.tasks = {}
+        self.playlists = {1: {'item_id': 1, 'name': 'Mix', 'is_editable': True, 'owner': 'rob', 'metadata': {},
+                              'provider_mappings': [BUILTIN_MAPPING], 'tracks': [TRACK]}}
+        self.next_id = 2
+
+    def __call__(self, command, args):
+        self.calls.append((command, args))
+        if command == 'info':
+            return {'server_version': '2.10.6', 'schema_version': 65}
+        if command == 'auth/me':
+            return {'username': 'rob'}
+        if command == 'tasks/list':
+            return [{'task_id': 't-sync', 'name': 'Sync filesystem_local', 'status': 'running'}]
+        if command == 'providers':
+            return [{'instance_id': SRC, 'domain': 'filesystem_local', 'name': 'Local files'},
+                    {'instance_id': 'spotify--x', 'domain': 'spotify', 'name': 'Spotify'}]
+        if command == 'config/providers/get_value':
+            assert args == {'instance_id': SRC, 'key': 'path'}
+            return '/media/music/'
+        if command == 'music/artists/library_items':
+            return [ARTIST] if args.get('offset', 0) == 0 else []
+        if command == 'music/albums/library_items':
+            return [ALBUM] if args.get('offset', 0) == 0 else []
+        if command == 'music/artists/artist_albums':
+            return [ALBUM, {**ALBUM, 'item_id': 'sp9', 'provider': 'spotify--x'}]
+        if command == 'music/albums/album_tracks':
+            return [TRACK, STREAM_ONLY, CUE]
+        if command == 'music/artists/get':
+            return ARTIST if str(args['item_id']) == '7' else None
+        if command == 'music/albums/get':
+            return ALBUM if str(args['item_id']) == '70' else None
+        if command.endswith('/count'):
+            return 3
+        if command == 'music/sync':
+            return [{
+                'id': f'music_sync_{SRC}_track',
+                'status': 'pending',
+                'started_at': None,
+                'metadata': {
+                    'task_domain': 'music_sync',
+                    'provider_instance': SRC,
+                    'provider_domain': 'filesystem_local',
+                    'media_type': 'track',
+                },
+            }]
+        if command == 'music/search':
+            return {'tracks': [TRACK]}
+        if command == 'music/playlists/library_items':
+            return list(self.playlists.values()) if args.get('offset', 0) == 0 else []
+        if command == 'music/playlists/get':
+            return self.playlists.get(int(args['item_id']))
+        if command == 'music/playlists/playlist_tracks':
+            return [{**t, 'position': i} for i, t in enumerate(self.playlists[int(args['item_id'])]['tracks'])]
+        if command == 'music/playlists/create_playlist':
+            if args.get('provider_instance_or_domain') != 'builtin':
+                # what 2.10 answers for 'library' (#2111)
+                raise MusicAssistantError('music/playlists/create_playlist: HTTP 500')
+            pid = self.next_id
+            self.next_id += 1
+            self.playlists[pid] = {'item_id': pid, 'name': args['name'], 'is_editable': True, 'owner': 'rob',
+                                   'metadata': {}, 'provider_mappings': [BUILTIN_MAPPING], 'tracks': []}
+            return self.playlists[pid]
+        if command == 'music/playlists/add_playlist_tracks':
+            pl = self.playlists[int(args['db_playlist_id'])]
+            for uri in args['uris']:
+                tid = int(uri.rsplit('/', 1)[-1])
+                pl['tracks'].append({**TRACK, 'item_id': tid, 'uri': uri})
+            return self._task('add')
+        if command == 'music/playlists/remove_playlist_tracks':
+            pl = self.playlists[int(args['db_playlist_id'])]
+            drop = set(args['positions_to_remove'])
+            pl['tracks'] = [t for i, t in enumerate(pl['tracks']) if i not in drop]
+            return self._task('remove')
+        if command == 'music/playlists/update':
+            self.playlists[int(args['item_id'])]['name'] = args['update']['name']
+            return self.playlists[int(args['item_id'])]
+        if command == 'music/playlists/remove':
+            self.playlists.pop(int(args['item_id']), None)
+            return None
+        if command == 'tasks/get':
+            task = self.tasks[args['task_id']]
+            task['polls'] = task.get('polls', 0) + 1
+            task['status'] = 'finished' if task['polls'] >= 2 else 'running'
+            return task
+        raise MusicAssistantError(f"fake: no answer for {command}")
+
+    def _task(self, kind):
+        tid = f"t-{kind}-{len(self.tasks)}"
+        self.tasks[tid] = {'task_id': tid, 'status': 'pending'}
+        return dict(self.tasks[tid])
+
+
+@pytest.fixture
+def client(monkeypatch):
+    fake = Fake()
+    monkeypatch.setattr('core.music_assistant_client.config_manager.get',
+                        lambda key, default=None: {'base_url': 'http://ma:8095', 'token': 'tok', 'source_instance': SRC}
+                        if key == 'music_assistant' else default)
+    monkeypatch.setattr('core.music_assistant_client.time.sleep', lambda s: None)
+    c = MusicAssistantClient(transport=fake)
+    c.fake = fake
+    return c
+
+
+def test_declares_the_mvp_capabilities_honestly():
+    caps = MusicAssistantClient.CAPABILITIES
+    assert {Capability.SEARCH, Capability.RECENTLY_ADDED, Capability.SCAN_TRIGGER,
+            Capability.LIBRARY_STATS, Capability.PLAYLISTS} <= caps
+    assert Capability.PLAYLIST_IMAGE not in caps and Capability.TAGS_AUTODETECTED not in caps
+    assert MusicAssistantClient.declared_capability_gaps() == {}
+
+
+def test_connection_reads_version_and_user(client):
+    assert client.ensure_connection() is True
+    assert client.is_connected() and client.server_version == '2.10.6' and client.user_name == 'rob'
+    ok, message = client.test_connection()
+    assert ok and '2.10.6' in message and '/media/music' in message
+
+
+def test_no_token_means_not_connected(monkeypatch):
+    monkeypatch.setattr('core.music_assistant_client.config_manager.get',
+                        lambda key, default=None: {'base_url': 'http://ma:8095'} if key == 'music_assistant' else default)
+    c = MusicAssistantClient(transport=Fake())
+    assert c.ensure_connection() is False and c.is_connected() is False
+
+
+def test_scan_reads_follow_the_item_contract(client):
+    artists = client.get_all_artists()
+    assert client.last_fetch_failed is False
+    assert len(artists) == 1 and isinstance(artists[0], items.MediaArtist)
+    artist = artists[0]
+    assert artist.ratingKey == '7' and artist.title == 'Artist A' and artist.summary == 'bio'
+    assert artist.genres == ['rock'] and artist.musicBrainzId == 'mb-artist'
+    assert artist.thumb == f"ma:{SRC}:Artist A/folder.jpg"
+    albums = artist.albums()
+    assert [a.ratingKey for a in albums] == ['70'], 'only library albums, not the provider copies'
+    album = albums[0]
+    assert isinstance(album, MusicAssistantAlbum) and album.year == 2001 and album.musicBrainzId == 'mb-album'
+    assert album.thumb == 'https://cdn/x.jpg'
+    for attr in items.ALBUM_ATTRS:
+        assert hasattr(album, attr), attr
+    tracks = album.tracks()
+    assert [t.ratingKey for t in tracks] == ['700'], 'stream-only and cue sub-tracks have no path and are skipped'
+    track = tracks[0]
+    assert isinstance(track, MusicAssistantTrack)
+    for attr in items.TRACK_ATTRS:
+        assert hasattr(track, attr), attr
+    assert track.path == '/media/music/Artist A/Album B/03 Song C.flac'
+    assert track.duration == 61000 and track.bitRate == 900 and track.suffix == 'flac'
+    assert track.trackNumber == 3 and track.discNumber == 2 and track.year == 2001
+    assert track.musicBrainzId == 'mb-rec' and track.isrc == 'US123'
+    assert track._artist_ids == ['7', '8'] and track._album_id == '70'
+    assert track.artist().title == 'Artist A' and track.album().title == 'Album B'
+    assert client.get_all_album_ids() == {'70'} and client.get_all_artist_ids() == {'7'}
+
+
+def test_a_failed_page_never_reads_as_an_empty_library(client):
+    calls = []
+
+    def broken(command, args):
+        calls.append(command)
+        if command == 'music/artists/library_items':
+            raise MusicAssistantError('boom')
+        return client.fake(command, args)
+
+    client._transport = broken
+    assert client.get_all_artists() == []
+    assert client.last_fetch_failed is True
+
+
+def test_listing_pages_until_a_short_page(client):
+    big = [{**ARTIST, 'item_id': i, 'name': f'A{i}'} for i in range(500)]
+
+    def paged(command, args):
+        if command == 'music/artists/library_items':
+            return big if args['offset'] == 0 else [ARTIST]
+        return client.fake(command, args)
+
+    client._transport = paged
+    assert len(client.get_all_artists()) == 501
+
+
+def test_recently_added_stats_scan_and_search(client):
+    recent = client.get_recently_added_albums(limit=10)
+    assert [a.ratingKey for a in recent] == ['70']
+    cmd, args = [c for c in client.fake.calls if c[0] == 'music/albums/library_items'][-1]
+    assert args['order_by'] == 'timestamp_added_desc' and args['provider'] == SRC
+    assert client.get_library_stats() == {'artists': 3, 'albums': 3, 'tracks': 3, 'playlists': 3}
+    assert client.trigger_library_scan() is True
+    assert [c for c in client.fake.calls if c[0] == 'music/sync'][-1][1] == {'providers': [SRC]}
+    assert client.is_library_scanning() is True
+    hits = client.search_tracks('Song C', 'Artist A')
+    assert len(hits) == 1 and hits[0].id == '700' and hits[0].artist == 'Artist A' and hits[0].duration == 61000
+    assert [c for c in client.fake.calls if c[0] == 'music/search'][-1][1]['library_only'] is True
+
+
+def _scan_task(status, started_at=None, *, task_id=None, media_type='track',
+               instance=SRC, domain='filesystem_local'):
+    return {
+        'id': task_id or f'music_sync_{instance}_{media_type}',
+        'name': 'Sync Tracks for Filesystem (local disk)',
+        'status': status,
+        'started_at': started_at,
+        'finished_at': None,
+        'updated_at': started_at,
+        'last_run': started_at,
+        'metadata': {
+            'task_domain': 'music_sync',
+            'provider_instance': instance,
+            'provider_domain': domain,
+            'media_type': media_type,
+        },
+    }
+
+
+def test_scan_state_monitors_only_music_sync_return_ids_and_new_started_at(client):
+    old_start = '2026-11-14T09:00:00+00:00'
+    new_start = '2026-11-14T09:01:00+00:00'
+    task_states = iter([
+        [
+            _scan_task('success', old_start),
+            _scan_task('running', '2026-11-14T08:00:00+00:00',
+                       instance='filesystem_local--other'),
+            {'id': 'global-sync', 'name': 'Fix sync group members', 'status': 'running'},
+        ],
+        [
+            _scan_task('running', new_start),
+            _scan_task('running', '2026-11-14T09:02:00+00:00',
+                       instance='filesystem_local--other'),
+            {'id': 'global-sync', 'name': 'Fix sync group members', 'status': 'running'},
+        ],
+        [
+            {**_scan_task('success', new_start),
+             'finished_at': '2026-11-14T09:01:05+00:00'},
+            _scan_task('running', '2026-11-14T09:03:00+00:00',
+                       instance='filesystem_local--other'),
+            {'id': 'global-sync', 'name': 'Fix sync group members', 'status': 'running'},
+        ],
+    ])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(task_states)
+        if command == 'music/sync':
+            return [_scan_task('pending', None)]
+        return client.fake(command, args)
+
+    client._transport = transport
+    baseline = client.get_scan_state()
+    assert baseline['task_monitor'] is True
+    assert client.trigger_library_scan() is True
+    running = client.get_scan_state()
+    completed = client.get_scan_state()
+
+    assert running['scanning'] is True
+    assert running['outcome'] == 'running'
+    assert completed['scanning'] is False
+    assert completed['outcome'] == 'success'
+    assert client._scan_task_ids == {f'music_sync_{SRC}_track'}
+
+
+def test_pending_sync_does_not_accept_stale_success_from_previous_generation(client):
+    old_start = '2026-11-14T09:00:00+00:00'
+    new_start = '2026-11-14T09:01:00+00:00'
+    old_task = _scan_task('success', old_start)
+    new_task = _scan_task('success', new_start)
+    task_states = iter([[old_task], [old_task], [new_task]])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(task_states)
+        if command == 'music/sync':
+            return [_scan_task('pending', None)]
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+
+    stale = client.get_scan_state()
+    assert stale['scanning'] is True
+    assert stale['outcome'] == 'running'
+    assert stale['awaiting_started_at_ids'] == [old_task['id']]
+
+    completed = client.get_scan_state()
+    assert completed['scanning'] is False
+    assert completed['outcome'] == 'success'
+
+
+def test_unreadable_pretrigger_baseline_cannot_verify_task_success(client):
+    new_start = '2026-11-14T09:01:00+00:00'
+    calls = {'task_list': 0}
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            calls['task_list'] += 1
+            if calls['task_list'] == 1:
+                raise MusicAssistantError('task list temporarily unavailable')
+            return [_scan_task('success', new_start)]
+        if command == 'music/sync':
+            return [_scan_task('pending', None)]
+        return client.fake(command, args)
+
+    client._transport = transport
+    baseline = client.get_scan_state()
+    assert baseline['task_monitor'] is True
+    assert baseline['state_readable'] is False
+    assert client.trigger_library_scan() is True
+
+    state = client.get_scan_state()
+    assert state['task_monitor'] is True
+    assert state['outcome'] == 'unknown'
+    assert state['reason'] == 'pre_trigger_baseline_unavailable'
+
+
+@pytest.mark.parametrize(('status', 'expected_outcome', 'scanning'), [
+    ('pending', 'running', True),
+    ('running', 'running', True),
+    ('success', 'success', False),
+    ('partial_success', 'partial_success', False),
+    ('failed', 'failed', False),
+    ('cancelled', 'cancelled', False),
+    ('idle', 'unknown', False),
+    ('unknown', 'unknown', False),
+    ('future_status', 'unknown', False),
+    ('', 'unknown', False),
+])
+def test_scan_state_distinguishes_music_assistant_task_outcomes(
+        client, status, expected_outcome, scanning):
+    old_start = '2026-11-14T09:00:00+00:00'
+    new_start = '2026-11-14T09:01:00+00:00'
+    baseline_task = _scan_task('success', old_start)
+    requested_task = _scan_task(
+        status,
+        None if status == 'pending' else new_start,
+    )
+    polled_task = _scan_task(
+        status,
+        None if status == 'pending' else new_start,
+    )
+    if status in ('success', 'partial_success', 'failed', 'cancelled'):
+        polled_task['finished_at'] = '2026-11-14T09:01:05+00:00'
+    responses = iter([[baseline_task], [polled_task]])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(responses)
+        if command == 'music/sync':
+            return [requested_task]
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+    state = client.get_scan_state()
+
+    assert state['scanning'] is scanning
+    assert state['outcome'] == expected_outcome
+
+
+def test_scan_state_does_not_reuse_a_preexisting_running_task(client):
+    started_at = '2026-11-14T09:00:00+00:00'
+    task_states = iter([
+        [_scan_task('running', started_at)],
+        [_scan_task('running', started_at)],
+        [{**_scan_task('success', started_at), 'finished_at': '2026-11-14T09:05:00+00:00'}],
+    ])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(task_states)
+        if command == 'music/sync':
+            return [_scan_task('running', started_at)]
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+    # the old run is still going: wait for it, don't call the scan done yet
+    state = client.get_scan_state()
+    assert state['scanning'] is True
+    assert state['outcome'] == 'running'
+
+    state = client.get_scan_state()
+    assert state['scanning'] is False
+    assert state['outcome'] == 'already_running'
+
+
+def test_scan_state_reports_already_running_when_other_requested_tasks_succeed(client):
+    old_track_start = '2026-11-14T09:00:00+00:00'
+    old_album_start = '2026-11-14T08:00:00+00:00'
+    old_playlist_start = '2026-11-14T07:00:00+00:00'
+    new_album_start = '2026-11-14T09:01:00+00:00'
+    new_playlist_start = '2026-11-14T09:02:00+00:00'
+
+    baseline_tasks = [
+        _scan_task('running', old_track_start, media_type='track'),
+        _scan_task('success', old_album_start, media_type='album'),
+        _scan_task('success', old_playlist_start, media_type='playlist'),
+    ]
+    requested_tasks = [
+        _scan_task('running', old_track_start, media_type='track'),
+        _scan_task('pending', None, media_type='album'),
+        _scan_task('pending', None, media_type='playlist'),
+    ]
+    completed_tasks = [
+        _scan_task('running', old_track_start, media_type='track'),
+        _scan_task('success', new_album_start, media_type='album'),
+        _scan_task('success', new_playlist_start, media_type='playlist'),
+    ]
+    old_run_done = [
+        _scan_task('failed', old_track_start, media_type='track'),
+        _scan_task('success', new_album_start, media_type='album'),
+        _scan_task('success', new_playlist_start, media_type='playlist'),
+    ]
+    task_states = iter([baseline_tasks, completed_tasks, old_run_done])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(task_states)
+        if command == 'music/sync':
+            return requested_tasks
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+    state = client.get_scan_state()
+
+    assert state['task_statuses'] == {
+        f'music_sync_{SRC}_track': 'running',
+        f'music_sync_{SRC}_album': 'success',
+        f'music_sync_{SRC}_playlist': 'success',
+    }
+    assert state['scanning'] is True
+    assert state['outcome'] == 'running'
+
+    # how the old run ended doesn't count against the request it swallowed
+    state = client.get_scan_state()
+    assert state['scanning'] is False
+    assert state['outcome'] == 'already_running'
+
+
+def test_scan_state_accepts_new_generation_when_valid_baseline_has_no_task(client):
+    started_at = '2026-11-14T09:01:00+00:00'
+    responses = iter([[], [_scan_task('running', started_at)]])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(responses)
+        if command == 'music/sync':
+            return [_scan_task('running', started_at)]
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+    state = client.get_scan_state()
+
+    assert state['scanning'] is True
+    assert state['outcome'] == 'running'
+    assert state['task_statuses'] == {f'music_sync_{SRC}_track': 'running'}
+
+
+def test_scan_state_never_treats_missing_returned_task_as_success(client):
+    task = _scan_task('success', '2026-11-14T09:00:00+00:00')
+    requested = _scan_task('pending', None)
+    responses = iter([[task], []])
+
+    def transport(command, args):
+        if command == 'tasks/list':
+            return next(responses)
+        if command == 'music/sync':
+            return [requested]
+        return client.fake(command, args)
+
+    client._transport = transport
+    client.get_scan_state()
+    assert client.trigger_library_scan() is True
+    state = client.get_scan_state()
+
+    assert state['scanning'] is False
+    assert state['outcome'] == 'unknown'
+    assert state['missing_task_ids'] == [requested['id']]
+
+
+def test_playlist_round_trip_waits_for_each_task(client):
+    class T:
+        def __init__(self, key):
+            self.ratingKey = key
+
+    new_id = client.create_playlist('Fresh', [T('700'), T('701')])
+    assert new_id == '2'
+    assert client.fake.playlists[2]['name'] == 'Fresh'
+    assert [t['item_id'] for t in client.fake.playlists[2]['tracks']] == [700, 701]
+    polls = [c for c in client.fake.calls if c[0] == 'tasks/get']
+    assert polls, 'the add was awaited through tasks/get'
+
+    assert client.get_playlist_by_name('fresh').id == '2'
+    assert client.get_playlist_track_ids('2') == ['700', '701']
+
+    # append skips what is already there
+    assert client.append_to_playlist('Fresh', [T('701'), T('702')]) is True
+    assert [t['item_id'] for t in client.fake.playlists[2]['tracks']] == [700, 701, 702]
+
+    # reconcile removes the gone and adds the missing, by position
+    assert client.reconcile_playlist('Fresh', [T('700'), T('703')], playlist_id='2') is True
+    assert [t['item_id'] for t in client.fake.playlists[2]['tracks']] == [700, 703]
+
+    # update replaces in order
+    assert client.update_playlist('Fresh', [T('703'), T('700')], playlist_id='2') is True
+    assert [t['item_id'] for t in client.fake.playlists[2]['tracks']] == [703, 700]
+
+    assert client.rewrite_playlist_order('2', 'Fresh', ['700', '703']) is True
+    assert [t['item_id'] for t in client.fake.playlists[2]['tracks']] == [700, 703]
+
+    assert client.copy_playlist('Fresh', 'Fresh copy') is True
+    assert [t['item_id'] for t in client.fake.playlists[3]['tracks']] == [700, 703]
+    assert client.delete_playlist('3') is True and 3 not in client.fake.playlists
+    assert client.set_playlist_image('Fresh', 'https://x/y.jpg') is False
+
+
+def test_a_failed_task_fails_the_write(client):
+    class T:
+        ratingKey = '700'
+
+    def failing(command, args):
+        if command == 'tasks/get':
+            return {'task_id': args['task_id'], 'status': 'failed', 'error': 'disk full'}
+        return client.fake(command, args)
+
+    client._transport = failing
+    assert client.create_playlist('Doomed', [T()]) is False
+
+
+def test_image_url_builds_the_proxy_or_passes_a_remote_url(client):
+    assert client.image_url(f"ma:{SRC}:Artist A/folder.jpg") == (
+        f"http://ma:8095/imageproxy?path=Artist%20A%2Ffolder.jpg&provider={SRC.replace('--', '--')}&size=0")
+    assert client.image_url('https://cdn/x.jpg') == 'https://cdn/x.jpg'
+    assert client.image_url('/library/metadata/1/thumb') is None
+    assert client.image_url(None) is None
+
+
+def test_sources_and_source_folder(client):
+    assert client.get_sources() == [{'key': SRC, 'title': 'Local files', 'domain': 'filesystem_local'}]
+    assert client.source_folder() == '/media/music'
+    assert client.resolve_path({'item_id': 'a/b.flac', 'provider_domain': 'filesystem_local', 'provider_instance': SRC}) == '/media/music/a/b.flac'
+    assert client.resolve_path({'item_id': 'x', 'provider_domain': 'spotify', 'provider_instance': 'spotify--x'}) is None
+    assert client.resolve_path({'item_id': 'a/all.flac::3', 'provider_domain': 'filesystem_local', 'provider_instance': SRC}) is None
+
+
+def _ma_2_10_9(client, monkeypatch, folder_setting):
+    """2.10.9 keeps the folder in setup data it never sends, and has no
+    storage/source_folder yet (#1992)"""
+    answer = client.fake.__call__
+
+    def fake(command, args):
+        if command == 'config/providers/get_value':
+            raise MusicAssistantError(f"Config key path not found for provider {SRC}")
+        if command == 'storage/source_folder':
+            raise MusicAssistantError("Invalid Command: storage/source_folder")
+        return answer(command, args)
+    client._transport = fake
+    monkeypatch.setattr('core.music_assistant_client.config_manager.get',
+                        lambda key, default=None: folder_setting if key == 'music_assistant.source_folder'
+                        else {'base_url': 'http://ma:8095', 'token': 'tok', 'source_instance': SRC}
+                        if key == 'music_assistant' else default)
+
+
+def test_a_server_that_wont_say_its_folder_uses_the_one_from_settings(client, monkeypatch):
+    _ma_2_10_9(client, monkeypatch, ' /media/music/ ')
+    assert client.source_folder() == '/media/music'
+    assert client.resolve_path({'item_id': 'a/b.flac', 'provider_domain': 'filesystem_local', 'provider_instance': SRC}) == '/media/music/a/b.flac'
+    ok, message = client.test_connection()
+    assert ok, message
+
+
+def test_without_the_setting_the_test_asks_for_the_folder_not_the_token(client, monkeypatch):
+    _ma_2_10_9(client, monkeypatch, '')
+    ok, message = client.test_connection()
+    assert not ok
+    assert 'Source folder' in message and 'token' not in message
+
+
+def test_descriptor_and_registry_know_the_server():
+    from core.media_server import specs
+    from core.media_server.registry import build_default_registry
+
+    d = specs.describe('music_assistant')
+    assert d is not None and d.is_external and d.library_concept == 'source'
+    assert d.required_keys == ('base_url', 'token') and d.secret_keys == ('token',)
+    assert d.detection.port == 8095
+    assert specs.describe('ma') is d
+    assert 'music_assistant' in build_default_registry().names()
+    assert 'music_assistant' in specs.external_names()
+
+
+def test_scan_hints_and_wrappers_report_the_server(client):
+    assert client.scan_hints()['caches_listings'] is True
+    assert MusicAssistantArtist(ARTIST, client).server == 'music_assistant'
+    client.get_all_artists()
+    assert client.get_cache_stats()['artists_cached'] == 1
+    client.clear_cache()
+    assert client.get_cache_stats()['artists_cached'] == 0
+
+
+class _T:
+    def __init__(self, key):
+        self.ratingKey = key
+
+
+def _spotify_playlist(fake, name='Mix'):
+    """a spotify playlist the user owns: editable, but not music assistant's."""
+    fake.playlists[9] = {'item_id': 9, 'name': name, 'is_editable': True, 'owner': 'rob', 'metadata': {},
+                         'provider_mappings': [{'item_id': 'sp', 'provider_domain': 'spotify',
+                                                'provider_instance': 'spotify--x'}],
+                         'tracks': [TRACK] * 14}
+
+
+def test_a_streaming_services_playlist_is_never_found_or_written(client):
+    """#2111: a same-named spotify playlist was found by name and reconciled,
+    and music assistant cut the real spotify playlist down to one track."""
+    client.fake.playlists.pop(1)
+    _spotify_playlist(client.fake, 'My Playlist')
+    assert client.get_all_playlists() == []
+    assert client.get_playlist_by_name('My Playlist') is None
+    assert client.get_playlist_by_id('9') is None
+
+    assert client.reconcile_playlist('My Playlist', [_T('700')]) is True
+    assert len(client.fake.playlists[9]['tracks']) == 14  # untouched
+    new = [p for k, p in client.fake.playlists.items() if k != 9]
+    assert [p['name'] for p in new] == ['My Playlist']
+    assert client.delete_playlist('9') is False and 9 in client.fake.playlists
+
+
+def test_playlists_are_created_on_the_builtin_provider(client):
+    """#2111: 'library' is not a provider on 2.10, create_playlist 500'd."""
+    assert client.create_playlist('Fresh', [_T('700')]) == '2'
+    sent = [a for c, a in client.fake.calls if c == 'music/playlists/create_playlist']
+    assert sent == [{'name': 'Fresh', 'provider_instance_or_domain': 'builtin'}]
+
+
+def test_is_connected_reconnects_after_a_restart(client, monkeypatch):
+    """#2111: after either side restarted it read "not connected" until a
+    manual test. it now retries, at most every RECONNECT_INTERVAL."""
+    import core.music_assistant_client as mac
+    now = [1000.0]
+    monkeypatch.setattr(mac.time, 'monotonic', lambda: now[0])
+    assert client.is_connected() is True  # fresh start: connects on its own
+    infos = sum(1 for c, _ in client.fake.calls if c == 'info')
+
+    client._connected = False  # the server went away
+    client._last_connect_attempt = now[0]
+    assert client.is_connected() is False  # throttled
+    assert sum(1 for c, _ in client.fake.calls if c == 'info') == infos
+    now[0] += mac.RECONNECT_INTERVAL
+    assert client.is_connected() is True
+
+
+def test_a_dropped_connection_is_forgotten(monkeypatch):
+    """#2111: a transport failure clears the cached connection so the next
+    call reconnects instead of failing against a stale flag."""
+    import requests
+    monkeypatch.setattr('core.music_assistant_client.config_manager.get',
+                        lambda key, default=None: {'base_url': 'http://ma:8095', 'token': 'tok'}
+                        if key == 'music_assistant' else default)
+    c = MusicAssistantClient()
+    c._connected = True
+    monkeypatch.setattr(c._session, 'post', lambda *a, **k: (_ for _ in ()).throw(requests.ConnectionError('refused')))
+    with pytest.raises(MusicAssistantError):
+        c._call('music/playlists/library_items')
+    assert c._connected is False

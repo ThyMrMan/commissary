@@ -13,11 +13,20 @@ from __future__ import annotations
 
 import types
 
+import pytest
+
 import core.imports.pipeline as import_pipeline
 from core.imports.pipeline import import_rejection_reason
 from core.imports.routes import ImportRouteRuntime, album_process
 from tests.imports.test_import_pipeline import _wire_post_process_common
 from tests.imports.test_import_routes import _FakeLogger, _touch
+
+
+@pytest.fixture(autouse=True)
+def _no_catalogue(monkeypatch):
+    """These fakes write no Library v2 row; upstream's registration gate
+    (3.6.8) is not what this file tests."""
+    monkeypatch.setattr(import_pipeline, "require_library_v2_registration", lambda *_a, **_k: None)
 
 
 def _runtime():

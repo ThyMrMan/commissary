@@ -31,11 +31,17 @@ from core.edition_grouping import (
     EDITION_PREFERENCE_VALUES as _EDITION_PREFERENCE_VALUES,
 )
 from core.artists.map import _artmap_cache_invalidate
+from core.library2.provider_ids import ARTIST_IDS_SQL as _ARTIST_IDS_SQL
 from core.metadata.registry import get_spotify_client
 from core.watchlist import scan_state as _scan_state
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("api.artist_watchlist")
+
+# A Spotify artist id: 22 base62 characters. What add_to_watchlist can trust
+# about an id whose source it only guessed.
+_SPOTIFY_ID_RE = re.compile(r"[0-9A-Za-z]{22}")
 
 bp = Blueprint("artist_watchlist", __name__)
 
@@ -63,6 +69,13 @@ _owned_mirrored_playlist = None
 _build_watchlist_count_payload = None
 
 
+def _acting(current_profile_id):
+    def _profile_id():
+        from core.library_scope import acting_profile_id
+        return acting_profile_id(current_profile_id())
+    return _profile_id
+
+
 def configure(*, config, database_getter, socketio_obj, timer_lock,
               deezer_client_getter, spotify_client_getter, automation_engine_getter,
               current_profile_id, discogs_client, metadata_fallback_client,
@@ -82,7 +95,10 @@ def configure(*, config, database_getter, socketio_obj, timer_lock,
     _get_deezer_client = deezer_client_getter
     _spotify_client = spotify_client_getter
     _automation_engine = automation_engine_getter
-    get_current_profile_id = current_profile_id
+    # E-12: a watchlist entry belongs to the library it fills. An admin who
+    # picked someone's own library in the header watches for THAT library, and
+    # sees its list -- so every handler here asks for the acting profile.
+    get_current_profile_id = _acting(current_profile_id)
     _get_discogs_client = discogs_client
     _get_metadata_fallback_client = metadata_fallback_client
     _get_metadata_fallback_source = metadata_fallback_source
@@ -101,6 +117,7 @@ def create_blueprint():
 # --- Watchlist API Endpoints ---
 
 @bp.route('/api/watchlist/count', methods=['GET'])
+@requires("music.access")
 def get_watchlist_count():
     """Get the number of artists in the watchlist"""
     try:
@@ -119,7 +136,34 @@ def get_watchlist_count():
         logger.error(f"Error getting watchlist count: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
+
+@bp.route('/api/dashboard/tile-pictures', methods=['GET'])
+@requires("music.dashboard")
+def get_dashboard_tile_pictures():
+    """A few of what the dashboard's two count tiles count: the newest watched
+    artists' pictures and the sleeves of the newest wishes. Its own request
+    because the counts mostly arrive over the socket. Read-only."""
+    try:
+        from core.dashboard_tiles import (
+            watched_faces, watchlist_facts, wished_sleeves, wishlist_facts)
+        database = get_database()
+        profile_id = get_current_profile_id()
+        return jsonify({
+            "success": True,
+            "faces": watched_faces(database, profile_id),
+            "sleeves": wished_sleeves(database, profile_id),
+            # what each count is made of, and the newest thing in it
+            "facts": {
+                "watchlist": watchlist_facts(database, profile_id),
+                "wishlist": wishlist_facts(database, profile_id),
+            },
+        })
+    except Exception as e:
+        logger.error(f"Error getting dashboard tile pictures: {e}")
+        return jsonify({"success": False, "faces": [], "sleeves": []}), 500
+
 @bp.route('/api/watchlist/recent-releases', methods=['GET'])
+@requires("music.access")
 def get_watchlist_recent_releases():
     """Newest releases across the whole watchlist, flat (the dashboard rail).
 
@@ -139,6 +183,7 @@ def get_watchlist_recent_releases():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/artists', methods=['GET'])
+@requires("music.access")
 def get_watchlist_artists():
     """Get all artists in the watchlist with cached images"""
     try:
@@ -189,6 +234,7 @@ def get_watchlist_artists():
                 "include_eps": rules['include_eps'],
                 "include_singles": rules['include_singles'],
                 "include_live": rules['include_live'],
+                "include_live_tracks": rules['include_live_tracks'],
                 "include_remixes": rules['include_remixes'],
                 "include_acoustic": rules['include_acoustic'],
                 "include_compilations": rules['include_compilations'],
@@ -202,6 +248,7 @@ def get_watchlist_artists():
 
 
 @bp.route('/api/watchlist/export', methods=['GET'])
+@requires("music.access")
 def export_watchlist():
     """Export the watchlist roster (name + source IDs, optionally external links)
     as json / csv / txt. Returns the content for the export modal to preview +
@@ -375,6 +422,7 @@ def _run_playlist_export(job_id, playlist_id, title, mode):
 
 
 @bp.route('/api/playlists/<playlist_id>/export/listenbrainz', methods=['POST'])
+@requires("music.access")
 def start_playlist_export_listenbrainz(playlist_id):
     """Start a background export of a mirrored playlist to ListenBrainz/JSPF.
 
@@ -405,6 +453,7 @@ def start_playlist_export_listenbrainz(playlist_id):
 
 
 @bp.route('/api/playlists/<playlist_id>/export/service/<service>', methods=['POST'])
+@requires("music.access")
 def start_playlist_export_service(playlist_id, service):
     """Export a mirrored playlist back to a streaming service (#945).
 
@@ -450,6 +499,7 @@ def start_playlist_export_service(playlist_id, service):
 
 
 @bp.route('/api/playlists/export/status/<job_id>', methods=['GET'])
+@requires("music.access")
 def playlist_export_status(job_id):
     """Live status for an export job (polled by the mirrored-playlist card)."""
     job = _playlist_export_jobs.get(job_id)
@@ -462,6 +512,7 @@ def playlist_export_status(job_id):
 
 
 @bp.route('/api/playlists/export/download/<job_id>', methods=['GET'])
+@requires("music.access")
 def playlist_export_download(job_id):
     """Download a completed export's JSPF file."""
     job = _playlist_export_jobs.get(job_id)
@@ -477,6 +528,7 @@ def playlist_export_download(job_id):
 
 
 @bp.route('/api/library/artists/export', methods=['GET'])
+@requires("music.access")
 def export_library_artists():
     """Export the WHOLE library artist roster (name + every source id/url we have,
     optional external links, optional owned album/track counts) as json/csv/txt."""
@@ -489,24 +541,53 @@ def export_library_artists():
         conn = database._get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("""
-                SELECT id, name, spotify_artist_id, musicbrainz_id, deezer_id,
-                       discogs_id, itunes_artist_id, tidal_id, qobuz_id, amazon_id,
-                       lastfm_url, genius_url, soul_id
-                FROM artists ORDER BY name COLLATE NOCASE
+            # the artists you have, once each: lib2_artists also holds
+            # featured credits, discography / wishlist / watchlist rows and
+            # alias members, and 3.6.1's export was the owned library. the
+            # release-artist set: a featured credit on one owned track is not
+            # an artist you have (review 5 W3-TD-3)
+            from core.library2.sql_util import owned_sql
+            cur.execute(f"""
+                SELECT id, name, soul_id, {_ARTIST_IDS_SQL}
+                FROM lib2_artists
+                WHERE canonical_artist_id IS NULL
+                  AND {owned_sql('release_artist', 'lib2_artists')}
+                ORDER BY name COLLATE NOCASE
             """)
             cols = [d[0] for d in cur.description]
             rows = [dict(zip(cols, r, strict=False)) for r in cur.fetchall()]
 
             counts = {}
             if include_contents:
-                for table, key in (('albums', 'album_count'), ('tracks', 'track_count')):
+                # Counts roll up the OWNED v2 catalogue. Two things this must not
+                # do, both of which it used to: read legacy `albums`/`tracks` (the
+                # cutover ported the roster query above but not this roll-up, and
+                # because the empty legacy tables still exist the query "worked"
+                # and returned nothing), and count every catalogue row (v2 keeps
+                # discography and wishlist releases beside the owned ones, where
+                # legacy was the owned library by construction).
+                from core.library2.sql_util import owned_sql
+                roll_ups = (
+                    ('album_count', f"""
+                        SELECT al.primary_artist_id, COUNT(*)
+                          FROM lib2_albums al
+                         WHERE {owned_sql('album', 'al')}
+                      GROUP BY al.primary_artist_id"""),
+                    ('track_count', f"""
+                        SELECT al.primary_artist_id, COUNT(*)
+                          FROM lib2_tracks t
+                          JOIN lib2_albums al ON al.id = t.album_id
+                         WHERE {owned_sql('track', 't')}
+                      GROUP BY al.primary_artist_id"""),
+                )
+                for key, sql in roll_ups:
                     try:
-                        for aid, n in cur.execute(
-                                f"SELECT artist_id, COUNT(*) FROM {table} GROUP BY artist_id"):
+                        for aid, n in cur.execute(sql):
                             counts.setdefault(str(aid), {})[key] = n
-                    except Exception:  # noqa: S110 — counts are best-effort
-                        pass
+                    except Exception as e:
+                        # Still best-effort, but never silently again: a null
+                        # count column is exactly how the legacy read survived.
+                        logger.warning("Library export %s roll-up failed: %s", key, e)
         finally:
             conn.close()
 
@@ -543,6 +624,7 @@ def export_library_artists():
 
 
 @bp.route('/api/watchlist/add', methods=['POST'])
+@requires("music.watchlist")
 def add_to_watchlist():
     """Add an artist to the watchlist"""
     try:
@@ -583,9 +665,9 @@ def add_to_watchlist():
             try:
                 conn = database._get_connection()
                 cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT spotify_artist_id, itunes_artist_id, deezer_id, discogs_id, musicbrainz_id
-                    FROM artists WHERE id = ? LIMIT 1
+                cursor.execute(f"""
+                    SELECT {_ARTIST_IDS_SQL}
+                    FROM lib2_artists WHERE id = ? LIMIT 1
                 """, (artist_id,))
                 row = cursor.fetchone()
                 conn.close()
@@ -619,6 +701,9 @@ def add_to_watchlist():
             except Exception as e:
                 logger.debug("watchlist artist source lookup failed: %s", e)
         fallback_source = _get_metadata_fallback_source()   # always defined — image block below reads it
+        # Named by the caller or read off our own row. A guessed source is
+        # fine for the Watchlist row but must not become a catalogue id.
+        source_is_known = bool(source)
         if not source:
             # The fallback source is a hint, not a storable provider: hydrabase,
             # jiosaavn and bandcamp are in METADATA_SOURCE_PRIORITY but have no
@@ -635,6 +720,20 @@ def add_to_watchlist():
         )
         if success:
             database.backfill_watchlist_musicbrainz_ids_from_library(profile_id=get_current_profile_id())
+            # The Watchlist is artist monitoring: the artist gets its Library v2
+            # row and is monitored there now, as "Monitor artist" does, not
+            # only once a download creates the row. A Spotify id is recognisable
+            # on its own; any other guess is left to the name.
+            from core.library2.monitor_sync import sync_watchlist_addition
+            id_is_trusted = source_is_known or (
+                source == 'spotify' and _SPOTIFY_ID_RE.fullmatch(str(artist_id)) is not None)
+            sync_watchlist_addition(
+                database,
+                name=artist_name,
+                provider_id=artist_id if id_is_trusted else None,
+                source=source if id_is_trusted else None,
+                profile_id=get_current_profile_id(),
+            )
 
         if success:
 
@@ -735,6 +834,7 @@ def add_to_watchlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/remove', methods=['POST'])
+@requires("music.watchlist")
 def remove_from_watchlist():
     """Remove an artist from the watchlist"""
     try:
@@ -745,9 +845,23 @@ def remove_from_watchlist():
             return jsonify({"success": False, "error": "Missing artist_id"}), 400
 
         database = get_database()
-        success = database.remove_artist_from_watchlist(artist_id, profile_id=get_current_profile_id())
+        # §69.1 reverse edge: capture the row's identity BEFORE deleting so the
+        # matching monitored lib2 artist can be demonitored (states must stay in
+        # sync both ways). Fires only for a user-facing removal — the forward
+        # mirror removes rows via the DB layer directly, never through here.
+        _wl_descriptor = database.get_watchlist_artist_descriptor(artist_id, profile_id=get_current_profile_id())
+        # the provider the id is from, when the page knows it (G02-4)
+        source = {'source': data['source']} if data.get('source') else {}
+        success = database.remove_artist_from_watchlist(artist_id, profile_id=get_current_profile_id(),
+                                                        **source)
 
         if success:
+            try:
+                from core.library2.monitor_sync import sync_watchlist_removal
+                sync_watchlist_removal(database, config_manager, _wl_descriptor,
+                                       profile_id=get_current_profile_id())
+            except Exception as _sync_e:
+                logger.debug("watchlist reverse-sync (single) failed: %s", _sync_e)
             # Push updated count to this profile's WebSocket room immediately
             try:
                 pid = get_current_profile_id()
@@ -772,6 +886,7 @@ def remove_from_watchlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/add-batch', methods=['POST'])
+@requires("music.watchlist")
 def add_batch_to_watchlist():
     """Add multiple artists to the watchlist at once"""
     try:
@@ -878,6 +993,7 @@ def add_batch_to_watchlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/library/watchlist-all-unwatched', methods=['POST'])
+@requires("music.watchlist")
 def watchlist_all_unwatched_library_artists():
     """Add all unwatched library artists (that have valid external IDs) to the watchlist"""
     try:
@@ -960,6 +1076,7 @@ def watchlist_all_unwatched_library_artists():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/remove-batch', methods=['POST'])
+@requires("music.watchlist")
 def remove_batch_from_watchlist():
     """Remove multiple artists from the watchlist"""
     try:
@@ -971,9 +1088,34 @@ def remove_batch_from_watchlist():
 
         database = get_database()
         removed = 0
+        # §69.1 reverse edge (covers "Clear Watchlist" = batch remove): demonitor
+        # the matching lib2 artist for every row we actually removed.
+        removed_descriptors = []
         for artist_id in artist_ids:
+            descriptor = database.get_watchlist_artist_descriptor(artist_id, profile_id=get_current_profile_id())
             if database.remove_artist_from_watchlist(artist_id, profile_id=get_current_profile_id()):
                 removed += 1
+                if descriptor:
+                    removed_descriptors.append(descriptor)
+
+        try:
+            # one pass for the lot (#2200): one per artist recomputed and
+            # mirrored each artist on its own, 70 s for 57 artists
+            from core.library2.monitor_sync import sync_watchlist_removals
+            sync_watchlist_removals(database, removed_descriptors,
+                                    profile_id=get_current_profile_id())
+        except Exception as _sync_e:
+            logger.debug("watchlist reverse-sync (batch) failed: %s", _sync_e)
+
+        if removed:
+            # what a single removal does, once for the lot
+            pid = get_current_profile_id()
+            try:
+                socketio.emit('watchlist:count', _build_watchlist_count_payload(profile_id=pid),
+                              room=f'profile:{pid}')
+            except Exception as e:
+                logger.debug("watchlist count emit failed: %s", e)
+            _artmap_cache_invalidate(pid)
 
         return jsonify({
             "success": True,
@@ -986,6 +1128,7 @@ def remove_batch_from_watchlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/check', methods=['POST'])
+@requires("music.access")
 def check_watchlist_status():
     """Check if an artist is in the watchlist"""
     try:
@@ -996,7 +1139,9 @@ def check_watchlist_status():
             return jsonify({"success": False, "error": "Missing artist_id"}), 400
         
         database = get_database()
-        is_watching = database.is_artist_in_watchlist(artist_id, profile_id=get_current_profile_id())
+        source = {'source': data['source']} if data.get('source') else {}
+        is_watching = database.is_artist_in_watchlist(artist_id, profile_id=get_current_profile_id(),
+                                                      **source)
 
         return jsonify({"success": True, "is_watching": is_watching})
         
@@ -1005,6 +1150,7 @@ def check_watchlist_status():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/check-batch', methods=['POST'])
+@requires("music.access")
 def check_watchlist_status_batch():
     """Check watchlist status for multiple artists in one request"""
     try:
@@ -1026,6 +1172,7 @@ def check_watchlist_status_batch():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/scan', methods=['POST'])
+@requires("music.watchlist")
 def start_watchlist_scan():
     """Start a watchlist scan for new releases"""
     try:
@@ -1322,6 +1469,7 @@ def start_watchlist_scan():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/scan/status', methods=['GET'])
+@requires("music.watchlist")
 def get_watchlist_scan_status():
     """Get the current status of watchlist scanning"""
     try:
@@ -1344,6 +1492,7 @@ def get_watchlist_scan_status():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/scan/history', methods=['GET'])
+@requires("music.access")
 def get_watchlist_scan_history():
     """Recent watchlist scan runs (counts only — ledgers fetched per run)."""
     try:
@@ -1355,7 +1504,22 @@ def get_watchlist_scan_history():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+@bp.route('/api/watchlist/found', methods=['GET'])
+@requires("music.watchlist")
+def get_watchlist_found():
+    """What recent scans added to the wishlist, grouped by release (the page shelf)."""
+    try:
+        limit = min(50, max(1, int(request.args.get('limit', 24) or 24)))
+        releases = get_database().get_watchlist_found_releases(
+            limit=limit, profile_id=get_current_profile_id())
+        return jsonify({"success": True, "releases": releases})
+    except Exception as e:
+        logger.error(f"Error getting watchlist found releases: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 @bp.route('/api/watchlist/scan/history/<run_id>/tracks', methods=['GET'])
+@requires("music.access")
 def get_watchlist_scan_history_tracks(run_id):
     """The track ledger (added/skipped) for one past scan run."""
     try:
@@ -1367,6 +1531,7 @@ def get_watchlist_scan_history_tracks(run_id):
 
 
 @bp.route('/api/watchlist/scan/cancel', methods=['POST'])
+@requires("music.watchlist")
 def cancel_watchlist_scan():
     """Cancel a running watchlist scan"""
     try:
@@ -1392,6 +1557,7 @@ similar_artists_update_state = {
 similar_artists_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="SimilarArtistsUpdate")
 
 @bp.route('/api/watchlist/update-similar-artists', methods=['POST'])
+@requires("music.watchlist")
 def update_similar_artists_endpoint():
     """Update similar artists for all watchlist artists (for discovery feature)"""
     try:
@@ -1422,6 +1588,7 @@ def update_similar_artists_endpoint():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/similar-artists-status', methods=['GET'])
+@requires("music.watchlist")
 def get_similar_artists_update_status():
     """Get status of similar artists update"""
     try:
@@ -1466,8 +1633,14 @@ def _watchlist_spotify_artist_info(artist_data, fallback_id):
 
 
 @bp.route('/api/watchlist/artist/<artist_id>/config', methods=['GET', 'POST'])
+@requires("music.access")
 def watchlist_artist_config(artist_id):
     """Get or update watchlist artist configuration"""
+    # #2209: reading a row is the artist page's; changing it is the Watchlist's
+    if request.method == 'POST':
+        from core.permissions import can, enforcing, refusal
+        if enforcing() and not can(None, "music.watchlist"):
+            return refusal("music.watchlist")
     try:
         from database.music_database import get_database
 
@@ -1491,7 +1664,7 @@ def watchlist_artist_config(artist_id):
                        lookback_days, discogs_artist_id, preferred_metadata_source,
                        amazon_artist_id, musicbrainz_artist_id, auto_download,
                        quality_profile_id, auto_download_pref, include_other_artists,
-                       follow_defaults
+                       follow_defaults, include_live_tracks, allowed_release_statuses
                 FROM watchlist_artists
                 WHERE profile_id = ? AND (
                       spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
@@ -1556,9 +1729,12 @@ def watchlist_artist_config(artist_id):
                 # 'no such column' on every watchlist-config GET.
                 cur2.execute("""
                     SELECT banner_url, summary, style, mood, label, genres
-                    FROM artists
-                    WHERE spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_id = ?
-                          OR discogs_id = ? OR musicbrainz_id = ?
+                    FROM lib2_artists
+                    WHERE spotify_id = ?
+                       OR TRIM(CAST(json_extract(external_ids,'$.itunes') AS TEXT)) = ?
+                       OR TRIM(CAST(json_extract(external_ids,'$.deezer') AS TEXT)) = ?
+                       OR TRIM(CAST(json_extract(external_ids,'$.discogs') AS TEXT)) = ?
+                       OR musicbrainz_id = ?
                     LIMIT 1
                 """, (
                     spotify_id or artist_id,
@@ -1617,6 +1793,9 @@ def watchlist_artist_config(artist_id):
                 'include_eps': bool(result[1]),
                 'include_singles': bool(result[2]),
                 'include_live': bool(result[3]),
+                # #2082: never set = it follows the Live albums rule
+                'include_live_tracks': bool(result[25] if len(result) > 25 and result[25] is not None
+                                            else result[3]),
                 'include_remixes': bool(result[4]),
                 'include_acoustic': bool(result[5]),
                 'include_compilations': bool(result[6]),
@@ -1640,6 +1819,8 @@ def watchlist_artist_config(artist_id):
                 # then show the defaults, the rules a scan actually applies.
                 'follow_defaults': bool(result[24]) if len(result) > 24 and result[24] is not None else False,
                 'defaults': defaults,
+                # #2175: null follows the library-wide statuses
+                **_release_status_config(result[26] if len(result) > 26 else None),
             }
             if config['follow_defaults']:
                 config.update(defaults)
@@ -1724,7 +1905,8 @@ def watchlist_artist_config(artist_id):
                 SELECT include_albums, include_eps, include_singles, include_live,
                        include_remixes, include_acoustic, include_compilations,
                        include_instrumentals, include_other_artists, lookback_days, preferred_metadata_source,
-                       auto_download, quality_profile_id, auto_download_pref, follow_defaults
+                       auto_download, quality_profile_id, auto_download_pref, follow_defaults,
+                       include_live_tracks, allowed_release_statuses
                 FROM watchlist_artists
                 WHERE profile_id = ? AND (
                       spotify_artist_id = ? OR itunes_artist_id = ? OR deezer_artist_id = ?
@@ -1781,6 +1963,13 @@ def watchlist_artist_config(artist_id):
                 include_compilations = _field('include_compilations', False)
                 include_instrumentals = _field('include_instrumentals', False)
                 include_other_artists = _field('include_other_artists', False)
+                # #2082. None stays None: a client that never sends it keeps
+                # one Live switch for both, as before the split
+                include_live_tracks = _field('include_live_tracks', None)
+                if 'include_live' in data and 'include_live_tracks' not in data and was_following:
+                    # the follower's fill would pin it to the default. a client
+                    # that only sends Live means both
+                    include_live_tracks = None
             except _BadBool as bad:
                 conn.close()
                 return jsonify({"success": False, "error": f"{bad.field} must be a boolean"}), 400
@@ -1797,6 +1986,8 @@ def watchlist_artist_config(artist_id):
                         ('include_live', False), ('include_remixes', False),
                         ('include_acoustic', False), ('include_compilations', False),
                         ('include_instrumentals', False), ('include_other_artists', False)))
+                include_live_tracks = (bool(old_row['include_live_tracks'])
+                                       if old_row['include_live_tracks'] is not None else None)
 
             if 'lookback_days' in data:
                 lookback_days = data.get('lookback_days')  # None = use global setting
@@ -1868,6 +2059,21 @@ def watchlist_artist_config(artist_id):
                 conn.close()
                 return jsonify({"success": False, "error": "At least one release type must be selected"}), 400
 
+            # #2175: null follows the library-wide statuses, a list is its own.
+            # absent keeps what is stored
+            if 'release_statuses' in data:
+                from core.release_statuses import ReleaseStatusError, encode, validate_allowed
+                if data.get('release_statuses') is None:
+                    allowed_release_statuses = None
+                else:
+                    try:
+                        allowed_release_statuses = encode(validate_allowed(data.get('release_statuses')))
+                    except ReleaseStatusError as exc:
+                        conn.close()
+                        return jsonify({"success": False, "error": str(exc)}), 400
+            else:
+                allowed_release_statuses = old_row['allowed_release_statuses']
+
             # lookback_days changed — clear last_scan_timestamp to force rescan
             lookback_changed = old_row['lookback_days'] != lookback_days
 
@@ -1877,7 +2083,7 @@ def watchlist_artist_config(artist_id):
                     include_live = ?, include_remixes = ?, include_acoustic = ?, include_compilations = ?,
                     include_instrumentals = ?, include_other_artists = ?, lookback_days = ?, preferred_metadata_source = ?,
                     auto_download = ?, auto_download_pref = ?, quality_profile_id = ?,
-                    follow_defaults = ?,
+                    follow_defaults = ?, include_live_tracks = ?, allowed_release_statuses = ?,
                     last_scan_timestamp = CASE WHEN ? THEN NULL ELSE last_scan_timestamp END,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE profile_id = ? AND (
@@ -1887,7 +2093,10 @@ def watchlist_artist_config(artist_id):
             """, (int(include_albums), int(include_eps), int(include_singles),
                   int(include_live), int(include_remixes), int(include_acoustic), int(include_compilations),
                   int(include_instrumentals), int(include_other_artists), lookback_days, preferred_metadata_source, int(auto_download),
-                  auto_download_pref, quality_profile_id, int(bool(follow_defaults)), lookback_changed, active_profile_id,
+                  auto_download_pref, quality_profile_id, int(bool(follow_defaults)),
+                  None if include_live_tracks is None else int(bool(include_live_tracks)),
+                  allowed_release_statuses,
+                  lookback_changed, active_profile_id,
                   artist_id, artist_id, artist_id, artist_id, artist_id, artist_id))
             conn.commit()
 
@@ -1907,6 +2116,8 @@ def watchlist_artist_config(artist_id):
                     'include_eps': include_eps,
                     'include_singles': include_singles,
                     'include_live': include_live,
+                    'include_live_tracks': bool(include_live if include_live_tracks is None
+                                                else include_live_tracks),
                     'include_remixes': include_remixes,
                     'include_acoustic': include_acoustic,
                     'include_compilations': include_compilations,
@@ -1917,6 +2128,7 @@ def watchlist_artist_config(artist_id):
                     'auto_download_pref': auto_download_pref,
                     'quality_profile_id': quality_profile_id,
                     'follow_defaults': bool(follow_defaults),
+                    **_release_status_config(allowed_release_statuses),
                 }
             })
 
@@ -1927,6 +2139,7 @@ def watchlist_artist_config(artist_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/watchlist/artist/<artist_id>/link-provider', methods=['POST'])
+@requires("music.watchlist")
 def watchlist_artist_link_provider(artist_id):
     """Manually link a watchlist artist to a different Spotify/iTunes artist."""
     try:
@@ -2011,15 +2224,20 @@ def watchlist_artist_link_provider(artist_id):
 def _custom_artist_count(database, profile_id) -> int:
     conn = database._get_connection()
     try:
+        columns = {r[1] for r in conn.execute("PRAGMA table_info(watchlist_artists)")}
+        # #2175: its own release statuses count as its own rules too
+        own_statuses = (" OR allowed_release_statuses IS NOT NULL"
+                        if 'allowed_release_statuses' in columns else "")
         row = conn.execute(
             "SELECT COUNT(*) FROM watchlist_artists WHERE profile_id = ? "
-            "AND COALESCE(follow_defaults, 0) = 0", (int(profile_id),)).fetchone()
+            f"AND (COALESCE(follow_defaults, 0) = 0{own_statuses})", (int(profile_id),)).fetchone()
         return int(row[0] or 0)
     finally:
         conn.close()
 
 
 @bp.route('/api/watchlist/reset-to-defaults', methods=['POST'])
+@requires("music.watchlist")
 def watchlist_reset_to_defaults():
     """Every artist with its own release rules goes back to the defaults (#1822)."""
     try:
@@ -2032,7 +2250,37 @@ def watchlist_reset_to_defaults():
         return jsonify({"success": False, "error": str(e)}), 500
 
 
+def _release_status_config(stored):
+    """#2175: an artist's own statuses (None = the library's), the library's,
+    and the ones a scan applies."""
+    from core.release_statuses import parse_statuses
+    own = parse_statuses(stored) or None
+    library = _library_release_statuses()
+    return {
+        'release_statuses': list(own) if own else None,
+        'library_release_statuses': list(library),
+        'effective_release_statuses': list(own or library),
+    }
+
+
+def _posted_release_statuses(data):
+    """#2175: (statuses, None), (None, None) when not sent, or (None, error)."""
+    if data.get('release_statuses') is None:
+        return None, None
+    from core.release_statuses import ReleaseStatusError, validate_allowed
+    try:
+        return list(validate_allowed(data.get('release_statuses'))), None
+    except ReleaseStatusError as exc:
+        return None, str(exc)
+
+
+def _library_release_statuses():
+    from core.release_statuses import library_statuses
+    return library_statuses(config_manager)
+
+
 @bp.route('/api/watchlist/global-config', methods=['GET', 'POST'])
+@requires("music.watchlist")
 def watchlist_global_config():
     """Get or update global watchlist configuration (overrides per-artist settings)"""
     try:
@@ -2047,6 +2295,10 @@ def watchlist_global_config():
                 'include_eps': config_manager.get('watchlist.global_include_eps', True),
                 'include_singles': config_manager.get('watchlist.global_include_singles', True),
                 'include_live': config_manager.get('watchlist.global_include_live', False),
+                # #2082: never saved = it follows the Live albums default
+                'include_live_tracks': bool(_unset_follows(
+                    config_manager.get('watchlist.global_include_live_tracks', None),
+                    config_manager.get('watchlist.global_include_live', False))),
                 'include_remixes': config_manager.get('watchlist.global_include_remixes', False),
                 'include_acoustic': config_manager.get('watchlist.global_include_acoustic', False),
                 'include_compilations': config_manager.get('watchlist.global_include_compilations', False),
@@ -2066,10 +2318,16 @@ def watchlist_global_config():
                     'watchlist.prefer_explicit_edition', True),
                 # #1822: how many artists have their own rules instead
                 'custom_artist_count': _custom_artist_count(_db, get_current_profile_id()),
+                'release_statuses': list(_library_release_statuses()),  # #2175
             }
             return jsonify({"success": True, "config": config})
 
         else:  # POST
+            # the watchlist's global rules apply to every profile's artists:
+            # an admin's to change (Nov 13 2026). reading stays open
+            from core.profile_context import is_admin_request
+            if not is_admin_request():
+                return jsonify({"success": False, "error": "Admin access required"}), 403
             data = request.get_json()
             if not data:
                 return jsonify({"success": False, "error": "No data provided"}), 400
@@ -2079,6 +2337,8 @@ def watchlist_global_config():
             include_eps = data.get('include_eps', True)
             include_singles = data.get('include_singles', True)
             include_live = data.get('include_live', False)
+            # #2082: a client that does not send it leaves it as it is
+            include_live_tracks = data.get('include_live_tracks', None)
             include_remixes = data.get('include_remixes', False)
             include_acoustic = data.get('include_acoustic', False)
             include_compilations = data.get('include_compilations', False)
@@ -2090,12 +2350,17 @@ def watchlist_global_config():
             # always need a release type (#1822)
             if not (include_albums or include_eps or include_singles):
                 return jsonify({"success": False, "error": "At least one release type must be selected"}), 400
+            release_statuses, bad = _posted_release_statuses(data)  # #2175
+            if bad:
+                return jsonify({"success": False, "error": bad}), 400
 
             config_manager.set('watchlist.global_override_enabled', global_override_enabled)
             config_manager.set('watchlist.global_include_albums', include_albums)
             config_manager.set('watchlist.global_include_eps', include_eps)
             config_manager.set('watchlist.global_include_singles', include_singles)
             config_manager.set('watchlist.global_include_live', include_live)
+            if include_live_tracks is not None:
+                config_manager.set('watchlist.global_include_live_tracks', bool(include_live_tracks))
             config_manager.set('watchlist.global_include_remixes', include_remixes)
             config_manager.set('watchlist.global_include_acoustic', include_acoustic)
             config_manager.set('watchlist.global_include_compilations', include_compilations)
@@ -2104,6 +2369,8 @@ def watchlist_global_config():
             config_manager.set('watchlist.exclude_terms', exclude_terms)
             global_auto_download = bool(data.get('global_auto_download', True))
             config_manager.set('watchlist.global_auto_download', global_auto_download)
+            if release_statuses is not None:
+                config_manager.set('watchlist.global_release_statuses', release_statuses)
             # #1450: validate against the enum; anything else falls back to
             # "all" (today's behaviour) rather than persisting a bad value.
             edition_preference = data.get('edition_preference', _EDITION_PREFERENCE_ALL)
@@ -2132,6 +2399,9 @@ def watchlist_global_config():
                     'include_eps': include_eps,
                     'include_singles': include_singles,
                     'include_live': include_live,
+                    'include_live_tracks': bool(_unset_follows(
+                        config_manager.get('watchlist.global_include_live_tracks', None),
+                        include_live)),
                     'include_remixes': include_remixes,
                     'include_acoustic': include_acoustic,
                     'include_compilations': include_compilations,
@@ -2140,6 +2410,7 @@ def watchlist_global_config():
                     'global_auto_download': global_auto_download,
                     'edition_preference': edition_preference,
                     'prefer_explicit_edition': prefer_explicit_edition,
+                    'release_statuses': list(_library_release_statuses()),
                 }
             })
 
@@ -2148,6 +2419,11 @@ def watchlist_global_config():
         import traceback
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
+
+def _unset_follows(value, followed):
+    """a rule that was never saved takes the value of the rule it follows"""
+    return followed if value is None else value
+
 
 def _update_similar_artists_worker():
     """Background worker to update similar artists for all watchlist artists"""

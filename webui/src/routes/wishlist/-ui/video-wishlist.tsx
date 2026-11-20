@@ -1,8 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useMemo, useRef, useState } from 'react';
 
-// Commissary: video Library tabs (commissary/wishlist-libraries.tsx)
-import { WishlistLibraryTabs, useWishlistLibraries } from '@/commissary/wishlist-libraries';
 import { ActionMenu } from '@/routes/artist-detail/-ui/action-menu';
 
 import type { VideoMedia, VideoMovieItem, VideoShowItem, VideoSort } from '../-video.types';
@@ -11,6 +9,7 @@ import {
   VIDEO_WISHLIST_QUERY_KEY,
   backfillMovieArt,
   backfillShowArt,
+  videoLibraryNamesQueryOptions,
   videoWishlistCountsQueryOptions,
   videoWishlistListQueryOptions,
 } from '../-video.api';
@@ -21,7 +20,7 @@ import {
   failingOnlyShows,
   initials,
   isFailingItem,
-  movieMeta,
+  movieCardMeta,
   movieZone,
   moviesNeedArt,
   rowZone,
@@ -38,14 +37,13 @@ import { VIDEO_WISHLIST_CHANGED, useVideoWishlistActions } from '../-video.use-a
 import { artistHue, orbSizeClass } from '../-wishlist.helpers';
 import { NebulaOrb, NebulaPoster, NebulaStage, NebulaZone } from './nebula-parts';
 import { VideoMovieSheet, VideoShowSheet, openVideoDetail } from './video-sheets';
+import { WishlistExportDialog } from './wishlist-export';
 
 const TABS: { media: VideoMedia; label: string }[] = [
   { media: 'movies', label: 'Movies' },
   { media: 'tv', label: 'TV' },
   { media: 'youtube', label: 'YouTube' },
 ];
-
-const EYEBROW: Record<VideoMedia, string> = { movies: 'Movies', tv: 'TV', youtube: 'YouTube' };
 
 interface Props {
   profileId: number;
@@ -92,9 +90,20 @@ export function VideoWishlist({
   }, [query]);
 
   const [sort, setSort] = useState<VideoSort>('added');
-  const libs = useWishlistLibraries(media); // Commissary
+  const [exporting, setExporting] = useState(false);
+  // #2029: only what files into one video library; offered once the tab's
+  // kind has two
+  const [libraryPick, setLibraryPick] = useState<{ media: VideoMedia; id: number } | null>(null);
+  const libraryNames = useQuery(videoLibraryNamesQueryOptions());
+  const tabLibraries = (libraryNames.data ?? []).filter(
+    (l) => media !== 'youtube' && l.kind === (media === 'movies' ? 'movie' : 'show'),
+  );
+  const library =
+    libraryPick?.media === media && tabLibraries.some((l) => l.id === libraryPick.id)
+      ? libraryPick.id
+      : 0;
   // any change to what's listed starts again at page one.
-  const listKey = `${media}|${debounced}|${sort}|${libs.library ?? ''}`;
+  const listKey = `${media}|${debounced}|${sort}|${library}`;
   const [paging, setPaging] = useState({ key: listKey, page: 1 });
   const page = paging.key === listKey ? paging.page : 1;
   const setPage = (p: number) => setPaging({ key: listKey, page: p });
@@ -105,13 +114,7 @@ export function VideoWishlist({
   const setOpenKey = (key: string | null) => setOpen(key ? { media, key } : null);
 
   const list = useQuery(
-    videoWishlistListQueryOptions(profileId, {
-      media,
-      search: debounced,
-      sort,
-      page,
-      library: libs.library, // Commissary
-    }),
+    videoWishlistListQueryOptions(profileId, { media, search: debounced, sort, page, library }),
   );
   const counts = useQuery(videoWishlistCountsQueryOptions(profileId));
 
@@ -177,7 +180,8 @@ export function VideoWishlist({
   );
   const showZones = useMemo(() => videoZones(visibleShows, showZone, media), [visibleShows, media]);
 
-  const keyOfMovie = (m: VideoMovieItem) => `m:${m.tmdb_id}`;
+  // a copy wanted in another library (#2029) is its own card
+  const keyOfMovie = (m: VideoMovieItem) => `m:${m.tmdb_id}:${m.video_library_id ?? ''}`;
   const keyOfShow = (s: VideoShowItem) =>
     s.source === 'youtube' ? `y:${s.youtube_id}` : `s:${s.tmdb_id}`;
   const openMovie = isMovies ? visibleMovies.find((m) => keyOfMovie(m) === openKey) : undefined;
@@ -197,60 +201,56 @@ export function VideoWishlist({
 
   return (
     <>
-      <div className="wlp-media-tabs" role="tablist" aria-label="Video wishlist">
-        {TABS.map((t) => (
-          <button
-            key={t.media}
-            type="button"
-            role="tab"
-            aria-selected={media === t.media}
-            onClick={() => onMedia(t.media)}
-          >
-            {t.label}
-            <span className="wlp-tab-count">{tabCount[t.media]}</span>
-          </button>
-        ))}
-      </div>
-      {/* Commissary: one video Library of this kind */}
-      <WishlistLibraryTabs libs={libs} kindCount={tabCount[media]} />
-
-      <header className="wlp-hero">
-        <div className="wlp-hero-top">
-          <div>
-            <div className="wlp-eyebrow">{EYEBROW[media]}</div>
-            <h1 className="wlp-title">Wishlist</h1>
-            <p className="wlp-sub">
-              Everything you&apos;re hunting down. The automation searches this list every hour —
-              triage what&apos;s stuck, grab what you want now.
-            </p>
+      <header className="pgf-head wlp-hero">
+        <div className="pgf-actions wlp-hero-side">
+          <div className="wlp-media-tabs" role="tablist" aria-label="Video wishlist">
+            {TABS.map((t) => (
+              <button
+                key={t.media}
+                type="button"
+                role="tab"
+                aria-selected={media === t.media}
+                onClick={() => onMedia(t.media)}
+              >
+                {t.label}
+                <span className="wlp-tab-count">{tabCount[t.media]}</span>
+              </button>
+            ))}
           </div>
         </div>
-        {c && (c.total ?? 0) > 0 ? (
-          <div className="wlp-stats">
-            <div className="wlp-stat">
-              <span className="wlp-stat-value">{c.movie ?? 0}</span>
-              <span className="wlp-stat-label">Movies</span>
-            </div>
-            <div className="wlp-stat">
-              <span className="wlp-stat-value">{c.show ?? 0}</span>
-              <span className="wlp-stat-label">Shows</span>
-            </div>
-            <div className="wlp-stat">
-              <span className="wlp-stat-value">{c.episode ?? 0}</span>
-              <span className="wlp-stat-label">Episodes</span>
-            </div>
-            <div className="wlp-stat">
-              <span className="wlp-stat-value">{c.video ?? 0}</span>
-              <span className="wlp-stat-label">YouTube videos</span>
-            </div>
-            {stuckCount > 0 && (pagination?.total_pages ?? 1) <= 1 ? (
+        <div className="pgf-head-main">
+          <h1 className="pgf-title">Wishlist</h1>
+          {c && (c.total ?? 0) > 0 ? (
+            <div className="pgf-status wlp-stats">
               <div className="wlp-stat">
-                <span className="wlp-stat-value wlp-stat-value--warn">{stuckCount}</span>
-                <span className="wlp-stat-label">Stuck</span>
+                <span className="wlp-stat-value">{c.movie ?? 0}</span>
+                <span className="wlp-stat-label">Movies</span>
               </div>
-            ) : null}
-          </div>
-        ) : null}
+              <div className="wlp-stat">
+                <span className="wlp-stat-value">{c.show ?? 0}</span>
+                <span className="wlp-stat-label">Shows</span>
+              </div>
+              <div className="wlp-stat">
+                <span className="wlp-stat-value">{c.episode ?? 0}</span>
+                <span className="wlp-stat-label">Episodes</span>
+              </div>
+              <div className="wlp-stat">
+                <span className="wlp-stat-value">{c.video ?? 0}</span>
+                <span className="wlp-stat-label">YouTube videos</span>
+              </div>
+              {stuckCount > 0 && (pagination?.total_pages ?? 1) <= 1 ? (
+                <div className="wlp-stat">
+                  <span className="wlp-stat-value wlp-stat-value--warn">{stuckCount}</span>
+                  <span className="wlp-stat-label">Stuck</span>
+                </div>
+              ) : null}
+            </div>
+          ) : (
+            <p className="pgf-status">
+              Everything you&apos;re hunting down. The automation searches this list every hour.
+            </p>
+          )}
+        </div>
       </header>
 
       {stuckCount > 0 ? (
@@ -275,7 +275,19 @@ export function VideoWishlist({
         </div>
       ) : null}
 
-      <div className="wlp-cmdbar">
+      <div className="pgf-bar wlp-cmdbar">
+        {media !== 'youtube' ? (
+          <button
+            type="button"
+            className={`pgf-pill wlp-chip wlp-chip--warn${failingOn ? ' active' : ''}`}
+            title="Show only what keeps failing to download"
+            aria-pressed={failingOn}
+            onClick={() => onFailing(!failing)}
+          >
+            <span aria-hidden="true">⚠ </span>Failing
+            {failingCount > 0 && <span className="wlp-count">{failingCount}</span>}
+          </button>
+        ) : null}
         <div className="wlp-search">
           <input
             type="text"
@@ -285,17 +297,22 @@ export function VideoWishlist({
             onChange={(event) => onQuery(event.target.value)}
           />
         </div>
-        {media !== 'youtube' ? (
-          <button
-            type="button"
-            className={`wlp-chip wlp-chip--warn${failingOn ? ' active' : ''}`}
-            title="Show only what keeps failing to download"
-            aria-pressed={failingOn}
-            onClick={() => onFailing(!failing)}
-          >
-            <span aria-hidden="true">⚠ </span>Failing
-            {failingCount > 0 && <span className="wlp-count">{failingCount}</span>}
-          </button>
+        {tabLibraries.length > 1 ? (
+          <label className="wlp-sort">
+            Library
+            <select
+              aria-label="Show one library"
+              value={library}
+              onChange={(event) => setLibraryPick({ media, id: Number(event.target.value) })}
+            >
+              <option value={0}>All</option>
+              {tabLibraries.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.name}
+                </option>
+              ))}
+            </select>
+          </label>
         ) : null}
         <label className="wlp-sort">
           Sort
@@ -316,6 +333,12 @@ export function VideoWishlist({
             className="wlp-menu"
             items={[
               {
+                key: 'export',
+                label: 'Export…',
+                title: 'Save the wishlist as CSV or JSON',
+                onSelect: () => setExporting(true),
+              },
+              {
                 key: 'clear',
                 label: 'Clear all',
                 danger: true,
@@ -326,7 +349,7 @@ export function VideoWishlist({
               <button
                 type="button"
                 className="wlp-btn wlp-more"
-                title="Clear all"
+                title="Export, clear all"
                 aria-label="More wishlist actions"
                 {...props}
                 ref={props.ref as (el: HTMLButtonElement | null) => void}
@@ -391,7 +414,7 @@ export function VideoWishlist({
                           key={keyOfMovie(m)}
                           title={m.title}
                           image={sized(m.poster_url || '', 342)}
-                          meta={movieMeta(m)}
+                          meta={movieCardMeta(m)}
                           stuck={VIDEO_STUCK_ZONES.has(zone.kind)}
                           expanded={openKey === keyOfMovie(m)}
                           data={{ tmdb: String(m.tmdb_id) }}
@@ -461,6 +484,13 @@ export function VideoWishlist({
           ) : null}
         </>
       )}
+      {exporting ? (
+        <WishlistExportDialog
+          side="video"
+          initialScope={media === 'movies' ? 'movie' : media === 'tv' ? 'show' : 'all'}
+          onClose={() => setExporting(false)}
+        />
+      ) : null}
     </>
   );
 }

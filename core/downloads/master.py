@@ -210,7 +210,7 @@ def release_year_of(album_context) -> Optional[str]:
     return year if year.isdigit() else None
 
 
-def album_tracks_map_for(db, album_context, artist_context, active_server) -> dict:
+def album_tracks_map_for(db, album_context, artist_context, *, alias_cache=None) -> dict:
     """Album fast path: find the album in the db and map its lowercased track
     titles to their rows, so tracks match inside the one album instead of N
     global searches. Empty when the album isn't in the library."""
@@ -227,8 +227,8 @@ def album_tracks_map_for(db, album_context, artist_context, active_server) -> di
             title=album_name, artist=artist_name,
             confidence_threshold=0.7,
             expected_track_count=total_tracks if total_tracks > 0 else None,
-            server_source=active_server,
             expected_year=release_year_of(album_context),
+            _alias_cache=alias_cache,
         )
         if db_album and album_confidence >= 0.7:
             db_album_tracks = db.get_tracks_by_album(db_album.id)
@@ -278,12 +278,18 @@ def _artist_name_of(artist) -> str:
 
 
 def match_track_in_library(db, track_data, *, album_tracks_map, album_context,
-                           expected_year, album_only, active_server):
+                           expected_year, album_only, alias_cache=None,
+                           server_source=None, include_downloads=True):
     """Is this track already in the library? -> (found, confidence, db_track).
 
     the one ownership answer the download analysis gives, lifted out so the
     album modal can show it before anything is downloaded. album_only is the
     allow-duplicates rule for album downloads: only a copy in THIS album counts.
+
+    owned means a live file in this library (the lookups add that clause
+    themselves), not a row the active media server mapped: scoping to the
+    server called an album SoulSync imported but the server had not scanned
+    missing, the modal said so and Begin Analysis fetched it again.
     """
     track_name = track_data.get('name', '')
     artists = track_data.get('artists', [])
@@ -326,8 +332,8 @@ def match_track_in_library(db, track_data, *, album_tracks_map, album_context,
         for artist in artists:
             db_track, track_confidence = db.check_track_exists(
                 track_name, _artist_name_of(artist), confidence_threshold=0.7,
-                server_source=active_server, album=fallback_album,
-                include_downloads=True,
+                server_source=server_source, album=fallback_album,
+                include_downloads=include_downloads, _alias_cache=alias_cache,
             )
             if db_track and track_confidence >= 0.7:
                 # Re-release gate (5BILLION round 3): the hit came from the
@@ -347,43 +353,76 @@ def match_track_in_library(db, track_data, *, album_tracks_map, album_context,
     for artist in artists:
         db_track, track_confidence = db.check_track_exists(
             track_name, _artist_name_of(artist), confidence_threshold=0.7,
-            server_source=active_server, include_downloads=True,
+            server_source=server_source, include_downloads=include_downloads,
+            _alias_cache=alias_cache,
         )
         if db_track and track_confidence >= 0.7:
             return True, track_confidence, db_track
     return False, 0.0, None
 
 
+def _wishlist_keys(db, profile_id, alias_cache=None) -> set:
+    """the profile's wishlist as presence keys, empty when it can't be read:
+    the mark is a hint, never a reason to fail the preview."""
+    from core.wishlist.presence import load_wishlist_keys
+    try:
+        conn = db._get_connection()
+        try:
+            return load_wishlist_keys(
+                conn.cursor(), profile_id,
+                artist_aliases=lambda name: db._cached_artist_alias_names(name, alias_cache),
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.debug("preview: wishlist keys skipped: %s", e)
+        return set()
+
+
+def _wished(keys, track_data, artist_context) -> bool:
+    """on the wishlist under one of the track's credits or the album artist."""
+    from core.wishlist.presence import presence_key
+    names = [_artist_name_of(a) for a in track_data.get('artists') or []]
+    names.append((artist_context or {}).get('name') or '')
+    return any(presence_key(track_data.get('name', ''), name) in keys for name in names if name)
+
+
 def preview_ownership(db, tracks_json, *, album_context, artist_context, is_album,
-                      profile_id, source, active_server, allow_duplicates) -> list:
+                      profile_id, source, allow_duplicates) -> list:
     """What Begin Analysis would say is owned, without starting anything.
 
     same order of questions as the analysis (saved manual match, then the
-    library), read-only: no batch, no wishlist removal, no downloads. the
-    album modal shows it the moment it opens.
+    library), read-only: no batch, no wishlist removal, no downloads. every
+    download dialog shows it the moment it opens, and a missing track the
+    user already wants says so (in_wishlist).
     """
+    alias_cache = {}
     album_tracks_map = (
-        album_tracks_map_for(db, album_context, artist_context, active_server)
+        album_tracks_map_for(db, album_context, artist_context, alias_cache=alias_cache)
         if is_album else {}
     )
     expected_year = release_year_of(album_context)
+    # the wishlist of the library being worked in (E-12), not the caller's own
+    from core.library_scope import acting_profile_id
+    wished = _wishlist_keys(db, acting_profile_id(profile_id), alias_cache)
     results = []
     for i, track_data in enumerate(tracks_json or []):
         if not isinstance(track_data, dict):
             continue
         track_index = track_data.get('_original_index', i)
         if live_manual_match(db, profile_id, track_data, source):
-            results.append({'track_index': track_index, 'found': True, 'confidence': 1.0})
-            continue
-        found, confidence, _ = match_track_in_library(
-            db, track_data,
-            album_tracks_map=album_tracks_map,
-            album_context=album_context,
-            expected_year=expected_year,
-            album_only=allow_duplicates and is_album,
-            active_server=active_server,
-        )
-        results.append({'track_index': track_index, 'found': found, 'confidence': confidence})
+            found, confidence = True, 1.0
+        else:
+            found, confidence, _ = match_track_in_library(
+                db, track_data,
+                album_tracks_map=album_tracks_map,
+                album_context=album_context,
+                expected_year=expected_year,
+                album_only=allow_duplicates and is_album,
+                alias_cache=alias_cache,
+            )
+        results.append({'track_index': track_index, 'found': found, 'confidence': confidence,
+                        'in_wishlist': not found and _wished(wished, track_data, artist_context)})
     return results
 
 
@@ -649,16 +688,15 @@ def run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: Ma
     1. Runs the analysis.
     2. If missing tracks are found, it automatically queues them for download.
     """
-    # the analysis asks "do we already have this" through the batch owner's
-    # library (#1199); this runs on a pool thread with no request context
-    from core.library_scope import library_scope_for_profile, reset_library_scope, set_library_scope
+    # the analysis asks "do we already have this" through the library the
+    # batch fills (#1199) -- the one decided when it was created, which for an
+    # admin is the library they had selected, not their own. this runs on a
+    # pool thread with no request context.
+    from core.library_scope import batch_scope, library_scope
     with tasks_lock:
-        _batch_profile = (download_batches.get(batch_id) or {}).get('profile_id')
-    _scope_token = set_library_scope(library_scope_for_profile(_batch_profile))
-    try:
+        _batch = dict(download_batches.get(batch_id) or {})
+    with library_scope(batch_scope(_batch)):
         return _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps, serialize)
-    finally:
-        reset_library_scope(_scope_token)
 
 
 def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: MasterDeps,
@@ -673,7 +711,6 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
 
         from database.music_database import MusicDatabase
         db = MusicDatabase()
-        active_server = deps.config_manager.get_active_media_server()
         analysis_results = []
 
         # Get force download flag and album context from batch
@@ -713,6 +750,17 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                     download_batches[batch_id].get('source_playlist_ref') or ''
                 ).strip()
                 batch_skip_acoustid = bool(download_batches[batch_id].get('skip_acoustid', False))
+        # a Library v2 wishlist -- the admin's, or one filling a profile's own
+        # library (#1199) -- carries upgrade intents; asked once, off the lock
+        from core.library_scope import library_scope_for_profile
+        _lib2_wishlist = (int(batch_profile_id or 1) == 1
+                          or library_scope_for_profile(batch_profile_id) == int(batch_profile_id))
+        # an upgrade intent comes only from what the server stored on the
+        # wishlist row, never from the track json this batch was handed (a
+        # client can post that). read here, off the lock (review 5 W2-WD-2)
+        _stored_upgrade_sources = (
+            _stored_wishlist_sources(db, batch_profile_id, tracks_json)
+            if playlist_id == 'wishlist' and _lib2_wishlist else {})
 
         # Most album requests carry one explicit/mirrored profile on the batch.
         # For older/internal callers, recover the same intent from the first
@@ -728,17 +776,14 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             resolve_playlist_folder_mode_for_batch,
             track_exists_in_playlist_folder_from_track_data,
         )
-        if batch_id in download_batches and download_batches[batch_id].get("album_completion_only"):
-            effective_playlist_folder_mode, effective_playlist_name = False, batch_playlist_name
-        else:
-            effective_playlist_folder_mode, effective_playlist_name = resolve_playlist_folder_mode_for_batch(
-                db,
-                playlist_id=str(batch_playlist_id),
-                playlist_name=batch_playlist_name,
-                batch_playlist_folder_mode=batch_playlist_folder_mode,
-                profile_id=batch_profile_id,
-                source=batch_source,
-            )
+        effective_playlist_folder_mode, effective_playlist_name = resolve_playlist_folder_mode_for_batch(
+            db,
+            playlist_id=str(batch_playlist_id),
+            playlist_name=batch_playlist_name,
+            batch_playlist_folder_mode=batch_playlist_folder_mode,
+            profile_id=batch_profile_id,
+            source=batch_source,
+        )
         if effective_playlist_folder_mode and not batch_playlist_folder_mode:
             with tasks_lock:
                 if batch_id in download_batches:
@@ -806,10 +851,12 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         # ALBUM FAST PATH: If this is an album download, try to find the album in the DB first
         # and match tracks within it — faster and more accurate than N global searches
         batch_expected_year = release_year_of(batch_album_context)
+        alias_cache = {}
         album_tracks_map = {}
         if batch_is_album and not force_download_all:
             album_tracks_map = album_tracks_map_for(
-                db, batch_album_context, batch_artist_context, active_server)
+                db, batch_album_context, batch_artist_context,
+                alias_cache=alias_cache)
 
         for i, track_data in enumerate(tracks_json):
             # Use original table index if provided (for partial track selection),
@@ -878,7 +925,7 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                     album_context=batch_album_context,
                     expected_year=batch_expected_year,
                     album_only=allow_duplicates and batch_is_album,
-                    active_server=active_server,
+                    alias_cache=alias_cache,
                 )
 
             analysis_results.append({
@@ -1043,7 +1090,12 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             # Handle auto-initiated wishlist completion even when no missing tracks
             if is_auto_batch and playlist_id == 'wishlist':
                 logger.warning("[Auto-Wishlist] No missing tracks found - calling auto-completion handler to toggle cycle and reschedule")
-                deps.missing_download_executor.submit(deps.process_failed_tracks_to_wishlist_exact_with_auto_completion, batch_id)
+                # the pool thread starts with an empty context, so the batch
+                # owner's scope has to travel with the callable (#1199)
+                from core.library_scope import carrying_scope
+                deps.missing_download_executor.submit(
+                    carrying_scope(deps.process_failed_tracks_to_wishlist_exact_with_auto_completion),
+                    batch_id)
 
             # Organize-by-playlist with NOTHING to download (every track already
             # owned): the batch never enters the download/lifecycle path, so build
@@ -1091,7 +1143,6 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             batch_album_context = batch.get('album_context')
             batch_artist_context = batch.get('artist_context')
             batch_is_album = batch.get('is_album_download', False)
-            batch_album_completion_only = bool(batch.get('album_completion_only', False))
             batch_private_album_bundle = bool(batch.get('album_bundle_private_staging'))
             batch_playlist_folder_mode = batch.get('playlist_folder_mode', False)
             batch_playlist_name = batch.get('playlist_name', 'Unknown Playlist')
@@ -1102,12 +1153,6 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         # owned album would still trigger a release download.
         _bundle_state = _BatchStateAccessImpl()
         _album_bundle_sources = _resolve_album_bundle_sources(deps.config_manager)
-        # Commissary: a release picked in the album release picker - only its
-        # source, carrying the pick (core/commissary/release_picker.py)
-        from core.commissary.release_picker import bundle_pin as _commissary_bundle_pin
-        _pin_source, _pin_kwargs = _commissary_bundle_pin(batch.get('commissary_pinned_release'))
-        if _pin_source:
-            _album_bundle_sources = [_pin_source]
         _album_bundle_staged = batch_private_album_bundle
 
         def _configured_bundle_plugin(source):
@@ -1162,7 +1207,6 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             _duration = expected_release_duration_seconds(tracks_json)
             if _duration:
                 kwargs['expected_duration_seconds'] = _duration
-            kwargs.update(_pin_kwargs or {})  # Commissary: the picked release
             return kwargs or None
 
         def _stamp_terminal_bundle_failure():
@@ -1189,8 +1233,6 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         def _dispatch_bundle_sources(sources):
             """Try an ordered segment. Return True only for a terminal result."""
             nonlocal _album_bundle_staged
-            if batch_album_completion_only:
-                return False
             for source in sources:
                 if _album_bundle_staged:
                     break
@@ -1246,11 +1288,12 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         preflight_source = None
         preflight_tracks = None
         scored_albums = []
+        # every file the album search turned up, kept on the batch so a track
+        # whose download gets quarantined tries the rest before searching again
+        _preflight_pool = []
         _soulseek_bundle_plugin = (
             _configured_bundle_plugin('soulseek')
-            if (_soulseek_bundle_index is not None
-                and not batch_private_album_bundle
-                and not batch_album_completion_only)
+            if _soulseek_bundle_index is not None and not batch_private_album_bundle
             else None
         )
         soulseek_is_source = (
@@ -1258,8 +1301,7 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             and not batch_private_album_bundle
         )
         if (batch_is_album and batch_album_context and batch_artist_context
-                and soulseek_is_source and not batch_private_album_bundle
-                and not _pin_source):  # Commissary: a picked folder needs no pre-flight
+                and soulseek_is_source and not batch_private_album_bundle):
             artist_name = batch_artist_context.get('name', '')
             album_name = batch_album_context.get('name', '')
             if artist_name and album_name:
@@ -1281,6 +1323,7 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                     for aq in album_queries:
                         _sr.info(f"[Album Pre-flight] Trying query: '{aq}'")
                         track_results, album_results = deps.run_async(slsk.search(aq, timeout=30))
+                        _preflight_pool.extend(track_results or [])
                         if album_results:
                             _sr.info(f"[Album Pre-flight] Found {len(album_results)} album results with query: '{aq}'")
                             for ar in album_results:
@@ -1291,6 +1334,8 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                             _sr.info(f"[Album Pre-flight] No album results for query: '{aq}'")
 
                     album_results = list(album_results_by_source.values())
+                    for _ar in album_results:
+                        _preflight_pool.extend(getattr(_ar, 'tracks', None) or [])
                     if album_results:
                         # Score complete folders as releases before falling back to per-track search.
                         scored_albums = []
@@ -1486,6 +1531,14 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
             if batch_id not in download_batches: return
 
             download_batches[batch_id]['phase'] = 'downloading'
+            if _preflight_pool:
+                _seen_pool, _pool = set(), []
+                for _c in _preflight_pool:
+                    _key = (getattr(_c, 'username', None), getattr(_c, 'filename', None))
+                    if _key[0] and _key[1] and _key not in _seen_pool:
+                        _seen_pool.add(_key)
+                        _pool.append(_c)
+                download_batches[batch_id]['preflight_pool'] = _pool[:800]
 
             # Store album pre-flight results on batch for source reuse
             # unless the Soulseek album-bundle path already staged a private
@@ -1587,9 +1640,20 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
 
 
 
+            # #2068: $explicit in an album folder reads the ALBUM's flag, and most
+            # sources only flag tracks. Work it out once over every track of the
+            # album (owned ones included), so the folder is the same for all.
+            batch_album_explicit = None
+            if batch_is_album and batch_album_context:
+                from core.imports.paths import album_explicit_flag
+                batch_album_explicit = album_explicit_flag(
+                    batch_album_context, [r.get('track') or {} for r in analysis_results])
+
             for res in missing_tracks:
                 task_id = str(uuid.uuid4())
                 track_info = res['track'].copy()
+                if batch_album_explicit is not None:
+                    track_info['_album_explicit'] = batch_album_explicit
 
                 # Add explicit album context to track_info for artist album downloads
                 if batch_is_album and batch_album_context and batch_artist_context:
@@ -1678,6 +1742,10 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                             'album_type_locked': bool(shared_album.get('album_type_locked') or s_album.get('album_type_locked')),
                             'images': shared_album.get('images') or s_album.get('images', []),
                             'artists': shared_album.get('artists') or s_album.get('artists', []),
+                            # #2068: the album's own explicit flag when the wish carries one
+                            'explicit': (shared_album.get('explicit')
+                                         if shared_album.get('explicit') is not None
+                                         else s_album.get('explicit')),
                         }
 
                         track_info['_explicit_album_context'] = album_ctx
@@ -1779,14 +1847,60 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
                             _prov_si.get('playlist_name') or batch_playlist_name
                         )
 
+                from core.imports.upgrade_intent import (
+                    CONTEXT_KEY as _UPGRADE_INTENT_KEY,
+                    is_upgrade_intent,
+                    issue_upgrade_intent,
+                )
+                _upgrade_intent = track_info.pop(_UPGRADE_INTENT_KEY, None)
+                if (
+                    not is_upgrade_intent(_upgrade_intent)
+                    and playlist_id == 'wishlist'
+                    and _lib2_wishlist
+                ):
+                    _wishlist_row = str(track_info.get('wishlist_id') or '')
+                    _stored = (_stored_upgrade_sources.get(int(_wishlist_row))
+                               if _wishlist_row.isdigit() else None)
+                    # the row this track names, and only when it is that track
+                    _upgrade_source = (
+                        _stored[1] if _stored
+                        and _stored[0] == str(track_info.get('spotify_track_id') or '')
+                        else {})
+                    if (
+                        isinstance(_upgrade_source, dict)
+                        and _upgrade_source.get('source') == 'library_v2'
+                        and _upgrade_source.get('upgrade_check') is True
+                        and _upgrade_source.get('lib2_track_id')
+                    ):
+                        _upgrade_intent = issue_upgrade_intent(
+                            _upgrade_source['lib2_track_id'], origin='wishlist')
+                    elif (
+                        isinstance(_upgrade_source, dict)
+                        and _upgrade_source.get('job') in ('quality_upgrade', 'quality_upgrade_scan')
+                        and _upgrade_source.get('original_file_path')
+                    ):
+                        # a quality upgrade queued before Library v2, or by a
+                        # migrated finding: the file it replaces names the
+                        # track. without an intent the import treated it as a
+                        # plain download (same format: thrown away as already
+                        # there; a new format: both copies kept)
+                        _upgrade_track = _lib2_track_for_path(
+                            db, _upgrade_source['original_file_path'])
+                        if _upgrade_track:
+                            _upgrade_intent = issue_upgrade_intent(
+                                _upgrade_track, origin='wishlist')
+
                 download_tasks[task_id] = {
                     'status': 'pending', 'track_info': track_info,
+                    'profile_id': batch_profile_id,
                     'playlist_id': playlist_id, 'batch_id': batch_id,
                     'track_index': res['track_index'], 'retry_count': 0,
                     'cached_candidates': [], 'used_sources': set(),
                     'status_change_time': time.time(),
                     'metadata_enhanced': False
                 }
+                if is_upgrade_intent(_upgrade_intent):
+                    download_tasks[task_id][_UPGRADE_INTENT_KEY] = _upgrade_intent
                 download_batches[batch_id]['queue'].append(task_id)
 
         deps.download_monitor.start_monitoring(batch_id)
@@ -1825,3 +1939,44 @@ def _run_full_missing_tracks_process(batch_id, playlist_id, tracks_json, deps: M
         if is_auto_batch and playlist_id == 'wishlist':
             logger.error("[Auto-Wishlist] Master worker error - resetting auto-processing flag")
             deps.reset_wishlist_auto_processing()
+
+
+def _stored_wishlist_sources(db, profile_id, tracks) -> dict:
+    """wishlist row id -> (row key, source_info) as the server stored them,
+    for the rows these tracks name. empty when nothing can be read."""
+    ids = sorted({int(t['wishlist_id']) for t in tracks or []
+                  if isinstance(t, dict) and str(t.get('wishlist_id') or '').isdigit()})
+    out = {}
+    if not ids:
+        return out
+    try:
+        with db._get_connection() as conn:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                rows = conn.execute(
+                    "SELECT id, spotify_track_id, source_info FROM wishlist_tracks"
+                    f" WHERE profile_id=? AND id IN ({','.join('?' * len(chunk))})",
+                    (int(profile_id or 1), *chunk)).fetchall()
+                for row_id, key, raw in rows:
+                    try:
+                        info = json.loads(raw or '{}')
+                    except (TypeError, ValueError):
+                        continue
+                    if isinstance(info, dict):
+                        out[int(row_id)] = (str(key or ''), info)
+    except Exception as exc:  # noqa: BLE001 - unreadable: no upgrade authority
+        logger.debug("stored wishlist sources unreadable: %s", exc)
+    return out
+
+
+def _lib2_track_for_path(db, path):
+    """The Library v2 track whose live file is ``path``, or None."""
+    from contextlib import closing
+    try:
+        with closing(db._get_connection()) as conn:
+            row = conn.execute(
+                "SELECT track_id FROM lib2_track_files WHERE path=? "
+                "AND COALESCE(file_state,'active')='active' LIMIT 1", (str(path),)).fetchone()
+    except Exception:  # noqa: BLE001 - no catalogue: no upgrade authority
+        return None
+    return int(row[0]) if row else None

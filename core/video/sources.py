@@ -17,6 +17,7 @@ import re
 import time
 import threading
 import hashlib
+from datetime import datetime
 from typing import Any, Dict
 
 from utils.logging_config import get_logger
@@ -292,12 +293,6 @@ def _build_source(movies_lib=None, tv_lib=None, *, interactive=False):
     return None
 
 
-def _vlib_tag(item, section_title):
-    """Commissary: remember which server section a scanned item came from."""
-    from core.commissary.video_libraries import tag
-    return tag(item, section_title)
-
-
 def _load_selection():
     """The user's Movies/TV library choice for the VIDEO server (or {})."""
     try:
@@ -306,9 +301,9 @@ def _load_selection():
         if not server:
             return {}
         db = VideoDatabase()
-        # Commissary: with video Libraries, scan every library's section.
-        from core.commissary.video_libraries import scan_selection
-        return scan_selection(db, server, db.get_library_selection(server))
+        # Commissary: extra movie sections too (upstream scans one; any number of TV)
+        from core.commissary.library_migration import movie_sections
+        return movie_sections(db, server, db.get_library_selection(server))
     except Exception:
         logger.exception("video sources: could not load library selection")
         return {}
@@ -439,6 +434,19 @@ def video_server_has_item(media_type, item) -> bool:
         logger.debug("video sources: has_item probe failed", exc_info=True)
         invalidate_video_source_cache()
         return False
+
+
+def server_library_folders():
+    """the folders the picked server libraries read, as the server sees them,
+    or None when the server can't be asked right now"""
+    src = scan_video_source()        # the picked libraries, as a scan reads them
+    if src is None or not hasattr(src, "library_folders"):
+        return None
+    try:
+        return src.library_folders()
+    except Exception:   # noqa: BLE001 - an unreachable server: the caller falls back
+        logger.debug("could not list the server's library folders", exc_info=True)
+        return None
 
 
 def list_video_libraries():
@@ -603,6 +611,17 @@ class PlexVideoSource:
             "tv": [{"title": s.title} for s in self._sections("show")],
         }
 
+    def library_folders(self) -> list:
+        """every folder the picked libraries read, the way plex sees it:
+        [{server, kind ('movie' | 'episode'), library}]"""
+        out = []
+        for kind, plex_kind, name in (("movie", "movie", self._movies_lib),
+                                      ("episode", "show", self._tv_lib)):
+            for s in self._scan_sections(plex_kind, name):
+                for loc in getattr(s, "locations", None) or []:
+                    out.append({"server": str(loc), "kind": kind, "library": s.title})
+        return out
+
     def counts(self, incremental=False) -> dict:
         """Cheap item totals (no full fetch) for the progress bar."""
         m = sum(int(getattr(s, "totalSize", 0) or 0) for s in self._scan_sections("movie", self._movies_lib))
@@ -673,7 +692,7 @@ class PlexVideoSource:
                 items = section.search(sort="addedAt:desc", maxresults=100)   # first run: recent window
             for m in items:
                 try:
-                    yield _vlib_tag(self._movie(m), section.title)  # Commissary
+                    yield self._movie(m)
                 except Exception:
                     logger.exception("Plex: skipping movie %s", getattr(m, "title", "?"))
 
@@ -733,7 +752,7 @@ class PlexVideoSource:
                 try:
                     d = self._show(sh)
                     d["library"] = getattr(section, "title", None) or d.get("library")
-                    yield _vlib_tag(d, section.title)  # Commissary
+                    yield d
                 except Exception:
                     logger.exception("Plex: skipping show %s", getattr(sh, "title", "?"))
 
@@ -865,6 +884,41 @@ class PlexVideoSource:
         except Exception as e:   # noqa: BLE001
             logger.exception("Plex: set_watched failed for %s", server_id)
             return {"ok": False, "error": str(e)}
+
+    # Floor for a full watch-state read: lastViewedAt is set by playing (even
+    # partly) and by marking played, so "viewed since 2000" is every title the
+    # token's user has touched.
+    _WATCH_FLOOR = datetime(2000, 1, 1)
+
+    def iter_watch_state(self, since=None, media_type="all"):
+        """The watch state of the movies and episodes THIS connection's user has
+        touched, in the mapped libraries: {kind, server_id, play_count,
+        last_viewed_at, view_offset_ms}. ``since`` limits it to titles viewed
+        after then (an incremental read); None reads all of them. Used with a
+        member's own token (core.video.member_watch, #1941). Errors raise, so
+        a partial read is never taken for the whole set."""
+        floor = since or self._WATCH_FLOOR
+        media_type = normalize_media_type(media_type)
+        if media_type in ("all", "movie"):
+            for section in self._scan_sections("movie", self._movies_lib):
+                for m in section.search(filters={"lastViewedAt>>": floor},
+                                        sort="lastViewedAt:desc"):
+                    yield self._watch_row("movie", m)
+        if media_type in ("all", "show"):
+            for section in self._scan_sections("show", self._tv_lib):
+                for ep in section.search(libtype="episode",
+                                         filters={"lastViewedAt>>": floor},
+                                         sort="lastViewedAt:desc"):
+                    yield self._watch_row("episode", ep)
+
+    @staticmethod
+    def _watch_row(kind, item) -> dict:
+        """the same three fields _movie / _episode read, for one item."""
+        offset = int(getattr(item, "viewOffset", 0) or 0)
+        return {"kind": kind, "server_id": str(item.ratingKey),
+                "play_count": int(getattr(item, "viewCount", 0) or 0),
+                "last_viewed_at": _iso_dt(getattr(item, "lastViewedAt", None)),
+                "view_offset_ms": offset}
 
     # ── Collections (SoulSync-managed) ────────────────────────────────────────
     def _collection_section(self, kind: str):
@@ -1182,6 +1236,8 @@ class PlexVideoSource:
             "play_count": int(getattr(m, "viewCount", 0) or 0),
             "last_viewed_at": _iso_dt(getattr(m, "lastViewedAt", None)),
             "view_offset_ms": int(getattr(m, "viewOffset", 0) or 0),   # resume position
+            # when it went into Plex (immutable), not when SoulSync first saw it
+            "server_added_at": _iso_dt(getattr(m, "addedAt", None)),
             "genres": self._tags(getattr(m, "genres", None)),
             "runtime_minutes": int(dur / 60000) if dur else None,
             "files": self._part_files(m),
@@ -1275,7 +1331,7 @@ class PlexVideoSource:
 
 # ── Jellyfin ────────────────────────────────────────────────────────────────
 _JF_MOVIE_FIELDS = ("Overview,Path,MediaSources,ProductionYear,OfficialRating,RunTimeTicks,Studios,"
-                    "ProviderIds,Genres,Taglines,CommunityRating,CriticRating,UserData")
+                    "ProviderIds,Genres,Taglines,CommunityRating,CriticRating,DateCreated,UserData")
 _JF_EP_FIELDS = ("Overview,Path,MediaSources,PremiereDate,RunTimeTicks,IndexNumber,ParentIndexNumber,"
                  "ProviderIds,CommunityRating,DateCreated,UserData")
 _JF_SHOW_FIELDS = ("Overview,ProductionYear,OfficialRating,ProviderIds,Genres,Taglines,CommunityRating,"
@@ -1323,6 +1379,35 @@ def _union_jf_episode_delta_series(req, uid, view_id, since, series_items, show_
     except Exception:   # noqa: BLE001 - the episode-level delta is an assist over the series delta
         logger.debug("Jellyfin: episode-level delta failed", exc_info=True)
         return series_items
+
+
+def _stream_langs(streams, kind: str, *, embedded_only: bool = False) -> list:
+    """a jellyfin item's languages for one stream type, in track order, each
+    once. its external .srt files come through as streams too: left out of
+    the embedded subtitle list."""
+    from core.video.subtitles.languages import to_code
+    out: list = []
+    for s in streams or []:
+        if not isinstance(s, dict) or s.get("Type") != kind:
+            continue
+        if embedded_only and s.get("IsExternal"):
+            continue
+        code = to_code(s.get("Language"))
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
+def _jf_resolution(vid) -> Any:
+    """a jellyfin video stream's resolution, bucketed by its width AND height.
+    the height alone misreads every cropped film: a 1920x1038 bluray came out
+    '1038p', which no resolution rank knows, so the file read as Unknown and
+    got flagged for an upgrade (#2025). height only when there is no width."""
+    from core.video.mediainfo import resolution_from_dimensions
+    w, h = vid.get("Width"), vid.get("Height")
+    if w and h:
+        return resolution_from_dimensions(w, h)
+    return (str(h) + "p") if h else None
 
 
 class JellyfinVideoSource:
@@ -1376,6 +1461,22 @@ class JellyfinVideoSource:
             "movies": [{"title": v.get("Name")} for v in self._views("movies")],
             "tv": [{"title": v.get("Name")} for v in self._views("tvshows")],
         }
+
+    def library_folders(self) -> list:
+        """every folder the picked libraries read, the way jellyfin sees it
+        (/Library/VirtualFolders): [{server, kind, library}]"""
+        movies, tv = set(_title_list(self._movies_lib)), set(_title_list(self._tv_lib))
+        out = []
+        for v in self._req("/Library/VirtualFolders") or []:
+            if not isinstance(v, dict):
+                continue
+            name = v.get("Name")
+            kind = "movie" if name in movies else "episode" if name in tv else None
+            if not kind:
+                continue
+            for loc in v.get("Locations") or []:
+                out.append({"server": str(loc), "kind": kind, "library": name})
+        return out
 
     def refresh_sections(self, media_type="all") -> dict:
         """Ask Jellyfin to rescan the selected video libraries (POST /Items/{id}/Refresh)
@@ -1747,13 +1848,16 @@ class JellyfinVideoSource:
             entry = {
                 "relative_path": fpath,
                 "size_bytes": src.get("Size"),
-                "resolution": (str(vid.get("Height")) + "p") if vid.get("Height") else None,
+                "resolution": _jf_resolution(vid),
                 "aspect": vid.get("AspectRatio") or (
                     (vid.get("Width") / vid.get("Height")) if vid.get("Width") and vid.get("Height") else None),
                 "video_codec": vid.get("Codec"),
                 "audio_codec": aud.get("Codec"),
                 "audio_channels": aud.get("Channels"),
                 "runtime_seconds": JellyfinVideoSource._ticks_to_seconds(item.get("RunTimeTicks")),
+                # every track's language, which jellyfin sends with the listing
+                "audio_languages": _stream_langs(streams, "Audio"),
+                "subtitle_languages": _stream_langs(streams, "Subtitle", embedded_only=True),
             }
             # release-name tokens first, then REAL stream facts override them
             entry.update(_format_from_name(fpath))
@@ -1804,7 +1908,7 @@ class JellyfinVideoSource:
                 items = self._paged(path, params)
             for it in items:
                 try:
-                    yield _vlib_tag(self._movie(it), view.get("Name"))  # Commissary
+                    yield self._movie(it)
                 except Exception:
                     logger.exception("Jellyfin: skipping movie %s", it.get("Name", "?"))
 
@@ -1846,6 +1950,8 @@ class JellyfinVideoSource:
             "last_viewed_at": _iso_dt((it.get("UserData") or {}).get("LastPlayedDate")),
             # JF ticks are 100ns units → ms
             "view_offset_ms": int(((it.get("UserData") or {}).get("PlaybackPositionTicks") or 0) // 10_000),
+            # when it went into Jellyfin, not when SoulSync first saw it
+            "server_added_at": _iso_dt(it.get("DateCreated")),
             "genres": it.get("Genres") or [],
             "runtime_minutes": int(ticks / 600_000_000) if ticks else None,
             "files": self._files(it),
@@ -1900,7 +2006,7 @@ class JellyfinVideoSource:
                     # the library (view) it lives in -- anime-marked libraries
                     # make their shows anime
                     d["library"] = view.get("Name") or d.get("library")
-                    yield _vlib_tag(d, view.get("Name"))  # Commissary
+                    yield d
                 except Exception:
                     logger.exception("Jellyfin: skipping show %s", it.get("Name", "?"))
 

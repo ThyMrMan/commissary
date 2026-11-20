@@ -83,6 +83,9 @@ function stub(s: Stub = {}) {
       HttpResponse.json({ downloads: s.downloads ?? [] }),
     ),
     http.get('/api/video/scan/status', () => HttpResponse.json({ state: 'idle' })),
+    // the count tiles' posters: none unless a test says otherwise
+    http.get('/api/video/watchlist', () => HttpResponse.json({ success: true, items: [] })),
+    http.get('/api/video/wishlist', () => HttpResponse.json({ success: true, items: [] })),
     http.get('/api/video/issues/counts', () =>
       HttpResponse.json({ counts: { open: s.issues ?? 0 } }),
     ),
@@ -142,14 +145,25 @@ afterEach(() => {
 });
 
 describe('the music dashboard skeleton', () => {
-  it('is #dashboard-page, so the music styling applies: hero, two columns, footer', async () => {
+  it('is #dashboard-page, so the music styling applies: hero, the room, footer', async () => {
     stub();
     const { container } = mount();
     const page = container.querySelector('#dashboard-page');
     expect(page?.getAttribute('data-media')).toBe('video');
     expect(page?.querySelector(':scope > .dashboard-header.dash-hero')).not.toBeNull();
-    expect(page?.querySelector(':scope > .dash-layout > .dash-main')).not.toBeNull();
-    expect(page?.querySelector(':scope > .dash-layout > aside.dash-side')).not.toBeNull();
+    // the same room as the music dashboard: what to watch, the board, the shelves
+    expect(page?.classList.contains('dash-room')).toBe(true);
+    expect(
+      Array.from(page?.children ?? [])
+        .map((child) => child.className.split(' ')[0])
+        .filter(
+          (name) =>
+            name.startsWith('room-') || name.startsWith('video-board') || name === 'dash-footer',
+        ),
+    ).toEqual(['room-top', 'video-board-wrap', 'room-shelves', 'dash-footer']);
+    // the wrap is what the board measures itself against
+    expect(page?.querySelector('.video-board-wrap > .room-board')).not.toBeNull();
+    expect(page?.querySelector('.dash-side')).toBeNull();
     expect(page?.querySelector(':scope > footer.dash-footer')).not.toBeNull();
     expect(await screen.findByText('8,873')).toBeTruthy();
     expect(screen.getByText('105.7K')).toBeTruthy();
@@ -281,8 +295,8 @@ describe('bands that vanish when empty', () => {
     });
     expect(band.querySelectorAll('.vdn-card')).toHaveLength(4);
     expect(within(band).getByText('and 4 more')).toBeTruthy();
-    // it lives in the rail, between this week and up next
-    expect(band.closest('.dash-side')).not.toBeNull();
+    // it is one of the board's cards
+    expect(band.closest('.room-board')).not.toBeNull();
     expect(within(band).queryByText('Done')).toBeNull();
   });
 
@@ -314,6 +328,58 @@ describe('bands that vanish when empty', () => {
     fireEvent.click(within(band).getByRole('tab', { name: 'Shows' }));
     const left = [...band.querySelectorAll('a.dash-rail-card')];
     expect(left.map((a) => a.getAttribute('href'))).toEqual(['/video-detail/library/show/2']);
+  });
+});
+
+describe('the count tiles carry posters', () => {
+  it('shows the newest watched shows and wished movies, as small posters', async () => {
+    stub();
+    server.use(
+      http.get('/api/video/watchlist', () =>
+        HttpResponse.json({
+          success: true,
+          items: [
+            { poster_url: '/api/video/poster/show/5' },
+            { poster_url: null },
+            { poster_url: 'https://image.tmdb.org/t/p/original/abc.jpg' },
+          ],
+        }),
+      ),
+      http.get('/api/video/wishlist', () => HttpResponse.json({ success: true, items: [] })),
+    );
+    const { container } = mount();
+    const art = await waitFor(() => {
+      const imgs = container.querySelectorAll('.room-tile-art--posters img');
+      if (imgs.length < 2) throw new Error('not yet');
+      return [...imgs].map((img) => img.getAttribute('src'));
+    });
+    // a thumbnail of each, never the full-size art
+    expect(art).toEqual([
+      '/api/video/poster/show/5?w=185',
+      'https://image.tmdb.org/t/p/w185/abc.jpg',
+    ]);
+    // the wishlist tile keeps its slot with nothing in it, so the tiles stay level
+    expect(container.querySelectorAll('.room-tile-art--posters').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('what is downloading comes before what runs next on the board', async () => {
+    stub();
+    const { container } = mount();
+    await waitFor(() => {
+      if (!container.querySelector('.room-board')) throw new Error('not yet');
+    });
+    const css = readFileSync(resolve(process.cwd(), 'static/dashboard-premier.css'), 'utf8');
+    // both take the whole row: side by side they left a sixth of it empty
+    expect(css).toContain(
+      "#dashboard-page.dash-room[data-media='video'] .room-board > [data-card='downloads'],",
+    );
+    const page = readFileSync(
+      resolve(process.cwd(), 'src/routes/dashboard/-video/video-dashboard-page.tsx'),
+      'utf8',
+    );
+    expect(page.indexOf('<DownloadsBand />')).toBeLessThan(
+      page.indexOf('<AutomationsCard compact'),
+    );
   });
 });
 
@@ -425,5 +491,142 @@ describe('the card styles the bands reuse', () => {
     expect(grid).toContain('auto-fill');
     const body = CSS.slice(CSS.indexOf('.vdn-body {'), CSS.indexOf('.vdn-name {'));
     expect(body).toContain('min-width: 0');
+  });
+});
+
+// #2196: the video workers are the admins'. a member's hero has no orb stage,
+// no Manage Workers, and the page never primes the worker buttons (the
+// status routes refuse a member).
+describe('the workers are the admins (#2196)', () => {
+  afterEach(() => {
+    delete window.videoWorkerOrbs;
+    delete window.videoEnrichmentPrime;
+  });
+
+  function spyVanilla() {
+    const refresh = vi.fn();
+    const prime = vi.fn();
+    window.videoWorkerOrbs = { refresh } as never;
+    window.videoEnrichmentPrime = prime;
+    return { refresh, prime };
+  }
+
+  it('a member gets no orbs, no Manage Workers and no worker calls', async () => {
+    stub();
+    const asked: string[] = [];
+    const listen = ({ request }: { request: Request }) => {
+      asked.push(new URL(request.url).pathname);
+    };
+    server.events.on('request:start', listen);
+    const { refresh, prime } = spyVanilla();
+    const { container } = mount({ isAdmin: false });
+    expect(await screen.findByText('8,873')).toBeTruthy();
+    const hero = container.querySelector('[data-video-hero]')!;
+    expect(hero.classList.contains('dash-hero--solo')).toBe(true);
+    expect(container.querySelector('[data-video-orb-stage]')).toBeNull();
+    expect(container.querySelector('[data-video-enrich]')).toBeNull();
+    expect(container.querySelector('[data-video-manage-workers]')).toBeNull();
+    expect(screen.queryByText('Workers resting')).toBeNull();
+    expect(refresh).not.toHaveBeenCalled();
+    expect(prime).not.toHaveBeenCalled();
+    server.events.removeListener('request:start', listen);
+    // the listener heard the page (so an empty list below means something)
+    expect(asked).toContain('/api/video/dashboard');
+    expect(asked.filter((path) => path.startsWith('/api/video/enrichment'))).toEqual([]);
+  });
+
+  it('an admin keeps the stage and primes it', async () => {
+    stub();
+    const { refresh, prime } = spyVanilla();
+    const { container } = mount();
+    expect(
+      container.querySelector('[data-video-hero]')!.classList.contains('dash-hero--solo'),
+    ).toBe(false);
+    expect(
+      container.querySelector('[data-video-orb-stage] [data-video-manage-workers]'),
+    ).not.toBeNull();
+    expect(refresh).toHaveBeenCalled();
+    expect(prime).toHaveBeenCalled();
+  });
+});
+
+// #2207: the server's name and state, when it was scanned, the scans, the
+// poster manager and how much disk the library takes are the admin's. the
+// server leaves size_bytes out of a member's payload; a member's strip is a
+// way into the library page, when they may open it.
+describe("the library strip is the admin's (#2207)", () => {
+  function stubMember() {
+    stub();
+    server.use(
+      http.get('/api/video/dashboard', () =>
+        HttpResponse.json({
+          library: { movies: 8873, shows: 3470, episodes: 105674 },
+          downloads: { active: 0, finished: 0, speed_bps: 0 },
+          watchlist: 978,
+          wishlist: 382,
+          server: 'plex',
+          recent: [],
+        }),
+      ),
+    );
+  }
+
+  afterEach(() => {
+    delete window.SoulSyncVideo;
+  });
+
+  it('a member gets Browse library, no server, no scan, no poster manager, no disk size', async () => {
+    stubMember();
+    window.SoulSyncVideo = { pageAllowed: (id: string) => id === 'video-library' };
+    const asked: string[] = [];
+    const listen = ({ request }: { request: Request }) => {
+      asked.push(new URL(request.url).pathname);
+    };
+    server.events.on('request:start', listen);
+    const { container } = mount({ isAdmin: false });
+    expect(await screen.findByText('8,873')).toBeTruthy();
+    server.events.removeListener('request:start', listen);
+    const strip = container.querySelector('[data-card="library"]')!;
+    expect(within(strip as HTMLElement).getByText('Browse library')).toBeTruthy();
+    expect(strip.textContent).not.toMatch(/plex|scan|poster|repair/i);
+    expect(strip.querySelector('.library-status-more')).toBeNull();
+    expect(screen.queryByText('On disk')).toBeNull();
+    // when the library was scanned is the admin's: never asked
+    expect(asked).not.toContain('/api/video/scan/status');
+  });
+
+  it('Browse library opens the video library', async () => {
+    stubMember();
+    window.SoulSyncVideo = { pageAllowed: () => true };
+    const go = vi.fn();
+    document.addEventListener('soulsync:video-navigate', go);
+    try {
+      const { container } = mount({ isAdmin: false });
+      await screen.findByText('8,873');
+      const strip = container.querySelector('[data-card="library"]') as HTMLElement;
+      fireEvent.click(within(strip).getByText('Browse library'));
+      expect(go).toHaveBeenCalled();
+      expect((go.mock.calls[0][0] as CustomEvent).detail).toEqual({ page: 'video-library' });
+    } finally {
+      document.removeEventListener('soulsync:video-navigate', go);
+    }
+  });
+
+  it('a member who may not open the library has no strip at all', async () => {
+    stubMember();
+    window.SoulSyncVideo = { pageAllowed: () => false };
+    const { container } = mount({ isAdmin: false });
+    await screen.findByText('8,873');
+    expect(container.querySelector('[data-card="library"]')).toBeNull();
+  });
+
+  it('an admin keeps the server, the size, the scan and the poster manager', async () => {
+    stub();
+    const { container } = mount();
+    expect(await screen.findByText('Plex library')).toBeTruthy();
+    expect(screen.getByText('On disk')).toBeTruthy();
+    const strip = container.querySelector('[data-card="library"]') as HTMLElement;
+    expect(within(strip).getByText('Poster manager')).toBeTruthy();
+    expect(within(strip).getByText('Scan')).toBeTruthy();
   });
 });

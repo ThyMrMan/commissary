@@ -275,6 +275,47 @@ AcoustID's `client=` included).
   - Local dev: another project's regular `core` package on the user site path
     shadows SoulSync's namespace `core`; run tests and the scratch server with that
     path removed from `sys.path`.
+- **3.6.8** (2026-11-20, step 2: 3.6.2 - 3.6.8) -> `3.6.8-c.1`. Upstream now covers
+  several fork features, so they were retired rather than merged:
+  - Video Libraries (item 1, item 12, the 3.5.9 wishlist tabs): upstream's own video
+    libraries (3.6.4, #2029: main / 4K / custom, per-library category, trackers,
+    profile, rules) and per-title library choice. `core/commissary/library_migration.py`
+    copies the fork's registry over once on start (marker
+    `commissary_libraries_migrated`): the first Library per kind fills the builtin main
+    (folder setting only if empty), a TV Library on `anime_path` becomes upstream's
+    anime folder, the rest become custom libraries; an `anime` series type marks the
+    server section in `<server>.anime_libraries`; every title's choice (owned, wished,
+    followed) becomes a `video_title_libraries` row. Checked on a copy of the live DB:
+    4 Libraries, 745 titles, integrity ok. The old `root_folders` columns stay, unread.
+    Upstream scans one movie section; the fork keeps the extras in
+    `<server>.movies_libraries_more` (no UI; the migration fills it) and adds them in
+    `core/video/sources._load_selection`.
+  - Import lock (item 7): upstream's padlock (`hands_off`, 3.6.6). A whole-title lock
+    moves over once (`commissary_locks_migrated`); a lock on one season has no upstream
+    equivalent and is dropped. Rename-before-import skips a padlocked title.
+  - Log API-key redaction: upstream redacts in utils/logging_config itself.
+  - Remembering a failed release (item 11, client_retry): upstream's
+    `redownload_failed` blocklists it and grabs the next. The TMDB search half stays.
+  - Track Inspector button, Search page sources picker and album release picker (5b,
+    5c): upstream's Candidate Inspector and release picker. The candidates window's
+    every-source list (5a) and the tracker link stay.
+  - Chat / Support hiding switch: upstream hides them per profile (3.6.4). Until that
+    is set they show again.
+  - Settings is React (3.6.7): the `{Token}` naming help (chips, TRaSH scheme, the
+    server-rendered example) and the rename-before-import switch moved to
+    `webui/src/commissary/naming-panel.tsx`, three lines in
+    library-video-organization.tsx; their routes are api/video/commissary_naming.py.
+    The download folder boxes show a legacy list joined (`webui/src/commissary/
+    download-paths.ts`).
+  - Merged with upstream's own versions: manual search identity (upstream sends
+    `tmdb_id` and year, #2027; the fork's aliases and episode hints add to it);
+    naming facts (upstream's probe stores channels and languages as a count and a
+    list, the `{Token}`s write `7.1` / `EN+JA`); client downloads (upstream returns the
+    job folder; the settle and RAR checks re-inserted); usenet categories (upstream's
+    fix, the fork's test dropped); the import pipeline's Library v2 registration gate
+    (fork tests stub it).
+  - Series type set before a show is owned is adopted after each scan
+    (`title_overrides.adopt_after_scan`, one call in scanner.py).
 
 ## Decisions (2026-10-20)
 

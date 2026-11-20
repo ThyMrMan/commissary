@@ -51,7 +51,7 @@ def test_the_open_list_is_upstreams_own_gate_lists():
 
 
 def test_the_page_hands_the_list_to_the_script():
-    assert '"authOpen": {"get": [' in str(head_html(lambda k, d=None: d))
+    assert '"authOpen": {"get": [' in str(head_html())
 
 
 def test_head_hook_runs_before_the_script():

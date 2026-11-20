@@ -4,9 +4,10 @@
 Watchlist Scanner Service - Monitors watched artists for new releases
 """
 
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Tuple
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
+import json
 import re
 import sqlite3
 import time
@@ -30,6 +31,7 @@ from core.edition_grouping import (
     EDITION_PREFERENCE_ONE_COMPLETE,
     EDITION_PREFERENCE_ONE_STANDARD,
     EDITION_PREFERENCE_VALUES,
+    drop_clean_twins,
     edition_group_key,
     reduce_edition_group,
 )
@@ -260,6 +262,16 @@ def is_live_version(track_name: str, album_name: str = "") -> bool:
             return True
 
     return False
+
+def is_live_album(album_name: str) -> bool:
+    """Is the release itself a live recording, going by its title?
+
+    "MTV Unplugged", "Live at Wembley", "Alive in Concert". A studio album
+    with one "(Live)" bonus track is not: that is a live track (#2082), which
+    ``is_live_version(track_name)`` on the track's own title answers.
+    """
+    return bool(album_name) and is_live_version(album_name)
+
 
 def is_remix_version(track_name: str, album_name: str = "") -> bool:
     """
@@ -528,6 +540,93 @@ def _extract_volume_marker(normalized_name: str):
     return last.group(1) or last.group(2)
 
 
+def library_random_albums(conn, limit: int = 5) -> List[Any]:
+    """A few of the user's OWN releases, for discovery-pool variety.
+
+    Physical active-file evidence is the filter: catalogue provenance alone
+    does not say that the user still has the release.
+    """
+    return conn.execute(
+        """SELECT DISTINCT al.title, ar.name AS artist_name
+             FROM lib2_albums al
+             JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+            WHERE EXISTS (SELECT 1 FROM lib2_tracks t JOIN lib2_track_files f
+                          ON f.track_id=t.id WHERE t.album_id=al.id
+                          AND f.file_state='active' AND TRIM(f.path)<>'')
+            ORDER BY RANDOM()
+            LIMIT ?""",
+        (int(limit),),
+    ).fetchall()
+
+
+def library_artist_genres(conn) -> Dict[str, set]:
+    """``name.lower()`` → the artist's genres, lowercased, for affinity scoring.
+
+    Artists without genres are left out entirely: the callers ask this map
+    whether an artist's genres are *known*, and an empty entry answers yes.
+    """
+    cache: Dict[str, set] = {}
+    for row in conn.execute(
+        "SELECT name, genres FROM lib2_artists "
+        "WHERE name IS NOT NULL AND name <> ''"
+    ).fetchall():
+        try:
+            parsed = json.loads(row["genres"] or "[]")
+        except (TypeError, ValueError):
+            # v2 writes a JSON list; a row that says otherwise is one broken
+            # artist, not a reason to score the whole run without genres.
+            continue
+        genres = {str(g).lower() for g in parsed if g} if isinstance(parsed, list) else set()
+        if genres:
+            cache[str(row["name"]).lower()] = genres
+    return cache
+
+
+def library_owned_and_seed_ids(conn, seed_names) -> Tuple[set, List[str], Dict[str, str]]:
+    """``(owned names, the seeds' provider ids, provider id → name)``.
+
+    ``owned`` is the artists you have music by, as 3.6.1's media-server
+    artists were. lib2_artists also holds featured guests, discography rows
+    and artists from one wishlisted song; calling those owned meant Bon Iver
+    (a verse on folklore) was never recommended (139ba4181 fixed the same for
+    the taste map). The seed ids still come from every row.
+
+    The ids are PROVIDER ids because that is what ``similar_artists``' graph is
+    keyed by (``similar_artists_worker.pick_source_artist_id``), never a
+    catalogue row id. Only Spotify and MusicBrainz have promoted columns in v2;
+    every other provider lives in ``external_ids``, so a seed whose graph was
+    built on its Deezer id is reachable only through there.
+    """
+    from core.library2.provider_ids import parse_external_ids
+
+    owned: set = set()
+    seed_source_ids: List[str] = []
+    seed_id_to_name: Dict[str, str] = {}
+    from core.library2.sql_util import owned_sql
+
+    for row in conn.execute(
+        "SELECT a.name, a.spotify_id, a.musicbrainz_id, a.external_ids, "
+        f"       ({owned_sql('artist', 'a')}) AS has_music FROM lib2_artists a "
+        "WHERE a.name IS NOT NULL AND a.name <> ''"
+    ).fetchall():
+        name = row["name"]
+        lowered = str(name or '').lower()
+        if not lowered:
+            continue
+        if row["has_music"]:
+            owned.add(lowered)
+        if lowered not in seed_names:
+            continue
+        known = parse_external_ids(row["external_ids"])
+        for value in (row["spotify_id"], known.get("itunes"), known.get("deezer"),
+                      row["musicbrainz_id"]):
+            provider_id = str(value or '').strip()
+            if provider_id and provider_id not in seed_id_to_name:
+                seed_source_ids.append(provider_id)
+                seed_id_to_name[provider_id] = name
+    return owned, seed_source_ids, seed_id_to_name
+
+
 def _albums_likely_match(spotify_album: str, lib_album: str, threshold: float = 0.85) -> bool:
     """Return True when two album names plausibly identify the same release.
 
@@ -577,6 +676,48 @@ def _extid_match_is_owned(wanted_album: str, library_album: str, allow_duplicate
     if not wanted_album or not library_album:
         return True   # nothing to compare -> conservative: treat as owned (prior behaviour)
     return _albums_likely_match(wanted_album, library_album)
+
+
+def _watchlist_release_statuses(artist, source, source_artist_id, source_provider):
+    """#2175: (allowed statuses, {group id: statuses} or None) for one artist.
+
+    Only a MusicBrainz catalogue has statuses. Any other source, or every
+    status allowed, asks nothing and keeps nothing out."""
+    from core.release_statuses import effective_statuses, fetch_group_statuses, is_restrictive
+    try:
+        from core.settings import config_manager
+    except Exception:  # noqa: BLE001
+        config_manager = None
+    allowed = effective_statuses(artist, config_manager)
+    if not is_restrictive(allowed):
+        return allowed, None
+    if str(source or source_provider or '').strip().lower() != 'musicbrainz':
+        return allowed, None
+    mbid = (source_artist_id if str(source_provider or source or '').strip().lower() == 'musicbrainz'
+            else None) or getattr(artist, 'musicbrainz_artist_id', None)
+    if not mbid:
+        return allowed, None
+    return allowed, fetch_group_statuses(str(mbid))
+
+
+def _album_statuses_pass(album, album_data, group_statuses, allowed) -> bool:
+    """Does this album's release group get through the status filter? A
+    group the lookup doesn't know passes."""
+    if not group_statuses:
+        return True
+    from core.release_statuses import statuses_pass
+
+    def read(obj, key):
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
+
+    for obj in (album, album_data):
+        for key in ('release_group_id', 'id'):
+            value = str(read(obj, key) or '').strip().lower()
+            if value and value in group_statuses:
+                return statuses_pass(group_statuses[value], allowed)
+    return True
 
 
 def _resolve_edition_preference(explicit_value=None) -> str:
@@ -639,6 +780,19 @@ def _group_albums_by_edition(albums):
             index_by_key[key] = len(groups)
             groups.append([album])
     return groups
+
+
+def _without_clean_twins(albums, prefer_explicit_edition: bool):
+    """Every edition, less the clean copy of an album that is listed
+    uncensored too (#2081: "prefer explicit" only chose between editions once
+    one edition per album was on, so with All editions the "(Clean)" twin was
+    wished for next to the explicit one). Provider order is kept."""
+    albums = list(albums or [])
+    if not prefer_explicit_edition:
+        return albums
+    kept = {id(album) for group in _group_albums_by_edition(albums)
+            for album in drop_clean_twins(group)}
+    return [album for album in albums if id(album) in kept]
 
 
 def _edition_explicit_flag(album_data, tracks) -> bool:
@@ -1803,10 +1957,18 @@ class WatchlistScanner:
                 # and only it runs the normal per-track flow. For "all" each
                 # unit is one album, so the loop below behaves exactly as
                 # before.
+                # #2175: the MusicBrainz statuses this artist lets through, and
+                # each release group's, asked once per artist and only when a
+                # status is kept out and the catalogue is MusicBrainz's
+                allowed_statuses, group_statuses = _watchlist_release_statuses(
+                    artist, source if not isinstance(discography_result, list) else None,
+                    source_artist_id, source_provider)
+
                 if edition_preference != EDITION_PREFERENCE_ALL:
                     album_units = _group_albums_by_edition(albums)
                 else:
-                    album_units = [[album] for album in albums]
+                    album_units = [[album] for album in _without_clean_twins(
+                        albums, prefer_explicit_edition)]
 
                 absolute_index = artist_index_offset + i + 1
                 if scan_state is not None:
@@ -1878,13 +2040,16 @@ class WatchlistScanner:
                         if self._has_placeholder_tracks(tracks):
                             logger.info("Skipping album with placeholder tracks: %s", album_name)
                             continue
-                        if not self._should_include_release(len(tracks), artist):
+                        from core.metadata.release_type import release_type_from_shape, tracklist_runtime_ms
+                        _runtime = tracklist_runtime_ms(list(tracks or []))
+                        if not self._should_include_release(len(tracks), artist, _runtime):
                             # Make the type-filter skip visible — otherwise a user
                             # with "Albums" toggled off just sees missing tracks
                             # with no explanation (Sokhi #815-adjacent: 14 singles,
                             # 0 albums because include_albums was off).
                             _n = len(tracks)
-                            _kind = 'album' if _n >= 7 else ('EP' if _n >= 4 else 'single')
+                            _kind = release_type_from_shape(_n, _runtime)
+                            _kind = 'EP' if _kind == 'ep' else _kind
                             logger.info(
                                 "Skipping %s '%s' (%d tracks) — release type filter "
                                 "(albums=%s, eps=%s, singles=%s) excludes it",
@@ -1892,6 +2057,12 @@ class WatchlistScanner:
                                 getattr(artist, 'include_albums', True),
                                 getattr(artist, 'include_eps', True),
                                 getattr(artist, 'include_singles', True))
+                            continue
+                        if not _album_statuses_pass(album, album_data, group_statuses,
+                                                    allowed_statuses):
+                            logger.info(
+                                "Skipping '%s': MusicBrainz release status filter (%s) excludes it",
+                                album_name, ', '.join(allowed_statuses or ()))
                             continue
 
                         if edition_preference == EDITION_PREFERENCE_ONE_STANDARD and \
@@ -2025,6 +2196,9 @@ class WatchlistScanner:
                     artist_index=absolute_index,
                     total_artists=total_artists_override if total_artists_override is not None else len(watchlist_artists),
                     profile_id=profile_id,
+                    # whose watch row this artist is (an all-profiles scan
+                    # walks everyone's)
+                    owner_profile_id=getattr(artist, 'profile_id', None) or profile_id,
                     albums_checked=albums_processed,
                     new_tracks_found=artist_new_tracks,
                     tracks_added_to_wishlist=artist_added_tracks,
@@ -2643,14 +2817,15 @@ class WatchlistScanner:
         # (some albums legitimately have a track called "Track X" but not most of them)
         return placeholder_count > len(tracks) / 2
 
-    def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist) -> bool:
+    def _should_include_release(self, track_count: int, watchlist_artist: WatchlistArtist,
+                                total_ms: Optional[int] = None) -> bool:
         """
         Check if a release should be included based on user's preferences.
 
-        Categorization:
-        - Singles: 1-3 tracks
-        - EPs: 4-6 tracks
-        - Albums: 7+ tracks
+        Categorization (the store rule):
+        - Singles: 1-3 tracks under 30 minutes
+        - EPs: 4-6 tracks under 30 minutes
+        - Albums: 7+ tracks, or 30 minutes and up (runtime unknown: count alone)
 
         Args:
             track_count: Number of tracks in the release
@@ -2665,16 +2840,14 @@ class WatchlistScanner:
             include_eps = getattr(watchlist_artist, 'include_eps', True)
             include_singles = getattr(watchlist_artist, 'include_singles', True)
 
-            # Determine release type based on track count
-            if track_count >= 7:
-                # This is an album
+            from core.metadata.release_type import release_type_from_shape
+            kind = (release_type_from_shape(track_count, total_ms)
+                    if (track_count or 0) > 0 else 'single')
+            if kind == 'album':
                 return include_albums
-            elif track_count >= 4:
-                # This is an EP (4-6 tracks)
+            if kind == 'ep':
                 return include_eps
-            else:
-                # This is a single (1-3 tracks)
-                return include_singles
+            return include_singles
 
         except Exception as e:
             logger.warning(f"Error checking release inclusion: {e}")
@@ -2732,27 +2905,20 @@ class WatchlistScanner:
                     logger.debug(f"Skipping compilation album: {album_name}")
                     return False
 
-            # Check track content type filters
-            if not include_live:
-                if is_live_version(track_name, album_name):
-                    logger.debug(f"Skipping live version: {track_name}")
-                    return False
-
-            if not include_remixes:
-                if is_remix_version(track_name, album_name):
-                    logger.debug(f"Skipping remix: {track_name}")
-                    return False
-
-            if not include_acoustic:
-                if is_acoustic_version(track_name, album_name):
-                    logger.debug(f"Skipping acoustic version: {track_name}")
-                    return False
-
-            # Check instrumental versions
-            if not include_instrumentals:
-                if is_instrumental_version(track_name, album_name):
-                    logger.debug(f"Skipping instrumental version: {track_name}")
-                    return False
+            # Check track content type filters. one rule set for the scanner,
+            # the Library's auto add and Download Discography (#2082: a live
+            # album and a live track on a studio album are two rules)
+            from core.metadata.discography_filters import content_type_skip_reason
+            skip_reason = content_type_skip_reason(track_name, album_name, {
+                'include_live': include_live,
+                'include_live_tracks': getattr(watchlist_artist, 'include_live_tracks', None),
+                'include_remixes': include_remixes,
+                'include_acoustic': include_acoustic,
+                'include_instrumentals': include_instrumentals,
+            })
+            if skip_reason:
+                logger.debug(f"Skipping {skip_reason} version: {track_name}")
+                return False
 
             # Check custom exclusion terms
             try:
@@ -2816,7 +2982,27 @@ class WatchlistScanner:
         if not names:
             logger.debug("track has no artist credits; including (fail open)")
             return True
-        return track_artist_matches(names, artist_name)
+        if track_artist_matches(names, artist_name):
+            return True
+        return self._deezer_credits_watched_artist(track, album_data, artist_name)
+
+    @staticmethod
+    def _deezer_credits_watched_artist(track, album_data, artist_name) -> bool:
+        """Deezer's tracklist names only a track's first artist, so a release
+        the watched artist co-leads read as someone else's. Ask the album's
+        and the track's own credits before dropping it (#2104)."""
+        def _field(obj, key):
+            return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+        if 'deezer' not in (_field(track, '_source'), _field(album_data, '_source')):
+            return False
+        try:
+            from core.metadata import deezer_credits
+            return deezer_credits.credits_artist(
+                artist_name, album_id=_field(album_data, 'id'), track_id=_field(track, 'id'))
+        except Exception as e:
+            logger.debug(f"deezer credits check failed ({e}); track stays dropped")
+            return False
 
     def is_track_missing_from_library(self, track, album_name: str = None,
                                       edition_preference: str = None) -> bool:
@@ -2963,7 +3149,12 @@ class WatchlistScanner:
                     # When allow_duplicates is on, skip album hint so we get title+artist matches only
                     search_album = None if allow_duplicates else album_name
                     from core.downloads.atomic_album_publish import contains_staging_segment
-                    db_track, confidence = self.database.check_track_exists(query_title, artist_name, confidence_threshold=0.7, server_source=active_server, album=search_album, include_downloads=True, prefer_album=album_name)
+                    # Owned means a live file in the library (the matcher
+                    # requires one), not a mapping on the active server: an
+                    # album SoulSync imported that the server hasn't scanned,
+                    # or a profile folder it doesn't index, read as missing
+                    # and was wishlisted again (the #1952 fix, for the scan).
+                    db_track, confidence = self.database.check_track_exists(query_title, artist_name, confidence_threshold=0.7, server_source=None, album=search_album, include_downloads=True, prefer_album=album_name)
 
                     if db_track and confidence >= 0.7:
                         # #1289: a row whose file is still in atomic-publish
@@ -3091,6 +3282,17 @@ class WatchlistScanner:
                 'is_local': False
             }
             
+            # the artist's owner may still have this (#2166): music on, not
+            # Can't request, the watchlist part on, explicit hidden when it
+            # hides explicit, and a quality they may use. an ask-first owner's
+            # row is a request (the scheduled run only takes approved ones).
+            owner_id = getattr(watchlist_artist, 'profile_id', 1)
+            want = self._owner_gate(owner_id).want(
+                'music', explicit=track_explicit, part='music.watchlist', title=track_name,
+                quality_id=getattr(watchlist_artist, 'quality_profile_id', None))
+            if want.skip:
+                return False
+
             # Add to wishlist with watchlist context (scoped to artist's profile)
             success = self.database.add_to_wishlist(
                 spotify_track_data=spotify_track_data,
@@ -3104,10 +3306,12 @@ class WatchlistScanner:
                     # #831: groups wishlist rows by the scan run that added them.
                     'scan_run_id': scan_run_id or '',
                 },
-                profile_id=getattr(watchlist_artist, 'profile_id', 1),
-                quality_profile_id=getattr(
-                    watchlist_artist, 'quality_profile_id', None
-                ),
+                profile_id=owner_id,
+                # SYNC-01: the watchlist artist's quality profile, not the
+                # global default. The user profile above says WHOSE intent this
+                # is; this says which quality bar the download has to clear.
+                # resolved for the owner: one they may not use is their default
+                quality_profile_id=want.quality_profile_id,
             )
             
             if success:
@@ -3122,6 +3326,22 @@ class WatchlistScanner:
             logger.error(f"Error adding track to wishlist: {track_name}: {e}")
             return False
     
+    def _owner_gate(self, owner_id):
+        """one OwnerGate per owner for this scanner (it re-reads the owner's
+        rights every minute), over the scanner's own database."""
+        from core.owner_gate import OwnerGate
+        gates = self.__dict__.setdefault('_owner_gates', {})
+        key = owner_id if owner_id is not None else 1
+        gate = gates.get(key)
+        if gate is None:
+            def _ctx(pid):
+                from core.permission_store import context_for
+                return context_for(self.database, pid)
+            gate = gates[key] = OwnerGate(key, load_context=_ctx,
+                                          load_profile=lambda pid: self.database.get_profile(pid),
+                                          label='watchlist scan')
+        return gate
+
     def update_artist_scan_timestamp(self, artist) -> bool:
         """Update the last scan timestamp for an artist.
 
@@ -3724,15 +3944,7 @@ class WatchlistScanner:
             logger.info("Adding tracks from database albums to discovery pool...")
             try:
                 with self.database._get_connection() as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT DISTINCT a.title, ar.name as artist_name
-                        FROM albums a
-                        JOIN artists ar ON a.artist_id = ar.id
-                        ORDER BY RANDOM()
-                        LIMIT 5
-                    """)
-                    db_albums = cursor.fetchall()
+                    db_albums = library_random_albums(conn, limit=5)
 
                     logger.info(f"Processing {len(db_albums)} database albums for discovery pool")
 
@@ -4396,24 +4608,16 @@ class WatchlistScanner:
             # Pre-build artist genre cache from local DB for genre affinity scoring
             _artist_genre_cache = {}
             if profile['has_data']:
+                _conn = None
                 try:
-                    import json as _json
                     _conn = self.database._get_connection()
-                    _cur = _conn.cursor()
-                    _cur.execute("SELECT name, genres FROM artists WHERE genres IS NOT NULL AND genres != ''")
-                    for _row in _cur.fetchall():
-                        if not _row[0]:
-                            continue
-                        try:
-                            _parsed = _json.loads(_row[1])
-                            if isinstance(_parsed, list):
-                                _artist_genre_cache[_row[0].lower()] = {g.lower() for g in _parsed if g}
-                        except (ValueError, TypeError):
-                            _artist_genre_cache[_row[0].lower()] = {g.strip().lower() for g in _row[1].split(',') if g.strip()}
-                    _conn.close()
+                    _artist_genre_cache = library_artist_genres(_conn)
                     logger.debug(f"Built genre cache for {len(_artist_genre_cache)} artists")
                 except Exception as e:
                     logger.debug("artist genre cache build failed: %s", e)
+                finally:
+                    if _conn is not None:
+                        _conn.close()
 
             logger.info(f"Curating playlists for sources: {sources_to_process}")
 
@@ -4511,7 +4715,7 @@ class WatchlistScanner:
                                             artist_genres_lower = _artist_genre_cache.get(artist_lower, set())
                                         if artist_genres_lower & profile['top_genres']:
                                             genre_bonus = 10
-                                        # Artist familiarity: boost tracks from artists user listens to
+                                        # Artist familiarity: boost what the user already listens to
                                         if artist_lower in profile['top_artist_names']:
                                             artist_bonus = 15
                                         # Overplay penalty: reduce score for artists user has heard too much
@@ -4930,22 +5134,12 @@ class WatchlistScanner:
             seed_names = {s['name'].lower() for s in seeds}
 
             # Owned-artist set (for exclusion) + the seeds' SOURCE ids (similar_artists.source_artist_id
-            # is a Spotify/iTunes/Deezer/MusicBrainz id, never the internal artists.id). We only need
+            # is a Spotify/iTunes/Deezer/MusicBrainz id, never a catalogue row id). We only need
             # id→name for the SEED ids, since the edge query below is already scoped to them.
-            owned, seed_source_ids, seed_id_to_name = set(), [], {}
             with self.database._get_connection() as conn:
+                owned, seed_source_ids, seed_id_to_name = library_owned_and_seed_ids(
+                    conn, seed_names)
                 cur = conn.cursor()
-                cur.execute("SELECT name, spotify_artist_id, itunes_artist_id, deezer_id, "
-                            "musicbrainz_id FROM artists WHERE name IS NOT NULL AND name != ''")
-                for row in cur.fetchall():
-                    nm = row[0]
-                    lname = (nm or '').lower()
-                    owned.add(lname)
-                    if lname in seed_names:
-                        for sid in (row[1], row[2], row[3], row[4]):
-                            if sid:
-                                seed_source_ids.append(str(sid))
-                                seed_id_to_name[str(sid)] = nm
 
                 # RAW per-seed edges (preserve consensus + similarity_rank). Scoped to the seeds.
                 edges, edge_cols = [], ('source_artist_id', 'similar_artist_name', 'similarity_rank',
@@ -5275,6 +5469,7 @@ class WatchlistScanner:
 
             logger.info(f"Last.fm radio: generating playlists for {len(top_tracks)} top tracks")
 
+            from core import lastfm_fallback
             from core.lastfm_client import LastFMClient
             from core.listenbrainz_manager import ListenBrainzManager
 
@@ -5290,15 +5485,19 @@ class WatchlistScanner:
                     continue
 
                 try:
-                    similar = client.get_similar_tracks(artist_name, track_name, limit=25)
+                    # last.fm first; deezer's artist radio when the key is
+                    # refused (pro only from 1 december 2026) or it has nothing
+                    similar, similar_source = lastfm_fallback.similar_tracks(
+                        artist_name, track_name, limit=25, lastfm=client)
                     if not similar:
                         logger.info(f"Last.fm radio: no similar tracks for '{artist_name} - {track_name}'")
                         continue
 
-                    playlist_mbid = lb_manager.save_lastfm_radio_playlist(track_name, artist_name, similar)
+                    playlist_mbid = lb_manager.save_lastfm_radio_playlist(
+                        track_name, artist_name, similar, source=similar_source)
                     logger.info(
                         f"Last.fm radio: saved '{track_name}' by '{artist_name}' "
-                        f"→ {playlist_mbid} ({len(similar)} tracks)"
+                        f"→ {playlist_mbid} ({len(similar)} tracks from {similar_source})"
                     )
                     generated += 1
                 except Exception as track_err:

@@ -1,8 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { useState } from 'react';
 
-// Commissary: which video Library the next grab is filed into
-import { WishlistLibraryPicker } from '@/commissary/wishlist-libraries';
 import { ActionMenu, type ActionMenuItem } from '@/routes/artist-detail/-ui/action-menu';
 
 import type { VideoEpisode, VideoMovieItem, VideoSeason, VideoShowItem } from '../-video.types';
@@ -28,6 +26,7 @@ import {
   initials,
   isFailingItem,
   liveStatus,
+  movieTarget,
   rowZone,
   showEpisodes,
   sized,
@@ -171,12 +170,13 @@ export function VideoMovieSheet({
   onClose: () => void;
 }) {
   const [showDiag, setShowDiag] = useState(false);
-  const target: VideoActionTarget = { scope: 'movie', tmdb_id: movie.tmdb_id };
+  const target = movieTarget(movie);
   const st = liveStatus(movie);
   const desc = describeVideoRow(movie);
   const stuck = VIDEO_STUCK_ZONES.has(desc.zone);
   const owned = movie.library_id != null;
   const meta = [
+    movie.video_library_name,
     movie.year,
     movie.upgrade_from ? `⇪ from ${movie.upgrade_from}` : owned ? 'In library' : null,
     VIDEO_STATUS[st],
@@ -261,8 +261,6 @@ export function VideoMovieSheet({
           ) : null}
         </section>
       ) : null}
-      {/* Commissary */}
-      <WishlistLibraryPicker kind="movie" tmdbId={movie.tmdb_id} owned={owned} />
       <button
         type="button"
         className="wlp-sheet-remove"
@@ -379,10 +377,6 @@ export function VideoShowSheet({
           actions={actions}
         />
       ))}
-      {/* Commissary */}
-      {!youtube ? (
-        <WishlistLibraryPicker kind="show" tmdbId={show.tmdb_id} owned={show.library_id != null} />
-      ) : null}
       <button
         type="button"
         className="wlp-sheet-remove"

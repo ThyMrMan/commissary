@@ -37,7 +37,10 @@ const ROWS = [
 
 describe('syncHealth', () => {
   it('adds up every playlist with a known total', () => {
-    expect(syncHealth(ROWS)).toEqual({ inLibrary: 336, total: 350, pct: 96, short: 4 });
+    const health = syncHealth(ROWS)!;
+    expect(health).toMatchObject({ inLibrary: 336, total: 350, pct: 96, short: 4 });
+    // every playlist with a total is either whole or short
+    expect(health.complete + health.short).toBe(ROWS.filter((r) => r.coverage).length);
   });
 
   it('rounds DOWN, it never claims more of your playlists than you own', () => {
@@ -65,6 +68,14 @@ describe('railRows', () => {
       row('Also Done', { inLibrary: 9, total: 9, pct: 100 }),
     ];
     expect(railRows(oneShort, false).map((r) => r.name)).toEqual(['Hot Hits']);
+  });
+
+  it('the board asks for five', () => {
+    const many = Array.from({ length: 8 }, (_, n) =>
+      row(`P${n}`, { inLibrary: n, total: 20, pct: n * 5 }),
+    );
+    expect(railRows(many, false, 'missing', () => false, 5)).toHaveLength(5);
+    expect(railRows(many, false)).toHaveLength(3);
   });
 
   it('See all shows every playlist, most missing first', () => {
@@ -243,20 +254,56 @@ describe('the card with playlists', () => {
 
   it('the sort reorders the rows and is remembered', async () => {
     const view = await mount();
-    const select = view.container.querySelector<HTMLSelectElement>('.dash-side-sort select')!;
-    expect(select.value).toBe('missing');
+    // the four sorts are a row of pills, one pressed
+    const pressed = (v: ReturnType<typeof render>) =>
+      v.container.querySelector('.dash-sync-sort[aria-pressed="true"]')?.textContent;
+    const pill = (v: ReturnType<typeof render>, label: string) =>
+      Array.from(v.container.querySelectorAll<HTMLButtonElement>('.dash-sync-sort')).find(
+        (b) => b.textContent === label,
+      )!;
+    expect(
+      Array.from(view.container.querySelectorAll('.dash-sync-sort')).map((b) => b.textContent),
+    ).toEqual(['Most missing', 'Last synced', 'Next run', 'Name']);
+    expect(pressed(view)).toBe('Most missing');
 
-    fireEvent.change(select, { target: { value: 'recent' } });
+    fireEvent.click(pill(view, 'Last synced'));
     expect(names(view)).toEqual(['Zeta Mix', 'Alpha Mix']);
 
-    fireEvent.change(select, { target: { value: 'name' } });
+    fireEvent.click(pill(view, 'Name'));
     expect(names(view)).toEqual(['Alpha Mix', 'Zeta Mix']);
     cleanup();
 
     const again = await mount();
-    expect(again.container.querySelector<HTMLSelectElement>('.dash-side-sort select')!.value).toBe(
-      'name',
+    expect(pressed(again)).toBe('Name');
+  });
+
+  it('says how many of how many, and draws the share as a ring', async () => {
+    const view = await mount();
+    const ring = view.container.querySelector<HTMLElement>('.dash-sync-ring')!;
+    expect(ring.getAttribute('aria-valuenow')).toBe('70');
+    expect(ring.style.getPropertyValue('--pct')).toBe('70%');
+    expect(view.container.querySelector('.dash-sync-of')!.textContent).toBe(
+      '14 of 20playlist tracks are in your library, across 2 playlists',
     );
+  });
+
+  it('each row says what it needs under its name', async () => {
+    const view = await mount();
+    const subs = Array.from(view.container.querySelectorAll('.dash-sync-row')).map((row) => [
+      row.querySelector('.dash-sync-name')?.textContent,
+      row.querySelector('.dash-sync-sub')?.textContent,
+    ]);
+    expect(subs).toEqual([['Alpha Mix', '6 missing']]);
+  });
+
+  it('splits the playlists into whole and short, and shows how much of a row is owned', async () => {
+    const view = await mount();
+    expect(view.container.querySelector('.dash-sync-mixkey')!.textContent).toBe(
+      '1 complete1 missing tracks',
+    );
+    const cover = view.container.querySelector<HTMLElement>('.dash-sync-row .dash-sync-cover')!;
+    expect(cover.querySelector('em')!.textContent).toMatch(/^\d+ of \d+$/);
+    expect(cover.querySelector<HTMLElement>('u')!.style.width).toMatch(/^\d+%$/);
   });
 });
 
@@ -298,7 +345,15 @@ describe('the split sync buttons (#1455)', () => {
         return {
           ok: true,
           json: async () => [
-            { id: 7, name: 'Test List', source: 'spotify', total_count: 10, in_library_count: 4 },
+            // fully checked: coverage needs library_checked_count since review 5 R5-K-1
+            {
+              id: 7,
+              name: 'Test List',
+              source: 'spotify',
+              total_count: 10,
+              in_library_count: 4,
+              library_checked_count: 10,
+            },
           ],
         };
       if (u === '/api/automations')
@@ -361,5 +416,49 @@ describe('the split sync buttons (#1455)', () => {
     fireEvent.click(view.getByLabelText('Sync Test List and download missing tracks'));
     await vi.waitFor(() => expect(posts).toHaveLength(2));
     expect(posts[1].body).toEqual({ skip_wishlist: false });
+  });
+
+  it('syncs an unscheduled mirror without a history entry through its pipeline', async () => {
+    // a mirror with no Auto-Sync automation and no pipeline history
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: unknown, init?: { body?: unknown }) => {
+        const u = String(url);
+        if (u.endsWith('/pipeline/run')) {
+          posts.push({ url: u, body: JSON.parse(String((init as { body?: string })?.body)) });
+          return { ok: true, json: async () => ({}) };
+        }
+        if (u === '/api/mirrored-playlists')
+          return {
+            ok: true,
+            json: async () => [
+              {
+                id: 8,
+                name: 'Feelings',
+                source: 'spotify',
+                total_count: 414,
+                in_library_count: 65,
+                // fully checked: coverage needs library_checked_count since review 5 R5-K-1
+                library_checked_count: 414,
+              },
+            ],
+          };
+        if (u === '/api/automations') return { ok: true, json: async () => [] };
+        if (u.startsWith('/api/sync/history'))
+          return { ok: true, json: async () => ({ entries: [] }) };
+        return { ok: true, json: async () => ({}) };
+      }),
+    );
+    let view!: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<SyncRail />);
+    });
+    await vi.waitFor(() => expect(view.container.querySelector('.dash-sync-act')).not.toBeNull());
+    fireEvent.click(view.container.querySelector('.dash-sync-act')!);
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(posts[0]).toEqual({
+      url: '/api/mirrored-playlists/8/pipeline/run',
+      body: { skip_wishlist: true },
+    });
   });
 });

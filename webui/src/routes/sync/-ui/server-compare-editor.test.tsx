@@ -222,6 +222,55 @@ describe('ServerCompareEditor', () => {
     expect((serverRows[1] as HTMLElement).style.display).toBe('');
   });
 
+  it('marks two source tracks that are one song on the server, and can show only those (#2059)', async () => {
+    payload = {
+      success: true,
+      server_type: 'navidrome',
+      server_track_count: 2,
+      source_track_count: 3,
+      tracks: [
+        TRACKS[0],
+        {
+          match_status: 'matched',
+          source_track: { position: 2, name: 'Money Trees', artist: 'Kendrick' },
+          server_track: { id: 's2', title: 'Money Trees', artist: 'Kendrick' },
+        },
+        {
+          match_status: 'matched',
+          source_track: { position: 3, name: 'Alright (Single)', artist: 'Kendrick' },
+          server_track: { id: 's1', title: 'Alright', artist: 'Kendrick' },
+        },
+      ],
+    };
+    renderEditor();
+    await waitFor(() => expect(screen.getByText('Same song (2)')).toBeInTheDocument());
+    const serverRows = document.querySelectorAll('#server-col-server-scroll .server-track-item');
+    expect(serverRows[0].querySelector('.server-track-shared')?.textContent).toBe(
+      'Same song as #3',
+    );
+    expect(serverRows[1].querySelector('.server-track-shared')).toBeNull();
+    expect(serverRows[2].querySelector('.server-track-shared')?.textContent).toBe(
+      'Same song as #1',
+    );
+    expect(document.querySelector('#server-editor-footer')?.textContent).toBe(
+      '3/3 matched · 2 source tracks are one song on the server, so it holds 1 fewer',
+    );
+
+    fireEvent.click(screen.getByText('Same song (2)'));
+    const sourceRows = document.querySelectorAll('#server-col-source-scroll .server-track-item');
+    expect((sourceRows[0] as HTMLElement).style.display).toBe('');
+    expect((sourceRows[1] as HTMLElement).style.display).toBe('none');
+    expect((sourceRows[2] as HTMLElement).style.display).toBe('');
+    expect((serverRows[1] as HTMLElement).style.display).toBe('none');
+  });
+
+  it('offers no "Same song" pill when nothing is shared', async () => {
+    renderEditor();
+    await waitFor(() => expect(screen.getByText('All (3)')).toBeInTheDocument());
+    expect(document.querySelector('[data-filter="shared"]')).toBeNull();
+    expect(document.querySelector('.server-track-shared')).toBeNull();
+  });
+
   it('paints the stats, the pills and the footer from one count (356-382)', async () => {
     renderEditor();
     await waitFor(() => expect(screen.getByText('Matched')).toBeInTheDocument());
@@ -268,6 +317,54 @@ describe('ServerCompareEditor', () => {
     // 312 + 323: no mirror means the generic label and the clipboard.
     expect(document.querySelector('#server-col-source-label')?.textContent).toBe('Source');
     expect(document.querySelector('#server-col-source-icon')?.textContent).toBe('📋');
+  });
+
+  it('offers to adopt a playlist made outside soulsync, and compares against it after', async () => {
+    const adopted = { id: 31, name: 'Road Trip', source: 'soulsync', sync_name: 'Road Trip' };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (url: string, init?: RequestInit) => {
+        calls.push({ url, body: init?.body ? JSON.parse(init.body as string) : undefined });
+        if (url.includes('/adopt')) {
+          return new Response(
+            JSON.stringify({ success: true, id: 31, name: 'Road Trip', track_count: 3 }),
+          );
+        }
+        if (url === '/api/mirrored-playlists') return new Response(JSON.stringify([adopted]));
+        return new Response(JSON.stringify(payload));
+      }),
+    );
+    const onAdopted = vi.fn();
+    render(
+      <ServerCompareEditor
+        playlist={PLAYLIST}
+        mirrored={null}
+        onBack={vi.fn()}
+        onAdopted={onAdopted}
+      />,
+    );
+    const button = await screen.findByRole('button', { name: 'Adopt into My Playlists' });
+    fireEvent.click(button);
+
+    await waitFor(() => expect(onAdopted).toHaveBeenCalledWith(adopted));
+    const adopt = calls.find((c) => c.url.includes('/adopt'));
+    expect(adopt?.url).toBe('/api/server/playlist/7/adopt');
+    expect(adopt?.body).toEqual({ name: 'Road Trip' });
+  });
+
+  it("never offers to adopt a smart playlist, the server's to build", async () => {
+    render(
+      <ServerCompareEditor
+        playlist={{ ...PLAYLIST, readonly: true }}
+        mirrored={null}
+        onBack={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(document.querySelector('#server-no-source-banner')).not.toBeNull());
+    expect(screen.queryByRole('button', { name: 'Adopt into My Playlists' })).toBeNull();
+    expect(document.querySelector('#server-no-source-banner')?.textContent).toContain(
+      'Read-only on the server',
+    );
   });
 
   it('reports a failed load in the meta line, not as a crash (284-286)', async () => {
@@ -936,5 +1033,30 @@ describe('ServerCompareEditor — unmatch', () => {
     fireEvent.click(document.querySelector('.server-track-unmatch-btn') as Element);
     await waitFor(() => expect(toast).toHaveBeenCalledWith('nope', 'error'));
     expect(document.querySelector('[data-status="extra"]')).toBeNull();
+  });
+});
+
+describe('ServerCompareEditor — tag every song in Plex (wolf39us)', () => {
+  it('tags the playlist with a mood named after it, when the server allows it', async () => {
+    payload = { ...(payload as object), can_tag: true };
+    writePayload = { success: true, tag: 'Road Trip', total: 2 };
+    renderEditor();
+    fireEvent.click(await screen.findByRole('button', { name: 'Tag in Plex' }));
+    const input = screen.getByRole('textbox') as HTMLInputElement;
+    expect(input.value).toBe('Road Trip');
+    fireEvent.change(input, { target: { value: 'mom' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Tag every song' }));
+    await waitFor(() =>
+      expect(calls.find((c) => c.url.endsWith('/tag-mood'))).toEqual({
+        url: '/api/server/playlist/7/tag-mood',
+        body: { name: 'Road Trip', tag: 'mom' },
+      }),
+    );
+  });
+
+  it('is not offered when the server says no (not admin, or not plex)', async () => {
+    renderEditor();
+    await screen.findByRole('button', { name: /Export|M3U/i });
+    expect(screen.queryByRole('button', { name: 'Tag in Plex' })).toBeNull();
   });
 });

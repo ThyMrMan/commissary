@@ -10,6 +10,7 @@
 
     register({
         id: 'api',
+        needs: 'admin',
         title: 'API Reference',
         icon: '🔌',
         pages: [
@@ -19,6 +20,8 @@
             lede: 'One key unlocks the whole public API. Here is how to mint it, send it, and keep it safe.',
             body: `
 # Authentication & API Keys
+
+![API keys are created and revoked in Settings, in the SoulSync API section](api-keys.jpg)
 
 ## How authentication works
 
@@ -37,7 +40,7 @@ The \`Authorization: Bearer <key>\` header is preferred — a key in the query s
 
 **Key metadata.** Each stored key records a \`label\`, a \`scope\`, a visible \`key_prefix\` (\`sk_\` plus the first 8 characters of the raw key), \`created_at\`, and \`last_used_at\`. \`last_used_at\` is refreshed on every authenticated request (persisted to disk at most once every 15 minutes per key, so heavy polling does not rewrite the config file constantly).
 
-**Rate limiting.** The whole \`/api/v1\` blueprint is limited to 60 requests per minute per client IP (Flask-Limiter, keyed on remote address). Exceeding it returns \`429\` with code \`RATE_LIMITED\`.
+**Rate limiting.** The whole \`/api/v1\` blueprint is rate-limited (Flask-Limiter). A request with a valid API key gets 600 requests per minute, counted per key. A request with no key or an invalid key gets 60 per minute per client IP — a bogus key never earns the bigger bucket. Exceeding the limit returns \`429\` with code \`RATE_LIMITED\`.
 
 **Response envelope.** Every response — success or failure — uses the same shape:
 
@@ -174,7 +177,7 @@ curl -X DELETE http://localhost:8008/api/v1/api-keys/123e4567-e89b-12d3-a456-426
 
 ### \`POST /api/v1/api-keys/bootstrap\`
 
-Mint the **first** API key on a fresh install. This is the only public endpoint that works without authentication — and it only works while **zero** keys exist.
+Mint the **first** API key on a fresh install. It needs no key, only while **zero** keys exist, and only for the admin: a signed-in admin session, or any request on a single-profile install with no login or launch PIN. Everyone else gets \`403\`.
 
 **Request body** (\`application/json\`):
 
@@ -221,6 +224,8 @@ curl -X POST http://localhost:8008/api/v1/api-keys/bootstrap \\
             lede: 'Health, statistics, and the live activity feed — the fastest way to check the server is alive.',
             body: `
 # System
+
+![The dashboard: worker orbs, this-week stats and fresh releases, all kept current by the system endpoints](dash-overview.jpg)
 
 ### \`GET /api/v1/system/status\`
 
@@ -372,8 +377,10 @@ curl -H "Authorization: Bearer sk_..." http://localhost:8008/api/v1/system/stats
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is populated only on paginated
-> endpoints (noted per endpoint); elsewhere it is \`null\`. Rate limit: 60
-> requests/minute per IP (\`429\`, code \`RATE_LIMITED\`).
+> endpoints (noted per endpoint); elsewhere it is \`null\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
+
+![The library artist grid — the collection the library endpoints read](lib-standard.jpg)
 
 ## Endpoint reference
 
@@ -1018,9 +1025,11 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\` or \`?page=\` — they take their
 parameters in the JSON body as documented below.
+
+![Catalog search results — the same provider results the search endpoints return](dl-enhanced-search.jpg)
 
 ### \`POST /api/v1/search/tracks\`
 
@@ -1200,9 +1209,11 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\`. \`GET /downloads\` paginates with
 \`limit\`/\`offset\`, not \`page\`.
+
+![The Active Downloads page behind the downloads endpoints, here with no transfers running](dl-manager.jpg)
 
 ### \`GET /api/v1/downloads\`
 
@@ -1437,6 +1448,8 @@ Base path: \`/api/v1\`. Every endpoint requires an API key, sent as an
 \`Authorization: Bearer sk_...\` header (preferred) or as a \`?api_key=\` query
 parameter. An API key acts with admin rights.
 
+![Mirrored playlists on the Playlists page — the playlists these endpoints list, inspect and sync](sync-overview.jpg)
+
 All responses use the standard envelope:
 
 \`\`\`json
@@ -1457,8 +1470,9 @@ not apply.
 
 Cross-cutting facts:
 
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/playlists\`
 
@@ -1646,6 +1660,8 @@ Base path: \`/api/v1\`. Every endpoint requires an API key, sent as an
 \`Authorization: Bearer sk_...\` header (preferred) or as a \`?api_key=\` query
 parameter. An API key acts with admin rights.
 
+![The Watchlist page: the watched artists the watchlist endpoints manage](art-watchlist.jpg)
+
 All responses use the standard envelope:
 
 \`\`\`json
@@ -1667,8 +1683,9 @@ Cross-cutting parameters on these endpoints:
   non-numeric values fall back to 1 (\`api/helpers.py:parse_profile_id\`).
 - **Field selection:** \`?fields=artist_name,source\` trims each returned artist
   object to the named fields (\`api/helpers.py:parse_fields\`).
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/watchlist\`
 
@@ -1822,7 +1839,8 @@ body are touched** (\`api/watchlist.py:update_watchlist_filters\`).
 | include_albums | boolean | no | unchanged | Watch full albums. |
 | include_eps | boolean | no | unchanged | Watch EPs. |
 | include_singles | boolean | no | unchanged | Watch singles. |
-| include_live | boolean | no | unchanged | Watch live releases. |
+| include_live | boolean | no | unchanged | Watch live albums. |
+| include_live_tracks | boolean | no | unchanged | Watch live versions on other releases. Follows include_live until set once. |
 | include_remixes | boolean | no | unchanged | Watch remixes. |
 | include_acoustic | boolean | no | unchanged | Watch acoustic releases. |
 | include_compilations | boolean | no | unchanged | Watch compilations. |
@@ -1914,6 +1932,8 @@ Base path: \`/api/v1\`. Every endpoint requires an API key, sent as an
 \`Authorization: Bearer sk_...\` header (preferred) or as a \`?api_key=\` query
 parameter. An API key acts with admin rights.
 
+![The Wishlist page: the wanted tracks the wishlist endpoints add, remove and process](art-wishlist.jpg)
+
 All responses use the standard envelope:
 
 \`\`\`json
@@ -1939,8 +1959,9 @@ Cross-cutting parameters on these endpoints:
 - **Pagination:** \`?page=\` (default 1, minimum 1) and \`?limit=\` (default 50,
   minimum 1, maximum 200). Non-numeric values fall back to the defaults
   (\`api/helpers.py:parse_pagination\`).
-- **Rate limit:** 60 requests/minute per IP; exceeding it returns \`429\` with
-  code \`RATE_LIMITED\`.
+- **Rate limit:** 600 requests/minute per valid API key; 60/minute per IP
+  when the key is missing or invalid. Exceeding it returns \`429\` with code
+  \`RATE_LIMITED\`.
 
 ### \`GET /api/v1/wishlist\`
 
@@ -2144,13 +2165,15 @@ All endpoints live under \`/api/v1\` and require an API key: send it as an
 \`Authorization: Bearer sk_...\` header (preferred) or as an \`?api_key=sk_...\`
 query parameter. Every response uses the standard envelope
 \`{"success": bool, "data": ..., "error": {"code","message"}|null, "pagination": ...|null}\`.
-Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 These endpoints do not support \`?fields=\`.
 
 This is the inbound music-request flow used by external sources (Discord
 bots, curl, automation): submit a free-text query, SoulSync searches,
 matches, and downloads in the background, and you poll for the outcome —
 or give it a \`notify_url\` and it will POST you when the request settles.
+
+![The Requests page with its Waiting, On the way, Available and Declined filters](profiles-requests.jpg)
 
 ### \`POST /api/v1/request\`
 
@@ -2301,9 +2324,11 @@ curl http://localhost:8008/api/v1/request/3fa85f64-5717-4562-b3fc-2c963f66afa6 \
             body: `
 # Discover API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 The five \`GET\` endpoints that read per-profile discovery state (\`/discover/pool\`, \`/discover/similar-artists\`, \`/discover/recent-releases\`, \`/discover/pool/metadata\`, \`/discover/bubbles\`, \`/discover/bubbles/<snapshot_type>\`) are profile-scoped: send an \`X-Profile-Id\` header or \`?profile_id=\` query parameter (defaults to profile 1 when omitted).
+
+![Discover's front page — the pool, playlists and new releases the discover endpoints expose](disc-hero.jpg)
 
 ### \`GET /api/v1/discover/pool\`
 
@@ -2635,8 +2660,8 @@ curl -H "Authorization: Bearer sk_..." \\
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is \`null\` on all profile endpoints
-> (none are paginated). Rate limit: 60 requests/minute per IP (\`429\`, code
-> \`RATE_LIMITED\`).
+> (none are paginated). Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
 
 ## Endpoint reference
 
@@ -2958,6 +2983,8 @@ curl -X DELETE -H "Authorization: Bearer $API_KEY" \\
             body: `
 # Settings
 
+![The SoulSync API section in Settings, where API keys are generated and the integrations are switched on](api-keys.jpg)
+
 ### \`GET /api/v1/settings\`
 
 Return the current server settings with sensitive values redacted. Safe to log or display the response — no secret ever leaves the server through this endpoint.
@@ -3067,22 +3094,26 @@ curl -X PATCH http://localhost:8008/api/v1/settings \\
 > at \`http://localhost:8008\`. Every response uses the standard envelope
 > \`{"success": true|false, "data": {...}|null, "error": {"code","message"}|null,
 > "pagination": {...}|null}\`. \`pagination\` is \`null\` on all retag endpoints
-> (none are paginated). Rate limit: 60 requests/minute per IP (\`429\`, code
-> \`RATE_LIMITED\`).
+> (none are paginated). Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+> the key is missing or invalid (\`429\`, code \`RATE_LIMITED\`).
+
+![The Preview Retag window — the retag batches the retag endpoints inspect](dash-retag.jpg)
 
 ## Endpoint reference
 
 Retag groups collect files whose metadata needs rewriting — the batches behind
 library-wide tag fixes. The API is read-and-delete only: inspect the groups,
 review what a group caught, delete it when its fixes are done, or clear
-everything at once. Groups themselves are created by the retag worker, not by
-this API.
+everything at once. Groups come from the Library Re-tag job: a group is an
+album with pending Re-tag findings (its \`id\` is the album's id), a track is one
+of those findings (its \`id\` is the finding's id), and deleting a group
+dismisses its findings.
 
 ### The retag group object
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`id\` | int | Group ID |
+| \`id\` | int | Group ID (the album's id) |
 | \`group_type\` | string | Group kind, e.g. \`"album"\` (default) |
 | \`artist_name\` | string | Artist the group belongs to |
 | \`album_name\` | string | Album the group belongs to |
@@ -3098,7 +3129,7 @@ this API.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`id\` | int | Track row ID |
+| \`id\` | int | Track ID (the Re-tag finding's id) |
 | \`group_id\` | int | Owning group ID |
 | \`track_number\` | int \\| null | Track number within the disc |
 | \`disc_number\` | int | Disc number (default \`1\`) |
@@ -3107,7 +3138,7 @@ this API.
 | \`file_format\` | string \\| null | Audio container/codec, e.g. \`"flac"\` |
 | \`spotify_track_id\` | string \\| null | Spotify track ID, when known |
 | \`itunes_track_id\` | string \\| null | iTunes track ID, when known |
-| \`created_at\` | string | When the track row was created |
+| \`created_at\` | string | When the Re-tag finding was raised |
 
 Note: \`?fields=\` trimming and \`?page=\`/\`?limit=\` pagination are **not**
 supported on any retag endpoint.
@@ -3230,7 +3261,9 @@ curl -H "Authorization: Bearer $API_KEY" \\
 
 ### \`DELETE /api/v1/retag/groups/{group_id}\`
 
-Delete one retag group and all of its tracks. **There is no undo.**
+Dismiss one retag group: every pending Re-tag finding of that album. The files
+are not touched; the next Re-tag scan raises a finding again for a file that
+still disagrees with the catalogue.
 
 **Path parameters**
 
@@ -3253,6 +3286,7 @@ Delete one retag group and all of its tracks. **There is no undo.**
 
 | Status | Code | Meaning |
 |--------|------|---------|
+| 404 | \`NOT_FOUND\` | The album has no pending Re-tag findings |
 | 500 | \`RETAG_ERROR\` | Database failure |
 
 **Example**
@@ -3262,26 +3296,13 @@ curl -X DELETE -H "Authorization: Bearer $API_KEY" \\
   http://localhost:8008/api/v1/retag/groups/7
 \`\`\`
 
-**Notes**
-
-- The underlying delete does not check that the group exists first: deleting
-  a nonexistent \`group_id\` still answers \`200\` with the confirmation message.
-  (The \`404\` branch in the route is unreachable with the current database
-  code, which returns success unconditionally.)
-
 ---
 
 ### \`DELETE /api/v1/retag/groups\`
 
-Delete **all** retag groups and their tracks at once. **There is no undo.**
+Dismiss **every** pending Re-tag finding at once.
 
-> [!WARNING]
-> This endpoint is currently broken: it always answers \`500 RETAG_ERROR\`
-> because \`api/retag.py\` calls \`db.clear_all_retag_groups()\`, which does not
-> exist (the database method is \`delete_all_retag_groups()\`). The contract
-> below is the intended behavior once that is fixed.
-
-**Response** — intended \`200\` with the number of groups cleared:
+**Response** — \`200\` with the number of groups (albums) cleared:
 
 \`\`\`json
 {
@@ -3330,9 +3351,9 @@ key):
 
 | Field | Type | Description |
 |-------|------|-------------|
-| \`groups\` | int | Total retag groups (\`COUNT(*)\` on \`retag_groups\`) |
-| \`tracks\` | int | Total retag tracks (\`COUNT(*)\` on \`retag_tracks\`) |
-| \`artists\` | int | Distinct artists (\`COUNT(DISTINCT artist_name)\` on \`retag_groups\`) |
+| \`groups\` | int | Albums with a pending Re-tag finding |
+| \`tracks\` | int | Pending Re-tag findings (one per track) |
+| \`artists\` | int | Distinct artists across those albums |
 
 **Errors**
 
@@ -3355,9 +3376,11 @@ curl -H "Authorization: Bearer $API_KEY" \\
             body: `
 # Cache API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 These endpoints are diagnostic: inspect what SoulSync has cached from MusicBrainz lookups and discovery-provider matching. They are **read-only** — all four are \`GET\` and none of them clear, purge, or otherwise modify the caches. They are not profile-scoped.
+
+![The Metadata Cache card on the Tools page, with its Browse Cache and Cache Health views](dash-metadata-cache.jpg)
 
 ### \`GET /api/v1/cache/musicbrainz\`
 
@@ -3556,9 +3579,11 @@ curl -H "Authorization: Bearer sk_..." \\
             body: `
 # ListenBrainz API — draft documentation
 
-Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. All endpoints require an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). All responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 These endpoints read the ListenBrainz playlists SoulSync has imported or generated. They are not profile-scoped. \`playlist_id\` on the detail endpoint accepts either the internal integer ID or the MusicBrainz playlist MBID.
+
+![A ListenBrainz playlist SoulSync imported, shown in the mirrored Playlists view](sync-listenbrainz.jpg)
 
 ### \`GET /api/v1/listenbrainz/playlists\`
 
@@ -3695,9 +3720,11 @@ curl -H "Authorization: Bearer sk_..." \\
             body: `
 # MetaSync Export API — draft documentation
 
-Base: \`/api/v1\`. Requires an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). Responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 60 requests/minute per IP (\`429\` / \`RATE_LIMITED\`).
+Base: \`/api/v1\`. Requires an API key (\`Authorization: Bearer sk_...\` header or \`?api_key=\` query parameter). Responses use the standard envelope \`{"success", "data", "error", "pagination"}\`. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when the key is missing or invalid (\`429\` / \`RATE_LIMITED\`).
 
 MetaSync is a peer-to-peer metadata network that runs as a SoulSync sidecar. This endpoint is how it reads SoulSync's library: a **read-only**, cursor-paged walk of resolved metadata (artists, albums, tracks). It is not profile-scoped.
+
+![The MetaSync section in Settings — the connection the export endpoint feeds](ms-settings.jpg)
 
 Two things distinguish it from the \`/library\` endpoints:
 
@@ -3819,8 +3846,10 @@ curl -H "Authorization: Bearer sk_..." \\
 
 All endpoints live under \`/api/v1\` and require an API key, sent as an
 \`Authorization: Bearer sk_...\` header or as the \`?api_key=\` query parameter.
-An API key acts with **admin rights**. Rate limit: 60 requests/minute per IP
-(\`429\` with code \`RATE_LIMITED\`).
+An API key acts with **admin rights**. Rate limit: 600 requests/minute per valid API key; 60/minute per IP when
+the key is missing or invalid (\`429\` with code \`RATE_LIMITED\`).
+
+![The video side's Connections settings, where the TMDB and TVDB keys behind the video surface are set](vapi-surfaces.jpg)
 
 ## How the video surface works
 
@@ -4729,6 +4758,8 @@ curl -X POST -H "Authorization: Bearer $API_KEY" \\
 > [!NOTE]
 > These endpoints live **outside** \`/api/v1\` — they are the web UI's own session-authenticated surface and do **not** accept API keys. Call them from an authenticated browser session (export your login cookies and pass \`curl -b cookies.txt\`).
 
+![The Automations overview — the automations these endpoints list, run and read history for](auto-overview.jpg)
+
 | Method | Path | Purpose | Auth |
 |--------|------|---------|------|
 | GET | \`/api/automations\` | List automations for the current profile | session (profile-scoped) |
@@ -4743,7 +4774,8 @@ curl -X POST -H "Authorization: Bearer $API_KEY" \\
 | POST | \`/api/automations/{automation_id}/duplicate\` | Duplicate an automation into your profile | session (profile-scoped) |
 | POST | \`/api/automations/{automation_id}/toggle\` | Enable/disable one automation | session |
 | POST | \`/api/automations/{automation_id}/run\` | Run an automation right now | session (profile-scoped) |
-| GET | \`/api/automations/progress\` | Live progress of running automations | session |
+| GET | \`/api/automations/progress\` | Live progress of running automations. A member gets their own automations' runs only, never a system one | session |
+| GET | \`/api/automations/activity\` | The last 24 hours by automation and the last 7 days by local day. \`?side=video\` for the video side. Returns \`{recent, days, totals}\` | session |
 | GET | \`/api/automations/{automation_id}/history\` | Run history — \`?limit=50&offset=0\` | session |
 | GET | \`/api/scripts\` | Scripts available to the run-script action | session |
 | GET | \`/api/automations/blocks\` | Trigger/action/notification block catalog | session |
@@ -4800,6 +4832,8 @@ Both answer \`{"success": true, "updated": <n>}\`.
 
 SoulSync can act as an MCP server, so an AI app like Claude can search for music, check what you already own, and download things for you.
 
+![The MCP for AI Clients controls sit in the same SoulSync API section as the REST API keys](api-keys.jpg)
+
 ## Turn it on
 
 Go to **Settings > System > SoulSync API > MCP for AI Clients** and tick **Answer MCP requests at /mcp**. While it's off, \`/mcp\` answers \`404\`.
@@ -4846,6 +4880,8 @@ To get a whole album, the client calls \`find_album\` with "Artist - Album" and 
 
 Some request apps only know how to talk to Lidarr. SoulSync can answer as Lidarr, so those apps send their album requests to SoulSync instead. Built for **Singarr** and **MusicSeerr 1.x**. MusicSeerr 2.0 and newer dropped Lidarr support, so it can't connect.
 
+![The Lidarr Compatible API toggle lives in the SoulSync API section in Settings](api-keys.jpg)
+
 ## Turn it on
 
 Go to **Settings > System > SoulSync API > Lidarr Compatible API**:
@@ -4871,6 +4907,45 @@ All under \`/lidarr/api/v1\`: \`system/status\`, \`qualityprofile\`, \`metadatap
 `
         },
         {
+            id: 'api-seerr',
+            title: 'Seerr Compatible API',
+            lede: 'Let Seerr apps like Litefin browse and request movies and shows through SoulSync.',
+            body: `
+# Seerr compatible API
+
+Apps built for Seerr (Jellyseerr, Overseerr) can use SoulSync's video side instead. They browse and search through SoulSync's TMDB data, see what's already in your library, and their movie and show requests land on SoulSync's video wishlist. Built for **Litefin** and its Jellyfin plugin.
+
+## Turn it on
+
+Go to **Settings > System > SoulSync API > Seerr Compatible API**:
+
+1. Tick **Answer as Seerr at /seerr**. While it's off, every \`/seerr\` route answers \`404\`.
+2. Pick **Jellyfin users with no profile request as**.
+
+## Connect the app
+
+In the app, set the Seerr URL to \`http://<host>:8008/seerr\` and paste a SoulSync **admin** API key as the Seerr API key. For Litefin that's the **Seerr Integration** on the Litefin plugin's page in your Jellyfin dashboard. A read key gets \`403\`. The app talks to \`/seerr/api/v1\` like it would to a real Seerr.
+
+## Who asks
+
+Each Jellyfin user requests as the SoulSync profile that picked that Jellyfin user under **Settings > Connections**, else the profile with the same name, else the profile picked above. A profile without the video side can't request, and a kids profile can't request a title over its rating cap.
+
+## What happens
+
+- A profile that can download gets it straight away: a movie goes on its video wishlist, and for a show every aired episode of the seasons asked for that isn't in the library yet. Asking for the newest season also follows the show, so its next episodes come too.
+- A profile that can't download files a video request that waits on the **Requests** page. SoulSync requests pick a whole-show policy, so when the seasons asked for aren't all, the first or the newest, the request asks for every season and the note says which ones were picked. The admin can change it when approving.
+- Request limits apply like they do in SoulSync.
+- A kids profile's rating cap applies everywhere: discover, search, similar, credits and recently added keep only what the library rates under it, and an over-cap title reads as not found.
+- The request list shows the acting user's own requests. An admin sees everyone's.
+- Cards show **Available** when it's in your library, **Partially available** for a show with episodes missing, **Processing** when it's on a wishlist or followed, and **Pending** while a request waits.
+- Downloads use your normal quality profiles. There are no Radarr or Sonarr servers to pick and no separate 4K request.
+
+## Supported routes
+
+All under \`/seerr/api/v1\`: \`status\`, \`auth/me\`, \`user\`, \`discover/trending\`, \`discover/movies\` (plus \`upcoming\`, \`studio\`, \`genre\`), \`discover/tv\` (plus \`upcoming\`, \`network\`, \`genre\`), \`discover/genreslider\`, \`search\`, \`movie\` and \`tv\` (details, \`similar\`, \`recommendations\`), \`person\` (with \`combined_credits\`), \`collection\`, \`request\` (list, create, cancel) and \`media\`. Seerr's watch-later list, outside ratings and Radarr/Sonarr service lists answer empty, since SoulSync doesn't keep them.
+`
+        },
+        {
             id: 'api-legacy',
             title: 'Requests & Profile Admin',
             lede: 'Member download requests, invites, devices, and avatars — the session-authenticated endpoints behind household management.',
@@ -4893,8 +4968,14 @@ Members submit download requests; admins approve or decline them.
 | POST | \`/api/requests/music/decline\` | Decline one request | admin |
 | POST | \`/api/requests/music/withdraw\` | Withdraw your own request | session |
 | DELETE | \`/api/requests/music/{request_id}\` | Delete a request from history | session (own) / admin |
+| POST | \`/api/requests/media/{request_id}/approve\` | Approve an audiobook or podcast episode request | admin / moderator |
+| POST | \`/api/requests/media/{request_id}/decline\` | Decline one, with an optional \`response\` | admin / moderator |
+| POST | \`/api/requests/media/{request_id}/withdraw\` | Withdraw your own waiting one | session |
+| DELETE | \`/api/requests/media/{request_id}\` | Delete a finished one from history | session (own) / admin |
 
 \`POST /api/requests/music/approve\` takes \`{"profile_id": 2, "key": "<request-key>"}\` with an optional \`response\` note (truncated to 500 characters) and answers \`{"success": true, "approved": <n>}\`. \`approve-all\` takes an optional \`profile_id\` — omit it to approve everything pending. \`decline\` takes the same body shape as \`approve\`. \`withdraw\` takes \`{"key": "<request-key>"}\`.
+
+Audiobook and podcast episode requests come from a profile on **Require approval** for them: \`POST /api/audiobooks/wishlist\` and \`POST /api/podcasts/download\` answer \`{"success": true, "requested": true}\` instead of adding or downloading. \`GET /api/requests/music\` lists them as \`pending_media\` and \`media_history\` (each with \`kind\` \`audiobook\` or \`podcast\`), and the counts include them. Approving a book puts it on the requester's audiobook wishlist; approving an episode starts its download.
 
 ## Profile admin
 
@@ -4928,6 +5009,8 @@ Accepting an invite takes \`{"name": "..."}\` (required, ≤40 chars) with optio
             body: `
 SoulSync runs **Socket.IO** on the same host and port as the web UI. Connect with any Socket.IO client — the connection uses your logged-in session, not an API key, so connect from a context where you are authenticated.
 
+![The dashboard updates live over the same Socket.IO connection the events reference describes](dash-overview.jpg)
+
 \`\`\`javascript
 import { io } from "socket.io-client";
 const socket = io("http://localhost:8008");
@@ -4947,17 +5030,17 @@ Every emit below is server → client, pushed from a background thread — none 
 | \`sync:progress\` | S→C | \`{playlist_id, …state}\` | Playlist sync progress. Join \`sync:{id}\` rooms with \`sync:subscribe\`. |
 | \`sync:active\` | S→C | \`{active, syncs}\` | The currently active syncs — broadcast while any sync runs (deliberately unscoped). |
 | \`repair:progress\` | S→C | \`{job_id: state}\` | Library Maintenance job progress; state carries \`status\`, \`progress\`, \`processed\`, \`total\`, \`log\`, \`finished_at\`. |
-| \`automation:progress\` | S→C | \`{automation_id: state}\` | Automation run progress (also pollable via \`GET /api/automations/progress\`). |
-| \`dashboard:stats\` | S→C | system stats | Dashboard numbers refreshed (every 10s): active/finished downloads, download speed, active syncs, uptime, memory. |
-| \`dashboard:db_stats\` | S→C | database info | Database statistics refreshed (every 10s). |
+| \`automation:progress\` | S→C | \`{automation_id: state}\` | Automation run progress (also pollable via \`GET /api/automations/progress\`). Admins get every run; a member only their own automations' runs. |
+| \`dashboard:stats\` | S→C | system stats | Admins only. Server numbers refreshed (every 10s): active/finished downloads, download speed, active syncs, uptime, memory. \`GET /api/system/stats\` is the same, admin only. |
+| \`dashboard:db_stats\` | S→C | database info | Admins only. Database statistics refreshed (every 10s): counts, size, path, scan times. A member's \`GET /api/database/stats\` gives the counts of their own library only. |
 | \`dashboard:activity\` | S→C | \`{activities}\` | New activity feed entry (last 10, every 2s). |
 | \`dashboard:toast\` | S→C | \`{icon, title, subtitle}\` | Toast notification shown in the UI. |
 | \`dashboard:wishlist_count\` | S→C | \`{count}\` | Wishlist count changed (per profile). |
 | \`wishlist:stats\` | S→C | \`{is_auto_processing, active_batches, next_run_in_seconds}\` | Wishlist statistics changed. |
 | \`watchlist:count\` | S→C | \`{success, count, next_run_in_seconds}\` | Watchlist count changed (per profile). |
-| \`status:update\` | S→C | service connectivity flags | System status changed (every 5s): metadata source, Spotify, media server, Soulseek, enrichment, active downloads. |
-| \`activity:update\` | S→C | activity snapshot | Server activity updated — join the \`activity:live\` room with \`activity:subscribe\`. |
-| \`enrichment:{worker}\` | S→C | worker stats | Enrichment worker progress — one event per worker (e.g. \`enrichment:youtube\`). |
+| \`status:update\` | S→C | service connectivity flags | System status changed (every 5s): metadata source, Spotify, media server, Soulseek, enrichment, active downloads. A member's copy has no Spotify ban and no enrichment; the admins get the whole one. |
+| \`activity:update\` | S→C | activity snapshot | Server activity updated — join the \`activity:live\` room with \`activity:subscribe\` (admins only). |
+| \`enrichment:{worker}\` | S→C | worker stats | Enrichment worker progress — one event per worker (e.g. \`enrichment:youtube\`). Admins only, music and video, except \`enrichment:repair\` (the Tools page's maintenance header). |
 | \`tool:logs\` | S→C | \`{logs}\` | Tool output streamed (last 50 activity entries, formatted). |
 | \`tool:metadata\` | S→C | \`{success, status}\` | Metadata tool progress. |
 | \`tool:db-update\` | S→C | db-update state | Database update tool progress. |
@@ -4965,7 +5048,7 @@ Every emit below is server → client, pushed from a background thread — none 
 | \`logs:live\` | S→C | \`{lines, source}\` | Live log lines — admin only, subscribe with \`logs:subscribe\` first. |
 | \`lastfm:import-progress\` | S→C | import state | Last.fm history import progress (per profile). |
 | \`listenbrainz:import-progress\` | S→C | import state | ListenBrainz import progress (per profile). |
-| \`rate-monitor:update\` | S→C | per-service rate limits | API rate-monitor tick. |
+| \`rate-monitor:update\` | S→C | per-service rate limits | Admins only. API rate-monitor tick. |
 | \`chat:room_message\` | S→C | \`{room, messages}\` | New Soulseek chat messages (last 20 decoded). |
 | \`chat:room_protocol\` | S→C | \`{room, events}\` | Soulseek chat protocol events (last 40). |
 | \`chat:unread\` | S→C | \`{pms, users, grew}\` | PM unread count changed. |

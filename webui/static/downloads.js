@@ -595,12 +595,14 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
                         </label>`}
                         ${downloadModalQualityProfileSelectHtml(virtualPlaylistId)}
                     </div>
+                    <p class="music-get-off-note" role="note">Getting music isn't part of your profile. You can still see what's here and what you already have. Ask your admin if you'd like it.</p>
                     <button class="download-control-btn primary" id="begin-analysis-btn-${virtualPlaylistId}" onclick="startMissingTracksProcess('${virtualPlaylistId}')">
                         Begin Analysis
                     </button>
-                    <button class="download-control-btn" id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
+                    <button class="download-control-btn" data-request-action id="add-to-wishlist-btn-${virtualPlaylistId}" onclick="addModalTracksToWishlist('${virtualPlaylistId}')" style="background-color: #9333ea; color: white;">
                         ${typeof wishlistAddLabel === 'function' ? wishlistAddLabel() : 'Add to Wishlist'}
                     </button>
+                    <span class="music-asks-left" data-asks-left aria-live="polite"></span>
                     <button class="download-control-btn danger" id="cancel-all-btn-${virtualPlaylistId}" onclick="cancelAllOperations('${virtualPlaylistId}')" style="display: none;">
                         Cancel All
                     </button>
@@ -618,11 +620,10 @@ async function openDownloadMissingModalForYouTube(virtualPlaylistId, playlistNam
     applyProgressiveTrackRendering(virtualPlaylistId, spotifyTracks.length);
     // Quality Profile selector for this acquisition (P1-01).
     void hydrateDownloadModalQualityProfileSelect(virtualPlaylistId);
+    // a profile that asks first sees what's left of its limit (#2166)
+    if (typeof window.fillMusicAsksLeft === 'function') window.fillMusicAsksLeft(modal);
     modal.style.display = 'flex';
     hideLoadingOverlay();
-    // owned/missing per track straight away, not a column of 'pending' until
-    // Begin Analysis (#1910)
-    void previewModalOwnership(virtualPlaylistId);
 }
 
 async function closeDownloadMissingModal(playlistId) {
@@ -1082,7 +1083,7 @@ function startWishlistCountdownTimer(currentCycle, initialSeconds) {
                     const timerElement = document.getElementById('wishlist-next-auto-timer');
                     if (timerElement) {
                         const countdownText = formatCountdownTime(remainingSeconds);
-                        timerElement.textContent = `Next Auto: ${nextCycleText}${countdownText ? ' in ' + countdownText : ''}`;
+                        timerElement.textContent = `${nextCycleText}${countdownText ? ' in ' + countdownText : ''}`;
                     }
                 }
             } else {
@@ -1117,7 +1118,7 @@ function startWishlistCountdownTimer(currentCycle, initialSeconds) {
                         const timerElement = document.getElementById('wishlist-next-auto-timer');
                         if (timerElement) {
                             const countdownText = formatCountdownTime(remainingSeconds);
-                            timerElement.textContent = `Next Auto: ${newCycleText}${countdownText ? ' in ' + countdownText : ''}`;
+                            timerElement.textContent = `${newCycleText}${countdownText ? ' in ' + countdownText : ''}`;
                         }
                     }
                 } catch (error) {
@@ -1130,7 +1131,7 @@ function startWishlistCountdownTimer(currentCycle, initialSeconds) {
         const timerElement = document.getElementById('wishlist-next-auto-timer');
         if (timerElement) {
             const countdownText = formatCountdownTime(remainingSeconds);
-            timerElement.textContent = `Next Auto: ${nextCycleText}${countdownText ? ' in ' + countdownText : ''}`;
+            timerElement.textContent = `${nextCycleText}${countdownText ? ' in ' + countdownText : ''}`;
         }
     }, 1000); // Update every second
 }
@@ -1299,7 +1300,7 @@ async function cleanupWishlistOverview() {
 async function clearEntireWishlist() {
     console.log('🗑️ clearEntireWishlist() called');
 
-    if (!await showConfirmDialog({ title: 'Clear Wishlist', message: 'WARNING: This will permanently delete ALL tracks from your wishlist.\n\nThis action cannot be undone.\n\nAre you sure you want to continue?', confirmText: 'Clear All', destructive: true })) {
+    if (!await showConfirmDialog({ title: 'Clear Wishlist', message: 'Remove all wishlist entries? Artists without files or a watchlist entry will disappear from Library. Existing files are kept. A manual Sync & Download can request these tracks again.', confirmText: 'Clear All', destructive: true })) {
         console.log('User cancelled confirmation');
         return;
     }
@@ -1353,7 +1354,45 @@ function notifyWishlistChanged() {
 }
 
 
-async function openDownloadMissingWishlistModal(category = null, selectedTrackIds = null) {
+/**
+ * The rows of a wishlist batch already running, from the batch itself (#1982).
+ * Reopening one fetched the wishlist again by the batch's cycle, but a
+ * playlist run's cycle is "playlist", which no wishlist track is, and an
+ * auto run's cycle may have moved on: the modal opened with 0 tracks and an
+ * empty table while 32 downloaded. Each task keeps its row's index, so a row
+ * sits where the status poll looks for it. null when the batch has no tasks
+ * yet (still analysing).
+ */
+async function _wishlistBatchTracks(batchId) {
+    try {
+        const response = await fetch(`/api/playlists/${encodeURIComponent(batchId)}/download_status`);
+        if (!response.ok) return null;
+        const data = await response.json();
+        const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+        if (!tasks.length) return null;
+        const tracks = [];
+        tasks.forEach(task => {
+            const i = Number(task.track_index);
+            if (!Number.isInteger(i) || i < 0) return;
+            const ti = task.track_info || {};
+            const artist = ti.artist || ti.artist_name || '';
+            tracks[i] = {
+                ...ti,
+                name: ti.name || ti.track_name || ti.title || 'Unknown track',
+                artists: Array.isArray(ti.artists) && ti.artists.length ? ti.artists : (artist ? [artist] : []),
+            };
+        });
+        for (let i = 0; i < tracks.length; i++) {
+            if (!tracks[i]) tracks[i] = { name: '…', artists: [] };
+        }
+        return tracks.length ? tracks : null;
+    } catch (e) {
+        console.warn('wishlist batch tracks unavailable', e);
+        return null;
+    }
+}
+
+async function openDownloadMissingWishlistModal(category = null, selectedTrackIds = null, batchId = null) {
     showLoadingOverlay('Loading wishlist...');
     const playlistId = "wishlist"; // Use a consistent ID for wishlist
 
@@ -1379,8 +1418,11 @@ async function openDownloadMissingWishlistModal(category = null, selectedTrackId
     window.currentWishlistCategory = category;
 
     // Fetch actual wishlist tracks from the server
-    let tracks;
-    try {
+    let tracks = batchId ? await _wishlistBatchTracks(batchId) : null;
+    // only the wishlist's own categories filter it; a playlist run's
+    // "playlist" cycle matched no track at all (#1982)
+    if (category !== 'albums' && category !== 'singles') category = null;
+    if (!tracks) try {
         // Build API URL with optional category filter
         const apiUrl = category ? `/api/wishlist/tracks?category=${category}` : '/api/wishlist/tracks';
 
@@ -1472,6 +1514,11 @@ async function openDownloadMissingWishlistModal(category = null, selectedTrackId
                     </div>
                     <div class="download-tracks-table-container">
                         <table class="download-tracks-table">
+                            <!-- fixed layout sizes columns from here: the name takes the room, the rest stay put -->
+                            <colgroup>
+                                <col class="dmt-col-num"><col><col class="dmt-col-artist">
+                                <col class="dmt-col-status"><col class="dmt-col-status"><col class="dmt-col-actions">
+                            </colgroup>
                             <thead>
                                 <tr>
                                     <th>#</th>
@@ -1486,7 +1533,7 @@ async function openDownloadMissingWishlistModal(category = null, selectedTrackId
                                 ${tracks.map((track, index) => `
                                     <tr data-track-index="${index}">
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}<span class="track-name-text">${escapeHtml(track.name)}</span></td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-match-status match-checking" id="match-${playlistId}-${index}">🔍 Pending</td>
                                         <td class="track-download-status" id="download-${playlistId}-${index}">-</td>
@@ -1863,8 +1910,6 @@ async function startMissingTracksProcess(playlistId) {
             requestBody.is_album_download = _isAlbumContext; // false for single track search results
             requestBody.album_context = process.album;   // Full Spotify album object
             requestBody.artist_context = process.artist; // Full Spotify artist object
-            // Commissary: the release picked in Choose Release (commissary-release-picker.js)
-            if (process.commissaryPinnedRelease) requestBody.commissary_pinned_release = process.commissaryPinnedRelease;
             console.log(`🎵 [${_isAlbumContext ? 'Album' : 'Single Track'}] Sending context: ${process.album?.name} by ${process.artist?.name}`);
         } else {
             // For playlists/wishlists, use the virtual playlist name
@@ -1987,40 +2032,49 @@ function isAlbumContextPlaylistId(playlistId) {
 }
 
 // the library half of Begin Analysis, read-only, so the modal opens knowing
-// what's owned instead of a column of 'pending'. nothing is queued.
+// what's owned instead of a column of 'pending'. nothing is queued. a long
+// playlist or wishlist is asked in blocks: no request holds a server thread
+// for the whole list, and the rows fill in as each block answers.
 async function previewModalOwnership(playlistId) {
+    const BLOCK = 200;
     const process = activeDownloadProcesses[playlistId];
     if (!process || !process.tracks?.length) return;
     const isAlbum = isAlbumContextPlaylistId(playlistId);
     const progressText = document.getElementById(`analysis-progress-text-${playlistId}`);
     if (progressText) progressText.textContent = 'Checking your library...';
-    let data = null;
-    try {
-        const response = await fetch(`/api/playlists/${playlistId}/ownership-preview`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                tracks: process.tracks,
-                is_album_download: isAlbum,
-                album_context: isAlbum ? process.album : null,
-                artist_context: isAlbum ? process.artist : null,
-            }),
-        });
-        data = await response.json();
-    } catch (error) {
-        console.debug('ownership preview failed:', error);
+    const results = [];
+    for (let start = 0; start < process.tracks.length; start += BLOCK) {
+        let data = null;
+        try {
+            const response = await fetch(`/api/playlists/${playlistId}/ownership-preview`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    // each row keeps its place in the whole list
+                    tracks: process.tracks.slice(start, start + BLOCK)
+                        .map((track, offset) => ({ ...track, _original_index: start + offset })),
+                    is_album_download: isAlbum,
+                    album_context: isAlbum ? process.album : null,
+                    artist_context: isAlbum ? process.artist : null,
+                }),
+            });
+            data = await response.json();
+        } catch (error) {
+            console.debug('ownership preview failed:', error);
+        }
+        // begin analysis ran (or the modal closed) while we waited: its answer wins
+        if (activeDownloadProcesses[playlistId] !== process || process.status !== 'idle') return;
+        if (!data?.success || !Array.isArray(data.results)) {
+            if (progressText) progressText.textContent = 'Ready to start';
+            return;
+        }
+        updateTrackAnalysisResults(playlistId, data.results);
+        results.push(...data.results);
     }
-    // begin analysis ran (or the modal closed) while we waited: its answer wins
-    if (activeDownloadProcesses[playlistId] !== process || process.status !== 'idle') return;
-    if (!data?.success || !Array.isArray(data.results)) {
-        if (progressText) progressText.textContent = 'Ready to start';
-        return;
-    }
-    updateTrackAnalysisResults(playlistId, data.results);
     // Add to Wishlist reads this so it doesn't queue songs you own (#1910)
-    process.ownedIndices = new Set(data.results.filter(r => r.found).map(r => r.track_index));
-    const found = data.results.filter(r => r.found).length;
-    const missing = data.results.length - found;
+    process.ownedIndices = new Set(results.filter(r => r.found).map(r => r.track_index));
+    const found = results.filter(r => r.found).length;
+    const missing = results.length - found;
     const foundEl = document.getElementById(`stat-found-${playlistId}`);
     const missingEl = document.getElementById(`stat-missing-${playlistId}`);
     if (foundEl) foundEl.textContent = found;
@@ -2037,6 +2091,11 @@ function updateTrackAnalysisResults(playlistId, results) {
     for (const result of results) {
         const matchElement = document.getElementById(`match-${playlistId}-${result.track_index}`);
         if (matchElement) {
+            // the preview marks a missing track the user already wants
+            if (!result.found && result.in_wishlist && window.markWishlistedTrack) {
+                window.markWishlistedTrack(matchElement);
+                continue;
+            }
             matchElement.textContent = result.found ? '✅ Found' : '❌ Missing';
             matchElement.className = `track-match-status ${result.found ? 'match-found' : 'match-missing'}`;
         }
@@ -2092,6 +2151,11 @@ function renderDownloadModalBody(playlistId, tracks, labels = ['Track', 'Artist'
                     </div>
                     <div class="download-tracks-table-container">
                         <table class="download-tracks-table">
+                            <!-- fixed layout sizes columns from here: the name takes the room, the rest stay put -->
+                            <colgroup>
+                                <col class="dmt-col-select"><col class="dmt-col-num"><col><col class="dmt-col-artist">
+                                <col class="dmt-col-duration"><col class="dmt-col-status"><col class="dmt-col-status"><col class="dmt-col-actions">
+                            </colgroup>
                             <thead>
                                 <tr>
                                     <th class="track-select-header">
@@ -2117,7 +2181,7 @@ function renderDownloadModalBody(playlistId, tracks, labels = ['Track', 'Artist'
                                                    onchange="updateTrackSelectionCount('${playlistId}')">
                                         </td>
                                         <td class="track-number">${index + 1}</td>
-                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}${escapeHtml(track.name)}</td>
+                                        <td class="track-name" title="${escapeHtml(track.name)}">${renderModalTrackPlayButton(playlistId, index)}${renderModalTrackPlaylistButton(playlistId, index)}<span class="track-name-text">${escapeHtml(track.name)}</span></td>
                                         <td class="track-artist" title="${escapeHtml(formatArtists(track.artists))}">${escapeHtml(formatArtists(track.artists))}</td>
                                         <td class="track-duration">${formatDuration(track.duration_ms)}</td>
                                         <td class="track-match-status match-checking" id="match-${playlistId}-${index}">🔍 Pending</td>
@@ -2140,9 +2204,7 @@ function renderModalTrackPlayButton(playlistId, trackIndex) {
 // the add-to-playlist picker lives in the react bundle (features/playlists),
 // so this only hands it the row's artist + title
 function renderModalTrackPlaylistButton(playlistId, trackIndex) {
-    return `<button class="modal-track-play-btn modal-track-add-btn" onclick="event.stopPropagation(); addDownloadModalTrackToPlaylist('${escapeForInlineJs(playlistId)}', ${trackIndex}, this)" title="Add to playlist" aria-label="Add to playlist"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z"/></svg></button>`
-        // Commissary: search every source for this track (commissary-track-inspector.js)
-        + (typeof globalThis.commissaryInspectButton === 'function' ? globalThis.commissaryInspectButton(playlistId, trackIndex) : '');
+    return `<button class="modal-track-play-btn modal-track-add-btn" onclick="event.stopPropagation(); addDownloadModalTrackToPlaylist('${escapeForInlineJs(playlistId)}', ${trackIndex}, this)" title="Add to playlist" aria-label="Add to playlist"><svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M14 10H3v2h11v-2zm0-4H3v2h11V6zm4 8v-4h-2v4h-4v2h4v4h2v-4h4v-2h-4zM3 16h7v-2H3v2z"/></svg></button>`;
 }
 
 function addDownloadModalTrackToPlaylist(playlistId, trackIndex, button) {
@@ -3672,10 +3734,6 @@ function processModalStatusUpdate(playlistId, data) {
                 }
             } else if (actionsEl && ['completed', 'failed', 'cancelled', 'not_found', 'post_processing'].includes(task.status)) {
                 actionsEl.innerHTML = '-'; // No actions available for terminal or processing states
-                // Commissary: a failed row says it can be picked by hand (commissary-track-inspector.js)
-                if (typeof window.commissarySourcesButton === 'function') {
-                    actionsEl.innerHTML = window.commissarySourcesButton(task, isQuarantinedTask) || '-';
-                }
             }
         });
 
@@ -3815,6 +3873,9 @@ function processModalStatusUpdate(playlistId, data) {
                 if (process.status !== 'complete') {
                     process.status = 'complete';
                     updatePlaylistCardUI(playlistId); // Update card to show ready for review
+                    // a wishlist run that had nothing to start says why (an empty
+                    // list, or requests still waiting for approval)
+                    if (isWishlist && data.error) showToast(data.error, 'info');
                     _announceDownloadsFinished(playlistId, completedCount);
 
                     // Update YouTube playlist phase to 'download_complete' if this is a YouTube playlist
@@ -4853,35 +4914,6 @@ function updateModalSyncProgress(playlistId, progress) {
 // declared again in wishlist-tools.js, which loads after this file, so those
 // copies won. The live ones are what was ported.
 
-async function loadArtistsData() {
-    try {
-        const response = await fetch(API.artists);
-        const data = await response.json();
-
-        const artistsGrid = document.getElementById('artists-grid');
-        if (data.artists && data.artists.length) {
-            artistsGrid.innerHTML = data.artists.map(artist => `
-                <div class="artist-card">
-                    <div class="artist-image">
-                        ${artist.image ?
-                    `<img src="${artist.image}" alt="${escapeHtml(artist.name)}" />` :
-                    '<div class="artist-placeholder">🎵</div>'
-                }
-                    </div>
-                    <div class="artist-info">
-                        <div class="artist-name">${escapeHtml(artist.name)}</div>
-                        <div class="artist-albums">${artist.album_count || 0} albums</div>
-                    </div>
-                </div>
-            `).join('');
-        } else {
-            artistsGrid.innerHTML = '<div class="no-artists">No artists found</div>';
-        }
-    } catch (error) {
-        console.error('Error loading artists data:', error);
-        document.getElementById('artists-grid').innerHTML = '<div class="error">Error loading artists</div>';
-    }
-}
 
 // ===============================
 // UTILITY FUNCTIONS
@@ -4913,7 +4945,26 @@ const _notifState = {
     pending: [],         // toasts awaiting the fire-and-forget journal flush
     flushTimer: null,
     sysStats: null,      // last dashboard:stats frame — feeds the tray's system footer
+    seeded: false,       // the panel was filled from the server journal once
+    jobsOpen: false,     // Running now shows every job, not the first three
+    openFamilies: {},    // runs of like notes the user opened up
+    clockTimer: null,
 };
+
+// ── who is looking ───────────────────────────────────────────────────────────
+// the panel is everyone's: their own notes, their own downloads, their own
+// automations and imports. what the server is doing (system numbers, health,
+// library scans, repair, the wishlist run, video jobs, other people's syncs)
+// is the admins' (#2170). the server refuses those feeds to a member too; this
+// keeps the panel from asking, and from drawing frames the socket still sends.
+// the same rule the server activity button uses (shell/server-activity.ts).
+function _notifViewerIsAdmin() {
+    let ctx = null;
+    try {
+        ctx = typeof getCurrentProfileContext === 'function' ? getCurrentProfileContext() : null;
+    } catch (e) { ctx = null; }
+    return !!ctx && (ctx.isAdmin === true || ctx.profileId === 1);
+}
 
 // ── system status in the tray ────────────────────────────────────────────
 // The dashboard's System Stats strip retired (Boulder: telemetry belongs
@@ -4933,31 +4984,68 @@ window.addEventListener('ss:dashboard-stats', function (e) {
 function _updateNotifDlBadge() {
     const el = document.getElementById('notif-bell-dl');
     if (!el) return;
-    const n = (_notifState.sysStats && _notifState.sysStats.active_downloads) || 0;
+    // the server-wide download count is an admin's number
+    const n = (_notifViewerIsAdmin() && _notifState.sysStats && _notifState.sysStats.active_downloads) || 0;
     el.textContent = n > 99 ? '99+' : n;
     el.style.display = n > 0 ? '' : 'none';
 }
 
 function _notifSysHTML() {
     const s = _notifState.sysStats;
-    if (!s) return '';
+    if (!s || !_notifViewerIsAdmin()) return '';
     const bits = [];
     const dl = s.active_downloads || 0;
-    bits.push('<span class="notif-sys-item notif-sys-item--link" ' +
+    bits.push('<button type="button" class="notif-sys-item notif-sys-item--link" ' +
         'onclick="navigateToPage(\'active-downloads\')" title="Open the download manager">' +
-        '⬇ ' + dl + ' active' +
+        _notifGlyphs.down + '<b>' + dl + '</b> downloading' +
         (dl > 0 && s.download_speed ? ' · ' + _escToast(String(s.download_speed)) : '') +
-        '</span>');
-    if (s.uptime) bits.push('<span class="notif-sys-item" title="Application runtime">⏱ ' + _escToast(String(s.uptime)) + '</span>');
+        '</button>');
+    if (s.uptime) bits.push('<span class="notif-sys-item" title="Application runtime">' + _notifGlyphs.clock + 'up <b>' + _escToast(String(s.uptime)) + '</b></span>');
     if (s.memory_usage) {
         bits.push('<span class="notif-sys-item" title="System memory' +
-            (s.process_memory ? ' — SoulSync uses ' + _escAttr(String(s.process_memory)) : '') + '">▦ ' +
-            _escToast(String(s.memory_usage)) + '</span>');
+            (s.process_memory ? ' — SoulSync uses ' + _escAttr(String(s.process_memory)) : '') + '">' + _notifGlyphs.chip + 'memory <b>' +
+            _escToast(String(s.memory_usage)) + '</b></span>');
     }
-    return bits.join('<span class="notif-sys-sep">·</span>');
+    return bits.join('');
+}
+
+// ── whose panel this is ──────────────────────────────────────────────────────
+// the panel's memory (notes, the system numbers) belongs to the profile it was
+// filled for. switching profile without a reload used to leave the last
+// profile's notes and an admin's uptime/memory footer standing in a member's
+// panel (#2191): a new profile starts it over, from its own journal.
+let _notifProfileId;
+window.addEventListener('ss:webui-profile-context-changed', function () {
+    let ctx = null;
+    try {
+        ctx = typeof getCurrentProfileContext === 'function' ? getCurrentProfileContext() : null;
+    } catch (e) { ctx = null; }
+    const id = ctx ? ctx.profileId : null;
+    if (_notifProfileId === undefined) { _notifProfileId = id; return; }
+    if (id === _notifProfileId) return;
+    _notifProfileId = id;
+    _notifResetForProfile();
+});
+
+function _notifResetForProfile() {
+    _notifState.history = [];
+    _notifState.unreadCount = 0;
+    _notifState.pending = [];
+    _notifState.sysStats = null;
+    _notifState.seeded = false;
+    _notifState.openFamilies = {};
+    try { _notifHealth = null; } catch (e) { /* not set up yet */ }
+    _updateNotifBadge();
+    _updateNotifDlBadge();
+    const host = document.querySelector('[data-notif-sys]');
+    if (host) host.innerHTML = _notifSysHTML();
+    if (_notifState.panelOpen) _renderNotifFeed();
+    _seedNotifPanelFromJournal();
+    _seedNotifSys();
 }
 
 function _seedNotifSys() {
+    if (!_notifViewerIsAdmin()) return;
     fetch('/api/system/stats').then(r => r.ok ? r.json() : null).then(data => {
         if (!data) return;
         _notifState.sysStats = data;
@@ -4988,7 +5076,77 @@ function _queueNotifJournal(type, message) {
 }
 const _recentToastKeys = new Map();
 
-const _notifIcons = { success: '✓', error: '✕', warning: '⚠', info: 'ℹ' };
+// ── glyphs ───────────────────────────────────────────────────────────────────
+// drawn, not typed: ✓ ✕ ⚠ ℹ came out of whatever font had them, at four weights
+const _NOTIF_SVG = (d) => `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false">${d}</svg>`;
+const _notifIcons = {
+    success: _NOTIF_SVG('<path d="M5 12.5l4.5 4.5L19 7.5"/>'),
+    error: _NOTIF_SVG('<path d="M6 6l12 12M18 6L6 18"/>'),
+    warning: _NOTIF_SVG('<path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17.2v.3"/>'),
+    info: _NOTIF_SVG('<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.6v.3"/>'),
+};
+const _notifGlyphs = {
+    history: _NOTIF_SVG('<path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/>'),
+    clear: _NOTIF_SVG('<path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13"/>'),
+    close: _NOTIF_SVG('<path d="M6 6l12 12M18 6L6 18"/>'),
+    search: _NOTIF_SVG('<circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>'),
+    down: _NOTIF_SVG('<path d="M12 4v12M7 11l5 5 5-5M5 20h14"/>'),
+    clock: _NOTIF_SVG('<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>'),
+    chip: _NOTIF_SVG('<rect x="6" y="6" width="12" height="12" rx="2"/><path d="M9 2v4M15 2v4M9 18v4M15 18v4M2 9h4M2 15h4M18 9h4M18 15h4"/>'),
+};
+// what each kind is called where a symbol alone would not say it
+const _NOTIF_KIND_LABEL = { success: 'Done', error: 'Problem', warning: 'Warning', info: 'Info' };
+
+// ── what a note is about ─────────────────────────────────────────────────────
+// A file path inside a message wraps across three lines and pushes the reason
+// off the end. The note shows the file's NAME in the sentence and keeps the
+// whole path on its own line, cut from the left so the end stays readable, with
+// a button to copy it.
+const _NOTIF_PATH_RE = /(?:[A-Za-z]:\\|\\\\|\/)[^\s"'<>|:*?]+(?:[\\/][^"'<>|:*?\n]+?)*\.[A-Za-z0-9]{2,5}(?=$|[\s:,;)"'])/;
+
+function _notifPathOf(message) {
+    const hit = _NOTIF_PATH_RE.exec(String(message || ''));
+    if (!hit) return null;
+    const path = hit[0];
+    if (!/[\\/].*[\\/]/.test(path)) return null;   // one separator is a date or a ratio, not a path
+    const name = path.split(/[\\/]/).pop();
+    return { path, name, index: hit.index };
+}
+
+// the sentence, with a path cut down to its file name in bold
+function _notifMessageHTML(message) {
+    const text = String(message == null ? '' : message);
+    const found = _notifPathOf(text);
+    if (!found) return _escToast(text);
+    return _escToast(text.slice(0, found.index)) + '<b>' + _escToast(found.name) + '</b>'
+        + _escToast(text.slice(found.index + found.path.length));
+}
+
+// notes that say the same thing about different things ("Downloaded X", then
+// "Downloaded Y") are one family: numbers and quoted names are what differ
+function _notifFamily(entry) {
+    return entry.type + '|' + String(entry.message || '')
+        .replace(/"[^"]*"|'[^']*'|“[^”]*”/g, '"…"')
+        .replace(/\d+(?:[.,:]\d+)*/g, '#')
+        .replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 48);
+}
+
+function _notifCopy(text, done) {
+    const finish = (ok) => { if (typeof done === 'function') done(ok); };
+    try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(() => finish(true), () => finish(false));
+            return;
+        }
+    } catch (e) { /* fall through to the old way */ }
+    try {
+        const area = document.createElement('textarea');
+        area.value = text; area.style.position = 'fixed'; area.style.opacity = '0';
+        document.body.appendChild(area); area.select();
+        finish(document.execCommand('copy'));
+        area.remove();
+    } catch (e) { finish(false); }
+}
 
 // ── Active overlay-apply task (live via the 'overlay:progress' socket event) ────
 // Surfaced two ways: a working indicator on the bell (visible without opening),
@@ -5511,14 +5669,43 @@ function _listenbrainzImportActiveHTML() {
 }
 
 function _musicTasksActive() {
+    if (!_notifViewerIsAdmin()) return _memberTasksActive();
     return _musicAutomationActive() || _musicRepairActive() || _musicWatchlistActive()
         || _musicMediaScanActive() || _musicWishlistActive() || _musicSyncActive()
         || _lastfmImportActive() || _listenbrainzImportActive();
 }
 
 function _musicActiveHTML() {
+    if (!_notifViewerIsAdmin()) return _memberActiveHTML();
     return _musicAutomationActiveHTML() + _musicSyncActiveHTML() + _musicWishlistActiveHTML()
         + _lastfmImportActiveHTML() + _listenbrainzImportActiveHTML() + _musicWatchlistActiveHTML() + _musicMediaScanActiveHTML() + _musicRepairActiveHTML();
+}
+
+// a member's Running now (#2170): only what is theirs. their own automations
+// (the server sends a member nothing else), the downloads this page started,
+// and their listening imports. the unscoped sync pulse lists everyone's
+// playlists, so a member's sync card reads their own downloads only.
+function _memberSyncActiveHTML() {
+    const sources = _activeMusicDownloads();
+    if (!sources.length) return '';
+    const first = sources[0];
+    const title = sources.length === 1
+        ? `Downloading ${_syncProcessName(first)}`
+        : `Downloading ${sources.length} playlists`;
+    const line = sources.length === 1
+        ? _syncProcessLine(first)
+        : sources.map(p => _escToast(_syncProcessName(p))).slice(0, 3).join(', ');
+    return _taskCardHTML(title, _syncProcessProgress(first), line, '', _notifActionHTML('Open Downloads', 'active-downloads'));
+}
+
+function _memberTasksActive() {
+    return _musicAutomationActive() || _activeMusicDownloads().length > 0
+        || _lastfmImportActive() || _listenbrainzImportActive();
+}
+
+function _memberActiveHTML() {
+    return _musicAutomationActiveHTML() + _memberSyncActiveHTML()
+        + _lastfmImportActiveHTML() + _listenbrainzImportActiveHTML();
 }
 
 function _seedMusicAutomationTask() {
@@ -5567,10 +5754,15 @@ function _seedListenbrainzImportTask() {
         .catch(() => {});
 }
 
+// the server's own jobs: an admin's to watch (#2170)
+function _adminTasksActive() {
+    return _notifViewerIsAdmin()
+        && (_overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive());
+}
+
 function _updateOverlayBell() {
     const btn = document.getElementById('notif-bell-btn');
-    if (btn) btn.classList.toggle('notif-bell-working',
-        _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive() || _musicTasksActive());
+    if (btn) btn.classList.toggle('notif-bell-working', _adminTasksActive() || _musicTasksActive());
     _ensureTaskPolling();
 }
 
@@ -5579,20 +5771,9 @@ function _updateOverlayBell() {
 // strand an Active card in its last "running" state. Stops itself when idle.
 let _taskPollTimer = null;
 function _ensureTaskPolling() {
-    const active = _overlayTaskActive() || _colSyncTaskActive() || _colArtTaskActive() || _videoBulkTaskActive() || _musicTasksActive();
+    const active = _adminTasksActive() || _musicTasksActive();
     if (active && !_taskPollTimer) {
-        _taskPollTimer = setInterval(() => {
-            _seedOverlayTask();
-            _seedCollectionSyncTask();
-            _seedCollectionArtTask();
-            _seedVideoBulkTask();
-            _seedMusicAutomationTask();
-            _seedMusicDownloadTask();
-            _seedMusicRepairTask();
-            _seedMusicMediaScanTask();
-            _seedLastfmImportTask();
-            _seedListenbrainzImportTask();
-        }, 12000);
+        _taskPollTimer = setInterval(_seedNotifTasks, 12000);
     } else if (!active && _taskPollTimer) {
         clearInterval(_taskPollTimer);
         _taskPollTimer = null;
@@ -5772,12 +5953,19 @@ function _overlayActiveHTML() {
 }
 
 function _patchOverlayActive() {
-    const host = document.querySelector('#notif-panel [data-notif-active-host]');
-    if (host) host.innerHTML = _musicActiveHTML() + _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML();
+    _renderActiveHost();
 }
 
 // opts.journal === false skips the server journal: for notes the server
 // already logged itself (profile:notify)
+// opts.history === false keeps the note out of the panel and the journal
+// altogether: a refusal ("isn't part of your profile") or a progress line
+// ("Fetching full discography...") is said once, not kept (#2191)
+// opts.action = { label, page } or { label, run } gives the note one thing to
+// do, on the toast and in the panel
+const _TOAST_MAX = 3;                       // more than this and the bell counts, the screen does not fill
+const _TOAST_MS = { success: 3800, info: 3800, warning: 6000, error: 8000 };
+
 function showToast(message, type = 'success', helpSection = null, opts = null) {
     const toastKey = `${type}:${message}`;
     const now = Date.now();
@@ -5787,53 +5975,99 @@ function showToast(message, type = 'success', helpSection = null, opts = null) {
     _recentToastKeys.set(toastKey, now);
     for (const [k, t] of _recentToastKeys) { if (now - t > 10000) _recentToastKeys.delete(k); }
 
-    // Add to notification history
-    const entry = { id: now + Math.random(), message, type, helpSection, timestamp: now, read: false };
-    _notifState.history.unshift(entry);
-    if (_notifState.history.length > _notifState.maxHistory) _notifState.history.pop();
-    _notifState.unreadCount++;
-    _updateNotifBadge();
-    if (!opts || opts.journal !== false) _queueNotifJournal(type, message);
+    // Add to notification history. opts.history === false is a toast that
+    // passes (a refusal, a progress line): shown, never kept, never journaled
+    // (#2191)
+    const action = opts && opts.action && opts.action.label ? opts.action : null;
+    if (!opts || opts.history !== false) {
+        const entry = { id: now + Math.random(), message, type, helpSection, action, timestamp: now, read: false };
+        _notifState.history.unshift(entry);
+        if (_notifState.history.length > _notifState.maxHistory) _notifState.history.pop();
+        _notifState.unreadCount++;
+        _updateNotifBadge();
+        if (!opts || opts.journal !== false) _queueNotifJournal(type, message);
+        // the panel is open: the note joins it, new, without a reopen
+        if (_notifState.panelOpen) _renderNotifFeed();
+    }
 
-    // Show compact toast — dismiss current if showing
     const container = document.getElementById('toast-container');
     if (!container) return;
 
-    if (_notifState.currentToast && container.contains(_notifState.currentToast)) {
-        _notifState.currentToast.classList.add('toast-exit');
-        const old = _notifState.currentToast;
-        setTimeout(() => { if (container.contains(old)) container.removeChild(old); }, 200);
-    }
-    if (_notifState.toastTimer) clearTimeout(_notifState.toastTimer);
+    // up to three stand, newest nearest the bell. a fourth takes the oldest's
+    // place: the count on the bell is what says there were more
+    const standing = Array.from(container.querySelectorAll('.toast-compact:not(.toast-exit)'));
+    while (standing.length >= _TOAST_MAX) _dismissToast(standing.shift());
 
-    const icon = _notifIcons[type] || 'ℹ';
+    const kind = _notifIcons[type] ? type : 'info';
     const toast = document.createElement('div');
-    toast.className = `toast-compact toast-${type}`;
-    toast.innerHTML = `<span class="toast-compact-icon">${icon}</span><span class="toast-compact-msg">${_escToast(message)}</span>`;
-    if (helpSection) {
-        const link = document.createElement('span');
-        link.className = 'toast-compact-link';
-        link.textContent = 'Learn more →';
-        link.onclick = e => { e.stopPropagation(); if (typeof navigateToDocsSection === 'function') navigateToDocsSection(helpSection); };
-        toast.appendChild(link);
-    }
-    toast.onclick = () => { toast.classList.add('toast-exit'); setTimeout(() => { if (container.contains(toast)) container.removeChild(toast); }, 200); };
+    toast.className = `toast-compact toast-${kind}`;
+    toast.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    toast.innerHTML = `<span class="toast-compact-icon">${_notifIcons[kind]}</span>`
+        + `<span class="toast-compact-msg">${_notifMessageHTML(message)}</span>`;
+
+    const addButton = (label, run) => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'toast-compact-link';
+        btn.textContent = label;
+        btn.onclick = (e) => { e.stopPropagation(); run(); _dismissToast(toast); };
+        toast.appendChild(btn);
+    };
+    if (action) addButton(action.label, () => _runNotifAction(action));
+    else if (helpSection) addButton('Learn more', () => { if (typeof navigateToDocsSection === 'function') navigateToDocsSection(helpSection); });
+
+    // the line along the bottom is the time left. it stops while you point at it
+    const life = (_TOAST_MS[kind] || 3800) + (helpSection || action ? 1500 : 0);
+    const timer = document.createElement('span');
+    timer.className = 'toast-compact-timer';
+    timer.style.animationDuration = life + 'ms';
+    toast.appendChild(timer);
+    timer.addEventListener('animationend', () => _dismissToast(toast));
+    // no animation (reduce motion, max performance): the clock still runs
+    toast._fallback = setTimeout(() => _dismissToast(toast), life + 400);
+    toast.addEventListener('mouseenter', () => { clearTimeout(toast._fallback); });
+    toast.addEventListener('mouseleave', () => {
+        clearTimeout(toast._fallback);
+        toast._fallback = setTimeout(() => _dismissToast(toast), life);
+    });
+    toast.onclick = () => _dismissToast(toast);
 
     container.appendChild(toast);
     requestAnimationFrame(() => toast.classList.add('toast-enter'));
     _notifState.currentToast = toast;
+}
 
-    _notifState.toastTimer = setTimeout(() => {
-        if (container.contains(toast)) {
-            toast.classList.add('toast-exit');
-            setTimeout(() => { if (container.contains(toast)) container.removeChild(toast); }, 300);
-        }
-        _notifState.currentToast = null;
-    }, helpSection ? 5000 : 3500);
+function _dismissToast(toast) {
+    if (!toast || toast.classList.contains('toast-exit')) return;
+    clearTimeout(toast._fallback);
+    toast.classList.add('toast-exit');
+    setTimeout(() => { toast.remove(); }, 260);
+    if (_notifState.currentToast === toast) _notifState.currentToast = null;
+}
+
+function _runNotifAction(action) {
+    if (!action) return;
+    try {
+        if (typeof action.run === 'function') action.run();
+        else if (action.page && typeof navigateToPage === 'function') navigateToPage(action.page);
+    } catch (e) { console.debug('notification action failed', e); }
 }
 
 function _escToast(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
-function _escAttr(s) { return _escToast(s).replace(/'/g, "\\'").replace(/\n/g, ' ').replace(/\r/g, ''); }
+// `_escAttr` used to be redefined here as a JS-string escaper. Both this file
+// and stats-automations.js declared a global `function _escAttr`, and
+// stats-automations.js loads SECOND (index.html), so its HTML-entity version
+// won for every call site in BOTH files. The onclick builders below therefore
+// got &#39; where they needed \' -- the attribute parser decoded it back to a
+// bare apostrophe, which terminated the JS string literal and threw a
+// SyntaxError that silently killed the whole handler. That is the
+// "Road trip-The Rolfe's" delete-button bug, and it was still live
+// (frontend-audit FE-07).
+//
+// There is no second definition now. `_escAttr` (HTML attribute content) and
+// `_escJs` (a JS string literal inside an HTML attribute -- the double-decoded
+// case) both live in stats-automations.js, and each call site below uses the
+// one that matches its context.
 
 function _updateNotifBadge() {
     const badge = document.getElementById('notif-bell-badge');
@@ -5842,6 +6076,65 @@ function _updateNotifBadge() {
         badge.style.display = _notifState.unreadCount > 0 ? '' : 'none';
     }
 }
+
+// ── what you have already seen ───────────────────────────────────────────────
+// Opening the panel used to mark everything read on the spot, so the panel
+// could never show you which notes were new. And the list lived in memory, so
+// a reload emptied it while the server's journal sat right there. Now: notes
+// stay "new" until the panel closes, the moment it closes is remembered in
+// this browser, and a fresh page fills the panel from the journal.
+const _NOTIF_SEEN_KEY = 'ss.notif.seenAt';
+
+function _notifSeenAt() {
+    try { return Number(window.localStorage.getItem(_NOTIF_SEEN_KEY)) || 0; } catch (e) { return 0; }
+}
+
+function _notifMarkSeen() {
+    _notifState.history.forEach(e => { e.read = true; });
+    _notifState.unreadCount = 0;
+    _updateNotifBadge();
+    try { window.localStorage.setItem(_NOTIF_SEEN_KEY, String(Date.now())); } catch (e) { /* private window */ }
+}
+
+// the journal stamps in UTC ("2026-11-12 22:14:03"); a browser reads that as local
+function _notifStampMs(created) {
+    const text = String(created || '');
+    const ms = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(text) ? text : text.replace(' ', 'T') + 'Z');
+    return Number.isFinite(ms) ? ms : Date.now();
+}
+
+function _seedNotifPanelFromJournal() {
+    if (_notifState.seeded) return;
+    _notifState.seeded = true;
+    fetch('/api/notifications/history?limit=' + _notifState.maxHistory)
+        .then(r => (r.ok ? r.json() : null))
+        .then(data => {
+            const rows = (data && data.notifications) || [];
+            if (!rows.length) return;
+            const seenAt = _notifSeenAt();
+            let clearedAt = 0;
+            try { clearedAt = Number(window.localStorage.getItem('ss.notif.clearedAt')) || 0; } catch (e) { clearedAt = 0; }
+            // anything this page already showed is in the list; the journal's copy of it is not a second note
+            const have = new Set(_notifState.history.map(e => e.type + '|' + e.message));
+            const older = [];
+            rows.forEach(row => {
+                const key = row.type + '|' + row.message;
+                const stamp = _notifStampMs(row.created_at);
+                if (stamp <= clearedAt) return;
+                if (have.has(key) && Date.now() - stamp < 120000) return;
+                older.push({ id: 'j' + row.id, message: row.message, type: row.type, helpSection: null,
+                    action: null, timestamp: stamp, read: stamp <= seenAt });
+            });
+            if (!older.length) return;
+            _notifState.history = _notifState.history.concat(older)
+                .sort((a, b) => b.timestamp - a.timestamp).slice(0, _notifState.maxHistory);
+            _notifState.unreadCount = _notifState.history.filter(e => !e.read).length;
+            _updateNotifBadge();
+            if (_notifState.panelOpen) _renderNotifFeed();
+        })
+        .catch(() => { /* the panel starts empty, as it always did */ });
+}
+setTimeout(_seedNotifPanelFromJournal, 1800);
 
 // ── system health, as symbols in the panel header ────────────────────────────
 // Health is a STATE, not an event: "slskd is unreachable" stays true until it is
@@ -5852,22 +6145,23 @@ function _updateNotifBadge() {
 let _notifHealth = null;
 
 function _notifHealthHTML() {
-    if (!_notifHealth) return '';
+    if (!_notifHealth || !_notifViewerIsAdmin()) return '';
     const checks = _notifHealth.checks || [];
     if (!checks.length) return '';
     const n = s => checks.filter(c => c.status === s).length;
     const bits = [];
-    // Only non-zero counts get a symbol: a "0 problems" badge is noise, and the
-    // green tick already carries that news.
-    if (n('error')) bits.push(`<span class="notif-health-sym notif-health-sym--error">🔴 ${n('error')}</span>`);
-    if (n('warning')) bits.push(`<span class="notif-health-sym notif-health-sym--warn">⚠️ ${n('warning')}</span>`);
-    if (n('ok')) bits.push(`<span class="notif-health-sym notif-health-sym--ok">✓ ${n('ok')}</span>`);
+    // Only non-zero counts get a symbol: a "0 problems" badge is noise. Each is
+    // a dot, a count and a word, so the pill reads without a legend.
+    if (n('error')) bits.push(`<span class="notif-health-sym notif-health-sym--error"><i></i>${n('error')} down</span>`);
+    if (n('warning')) bits.push(`<span class="notif-health-sym notif-health-sym--warn"><i></i>${n('warning')} warning${n('warning') === 1 ? '' : 's'}</span>`);
+    if (n('ok')) bits.push(`<span class="notif-health-sym notif-health-sym--ok"><i></i>${n('ok')} ok</span>`);
     const worst = n('error') ? 'error' : n('warning') ? 'warning' : 'ok';
     return `<button class="notif-health-btn notif-health-btn--${worst}" type="button"
                 onclick="_openHealthModal()" title="System health — click for detail">${bits.join('')}</button>`;
 }
 
 function _seedNotifHealth() {
+    if (!_notifViewerIsAdmin()) return Promise.resolve();
     return fetch('/api/video/health', { headers: { Accept: 'application/json' } })
         .then(r => (r.ok ? r.json() : null))
         .then(h => {
@@ -5886,17 +6180,34 @@ function _closeHealthModal() {
 function _healthRowsHTML() {
     const checks = (_notifHealth && _notifHealth.checks) || [];
     if (!checks.length) return '<div class="notif-panel-empty">Nothing to report.</div>';
-    const icons = { error: '\ud83d\udd34', warning: '\u26a0\ufe0f', ok: '\u2713' };
     const esc = s => String(s == null ? '' : s)
         .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    return checks.map(c => `
-        <div class="notif-health-row notif-health-row--${c.status}">
-            <span class="notif-health-ico">${icons[c.status] || '\u2139\ufe0f'}</span>
+    // the worst first: what needs you is not under a row of things that are fine
+    const rank = { error: 0, warning: 1, ok: 2 };
+    const sorted = checks.slice().sort((a, b) => (rank[a.status] ?? 3) - (rank[b.status] ?? 3));
+    return sorted.map(c => {
+        // a healthy check reports its facts as "name: value; name: value". those
+        // read better as labels than as one long sentence. anything that needs
+        // attention keeps its whole sentence, word for word.
+        const parts = String(c.detail == null ? '' : c.detail).split(/;\s+/).map(p => p.trim()).filter(Boolean);
+        const facts = c.status === 'ok' && parts.length >= 2 && parts.every(p => /^[^:]{1,40}:\s*\S/.test(p) || /\s/.test(p));
+        const detail = facts
+            ? `<div class="notif-health-facts">${parts.map(p => {
+                const cut = p.indexOf(':');
+                return cut > 0
+                    ? `<span>${esc(p.slice(0, cut))} <b>${esc(p.slice(cut + 1).trim())}</b></span>`
+                    : `<span><b>${esc(p)}</b></span>`;
+            }).join('')}</div>`
+            : `<div class="notif-health-detail">${esc(c.detail)}</div>`;
+        return `
+        <div class="notif-health-row notif-health-row--${esc(c.status)}">
+            <span class="notif-health-ico" aria-hidden="true"></span>
             <div class="notif-health-text">
                 <div class="notif-health-label">${esc(c.label)}</div>
-                <div class="notif-health-detail">${esc(c.detail)}</div>
+                ${detail}
             </div>
-        </div>`).join('');
+        </div>`;
+    }).join('');
 }
 
 function _openHealthModal() {
@@ -5906,16 +6217,22 @@ function _openHealthModal() {
     overlay.id = 'notif-health-overlay';
     overlay.className = 'notif-history-overlay';
     overlay.innerHTML = `
-        <div class="notif-history-modal">
+        <div class="notif-history-modal notif-history-modal--health" role="dialog" aria-modal="true" aria-label="System health" tabindex="-1">
             <div class="notif-history-header">
-                <span class="notif-history-title">\ud83e\ude7a System Health</span>
-                <button class="notif-history-close" onclick="_closeHealthModal()">\u2715</button>
+                <span class="notif-history-title">System health</span>
+                <span class="notif-health" data-notif-health-summary></span>
+                <button class="notif-icon-btn notif-history-close" type="button" onclick="_closeHealthModal()" title="Close" aria-label="Close">${_notifGlyphs.close}</button>
             </div>
             <div class="notif-history-body" data-notif-health-body>${_healthRowsHTML()}</div>
         </div>`;
     overlay.addEventListener('click', e => { if (e.target === overlay) _closeHealthModal(); });
+    overlay.addEventListener('keydown', e => { if (e.key === 'Escape') _closeHealthModal(); });
     document.body.appendChild(overlay);
-    requestAnimationFrame(() => overlay.classList.add('visible'));
+    requestAnimationFrame(() => {
+        overlay.classList.add('visible');
+        const modal = overlay.querySelector('.notif-history-modal');
+        if (modal) modal.focus();
+    });
     // Re-read on open: the panel may have been sitting there a while, and stale
     // health is the one thing this modal must not show.
     return _seedNotifHealth().then(() => {
@@ -5932,46 +6249,88 @@ function toggleNotifPanel() {
     }
 }
 
+// ── running now ──────────────────────────────────────────────────────────────
+// Every long job pins a row here. Three show; the rest fold under one line, so
+// a busy night does not push the notes off the panel.
+const _NOTIF_JOBS_SHOWN = 3;
+
+// what Running now asks the server for. a member asks for their own things
+// only: the server's jobs answer an admin alone (#2170)
+function _seedNotifTasks() {
+    _seedMusicAutomationTask();
+    _seedMusicDownloadTask();
+    _seedLastfmImportTask();
+    _seedListenbrainzImportTask();
+    if (!_notifViewerIsAdmin()) return;
+    _seedOverlayTask();
+    _seedCollectionSyncTask();
+    _seedCollectionArtTask();
+    _seedVideoBulkTask();
+    _seedMusicRepairTask();
+    _seedMusicMediaScanTask();
+}
+
+function _renderActiveHost() {
+    const host = document.querySelector('#notif-panel [data-notif-active-host]');
+    if (!host) return;
+    const cards = _musicActiveHTML() + (_notifViewerIsAdmin()
+        ? _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML()
+        : '');
+    const scratch = document.createElement('div');
+    scratch.innerHTML = cards;
+    const jobs = Array.from(scratch.children);
+    if (!jobs.length) { host.innerHTML = ''; return; }
+    const open = !!_notifState.jobsOpen;
+    const extra = Math.max(0, jobs.length - _NOTIF_JOBS_SHOWN);
+    jobs.forEach((job, i) => { if (!open && i >= _NOTIF_JOBS_SHOWN) job.classList.add('notif-active--folded'); });
+    host.innerHTML = `<div class="notif-section"><span>Running now</span><b>${jobs.length} ${jobs.length === 1 ? 'job' : 'jobs'}</b></div>`
+        + jobs.map(j => j.outerHTML).join('')
+        + (extra ? `<button type="button" class="notif-active-more" onclick="_toggleNotifJobs()">${open ? 'Show fewer' : `and ${extra} more running`}</button>` : '');
+}
+
+function _toggleNotifJobs() {
+    _notifState.jobsOpen = !_notifState.jobsOpen;
+    _renderActiveHost();
+}
+
 function _openNotifPanel() {
-    _closeNotifPanel(); // Remove existing
+    // an old panel still fading out is removed now, not left to stack
+    const stale = document.getElementById('notif-panel');
+    if (stale) stale.remove();
 
     _notifState.panelOpen = true;
-    _notifState.unreadCount = 0;
-    _notifState.history.forEach(e => e.read = true);
-    _updateNotifBadge();
+    // the bell stops counting, the notes stay marked new until you close
+    const badge = document.getElementById('notif-bell-badge');
+    if (badge) badge.style.display = 'none';
 
     const btn = document.getElementById('notif-bell-btn');
+    if (btn) btn.setAttribute('aria-expanded', 'true');
     const panel = document.createElement('div');
     panel.id = 'notif-panel';
     panel.className = 'notif-panel';
-
-    const entries = _notifState.history;
+    panel.setAttribute('role', 'dialog');
+    panel.setAttribute('aria-label', 'Notifications');
+    panel.tabIndex = -1;
 
     panel.innerHTML = `
         <div class="notif-panel-header">
             <span class="notif-panel-title">Notifications</span>
             <span class="notif-health" data-notif-health>${_notifHealthHTML()}</span>
-            <button class="notif-panel-clear" onclick="_openNotifHistory()">History</button>
-            ${entries.length > 0 ? '<button class="notif-panel-clear" onclick="_clearNotifHistory()">Clear All</button>' : ''}
+            <button class="notif-icon-btn" type="button" onclick="_openNotifHistory()" title="History" aria-label="History">${_notifGlyphs.history}</button>
+            <button class="notif-icon-btn" type="button" data-notif-clear onclick="_clearNotifHistory()" title="Clear this list" aria-label="Clear this list">${_notifGlyphs.clear}</button>
         </div>
-        <div class="notif-filter-row">${_notifFilterChipsHTML()}</div>
-        <div class="notif-active-host" data-notif-active-host>${_musicActiveHTML() + _overlayActiveHTML() + _colSyncActiveHTML() + _colArtActiveHTML() + _videoBulkActiveHTML()}</div>
-        <div class="notif-panel-body">${_notifEntriesHTML()}</div>
+        <div class="notif-filter-row" role="group" aria-label="Filter notifications"></div>
+        <div class="notif-active-host" data-notif-active-host></div>
+        <div class="notif-panel-body"></div>
         <div class="notif-panel-sys" data-notif-sys>${_notifSysHTML()}</div>
     `;
 
     document.body.appendChild(panel);
+    _renderActiveHost();
+    _renderNotifFeed();
     _seedNotifHealth();   // system health symbols (see _notifHealthHTML)
     _seedNotifSys();      // fresh system numbers even when the socket is down
-    _seedOverlayTask();   // refresh the Active cards from the server on open (socket keeps them live after)
-    _seedCollectionSyncTask();
-    _seedCollectionArtTask();
-    _seedVideoBulkTask();
-    _seedMusicAutomationTask();
-    _seedMusicDownloadTask();
-    _seedMusicRepairTask();
-    _seedMusicMediaScanTask();
-    _seedLastfmImportTask();
+    _seedNotifTasks();    // refresh the Active cards from the server on open (socket keeps them live after)
 
     // Position above the bell button
     if (btn) {
@@ -5980,12 +6339,25 @@ function _openNotifPanel() {
         panel.style.bottom = (window.innerHeight - rect.top + 8) + 'px';
     }
 
-    requestAnimationFrame(() => panel.classList.add('visible'));
+    requestAnimationFrame(() => { panel.classList.add('visible'); panel.focus({ preventScroll: true }); });
+
+    panel.addEventListener('keydown', e => {
+        if (e.key === 'Escape') { e.stopPropagation(); _closeNotifPanel(); if (btn) btn.focus(); }
+    });
+    // the relative times ("40s ago") move while the panel is open
+    _notifState.clockTimer = setInterval(() => {
+        document.querySelectorAll('#notif-panel [data-notif-at]').forEach(el => {
+            el.textContent = _notifTimeAgo(Number(el.getAttribute('data-notif-at')));
+        });
+    }, 15000);
 
     // Close on outside click
     setTimeout(() => {
         const closeHandler = e => {
-            if (!panel.contains(e.target) && e.target.id !== 'notif-bell-btn') {
+            if (!panel.isConnected) { document.removeEventListener('click', closeHandler); return; }
+            // a row that was just removed (dismiss, show more) is no longer inside the panel
+            if (!e.target.isConnected) return;
+            if (!panel.contains(e.target) && !(e.target.closest && e.target.closest('#notif-bell-btn'))) {
                 _closeNotifPanel();
                 document.removeEventListener('click', closeHandler);
             }
@@ -5995,7 +6367,13 @@ function _openNotifPanel() {
 }
 
 function _closeNotifPanel() {
+    const wasOpen = _notifState.panelOpen;
     _notifState.panelOpen = false;
+    if (_notifState.clockTimer) { clearInterval(_notifState.clockTimer); _notifState.clockTimer = null; }
+    const btn = document.getElementById('notif-bell-btn');
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+    // closing is what reads them: you have had your look
+    if (wasOpen) _notifMarkSeen();
     const panel = document.getElementById('notif-panel');
     if (panel) {
         panel.classList.remove('visible');
@@ -6008,18 +6386,62 @@ function _clearNotifHistory() {
     _notifState.history = [];
     _notifState.unreadCount = 0;
     _updateNotifBadge();
+    // remembered, so a reload does not bring the cleared notes back from the journal
+    try { window.localStorage.setItem('ss.notif.clearedAt', String(Date.now())); } catch (e) { /* private window */ }
     _closeNotifPanel();
 }
 
 // ── panel filter (Kazimir: "is there a place to filter notifications?") ─────
+// named, with how many of each: four bare symbols said nothing about what was there
 const _NOTIF_FILTERS = [
-    ['all', 'All'], ['success', '✓'], ['error', '✕'], ['warning', '⚠'], ['info', 'ℹ'],
+    ['all', 'All'], ['error', 'Problems'], ['warning', 'Warnings'], ['success', 'Done'], ['info', 'Info'],
 ];
 
 function _notifFilterChipsHTML() {
-    return _NOTIF_FILTERS.map(([key, label]) =>
-        `<button class="notif-filter-chip${_notifState.filter === key ? ' active' : ''}"
-                 onclick="_setNotifFilter('${key}')" title="${key}">${label}</button>`).join('');
+    const counts = { all: _notifState.history.length };
+    _notifState.history.forEach(e => { counts[e.type] = (counts[e.type] || 0) + 1; });
+    return _NOTIF_FILTERS.map(([key, label]) => {
+        const n = counts[key] || 0;
+        // a kind with nothing in it is not a filter worth offering
+        if (key !== 'all' && !n && _notifState.filter !== key) return '';
+        return `<button type="button" class="notif-filter-chip${_notifState.filter === key ? ' active' : ''}"
+                 aria-pressed="${_notifState.filter === key}"
+                 onclick="_setNotifFilter('${key}')">${label}<b>${n}</b></button>`;
+    }).join('');
+}
+
+function _notifDayStart(ts) {
+    const d = new Date(ts); d.setHours(0, 0, 0, 0); return d.getTime();
+}
+
+// "New", then the days behind it
+function _notifSectionOf(entry, today) {
+    if (!entry.read) return 'New';
+    const day = _notifDayStart(entry.timestamp);
+    if (day >= today) return 'Earlier today';
+    if (day >= today - 86400000) return 'Yesterday';
+    return 'Older';
+}
+
+function _notifEntryHTML(entry, more) {
+    const kind = _notifIcons[entry.type] ? entry.type : 'info';
+    const found = _notifPathOf(entry.message);
+    const links = [];
+    if (entry.action) links.push(`<button type="button" class="notif-entry-link" onclick="_notifEntryAction('${entry.id}')">${_escToast(entry.action.label)}</button>`);
+    if (entry.helpSection) links.push(`<button type="button" class="notif-entry-link" onclick="_notifEntryHelp('${entry.id}')">Learn more</button>`);
+    if (found) links.push(`<button type="button" class="notif-entry-link" onclick="_notifEntryCopy('${entry.id}', this)">Copy path</button>`);
+    if (more > 0) links.push(`<button type="button" class="notif-entry-more" onclick="_notifExpandFamily('${entry.id}')">and ${more} more like this</button>`);
+    return `
+            <div class="notif-entry notif-entry-${kind}${entry.read ? '' : ' notif-entry--new'}" data-notif-id="${entry.id}">
+                <span class="notif-entry-icon notif-icon-${kind}" title="${_NOTIF_KIND_LABEL[kind]}">${_notifIcons[kind]}</span>
+                <div class="notif-entry-body">
+                    <div class="notif-entry-msg">${_notifMessageHTML(entry.message)}</div>
+                    ${found ? `<div class="notif-entry-path" title="${_escAttr(found.path)}"><bdi>${_escToast(found.path)}</bdi></div>` : ''}
+                    ${links.length ? `<div class="notif-entry-meta">${links.join('')}</div>` : ''}
+                </div>
+                <span class="notif-entry-when" data-notif-at="${entry.timestamp}">${_notifTimeAgo(entry.timestamp)}</span>
+                <button type="button" class="notif-entry-x" title="Dismiss" aria-label="Dismiss" onclick="_dismissNotifEntry('${entry.id}')">${_notifGlyphs.close}</button>
+            </div>`;
 }
 
 function _notifEntriesHTML() {
@@ -6027,73 +6449,155 @@ function _notifEntriesHTML() {
         ? _notifState.history
         : _notifState.history.filter(e => e.type === _notifState.filter);
     if (entries.length === 0) {
-        return `<div class="notif-panel-empty">${_notifState.filter === 'all'
-            ? 'No notifications yet' : 'Nothing with this filter'}</div>`;
+        return _notifState.filter === 'all'
+            ? (_notifViewerIsAdmin()
+                ? '<div class="notif-panel-empty"><b>You are all caught up</b>Downloads, scans and jobs leave their notes here.</div>'
+                : '<div class="notif-panel-empty"><b>You are all caught up</b>Your downloads and requests leave their notes here.</div>')
+            : '<div class="notif-panel-empty"><b>Nothing with this filter</b>Pick All to see every note.</div>';
     }
-    return entries.map(e => {
-        const icon = _notifIcons[e.type] || 'ℹ';
-        const ago = _notifTimeAgo(e.timestamp);
-        const unreadDot = e.read ? '' : '<span class="notif-entry-unread"></span>';
-        const learnMore = e.helpSection ? `<span class="notif-entry-link" onclick="event.stopPropagation(); _closeNotifPanel(); navigateToDocsSection('${e.helpSection}')">Learn more →</span>` : '';
-        return `
-            <div class="notif-entry notif-entry-${e.type}">
-                ${unreadDot}
-                <span class="notif-entry-icon notif-icon-${e.type}">${icon}</span>
-                <div class="notif-entry-body">
-                    <div class="notif-entry-msg">${_escToast(e.message)}</div>
-                    <div class="notif-entry-meta">${ago}${learnMore}</div>
-                </div>
-            </div>`;
-    }).join('');
+    const today = _notifDayStart(Date.now());
+    const open = _notifState.openFamilies || (_notifState.openFamilies = {});
+    let html = '', section = null, i = 0;
+    while (i < entries.length) {
+        const entry = entries[i];
+        const name = _notifSectionOf(entry, today);
+        if (name !== section) {
+            section = name;
+            const count = entries.filter(e => _notifSectionOf(e, today) === name).length;
+            html += `<div class="notif-section"><span>${name}</span>${name === 'New' ? `<b>${count}</b>` : ''}</div>`;
+        }
+        // the notes right behind this one that say the same thing about something else
+        const family = _notifFamily(entry);
+        let j = i + 1;
+        while (j < entries.length && _notifFamily(entries[j]) === family
+            && _notifSectionOf(entries[j], today) === name) j++;
+        const run = entries.slice(i, j);
+        if (run.length >= 3 && !open[family + '|' + name]) {
+            html += _notifEntryHTML(entry, run.length - 1);
+        } else {
+            html += run.map(e => _notifEntryHTML(e, 0)).join('');
+        }
+        i = j;
+    }
+    return html;
 }
 
-function _setNotifFilter(key) {
-    _notifState.filter = key;
+function _renderNotifFeed() {
     const panel = document.getElementById('notif-panel');
     if (!panel) return;
     const row = panel.querySelector('.notif-filter-row');
     const body = panel.querySelector('.notif-panel-body');
+    const clear = panel.querySelector('[data-notif-clear]');
     if (row) row.innerHTML = _notifFilterChipsHTML();
     if (body) body.innerHTML = _notifEntriesHTML();
+    if (clear) clear.hidden = _notifState.history.length === 0;
+}
+
+function _setNotifFilter(key) {
+    _notifState.filter = key;
+    _renderNotifFeed();
+}
+
+function _notifEntryById(id) {
+    return _notifState.history.find(e => String(e.id) === String(id)) || null;
+}
+
+function _dismissNotifEntry(id) {
+    const entry = _notifEntryById(id);
+    if (!entry) return;
+    _notifState.history = _notifState.history.filter(e => e !== entry);
+    if (!entry.read) _notifState.unreadCount = Math.max(0, _notifState.unreadCount - 1);
+    const el = document.querySelector(`#notif-panel [data-notif-id="${CSS.escape(String(id))}"]`);
+    if (el) {
+        el.classList.add('notif-entry--leaving');
+        setTimeout(_renderNotifFeed, 180);
+    } else {
+        _renderNotifFeed();
+    }
+}
+
+function _notifExpandFamily(id) {
+    const entry = _notifEntryById(id);
+    if (!entry) return;
+    const open = _notifState.openFamilies || (_notifState.openFamilies = {});
+    open[_notifFamily(entry) + '|' + _notifSectionOf(entry, _notifDayStart(Date.now()))] = true;
+    _renderNotifFeed();
+}
+
+function _notifEntryAction(id) {
+    const entry = _notifEntryById(id);
+    if (!entry || !entry.action) return;
+    _closeNotifPanel();
+    _runNotifAction(entry.action);
+}
+
+function _notifEntryHelp(id) {
+    const entry = _notifEntryById(id);
+    if (!entry || !entry.helpSection) return;
+    _closeNotifPanel();
+    if (typeof navigateToDocsSection === 'function') navigateToDocsSection(entry.helpSection);
+}
+
+function _notifEntryCopy(id, button) {
+    const entry = _notifEntryById(id);
+    const found = entry && _notifPathOf(entry.message);
+    if (!found) return;
+    _notifCopy(found.path, ok => {
+        if (!button) return;
+        button.textContent = ok ? 'Copied' : 'Could not copy';
+        setTimeout(() => { if (button.isConnected) button.textContent = 'Copy path'; }, 1600);
+    });
 }
 
 // ── persistent history modal (server journal; survives Clear All) ───────────
-const _notifHistState = { type: '', q: '', offset: 0, pageSize: 100 };
+const _notifHistState = { type: '', q: '', offset: 0, pageSize: 100, total: 0, lastDay: null };
+
+function _notifHistChipsHTML(counts) {
+    const c = counts || {};
+    const all = (c.success || 0) + (c.error || 0) + (c.warning || 0) + (c.info || 0);
+    return _NOTIF_FILTERS.map(([key, label]) => {
+        const value = key === 'all' ? '' : key;
+        const n = key === 'all' ? all : (c[key] || 0);
+        return `<button type="button" class="notif-filter-chip${_notifHistState.type === value ? ' active' : ''}"
+                 aria-pressed="${_notifHistState.type === value}"
+                 onclick="_notifHistFilterChanged('${value}')">${label}<b>${n.toLocaleString()}</b></button>`;
+    }).join('');
+}
 
 function _openNotifHistory() {
     _closeNotifPanel();
     _closeNotifHistory();
     const overlay = document.createElement('div');
     overlay.id = 'notif-history-overlay';
-    overlay.className = 'notif-history-overlay';
+    overlay.className = 'notif-history-overlay visible';
     overlay.innerHTML = `
-        <div class="notif-history-modal">
+        <div class="notif-history-modal" role="dialog" aria-modal="true" aria-label="Notification history" tabindex="-1">
             <div class="notif-history-header">
-                <span class="notif-history-title">🔔 Notification History</span>
-                <button class="notif-history-close" onclick="_closeNotifHistory()">✕</button>
+                <span class="notif-history-title">History</span>
+                <button class="notif-icon-btn" type="button" onclick="_clearServerNotifHistory()" title="Clear history" aria-label="Clear history">${_notifGlyphs.clear}</button>
+                <button class="notif-icon-btn notif-history-close" type="button" onclick="_closeNotifHistory()" title="Close" aria-label="Close">${_notifGlyphs.close}</button>
             </div>
             <div class="notif-history-controls">
-                <select class="notif-history-type" onchange="_notifHistFilterChanged()">
-                    <option value="">All types</option>
-                    <option value="success">Success</option>
-                    <option value="error">Error</option>
-                    <option value="warning">Warning</option>
-                    <option value="info">Info</option>
-                </select>
-                <input class="notif-history-search" type="text" placeholder="Search messages…"
-                       oninput="_notifHistSearchChanged(this.value)">
-                <button class="notif-panel-clear" onclick="_clearServerNotifHistory()">Clear history</button>
+                <label class="notif-history-searchbox">${_notifGlyphs.search}
+                    <input class="notif-history-search" type="search" placeholder="Search messages" aria-label="Search messages"
+                           oninput="_notifHistSearchChanged(this.value)">
+                </label>
             </div>
+            <div class="notif-filter-row" data-notif-history-chips role="group" aria-label="Filter history">${_notifHistChipsHTML(null)}</div>
             <div class="notif-history-body" data-notif-history-list>
                 <div class="notif-panel-empty">Loading…</div>
             </div>
             <div class="notif-history-footer">
-                <button class="notif-history-more hidden" data-notif-history-more
+                <span data-notif-history-count></span>
+                <button class="notif-history-more hidden" type="button" data-notif-history-more
                         onclick="_loadNotifHistory(false)">Load more</button>
             </div>
         </div>`;
     overlay.addEventListener('click', e => { if (e.target === overlay) _closeNotifHistory(); });
+    overlay.addEventListener('keydown', e => { if (e.key === 'Escape') _closeNotifHistory(); });
     document.body.appendChild(overlay);
+    const search = overlay.querySelector('.notif-history-search');
+    if (search) search.focus();
     _notifHistState.type = '';
     _notifHistState.q = '';
     _loadNotifHistory(true);
@@ -6111,17 +6615,30 @@ function _notifHistSearchChanged(value) {
     _notifHistSearchTimer = setTimeout(() => _loadNotifHistory(true), 300);
 }
 
-function _notifHistFilterChanged() {
-    const sel = document.querySelector('.notif-history-type');
-    _notifHistState.type = sel ? sel.value : '';
+function _notifHistFilterChanged(value) {
+    _notifHistState.type = value || '';
     _loadNotifHistory(true);
+}
+
+function _notifDayLabel(ts) {
+    const today = _notifDayStart(Date.now());
+    const day = _notifDayStart(ts);
+    if (day === today) return 'Today';
+    if (day === today - 86400000) return 'Yesterday';
+    return new Date(ts).toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' });
+}
+
+function _notifClock(ts) {
+    return new Date(ts).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 async function _loadNotifHistory(reset) {
     const list = document.querySelector('[data-notif-history-list]');
     const more = document.querySelector('[data-notif-history-more]');
+    const chips = document.querySelector('[data-notif-history-chips]');
+    const count = document.querySelector('[data-notif-history-count]');
     if (!list) return;
-    if (reset) _notifHistState.offset = 0;
+    if (reset) { _notifHistState.offset = 0; _notifHistState.lastDay = null; }
     const params = new URLSearchParams({
         limit: String(_notifHistState.pageSize),
         offset: String(_notifHistState.offset),
@@ -6132,27 +6649,41 @@ async function _loadNotifHistory(reset) {
         const res = await fetch('/api/notifications/history?' + params.toString());
         const data = res.ok ? await res.json() : null;
         const rows = (data && data.notifications) || [];
-        const html = rows.map(r => {
-            const icon = _notifIcons[r.type] || 'ℹ';
-            const when = r.created_at ? String(r.created_at).replace('T', ' ').slice(0, 19) : '';
-            return `
-                <div class="notif-entry notif-entry-${r.type}">
-                    <span class="notif-entry-icon notif-icon-${r.type}">${icon}</span>
+        let html = '';
+        rows.forEach(r => {
+            const kind = _notifIcons[r.type] ? r.type : 'info';
+            const at = _notifStampMs(r.created_at);
+            const day = _notifDayLabel(at);
+            // a new day is a heading, once
+            if (day !== _notifHistState.lastDay) {
+                _notifHistState.lastDay = day;
+                html += `<div class="notif-section"><span>${_escToast(day)}</span></div>`;
+            }
+            html += `
+                <div class="notif-entry notif-entry-${kind}">
+                    <span class="notif-entry-icon notif-icon-${kind}" title="${_NOTIF_KIND_LABEL[kind]}">${_notifIcons[kind]}</span>
                     <div class="notif-entry-body">
-                        <div class="notif-entry-msg">${_escToast(r.message)}</div>
-                        <div class="notif-entry-meta">${when}</div>
+                        <div class="notif-entry-msg">${_notifMessageHTML(r.message)}</div>
                     </div>
+                    <span class="notif-entry-when" title="${_escAttr(new Date(at).toLocaleString())}">${_notifClock(at)}</span>
                 </div>`;
-        }).join('');
+        });
         if (reset) {
-            list.innerHTML = html || '<div class="notif-panel-empty">Nothing here yet</div>';
+            list.innerHTML = html || `<div class="notif-panel-empty"><b>Nothing here</b>${_notifHistState.q || _notifHistState.type ? 'No note matches that search.' : 'Notes are kept here after they leave the bell.'}</div>`;
         } else if (html) {
             list.insertAdjacentHTML('beforeend', html);
         }
         _notifHistState.offset += rows.length;
-        if (more) more.classList.toggle('hidden', rows.length < _notifHistState.pageSize);
+        if (data && data.counts && chips) chips.innerHTML = _notifHistChipsHTML(data.counts);
+        const total = data && Number.isFinite(Number(data.total)) ? Number(data.total) : null;
+        if (count) {
+            count.textContent = total == null || !_notifHistState.offset ? ''
+                : `Showing ${_notifHistState.offset.toLocaleString()} of ${total.toLocaleString()}`;
+        }
+        const done = total != null ? _notifHistState.offset >= total : rows.length < _notifHistState.pageSize;
+        if (more) more.classList.toggle('hidden', done);
     } catch (e) {
-        if (reset) list.innerHTML = "<div class=\"notif-panel-empty\">Couldn't load history</div>";
+        if (reset) list.innerHTML = '<div class="notif-panel-empty"><b>Could not load history</b>Try again in a moment.</div>';
     }
 }
 
@@ -6171,13 +6702,13 @@ function _clearServerNotifHistory() {
 
 function _notifTimeAgo(ts) {
     const s = Math.floor((Date.now() - ts) / 1000);
-    if (s < 5) return 'just now';
-    if (s < 60) return `${s}s ago`;
+    if (s < 5) return 'now';
+    if (s < 60) return `${s}s`;
     const m = Math.floor(s / 60);
-    if (m < 60) return `${m}m ago`;
+    if (m < 60) return `${m}m`;
     const h = Math.floor(m / 60);
-    if (h < 24) return `${h}h ago`;
-    return `${Math.floor(h / 24)}d ago`;
+    if (h < 24) return `${h}h`;
+    return `${Math.floor(h / 24)}d`;
 }
 
 // ==================================================================================
@@ -6260,134 +6791,9 @@ const _gsState = {
 // Shared source-picker controller — built on DOM-ready in `_doInit`.
 let _gsController = null;
 
-(function initGlobalSearch() {
-    // Defer init until DOM is ready
-    const _doInit = () => {
-        const bar = document.getElementById('gsearch-bar');
-        const input = document.getElementById('gsearch-input');
-        const results = document.getElementById('gsearch-results');
-        if (!input || !bar || !results) return;
-
-        // Build the stable results-panel structure up front so the controller
-        // has a sourceRow element to render into on its first _notify().
-        results.innerHTML = `
-            <div class="gsearch-source-row" id="gsearch-source-row"></div>
-            <div class="gsearch-fallback-banner hidden" id="gsearch-fallback-banner"></div>
-            <div id="gsearch-body"></div>
-        `;
-
-        _gsController = createSearchController({
-            sourceRowElement: document.getElementById('gsearch-source-row'),
-            iconClassPrefix: 'gsearch',
-            onStateChange: _gsRenderFromState,
-            onSoulseekSelected: (query) => _gsNavigateToSearchPage(query, 'soulseek'),
-            onUnconfiguredClick: (src) => {
-                _gsDeactivate();
-                openSettingsForSource(src);
-            },
-        });
-
-        bar.addEventListener('click', () => input.focus());
-
-        input.addEventListener('focus', () => {
-            bar.classList.add('active');
-            const aura = document.getElementById('gsearch-aura');
-            if (aura) aura.classList.add('active');
-            _gsState.active = true;
-            const shortcut = document.getElementById('gsearch-shortcut');
-            if (shortcut) shortcut.style.display = 'none';
-            // Always redraw on focus so the source icon row is current
-            // (cache dots, active state, etc.). init() is a no-op after the
-            // first call — safe to invoke on every focus.
-            _gsController.init().then(() => _gsRenderFromState(_gsController.state));
-        });
-
-        // No blur handler — closing is handled by click-outside and Escape only
-        // This prevents tab switching and result clicks from closing the panel
-
-        const clearBtn = document.getElementById('gsearch-clear');
-
-        input.addEventListener('input', () => {
-            const q = input.value.trim();
-            if (clearBtn) clearBtn.style.display = q.length > 0 ? '' : 'none';
-            if (_gsState.debounceTimer) clearTimeout(_gsState.debounceTimer);
-            if (q.length < 2) { _gsHideResults(); return; }
-            // 600ms (was 300) — coalesce a name being typed into one search
-            // instead of one external-API search per letter (#751). Enter still
-            // fires immediately via the keydown handler.
-            _gsState.debounceTimer = setTimeout(() => _gsController.submitQuery(q), 600);
-        });
-
-        if (clearBtn) {
-            clearBtn.addEventListener('click', e => {
-                e.stopPropagation();
-                input.value = '';
-                clearBtn.style.display = 'none';
-                // Drop cache so the next search starts clean, but don't
-                // auto-fire a fetch for an empty query.
-                if (_gsController) {
-                    _gsController.state.query = '';
-                    _gsController.state.sources = {};
-                    _gsController.state.fallbacks = {};
-                    _gsController.state.loadingSources = new Set();
-                    _gsController.renderSourceRow();
-                }
-                _gsHideResults();
-                input.focus();
-            });
-        }
-
-        input.addEventListener('keydown', e => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                if (_gsState.debounceTimer) clearTimeout(_gsState.debounceTimer);
-                const q = input.value.trim();
-                if (q.length >= 2) _gsController.submitQuery(q);
-            } else if (e.key === 'Escape') {
-                _gsDeactivate();
-                input.blur();
-            }
-        });
-
-        // Keyboard shortcuts — never summon the (music-only) global search on the video side.
-        document.addEventListener('keydown', e => {
-            if (document.body.getAttribute('data-side') === 'video') return;
-            if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); input.focus(); return; }
-            if (e.key === '/' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName)) { e.preventDefault(); input.focus(); }
-        });
-
-        // Click outside to close — uses delayed check because tab clicks replace DOM
-        document.addEventListener('click', e => {
-            if (!_gsState.active) return;
-            // Skip if click was recent interaction with search system (within 100ms of a switch)
-            if (_gsState._lastInteraction && Date.now() - _gsState._lastInteraction < 200) return;
-            setTimeout(() => {
-                if (!_gsState.active) return;
-                const freshBar = document.getElementById('gsearch-bar');
-                const freshResults = document.getElementById('gsearch-results');
-                const target = e.target;
-                if (freshBar?.contains(target) || freshResults?.contains(target)) return;
-                // The media player (mini bar + expanded now-playing modal)
-                // floats above the page. Clicking it — e.g. opening the full
-                // modal from the mini player, or anything inside that modal —
-                // must NOT tear down the global search results (#732).
-                if (target.closest && target.closest('#media-player, #np-modal-overlay')) return;
-                _gsDeactivate();
-            }, 100);
-        });
-
-        // Collapse on sidebar navigation + hide on downloads page
-        document.addEventListener('click', e => {
-            if (e.target.closest('.sidebar-link, .nav-item, .back-btn')) {
-                if (_gsState.active) _gsDeactivate();
-                // Check after navigation which page we're on
-                setTimeout(_gsUpdateVisibility, 200);
-            }
-        });
-    };
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { _doInit(); _gsUpdateVisibility(); });
-    else { _doInit(); setTimeout(_gsUpdateVisibility, 500); }
-})();
+// initGlobalSearch went with the floating search bar's markup. it bound
+// Ctrl/Cmd K and / on every page; Ctrl/Cmd K is the help palette's now
+// (features/help/host.tsx), which also hands a name to the Search page.
 
 // On load, seed the overlay-apply + collection-sync tasks so the bell reflects a
 // job that was already running before this page connected (the socket keeps them
@@ -6409,7 +6815,7 @@ function _gsUpdateVisibility() {
     if (!bar) return;
     // Hide on pages where global search doesn't belong, and always on the
     // video side (the global/music search is music-only).
-    const _gsHidePages = new Set(['search', 'downloads', 'settings', 'help', 'issues', 'import']);
+    const _gsHidePages = new Set(['search', 'downloads', 'settings', 'help', 'issues', 'import', 'library']);
     const onVideoSide = document.body.getAttribute('data-side') === 'video';
     const onHidePage = onVideoSide || (typeof currentPage !== 'undefined' && _gsHidePages.has(currentPage));
     bar.style.display = onHidePage ? 'none' : '';
@@ -6578,7 +6984,7 @@ function _gsRenderFromState(state) {
 
     if (dbArtists.length) {
         h += '<div class="gsearch-section-header">📚 In Your Library</div><div class="gsearch-grid">';
-        h += dbArtists.map(a => `<a class="gsearch-item" href="${a.id ? buildArtistDetailPath(a.id, null) : '#'}" onclick="_gsDeactivate()" style="text-decoration:none;color:inherit;">${a.image_url ? `<div class="gsearch-item-art"><img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎤'"></div>` : '<div class="gsearch-item-art">🎤</div>'}<div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">Library</div></div></a>`).join('');
+        h += dbArtists.map(a => `<a class="gsearch-item" href="${a.library_v2_id ? `/library?artist=${encodeURIComponent(a.library_v2_id)}` : (a.id ? buildArtistDetailPath(a.id, null) : '#')}" onclick="_gsDeactivate()" style="text-decoration:none;color:inherit;">${a.image_url ? `<div class="gsearch-item-art"><img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎤'"></div>` : '<div class="gsearch-item-art">🎤</div>'}<div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">Library</div></div></a>`).join('');
         h += '</div>';
     }
 
@@ -6594,7 +7000,7 @@ function _gsRenderFromState(state) {
             const ar = a.artist || (a.artists ? a.artists.join(', ') : '');
             const yr = a.release_date ? a.release_date.substring(0, 4) : '';
             const img = (a.image_url || '').replace(/'/g, "\\'");
-            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escAttr(a.name)}', '${_escAttr(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='💿'">` : '💿'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${yr ? ` · ${yr}` : ''}</div></div></div>`;
+            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escJs(a.name)}', '${_escJs(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='💿'">` : '💿'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${yr ? ` · ${yr}` : ''}</div></div></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6604,7 +7010,7 @@ function _gsRenderFromState(state) {
         h += singles.map(a => {
             const ar = a.artist || (a.artists ? a.artists.join(', ') : '');
             const img = (a.image_url || '').replace(/'/g, "\\'");
-            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escAttr(a.name)}', '${_escAttr(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎶'">` : '🎶'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}</div></div></div>`;
+            return `<div class="gsearch-item" onclick="_gsClickAlbum('${a.id}', '${_escJs(a.name)}', '${_escJs(ar)}', '${img}', '${activeSrc}')"><div class="gsearch-item-art">${a.image_url ? `<img src="${a.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎶'">` : '🎶'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(a.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}</div></div></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6614,7 +7020,7 @@ function _gsRenderFromState(state) {
         h += tracks.map(t => {
             const ar = t.artist || (t.artists ? t.artists.join(', ') : '');
             const dur = t.duration_ms ? `${Math.floor(t.duration_ms / 60000)}:${String(Math.floor((t.duration_ms % 60000) / 1000)).padStart(2, '0')}` : '';
-            return `<div class="gsearch-track" onclick="_gsClickTrack('${_escAttr(ar)}', '${_escAttr(t.name)}', '${_escAttr(t.album || '')}', '${_escAttr(t.id || '')}', '${_escAttr(t.image_url || '')}', ${t.duration_ms || 0})"><div class="gsearch-item-art" style="width:32px;height:32px;border-radius:6px">${t.image_url ? `<img src="${t.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎵'">` : '🎵'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(t.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${t.album ? ` · ${_escToast(t.album)}` : ''}</div></div><div class="gsearch-track-dur">${dur}</div><button class="gsearch-play-btn" onclick="event.stopPropagation(); _gsPlayTrack('${_escAttr(t.name)}', '${_escAttr(ar)}', '${_escAttr(t.album || '')}')" title="Stream">▶</button></div>`;
+            return `<div class="gsearch-track" onclick="_gsClickTrack('${_escJs(ar)}', '${_escJs(t.name)}', '${_escJs(t.album || '')}', '${_escJs(t.id || '')}', '${_escJs(t.image_url || '')}', ${t.duration_ms || 0})"><div class="gsearch-item-art" style="width:32px;height:32px;border-radius:6px">${t.image_url ? `<img src="${t.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎵'">` : '🎵'}</div><div class="gsearch-item-info"><div class="gsearch-item-title">${_escToast(t.name)}</div><div class="gsearch-item-sub">${_escToast(ar)}${t.album ? ` · ${_escToast(t.album)}` : ''}</div></div><div class="gsearch-track-dur">${dur}</div><button class="gsearch-play-btn" onclick="event.stopPropagation(); _gsPlayTrack('${_escJs(t.name)}', '${_escJs(ar)}', '${_escJs(t.album || '')}')" title="Stream">▶</button></div>`;
         }).join('');
         h += '</div>';
     }
@@ -6651,7 +7057,7 @@ async function _gsLazyLoadArtistImages() {
             const data = await res.json();
             if (data.success && data.image_url) {
                 const artDiv = card.querySelector('.gsearch-item-art');
-                if (artDiv) artDiv.innerHTML = `<img src="${data.image_url}" loading="lazy" onerror="this.parentElement.textContent='🎤'">`;
+                if (artDiv) artDiv.innerHTML = `<img src="${escapeHtml(data.image_url)}" loading="lazy" onerror="this.parentElement.textContent='🎤'">`;
                 card.removeAttribute('data-needs-image');
             }
         } catch (e) { /* ignore */ }
@@ -7020,31 +7426,28 @@ async function showVersionInfo() {
         } catch (e) { /* ignore */ }
     }
 
-    // Build version data straight from helper.js — single source of truth.
-    // No backend round-trip; the changelog content is shipped in the same
-    // bundle the browser already loaded.
-    const version = (typeof _getCurrentVersion === 'function')
-        ? _getCurrentVersion()
-        : (btn ? btn.textContent.trim().replace('v', '') : '');
-    const sections = (typeof VERSION_MODAL_SECTIONS !== 'undefined')
-        ? VERSION_MODAL_SECTIONS
-        : [];
+    // The notes come from the one release notes file
+    // (webui/src/features/help/release-notes.ts), which the React bundle
+    // publishes as window.SoulSyncReleaseNotes. The help sheet's What's new
+    // reads the same file, so a release is written once.
+    const version = btn ? btn.textContent.trim().replace(/^v/, '') : '';
+    const notes = window.SoulSyncReleaseNotes;
+    let sections = [];
+    try {
+        sections = notes ? notes.modalSections(version || undefined) : [];
+    } catch (e) { /* no notes: the modal still opens with its header */ }
     const versionData = {
         version,
         title: "What's New in SoulSync",
-        subtitle: version ? `Version ${version} — Latest Changes` : 'Latest Changes',
+        subtitle: version ? `Version ${version}: latest changes` : 'Latest changes',
         sections,
     };
 
-    // The version modal shows the same What's New content the helper's badge
-    // points at — mark it seen here too, or the helper button's red dot never
-    // clears for users who read release notes this way (Kazimir's stuck dot).
+    // Reading the notes here counts as having seen them: What's new's chip in
+    // the help sheet keys off the same version (Kazimir's stuck dot).
     try {
-        if (typeof _getLatestWhatsNewVersion === 'function') {
-            localStorage.setItem('soulsync_helper_version_seen', _getLatestWhatsNewVersion());
-            if (typeof _updateHelperBadge === 'function') _updateHelperBadge();
-        }
-    } catch (e) { /* badge sync is cosmetic */ }
+        if (version) localStorage.setItem('soulsync_helper_version_seen', version);
+    } catch (e) { /* storage blocked */ }
 
     try {
         populateVersionModal(versionData, hadUpdate ? updateInfo : null);
