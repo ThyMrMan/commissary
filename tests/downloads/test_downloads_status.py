@@ -803,17 +803,21 @@ def test_unified_response_includes_persistent_download_history():
 
 
 def test_history_rows_carry_kind_acoustid_and_what_was_asked_for():
-    # the downloads page detail sheet reads these. a podcast row has to say
-    # it's a podcast, and a wrong-file grab has to show what we asked for.
+    """in-app chat (makiel): review showed asked for and got reversed.
+
+    library_history keeps the ask in title/artist_name and what the source
+    handed over in source_track_title/source_artist. the row put the source's
+    side in expected_*, so the sheet's "asked for" showed the file."""
     deps, _ = _build_deps(
         persistent_history=lambda limit: [
             {
                 'id': 7,
                 'event_type': 'podcast',
-                'title': 'Episode',
+                'title': 'Asked Title',
+                'artist_name': 'Asked Artist',
                 'acoustid_result': 'verified',
-                'source_track_title': 'Asked Title',
-                'source_artist': 'Asked Artist',
+                'source_track_title': 'Got Title',
+                'source_artist': 'Got Artist',
                 'created_at': '2026-05-24 12:34:56',
             },
             {'id': 8, 'title': 'Bare', 'created_at': '2026-05-24 12:00:00'},
@@ -825,12 +829,17 @@ def test_history_rows_carry_kind_acoustid_and_what_was_asked_for():
     rich, bare = out['downloads']
     assert rich['event_type'] == 'podcast'
     assert rich['acoustid_result'] == 'verified'
+    assert rich['title'] == 'Asked Title'
     assert rich['expected_title'] == 'Asked Title'
     assert rich['expected_artist'] == 'Asked Artist'
+    assert rich['got_title'] == 'Got Title'
+    assert rich['got_artist'] == 'Got Artist'
     # old rows without the columns get empty strings, never None
     assert bare['event_type'] == ''
     assert bare['acoustid_result'] == ''
-    assert bare['expected_title'] == ''
+    assert bare['expected_title'] == 'Bare'
+    assert bare['got_title'] == ''
+    assert bare['got_artist'] == ''
 
 
 def test_unified_response_dedupes_history_against_live_task():
@@ -1030,3 +1039,15 @@ def test_external_audiobook_progress_survives_music_timeout_and_serializes():
     row = next(item for item in unified['downloads'] if item['task_id'] == 'book')
     assert row['progress'] == 37.5
     assert row['status'] == 'downloading'
+
+
+def test_completed_live_and_history_rows_keep_separate_metadata_verdicts():
+    deps, _ = _build_deps()
+    download_tasks['t1'] = {'status': 'completed', 'track_info': {'title': 'New Track', 'artist': 'Artist'}, 'metadata_status': 'unknown'}
+    deps.get_persistent_download_history = lambda limit: [{'id': 1, 'title': 'Old Track', 'file_path': '/music/old.flac'}]
+    looked_up = []
+    deps.get_metadata_states = lambda paths: looked_up.extend(paths) or {'/music/old.flac': 'issues'}
+    rows = st.build_unified_downloads_response(20, deps)['downloads']
+    assert looked_up == ['/music/old.flac']
+    assert {r['task_id']: (r['status'], r['metadata_status']) for r in rows} == {
+        't1': ('completed', 'unknown'), 'history-1': ('completed', 'issues')}

@@ -16,7 +16,7 @@ export interface VdlHeaderProps {
   filter: VdlFilter;
   onFilter: (filter: VdlFilter) => void;
   downloads: VdlDownload[];
-  counts: { active: number; completed: number; failed: number; total: number };
+  counts: { active: number; completed: number; failed: number; removable: number; total: number };
   liveSpeedBps: number;
   hasRunningWork: boolean;
   retryableCount: number;
@@ -25,8 +25,17 @@ export interface VdlHeaderProps {
   onOpenHistory: () => void;
   onCancelAll: () => void;
   onRetryAll: () => void;
+  /** failed rows whose release can be blocked and replaced; 0 hides the item */
+  blockableFailedCount?: number;
+  onBlockRetryAll?: () => void;
   onClearFinished: () => void;
+  onClearFailed: () => void;
+  /** completed, failed and cancelled rows; import failures stay for Manual import. */
+  onClearEverything: () => void;
   retryAllPending: boolean;
+  /** an admin: clearing the list, cancel all and the Review pane (recycle
+   * bin + blocklist) are theirs. a member sees their own grabs only. */
+  canManage?: boolean;
 }
 
 const REVIEW_TITLE = 'Recycle bin + release blocklist';
@@ -47,11 +56,18 @@ export function VdlHeader({
   onOpenHistory,
   onCancelAll,
   onRetryAll,
+  blockableFailedCount = 0,
+  onBlockRetryAll,
   onClearFinished,
+  onClearFailed,
+  onClearEverything,
   retryAllPending,
+  canManage = true,
 }: VdlHeaderProps) {
   const chipCounts = videoChipCounts(downloads);
-  const finished = counts.completed + counts.failed;
+  // Clear finished takes completed rows only; failed rows go through Clear
+  // failed, import failures through Manual import
+  const finished = counts.completed;
   const menu: ActionMenuItem[] = [];
   if (retryableCount > 0) {
     menu.push({
@@ -62,10 +78,38 @@ export function VdlHeader({
       onSelect: onRetryAll,
     });
   }
-  if (finished > 0) {
+  if (blockableFailedCount > 0 && onBlockRetryAll) {
+    menu.push({
+      key: 'block-retry',
+      label: `Block and retry failed (${blockableFailedCount})`,
+      title: 'Block every failed release and grab the next best release for each',
+      disabled: retryAllPending,
+      onSelect: onBlockRetryAll,
+    });
+  }
+  if (counts.removable > 0 && canManage) {
+    menu.push({
+      key: 'clear-failed',
+      label: `Clear failed (${counts.removable})`,
+      title: 'Remove failed and cancelled downloads from the list without retrying',
+      onSelect: onClearFailed,
+    });
+  }
+  if (finished > 0 && canManage) {
     menu.push({ key: 'clear', label: `Clear finished (${finished})`, onSelect: onClearFinished });
   }
-  if (hasRunningWork) {
+  const everything = counts.completed + counts.removable;
+  if (everything > 0 && canManage) {
+    menu.push({
+      key: 'clear-all',
+      label: `Clear everything (${everything})`,
+      title:
+        'Clear finished and failed downloads together. Import failures stay for Manual import.',
+      danger: true,
+      onSelect: onClearEverything,
+    });
+  }
+  if (hasRunningWork && canManage) {
     menu.push({
       key: 'cancel',
       label: `Cancel all (${counts.active})`,
@@ -78,7 +122,9 @@ export function VdlHeader({
     <DlHeader
       tabs={[
         { value: 'downloads', label: 'Downloads' },
-        { value: 'review', label: 'Review', title: REVIEW_TITLE, badge: reviewCount },
+        ...(canManage
+          ? [{ value: 'review', label: 'Review', title: REVIEW_TITLE, badge: reviewCount }]
+          : []),
         { value: 'clients', label: 'Clients', title: CLIENTS_TITLE },
       ]}
       view={view}

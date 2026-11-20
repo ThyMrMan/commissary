@@ -41,7 +41,7 @@ logger = get_logger("automation.video_process_wishlist")
 def acceptable_candidates(candidates: List[Dict[str, Any]],
                           min_rank: int = 0) -> List[Dict[str, Any]]:
     """Every release worth trying, best first. ``_evaluate_hits`` already sorts
-    best-first (accepted, score, availability), so this just filters.
+    best-first (core/video/release_rank), so this just filters.
 
     ``min_rank`` > 0 = an UPGRADE pick for an owned item: only releases with a
     resolution STRICTLY better than the current copy qualify (a same-quality
@@ -168,8 +168,30 @@ def reset_source_cooldowns() -> None:
         _SOURCE_COOLDOWNS.clear()
 
 
+def held_titles(db) -> Optional[Callable[[Dict[str, Any]], bool]]:
+    """says whether a wishlist row's title is padlocked (reviewed and locked in
+    the library manager), or None when nothing is. a padlocked title keeps the
+    copy it has: no automatic upgrade replaces it."""
+    try:
+        ids = db.hands_off_tmdb_ids()
+    except Exception:   # noqa: BLE001 - no answer means nothing is held
+        return None
+    if not ids.get("movie") and not ids.get("show"):
+        return None
+
+    def held(item: Dict[str, Any]) -> bool:
+        show = "show_tmdb_id" in item
+        try:
+            tmdb = int(item.get("show_tmdb_id" if show else "tmdb_id"))
+        except (TypeError, ValueError):
+            return False
+        return tmdb in ids["show" if show else "movie"]
+    return held
+
+
 def annotate_upgrades(items: List[Dict[str, Any]], cutoff_rank: int,
-                      cutoff_for: Optional[Callable[[Dict[str, Any]], int]] = None) -> List[Dict[str, Any]]:
+                      cutoff_for: Optional[Callable[[Dict[str, Any]], int]] = None,
+                      held: Optional[Callable[[Dict[str, Any]], bool]] = None) -> List[Dict[str, Any]]:
     """Upgrade-until-cutoff eligibility over the wishlist rows (pure).
 
     Unowned items pass through untouched. Owned items (the queries annotate
@@ -185,12 +207,17 @@ def annotate_upgrades(items: List[Dict[str, Any]], cutoff_rank: int,
 
     ``cutoff_for`` (P2, per-title profiles): when given, each owned item is
     judged against ITS OWN profile's cutoff instead of the global
-    ``cutoff_rank``. Still pure — the callable is injected."""
+    ``cutoff_rank``. Still pure — the callable is injected.
+
+    ``held``: says an owned item's title is padlocked. it is skipped, the
+    copy it has stays."""
     from core.video.quality_eval import resolution_rank
     out = []
     for it in items or []:
         if not it.get("owned"):
             out.append(it)
+            continue
+        if held is not None and held(it):
             continue
         rks = [resolution_rank(r) for r in str(it.get("owned_resolutions") or "").split(",")
                if r.strip()]
@@ -301,6 +328,9 @@ def apply_group_overrides(candidates: List[Dict[str, Any]],
 def item_key(item: Dict[str, Any], media_type: str) -> tuple:
     """Stable identity for de-duping a wished item against active downloads."""
     if media_type == "movie":
+        # a copy wanted in another library (#2029) is its own item
+        if item.get("video_library_id"):
+            return ("movie", str(item.get("tmdb_id")), int(item["video_library_id"]))
         return ("movie", str(item.get("tmdb_id")))
     if item.get("episode_number") is None and item.get("season_number") is not None:
         return ("season", str(item.get("show_tmdb_id")), int(item.get("season_number") or 0))
@@ -315,7 +345,10 @@ def active_download_keys(active: Iterable[Dict[str, Any]]) -> set:
     for d in active or []:
         kind = str(d.get("kind") or "").lower()
         if kind == "movie":
-            keys.add(("movie", str(d.get("media_id"))))
+            if d.get("video_library_id"):
+                keys.add(("movie", str(d.get("media_id")), int(d["video_library_id"])))
+            else:
+                keys.add(("movie", str(d.get("media_id"))))
         elif kind in ("episode", "show", "season"):
             ctx = d.get("search_ctx")
             if isinstance(ctx, str):
@@ -414,7 +447,7 @@ def season_pack_requests(items: List[Dict[str, Any]], active: Iterable,
     return out
 
 
-def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
+def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any, season: Any = None) -> List[str]:
     """[primary title, *TMDB aliases, *your own] — deduped, primary first. The alias
     set the release-title gate matches against (so a release named by a known aka still
     matches). Best-effort: just the primary when TMDB is unavailable.
@@ -439,12 +472,62 @@ def _acceptable_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
             get_video_db().title_overrides_for(kind, tmdb_id=tmdb_id).get("manual_aliases") or [])
     except Exception:   # noqa: BLE001 - same: an assist never blocks a grab
         logger.debug("manual aliases unavailable for %s %s", kind, tmdb_id, exc_info=True)
+    # an anime's AniList names (romaji, english, that season's synonyms): the
+    # scene names anime releases those ways ("Shingeki no Kyojin"). per season,
+    # so season 2's "JJK2" never accepts a release for season 1
+    try:
+        from api.video import get_video_db
+        aliases = list(aliases) + list(get_video_db().anime_titles_for(kind, tmdb_id, season))
+    except Exception:   # noqa: BLE001 - same: an assist never blocks a grab
+        logger.debug("anime titles unavailable for %s %s", kind, tmdb_id, exc_info=True)
     out, seen = [], set()
     for t in [primary, *aliases]:
         t = str(t or "").strip()
         if t and t.lower() not in seen:
             seen.add(t.lower())
             out.append(t)
+    return out
+
+
+def tmdb_identity(kind: str, tmdb_id: Any) -> Dict[str, Any]:
+    """TMDB's {name, original_name, year, aliases} for a title, cached by the
+    enrichment engine. {} when TMDB can't say; never raises."""
+    if not tmdb_id:
+        return {}
+    try:
+        from core.video.enrichment.engine import get_video_enrichment_engine
+        fn = getattr(get_video_enrichment_engine(), "title_identity", None)
+        return (fn(kind, tmdb_id) or {}) if fn else {}
+    except Exception:   # noqa: BLE001 - a matching assist must never break a grab
+        logger.debug("tmdb identity unavailable for %s %s", kind, tmdb_id, exc_info=True)
+        return {}
+
+
+# how many names one search asks the indexers under: the library's title,
+# TMDB's own (english) name and the original-language one. each extra name
+# is one more text query per search, so this stays small
+MAX_SEARCH_TITLES = 3
+
+
+def search_titles(primary: Any, kind: str, tmdb_id: Any) -> List[str]:
+    """The names to SEARCH a title under, primary first, at most
+    MAX_SEARCH_TITLES, two names that fold to the same text counted once.
+
+    one name was all a search ever sent, and it was the library's, so a show
+    whose server is in french was only searched as "L'amour sous couverture"
+    and the releases named "Love in Disguise" were never found (#2021).
+    Sonarr searches a series under its scene titles the same way."""
+    from core.video.release_parse import normalize_title
+    ident = tmdb_identity(kind, tmdb_id)
+    out, seen = [], set()
+    for t in (primary, ident.get("name"), ident.get("original_name")):
+        t = str(t or "").strip()
+        key = normalize_title(t) if t else ""
+        if t and key and key not in seen:
+            seen.add(key)
+            out.append(t)
+        if len(out) >= MAX_SEARCH_TITLES:
+            break
     return out
 
 
@@ -459,7 +542,12 @@ def show_year_for(item: Dict[str, Any]) -> Optional[str]:
     'Dark.Matter.2024.S02E08', was rejected as "Wrong year (2024, wanted 2026)"
     by the drain and again by the importer, and the right episode sat on the
     wishlist forever. the library's show year first, then a "(2024)" in the
-    title, else no year at all (no year means no year judgement)."""
+    title, then TMDB's first-air year, else no year at all (no year means no
+    year judgement).
+
+    the TMDB step is #2027: a show that isn't in the library has no library
+    year, so 'The.Office.2024.S01E01' passed for The Office (2005) and was
+    sent to the download client."""
     year = item.get("show_year")
     try:
         if year:
@@ -467,7 +555,10 @@ def show_year_for(item: Dict[str, Any]) -> Optional[str]:
     except (TypeError, ValueError):
         pass
     m = _TITLE_YEAR.search(str(item.get("show_title") or "").strip())
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+    ty = tmdb_identity("show", item.get("show_tmdb_id")).get("year")
+    return str(ty) if ty else None
 
 
 def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
@@ -475,7 +566,9 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
     Carries ``titles`` — the primary title plus TMDB aliases — so both the initial pick
     and every retry gate releases against the full alias set."""
     if media_type == "movie":
-        ctx = {"scope": "movie", "title": item.get("title"), "year": item.get("year")}
+        # a movie row without a year (#2027): TMDB's, so the year gate runs
+        ctx = {"scope": "movie", "title": item.get("title"),
+               "year": item.get("year") or tmdb_identity("movie", item.get("tmdb_id")).get("year")}
         tmdb_id, kind = item.get("tmdb_id"), "movie"
     else:
         scope = "season" if item.get("episode_number") is None and item.get("season_number") is not None else "episode"
@@ -486,6 +579,11 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
                # full air date — daily series (Daily Show / Kimmel / soaps) release by
                # DATE, not SxxExx; the ranker + retry queries key off this.
                "air_date": (str(item.get("air_date") or "")[:10] or None)}
+        if scope == "episode" and item.get("episode_title"):
+            # the naming template's $episodetitle (the import also looks it up)
+            from database.video_database import real_episode_title
+            if real_episode_title(item["episode_title"]):
+                ctx["episode_title"] = str(item["episode_title"]).strip()
         if scope == "season":
             ctx.pop("episode", None)
             ctx.pop("air_date", None)
@@ -523,9 +621,17 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 pass
         tmdb_id, kind = item.get("show_tmdb_id"), "show"
-    titles = _acceptable_titles(ctx["title"], kind, tmdb_id)
+    # the anime id map numbers seasons the scene (TVDB) way: alt_season when
+    # TMDB's numbering differs
+    anime_season = ctx.get("alt_season", ctx.get("season")) if kind == "show" else None
+    titles = _acceptable_titles(ctx["title"], kind, tmdb_id, anime_season)
     if len(titles) > 1:
         ctx["titles"] = titles
+    # the names the indexers are asked under (#2021). only when there is more
+    # than the one, so a ctx keeps its old shape otherwise
+    names = search_titles(ctx["title"], kind, tmdb_id)
+    if len(names) > 1:
+        ctx["search_titles"] = names
     # External ids for the indexer search. Prowlarr's structured tvsearch/movie
     # queries take tvdbid/imdbid/tmdbid and route each to the indexers that can
     # resolve it — the id-aware path Sonarr/Radarr rely on so they never depend on
@@ -536,6 +642,17 @@ def search_context(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
         ids["tvdb_id"] = item.get("tvdb_id")
     ctx.update({k: v for k, v in ids.items() if v})
     return ctx
+
+
+def _library_profile(item: Dict[str, Any]) -> Optional[int]:
+    """The default profile of the item's video library (#2029), or None.
+    Best-effort: never stops a grab."""
+    try:
+        from api.video import get_video_db
+        from core.video.quality_profile import library_profile_for_item
+        return library_profile_for_item(get_video_db(), item)
+    except Exception:   # noqa: BLE001
+        return None
 
 
 def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates: List[Dict[str, Any]],
@@ -564,7 +681,11 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
         "poster_url": item.get("poster_url"), "search_ctx": json.dumps(ctx), "attempts": 0,
         # the profile this grab was judged under — the monitor's cutoff/requery
         # decisions stay consistent even if the title is reassigned mid-flight
-        "quality_profile_id": item.get("quality_profile_id"),
+        # (no profile of its own: its library's default, #2029)
+        "quality_profile_id": item.get("quality_profile_id") or _library_profile(item),
+        # a second copy's library (#2029): the import files it there and
+        # judges only the copy already in that library
+        "video_library_id": item.get("video_library_id"),
     }
     if transport_source == "soulseek":
         rest = [c for c in (candidates or []) if c.get("filename") != best.get("filename")]
@@ -584,12 +705,27 @@ def build_download_record(item: Dict[str, Any], best: Dict[str, Any], candidates
 # ── production seams ──────────────────────────────────────────────────────────
 def _default_fetch_items(media_type: str) -> List[Dict[str, Any]]:
     from api.video import get_video_db
-    from core.commissary.import_lock import unlocked   # Commissary: a lock refuses what it would grab
     db = get_video_db()
     if media_type == "movie":
-        return unlocked(db.movie_wishlist_to_download(), media_type, db)
+        return db.movie_wishlist_to_download()
     from core.video.numbering import annotate
-    return annotate(unlocked(db.episode_wishlist_to_download(), media_type, db), db=db)
+    return annotate(db.episode_wishlist_to_download(), db=db)
+
+
+def _default_still_wanted(item: Dict[str, Any], media_type: str) -> bool:
+    """Is this item still on anyone's wishlist? Fails open: a DB hiccup must
+    not stop the drain from grabbing what it was asked to."""
+    try:
+        from api.video import get_video_db
+        db = get_video_db()
+        if media_type == "movie":
+            return db.wishlist_has("movie", tmdb_id=item.get("tmdb_id"))
+        return db.wishlist_has("episode", tmdb_id=item.get("show_tmdb_id"),
+                               season_number=item.get("season_number"),
+                               episode_number=item.get("episode_number"))
+    except Exception:   # noqa: BLE001 - visibility check, never a blocker
+        logger.debug("still_wanted check failed", exc_info=True)
+        return True
 
 
 def _backfill_movie_available_dates(limit: int = 25) -> None:
@@ -633,12 +769,22 @@ def _default_db():   # Commissary
 
 def _default_target_dir(media_type: str) -> str:
     from api.video import get_video_db
-    from core.commissary.video_libraries import target_dir as _vlib_target  # Commissary
     db = get_video_db()
     if media_type == "movie":
-        return (db.get_setting("movies_path") or db.get_setting("transfer_path")
-                or _vlib_target(db, media_type) or "")
-    return db.get_setting("tv_path") or _vlib_target(db, media_type) or ""
+        main = db.get_setting("movies_path") or db.get_setting("transfer_path") or ""
+    else:
+        main = db.get_setting("tv_path") or ""
+    if main:
+        return main
+    # no main folder: a custom default library (#2029) still has somewhere to
+    # file new titles
+    try:
+        from core.video.libraries import list_libraries
+        lib = next((x for x in list_libraries(db, "movie" if media_type == "movie" else "show")
+                    if x["is_default"] and x["usable"]), None)
+        return lib["path"] if lib else ""
+    except Exception:   # noqa: BLE001 - no libraries: no folder, as before
+        return ""
 
 
 def _default_route_type(item: Dict[str, Any]) -> Optional[str]:
@@ -680,19 +826,67 @@ def _default_profile_library(item: Dict[str, Any]) -> str:
         return "main"
 
 
+def _default_pick_library(item: Dict[str, Any], media_type: str,
+                          profile_library: Callable[[], str]) -> Optional[Dict[str, Any]]:
+    """The video library (#2029) a wished item files into: picked for its
+    row, picked for the title, the 4K one by its profile, the rules, the
+    default (core.video.libraries.choose). None when it can't be read, which
+    routes the way it did before libraries existed."""
+    try:
+        from api.video import get_video_db
+        from core.video.libraries import choose
+        db = get_video_db()
+        kind = "movie" if media_type == "movie" else "show"
+        tmdb = item.get("tmdb_id") if media_type == "movie" else item.get("show_tmdb_id")
+        title = item.get("title") if media_type == "movie" else (item.get("show_title") or item.get("title"))
+        lib = choose(db, kind, tmdb_id=tmdb, explicit_id=item.get("video_library_id"),
+                     profile_library=profile_library, title=title)
+        if lib and tmdb and not item.get("video_library_id"):
+            # where the title's own wish files into, for the wanted list's
+            # library filter (a no-op write when nothing moved)
+            db.stamp_filed_library(kind, tmdb, lib["id"])
+        return lib
+    except Exception:   # noqa: BLE001 - routing falls back to the main folder
+        logger.debug("library pick failed", exc_info=True)
+        return None
+
+
+def _library_dir(lib: Dict[str, Any], root: str, four_k_root: str) -> str:
+    """The folder of a chosen library: the main one is the caller's root and
+    the 4K one its 4K root (so a caller's own folders win), a custom one its
+    own folder."""
+    if lib.get("builtin") == "main":
+        return root
+    if lib.get("builtin") == "4k":
+        return four_k_root or root
+    return str(lib.get("path") or "") or root
+
+
 def item_target_dir(item: Dict[str, Any], media_type: str, root: str, anime_root: str,
                     four_k_root: str, route_type: Callable[[Dict[str, Any]], Optional[str]],
-                    profile_library: Callable[[Dict[str, Any]], str]) -> str:
-    """The folder ONE wished item is filed in. The anime folder by the show's
-    routing type (never the genre tag); else the 4K folder when the item's
-    quality profile says 4K and that library is on; else the main folder.
-    Each lookup only runs when its folder is set. Shared by the drain and RSS
-    sync so both route the same way."""
+                    profile_library: Callable[[Dict[str, Any]], str],
+                    pick_library: Optional[Callable[..., Optional[Dict[str, Any]]]] = None) -> str:
+    """The folder ONE wished item is filed in. A library picked for the item
+    or its title by hand; else the anime folder by the show's routing type
+    (never the genre tag); else its library (#2029: the 4K one when its
+    quality profile says 4K and that library is on, a library whose rules
+    match, the default one); else the main folder. The profile is only read
+    while the 4K folder is set. Shared by the drain and RSS sync so both
+    route the same way. Without ``pick_library`` it routes the way it did
+    before libraries existed."""
+    def profile():
+        return profile_library(item) if four_k_root else "main"
+
+    lib = pick_library(item, media_type, profile) if pick_library else None
+    if lib and lib.get("why") in ("picked", "assigned"):
+        return _library_dir(lib, root, four_k_root)
     if media_type == "episode" and anime_root:
         from core.video.download_pipeline import tv_root_for
         anime = tv_root_for(route_type(item), "", anime_root)
         if anime:
             return anime
+    if lib:
+        return _library_dir(lib, root, four_k_root)
     if four_k_root and profile_library(item) == "4k":
         return four_k_root
     return root
@@ -706,6 +900,41 @@ def _default_anime_dir() -> str:
         return get_video_db().get_setting("anime_path") or ""
     except Exception:   # noqa: BLE001 - routing falls back to the TV folder
         return ""
+
+
+def _routing_type_for(item: Dict[str, Any]) -> Optional[str]:
+    """``_default_route_type`` for an item that may not come from a wishlist
+    query (a repair grab carries only ``show_tmdb_id``): the library's rule
+    first -- set by hand, an anime-marked library, or a stored hint, never the
+    genre -- and TMDB only for a show in no library with no stored type."""
+    st = item.get("route_series_type")
+    if st:
+        return st
+    tmdb = item.get("show_tmdb_id")
+    if not tmdb:
+        return None
+    try:
+        from api.video import get_video_db
+        st = get_video_db().routing_series_type(tmdb_id=tmdb)
+    except Exception:   # noqa: BLE001 - routing falls back to the TV folder
+        st = None
+    if st and st != "standard":
+        return st
+    return _default_route_type(item)
+
+
+def grab_target_dir(item: Dict[str, Any], media_type: str, root: str) -> str:
+    """``item_target_dir`` for the grab paths that are not the drain or RSS
+    sync (wishlist search now, repair grabs): reads the anime and 4K folders
+    itself, so an anime show's episode goes to the anime folder and a title
+    whose profile says 4K goes to the 4K folder from these paths too."""
+    if not root:
+        return root
+    anime_root = _default_anime_dir() if media_type == "episode" else ""
+    return item_target_dir(item, media_type, root, anime_root,
+                           _default_four_k_dir(media_type),
+                           _routing_type_for, _default_profile_library,
+                           _default_pick_library)
 
 
 def _extto_hits_for_context(ctx: Dict[str, Any]) -> tuple:
@@ -754,16 +983,14 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
         hits = res.get("hits") or []
     elif source in ("torrent", "usenet"):
         from core.video.prowlarr_search import prowlarr_search
-        # Commissary: limited to the title's video Library's trackers, if it has any
-        from core.commissary.video_libraries import search_indexer_ids
-        lib_ids = search_indexer_ids(get_video_db(), media_type, item=item)
         pres = prowlarr_search(ctx["scope"], ctx["title"], year=ctx.get("year"),
                                season=ctx.get("season"), episode=ctx.get("episode"), source=source,
                                air_date=ctx.get("air_date"), absolute=ctx.get("absolute"),
                                series_type=ctx.get("series_type"),
                                imdb_id=ctx.get("imdb_id"), tmdb_id=ctx.get("tmdb_id"),
                                tvdb_id=ctx.get("tvdb_id"), alt=ctx_alt(ctx),
-                               **({"indexer_ids": lib_ids} if lib_ids else {}))
+                               alt_titles=(ctx.get("search_titles") or [])[1:],
+                               indexer_ids=item_indexer_ids(item, media_type))
         prowlarr_err = None
         if not pres.get("configured"):
             prowlarr_err = "Prowlarr not configured"
@@ -810,9 +1037,7 @@ def _search_one_source(source: str, item: Dict[str, Any], media_type: str):
             c["source"] = "extto"
         else:
             c["source"] = source
-    # Commissary: a release that just failed on its client isn't grabbed again
-    from core.commissary.client_retry import mark_failed as _mark_failed
-    return _mark_failed(item, media_type, cands), "; ".join(source_notes) or None
+    return cands, "; ".join(source_notes) or None
 
 
 # How many individual releases a snapshot keeps per source. Enough to answer
@@ -890,6 +1115,9 @@ def _default_search(item: Dict[str, Any], media_type: str):
     cfg = download_config.load(get_video_db())
     mode = str(cfg.get("download_mode") or "soulseek")
     chain = (cfg.get("hybrid_order") or ["soulseek"]) if mode == "hybrid" else [mode]
+    # the item's library may order its own sources (#2029); the title's
+    # preferred sources narrow that the way they narrow the global order
+    chain = item_source_chain(item, media_type, chain)
     chain = chain_for(chain, title_overrides_for_item(item, media_type))
     skips: List[str] = []
     fallback = None      # hits that didn't pass the profile — kept so the caller can say 'rejected'
@@ -918,6 +1146,39 @@ def _default_search(item: Dict[str, Any], media_type: str):
     return [], note                                  # → 'source empty' (+ any skip note)
 
 
+def library_allows(item: Dict[str, Any], media_type: str, pick_library: Callable[..., Any],
+                   profile_library: Callable[[Dict[str, Any]], str]) -> bool:
+    """May the drain / RSS hunt this item, by its library's automatic search
+    and upgrade switches (#2029)? Reads (and caches) the item's library."""
+    from core.video.libraries import allows_automatic
+    if "_library" not in item:
+        item["_library"] = pick_library(item, media_type, lambda: profile_library(item))
+    return allows_automatic(item["_library"], bool(item.get("owned")))
+
+
+def item_library(item: Dict[str, Any], media_type: str) -> Optional[Dict[str, Any]]:
+    """The video library a wished item files into (#2029), read once per
+    item (cached on it like _overrides). None when it can't be read."""
+    if "_library" not in item:
+        item["_library"] = _default_pick_library(
+            item, media_type, lambda: _default_profile_library(item))
+    return item["_library"]
+
+
+def item_indexer_ids(item: Dict[str, Any], media_type: str) -> Optional[List[int]]:
+    """The Prowlarr indexers the item's library searches (#2029), or None
+    for every one."""
+    from core.video.libraries import indexer_ids_for
+    return indexer_ids_for(item_library(item, media_type))
+
+
+def item_source_chain(item: Dict[str, Any], media_type: str, chain: List[str]) -> List[str]:
+    """The download sources an item's automatic search tries: its library's
+    own order, else ``chain`` (#2029)."""
+    from core.video.libraries import source_chain
+    return source_chain(item_library(item, media_type), chain)
+
+
 def _pack_preference_for(item: Dict[str, Any]) -> str:
     """This show's season-pack preference: auto | prefer | never."""
     return str(title_overrides_for_item(item, "episode").get("pack_preference") or "auto")
@@ -936,10 +1197,6 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
     from core.video.download_monitor import ensure_started
     from core.video.slskd_search import build_query
     name = display_name(item, media_type)
-    # Commissary: file the grab into the title's video Library, with its category.
-    from core.commissary.video_libraries import category as _vlib_category
-    from core.commissary.video_libraries import target_dir as _vlib_target
-    target_dir = _vlib_target(get_video_db(), media_type, item=item) or target_dir
     room = disk_guard.check_room(target_dir, organization.load(get_video_db()))
     if not room["ok"]:
         msg = disk_guard.shortfall_message(room, target_dir)
@@ -961,10 +1218,12 @@ def _default_enqueue(item: Dict[str, Any], best: Dict[str, Any], candidates: Lis
                 return {"ok": False, "error": resolved.get("error")
                         or "EXT.to would not hand over a magnet for this release."}
             best = {**best, "download_url": resolved["magnet"], "magnet_uri": resolved["magnet"]}
-        from core.video.client_grab import _category_kw, grab
+        from core.video.client_grab import grab
+        from core.video.libraries import client_category
+        # the category / label of the library it files into (#2029)
+        cat = client_category(get_video_db(), target_dir, transport_source)
         res = grab(transport_source, best.get("download_url"),
-                   fallback_magnet=best.get("magnet_uri"),
-                   **_category_kw(_vlib_category(get_video_db(), media_type, item=item)))  # Commissary
+                   fallback_magnet=best.get("magnet_uri"), **({"category": cat} if cat else {}))
         if not res.get("ok"):
             logger.warning("video hybrid: %s grab refused for %s: %s", source, name, res.get("error"))
             return {"ok": False, "error": res.get("error") or "the download client refused it"}
@@ -1046,6 +1305,14 @@ def _wishlist_db_key(item: Dict[str, Any], media_type: str) -> tuple:
     return kind, tmdb, item.get('season_number'), item.get('episode_number')
 
 
+def _row_library(item: Dict[str, Any], media_type: str) -> Dict[str, Any]:
+    """The wishlist writers' library scope for a movie item (#2029): its own
+    row only, a copy's or the title's. {} for episodes (every row)."""
+    if media_type != "movie":
+        return {}
+    return {"video_library_id": item.get("video_library_id")}
+
+
 def _default_record_outcome(item: Dict[str, Any], media_type: str, grabbed: bool,
                             refusal: Optional[Dict[str, Any]] = None) -> None:
     """Persist the drain search outcome on the wishlist row (#liveleak-failing-hub):
@@ -1069,7 +1336,7 @@ def _default_record_outcome(item: Dict[str, Any], media_type: str, grabbed: bool
             episode_number=episode,
             refusal=refusal_line(refusal),
             refusal_quality=(refusal or {}).get('quality_label'),
-            snapshot=item.get("_source_snapshot"))
+            snapshot=item.get("_source_snapshot"), **_row_library(item, media_type))
     except Exception:   # noqa: BLE001 - visibility must never break acquisition
         logger.debug("record_wishlist_search_outcome failed", exc_info=True)
 
@@ -1085,7 +1352,7 @@ def _default_record_note(item: Dict[str, Any], media_type: str, note: str,
             return
         get_video_db().record_wishlist_search_note(
             kind, tmdb, note, season_number=season, episode_number=episode,
-            refusal_quality=refusal_quality)
+            refusal_quality=refusal_quality, **_row_library(item, media_type))
     except Exception:   # noqa: BLE001 - visibility must never break acquisition
         logger.debug("record_wishlist_search_note failed", exc_info=True)
 
@@ -1106,10 +1373,12 @@ def auto_video_process_wishlist(
     four_k_dir: Optional[Callable[[str], str]] = None,
     route_type: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
     profile_library: Optional[Callable[[Dict[str, Any]], str]] = None,
+    pick_library: Optional[Callable[..., Optional[Dict[str, Any]]]] = None,
     search: Optional[Callable[[Dict[str, Any], str], List[Dict[str, Any]]]] = None,
     enqueue: Optional[Callable[..., bool]] = None,
     record_outcome: Optional[Callable[[Dict[str, Any], str, bool], None]] = None,
     record_note: Optional[Callable[[Dict[str, Any], str, str, Optional[str]], None]] = None,
+    still_wanted: Optional[Callable[[Dict[str, Any], str], bool]] = None,
 ) -> Dict[str, Any]:
     """Auto-grab the wished movies (or episodes): search Soulseek, pick the best release,
     enqueue — at most ``max_simultaneous_downloads`` grabs per run (default 3); the rest
@@ -1117,8 +1386,17 @@ def auto_video_process_wishlist(
     (``max_concurrent``).
 
     Returns ``{'status': 'completed', 'searched': int, 'grabbed': int, ...}``."""
+    # Re-check against the same source the items came from: a caller that
+    # hands in its own items (a manual retry, a test) has no wishlist rows
+    # for the DB check to find.
+    if still_wanted is None:
+        still_wanted = _default_still_wanted if fetch_items is None else (lambda _it, _mt: True)
     fetch_items = fetch_items or _default_fetch_items
     active_keys = active_keys or _default_active_keys
+    # a test that hands in its own folders routes by them alone unless it
+    # hands in a library pick too
+    if pick_library is None and target_dir is None:
+        pick_library = _default_pick_library
     target_dir = target_dir or _default_target_dir
     anime_dir = anime_dir or _default_anime_dir
     four_k_dir = four_k_dir or _default_four_k_dir
@@ -1167,6 +1445,10 @@ def auto_video_process_wishlist(
         if media_type == 'movie':
             _backfill_movie_available_dates()   # resolve downloadable dates so the gate can skip cinema-only films
         items = fetch_items(media_type) or []
+        if pick_library is not None:
+            # a library with automatic search off (or upgrades off, for what
+            # it already has) is only searched when you ask (#2029)
+            items = [it for it in items if library_allows(it, media_type, pick_library, profile_library)]
         # Upgrade-until-cutoff: owned rows are judged against the profile cutoff
         # (skip when met; strictly-better-only when below). Only loaded when an
         # owned row is actually present — the common all-new case stays DB-free.
@@ -1180,7 +1462,9 @@ def auto_video_process_wishlist(
             # stays on the single global read)
             per_item = _cutoff_rank_for_item if any(
                 it.get("quality_profile_id") for it in items) else None
-            items = annotate_upgrades(items, cutoff_rank, cutoff_for=per_item)
+            from api.video import get_video_db as _held_db
+            items = annotate_upgrades(items, cutoff_rank, cutoff_for=per_item,
+                                      held=held_titles(_held_db()))
         active = set(active_keys(media_type) or set())
         from core.commissary import season_packs as _season_packs   # Commissary
         # Commissary: an episode whose season pack is downloading is in flight too
@@ -1214,6 +1498,7 @@ def auto_video_process_wishlist(
         refused = [0]      # releases passed the profile; the download client said no
         deferred = [0]      # budget spent: left on the wishlist for the next run
         stopped = [0]       # cancel all hit mid-run: left on the wishlist untouched
+        gone = [0]          # taken off the wishlist while its search ran: not grabbed
         slots_claimed = [0]  # atomic grab-budget claims this run (never > max_downloads)
         total = [len(todo)]
         lock = threading.Lock()
@@ -1245,6 +1530,18 @@ def auto_video_process_wishlist(
             cooldown_wait = max([remaining for _c, remaining in cooled], default=0)
             ok, refusal = False, None
             budget_deferred = False
+            if usable and not still_wanted(it, media_type):
+                # The item list was read before this search, and a search can
+                # take minutes. If the title was deleted or un-wished in the
+                # meantime, grabbing it now brings it straight back -- and a
+                # failed grab re-wishes it outright. Drop it, record nothing.
+                with lock:
+                    gone[0] += 1
+                    deps.update_progress(
+                        automation_id, log_type='info',
+                        log_line="'%s' was removed from the wishlist while searching -- not grabbed"
+                                 % display_name(it, media_type))
+                return
             if usable:
                 # Atomic claim (YouTube's slots_free() pattern): threads race
                 # here, so the check + increment must be one locked step — at
@@ -1266,7 +1563,7 @@ def auto_video_process_wishlist(
                         out = enqueue_outcome(enqueue(
                             it, cand, cands, media_type,
                             item_target_dir(it, media_type, root, anime_root, four_k_root,
-                                            route_type, profile_library)))
+                                            route_type, profile_library, pick_library)))
                         if out["ok"]:
                             clear_source_refusal(it, media_type, cand)
                             ok = True
@@ -1409,6 +1706,8 @@ def auto_video_process_wishlist(
             tail.append('%d rejected on quality' % rejected[0])
         if refused[0]:
             tail.append('%d refused by the download client' % refused[0])
+        if gone[0]:
+            tail.append('%d removed from the wishlist mid-search' % gone[0])
         if deferred[0]:
             tail.append('%d deferred to the next run (download cap %d)'
                         % (deferred[0], max_downloads))

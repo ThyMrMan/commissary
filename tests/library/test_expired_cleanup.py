@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from core.library.expired_cleanup import (
     normalize_track_key,
@@ -10,6 +11,7 @@ from core.library.expired_cleanup import (
     is_expired,
     select_expired,
 )
+from core.repair_jobs.expired_download_cleaner import delete_origin_download
 
 NOW = datetime(2026, 6, 7, tzinfo=timezone.utc)
 
@@ -96,6 +98,126 @@ def test_select_expired_filters():
     assert [e["id"] for e in out] == [1]
 
 
+def test_automatic_delete_syncs_v2_before_removing_retry_history(monkeypatch, tmp_path):
+    path = tmp_path / "expired.flac"
+    path.write_bytes(b"audio")
+    calls = []
+
+    class _DB:
+        def delete_track_by_file_path(self, value, **kwargs):
+            calls.append(("legacy", value, kwargs))
+
+        def delete_library_history_rows(self, ids):
+            calls.append(("history", ids))
+            return 1
+
+    monkeypatch.setattr(
+        "core.library2.maintenance_sync.annotate_finding_details",
+        lambda *_args, **kwargs: {
+            **kwargs["details"],
+            "library_v2": {"track_ids": [7], "file_ids": [9]},
+        },
+    )
+
+    def sync(*_args, **kwargs):
+        calls.append(("sync", kwargs))
+        assert path.exists() is False
+        return {"reason": "synchronized", "files": 1}
+
+    monkeypatch.setattr("core.library2.maintenance_sync.sync_repair_change", sync)
+
+    outcome = delete_origin_download(
+        _DB(),
+        {
+            "id": 42,
+            "file_path": str(path),
+            "origin": "playlist",
+            "origin_context": "mix",
+        },
+        object(),
+    )
+
+    assert outcome["error"] is None
+    assert outcome["file_deleted"] is True
+    assert outcome["removed"] == 1
+    assert outcome["library_v2"]["reason"] == "synchronized"
+    assert [call[0] for call in calls] == ["legacy", "sync", "history"]
+    # nobody played it, so the wish goes too or the reconcile grabs it again
+    assert calls[0][2] == {"release_wish": True}
+
+
+def test_sync_failure_keeps_history_row_for_retry(monkeypatch, tmp_path):
+    path = tmp_path / "expired.flac"
+    path.write_bytes(b"audio")
+    history_calls = []
+
+    class _DB:
+        def delete_track_by_file_path(self, _value, **_kwargs):
+            return 1
+
+        def delete_library_history_rows(self, ids):
+            history_calls.append(ids)
+            return 1
+
+    monkeypatch.setattr(
+        "core.library2.maintenance_sync.annotate_finding_details",
+        lambda *_args, **kwargs: kwargs["details"],
+    )
+    monkeypatch.setattr(
+        "core.library2.maintenance_sync.sync_repair_change",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("locked")),
+    )
+
+    outcome = delete_origin_download(
+        _DB(), {"id": 42, "file_path": str(path)}, object(),
+    )
+
+    assert "synchronization failed" in outcome["error"]
+    assert history_calls == []
+
+
+def test_navidrome_virtual_path_is_reported_not_swallowed(monkeypatch):
+    """An unresolvable path is a mapping failure, not "already gone".
+
+    Navidrome hands SoulSync virtual paths unless "Report Real Path" is on.
+    Deleting the catalogue row for one of those would drop a track whose file
+    is still on disk, so the cleanup refuses and says how to fix it.
+    """
+    touched = []
+
+    class _DB:
+        def delete_track_by_file_path(self, value):
+            touched.append(value)
+
+        def delete_library_history_rows(self, ids):
+            touched.append(ids)
+            return 1
+
+    monkeypatch.setattr(
+        "core.library2.maintenance_sync.annotate_finding_details",
+        lambda *_args, **kwargs: kwargs["details"],
+    )
+    monkeypatch.setattr(
+        "core.repair_jobs.expired_download_cleaner.resolve_library_file_path",
+        lambda *_args, **_kwargs: None,
+    )
+
+    cfg = SimpleNamespace(
+        get=lambda _key, default=None: default,
+        get_active_media_server=lambda: "navidrome",
+    )
+    outcome = delete_origin_download(
+        _DB(),
+        {"id": 12, "file_path": "Muse/The Wow! Signal/01-06 - Hexagons.flac"},
+        cfg,
+    )
+
+    assert outcome["removed"] == 0
+    assert outcome["file_deleted"] is False
+    assert "Report Real Path" in outcome["error"]
+    assert touched == []
+
+
 # ── normalize_track_key ──────────────────────────────────────────────────
 
 def test_normalize_track_key_case_and_whitespace():
@@ -134,3 +256,65 @@ def test_normalize_track_key_empty_side_unusable():
     assert normalize_track_key("Artist", "   ") == ""
     assert normalize_track_key("", "Song") == ""
     assert normalize_track_key("", "") == ""
+
+
+# ── rotating playlists (#2039) ───────────────────────────────────────────────
+
+def test_rotated_out_skips_the_retention_window():
+    fresh = dict(_entry(days_old=1), rotated_out=True)
+    assert _check(fresh, pl="off") is True
+    assert _check(fresh, pl="6mo") is True
+    assert _check(_entry(days_old=1), pl="off") is False
+
+
+def test_rotated_out_skips_nothing_else():
+    base = dict(_entry(days_old=1), rotated_out=True)
+    assert _check(dict(base, protected=True), pl="off") is False
+    assert _check(dict(base, curated=True), pl="off") is False
+    assert _check(dict(base, grandfathered=True), pl="off") is False
+    assert _check(dict(base, play_count=None), pl="off") is False
+    assert _check(dict(base, play_count=2), pl="off") is False
+
+
+def _rotating(entry, **over):
+    return is_expired(dict(entry, rotated_out=True, **over), watchlist_retention="off",
+                      playlist_retention="off", min_plays=2, now=NOW,
+                      rotation_keeps_played=False)
+
+
+def test_a_play_need_not_keep_a_rotated_song():
+    """#2047: a rotating playlist is listened to. its owner can say a play is
+    no reason to keep what has left it."""
+    base = _entry(days_old=1)
+    assert _rotating(base, play_count=40) is True
+    assert _rotating(base, play_count=None) is True
+    # a deliberate act still keeps it, and so does everything else
+    assert _rotating(base, play_count=40, curated=True) is False
+    assert _rotating(base, protected=True) is False
+    assert _rotating(base, grandfathered=True) is False
+
+
+def test_the_switch_only_reaches_songs_that_left_a_rotating_playlist():
+    played = dict(_entry(days_old=400), play_count=5)
+    assert is_expired(played, watchlist_retention="off", playlist_retention="2mo",
+                      min_plays=2, now=NOW, rotation_keeps_played=False) is False
+
+
+def test_rotation_grace():
+    from core.library.expired_cleanup import ROTATION_GRACE_OPTIONS, rotation_grace_passed
+
+    def ago(hours):
+        return (NOW - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
+
+    assert rotation_grace_passed(ago(0), "none", NOW) is True
+    assert rotation_grace_passed(ago(10), "1d", NOW) is False
+    # the daily run drifts, an hour short still counts as the day
+    assert rotation_grace_passed(ago(23), "1d", NOW) is True
+    assert rotation_grace_passed(ago(48), "3d", NOW) is False
+    assert rotation_grace_passed(ago(24 * 7), "1w", NOW) is True
+    # anything unreadable is a no
+    assert rotation_grace_passed(None, "none", NOW) is False
+    assert rotation_grace_passed("junk", "1d", NOW) is False
+    assert rotation_grace_passed(ago(999), "bogus", NOW) is False
+    assert rotation_grace_passed(ago(999), None, NOW) is False
+    assert ROTATION_GRACE_OPTIONS[0] == "none"

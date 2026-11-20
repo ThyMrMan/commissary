@@ -390,6 +390,101 @@ def order_candidates(candidates, *, quality_first=False, targets=None,
         return sorted(rows, key=key, reverse=True)
 
 
+def _acquisition_task_ref(task):
+    """(import_id, track_id) for acquisition-dispatched tasks, else None."""
+    try:
+        from core.acquisition.retry_state import acquisition_task_ref
+        return acquisition_task_ref(task.get('track_info'))
+    except Exception:
+        return None
+
+
+def _prepare_scheduled_acquisition(
+        task_id, batch_id, profile_id, track_info, candidate, deps):
+    """Prepare a wishlist-worker correlation before its client dispatch.
+
+    Roadmap 3 (docs/library-v2.md §5.5): a wishlist-worker dispatch
+    correlates observationally into the acquisition contract
+    (trigger=scheduled). A lib2 mirror keeps its exact entity; an ordinary
+    wishlist task gets an explicitly namespaced legacy-shadow identity.
+
+    Acquisition-native dispatches (``_acquisition_import_id``) already carry
+    their full persistent bookkeeping and must not be double-booked. When the
+    plugin registry cannot identify the source, the walk is Soulseek's
+    (ADR-08: never guess a source family from heuristics beyond the registry).
+    Fail-open: correlation must never break or delay the download it describes.
+    """
+    try:
+        # Acquisition/Library-v2 is admin-profile only (ADR-01). Other
+        # profiles keep their independent legacy wishlist behavior.
+        if int(profile_id or 1) != 1:
+            return None
+        if not isinstance(track_info, dict):
+            return None
+        if track_info.get('_acquisition_import_id'):
+            return None
+        from core.downloads.origin import _parse_source_info
+        source_info = _parse_source_info(track_info.get('source_info'))
+        source = 'soulseek'
+        try:
+            spec = deps.download_orchestrator.registry.get_spec(candidate.username)
+            if spec is not None:
+                source = spec.name
+        except Exception as exc:
+            logger.debug("Candidate source classification failed: %s", exc)
+        from core.acquisition import manual_grab
+        return manual_grab.try_prepare_scheduled_grab(
+            lib2_context={
+                'track_id': source_info.get('lib2_track_id'),
+                'album_id': source_info.get('lib2_album_id'),
+                'quality_profile_id': source_info.get('quality_profile_id'),
+            } if source_info.get('lib2_track_id') else None,
+            target_context=track_info,
+            search_result={
+                'username': candidate.username,
+                'filename': candidate.filename,
+                'size': getattr(candidate, 'size', None),
+                'title': getattr(candidate, 'title', None),
+                'artist': getattr(candidate, 'artist', None),
+                'album': getattr(candidate, 'album', None),
+                'quality': getattr(candidate, 'quality', None),
+                'bitrate': getattr(candidate, 'bitrate', None),
+                'sample_rate': getattr(candidate, 'sample_rate', None),
+                'bit_depth': getattr(candidate, 'bit_depth', None),
+            },
+            source=source,
+            task_id=task_id,
+            batch_id=batch_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - observational bookkeeping only
+        logger.debug("scheduled grab correlation skipped: %s", exc)
+        return None
+
+
+def _persist_acquisition_used_sources(task_id, used_sources):
+    """Journal an acquisition walk's used_sources before the download starts.
+
+    Only rows the requeue path already opened are touched (no-op before the
+    first quarantine). Failing open is mandatory: the journal must never
+    break or delay an actual download attempt.
+    """
+    try:
+        from core.acquisition.retry_state import update_retry_progress
+        from database.music_database import get_database
+        conn = get_database()._get_connection()
+        try:
+            update_retry_progress(
+                conn, task_id,
+                used_sources=used_sources,
+                last_progress='attempting next candidate',
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.debug("acquisition retry journal update skipped: %s", exc)
+
+
 @dataclass
 class CandidatesDeps:
     """Bundle of cross-cutting deps the candidate-fallback logic needs."""
@@ -402,6 +497,22 @@ class CandidatesDeps:
     # one task (see _make_context_key in web_server.py).
     make_context_key: Callable[..., str]
     on_download_completed: Callable
+
+
+_UNSET_BASIS = object()
+
+
+def _note_start_failure(task_id, why):
+    """Why a matched candidate didn't start, kept on the task (#1981): the row
+    said "No specific failure reason was recorded" because nothing was. The
+    first few are enough to say what went wrong."""
+    with tasks_lock:
+        task = download_tasks.get(task_id)
+        if task is None:
+            return
+        notes = task.setdefault('start_failures', [])
+        if why not in notes and len(notes) < 6:
+            notes.append(why)
 
 
 def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
@@ -440,7 +551,10 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
     with tasks_lock:
         _pinned = bool((download_tasks.get(task_id) or {}).get('_pinned_candidate'))
     if not _pinned:
+        _before = len(candidates)
         candidates = filter_music_candidates(candidates, expected_duration_ms=expected_duration_ms)
+        if _before and not candidates:
+            _note_start_failure(task_id, 'every match was over the size limit or the wrong length')
 
     with tasks_lock:
         active_peer_occupancy = {}
@@ -480,10 +594,15 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
         # the file; we trust their selection over AcoustID disagreement so
         # repeated manual picks don't loop back into quarantine.
         user_manual_pick = bool(task.get('_user_manual_pick', False))
+        acquisition_walk_ref = _acquisition_task_ref(task)
+        from core.imports.upgrade_intent import CONTEXT_KEY as _UPGRADE_INTENT_KEY
+        server_upgrade_intent = task.get(_UPGRADE_INTENT_KEY)
         # The inspector's "grab anyway" on a below-profile row: the user saw
         # the quality and took it, for this one grab.
         quality_overridden = user_manual_pick and bool(task.get('_override_quality', False))
 
+    # what an upgrade has to beat, worked out once on the first candidate
+    upgrade_basis = _UNSET_BASIS
     # Endpoint fallback happens WITHIN each ranked release slot. A failed
     # fetch may use another indexer, without spending extra candidate slots.
     walk = []
@@ -517,8 +636,10 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
             rejected_releases = task.get('failed_release_ids') or ()
             attempted_endpoints = task.get('used_release_sources') or ()
         if release_id and release_id in rejected_releases:
+            _note_start_failure(task_id, 'its release already failed')
             continue
         if endpoint_id and endpoint_id in attempted_endpoints:
+            _note_start_failure(task_id, 'already tried')
             continue
 
         # Create source key to avoid duplicate attempts (like GUI)
@@ -526,6 +647,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
         is_slow_fallback = source_key == slow_fallback_key
         if source_key in used_sources and not is_slow_fallback:
             logger.info(f"[Modal Worker] Skipping already tried source: {source_key}")
+            _note_start_failure(task_id, 'already tried')
             continue
 
         # Blacklist check — skip sources the user has flagged as bad matches
@@ -533,6 +655,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
             _bl_db = deps.get_database()
             if _bl_db.is_blacklisted(candidate.username, candidate.filename):
                 logger.info(f"[Modal Worker] Skipping blacklisted source: {source_key}")
+                _note_start_failure(task_id, 'blacklisted')
                 continue
         except Exception as e:
             logger.debug("blacklist check failed: %s", e)
@@ -543,28 +666,40 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
             from core.downloads.failed_blocklist import is_candidate_blocked
             if is_candidate_blocked(deps.get_database(), candidate):
                 logger.info(f"[Modal Worker] Skipping failed-blocklisted file: {source_key}")
+                _note_start_failure(task_id, 'on the failed-download blocklist')
                 continue
         except Exception as e:
             logger.debug("failed-blocklist check failed: %s", e)
         
-        # CRITICAL: Add source to used_sources IMMEDIATELY to prevent race conditions
-        # This must happen BEFORE starting download to prevent multiple retries from picking same source
-        with tasks_lock:
-            if task_id in download_tasks:
-                download_tasks[task_id]['used_sources'].add(source_key)
-                if endpoint_id:
-                    download_tasks[task_id].setdefault('used_release_sources', set()).add(endpoint_id)
-                download_tasks[task_id].pop('_observed_speed_tracker', None)
-                if not is_slow_fallback:
-                    download_tasks[task_id].pop('_observed_speed_exempt', None)
-                logger.info(f"[Modal Worker] Marked source as used before download attempt: {source_key}")
-            
+        # #2060: an upgrade only starts a download that can be better than the
+        # file it would replace. Fail-open: a check that cannot be made is not
+        # a refusal, the import still measures what arrives.
+        if server_upgrade_intent is not None and not user_manual_pick:
+            try:
+                from core.library2 import upgrade_attempts
+                if upgrade_basis is _UNSET_BASIS:
+                    _basis_conn = deps.get_database()._get_connection()
+                    try:
+                        upgrade_basis = upgrade_attempts.upgrade_basis(
+                            _basis_conn, server_upgrade_intent.track_id)
+                    finally:
+                        _basis_conn.close()
+                refusal = upgrade_attempts.candidate_refusal(
+                    upgrade_basis, candidate, streaming_sources=_STREAMING_USERNAMES)
+            except Exception as e:
+                logger.debug("upgrade candidate check failed: %s", e)
+                upgrade_basis, refusal = None, None
+            if refusal:
+                logger.info("[Modal Worker] Skipping %s for the upgrade: %s", source_key, refusal)
+                _note_start_failure(task_id, refusal)
+                continue
+
         evidence = getattr(candidate, 'soulseek_match_evidence', None)
         identity_note = f", title via {evidence.source}" if evidence else ''
         logger.info(
             "[Modal Worker] Trying candidate %d/%d: %s (Confidence: %.2f%s)",
             candidate_index + 1, len(candidates), candidate.filename,
-            candidate.confidence, identity_note,
+            float(getattr(candidate, 'confidence', None) or 0.0), identity_note,
         )
         
         try:
@@ -573,10 +708,12 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
 
             # Prepare download - check if we have explicit album context from artist page
             track_info = {}
+            task_profile_id = 1
             with tasks_lock:
                 if task_id in download_tasks:
                     raw_track_info = download_tasks[task_id].get('track_info')
                     track_info = raw_track_info if isinstance(raw_track_info, dict) else {}
+                    task_profile_id = download_tasks[task_id].get('profile_id', 1) or 1
 
             # Use explicit album/artist context if available (from artist album downloads)
             has_explicit_context = track_info and track_info.get('_is_explicit_album_download', False)
@@ -612,7 +749,14 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                     'total_discs': explicit_album.get('total_discs', 1),
                     'album_type': explicit_album.get('album_type', 'album'),
                     'album_type_locked': bool(explicit_album.get('album_type_locked')),
-                    'artists': explicit_album.get('artists', [{'name': spotify_artist_context.get('name', '')}])
+                    # the release's runtime: $albumtype's store rule (5 tracks, 44 min is an album)
+                    'duration_ms': explicit_album.get('duration_ms') or 0,
+                    'artists': explicit_album.get('artists', [{'name': spotify_artist_context.get('name', '')}]),
+                    # #2068: the album's explicit flag, for $explicit in a folder.
+                    # the batch works it out over every track (_album_explicit)
+                    'explicit': (explicit_album.get('explicit')
+                                 if explicit_album.get('explicit') is not None
+                                 else track_info.get('_album_explicit')),
                 }
                 logger.info(f"[Explicit Context] Using real album data: '{spotify_album_context['name']}' ({spotify_album_context['album_type']}, {spotify_album_context['total_discs']} disc(s))")
             else:
@@ -645,6 +789,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                     # that sent no type gets its album's real one (#1605)
                     'album_type': fallback_album.get('album_type') or None,
                     'album_type_locked': bool(fallback_album.get('album_type_locked')),
+                    'duration_ms': fallback_album.get('duration_ms') or 0,
                     'total_tracks': fallback_album.get('total_tracks', 0),
                     'total_discs': fallback_album.get('total_discs', 1),
                     'artists': _fallback_album_artists
@@ -666,6 +811,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
             except Exception as _bf_err:  # noqa: BLE001 — never let backfill break a download
                 logger.debug("[Context] primary-source album backfill skipped: %s", _bf_err)
             if not spotify_album_context.get('album_type'):
+                spotify_album_context['_album_type_known'] = False
                 spotify_album_context['album_type'] = 'album'
             if not spotify_album_context.get('artists'):
                 # a wishlist album with no credit falls back to ONE singer for
@@ -698,19 +844,84 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
 
             # Initiate download
             logger.info(f"[Modal Worker] Starting download: {username} / {os.path.basename(filename)}")
+            acq_markers = None
+            if not user_manual_pick:
+                acq_markers = _prepare_scheduled_acquisition(
+                    task_id, batch_id, task_profile_id, track_info,
+                    candidate, deps)
+            if (
+                not acq_markers
+                and not user_manual_pick
+                and not acquisition_walk_ref
+                and int(task_profile_id or 1) == 1
+            ):
+                from core.acquisition.manual_grab import correlation_enforcement_enabled
+                enforced = correlation_enforcement_enabled()
+                from core.acquisition.correlation_coverage import (
+                    record_correlation_outcome_fail_open,
+                )
+                record_correlation_outcome_fail_open(
+                    "scheduled",
+                    "blocked" if enforced else "unprepared_dispatched",
+                )
+                if enforced:
+                    logger.error(
+                        "[Modal Worker] Acquisition preparation is required; "
+                        "candidate dispatch blocked for task %s",
+                        task_id,
+                    )
+                    with tasks_lock:
+                        if task_id in download_tasks:
+                            download_tasks[task_id]['status'] = 'searching'
+                    continue
+            # Consume the candidate only after every local/acquisition gate
+            # has prepared successfully, but still before external dispatch.
+            # A transient preparation failure remains retryable; the lock and
+            # active-download check continue to prevent overlapping picks.
+            used_sources_snapshot = None
+            with tasks_lock:
+                if task_id in download_tasks:
+                    download_tasks[task_id]['used_sources'].add(source_key)
+                    # Upstream (#1604): one attempt per indexer endpoint of a
+                    # release, so a renewed signed URL is not retried.
+                    if endpoint_id:
+                        download_tasks[task_id].setdefault(
+                            'used_release_sources', set()).add(endpoint_id)
+                    # A new transfer starts a new observed-speed window; only
+                    # the retained slow fallback keeps its exemption.
+                    download_tasks[task_id].pop('_observed_speed_tracker', None)
+                    if not is_slow_fallback:
+                        download_tasks[task_id].pop('_observed_speed_exempt', None)
+                    logger.info(
+                        "[Modal Worker] Marked prepared source as used: %s",
+                        source_key,
+                    )
+                    if acquisition_walk_ref:
+                        used_sources_snapshot = set(
+                            download_tasks[task_id]['used_sources']
+                        )
+            if used_sources_snapshot is not None:
+                _persist_acquisition_used_sources(task_id, used_sources_snapshot)
+            # Upstream's delta: the ladder that judges this transfer is the
+            # ITEM's. `track_info['quality_profile_id']` is a quality_profiles
+            # row — deliberately NOT `task_profile_id`, which is the USER
+            # profile that owns the task. Two different namespaces.
             _download_kwargs = {}
             if track_info.get('quality_profile_id') is not None:
                 _download_kwargs['quality_profile_id'] = track_info['quality_profile_id']
-            download_id = deps.run_async(
-                deps.download_orchestrator.download(
-                    username,
-                    filename,
-                    size,
-                    **_download_kwargs,
-                )
-            )
+            try:
+                download_id = deps.run_async(
+                    deps.download_orchestrator.download(
+                        username, filename, size, **_download_kwargs))
+            except Exception:
+                from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                fail_prepared_correlated_grab(
+                    acq_markers, "legacy client dispatch raised")
+                raise
 
             if download_id:
+                from core.acquisition.manual_grab import bind_correlated_grab_transfer
+                bind_correlated_grab_transfer(acq_markers, download_id)
                 if is_slow_fallback:
                     with tasks_lock:
                         if task_id in download_tasks:
@@ -816,6 +1027,25 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                         "track_info": track_info,  # Add track_info for playlist folder mode
                         "_download_username": username,  # Source username for AcoustID skip logic
                     }
+                    # #1199: the library the batch fills rides with the file --
+                    # the verification wrapper pops batch_id before the import
+                    # asks where the file goes. A plain dict read, no lock.
+                    from core.library_scope import BATCH_OWNER_KEY
+                    from core.runtime_state import download_batches
+                    _batch = download_batches.get(batch_id) or {}
+                    if BATCH_OWNER_KEY in _batch:
+                        matched_downloads_context[context_key][BATCH_OWNER_KEY] = _batch[BATCH_OWNER_KEY]
+                        matched_downloads_context[context_key].setdefault('profile_id', _batch.get('profile_id'))
+                    from core.imports.upgrade_intent import attach_upgrade_intent
+                    attach_upgrade_intent(
+                        matched_downloads_context[context_key],
+                        server_upgrade_intent,
+                    )
+                    if acq_markers:
+                        # Survives quarantine sidecars; pipeline_callback
+                        # closes the correlated grab on success/quarantine.
+                        matched_downloads_context[context_key][
+                            '_acquisition_grab_download_id'] = acq_markers['download_id']
                     # an as-is download from basic search: the simple
                     # post-processing branch keys on search_result, which
                     # this handoff never wrote, so the file would have been
@@ -924,6 +1154,8 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                             )
                             deps.run_async(deps.download_orchestrator.cancel_download(cancel_download_id, cancel_username, remove=True))
                             logger.warning(f"Successfully cancelled active download {cancel_download_id}")
+                            from core.acquisition.pipeline_callback import notify_correlated_grab_cancelled
+                            notify_correlated_grab_cancelled(cancel_download_id)
                         except Exception as cancel_error:
                             logger.error(f"Failed to cancel active download {cancel_download_id}: {cancel_error}")
                     if batch_id:
@@ -933,7 +1165,11 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
                 logger.info(f"[Modal Worker] Download started successfully for '{filename}'. Download ID: {download_id}")
                 return True  # Success!
             else:
+                from core.acquisition.manual_grab import fail_prepared_correlated_grab
+                fail_prepared_correlated_grab(
+                    acq_markers, "legacy client rejected the dispatch")
                 logger.error(f"[Modal Worker] Failed to start download for '{filename}'")
+                _note_start_failure(task_id, f"{candidate.username}: the download client refused it")
                 # Reset status back to searching for next attempt
                 with tasks_lock:
                     if task_id in download_tasks:
@@ -943,6 +1179,7 @@ def attempt_download_with_candidates(task_id, candidates, track, batch_id=None,
         except Exception as e:
             import traceback
             logger.error(f"[Modal Worker] Error attempting download for '{candidate.filename}': {e}")
+            _note_start_failure(task_id, f"{getattr(candidate, 'username', '?')}: {str(e)[:120]}")
             traceback.print_exc()
             # Reset status back to searching for next attempt
             with tasks_lock:

@@ -10,6 +10,7 @@ import hashlib
 import os
 import re
 import threading
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Set
 
@@ -17,6 +18,12 @@ from core.text.normalize import fold_dashes
 from utils.logging_config import get_logger
 
 logger = get_logger("soulsync_client")
+
+# how often a scan says where it is, in seconds (#2036)
+_PROGRESS_EVERY = 2.0
+# a quick scan asks for recent albums, updated albums and recent tracks one
+# after the other; each used to walk the whole music folder again
+_RECENT_SCAN_TTL = 120.0
 
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
 
@@ -33,11 +40,14 @@ def _read_tags(file_path: str) -> Dict[str, Any]:
         'track_number': 0, 'disc_number': 1, 'year': '',
         'genre': '', 'duration_ms': 0, 'bitrate': 0,
         'musicbrainz_albumid': '', 'musicbrainz_albumcomment': '',
+        'isrc': '',
     }
     try:
-        from mutagen import File as MutagenFile
-        audio = MutagenFile(file_path, easy=True)
-        if audio:
+        # AIFF/WAV carry raw ID3 the easy view can't map (#1919)
+        from core.metadata.easy_tags import open_easy
+        audio = open_easy(file_path)
+        # an untagged file is falsy to mutagen; its duration still counts (#1920)
+        if audio is not None:
             if audio.tags:
                 tags = audio.tags
                 result['title'] = (tags.get('title', [''])[0] or '').strip()
@@ -76,6 +86,11 @@ def _read_tags(file_path: str) -> Dict[str, Any]:
                 kbps = _kbps_from_stream_info(audio.info, file_path)
                 if kbps:
                     result['bitrate'] = int(kbps)
+        # Reuse the existing probe for both easy keys and raw ID3 frames.
+        if audio is not None:
+            from core.library2.tag_cache import plausible_isrc
+            from core.metadata.source import _isrc_tag_value
+            result['isrc'] = plausible_isrc(_isrc_tag_value(audio)) or ''
     except Exception as e:
         logger.debug(f"Could not read tags from {os.path.basename(file_path)}: {e}")
 
@@ -299,6 +314,7 @@ class SoulSyncClient(MediaServerBase):
     def clear_cache(self):
         self._cache = None
         self._cache_time = 0
+        self._recent_scan = None
 
     def get_cache_stats(self) -> Dict[str, int]:
         if not self._cache:
@@ -321,15 +337,22 @@ class SoulSyncClient(MediaServerBase):
     def _scan_transfer(self, since_mtime: float = 0) -> List[SoulSyncArtist]:
         """Scan the Transfer folder and build artist/album/track hierarchy."""
         if not os.path.isdir(self._transfer_path):
-            logger.warning(f"Transfer path not found: {self._transfer_path}")
+            logger.warning(f"Music library folder not found: {self._transfer_path}")
             return []
 
         self._emit_progress(f"Scanning {self._transfer_path}...")
-        logger.info(f"[SoulSync] Scanning Transfer folder: {self._transfer_path}")
+        logger.info(f"[SoulSync] Scanning music library folder: {self._transfer_path}")
 
         # Walk filesystem and collect all audio files with tags
         file_entries = []  # (file_path, tags)
         scanned = 0
+        # #2036: say something every couple of seconds whatever the walk is
+        # doing. a quick scan skips nearly every file (older than the last
+        # scan), and the old "every 100 files read" line then never came: half
+        # a million files on a network share took minutes in silence and the
+        # scan was called stuck.
+        seen = 0
+        last_said = time.monotonic()
 
         for root, _dirs, files in os.walk(self._transfer_path):
             # Prune hidden directories in place. The atomic-publish staging tree
@@ -346,6 +369,12 @@ class SoulSyncClient(MediaServerBase):
                     continue
 
                 file_path = os.path.join(root, filename)
+                seen += 1
+                if time.monotonic() - last_said >= _PROGRESS_EVERY:
+                    last_said = time.monotonic()
+                    self._emit_progress(
+                        f"Checking files: {seen:,} looked at, {scanned:,} new or changed..."
+                        if since_mtime > 0 else f"Reading tags: {scanned:,} files...")
 
                 # Incremental: skip files older than since_mtime
                 if since_mtime > 0:
@@ -359,9 +388,6 @@ class SoulSyncClient(MediaServerBase):
                 file_entries.append((file_path, tags))
                 scanned += 1
 
-                if scanned % 100 == 0:
-                    self._emit_progress(f"Reading tags: {scanned} files...")
-
         logger.info(f"[SoulSync] Found {len(file_entries)} audio files")
         self._emit_progress(f"Found {len(file_entries)} audio files, building library...")
 
@@ -370,7 +396,11 @@ class SoulSyncClient(MediaServerBase):
         artist_map: Dict[str, Dict[str, List]] = {}
         artist_names: Dict[str, str] = {}  # lower → canonical name
 
-        for file_path, tags in file_entries:
+        for index, (file_path, tags) in enumerate(file_entries):
+            if index % 2000 == 0 and time.monotonic() - last_said >= _PROGRESS_EVERY:
+                last_said = time.monotonic()
+                self._emit_progress(
+                    f"Building library: {index:,} of {len(file_entries):,} files...")
             # Prefer album artist, fall back to track artist, then folder name
             artist_name = tags['album_artist'] or tags['artist']
             if not artist_name:
@@ -409,6 +439,10 @@ class SoulSyncClient(MediaServerBase):
         # Build object hierarchy
         artists = []
         for a_key, albums_dict in artist_map.items():
+            if time.monotonic() - last_said >= _PROGRESS_EVERY:
+                last_said = time.monotonic()
+                self._emit_progress(
+                    f"Building library: {len(artists):,} of {len(artist_map):,} artists...")
             canonical_artist = artist_names[a_key]
             album_objects = []
 
@@ -491,7 +525,7 @@ class SoulSyncClient(MediaServerBase):
         thread = None
         try:
             if not self.is_connected():
-                logger.warning("[SoulSync] Library scan requested but the Transfer path is not available")
+                logger.warning("[SoulSync] Library scan requested but the music library folder is not available")
                 return False
             # The check + assign + start must be atomic: callers are
             # concurrent by design (scan-manager timer thread, the
@@ -534,7 +568,7 @@ class SoulSyncClient(MediaServerBase):
         import time
         try:
             if not os.path.isdir(self._transfer_path):
-                logger.error(f"[SoulSync] Triggered library scan aborted — Transfer path not available: {self._transfer_path}")
+                logger.error(f"[SoulSync] Triggered library scan aborted — music library folder not available: {self._transfer_path}")
                 return
             artists = self._scan_transfer()
             self._cache = artists
@@ -575,8 +609,13 @@ class SoulSyncClient(MediaServerBase):
         if since == 0:
             since = time.time() - (7 * 86400)  # 7 days ago
 
-        # Scan only recent files
-        artists = self._scan_transfer(since_mtime=since)
+        # Scan only recent files. one walk serves the calls of one quick scan
+        cached = getattr(self, '_recent_scan', None)
+        if cached and cached[0] == since and time.time() - cached[1] < _RECENT_SCAN_TTL:
+            artists = cached[2]
+        else:
+            artists = self._scan_transfer(since_mtime=since)
+            self._recent_scan = (since, time.time(), artists)
         all_albums = []
         for artist in artists:
             all_albums.extend(artist.albums())

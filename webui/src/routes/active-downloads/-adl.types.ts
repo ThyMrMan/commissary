@@ -39,6 +39,7 @@ export interface AdlDownload {
   progress: number;
   error: string | null;
   verification_status: string | null;
+  metadata_status?: string | null;
   batch_id: string;
   batch_name: string;
   batch_source: string;
@@ -82,9 +83,12 @@ export interface AdlDownload {
   event_type?: string;
   /** History rows only: what acoustid said about the file. */
   acoustid_result?: string;
-  /** History rows only: what we asked for, to show beside what we got. */
+  /** History rows only: what we asked for (the row's own title/artist). */
   expected_title?: string;
   expected_artist?: string;
+  /** History rows only: what the source handed over, to show beside the ask. */
+  got_title?: string;
+  got_artist?: string;
 }
 
 /**
@@ -264,6 +268,9 @@ export interface AdlQuarantineEntry {
   source_filename: string;
   thumb_url: string;
   quality: string;
+  /** what the release said and what the file measured, in seconds; null when unknown */
+  expected_length_s?: number | null;
+  actual_length_s?: number | null;
 }
 
 // ── Filters ───────────────────────────────────────────────────────────────
@@ -298,9 +305,13 @@ export interface ClientTorrentItem {
   content_path?: string | null;
   /** the client's own category (qbittorrent category, transmission/deluge label). */
   category?: string | null;
+  /** the tracker's host, never its announce url (#2123). */
+  tracker?: string | null;
+  /** the client has it stopped, even when state says completed (#2125). */
+  paused?: boolean;
   error?: string | null;
-  /** present when SoulSync itself dispatched this item. */
-  soulsync?: { kind?: string; title?: string };
+  /** present when SoulSync itself dispatched this item; indexer = the grab's indexer. */
+  soulsync?: { kind?: string; title?: string; indexer?: string };
 }
 
 export interface ClientUsenetItem {

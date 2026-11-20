@@ -152,9 +152,16 @@ class Identity:
         self.date, self.absolute = episode_hints(db, body, season, episode)
         self.series_type = series_type(db, self.tmdb_id) if kind_of(body) == "show" else None
 
-    def judge(self) -> dict:
-        """Keyword arguments for _evaluate_hits."""
-        return {"want_title": self.titles, "want_date": self.date,
+    def judge(self, upstream_titles=None) -> dict:
+        """Keyword arguments for _evaluate_hits. ``upstream_titles`` is what
+        upstream's own search judges by (the page's identity set, else the
+        title); a hit may carry any of those names or the fork's."""
+        names = []
+        for t in list(self.titles if isinstance(self.titles, (list, tuple)) else [self.titles]) + \
+                list(upstream_titles if isinstance(upstream_titles, (list, tuple)) else [upstream_titles]):
+            if t and t not in names:
+                names.append(t)
+        return {"want_title": names or self.titles, "want_date": self.date,
                 "want_absolute": self.absolute}
 
     def query(self) -> dict:

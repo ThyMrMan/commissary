@@ -43,7 +43,9 @@ def register_routes(bp):
         from core.video.sources import resolve_video_server
         try:
             db = get_video_db()
-            rows = db.continue_watching(server_source=resolve_video_server(), limit=20)
+            from core.video.watch_scope import current_watcher
+            rows = db.continue_watching(server_source=resolve_video_server(), limit=20,
+                                        watcher=current_watcher().rows)
             from .kids import filter_mixed_library_items, video_cap
             # a show row's id is the episode, the rating is on show_id
             rows = filter_mixed_library_items(db, rows, video_cap(), show_id_key="show_id")
@@ -64,6 +66,10 @@ def register_routes(bp):
             stats["recent"] = db.recently_added(server_source=server, limit=20)
             from .kids import filter_mixed_library_items, video_cap
             stats["recent"] = filter_mixed_library_items(db, stats["recent"], video_cap())
+            from .access import is_admin
+            if not is_admin():
+                # how much disk the library takes is the admin's (#2207)
+                stats.get("library", {}).pop("size_bytes", None)
             return jsonify(stats)
         except Exception:
             logger.exception("Failed to build video dashboard stats")

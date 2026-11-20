@@ -12,6 +12,21 @@
  */
 
 import {
+  filterSettings,
+  initializeSettings,
+  landPendingSettingsSave,
+  loadSettingsData,
+  openSettingsPage,
+  openSourceConfig,
+  probeSourceOnOpen,
+  saveSettings,
+  setSettingsSaveState,
+  startSettingsShell,
+  switchSettingsTab,
+  toggleSourceCard,
+} from '@/features/settings/shell';
+
+import {
   blockFromSearch,
   closeBlocklistModal,
   onBlocklistSearchInput,
@@ -21,12 +36,14 @@ import {
 } from './blocklist';
 import { patchChatMessages } from './chat-morph';
 import { refreshDiscoverInboxBadge, startDiscoverInboxBadge } from './discover-inbox-badge';
+import { installFeatures } from './features';
 import {
   _handoffLibrarySearchToEnhancedSearch,
   _updateSidebarLibraryBreadcrumb,
   clearArtistDetailPageState,
   navigateToArtistDetail,
   playLibraryTrack,
+  setLibraryArtistBreadcrumb,
 } from './library-globals';
 import {
   _mlmClose,
@@ -46,8 +63,12 @@ import {
   openPersonalSettings,
   saveMyAccountToken,
 } from './my-accounts';
-import { initOidcOnlyAdmin } from './oidc-only';
+import { installMyPermissions } from './my-permissions';
+import { initOidcOnlyAdmin, refreshOidcOnlySettingsStatus } from './oidc-only';
 import { initOidcAdminStatus, initOidcSignIn } from './oidc-signin';
+import './download-modal-library';
+import './library-switch';
+import './server-activity';
 import {
   closeDownloadOriginsModal,
   deleteSelectedOriginEntries,
@@ -58,7 +79,6 @@ import {
   toggleOriginEntry,
   toggleOriginGroup,
 } from './origin-history';
-import './server-activity';
 import { initPlexSignIn } from './plex-signin';
 import {
   closeServiceSwitchModal,
@@ -123,6 +143,7 @@ export const SHELL_WINDOW_EXPORTS = {
   playLibraryTrack,
   clearArtistDetailPageState,
   _updateSidebarLibraryBreadcrumb,
+  setLibraryArtistBreadcrumb,
   _handoffLibrarySearchToEnhancedSearch,
   // track-detail.js (ported aug 26)
   openTrackDetail,
@@ -149,9 +170,34 @@ export const SHELL_WINDOW_EXPORTS = {
   getWeatherPreview,
   setWeatherPreview,
   weatherPreviewPresets,
+  // ...whose controls the React System tab renders and wires through this
+  // (the shell is its own bundle: an import would be a second weather state)
+  initWeatherPreviewSettings,
+  // the OIDC boxes inside Security & Access, drawn once the React System tab
+  // has put them on the page (SETTINGS_PORT.md step 9c)
+  initOidcAdminStatus,
+  refreshOidcOnlySettingsStatus,
+  // settings.js (ported nov 16, SETTINGS_PORT.md step V4b)
+  initializeSettings,
+  openSettingsPage,
+  switchSettingsTab,
+  loadSettingsData,
+  saveSettings,
+  setSettingsSaveState,
+  filterSettings,
+  landPendingSettingsSave,
+  probeSourceOnOpen,
+  openSourceConfig,
+  toggleSourceCard,
 } as const;
 
 Object.assign(window, SHELL_WINDOW_EXPORTS);
+// window.SoulSyncFeatures (#1909): what this profile chose to see
+installFeatures();
+// window.SoulSyncPerms (#2166): what this profile may do, from the server
+installMyPermissions();
+// the Settings page's keyboard, and password managers kept off its fields
+startSettingsShell();
 startDiscoverInboxBadge();
 initSidebarWeather();
 const onReady = () => {

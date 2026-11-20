@@ -16,6 +16,8 @@ from dataclasses import asdict
 from flask import Blueprint, jsonify, request
 
 from utils.logging_config import get_logger
+from core.permissions import requires
+from core.profile_context import admin_only
 
 logger = get_logger("api.clients")
 
@@ -98,9 +100,21 @@ def _known(kind):
 def create_blueprint() -> Blueprint:
     bp = Blueprint('clients', __name__)
 
+
+    @bp.before_request
+    def _admin_manages_this():
+        """The download clients' queues is the admin's to change (Nov 13 2026). Reading stays open: the
+        pages that show it are not admin pages."""
+        from flask import jsonify as _jsonify, request as _request
+        from core.profile_context import is_admin_request
+        if _request.method in ("POST", "PUT", "PATCH", "DELETE") and not is_admin_request():
+            return _jsonify({"success": False, "error": "Admin access required"}), 403
+        return None
+
     # ── torrent ───────────────────────────────────────────────────────────
 
     @bp.route('/api/clients/torrent', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def torrent_overview():
         from core.torrent_clients import get_active_adapter
@@ -128,6 +142,7 @@ def create_blueprint() -> Blueprint:
                         "connected": True, "items": rows})
 
     @bp.route('/api/clients/torrent/action', methods=['POST'])
+    @admin_only
     @_json_guard
     def torrent_action():
         from core.torrent_clients import get_active_adapter
@@ -168,6 +183,7 @@ def create_blueprint() -> Blueprint:
     # ── usenet ────────────────────────────────────────────────────────────
 
     @bp.route('/api/clients/usenet', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def usenet_overview():
         from core.usenet_clients import get_active_adapter
@@ -195,6 +211,7 @@ def create_blueprint() -> Blueprint:
                         "connected": True, "items": rows})
 
     @bp.route('/api/clients/usenet/action', methods=['POST'])
+    @admin_only
     @_json_guard
     def usenet_action():
         from core.usenet_clients import get_active_adapter
@@ -235,6 +252,7 @@ def create_blueprint() -> Blueprint:
     # ── slskd ─────────────────────────────────────────────────────────────
 
     @bp.route('/api/clients/slskd', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def slskd_overview():
         # the whole body is guarded: the first version let a broken getter
@@ -289,6 +307,7 @@ def create_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": str(e)}), 500
 
     @bp.route('/api/clients/slskd/action', methods=['POST'])
+    @admin_only
     @_json_guard
     def slskd_action():
         client = _soulseek_client() if _soulseek_client else None
@@ -310,8 +329,15 @@ def create_blueprint() -> Blueprint:
             return jsonify({"success": False, "error": str(e)}), 500
 
     @bp.route('/api/clients/torrent/add', methods=['POST'])
+    @admin_only
     @_json_guard
     def torrent_add():
+        # a paste here starts a download: a profile with downloads turned
+        # off is refused, the same as on every other way to start one
+        from api.helpers import download_permission_error
+        denied = download_permission_error()
+        if denied:
+            return denied
         from core.torrent_clients import get_active_adapter
         payload = request.get_json(silent=True) or {}
         url = str(payload.get('url') or '').strip()
@@ -329,8 +355,15 @@ def create_blueprint() -> Blueprint:
         return jsonify({"success": True, "ref": str(ref)})
 
     @bp.route('/api/clients/usenet/add', methods=['POST'])
+    @admin_only
     @_json_guard
     def usenet_add():
+        # a paste here starts a download: a profile with downloads turned
+        # off is refused, the same as on every other way to start one
+        from api.helpers import download_permission_error
+        denied = download_permission_error()
+        if denied:
+            return denied
         from core.usenet_clients import get_active_adapter
         payload = request.get_json(silent=True) or {}
         url = str(payload.get('url') or '').strip()
@@ -340,12 +373,18 @@ def create_blueprint() -> Blueprint:
         if not adapter or not adapter.is_configured():
             return jsonify({"success": False, "error": "no usenet client configured"}), 400
         category = str(config_manager.get('usenet_client.category', 'soulsync') or 'soulsync')
-        ref = _run(adapter.add_nzb(url, category=category), timeout=60)
+        from core.usenet_clients.nzb_fetch import NzbFetchError
+        try:
+            # 120: the nzb is fetched here first now (#2030)
+            ref = _run(adapter.add_nzb(url, category=category), timeout=120)
+        except NzbFetchError as e:
+            return jsonify({"success": False, "error": str(e)})
         if not ref:
             return jsonify({"success": False, "error": "the client did not accept it"})
         return jsonify({"success": True, "ref": str(ref)})
 
     @bp.route('/api/clients/slskd/clear-completed', methods=['POST'])
+    @admin_only
     @_json_guard
     def slskd_clear_completed():
         client = _soulseek_client() if _soulseek_client else None
@@ -356,6 +395,7 @@ def create_blueprint() -> Blueprint:
                        {"success": False, "error": "slskd refused to clear"})
 
     @bp.route('/api/clients/links', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def client_links():
         """Each client's own web ui, for the open-in-new-tab buttons. Straight
@@ -373,12 +413,14 @@ def create_blueprint() -> Blueprint:
     # follows a client job, so its matches are kept and followed here.
 
     @bp.route('/api/clients/match/suggest', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def match_suggest():
         from core.client_match import suggest_from_name
         return jsonify({"success": True, **suggest_from_name(request.args.get('name') or '')})
 
     @bp.route('/api/clients/match/files', methods=['GET'])
+    @requires("music.downloads")
     @_json_guard
     def match_files():
         """Whether SoulSync can read this download's files, so the match window
@@ -419,6 +461,7 @@ def create_blueprint() -> Blueprint:
                         "visible": visible})
 
     @bp.route('/api/clients/match/music', methods=['POST'])
+    @admin_only
     @_json_guard
     def match_music():
         """Follow a client download to the library as an album or a track.

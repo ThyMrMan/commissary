@@ -9,7 +9,11 @@
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 
-import { DEEZER_PLAYLIST_PROGRESS_EVENT, deezerProgressLabel } from '../-sync.events';
+import {
+  DEEZER_PLAYLIST_PROGRESS_EVENT,
+  deezerProgressLabel,
+  MIRRORS_CHANGED_EVENT,
+} from '../-sync.events';
 import {
   canCopyAsMine,
   copyPlaylistAsMine,
@@ -18,6 +22,7 @@ import {
   mirrorKey,
   type ImportSpec,
 } from '../-sync.importer';
+import { previewTrack, type PreviewTrack } from './import-preview-sheet';
 
 export interface ImportLanding {
   /** Show one imported playlist: the Mirrored tab, its window open. */
@@ -26,6 +31,8 @@ export interface ImportLanding {
   showList: () => void;
   /** A copy kept as your own (#1913): My Playlists, its window open. */
   landMine?: (playlistId: number, name: string) => void;
+  /** An imported one's copy on the server, in the server editor. */
+  openEditor?: (mirrorId: number, name?: string) => Promise<boolean>;
 }
 
 const NO_LANDING: ImportLanding = { land: () => {}, showList: () => {} };
@@ -48,8 +55,16 @@ export interface Importer {
   /** Keep it as your own copy in My Playlists instead (#1913); undefined when
    *  the playlist can't be copied (it saves server-side). */
   copyAsMineFor: (spec: ImportSpec) => (() => void) | undefined;
+  /** The card's look-before-you-import songs (#1934); absent when it can't load them. */
+  previewFor: (spec: ImportSpec) => (() => Promise<PreviewTrack[]>) | undefined;
   /** A copy of this one is being made. */
   copyingOf: (source: string, sourceId: string | number) => boolean;
+  /** Open an imported one's server copy in the editor; undefined until it's in. */
+  editorFor: (
+    source: string,
+    sourceId: string | number,
+    name?: string,
+  ) => (() => Promise<boolean>) | undefined;
   landing: ImportLanding;
 }
 
@@ -91,19 +106,26 @@ export function useImporter(): Importer {
 
   useEffect(() => {
     let alive = true;
-    indexReady.current = fetchMirrorIndex()
-      .catch(
-        // not knowing what's in only costs an "Open" label; importing still
-        // works, and the backend dedupes a second import of the same playlist
-        () => new Map<string, number>(),
-      )
-      .then((found) => {
-        if (!alive) return;
-        indexRef.current = found;
-        setIndex(found);
-      });
+    const load = () => {
+      indexReady.current = fetchMirrorIndex()
+        .catch(
+          // not knowing what's in only costs an "Open" label; importing still
+          // works, and the backend dedupes a second import of the same playlist
+          () => new Map<string, number>(),
+        )
+        .then((found) => {
+          if (!alive) return;
+          indexRef.current = found;
+          setIndex(found);
+        });
+    };
+    load();
+    // a mirror deleted anywhere (the Mirrored tab, a batch delete) re-reads
+    // the index, or this tab kept offering Open and Edit for it (#1979)
+    window.addEventListener(MIRRORS_CHANGED_EVENT, load);
     return () => {
       alive = false;
+      window.removeEventListener(MIRRORS_CHANGED_EVENT, load);
     };
   }, []);
 
@@ -226,9 +248,28 @@ export function useImporter(): Importer {
     [copyAsMine],
   );
 
+  const previewFor = useCallback((spec: ImportSpec) => {
+    const { loadTracks, toMirrorTracks } = spec;
+    if (!loadTracks) return undefined;
+    return async () => {
+      const { tracks } = await loadTracks();
+      return (toMirrorTracks ? toMirrorTracks(tracks) : tracks).map(previewTrack);
+    };
+  }, []);
+
   const copyingOf = useCallback(
     (source: string, sourceId: string | number) => busy.has(`mine:${mirrorKey(source, sourceId)}`),
     [busy],
+  );
+
+  const { openEditor } = landing;
+  const editorFor = useCallback(
+    (source: string, sourceId: string | number, name?: string) => {
+      const mirrorId = index?.get(mirrorKey(source, sourceId));
+      if (mirrorId === undefined || !openEditor) return undefined;
+      return () => openEditor(mirrorId, name);
+    },
+    [index, openEditor],
   );
 
   return {
@@ -238,7 +279,9 @@ export function useImporter(): Importer {
     markImported,
     mirrorIdOf,
     copyAsMineFor,
+    previewFor,
     copyingOf,
+    editorFor,
     landing,
   };
 }

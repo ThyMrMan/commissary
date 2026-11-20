@@ -18,7 +18,10 @@ from flask import Flask
 from database.video_database import VideoDatabase
 
 _ROOT = Path(__file__).resolve().parent.parent
-_LIB_JS = (_ROOT / "webui" / "static" / "video" / "video-library.js").read_text(encoding="utf-8")
+# the library page is the React manager since Nov 13 2026
+_MGR = "\n".join(f.read_text(encoding="utf-8") for f in sorted(
+    (_ROOT / "webui" / "src" / "features" / "video-manager").glob("*.ts*"))
+    if ".test." not in f.name)
 _INDEX = (_ROOT / "webui" / "index.html").read_text(encoding="utf-8")
 
 
@@ -38,7 +41,9 @@ def _seed(db):
     db.upsert_show_tree("plex", {"server_id": "s1", "title": "Partial Show", "seasons": [
         {"season_number": 1, "episodes": [
             {"episode_number": 1, "file": {"relative_path": "e1.mkv", "size_bytes": 1_000_000_000}},
-            {"episode_number": 2}]}]})
+            # an aired gap: since #2018 an episode with no air date is not
+            # one (the card reads 1/1 and Missing agrees)
+            {"episode_number": 2, "air_date": "2020-01-01"}]}]})
     db.upsert_show_tree("plex", {"server_id": "s2", "title": "Complete Show", "seasons": [
         {"season_number": 1, "episodes": [
             {"episode_number": 1, "file": {"relative_path": "c1.mkv", "size_bytes": 500_000_000}}]}]})
@@ -104,17 +109,11 @@ def test_api_passes_resolution_and_returns_total_size(db, monkeypatch):
 # Frontend contracts
 # ---------------------------------------------------------------------------
 
-def test_js_renders_size_and_new_controls():
-    assert "fmtSize(it.size_bytes)" in _LIB_JS            # on the cards
-    assert "d.total_size_bytes" in _LIB_JS                # header total
-    assert "data-video-lib-res" in _LIB_JS and "loadResolutions" in _LIB_JS
-    assert "state.resolution" in _LIB_JS
-
-
-def test_html_has_new_options_scoped_right():
-    assert '<option value="size">Largest</option>' in _INDEX
-    assert '<option value="missing" hidden>Missing episodes</option>' in _INDEX
-    assert "data-video-lib-res" in _INDEX
-    # missing-option unhidden only on the shows tab; resolution reset off movies
-    assert "miss.hidden = state.tab !== 'shows'" in _LIB_JS
-    assert "state.tab !== 'movies' && state.resolution" in _LIB_JS
+def test_the_manager_shows_size_and_filters_by_quality():
+    assert "formatSize(row.size_bytes)" in _MGR           # on the cards and rows
+    assert "facets.size_bytes" in _MGR                    # the header total
+    assert "facets.resolutions" in _MGR and "filters.resolution" in _MGR
+    # largest first is a click on the Size column; missing episodes a shows-only
+    # column and a "needs a look" filter
+    assert "sort: 'size'" in _MGR and "sort: 'missing'" in _MGR
+    assert "sides: ['shows']" in _MGR

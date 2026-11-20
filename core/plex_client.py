@@ -652,6 +652,56 @@ class PlexClient(MediaServerBase):
             logger.error(f"Error fetching playlist '{name}': {e}")
             return None
     
+    def get_playlists_by_name(self, name: str) -> List[PlaylistInfo]:
+        """every audio playlist with this name, any casing, without loading
+        its tracks. what a mirror's link is first found by (#2098)."""
+        if not self.ensure_connection():
+            return []
+        wanted = str(name or '').strip().lower()
+        try:
+            return [
+                PlaylistInfo(id=str(pl.ratingKey), title=pl.title,
+                             description=getattr(pl, 'summary', None),
+                             duration=getattr(pl, 'duration', 0) or 0,
+                             leaf_count=getattr(pl, 'leafCount', 0) or 0, tracks=[])
+                for pl in self.server.playlists()
+                if getattr(pl, 'playlistType', None) == 'audio'
+                and str(getattr(pl, 'title', '') or '').strip().lower() == wanted
+            ]
+        except Exception as e:
+            logger.error(f"Error listing Plex playlists named '{name}': {e}")
+            return []
+
+    def _playlist_object(self, playlist_id):
+        """the plex playlist with this ratingKey, None when it is gone"""
+        if not playlist_id or not self.ensure_connection():
+            return None
+        try:
+            pl = self.server.fetchItem(int(playlist_id))
+        except Exception as e:  # noqa: BLE001 - gone, or not a key at all
+            logger.debug(f"Plex playlist {playlist_id} could not be read: {e}")
+            return None
+        return pl if getattr(pl, 'playlistType', None) == 'audio' else None
+
+    def get_playlist_by_id(self, playlist_id) -> Optional[PlaylistInfo]:
+        """one playlist by its ratingKey, None when the server no longer has it"""
+        pl = self._playlist_object(playlist_id)
+        if pl is None:
+            return None
+        return PlaylistInfo(id=str(pl.ratingKey), title=pl.title,
+                            description=getattr(pl, 'summary', None),
+                            duration=getattr(pl, 'duration', 0) or 0,
+                            leaf_count=getattr(pl, 'leafCount', 0) or 0, tracks=[])
+
+    def _target_playlist(self, playlist_name: str, playlist_id=None):
+        """the playlist a write goes to: the one with this id while the server
+        still has it (a rename there is followed), else the one with the name.
+        raises NotFound like ``server.playlist`` when there is neither."""
+        followed = self._playlist_object(playlist_id) if playlist_id else None
+        if followed is not None:
+            return followed
+        return self.server.playlist(playlist_name)
+
     # A single createPlaylist/addItems call with ~1000 ratingKeys builds an
     # oversized request that Plex (or a reverse proxy) can reject outright or
     # silently truncate — the sync then reports success while the playlist is
@@ -829,7 +879,8 @@ class PlexClient(MediaServerBase):
             logger.error(f"Error copying playlist '{source_name}' to '{target_name}': {e}")
             return False
 
-    def append_to_playlist(self, playlist_name: str, tracks: List[TrackInfo]) -> bool:
+    def append_to_playlist(self, playlist_name: str, tracks: List[TrackInfo], *,
+                           playlist_id=None) -> bool:
         """Append tracks to an existing playlist (creates it if missing).
 
         Differs from `update_playlist`: never deletes existing tracks,
@@ -842,7 +893,7 @@ class PlexClient(MediaServerBase):
 
         try:
             try:
-                existing_playlist = self.server.playlist(playlist_name)
+                existing_playlist = self._target_playlist(playlist_name, playlist_id)
             except NotFound:
                 logger.info(
                     f"Plex append: playlist '{playlist_name}' doesn't exist yet — "
@@ -877,7 +928,8 @@ class PlexClient(MediaServerBase):
             logger.error(f"Error appending to Plex playlist '{playlist_name}': {e}")
             return False
 
-    def reconcile_playlist(self, playlist_name: str, tracks: List[TrackInfo]) -> bool:
+    def reconcile_playlist(self, playlist_name: str, tracks: List[TrackInfo], *,
+                           playlist_id=None) -> bool:
         """In-place reconcile (#792): bring an existing playlist's tracks to match
         ``tracks`` by adding the missing ones and removing the gone ones, WITHOUT
         deleting/recreating the playlist — so its custom poster, summary, and
@@ -889,7 +941,7 @@ class PlexClient(MediaServerBase):
         try:
             from core.sync.playlist_edit import plan_playlist_reconcile
             try:
-                existing = self.server.playlist(playlist_name)
+                existing = self._target_playlist(playlist_name, playlist_id)
             except NotFound:
                 logger.info(f"Plex reconcile: '{playlist_name}' doesn't exist — creating")
                 return self.create_playlist(playlist_name, tracks)
@@ -1007,12 +1059,37 @@ class PlexClient(MediaServerBase):
             logger.error(f"Error reordering Plex playlist '{playlist_name}': {e}")
             return False
 
-    def update_playlist(self, playlist_name: str, tracks: List[TrackInfo]) -> bool:
+    def _replace_in_place(self, playlist, playlist_name: str, tracks) -> bool:
+        """make an existing playlist hold exactly these tracks, in this order,
+        without deleting it: it keeps its ratingKey, poster and summary, and
+        the mirror linked to it keeps finding it (#2098). False = the caller
+        deletes it and makes it again."""
+        wanted = [t for t in tracks if t is not None and hasattr(t, 'ratingKey')]
+        if not wanted or len(wanted) != len(tracks):
+            return False        # some need a lookup first: create_playlist does that
+        try:
+            current = [i for i in playlist.items() if hasattr(i, 'ratingKey')]
+            if [str(i.ratingKey) for i in current] == [str(t.ratingKey) for t in wanted]:
+                logger.info(f"Plex playlist '{playlist_name}' already holds these {len(wanted)} tracks")
+                return True
+            if current:
+                playlist.removeItems(current)
+            self._add_items_chunked(playlist, wanted)
+        except Exception as e:  # noqa: BLE001 - the recreate below still gets it right
+            logger.warning(f"Plex replace of '{playlist_name}' in place failed ({e})")
+            return False
+        logger.info(f"Replaced the tracks of Plex playlist '{playlist_name}' in place ({len(wanted)} tracks)")
+        return True
+
+    def update_playlist(self, playlist_name: str, tracks: List[TrackInfo], *,
+                        playlist_id=None) -> bool:
+        """rewrite a playlist, or make it. ``playlist_id`` is the playlist a
+        mirror is linked to; without one, or once it is gone, the name finds it."""
         if not self.ensure_connection():
             return False
         
         try:
-            existing_playlist = self.server.playlist(playlist_name)
+            existing_playlist = self._target_playlist(playlist_name, playlist_id)
             
             # Check if backup is enabled in config
             from core.settings import config_manager
@@ -1023,11 +1100,14 @@ class PlexClient(MediaServerBase):
                 backup_name = f"{playlist_name} Backup"
                 logger.info(f"Creating backup playlist '{backup_name}' before sync")
                 
-                if self.copy_playlist(playlist_name, backup_name):
+                if self.copy_playlist(existing_playlist.title, backup_name):
                     logger.info("Backup created successfully")
                 else:
                     logger.warning("Failed to create backup, continuing with sync")
             
+            if self._replace_in_place(existing_playlist, playlist_name, tracks):
+                return True
+
             # Delete original and recreate
             existing_playlist.delete()
             return self.create_playlist(playlist_name, tracks)
@@ -1502,7 +1582,7 @@ class PlexClient(MediaServerBase):
                 'Content-Type': 'image/jpeg'
             }
             
-            response = requests.post(upload_url, data=image_data, headers=headers)
+            response = requests.post(upload_url, data=image_data, headers=headers, timeout=(10, 60))
             response.raise_for_status()
             
             # Refresh artist to see changes
@@ -1514,6 +1594,29 @@ class PlexClient(MediaServerBase):
             logger.error(f"Error updating poster for {artist.title}: {e}")
             return False
     
+    def update_artist_background(self, artist: PlexArtist, image_data: bytes):
+        """Set the artist's background ("art"): the wide picture behind the
+        artist page in Plexamp and the web app (#1957)."""
+        try:
+            upload_url = f"{self.server._baseurl}/library/metadata/{artist.ratingKey}/arts"
+            headers = {
+                'X-Plex-Token': self.server._token,
+                'Content-Type': 'image/jpeg'
+            }
+            response = requests.post(upload_url, data=image_data, headers=headers, timeout=30)
+            response.raise_for_status()
+            artist.refresh()
+            logger.info(f"Updated background for {artist.title}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating background for {artist.title}: {e}")
+            return False
+
+    @staticmethod
+    def artist_has_background(artist) -> bool:
+        art = str(getattr(artist, 'art', '') or '')
+        return bool(art) and 'default' not in art.lower()
+
     def update_album_poster(self, album, image_data: bytes):
         """Update album poster image"""
         try:
@@ -1524,7 +1627,7 @@ class PlexClient(MediaServerBase):
                 'Content-Type': 'image/jpeg'
             }
             
-            response = requests.post(upload_url, data=image_data, headers=headers)
+            response = requests.post(upload_url, data=image_data, headers=headers, timeout=(10, 60))
             response.raise_for_status()
             
             # Refresh album to see changes
@@ -1593,8 +1696,9 @@ class PlexClient(MediaServerBase):
             logger.debug(f"Error checking update age for {artist.title}: {e}")
             return True  # Default to needing update if error
     
-    def update_artist_biography(self, artist: PlexArtist) -> bool:
-        """Update artist summary with current timestamp"""
+    def update_artist_biography(self, artist: PlexArtist, biography: Optional[str] = None) -> bool:
+        """Update artist summary with current timestamp. ``biography`` fills a
+        summary that's empty, never one that already has text (#1993)"""
         try:
             # Get current summary/biography
             current_summary = getattr(artist, 'summary', '') or ''
@@ -1614,7 +1718,7 @@ class PlexClient(MediaServerBase):
             today = datetime.now().strftime('%Y-%m-%d')
             
             # Add timestamp to summary field
-            new_summary = clean_summary
+            new_summary = clean_summary or (biography or '').strip()
             if ignore_flag:
                 new_summary = f"{new_summary}\n\n{ignore_flag}".strip()
             new_summary = f"{new_summary}\n\n-updatedAt{today}".strip()
@@ -1728,6 +1832,65 @@ class PlexClient(MediaServerBase):
             return True
         except Exception as e:
             logger.error(f"Failed to trigger library scan for '{section_label}': {e}")
+            return False
+
+    def playlist_tracks_for_tagging(self, playlist_id) -> List:
+        """The tracks of one plex playlist, for tag_tracks_mood."""
+        if not self.ensure_connection():
+            return []
+        playlist = self.server.fetchItem(int(playlist_id))
+        return [t for t in playlist.items() if getattr(t, "type", "") == "track"]
+
+    @staticmethod
+    def tag_tracks_mood(tracks, tag: str) -> Dict[str, int]:
+        """Add ``tag`` as a mood on each track that doesn't have it yet (wolf39us,
+        Discord Nov 4 2026): with every song on a playlist tagged, a plex smart
+        playlist can start from "mood is <tag>" and add rating rules on top.
+        Plex metadata only, nothing is written to the files; existing moods stay."""
+        wanted = tag.strip()
+        counts = {"tagged": 0, "skipped": 0, "failed": 0}
+        for track in tracks:
+            try:
+                have = {str(getattr(m, "tag", "")).casefold() for m in (track.moods or [])}
+                if wanted.casefold() in have:
+                    counts["skipped"] += 1
+                    continue
+                track.addMood(wanted)
+                counts["tagged"] += 1
+            except Exception as e:  # noqa: BLE001 - one track never stops the rest
+                counts["failed"] += 1
+                logger.debug(f"mood tag failed on {getattr(track, 'title', '?')}: {e}")
+        return counts
+
+    def trigger_folder_scan(self, folders: List[str]) -> bool:
+        """Scan only these folders (#1978), given as Plex sees them. Each goes
+        to the music section whose folder holds it; False, with nothing
+        triggered, when any of them sits in no music section, so the caller
+        scans the whole library instead of quietly missing an album."""
+        if not folders or not self.ensure_connection():
+            return False
+        from core.library2.scan_paths import location_for
+        try:
+            sections = self._get_music_sections()
+            if not sections and self.music_library is not None:
+                sections = [self.music_library]
+            plan = []
+            for folder in folders:
+                owner = None
+                for section in sections:
+                    if location_for(folder, list(getattr(section, "locations", None) or [])):
+                        owner = section
+                        break
+                if owner is None:
+                    logger.info(f"Plex folder scan: no music section holds {folder}")
+                    return False
+                plan.append((owner, folder))
+            for section, folder in plan:
+                section.update(path=folder)
+            logger.info(f"Triggered Plex folder scan of {len(plan)} folder(s)")
+            return True
+        except Exception as e:
+            logger.error(f"Plex folder scan failed: {e}")
             return False
 
     def is_library_scanning(self, library_name: str = "Music") -> bool:

@@ -450,33 +450,35 @@ class ListenBrainzListeningImportWorker:
             return ""
 
     def _resolve_db_track_ids(self, events: List[Dict[str, Any]]) -> None:
-        pairs = sorted({
-            ((ev.get("title") or "").strip().lower(), (ev.get("artist") or "").strip().lower())
-            for ev in events if ev.get("title")
-        })
+        """Point every listen at its catalogue row (``lib2_track_id``).
+
+        The same query as the Last.fm importer's: Library v2 is the catalogue,
+        the artist half matches on the indexed ``name_key`` fold (SQLite's
+        ``LOWER()`` is ASCII-only, iss29-D13), and the id is a CATALOGUE id, so
+        it goes in ``lib2_track_id`` -- ``db_track_id`` is the media server's
+        own id namespace (INT-01).
+        """
+        from core.library2.importer import normalize_name
+
+        def _key(name: Any) -> str:
+            return normalize_name(str(name or ""))
+
+        from core.library2.title_match import resolve_title_artist_pairs, title_fold
+
+        pairs = {(ev.get("title"), _key(ev.get("artist")))
+                 for ev in events if ev.get("title")}
         if not pairs:
             return
         conn = self.db._get_connection()
         try:
-            cursor = conn.cursor()
-            found: Dict[tuple[str, str], int] = {}
-            for i in range(0, len(pairs), 400):
-                chunk = pairs[i:i + 400]
-                placeholders = ",".join(["(?,?)"] * len(chunk))
-                args = [v for pair in chunk for v in pair]
-                cursor.execute(
-                    f"""
-                    SELECT LOWER(t.title), LOWER(ar.name), t.id
-                    FROM tracks t
-                    JOIN artists ar ON ar.id = t.artist_id
-                    WHERE (LOWER(t.title), LOWER(ar.name)) IN ({placeholders})
-                    """,
-                    args,
-                )
-                for title_l, artist_l, track_id in cursor.fetchall():
-                    found.setdefault((title_l, artist_l), track_id)
+            # review 5 R5-H-5: sqlite's LOWER() folds only A-Z, so a title
+            # with a non-ascii capital never matched a python-lowered key
+            found = resolve_title_artist_pairs(conn.cursor(), pairs)
             for ev in events:
-                ev["db_track_id"] = found.get(((ev.get("title") or "").strip().lower(), (ev.get("artist") or "").strip().lower()))
+                ev["lib2_track_id"] = found.get((
+                    title_fold(ev.get("title")),
+                    _key(ev.get("artist")),
+                ))
         finally:
             conn.close()
 

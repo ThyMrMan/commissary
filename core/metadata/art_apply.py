@@ -25,24 +25,40 @@ from utils.logging_config import get_logger
 
 logger = get_logger("metadata.art_apply")
 
-# Folder-level cover files recognised across players (matches soulsync_client).
-_COVER_SIDECARS = (
-    "cover.jpg", "cover.jpeg", "cover.png",
-    "folder.jpg", "folder.jpeg", "folder.png",
-)
+def folder_cover_file(folder: str) -> Optional[str]:
+    """the cover file sitting in an album folder, as a path, or None.
+
+    the same names the library reads a folder cover from (cover, folder,
+    front, album, albumart; jpg, jpeg, png, webp) in any case: Folder.JPG
+    is a cover on Linux too. a Disc 1 / CD2 folder also counts the cover in
+    the release folder above it (#2202: a two-disc album with cover.jpg
+    beside its disc folders was "missing a cover file" while the finding
+    showed that very cover.jpg)."""
+    if not folder:
+        return None
+    from core.library2.artwork import _ALBUM_FOLDER_STEMS, _DISC_FOLDER, _FOLDER_IMAGE_EXTS
+    folder = folder.rstrip("/\\") or folder
+    candidates = [folder]
+    if _DISC_FOLDER.match(os.path.basename(folder)):
+        candidates.append(os.path.dirname(folder))
+    for directory in candidates:
+        if not directory:
+            continue
+        try:
+            names = {name.lower(): name for name in os.listdir(directory)}
+        except OSError:
+            continue
+        for stem in _ALBUM_FOLDER_STEMS:
+            for ext in _FOLDER_IMAGE_EXTS:
+                found = names.get(f"{stem}.{ext}")
+                if found and os.path.isfile(os.path.join(directory, found)):
+                    return os.path.join(directory, found)
+    return None
 
 
 def folder_has_cover_sidecar(folder: str) -> bool:
-    """True if the album folder already carries a cover.jpg/folder.jpg sidecar."""
-    if not folder:
-        return False
-    try:
-        for name in _COVER_SIDECARS:
-            if os.path.isfile(os.path.join(folder, name)):
-                return True
-    except OSError:
-        return False
-    return False
+    """True if the album folder already carries a cover file (see folder_cover_file)."""
+    return folder_cover_file(folder) is not None
 
 
 def file_has_embedded_art(file_path: str) -> bool:
@@ -113,6 +129,10 @@ def extract_embedded_art(file_path: str) -> Optional[bytes]:
     return None
 
 
+def _image_mime(data: bytes) -> str:
+    return 'image/png' if data[:8] == b'\x89PNG\r\n\x1a\n' else 'image/jpeg'
+
+
 def album_has_art_on_disk(rep_file_path: str) -> bool:
     """Does this album have art on disk?
 
@@ -135,6 +155,7 @@ def apply_art_to_album_files(
     album_info: dict,
     folder: str = None,
     context: dict = None,
+    image_bytes: Optional[bytes] = None,
 ) -> dict:
     """Embed art into each audio file + write cover.jpg, reusing the standard.
 
@@ -149,6 +170,10 @@ def apply_art_to_album_files(
     SMB mount, or a read-only underlying fs) so callers can tell the user the
     real cause instead of a generic failure.
 
+    ``image_bytes``: the exact cover to use (#2169). embedded as is instead of
+    a fresh lookup by the art order, and written as the folder's cover.jpg
+    (#2202: the cover picked on the finding, not the files' own).
+
     NOTE: read-only is detected from an ACTUAL write raising EROFS, never from
     statvfs/mount flags — union/FUSE/network filesystems (mergerfs, rclone,
     NFS) common in self-hosted setups misreport those flags, which would
@@ -157,12 +182,32 @@ def apply_art_to_album_files(
     """
     result = {"embedded": 0, "failed": 0, "skipped": 0, "cover_written": False,
               "read_only_fs": False}
+    from core.metadata.common import get_config_manager
+    config = get_config_manager()
     symbols = get_mutagen_symbols()
     paths = [p for p in (file_paths or []) if p]
     if not symbols:
         return result
+    # #2046: a reviewed album with its artwork locked takes no cover from a
+    # job, in the files or beside them
+    try:
+        from core.library2 import locks
+        open_paths = [p for p in paths if not locks.blocks_file(p, "artwork", "Cover art")]
+    except Exception as exc:  # noqa: BLE001 - a lock check never fails an apply
+        logger.debug("lock check skipped: %s", exc)
+        open_paths = paths
+    if len(open_paths) != len(paths):
+        result["skipped"] += len(paths) - len(open_paths)
+        result["locked"] = len(paths) - len(open_paths)
+        paths = open_paths
+        if not paths:
+            return result
 
     for fp in paths:
+        if not config.get('metadata_enhancement.embed_album_art', True):
+            result['skipped'] += 1
+            result['embedding_off'] = True
+            continue
         if not os.path.isfile(fp):
             result["skipped"] += 1
             continue
@@ -181,7 +226,12 @@ def apply_art_to_album_files(
             if getattr(audio, "tags", None) is None and hasattr(audio, "add_tags"):
                 with contextlib.suppress(Exception):
                     audio.add_tags()
-            if embed_album_art_metadata(audio, metadata):
+            if image_bytes:
+                from core.metadata.artwork import _write_embedded_art
+                wrote = _write_embedded_art(audio, image_bytes, _image_mime(image_bytes), symbols)
+            else:
+                wrote = embed_album_art_metadata(audio, metadata)
+            if wrote:
                 audio.save()
                 result["embedded"] += 1
             else:
@@ -206,15 +256,18 @@ def apply_art_to_album_files(
     if not target_dir and paths:
         cand = os.path.dirname(paths[0])
         target_dir = cand if os.path.isdir(cand) else None
-    if target_dir and not folder_has_cover_sidecar(target_dir):
+    if target_dir and config.get('metadata_enhancement.cover_art_download', True) and not folder_has_cover_sidecar(target_dir):
         # Prefer the album's OWN embedded art for the cover.jpg sidecar: it's
         # always present once the files are arted (we may have just embedded it),
         # needs no API call, and the sidecar matches the files exactly
         # (#813/Sokhi: files have art, just no cover.jpg). Fall back to a fresh
         # download only when there's nothing embedded to extract.
         cover_path = os.path.join(target_dir, "cover.jpg")
-        art_bytes = None
-        for fp in paths:
+        # #2202: a cover the caller hands over is the one picked on the
+        # finding, so it goes in the folder even when the files carry
+        # another one
+        art_bytes = image_bytes
+        for fp in ([] if art_bytes else paths):
             art_bytes = extract_embedded_art(fp)
             if art_bytes:
                 break

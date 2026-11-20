@@ -41,12 +41,12 @@ services:
       # the music and video sides read from it (Settings → Downloads uses one path).
       - ./downloads:/app/downloads
       # ─── Music library (OUTPUT) — REQUIRED: uncomment + set your path ────
-      # The app needs a Transfer folder — where finished, organised music is moved
-      # to for Plex / Jellyfin / Navidrome to read. UNCOMMENT the line below, point
-      # the host side (left of the colon) at your music library, then set
-      # Settings → Downloads → Transfer to /app/Transfer (matches the in-app
-      
-      # ./Transfer placeholder). Left commented so it never clashes with a Transfer
+      # The app needs a music library folder — where finished, organised music is
+      # moved to for Plex / Jellyfin / Navidrome to read. Inside the container it is
+      # mounted at /app/Transfer. UNCOMMENT the line below, point the host side (left
+      # of the colon) at your music library, then set Settings → Library → Folders →
+      # Music Library Folder to /app/Transfer (matches the in-app ./Transfer
+      # placeholder). Left commented so it never clashes with an /app/Transfer
       # mount you already added in a previous setup — if you have one, keep it.
 
       # - ./Transfer:/app/Transfer
@@ -74,6 +74,12 @@ services:
       # An existing collection on another drive: mount it at its own path and add
       # it under Settings → Library → Folders → Audiobooks → More audiobook folders.
       # - /mnt/drive2/Audiobooks:/app/audiobooks2:rw
+      # ─── Playlist folders (OUTPUT), optional: uncomment + set your path ───
+      # "Organize by playlist" builds one folder per playlist here (copies,
+      # hardlinks or symlinks to your library). The default Playlist Folder is
+      # /app/Playlists; without a mount it lives in the container and is lost
+      # when the container is recreated.
+      # - ./Playlists:/app/Playlists
       # ─── Sample Studio folders (OUTPUT) — optional: uncomment + set your path ───
       # Saved Sample Studio chops are rendered here, organized as Artist/Track
       # folders by the sample path template. UNCOMMENT the line below, point the
@@ -162,8 +168,12 @@ services:
     restart: unless-stopped
     healthcheck:
       # Lightweight JSON probe, not / (rendering the index every 30s was a
-      # steady idle-CPU cost, #1905); allowlisted by every auth gate.
-      test: [ "CMD", "curl", "-f", "http://localhost:8008/api/setup/status" ]
+      # steady idle-CPU cost, #1905). Answered before every auth gate, and 200
+      # while SoulSync is still starting (a big library's upgrade can take a
+      # while), so the container isn't restarted halfway through it.
+      # --max-time: Docker does not reliably kill a check that outruns its
+      # timeout, and stuck curls pile up connections until the worker starves
+      test: [ "CMD", "curl", "-f", "--max-time", "5", "http://localhost:8008/api/startup-status" ]
       interval: 30s
       timeout: 10s
       retries: 3

@@ -14,17 +14,19 @@ can only do worse than.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, Optional
+import threading
+import time
+from typing import Any, Dict, List, Optional
 
 from utils.logging_config import get_logger
 
 logger = get_logger("playlists.track_origin")
 
-# the services a track can carry an id from, and the library column each one's
-# enrichment worker fills
+# the services a track can carry an id from, and where the Library v2 catalogue
+# keeps each one's id (spotify has its own column, the rest live in external_ids)
 LIBRARY_ID_COLUMNS = {
-    'spotify': 'spotify_track_id',
-    'deezer': 'deezer_id',
+    'spotify': 't.spotify_id',
+    'deezer': "json_extract(t.external_ids, '$.deezer')",
 }
 ORIGIN_SOURCES = frozenset(LIBRARY_ID_COLUMNS) | {'spotify_public', 'itunes', 'tidal', 'qobuz'}
 MAX_ORIGIN_ID_LENGTH = 100
@@ -57,38 +59,80 @@ def _extra(track: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+_FOLD_TTL_S = 600
+_fold_lock = threading.Lock()
+_fold_cache: Dict[str, Any] = {"at": 0.0, "db": None, "map": {}}
+
+
+def _accented_artist_keys(db: Any) -> Dict[str, List[str]]:
+    """{accent-folded key: [name_key, ...]} for the artists whose name has a
+    non-ASCII letter. third #1062 review G13-3: name_key only casefolds, so
+    "Beyonce" from a playlist no longer found the library's "Beyoncé" (3.6.1
+    compared unidecoded name_norm). only those names need the fold, a small
+    slice of the table, read at most every ten minutes"""
+    now = time.monotonic()
+    with _fold_lock:
+        if _fold_cache["db"] is db and now - _fold_cache["at"] < _FOLD_TTL_S:
+            return _fold_cache["map"]
+    from core.text.normalize import normalize_for_comparison
+    fold: Dict[str, List[str]] = {}
+    with db._get_connection() as conn:
+        for (key,) in conn.execute(
+                "SELECT DISTINCT name_key FROM lib2_artists WHERE name_key GLOB '*[^ -~]*'"):
+            if key:
+                fold.setdefault(normalize_for_comparison(key), []).append(key)
+    with _fold_lock:
+        _fold_cache.update(at=now, db=db, map=fold)
+    return fold
+
+
+def _fold_title(value: Any) -> str:
+    from core.text.normalize import normalize_for_comparison
+    return normalize_for_comparison(" ".join(str(value or "").split()))
+
+
 def library_ids(db: Any, title: str, artist: str) -> Dict[str, str]:
-    """the ids the library has for this song, by its normalised title and
-    artist. empty when the library doesn't have it."""
+    """the ids the library has for this song, by its title and the artist the
+    album or the track itself is credited to. empty when the library doesn't
+    have it."""
     found: Dict[str, str] = {}
     try:
-        title_norm = db._normalize_for_comparison(title or '')
-        artist_norm = db._normalize_for_comparison(artist or '')
-        if not title_norm or not artist_norm:
+        from core.library2.importer import normalize_name
+
+        title = (title or '').strip()
+        artist_key = normalize_name(artist or '')
+        if not title or not artist_key:
             return {}
+        from core.text.normalize import normalize_for_comparison
+        folded = normalize_for_comparison(artist_key)
+        keys = sorted({artist_key, folded, *_accented_artist_keys(db).get(folded, [])})
+        marks = ",".join("?" for _ in keys)
+
+        # the artist narrows through the indexed name_key; the title compares
+        # here with a real casefold. `LOWER(t.title) = LOWER(?)` read every
+        # track of the library and only folded ASCII, so "Björk"-style titles
+        # never matched
+        columns = ', '.join(LIBRARY_ID_COLUMNS.values())
         with db._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(tracks)")
-            cols = {r[1] for r in cursor.fetchall()}
-            wanted = [c for c in LIBRARY_ID_COLUMNS.values() if c in cols]
-            if not wanted or 'title_norm' not in cols:
-                return {}
-            artist_clause = "t.artist_id IN (SELECT id FROM artists WHERE name_norm = ?)"
-            params = [title_norm, artist_norm]
-            if 'track_artist_norm' in cols:
-                artist_clause = f"(t.track_artist_norm = ? OR {artist_clause})"
-                params = [title_norm, artist_norm, artist_norm]
-            cursor.execute(
-                f"SELECT {', '.join('t.' + c for c in wanted)} FROM tracks t "
-                f"WHERE t.title_norm = ? AND {artist_clause} LIMIT 5",
-                params,
-            )
-            for row in cursor.fetchall():
-                for service, column in LIBRARY_ID_COLUMNS.items():
-                    if column in wanted and service not in found:
-                        value = row[column]
-                        if value:
-                            found[service] = str(value)
+            rows = conn.execute(
+                f"""SELECT t.title, {columns} FROM lib2_tracks t
+                      JOIN lib2_albums al ON al.id = t.album_id
+                      JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                     WHERE ar.name_key IN ({marks})
+                    UNION
+                    SELECT t.title, {columns} FROM lib2_tracks t
+                      JOIN lib2_track_artists ta ON ta.track_id = t.id
+                      JOIN lib2_artists ar ON ar.id = ta.artist_id
+                     WHERE ar.name_key IN ({marks})""",
+                (*keys, *keys),
+            ).fetchall()
+        # accents folded on both sides, as 3.6.1's title_norm did
+        wanted = _fold_title(title)
+        matches = [row for row in rows if _fold_title(row[0]) == wanted][:5]
+        for row in matches:
+            for service, value in zip(LIBRARY_ID_COLUMNS, tuple(row)[1:], strict=True):
+                if value and service not in found:
+                    found[service] = str(value)
     except Exception as e:  # noqa: BLE001 - no ids just means identify searches
         logger.debug("library id lookup failed for %s - %s: %s", artist, title, e)
     return found

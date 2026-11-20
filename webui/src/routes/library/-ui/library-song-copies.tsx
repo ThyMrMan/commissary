@@ -3,11 +3,10 @@ import { useState } from 'react';
 
 import { DialogFrame } from '@/components/dialog';
 
-import type { LibrarySong } from '../-library.types';
+import type { LibrarySong } from '../-library-v2.songs';
 
-import { fetchSongCopies } from '../-library.api';
-import { songQueueTrack } from '../-library.helpers';
-import { deleteLibraryTrackRequest } from '../../artist-detail/-artist-detail.manage-actions';
+import { formatQuality } from '../-bitrate';
+import { deleteLibraryTrackRequest, fetchSongCopies, songQueueTrack } from '../-library-v2.songs';
 import { SmartDeleteDialog, TRACK_DELETE_COPY } from '../../artist-detail/-ui/smart-delete-dialog';
 import styles from './library-songs.module.css';
 import { duration, SongCover } from './song-bits';
@@ -50,16 +49,26 @@ export function SongCopiesDialog({
     const others = copies.filter((c) => String(c.id) !== String(keep.id));
     const mode = choice === 'delete_file' ? 'delete_file' : 'db_only';
     let failed = 0;
+    let reason = '';
     for (const other of others) {
       try {
-        await deleteLibraryTrackRequest(other.id, mode);
-      } catch {
+        // review 5 W2-WL-1: a file the disk wouldn't let go comes back as a
+        // warning, not a throw, and that copy is still in the library
+        const result = await deleteLibraryTrackRequest(other, mode);
+        if (result.tone !== 'success') {
+          failed += 1;
+          reason ||= result.extra || result.message;
+        }
+      } catch (error) {
         failed += 1;
+        reason ||= error instanceof Error ? error.message : '';
       }
     }
     window.showToast?.(
       failed
-        ? `Removed ${others.length - failed} of ${others.length} copies; ${failed} couldn't be`
+        ? `Removed ${others.length - failed} of ${others.length} copies; ${failed} couldn't be${
+            reason ? ` (${reason})` : ''
+          }`
         : `Kept the ${keep.album_title || 'chosen'} copy, removed ${others.length}`,
       failed ? 'warning' : 'success',
     );
@@ -115,12 +124,7 @@ export function SongCopiesDialog({
                     ) : null}
                   </div>
                   <div className={styles.copySpecs}>
-                    {[
-                      copy.format,
-                      copy.bitrate ? `${copy.bitrate} kbps` : '',
-                      size(copy.file_size),
-                      duration(copy.duration),
-                    ]
+                    {[formatQuality(copy).label, size(copy.file_size), duration(copy.duration)]
                       .filter(Boolean)
                       .join(' · ')}
                   </div>

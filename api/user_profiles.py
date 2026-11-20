@@ -18,10 +18,11 @@ from flask import Blueprint, jsonify, request, session
 
 from core.metadata import registry as metadata_registry
 from core.metadata.status import invalidate_metadata_status_caches
-from core.permissions import may_manage_profile, profile_view_for
+from core.permissions import may_manage_profile, profiles_listed_for
 from core.profile_context import admin_only, is_admin_request
 
 from utils.logging_config import get_logger
+from core.permissions import own_or_admin, public, requires, self_only
 
 logger = get_logger("api.user_profiles")
 
@@ -410,11 +411,23 @@ def _qs_media_servers():
 
 def _own_library_supported():
     """Per-profile own libraries need a server that can hold more than
-    one music library; the descriptor says which can. Reads this module's
-    config_manager so tests can inject one."""
-    from core.media_server import specs
-    descriptor = specs.describe(config_manager.get_active_media_server())
-    return bool(descriptor and descriptor.supports_own_libraries)
+    one music library (navidrome only from 0.58, #2031). Reads this
+    module's config_manager so tests can inject one."""
+    return _own_library_unsupported_reason() is None
+
+
+def _own_library_unsupported_reason():
+    """why own libraries are off on the active server, or None."""
+    from core.library_scope import own_library_unsupported_reason
+    return own_library_unsupported_reason(config_manager.get_active_media_server())
+
+
+def _navidrome_shared_folder_id():
+    """the music folder the shared library scans on navidrome, '' for all."""
+    try:
+        return str(get_database().get_preference('navidrome_music_folder_id') or '')
+    except Exception:  # noqa: BLE001 - unreadable reads as none picked
+        return ''
 
 
 def _qs_download_chain(mode, hybrid_order):
@@ -459,23 +472,33 @@ def _qs_server_available(server):
 
 
 @bp.route('/api/profiles', methods=['GET'])
+@public
 def list_profiles():
-    """List all profiles"""
+    """the profiles this viewer may see: everyone for an admin and for the
+    household picker, only their own for a member in login mode (#2162)"""
     try:
         database = get_database()
         viewer_id = get_current_profile_id()
         viewer_is_admin = is_admin_request()
-        profiles = [profile_view_for(p, viewer_id=viewer_id, viewer_is_admin=viewer_is_admin)
-                    for p in database.get_all_profiles()]
+        profiles = profiles_listed_for(database.get_all_profiles(), viewer_id=viewer_id,
+                                       viewer_is_admin=viewer_is_admin,
+                                       login_mode=bool(_require_login_enabled()))
         return jsonify({'success': True, 'profiles': profiles,
                         # where an own-library folder goes on this install (#1199):
                         # a mount under /app in docker, anywhere otherwise
                         'own_library_root_hint': _own_library_root_hint(),
-                        'own_library_supported': _own_library_supported()})
+                        'own_library_supported': _own_library_supported(),
+                        # what the profile settings say when it is not (#2031:
+                        # a navidrome older than 0.58 has one library)
+                        'own_library_unsupported_reason': _own_library_unsupported_reason(),
+                        # supported != available: the server may be right and the
+                        # feature still parked, and the UI must say which
+                        'own_library_available': not _own_library_parked()})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles', methods=['POST'])
+@admin_only
 def create_profile():
     """Create a new profile (admin only)"""
     try:
@@ -558,6 +581,7 @@ def create_profile():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/<int:profile_id>', methods=['PUT'])
+@own_or_admin
 def update_profile(profile_id):
     """Update a profile (admin or self)"""
     try:
@@ -657,14 +681,22 @@ def update_profile(profile_id):
             mode = 'own' if data.get('library_mode') == 'own' else 'shared'
             root = str(data.get('library_root') or '').strip()
             if mode == 'own':
-                if not _own_library_supported():
-                    existing_lib = database.get_profile_library(profile_id)
-                    is_already_own = (existing_lib.get('mode') == 'own' and
-                                      str(existing_lib.get('root') or '').strip() == root)
-                    if not is_already_own:
-                        return jsonify({'success': False, 'error': 'Own libraries require Plex or Jellyfin. Switch this profile to the shared library for Navidrome or Standalone.'}), 400
+                existing_lib = database.get_profile_library(profile_id)
+                is_already_own = (existing_lib.get('mode') == 'own' and
+                                  str(existing_lib.get('root') or '').strip() == root)
+                reason = _own_library_unsupported_reason()
+                if reason and not is_already_own:
+                    return jsonify({'success': False, 'error': f'{reason} Keep this profile on the shared library.'}), 400
                 if not root:
                     return jsonify({'success': False, 'error': 'An own library needs an output folder'}), 400
+                if (not reason and not is_already_own
+                        and config_manager.get_active_media_server() == 'navidrome'
+                        and not _navidrome_shared_folder_id()):
+                    # with no folder picked the shared scan reads every
+                    # navidrome library, theirs included (#2031)
+                    return jsonify({'success': False, 'error': (
+                        "Pick the shared library's music folder in Settings > Media server first, "
+                        "so the shared scan leaves their Navidrome library out")}), 400
                 shared_root = str(config_manager.get('soulseek.transfer_path', '') or '').strip().rstrip('/\\')
                 if shared_root and root.rstrip('/\\') == shared_root:
                     return jsonify({'success': False, 'error': 'That is the shared library folder; pick a different one'}), 400
@@ -675,8 +707,8 @@ def update_profile(profile_id):
                 if problem:
                     return jsonify({'success': False, 'error': problem}), 400
             library_result = database.set_profile_library(profile_id, mode, root or None)
-            from core.library_scope import invalidate_library_scope_cache
-            invalidate_library_scope_cache()
+            from core.library_scope import library_config_changed
+            library_config_changed()
             try:
                 from core.imports.paths import reset_own_library_fallback_notifications
                 reset_own_library_fallback_notifications()
@@ -708,6 +740,7 @@ def update_profile(profile_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/<int:profile_id>', methods=['DELETE'])
+@admin_only
 def delete_profile(profile_id):
     """Delete a profile (admin only, can't delete self)"""
     try:
@@ -728,12 +761,24 @@ def delete_profile(profile_id):
         if success:
             from api.profiles import _sweep_video_profile_data
             _sweep_video_profile_data(profile_id)
+            try:
+                from core import ui_features
+                ui_features.clear(database, profile_id)
+            except Exception as e:  # noqa: BLE001 - a leftover pref is harmless
+                logger.debug("features clear for %s failed: %s", profile_id, e)
+            # and their own sidebar weather (#2163)
+            from api.sidebar_weather import forget_profile as _forget_weather
+            _forget_weather(database, profile_id)
             _audit('profile_deleted', profile_id, target.get('name'))
+            # its folder is no library any more (#1199)
+            from core.library_scope import library_config_changed
+            library_config_changed()
         return jsonify({'success': success})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/select', methods=['POST'])
+@public
 def select_profile():
     """Select a profile (validates PIN if set)"""
     try:
@@ -816,6 +861,7 @@ def select_profile():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/current', methods=['GET'])
+@public
 def get_current_profile():
     """Get the currently selected profile from session"""
     try:
@@ -868,6 +914,7 @@ def get_current_profile():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/verify-launch-pin', methods=['POST'])
+@public
 def verify_launch_pin():
     """Verify PIN for launch lock screen"""
     try:
@@ -899,6 +946,7 @@ def verify_launch_pin():
 
 
 @bp.route('/api/profiles/<int:profile_id>/set-recovery', methods=['POST'])
+@own_or_admin
 def set_profile_recovery_endpoint(profile_id):
     """Set or clear a profile's recovery question + answer (admin, or self)."""
     try:
@@ -915,6 +963,7 @@ def set_profile_recovery_endpoint(profile_id):
 
 
 @bp.route('/api/profiles/reset-pin-via-credential', methods=['POST'])
+@public
 def reset_pin_via_credential():
     """Reset admin PIN by verifying a known API credential"""
     try:
@@ -979,6 +1028,7 @@ def reset_pin_via_credential():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/logout', methods=['POST'])
+@public
 def logout_profile():
     """Clear session — back to profile picker. drops the login and launch-pin
     flags too: popping only the profile left an authenticated session with no
@@ -993,6 +1043,7 @@ def logout_profile():
     return jsonify({'success': True})
 
 @bp.route('/api/profiles/<int:profile_id>/set-pin', methods=['POST'])
+@own_or_admin
 def set_profile_pin(profile_id):
     """Set or change PIN for a profile (admin or self)"""
     try:
@@ -1027,6 +1078,7 @@ def set_profile_pin(profile_id):
 
 
 @bp.route('/api/profiles/<int:profile_id>/set-password', methods=['POST'])
+@own_or_admin
 def set_profile_password_endpoint(profile_id):
     """Set or clear a profile's LOGIN password (admin, or the profile itself).
     Distinct from the quick-switch PIN."""
@@ -1069,6 +1121,7 @@ def set_profile_password_endpoint(profile_id):
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/listenbrainz', methods=['GET'])
+@self_only
 def get_profile_listenbrainz():
     """Get current profile's ListenBrainz connection status"""
     try:
@@ -1086,6 +1139,7 @@ def get_profile_listenbrainz():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/listenbrainz', methods=['POST'])
+@requires("account.connect")
 def save_profile_listenbrainz():
     """Save ListenBrainz credentials for current profile"""
     try:
@@ -1115,6 +1169,7 @@ def save_profile_listenbrainz():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/listenbrainz', methods=['DELETE'])
+@self_only
 def delete_profile_listenbrainz():
     """Clear ListenBrainz credentials for current profile"""
     try:
@@ -1136,9 +1191,13 @@ def _check_lastfm_user(username):
     api_key = config_manager.get('lastfm.api_key', '')
     if not api_key:
         return False, "Last.fm isn't set up on this server yet, ask the admin to add an API key in Settings."
+    from core.lastfm_client import LASTFM_IMPORT_REJECTED_MESSAGE, LastFMClient, LastFMKeyRejected
     try:
-        from core.lastfm_client import LastFMClient
         data = LastFMClient(api_key=api_key).get_user_recent_tracks(username, limit=1)
+    except LastFMKeyRejected:
+        # pro only from 1 december 2026. nothing here can stand in for a
+        # last.fm import, so say so plainly and point at listenbrainz
+        return False, LASTFM_IMPORT_REJECTED_MESSAGE
     except Exception as e:
         return False, f"Couldn't reach Last.fm: {e}"
     recent = (data or {}).get('recenttracks')
@@ -1148,6 +1207,7 @@ def _check_lastfm_user(username):
 
 
 @bp.route('/api/profiles/me/lastfm', methods=['GET'])
+@self_only
 def get_profile_lastfm():
     try:
         connected, username = _profile_lastfm_connection(get_current_profile_id())
@@ -1157,6 +1217,7 @@ def get_profile_lastfm():
 
 
 @bp.route('/api/profiles/me/lastfm', methods=['POST'])
+@requires("account.connect")
 def save_profile_lastfm():
     try:
         data = request.json or {}
@@ -1180,6 +1241,7 @@ def save_profile_lastfm():
 
 
 @bp.route('/api/profiles/me/lastfm', methods=['DELETE'])
+@self_only
 def delete_profile_lastfm():
     try:
         profile_id = get_current_profile_id()
@@ -1190,7 +1252,136 @@ def delete_profile_lastfm():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+# --- Per-profile scrobbling (Phonk_Ben_67) ---
+# a profile's own plays to its own accounts. listenbrainz reuses the token the
+# profile saved for its history; last.fm needs signing in, since writing
+# scrobbles takes a session where reading them only took a username. the
+# admin's scrobbling stays in Settings.
+
+_LASTFM_SCROBBLE_STATE_SECONDS = 15 * 60
+_lastfm_scrobble_states = {}  # state -> (profile id, expires at)
+_lastfm_scrobble_states_lock = threading.Lock()
+
+
+def _scrobbling_payload(pid):
+    db = get_database()
+    out = db.get_profile_scrobbling(pid)
+    out['lastfm']['available'] = bool(config_manager.get('lastfm.api_key', '')
+                                      and config_manager.get('lastfm.api_secret', ''))
+    out['listenbrainz']['available'] = bool((db.get_profile_listenbrainz(pid) or {}).get('token'))
+    return out
+
+
+@bp.route('/api/profiles/me/scrobbling', methods=['GET'])
+@self_only
+def get_my_scrobbling():
+    try:
+        pid = get_current_profile_id()
+        if not pid or pid == 1:
+            return jsonify({'success': True, 'managed_in_settings': True})
+        return jsonify({'success': True, **_scrobbling_payload(pid)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/listenbrainz/scrobble', methods=['POST'])
+@self_only
+def set_my_listenbrainz_scrobble():
+    """turn scrobbling this profile's plays to its own listenbrainz on or off."""
+    try:
+        pid = get_current_profile_id()
+        if not pid or pid == 1:
+            return jsonify({'success': False, 'error': 'The admin account is managed in Settings'}), 400
+        enabled = bool((request.json or {}).get('enabled'))
+        if not get_database().set_profile_listenbrainz_scrobble(pid, enabled) and enabled:
+            return jsonify({'success': False, 'error': 'Connect your ListenBrainz account first'}), 400
+        return jsonify({'success': True, **_scrobbling_payload(pid)})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/lastfm/scrobble/auth-url', methods=['GET'])
+@requires("account.connect")
+def my_lastfm_scrobble_auth_url():
+    """where to send the browser to sign this profile into last.fm. the
+    callback only accepts the state handed out here, for this profile."""
+    try:
+        pid = get_current_profile_id()
+        if not pid or pid == 1:
+            return jsonify({'success': False, 'error': 'The admin account is managed in Settings'}), 400
+        api_key = config_manager.get('lastfm.api_key', '')
+        if not api_key or not config_manager.get('lastfm.api_secret', ''):
+            return jsonify({'success': False, 'error':
+                            "Last.fm isn't set up on this server yet, ask the admin to add an API key and secret in Settings."}), 400
+        import secrets
+        from urllib.parse import quote
+        state = secrets.token_urlsafe(24)
+        now = time.time()
+        with _lastfm_scrobble_states_lock:
+            for key in [k for k, (_p, exp) in _lastfm_scrobble_states.items() if exp < now]:
+                _lastfm_scrobble_states.pop(key, None)
+            _lastfm_scrobble_states[state] = (int(pid), now + _LASTFM_SCROBBLE_STATE_SECONDS)
+        callback = request.host_url.rstrip('/') + '/api/profiles/me/lastfm/scrobble/callback?state=' + state
+        return jsonify({'success': True,
+                        'url': f"https://www.last.fm/api/auth/?api_key={api_key}&cb={quote(callback, safe='')}"})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _callback_page(title, body, ok):
+    from html import escape
+    color = '#1db954' if ok else '#e05252'
+    return (f'<html><body style="background:#121212;color:#fff;font-family:sans-serif;'
+            f'text-align:center;padding-top:100px;"><h2 style="color:{color}">{escape(title)}</h2>'
+            f'<p>{escape(body)}</p>' + ('<script>setTimeout(()=>window.close(),3000);</script>' if ok else '')
+            + '</body></html>')
+
+
+@bp.route('/api/profiles/me/lastfm/scrobble/callback', methods=['GET'])
+@requires("account.connect")
+def my_lastfm_scrobble_callback():
+    """last.fm sends the browser back here with a token. it becomes the
+    profile's scrobbling session, only for the profile that asked."""
+    try:
+        state = request.args.get('state', '')
+        with _lastfm_scrobble_states_lock:
+            pending = _lastfm_scrobble_states.pop(state, None)
+        pid = get_current_profile_id()
+        if not pending or pending[1] < time.time() or pending[0] != pid:
+            return _callback_page("Last.fm sign-in expired",
+                                  "Start it again from My Accounts in SoulSync.", False), 400
+        token = request.args.get('token')
+        if not token:
+            return _callback_page("Last.fm didn't sign you in", "No token came back from Last.fm.", False), 400
+        from core.lastfm_client import LastFMClient
+        session_data = LastFMClient(api_key=config_manager.get('lastfm.api_key', ''),
+                                    api_secret=config_manager.get('lastfm.api_secret', '')).get_session(token)
+        if not session_data:
+            return _callback_page("Last.fm didn't sign you in",
+                                  "Last.fm refused the sign-in. Try again from My Accounts.", False), 400
+        if not get_database().set_profile_lastfm_session(pid, session_data['key'], session_data['name']):
+            return _callback_page("Couldn't save the sign-in", "Try again from My Accounts.", False), 500
+        who = session_data['name'] or 'your account'
+        return _callback_page("Scrobbling to Last.fm",
+                              f"Your plays now scrobble to {who}. You can close this window.", True)
+    except Exception as e:
+        return _callback_page("Something went wrong", str(e), False), 500
+
+
+@bp.route('/api/profiles/me/lastfm/scrobble', methods=['DELETE'])
+@self_only
+def stop_my_lastfm_scrobble():
+    try:
+        pid = get_current_profile_id()
+        if pid and pid != 1:
+            get_database().set_profile_lastfm_session(pid, None)
+        return jsonify({'success': True})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/api/profiles/me/listenbrainz/test', methods=['POST'])
+@requires("account.connect")
 def test_profile_listenbrainz():
     """Test a ListenBrainz token without saving"""
     try:
@@ -1208,7 +1399,21 @@ def test_profile_listenbrainz():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+def _media_listening_sources(pid):
+    """the media server whose plays are this profile's own (a linked plex or
+    jellyfin user), so the listening card says where its listening comes from."""
+    try:
+        from core.listening_scope import media_account_owners
+        server = config_manager.get_active_media_server()
+        if server in ('plex', 'jellyfin') and int(pid) in media_account_owners(get_database(), server).values():
+            return [server]
+    except Exception as e:  # noqa: BLE001 - the card just names fewer sources
+        logger.debug("media listening source lookup failed: %s", e)
+    return []
+
+
 @bp.route('/api/profiles/me/connections', methods=['GET'])
+@self_only
 def get_my_connections():
     """Per-profile playlist-service connection status for the My Accounts modal.
     Readable by any profile; reports only this profile's own connections."""
@@ -1225,7 +1430,8 @@ def get_my_connections():
             # at the top of My Account
             'listening': {
                 'scope': get_database().listening_history_scope(pid),
-                'sources': [s for s, on in (('listenbrainz', lb_connected), ('lastfm', fm_connected)) if on],
+                'sources': [s for s, on in (('listenbrainz', lb_connected), ('lastfm', fm_connected)) if on]
+                + _media_listening_sources(pid),
             },
             'connections': {
                 'spotify': {'connected': sp_connected, 'account': sp_account},
@@ -1239,6 +1445,7 @@ def get_my_connections():
 
 
 @bp.route('/api/profiles/me/connections/<service>/disconnect', methods=['POST'])
+@self_only
 def disconnect_my_connection(service):
     """Disconnect the current profile's OWN account for a service (clears its
     per-profile tokens + cached client). The global/admin auth is untouched."""
@@ -1256,6 +1463,7 @@ def disconnect_my_connection(service):
 
 
 @bp.route('/api/profiles/me/spotify', methods=['GET'])
+@self_only
 def get_profile_spotify_creds():
     """Get current profile's Spotify credentials (if set)"""
     try:
@@ -1273,6 +1481,7 @@ def get_profile_spotify_creds():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/spotify', methods=['POST'])
+@requires("account.connect")
 def save_profile_spotify_creds():
     """Save Spotify API credentials for current profile"""
     try:
@@ -1296,6 +1505,7 @@ def save_profile_spotify_creds():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/spotify', methods=['DELETE'])
+@self_only
 def delete_profile_spotify_creds():
     """Clear Spotify credentials for current profile (revert to global)"""
     try:
@@ -1316,7 +1526,203 @@ def delete_profile_spotify_creds():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# --- what this profile chose to see (#1909) ---
+
+FEATURES_LOCKED_MESSAGE = "An admin set what this profile shows. Ask them if you want something changed."
+
+
+def _features_off_from(data):
+    """the off list a features save asks for: {off}, {preset} or {purposes}.
+    (off, None), (None, None) when it names none, or (None, error)."""
+    from core import ui_features
+    if 'preset' in data:
+        preset = data.get('preset')
+        if preset not in ui_features.PRESETS:
+            return None, 'Unknown preset'
+        return ui_features.PRESETS[preset], None
+    if 'purposes' in data:
+        return ui_features.off_from_purposes(data.get('purposes') or []), None
+    if isinstance(data.get('off'), list):
+        return data['off'], None
+    return None, None
+
+
+@bp.route('/api/profiles/me/features', methods=['GET'])
+@self_only
+def get_profile_features():
+    """the hideable parts of soulsync, the presets, and what's off for me"""
+    from core import ui_features
+    try:
+        db, pid = get_database(), get_current_profile_id()
+        body = {'success': True, **ui_features.profile_payload(db, pid)}
+        # install-wide, so only an admin sees or changes it
+        if is_admin_request():
+            body['background'] = ui_features.background_state(db)
+        return jsonify(body)
+    except Exception as e:
+        logger.error("features read failed: %s", e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/features', methods=['POST'])
+@self_only
+def save_profile_features():
+    """save what's off. takes {off: [...]}, {preset: 'simple'|'full'},
+    {purposes: [...]} (the setup answer) or {reset: true}. a profile an
+    admin locked can't change its own (#2157)."""
+    from core import ui_features
+    try:
+        data = request.json or {}
+        profile_id = get_current_profile_id()
+        if profile_id is None:
+            return jsonify({'success': False, 'error': 'Pick a profile first.'}), 400
+        db = get_database()
+        if ui_features.is_locked(db, profile_id):
+            return jsonify({'success': False, 'error': FEATURES_LOCKED_MESSAGE, 'locked': True}), 403
+        if data.get('reset') is True:
+            # only their own pick goes; what an admin set for them stays
+            ui_features.reset_own(db, profile_id)
+        else:
+            off, error = _features_off_from(data)
+            if error or off is None:
+                return jsonify({'success': False, 'error': error or 'Send off, preset, purposes or reset'}), 400
+            ui_features.save_off(db, profile_id, off)
+        body = {'success': True, **ui_features.profile_payload(db, profile_id)}
+        if is_admin_request():
+            # hiding a part can make it hidden for everyone, the pause line
+            # in the picker follows straight away
+            body['background'] = ui_features.background_state(db)
+        return jsonify(body)
+    except Exception as e:
+        logger.error("features save failed: %s", e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+def _features_target(profile_id):
+    """(db, profile, None) when the caller may set this profile's features,
+    or (None, None, response)."""
+    if not is_admin_request():
+        return None, None, (jsonify({'success': False, 'error': 'Admin only'}), 403)
+    db = get_database()
+    if not may_manage_profile(get_current_profile_id(), True, profile_id):
+        return None, None, (jsonify({'success': False, 'error': 'Unauthorized'}), 403)
+    target = db.get_profile(profile_id)
+    if not target:
+        return None, None, (jsonify({'success': False, 'error': 'Profile not found'}), 404)
+    return db, target, None
+
+
+@bp.route('/api/profiles/<int:profile_id>/features', methods=['GET'])
+@admin_only
+def get_other_profile_features(profile_id):
+    """what an admin sees when setting someone's features (#2157)"""
+    from core import ui_features
+    db, _target, refused = _features_target(profile_id)
+    if refused:
+        return refused
+    try:
+        return jsonify({'success': True, **ui_features.admin_payload(db, profile_id)})
+    except Exception as e:
+        logger.error("features read for %s failed: %s", profile_id, e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/<int:profile_id>/features', methods=['POST'])
+@admin_only
+def set_other_profile_features(profile_id):
+    """an admin sets what a profile shows and whether it's locked (#2157).
+    takes {off} or {preset}, {locked}, or {reset: true} (back to the default
+    for new profiles). works on a locked profile, that's the point. the set
+    and the lock both drop the member's old pick (#2164), so what the admin
+    set is what they see."""
+    from core import ui_features
+    db, target, refused = _features_target(profile_id)
+    if refused:
+        return refused
+    try:
+        data = request.json or {}
+        off, error = _features_off_from(data)
+        if error:
+            return jsonify({'success': False, 'error': error}), 400
+        has_lock = 'locked' in data
+        if has_lock and not ui_features.admin_sets(target):
+            return jsonify({'success': False, 'error': "Admins can always change their own, there's nothing to lock."}), 400
+        if data.get('reset') is not True and off is None and not has_lock:
+            return jsonify({'success': False, 'error': 'Send off, preset, locked or reset'}), 400
+        if data.get('reset') is True:
+            ui_features.reset(db, profile_id)
+        if off is not None:
+            ui_features.save_admin_off(db, profile_id, off)
+        if has_lock:
+            ui_features.admin_lock(db, profile_id, bool(data.get('locked')))
+        _audit('features_changed', profile_id, target.get('name'))
+        return jsonify({'success': True, **ui_features.admin_payload(db, profile_id)})
+    except Exception as e:
+        logger.error("features save for %s failed: %s", profile_id, e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/feature-defaults', methods=['GET'])
+@admin_only
+def get_feature_defaults():
+    """what a new profile starts with (#2157). admin only."""
+    from core import ui_features
+    if not is_admin_request():
+        return jsonify({'success': False, 'error': 'Admin only'}), 403
+    try:
+        return jsonify({'success': True, **ui_features.default_payload(get_database())})
+    except Exception as e:
+        logger.error("feature defaults read failed: %s", e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/feature-defaults', methods=['POST'])
+@admin_only
+def set_feature_defaults():
+    """{off} or {preset}, plus {locked}. every profile that never chose its
+    own follows this, new ones included."""
+    from core import ui_features
+    if not is_admin_request():
+        return jsonify({'success': False, 'error': 'Admin only'}), 403
+    try:
+        data = request.json or {}
+        db = get_database()
+        off, error = _features_off_from(data)
+        if error:
+            return jsonify({'success': False, 'error': error}), 400
+        now = ui_features.load_default(db)
+        ui_features.save_default(db, now['off'] if off is None else off,
+                                 bool(data['locked']) if 'locked' in data else now['locked'])
+        _audit('feature_defaults_changed')
+        return jsonify({'success': True, **ui_features.default_payload(db)})
+    except Exception as e:
+        logger.error("feature defaults save failed: %s", e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@bp.route('/api/profiles/me/features/background', methods=['POST'])
+@admin_only
+def set_feature_background():
+    """pause a part's background jobs (#1909). admin only, install-wide. it
+    only bites while every profile has the part hidden."""
+    from core import ui_features
+    if not is_admin_request():
+        return jsonify({'success': False, 'error': 'Admin only'}), 403
+    data = request.json or {}
+    feature = data.get('feature')
+    if feature not in ui_features.BACKGROUND_FEATURES:
+        return jsonify({'success': False, 'error': 'That part has no background pause'}), 400
+    try:
+        db = get_database()
+        ui_features.set_paused(db, feature, bool(data.get('paused')))
+        return jsonify({'success': True, 'background': ui_features.background_state(db)})
+    except Exception as e:
+        logger.error("background pause save failed: %s", e)
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/api/profiles/me/server-library', methods=['GET'])
+@self_only
 def get_profile_server_library():
     """Get current profile's media server library selection"""
     try:
@@ -1328,6 +1734,7 @@ def get_profile_server_library():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/profiles/me/server-library', methods=['POST'])
+@self_only
 def save_profile_server_library():
     """Save media server library/user selection for current profile"""
     try:
@@ -1342,6 +1749,25 @@ def save_profile_server_library():
 
         profile_id = get_current_profile_id()
         db = get_database()
+        if server_type == 'navidrome' and library_id:
+            # an own library on navidrome (#2031): one of the libraries their
+            # own login can see, and never the shared one
+            library_id = str(library_id)
+            listing = _navidrome_folders_for_profile(profile_id)
+            if listing.get('error'):
+                return jsonify({'success': False, 'error': listing['error']}), 400
+            if library_id not in {f['id'] for f in listing['folders']}:
+                return jsonify({'success': False, 'error': 'Your Navidrome login has no such library'}), 400
+            if library_id == _navidrome_shared_folder_id():
+                return jsonify({'success': False, 'error': 'That is the shared library; pick your own'}), 400
+        if server_type == 'jellyfin' and user_id:
+            # who you are on jellyfin decides whose history and requests are
+            # yours, so it has to be a real user there and nobody else's yet
+            # (the navidrome login proves itself with the password)
+            user_id = str(user_id).strip()
+            problem = _jellyfin_user_problem(user_id, profile_id, db)
+            if problem:
+                return jsonify({'success': False, 'error': problem[0]}), problem[1]
         success = db.set_profile_server_library(profile_id, server_type, library_id, user_id)
 
         if success:
@@ -1351,8 +1777,54 @@ def save_profile_server_library():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _norm_server_user_id(value) -> str:
+    """jellyfin ids arrive with and without dashes, in either case"""
+    return str(value or '').replace('-', '').strip().lower()
+
+
+def _jellyfin_user_problem(user_id, profile_id, db):
+    """None when this profile may be this jellyfin user, else (message, status).
+    the user has to be one the server lists, and not one another profile
+    already is."""
+    wanted = _norm_server_user_id(user_id)
+    if not wanted:
+        return ('Pick a Jellyfin user', 400)
+    try:
+        engine = _media_server_engine()
+        client = engine.client('jellyfin') if engine is not None else None
+        users = client.get_available_users() if client is not None else None
+    except Exception as e:  # noqa: BLE001 - unreadable is not a yes
+        logger.debug("jellyfin users for profile link: %s", e)
+        users = None
+    if users is None:
+        return ("Couldn't check that user with Jellyfin. Try again in a moment.", 503)
+    if wanted not in {_norm_server_user_id(u.get('id')) for u in users if isinstance(u, dict)}:
+        return ('Jellyfin has no such user', 400)
+    try:
+        with db._get_connection() as conn:
+            rows = conn.execute(
+                "SELECT id, jellyfin_user_id FROM profiles WHERE id != ? "
+                "AND jellyfin_user_id IS NOT NULL AND jellyfin_user_id != ''",
+                (int(profile_id),)).fetchall()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("jellyfin user claim check: %s", e)
+        return ("Couldn't check that user. Try again in a moment.", 503)
+    if any(_norm_server_user_id(r[1]) == wanted for r in rows):
+        return ('Another profile is already that Jellyfin user', 409)
+    return None
+
+
 def _is_docker() -> bool:
     return os.path.exists('/.dockerenv')
+
+
+def _own_library_parked() -> bool:
+    """Whether own libraries are switched off in this build (SCOPE_PARKED)."""
+    try:
+        from core.library_scope import SCOPE_PARKED
+        return bool(SCOPE_PARKED)
+    except Exception:  # noqa: BLE001 - unreadable means treat it as off
+        return True
 
 
 def _own_library_root_hint(name: str = '<name>') -> str:
@@ -1412,6 +1884,7 @@ def _own_library_root_problem(root: str):
 
 
 @bp.route('/api/profiles/me/navidrome-login', methods=['POST'])
+@requires("account.connect")
 def save_profile_navidrome_login():
     """save the current profile's own navidrome login. the login is checked
     with one ping as that user first, so a wrong password is refused here
@@ -1437,7 +1910,50 @@ def save_profile_navidrome_login():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _navidrome_folders_for_profile(profile_id):
+    """the navidrome libraries (music folders) the profile's own login can
+    see: getMusicFolders is scoped to the asking user's libraries since
+    navidrome 0.58 (#2031). {'folders': [{id, name}]} or {'error': ...}."""
+    engine = _media_server_engine()
+    client = engine.client('navidrome') if engine is not None else None
+    if client is None or not client.ensure_connection():
+        return {'folders': [], 'error': 'Navidrome is not connected'}
+    login = get_database().get_profile_navidrome_login(profile_id)
+    if not login:
+        return {'folders': [], 'error': 'Sign in with your own Navidrome user first'}
+    folders = client.as_user(*login).get_music_folders()
+    return {'folders': [{'id': str(f.get('key') or ''), 'name': f.get('title') or ''}
+                        for f in folders if f.get('key')]}
+
+
+@bp.route('/api/profiles/me/navidrome-libraries', methods=['GET'])
+@self_only
+def list_profile_navidrome_libraries():
+    """the own library pick on navidrome (#2031): whether this profile has
+    an own library, whether this navidrome can do it (0.58+), and the
+    libraries its own login sees, the shared one marked."""
+    try:
+        profile_id = get_current_profile_id()
+        db = get_database()
+        own = (db.get_profile_library(profile_id) or {}).get('mode') == 'own' if profile_id else False
+        reason = _own_library_unsupported_reason()
+        selected = (db.get_profile_server_library(profile_id) or {}).get('navidrome_library_id') or ''
+        out = {'success': True, 'own_library': bool(own), 'supported': reason is None,
+               'message': reason, 'selected': str(selected), 'folders': []}
+        if not own or reason:
+            return jsonify(out)
+        listing = _navidrome_folders_for_profile(profile_id)
+        shared = _navidrome_shared_folder_id()
+        out['folders'] = [dict(f, shared=(f['id'] == shared)) for f in listing['folders']]
+        if listing.get('error'):
+            out['message'] = listing['error']
+        return jsonify(out)
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
 @bp.route('/api/profiles/me/navidrome-login', methods=['DELETE'])
+@self_only
 def clear_profile_navidrome_login():
     """back to the app account for this profile."""
     try:
@@ -1447,10 +1963,32 @@ def clear_profile_navidrome_login():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _home_user_link_closed():
+    """linking a plex home user takes no proof that you are that user (the
+    admin token switches to them), which fits one household on the profile
+    picker. login mode is for people who are not one household: there a
+    member could link anyone in the admin's plex home without a pin and act
+    as them on the server. so in login mode it is for admins only, and
+    members use connect with plex, which proves the account on plex's page."""
+    if not _require_login_enabled():
+        return False
+    pid = get_current_profile_id()
+    if pid is None:
+        return True
+    if int(pid) == 1:
+        return False
+    return not bool((get_database().get_profile(pid) or {}).get('is_admin'))
+
+
 @bp.route('/api/profiles/me/plex-home-users', methods=['GET'])
+@self_only
 def list_plex_home_users():
     """the plex home users a profile can link itself to. names and ids only,
-    and only the flag saying whether one needs a pin."""
+    and only the flag saying whether one needs a pin. a member in login mode
+    gets none (an empty list, not a 4xx, so my account just leaves the
+    picker out)."""
+    if _home_user_link_closed():
+        return jsonify({'success': True, 'users': []})
     try:
         engine = _media_server_engine()
         client = engine.client('plex') if engine is not None else None
@@ -1462,17 +2000,28 @@ def list_plex_home_users():
 
 
 @bp.route('/api/profiles/me/plex-home-user', methods=['POST'])
+@requires("account.connect")
 def link_plex_home_user():
     """link the current profile to a plex home user (#1265). the admin token
     switches to that user once (with their profile pin when they have one,
     which is used for that call and not kept) and the user's own server
     access token is stored; the profile's playlists are then theirs."""
+    if _home_user_link_closed():
+        return jsonify({'success': False,
+                        'error': 'Use Connect with Plex to link your own Plex account'}), 403
     try:
         data = request.json or {}
         user_id = str(data.get('user_id') or '').strip()
         pin = str(data.get('pin') or '').strip() or None
         if not user_id:
             return jsonify({'success': False, 'error': 'Pick a Plex user'}), 400
+        # one plex user is one profile: their history and requests follow it
+        with get_database()._get_connection() as conn:
+            taken = conn.execute(
+                "SELECT 1 FROM profiles WHERE id != ? AND plex_home_user_id = ? LIMIT 1",
+                (int(get_current_profile_id() or 0), user_id)).fetchone()
+        if taken:
+            return jsonify({'success': False, 'error': 'Another profile is already that Plex user'}), 409
         engine = _media_server_engine()
         client = engine.client('plex') if engine is not None else None
         if client is None or not hasattr(client, 'mint_home_user_server_token'):
@@ -1488,6 +2037,7 @@ def link_plex_home_user():
 
 
 @bp.route('/api/profiles/me/plex-connect/start', methods=['POST'])
+@requires("account.connect")
 def plex_connect_start():
     """connect with plex from my account: anyone, home user or a friend the
     server is shared with, proves their plex account on plex's own page.
@@ -1514,6 +2064,7 @@ def plex_connect_start():
 
 
 @bp.route('/api/profiles/me/plex-connect/check', methods=['POST'])
+@requires("account.connect")
 def plex_connect_check():
     """poll the pin. once approved: who they are on plex links to this
     profile, for playlists, plex sign-in and their own listening history"""
@@ -1562,6 +2113,7 @@ def plex_connect_check():
 
 
 @bp.route('/api/profiles/me/oidc', methods=['GET'])
+@self_only
 def my_oidc_status():
     """my account's oidc card: whether sign in with oidc is on, whether this
     profile is connected, and (once) how the last connect went"""
@@ -1576,6 +2128,7 @@ def my_oidc_status():
 
 
 @bp.route('/api/profiles/me/oidc-connect/start', methods=['GET'])
+@requires("account.connect")
 def oidc_connect_start():
     """connect with oidc from my account: the signed-in profile proves its
     account at the provider, and oidc sign-in lands on it from then on. this
@@ -1585,6 +2138,7 @@ def oidc_connect_start():
 
 
 @bp.route('/api/profiles/me/oidc', methods=['DELETE'])
+@self_only
 def oidc_disconnect():
     """stop oidc signing in as this profile. refused when it's the profile's
     only way in: a profile made by oidc sign-in has no password, and dropping
@@ -1613,16 +2167,25 @@ def oidc_disconnect():
 
 
 @bp.route('/api/profiles/me/plex-home-user', methods=['DELETE'])
+@self_only
 def unlink_plex_home_user():
     """back to the app account for this profile."""
     try:
-        get_database().set_profile_plex_home_user(get_current_profile_id(), None, None, None)
+        pid = get_current_profile_id()
+        get_database().set_profile_plex_home_user(pid, None, None, None)
+        # its video watch state came from that account; it goes with it (#1941)
+        try:
+            from api.video import get_video_db
+            get_video_db().clear_profile_watch_state(pid)
+        except Exception:   # noqa: BLE001 - never blocks the unlink
+            logger.debug("clearing video watch state for profile %s failed", pid, exc_info=True)
         return jsonify({'success': True})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @bp.route('/api/profiles/me/services', methods=['GET'])
+@self_only
 def get_my_service_selections():
     """For the current profile: the available credential sets per service (id +
     label, never secrets) and which one this profile has selected. Drives the
@@ -1649,6 +2212,7 @@ def get_my_service_selections():
 
 
 @bp.route('/api/profiles/me/services/select', methods=['POST'])
+@self_only
 def select_my_service_credential():
     """Set which admin-created credential set is active for the current profile
     on a service. ``credential_id=null`` clears it (fall back to the global/admin
@@ -1680,6 +2244,7 @@ def select_my_service_credential():
 
 
 @bp.route('/api/profiles/me/active-sources', methods=['GET'])
+@self_only
 def get_active_sources():
     """Current active metadata source / media server / download source + the
     available options, for the quick-switch modal. Readable by any profile;

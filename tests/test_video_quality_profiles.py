@@ -24,7 +24,6 @@ from database.video_database import VideoDatabase
 
 _ROOT = Path(__file__).resolve().parent.parent
 _MANAGE_JS = (_ROOT / "webui" / "static" / "video" / "video-manage-panel.js").read_text(encoding="utf-8")
-_SETTINGS_JS = (_ROOT / "webui" / "static" / "video" / "video-settings.js").read_text(encoding="utf-8")
 _WLBTN_JS = (_ROOT / "webui" / "static" / "video" / "video-watchlist-btn.js").read_text(encoding="utf-8")
 _CSS = (_ROOT / "webui" / "static" / "video" / "video-side.css").read_text(encoding="utf-8")
 
@@ -114,6 +113,32 @@ def test_manual_search_items_carry_the_assignment(db):
     db.add_episodes_to_wishlist(95396, "Severance", [{"season_number": 1, "episode_number": 1}])
     items = db.wishlist_manual_search_items("episode", 95396, season_number=1, episode_number=1)
     assert items and items[0]["quality_profile_id"] == entry["id"]
+
+
+def test_a_wished_show_not_in_the_library_finds_its_profile(db):
+    """a show is wished for as its episodes (kind='episode'); the lookup asked
+    for kind='show' and never matched, so every manual search of a show the
+    library doesn't hold (seadogsbooty's dexter: resurrection) was judged by
+    the Default profile: its 3 GB episode cap and custom formats ignored"""
+    entry = _named_4k(db, "TV 720p/1080p")
+    db.add_episodes_to_wishlist(259909, "Dexter: Resurrection",
+                                [{"season_number": 1, "episode_number": 1}])
+    assert db.set_wishlist_quality_for_tmdb(259909, entry["id"]) == 1
+
+    assert db.quality_profile_id_for("show", tmdb_id=259909) == entry["id"]
+    # a movie's lookup never reads a show's rows with the same tmdb id
+    assert db.quality_profile_id_for("movie", tmdb_id=259909) is None
+
+
+def test_a_library_show_without_its_own_profile_falls_back_to_its_wishes(db):
+    entry = _named_4k(db)
+    db.upsert_show_tree("plex", {"server_id": "s9", "title": "Mobland", "tmdb_id": 247718,
+                                 "seasons": [{"season_number": 1, "episodes": [{"episode_number": 1}]}]})
+    sid = db.query_library("shows")["items"][0]["id"]
+    db.add_episodes_to_wishlist(247718, "Mobland", [{"season_number": 1, "episode_number": 1}])
+    db.set_wishlist_quality_for_tmdb(247718, entry["id"])
+
+    assert db.quality_profile_id_for("show", library_id=sid, tmdb_id=247718) == entry["id"]
 
 
 def test_download_record_carries_the_grab_profile(db):
@@ -249,9 +274,11 @@ def test_manage_panel_has_the_profile_picker():
 
 
 def test_settings_editor_grew_the_profile_bar():
-    assert "data-vq-profile-select" in _SETTINGS_JS
-    assert "QUALITY_URL + '/profiles'" in _SETTINGS_JS
-    assert "showConfirmDialog" in _SETTINGS_JS     # delete is confirm-gated (house rule)
+    # the editor is React (SETTINGS_PORT.md, video pass V1)
+    q = (_ROOT / "webui" / "src" / "features" / "settings" / "tabs" / "video-quality.tsx").read_text(encoding="utf-8")
+    assert "data-vq-profile-select" in q
+    assert "`${QUALITY_URL}/profiles`" in q
+    assert "showConfirmDialog" in q     # delete is confirm-gated (house rule)
 
 
 def test_follow_menu_is_shows_only_with_future_default():

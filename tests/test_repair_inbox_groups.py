@@ -17,6 +17,7 @@ a group row renders with a label and no meaning.
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 import threading
@@ -75,11 +76,13 @@ def worker():
 
 
 def _insert(worker, finding_type, *, status='pending', severity='info',
-            job_id='orphan_file_detector', created_at='2026-08-01 10:00:00'):
+            job_id='orphan_file_detector', created_at='2026-08-01 10:00:00',
+            details_json='{}'):
     worker.db._conn.execute(
-        "INSERT INTO repair_findings (job_id, finding_type, severity, status, title, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (job_id, finding_type, severity, status, f'{finding_type} row', created_at))
+        "INSERT INTO repair_findings (job_id, finding_type, severity, status, title, "
+        "created_at, details_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (job_id, finding_type, severity, status, f'{finding_type} row', created_at,
+         details_json))
     worker.db._conn.commit()
 
 
@@ -113,6 +116,21 @@ def test_severity_takes_the_worst_of_several_pending_rows(worker):
     _insert(worker, 'corrupt_audio', severity='warning')
 
     assert _by_type(worker.get_finding_groups())['corrupt_audio']['severity_max'] == 'error'
+
+
+def test_counts_rows_per_status_per_severity(worker):
+    # review 5 R5-L-3: severity_max is the worst PENDING row only, so the
+    # severity filter lost resolved errors (always "info") and the pending
+    # warnings of a type that also had one pending error
+    for _ in range(5):
+        _insert(worker, 'corrupt_audio', status='resolved', severity='error')
+    for _ in range(3):
+        _insert(worker, 'metadata_gap', severity='warning')
+    _insert(worker, 'metadata_gap', severity='error')
+
+    by = _by_type(worker.get_finding_groups())
+    assert by['corrupt_audio']['severities'] == {'resolved': {'error': 5}}
+    assert by['metadata_gap']['severities'] == {'pending': {'warning': 3, 'error': 1}}
 
 
 def test_orders_worst_first_then_biggest(worker):
@@ -190,6 +208,109 @@ def test_an_empty_type_dismisses_nothing(worker):
         "SELECT status FROM repair_findings").fetchone()[0] == 'pending'
 
 
+# ── bulk actions act on what the filtered view counts (review 5 W3-TT) ───────
+
+def _statuses(worker):
+    return worker.db._conn.execute(
+        "SELECT job_id, severity, status FROM repair_findings ORDER BY id").fetchall()
+
+
+def _filtered_rows(worker):
+    _insert(worker, 'metadata_gap', severity='warning', job_id='a')
+    _insert(worker, 'metadata_gap', severity='info', job_id='a')
+    _insert(worker, 'metadata_gap', severity='warning', job_id='b')
+    _insert(worker, 'metadata_gap', severity='warning', job_id='a', status='dismissed')
+    _insert(worker, 'metadata_gap', severity='info', job_id='a', status='dismissed')
+
+
+def test_a_filtered_inbox_row_counts_only_the_filtered_rows(worker):
+    # the row's "Fix all (N)" and "Dismiss all" count: with a job and a
+    # severity picked it counted every job and every severity of the type
+    _filtered_rows(worker)
+    group = _by_type(worker.get_finding_groups(job_id='a', severity='warning'))['metadata_gap']
+    assert (group['pending'], group['dismissed']) == (1, 1)
+    assert group['job_ids'] == ['a']
+    assert _by_type(worker.get_finding_groups())['metadata_gap']['pending'] == 3
+
+
+def test_dismiss_all_dismisses_only_the_filtered_rows(worker):
+    _filtered_rows(worker)
+    assert worker.dismiss_findings_by_type('metadata_gap', job_id='a', severity='warning') == 1
+    assert _statuses(worker)[:3] == [('a', 'warning', 'dismissed'), ('a', 'info', 'pending'),
+                                     ('b', 'warning', 'pending')]
+
+
+def test_reopen_all_reopens_only_the_filtered_severity(worker):
+    _filtered_rows(worker)
+    assert worker.reopen_findings_bulk(finding_type='metadata_gap', severity='info') == 1
+    assert _statuses(worker)[3:] == [('a', 'warning', 'dismissed'), ('a', 'info', 'pending')]
+
+
+def test_ids_in_view_keeps_only_rows_the_view_lists(worker):
+    _filtered_rows(worker)
+    _insert(worker, 'orphan_file', severity='warning', job_id='a')
+    every = [r[0] for r in worker.db._conn.execute("SELECT id FROM repair_findings ORDER BY id")]
+    assert worker.ids_in_view(every, status='pending', finding_type='metadata_gap',
+                              job_id='a', severity='warning') == [every[0]]
+    assert worker.ids_in_view(every, status='pending') == [every[0], every[1], every[2], every[5]]
+    assert worker.ids_in_view([], status='pending') == []
+
+
+@pytest.fixture()
+def api(worker):
+    from flask import Flask
+
+    import api.repair as repair_api
+    repair_api.configure(worker_getter=lambda: worker, image_url_fixer=lambda url: url,
+                         metadata_cache=None)
+    app = Flask(__name__)
+    app.register_blueprint(repair_api.create_blueprint())
+    return app.test_client()
+
+
+def test_the_groups_route_takes_the_inbox_filters(worker, api):
+    _filtered_rows(worker)
+    groups = api.get('/api/repair/findings/groups?job_id=a&severity=warning').get_json()['groups']
+    assert groups[0]['pending'] == 1
+
+
+def test_the_type_dismiss_route_takes_the_inbox_filters(worker, api):
+    _filtered_rows(worker)
+    res = api.post('/api/repair/findings/bulk', json={
+        'finding_type': 'metadata_gap', 'action': 'dismiss', 'job_id': 'a',
+        'severity': 'warning'}).get_json()
+    assert res['updated'] == 1
+    res = api.post('/api/repair/findings/reopen-all', json={
+        'finding_type': 'metadata_gap', 'severity': 'info'}).get_json()
+    assert res['reopened'] == 1
+
+
+def test_dismiss_selected_refuses_ids_outside_the_view(worker, api):
+    # a selection made in the open metadata_gap list can't dismiss another
+    # type's row, whatever ids the client sends
+    _insert(worker, 'metadata_gap')
+    _insert(worker, 'orphan_file')
+    res = api.post('/api/repair/findings/bulk', json={
+        'ids': [1, 2], 'action': 'dismiss',
+        'scope': {'status': 'pending', 'finding_type': 'metadata_gap'}}).get_json()
+    assert (res['updated'], res['refused']) == (1, 1)
+    assert [r[0] for r in worker.db._conn.execute(
+        "SELECT status FROM repair_findings ORDER BY id")] == ['dismissed', 'pending']
+
+
+def test_fix_selected_refuses_a_row_outside_the_view(worker, api, monkeypatch):
+    _insert(worker, 'metadata_gap', severity='info')
+    fixed = []
+    monkeypatch.setattr(worker, 'fix_finding', lambda fid, fix_action=None, explicit=False:
+                        fixed.append(fid) or {'success': True}, raising=False)
+    res = api.post('/api/repair/findings/1/fix', json={
+        'bulk': True, 'scope': {'status': 'pending', 'severity': 'warning'}})
+    assert res.status_code == 409 and fixed == []
+    res = api.post('/api/repair/findings/1/fix', json={
+        'bulk': True, 'scope': {'status': 'pending', 'severity': 'info'}})
+    assert res.status_code == 200 and fixed == [1]
+
+
 # ── the cross-language blurb contract ────────────────────────────────────────
 
 _BLURBS = Path(__file__).resolve().parents[1] / 'webui/src/routes/tools/-tools.groups.ts'
@@ -198,7 +319,7 @@ _BLURBS = Path(__file__).resolve().parents[1] / 'webui/src/routes/tools/-tools.g
 def _client_blurb_slugs() -> set:
     source = _BLURBS.read_text(encoding='utf-8')
     body = source.split('FINDING_TYPE_BLURBS: Record<string, string> = {', 1)[1].split('\n};', 1)[0]
-    return set(re.findall(r'^\s{2}([a-z_]+):', body, re.MULTILINE))
+    return set(re.findall(r'^\s{2}([a-z0-9_]+):', body, re.MULTILINE))
 
 
 def test_every_finding_type_has_a_client_blurb():
@@ -244,11 +365,14 @@ def _registered_job_ids() -> set:
     Importing the package would drag in the whole scanning stack for what is a
     question about a string constant.
     """
+    from core.repair_jobs import RETIRED_JOB_IDS
+
     ids = set()
     for path in _JOBS_DIR.glob('*.py'):
-        for match in re.finditer(r"^    job_id = '([^']+)'", path.read_text(encoding='utf-8'), re.M):
-            ids.add(match.group(1))
-    return ids
+        pattern = r'''^    job_id = (["'])([^"']+)\1'''
+        for match in re.finditer(pattern, path.read_text(encoding='utf-8'), re.M):
+            ids.add(match.group(2))
+    return ids - set(RETIRED_JOB_IDS)
 
 
 def test_every_job_is_filed_under_a_family():
@@ -275,3 +399,42 @@ def test_every_family_is_in_the_display_order():
 
     unordered = sorted(set(JOB_CATEGORIES.values()) - set(JOB_CATEGORY_ORDER))
     assert not unordered, f"family missing from JOB_CATEGORY_ORDER: {unordered}"
+
+
+# ── the hand-set count a bulk choice needs ───────────────────────────────────
+#
+# "Apply everything" and "apply everything except the fields I set myself" are
+# two different requests, and the user has to be able to tell which one they
+# want BEFORE clicking. That means the group row has to say how many of its
+# pending findings would overwrite a hand-set value — counted here, not by the
+# client walking every finding's diff.
+
+def test_a_group_counts_its_hand_set_conflicts(worker):
+    _insert(worker, 'library_retag', job_id='library_retag',
+            details_json=json.dumps({'has_manual_conflict': True}))
+    _insert(worker, 'library_retag', job_id='library_retag',
+            details_json=json.dumps({'has_manual_conflict': False}))
+    _insert(worker, 'library_retag', job_id='library_retag',
+            details_json=json.dumps({}))
+
+    group = _by_type(worker.get_finding_groups())['library_retag']
+
+    assert group['pending'] == 3
+    assert group['manual_conflicts'] == 1
+
+
+def test_a_resolved_conflict_is_not_still_counted(worker):
+    """The number sits next to "apply all N", and that action only touches
+    pending rows."""
+    _insert(worker, 'library_retag', job_id='library_retag', status='resolved',
+            details_json=json.dumps({'has_manual_conflict': True}))
+
+    group = _by_type(worker.get_finding_groups())['library_retag']
+
+    assert group['manual_conflicts'] == 0
+
+
+def test_a_type_that_cannot_have_conflicts_reports_zero(worker):
+    _insert(worker, 'orphan_file')
+
+    assert _by_type(worker.get_finding_groups())['orphan_file']['manual_conflicts'] == 0

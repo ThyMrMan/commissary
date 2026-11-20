@@ -50,14 +50,9 @@ def _add_mirrored_track(db, playlist_id, position, name, artist, source_track_id
 
 
 def _add_library_track(db, track_id, title, spotify_track_id):
+    from tests import lib2_seed
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Lib Artist')")
-        conn.execute("INSERT INTO albums (id, artist_id, title) VALUES (1, 1, 'Lib Album')")
-        conn.execute(
-            "INSERT INTO tracks (id, album_id, artist_id, title, spotify_track_id)"
-            " VALUES (?, 1, 1, ?, ?)",
-            (track_id, title, spotify_track_id),
-        )
+        lib2_seed.track(conn, 'Lib Artist', 'Lib Album', title, spotify_id=spotify_track_id)
         conn.commit()
 
 
@@ -182,3 +177,34 @@ def test_result_shape_matches_search_candidates(db):
         "source", "source_track_id", "title", "artist", "album",
         "context", "added_at",
     }
+
+
+def test_wishlist_row_of_one_release_is_listed_by_its_track_id(db):
+    """A wish for one release is keyed ``<track>::<album>``; the worklist
+    offers the source track, and an owned one stays out."""
+    track = _wishlist_track("sp-rel")
+    track["album"]["id"] = "al-1"
+    db.add_to_wishlist(spotify_track_data=track, profile_id=1)
+    owned = _wishlist_track("sp-owned-rel")
+    owned["album"]["id"] = "al-2"
+    db.add_to_wishlist(spotify_track_data=owned, profile_id=1)
+    _add_library_track(db, 1, "Song", "sp-owned-rel")
+
+    rows = mlm.list_unmatched_wanted_tracks(db, profile_id=1)
+
+    assert [r["source_track_id"] for r in rows] == ["sp-rel"]
+
+
+def test_a_manual_match_stamps_the_id_space_of_its_id(db):
+    """review 5 W2-WB-2: the pre-sync editor reads a stamp as a catalogue id
+    only when it says so; a server id and a catalogue id look alike."""
+    import json
+    _add_mirrored_playlist(db, pid=10, name="Test Mix")
+    tid = _add_mirrored_track(db, 10, 0, "Linked Song", "Artist", "sp-k1")
+    db.api_get_tracks_by_ids = lambda ids: [{"id": i} for i in ids]   # live
+    assert mlm.refresh_mirrored_library_flags(db, 1, "sp-k1", "9") == 1
+    extra = lambda: json.loads(db.get_mirrored_playlist_tracks(10)[0]["extra_data"])  # noqa: E731
+    assert extra()["library_track_id_kind"] == "lib2"
+    assert mlm.refresh_mirrored_library_flags(db, 1, "sp-k1", "rk-9", id_kind="server") == 1
+    assert extra()["library_track_id_kind"] == "server"
+    assert tid

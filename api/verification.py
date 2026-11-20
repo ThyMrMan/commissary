@@ -14,10 +14,12 @@ import os
 
 from flask import Blueprint, jsonify
 
+from core.downloads.asked_vs_got import history_asked_and_got
 from core.profile_context import admin_only, get_current_profile_id
 from core.search import stream as _search_stream
 from utils.async_helpers import run_async
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("api.verification")
 
@@ -79,7 +81,10 @@ def _resolve_history_audio_path(row):
             conn = get_database()._get_connection()
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT file_path FROM tracks WHERE file_path IS NOT NULL AND LOWER(title) = LOWER(?)",
+                "SELECT f.path AS file_path FROM lib2_track_files f"
+                "  JOIN lib2_tracks t ON t.id = f.track_id"
+                " WHERE f.path IS NOT NULL AND LOWER(t.title) = LOWER(?)"
+                "   AND COALESCE(f.file_state, 'active') <> 'deleted'",
                 (title,))
             return [r[0] for r in cursor.fetchall() if r[0]]
         except Exception as e:
@@ -97,6 +102,7 @@ def _resolve_history_audio_path(row):
 
 
 @bp.route('/api/verification/<int:history_id>/stream', methods=['GET'])
+@requires("music.access")
 def stream_verification_item(history_id):
     """Stream a completed download for the verification review queue (listen
     before approving). Path comes ONLY from the history row — no client paths."""
@@ -118,6 +124,7 @@ def stream_verification_item(history_id):
 
 
 @bp.route('/api/verification/<int:history_id>/entry', methods=['GET'])
+@requires("music.access")
 def get_verification_entry(history_id):
     """Full library_history row for one review-queue item — feeds the Audit
     Trail modal when opened from the Downloads page (where the history-page
@@ -133,6 +140,7 @@ def get_verification_entry(history_id):
 
 
 @bp.route('/api/verification/config', methods=['GET'])
+@requires("music.access")
 def get_verification_config():
     """Whether AcoustID/download-verification is enabled — if not, the review
     queue collapses to quarantine-only in the UI."""
@@ -185,6 +193,7 @@ def _set_review_play_session(file_path, title, artist, album, mimetype=None):
 
 
 @bp.route('/api/verification/<int:history_id>/play', methods=['POST'])
+@requires("music.access")
 def play_verification_item(history_id):
     """Load the downloaded file into the media player (review queue ▶)."""
     try:
@@ -208,6 +217,7 @@ def play_verification_item(history_id):
 
 
 @bp.route('/api/verification/<int:history_id>/compare-stream', methods=['POST'])
+@requires("music.access")
 def compare_stream_verification_item(history_id):
     """Find the expected track on Soulseek/streaming sources for an A/B
     comparison — the SAME pipeline as the /search page play button, but fed
@@ -266,11 +276,40 @@ def approve_verification_item(history_id):
             # The tracks row may carry either the recorded or the resolved path.
             for p in {p for p in (file_path, on_disk) if p}:
                 conn.execute(
-                    "UPDATE tracks SET verification_status = ? WHERE file_path = ?",
+                    "UPDATE lib2_track_files SET verification_status = ? WHERE path = ?",
                     (HUMAN_VERIFIED, p))
             conn.commit()
+        # iss29-E06: the resolver-backed lib2 update runs on its OWN
+        # transaction, after the write above is committed. It may still have to
+        # consult the path resolver for a mapped-path setup, and the resolver
+        # touches the filesystem — doing that inside the transaction above held
+        # the single SQLite writer across network stats on a NAS-backed library.
+        from core.library2.verification import mark_file_verification_status
+        with db._get_connection() as conn:
+            lib2_updated = mark_file_verification_status(
+                conn,
+                {p for p in (file_path, on_disk) if p},
+                HUMAN_VERIFIED,
+                config_manager=config_manager,
+            )
+            conn.commit()
         tag_written = bool(on_disk) and write_verification_status(on_disk, HUMAN_VERIFIED)
-        return jsonify({"success": True, "tag_written": tag_written})
+        # F-10: the human step of the pipeline story. Fail-open — a history row
+        # without acquisition correlation (ordinary library import) writes
+        # nothing and never blocks the approval itself.
+        try:
+            from core.acquisition.pipeline_callback import notify_verification_decision
+            notify_verification_decision(
+                history_id, decision="human_verified",
+                actor=f"profile:{get_current_profile_id()}",
+            )
+        except Exception as journal_error:  # noqa: BLE001
+            logger.debug("[Verification] approve journal skipped: %s", journal_error)
+        return jsonify({
+            "success": True,
+            "tag_written": tag_written,
+            "lib2_files_updated": lib2_updated,
+        })
     except Exception as e:
         logger.error(f"[Verification] Approve failed for {history_id}: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -328,7 +367,7 @@ def delete_verification_item(history_id):
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-def _reject_review_item(db, row, history_id):
+def _reject_review_item(db, row, history_id, reason_code="human_rejected"):
     """the file is wrong: its source is blacklisted, the file and its library
     row are deleted, and the review entry goes. returns (file_deleted,
     blacklisted)."""
@@ -343,6 +382,17 @@ def _reject_review_item(db, row, history_id):
         # (only a deep scan clears it), so playlist sync kept matching a
         # file that was gone and it never went back on the wishlist (#1754)
         db.delete_track_by_file_path(on_disk)
+    # F-10: journal the rejection BEFORE the row (and with it the stored
+    # acquisition correlation) is deleted — afterwards there is nothing
+    # left to correlate against. Fail-open as everywhere else.
+    try:
+        from core.acquisition.pipeline_callback import notify_verification_decision
+        notify_verification_decision(
+            history_id, decision="rejected", reason_code=reason_code,
+            actor=f"profile:{get_current_profile_id()}",
+        )
+    except Exception as journal_error:  # noqa: BLE001
+        logger.debug("[Verification] reject journal skipped: %s", journal_error)
     db.delete_library_history_rows([history_id])
     return file_deleted, blacklisted
 
@@ -359,12 +409,16 @@ def wrong_song_verification_item(history_id):
         row = _get_library_history_row(history_id)
         if not row:
             return jsonify({"success": False, "error": "History entry not found"}), 404
-        title = (row.get('source_track_title') or '').strip()
+        # the ask is the row's title/artist_name. source_track_title is what
+        # the source called the wrong file, so wishlisting that went hunting
+        # for the wrong song again.
+        asked, _got = history_asked_and_got(row)
+        title = asked['title']
         if not title:
             return jsonify({"success": False, "error": (
                 "There's no record of which song was asked for, so it can't be "
                 "searched again. Delete it and add the song yourself.")}), 400
-        artist = (row.get('source_artist') or '').strip()
+        artist = asked['artist']
         album = (row.get('album_name') or '').strip()
         track = {
             'id': str(row.get('source_track_id') or f"review_{history_id}"),
@@ -372,7 +426,7 @@ def wrong_song_verification_item(history_id):
             'artists': [{'name': artist}] if artist else [],
             'album': {'name': album} if album else {},
         }
-        file_deleted, blacklisted = _reject_review_item(db, row, history_id)
+        file_deleted, blacklisted = _reject_review_item(db, row, history_id, "wrong_song")
         outcome = db.add_to_wishlist_detailed(
             track,
             failure_reason='Wrong song, picked again from review',

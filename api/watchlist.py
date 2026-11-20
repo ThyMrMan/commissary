@@ -8,9 +8,12 @@ from core.watchlist_sources import (
     ARTIST_ID_COLUMNS, SOURCE_COLUMNS, artist_id_match_sql, normalize_source,
 )
 from database.music_database import get_database
+from utils.logging_config import get_logger
 from .auth import require_api_key
 from .helpers import api_success, api_error, parse_fields, parse_profile_id
 from .serializers import serialize_watchlist_artist
+
+logger = get_logger("api.watchlist")
 
 
 def _parse_quality_profile_id(db, body):
@@ -116,8 +119,18 @@ def register_routes(bp):
         profile_id = parse_profile_id(request)
         try:
             db = get_database()
+            # §69.1 reverse edge: capture identity before delete, demonitor the
+            # matching lib2 artist afterwards (both-way sync).
+            descriptor = db.get_watchlist_artist_descriptor(artist_id, profile_id=profile_id)
             ok = db.remove_artist_from_watchlist(artist_id, profile_id=profile_id)
             if ok:
+                try:
+                    from core.settings import config_manager
+                    from core.library2.monitor_sync import sync_watchlist_removal
+                    sync_watchlist_removal(db, config_manager, descriptor,
+                                           profile_id=profile_id)
+                except Exception as sync_e:
+                    logger.debug("watchlist reverse-sync skipped: %s", sync_e)
                 return api_success({"message": "Artist removed from watchlist."})
             return api_error("NOT_FOUND", "Artist not found in watchlist.", 404)
         except Exception as e:
@@ -130,19 +143,29 @@ def register_routes(bp):
 
         Body: {"include_albums": true, "include_live": false, ...}
         Accepts any combination of: include_albums, include_eps, include_singles,
-        include_live, include_remixes, include_acoustic, include_compilations,
-        follow_defaults.
+        include_live, include_live_tracks, include_remixes, include_acoustic,
+        include_compilations, follow_defaults, release_statuses.
+
+        include_live is about live albums, include_live_tracks about a live
+        version on any other release. Until include_live_tracks is sent once
+        it follows include_live (#2082).
 
         follow_defaults true puts the artist back on the watchlist defaults.
         Sending release rules for an artist that follows the defaults gives it
         its own rules, starting from the defaults it was getting (#1822).
+
+        release_statuses is a list of MusicBrainz statuses (official,
+        promotion, bootleg, pseudo-release, withdrawn, expunged, cancelled)
+        the artist lets through, or null to follow the library-wide list
+        (#2175).
         """
         body = request.get_json(silent=True) or {}
         profile_id = parse_profile_id(request)
 
         allowed_fields = {
             "include_albums", "include_eps", "include_singles",
-            "include_live", "include_remixes", "include_acoustic", "include_compilations",
+            "include_live", "include_live_tracks", "include_remixes", "include_acoustic",
+            "include_compilations",
         }
         # Only fields the client actually SENT are touched — this is a real
         # partial PATCH, unlike the legacy full-form endpoint (P2-03).
@@ -152,6 +175,17 @@ def register_routes(bp):
             if parsed is None:
                 return api_error("BAD_REQUEST", f"{key} must be a boolean.", 400)
             updates[key] = parsed
+        status_update = {}
+        if "release_statuses" in body:
+            from core.release_statuses import ReleaseStatusError, encode, validate_allowed
+            if body["release_statuses"] is None:
+                status_update["allowed_release_statuses"] = None
+            else:
+                try:
+                    status_update["allowed_release_statuses"] = encode(
+                        validate_allowed(body["release_statuses"]))
+                except ReleaseStatusError as exc:
+                    return api_error("BAD_REQUEST", str(exc), 400)
 
         try:
             db = get_database()
@@ -161,11 +195,11 @@ def register_routes(bp):
             if quality_profile_id is not None:
                 updates["quality_profile_id"] = quality_profile_id
 
-            if not updates:
+            if not updates and not status_update:
                 return api_error(
                     "BAD_REQUEST",
                     "No valid fields provided. Allowed: "
-                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id', 'follow_defaults'}))}",
+                    f"{', '.join(sorted(allowed_fields | {'quality_profile_id', 'follow_defaults', 'release_statuses'}))}",
                     400,
                 )
 
@@ -187,13 +221,20 @@ def register_routes(bp):
                         updates = {**{k: v for k, v in default_values(config_manager).items()
                                       if k not in updates}, **updates}
                         updates["follow_defaults"] = False
+                        # a client that sets Live and has never heard of live
+                        # tracks means both, as it always did (#2082): NULL
+                        # follows include_live
+                        if "include_live" in body and "include_live_tracks" not in body:
+                            updates["include_live_tracks"] = None
 
                 # Build SET clause
                 set_parts = [f"{k} = ?" for k in updates]
                 values = [
-                    int(v) if key == "quality_profile_id" else int(bool(v))
+                    None if v is None else int(v) if key == "quality_profile_id" else int(bool(v))
                     for key, v in updates.items()
                 ]
+                set_parts += [f"{k} = ?" for k in status_update]
+                values += list(status_update.values())
 
                 cursor.execute(f"""
                     UPDATE watchlist_artists
@@ -203,6 +244,10 @@ def register_routes(bp):
 
                 if cursor.rowcount > 0:
                     conn.commit()
+                    if status_update:
+                        from api.serializers import release_statuses_out
+                        updates["release_statuses"] = release_statuses_out(
+                            status_update["allowed_release_statuses"])
                     return api_success({"message": "Watchlist settings updated.", "updated": updates})
                 return api_error("NOT_FOUND", "Artist not found in watchlist.", 404)
         except Exception as e:

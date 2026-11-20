@@ -1,16 +1,18 @@
 registerDocsSection({
     id: 'artists',
+    needs: 'music.access',
     title: 'Artists & Watchlist',
     icon: '🎤',
     pages: [
         {
             id: 'art-search',
+            needs: 'music.search',
             title: 'Artist Search',
             lede: 'Find any artist and jump straight into their discography.',
             body: `
 Search for any artist by name. Results show artist cards with images and genres, sourced from Spotify (or iTunes as fallback). Click any card to open the artist detail view.
 
-![Artist search results](art-search.jpg)
+![Artist search results for Neon, showing Neon Orchard](art-search.jpg)
 `
         },
         {
@@ -24,16 +26,18 @@ The artist detail page shows a full discography organized by category:
 - Each release card shows cover art, title, year, track count, and a **completion percentage** — how many tracks you already own
 - Filter by category, content type (live / compilations / featured), or status (owned / missing)
 - Click any release to open the download modal with track selection
+- **+ Other sources** adds the releases your other metadata sources list that this page does not: it asks every source the artist is matched on (Spotify, Deezer, Apple Music, MusicBrainz) and compares against what the page already shows, so nothing is listed twice. Each added release carries a badge for the source it came from and opens and downloads from there. While it is on, releases you don't own also show which source lists them
 
 At the top, **View on** buttons link to the artist on each matched external service (Spotify, Apple Music, MusicBrainz, Deezer, AudioDB, Last.fm, Genius, Tidal, Qobuz). **Service badges** on artist cards also indicate which services have matched this artist.
 
 **Similar Artists** appear as clickable bubbles below the discography for further exploration and discovery.
 
-![Artist detail page](art-detail.jpg)
+![The Flicker Testers artist page with its collection summary and album grid with completion badges](art-detail.jpg)
 `
         },
         {
             id: 'art-watchlist',
+            needs: 'music.watchlist',
             title: 'Watchlist',
             lede: 'Follow artists and let SoulSync catch every new release for you.',
             body: `
@@ -45,11 +49,12 @@ The watchlist tracks artists you want to follow for new releases. When SoulSync 
 - Use **Watch All** to add all recommended artists at once
 - **Watch All Unwatched** — bulk-add every library artist that isn't already on your watchlist
 
-![Watchlist page](art-watchlist.jpg)
+![The Watchlist grid with followed artists, the recent releases rail and the scan controls](art-watchlist.jpg)
 `
         },
         {
             id: 'art-scanning',
+            needs: 'music.watchlist',
             title: 'New Release Scanning',
             lede: 'Automatic daily scans keep your watchlist fresh — or trigger one manually.',
             body: `
@@ -60,7 +65,7 @@ Click **Scan for New Releases** or let the system automation handle it (runs eve
 - Recent wishlist additions feed
 - Stats: artists scanned, new tracks found, tracks added to wishlist
 
-![New release scan panel](art-scan.jpg)
+![The watchlist scan activity panel](art-scan.jpg)
 
 > [!TIP]
 > Scanning respects your per-artist release-type settings — if you've excluded live albums for an artist, they won't land in your wishlist.
@@ -68,6 +73,7 @@ Click **Scan for New Releases** or let the system automation handle it (runs eve
         },
         {
             id: 'art-wishlist',
+            needs: 'music.wishlist',
             title: 'Wishlist',
             lede: 'The queue of tracks waiting to be downloaded — fed by scans, syncs, and your own picks.',
             body: `
@@ -100,17 +106,24 @@ Each group has a **Retry** button that clears the backoff on just those tracks. 
 
 The **Cleanup Wishlist** action removes duplicates (the same track added multiple times) and items you already own in your library. It lives in the **⋯** menu next to Download Wishlist, with **Ignored** and **Clear All**.
 
+## Export
+
+**⋯ → Export…** saves the wishlist as **CSV** or **JSON**: everything, **Albums & EPs** only or **Singles** only, previewed before you copy or download it. One row per wanted track with its title, artists, album, release date, length, ISRC, Spotify id, when it was added and the playlist that wanted it.
+
 > [!NOTE]
 > Each wishlist item tracks its source (watchlist scan, playlist sync, manual), retry attempts, and the last error message. There is no status column — a wishlist row is deleted once its download completes.
 
-![Wishlist queue](art-wishlist.jpg)
+![The Wishlist with its failing-items banner and tracks grouped by hunting state](art-wishlist.jpg)
 `
         },
         {
             id: 'art-settings',
+            needs: 'music.watchlist',
             title: 'Watchlist Settings',
             lede: 'Control exactly which release types SoulSync grabs for each artist — or set one global rule.',
             body: `
+![The Watchlist defaults modal with release types and content filters](art-settings.jpg)
+
 ## Per-artist settings
 
 Click the config icon on any watched artist to customize which release types to include:
@@ -118,7 +131,8 @@ Click the config icon on any watched artist to customize which release types to 
 - Albums
 - EPs
 - Singles
-- Live versions
+- Live albums (concert recordings, unplugged sets)
+- Live tracks (a live version on any other release, like a live bonus track)
 - Remixes
 - Acoustic versions
 - Compilations
@@ -129,6 +143,18 @@ Open **⋯ → Watchlist defaults** to set the release rules every artist uses. 
 
 To give one artist its own rules, open it and change a rule on the **Rules** tab. It then shows a **Custom** badge. Turn **Follow watchlist defaults** back on to put it back, or use **Reset all to defaults** in the defaults to put every custom artist back at once.
 
+Live albums and Live tracks are two rules, so you can keep live bonus tracks out and still have live albums added. A release you pick yourself, in Download Discography or with Fix on a discography finding, is never kept out by what it is: asking for a live album with Live albums off still adds its tracks.
+
+**Edition Preference** in the defaults decides what happens when an album exists in several editions. **Standard** is the original release: the edition with the fewest tracks, and among those the one that is not a remaster or reissue, then the earliest. With **Prefer explicit edition** on, the clean copy of an album that is also listed uncensored is never added, in any mode.
+
+## Release status
+
+MusicBrainz gives every release a status: Official, Promotion, Bootleg, Pseudo-Release, Withdrawn, Expunged or Cancelled. **Release Status** in the defaults picks the ones to grab, for the whole library. Every status is on until you change it, so nothing changes on its own.
+
+To give one artist its own, open it and set **Release status** on the **Rules** tab to **Pick for this artist** (or turn off **Use the library's statuses** in the library's Artist Settings). Set it back to the default to follow the library again.
+
+A status belongs to a release, not to the album as a whole, so an album is grabbed when any of its releases has a status you picked. An album with no status on MusicBrainz, and every release from Spotify, Deezer or another source that has no statuses, always gets through. The filter applies to new releases the watchlist finds and to the missing releases the Discography Refresh reports. SoulSync only asks MusicBrainz for statuses when your pick keeps something out.
+
 > [!TIP]
 > If you generally only want studio albums, set the defaults to Albums only and your wishlist stays focused.
 `
@@ -138,6 +164,7 @@ To give one artist its own rules, open it and change a rule on the **Rules** tab
 
 registerDocsSection({
     id: 'label-detail',
+    needs: 'music.access',
     title: 'Record Labels',
     icon: '🏷️',
     pages: [
@@ -146,6 +173,8 @@ registerDocsSection({
             title: 'The Label Page',
             lede: 'Every record label gets a catalog page: releases, ownership status, and a follow button.',
             body: `
+![The Blue Note label page with its hero, follow button and release catalog](label-page.jpg)
+
 ## Getting there
 
 - **Search** — label results render as quiet tiles (name, "Record label", area) linking to \`/label-detail/<id>?name=<name>\`. Labels only appear when the query also has other results — a labels-only match never shows on its own.
@@ -173,6 +202,8 @@ The **← Back** button doesn't use browser history: it returns to wherever you 
             lede: 'The label\'s full release list with ownership badges, filters, and one-click downloads.',
             body: `
 The catalog is a flat grid of release cards in server order (newest first), fetched 60 at a time from the label's MusicBrainz catalog. There is no grouping — filtering and sorting happen client-side, instantly, without refetching.
+
+![The label catalog grid with All, Missing and Owned filters and ownership badges on the cards](label-catalog.jpg)
 
 ## Filters and sorting
 
@@ -208,9 +239,12 @@ Cards show cover art, album title, and "artist · year" (year omitted when unkno
         },
         {
             id: 'label-follow',
+            needs: 'music.watchlist',
             title: 'Following Labels',
             lede: 'Follow a label to monitor its new releases from the Watchlist.',
             body: `
+![A label hero in the Watching state with the New releases and Full backlog monitor control](label-follow.jpg)
+
 ## Following
 
 Click **Add to Watchlist** in the label hero. The button flips to **Watching...** and the **Monitor** segmented control appears:

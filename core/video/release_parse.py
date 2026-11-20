@@ -36,8 +36,15 @@ _SOURCE = [
     (re.compile(r"\bweb-?rip\b", re.I), "webrip"),
     (re.compile(r"\bweb\b", re.I), "web-dl"),   # plain "WEB" (very common) — treat as WEB-DL
     (re.compile(r"\bhdtv\b", re.I), "hdtv"),
+    # a pre-release DVD rip is cam-grade whatever it is spelled as (PreDVDRip,
+    # PRE-DVD, PDVDRip). it sits before the plain DVD rule, which would take
+    # the "DVDRip" in "PRE-DVDRip" for a retail disc
+    (re.compile(r"\b(pre[-. ]?dvd(rip)?|pdvd(rip)?)\b", re.I), "cam"),
     (re.compile(r"\b(dvdrip|dvd)\b", re.I), "dvd"),
-    (re.compile(r"\b(cam|hdcam|ts|telesync|hdts)\b", re.I), "cam"),
+    # CAMRip/HDCAMRip, telesync (TS/HDTS/TSRip) and telecine (HDTC) are cam-grade
+    # too, joined or split: HD-CAM, CAM-Rip, HD-TS, HD-TC
+    (re.compile(r"\b(cam|hd[-. ]?cam|cam[-. ]?rip|hd[-. ]?cam[-. ]?rip|ts|tsrip|telesync|"
+                r"hd[-. ]?ts|hd[-. ]?tsrip|hd[-. ]?tc|telecine)\b", re.I), "cam"),
     (re.compile(r"\b(scr|screener|dvdscr|bdscr)\b", re.I), "screener"),
     (re.compile(r"\bworkprint\b", re.I), "workprint"),
 ]
@@ -73,6 +80,23 @@ _SXXEXX_SPAN = re.compile(
 _SXX = re.compile(r"\bS(\d{1,3})\b", re.I)                          # S02 (pack)
 _SEASON_WORD = re.compile(r"\bseason[\s.]?(\d{1,2})\b", re.I)        # Season 2
 _COMPLETE = re.compile(r"\b(complete|collection|all\s?seasons)\b", re.I)
+# A full disc image: the whole Blu-ray / DVD (an .iso, or a BDMV / VIDEO_TS
+# folder), not a playable file. Nothing in the importer can take one, so a grab
+# downloads 30-90 GB that can only fail. 'COMPLETE' alone is a TV series pack
+# (_COMPLETE above), so only COMPLETE sitting right before (UHD) BLURAY counts.
+# ISO counts only as the last word or right before the group, so a title that
+# contains the word ('The.Iso.Show') isn't caught, and it has to follow a dot or
+# space so a group called iSO ('...H.264-iSO') isn't either.
+_DISC = re.compile(
+    r"\bbdmv\b|\bbd(?:25|50|66|100)\b|\bbr-?disk\b|\bdvd(?:5|9|-?r)\b"
+    r"|(?<=[ ._])iso(?=-[A-Za-z0-9]+\s*$|\s*$)", re.I)
+# COMPLETE BLURAY is looser: 'Show.S01.Complete.Bluray.1080p.HEVC' is a tv pack
+_COMPLETE_BD = re.compile(r"\bcomplete[ ._-]+(?:uhd[ ._-]+)?blu-?ray\b", re.I)
+# An encoder name or REMUX means a single playable file, whatever else the name says
+_ENCODE = re.compile(r"\b(x26[45]|remux)\b", re.I)
+# and for COMPLETE BLURAY, any codec or web/rip source does too
+_PLAYABLE = re.compile(
+    r"\b(x26[45]|h\.?26[45]|hevc|xvid|divx|remux|web-?dl|webrip|bdrip|brrip|hdtv)\b", re.I)
 _GROUP = re.compile(r"-([A-Za-z0-9]{2,})\s*$")
 # Daily/date-named releases — 'The.Daily.Show.2026.07.08.Guest.1080p...' (Sonarr's
 # daily-series naming). Dots/spaces/dashes between the parts; month/day validated.
@@ -128,9 +152,9 @@ _MULTI_RX = re.compile(_EDGE_L + r"(?:multi|dual(?:[ ._-]?audio)?"
                        + _EDGE_R, re.I)
 
 
-def parse_languages(title: Any) -> tuple:
-    """(audio language codes, multi) from a release name's tags. only the part
-    after the title counts, so 'The.French.Dispatch.2021...' isn't french."""
+def _tag_tail(title: Any):
+    """the part of a release name after the title, where the scene puts its
+    tags. None when there is no year or quality token to cut at."""
     t = str(title or "")
     cut = None
     years = list(_YEAR_TOKEN.finditer(t))
@@ -139,11 +163,49 @@ def parse_languages(title: Any) -> tuple:
     m = _META_BOUNDARY.search(t)
     if m and _spaces(t[:m.start()]) and (cut is None or m.start() < cut):
         cut = m.start()
-    if cut is None:
+    return None if cut is None else t[cut:]
+
+
+def parse_languages(title: Any) -> tuple:
+    """(audio language codes, multi) from a release name's tags. only the part
+    after the title counts, so 'The.French.Dispatch.2021...' isn't french."""
+    tail = _tag_tail(title)
+    if tail is None:
         return [], False
-    tail = t[cut:]
     codes = [code for code, rx in _LANG_RX if rx.search(tail)]
     return codes, bool(_MULTI_RX.search(tail))
+
+
+# subtitle tags. VOSTFR / VOSTA style (original audio, subs in that language),
+# SUBFRENCH, FRENCH.SUBS, ESubs, and the language-less ones (MULTiSUBS, SUBBED).
+_SUB_PREFIX = {"fr": "vostfr|vost|subfrench|subfr|stfr", "en": "esubs?|subeng|vosta|engsubs?",
+               "de": "subgerman|subger", "it": "subita", "es": "subspa|subesp|vose"}
+_SUB_LANG_RX = [
+    (code, re.compile(_EDGE_L + "(?:" + "|".join(filter(None, (
+        _SUB_PREFIX.get(code),
+        "(?:" + words + ")[ ._-]?(?:subs?|subbed|subtitles?)"))) + ")" + _EDGE_R, re.I))
+    for code, words in _LANG_TAGS
+]
+_SUBS_ANY_RX = re.compile(_EDGE_L + r"(?:multi[ ._-]?subs?|subbed|subs|subtitles|hardsubs?)" + _EDGE_R,
+                          re.I)
+
+
+def parse_subtitle_tags(title: Any) -> tuple:
+    """(subtitle language codes, subbed) from a release name's tags. ``subbed``
+    is true for any subtitle tag, a language-less one (MULTiSUBS) included."""
+    tail = _tag_tail(title)
+    if tail is None:
+        return [], False
+    codes = [code for code, rx in _SUB_LANG_RX if rx.search(tail)]
+    return codes, bool(codes) or bool(_SUBS_ANY_RX.search(tail))
+
+
+def release_languages(title: Any) -> dict:
+    """what a release name says about its languages: audio codes, multi, and
+    the subtitles it carries. empty when the name tags none (#2120)."""
+    audio, multi = parse_languages(title)
+    subs, subbed = parse_subtitle_tags(title)
+    return {"audio": audio, "multi": multi, "subs": subs, "subbed": subbed}
 
 
 def parse_release(title: Any) -> dict:
@@ -162,6 +224,8 @@ def parse_release(title: Any) -> dict:
         "repack": bool(re.search(r"\brepack\b", t, re.I)),
         "proper": bool(re.search(r"\bproper\b", t, re.I)),
         "three_d": bool(re.search(r"\b3d\b", t, re.I)),
+        "disc_image": (bool(_DISC.search(t)) and not _ENCODE.search(t))
+                      or (bool(_COMPLETE_BD.search(t)) and not _PLAYABLE.search(t)),
         "season": None,
         "season_end": None,
         "episode": None,

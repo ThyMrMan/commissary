@@ -16,13 +16,23 @@
  *
  * Backend: GET /api/profiles/me/connections, the per-service save/OAuth
  * routes, POST /api/profiles/me/connections/<service>/disconnect, and the
- * media-server routes the old My Settings used, and GET/DELETE
- * /api/profiles/me/oidc for the sign-in card.
+ * media-server routes the old My Settings used, GET/DELETE
+ * /api/profiles/me/oidc for the sign-in card, and /api/weather for your own
+ * sidebar weather (#2163: the server answers each profile with its own).
  */
 
+import {
+  type CanDoRow,
+  describePermissions,
+  loadAdminName,
+  LIMIT_KINDS,
+  type LimitKind,
+  requestLimit,
+} from '@/platform/shell/my-permissions-core';
 import { appURL } from '@/platform/url-base';
 
 import { escapeHtml, toast } from './html';
+import { PERMS_CHANGED_EVENT, getMyPermissions, loadMyPermissions } from './my-permissions';
 
 type ServiceId = 'spotify' | 'tidal' | 'listenbrainz' | 'lastfm';
 
@@ -87,6 +97,13 @@ const _MA_SERVICES: MaService[] = [
   },
 ];
 
+/** where this profile scrobbles its own plays (Phonk_Ben_67) */
+interface MaScrobbling {
+  managed_in_settings?: boolean;
+  lastfm?: { connected?: boolean; user?: string; available?: boolean };
+  listenbrainz?: { enabled?: boolean; available?: boolean };
+}
+
 interface MaConnections {
   connections?: Record<string, { connected?: boolean; account?: string | null }>;
   is_admin?: boolean;
@@ -101,6 +118,15 @@ interface OidcStatus {
   connected?: boolean;
   /** how the connect that just came back went, handed over once */
   last?: { connected?: boolean; error?: string | null } | null;
+}
+
+/** GET /api/weather as a member sees it: their own place, never the admin's */
+interface MaWeather {
+  enabled?: boolean;
+  units?: 'celsius' | 'fahrenheit';
+  holidays?: boolean;
+  location?: { query?: string; name?: string } | null;
+  snapshot?: { current?: { temp?: number | null; condition?: string | null } | null } | null;
 }
 
 export const OIDC_CONNECT_URL = '/api/profiles/me/oidc-connect/start';
@@ -127,9 +153,22 @@ interface NamedOption {
   name: string;
 }
 
+interface NavidromeLibrary {
+  id: string;
+  name: string;
+  shared?: boolean;
+}
+
 interface ServerModel {
   type: 'navidrome' | 'plex' | 'jellyfin' | 'none';
   navidromeUser?: string;
+  /** an own library on navidrome (#2031): the profile has one, whether this
+   * navidrome can do it, why not, and the libraries its login sees */
+  navidromeOwn?: boolean;
+  navidromeOwnSupported?: boolean;
+  navidromeOwnMessage?: string;
+  navidromeLibraries?: NavidromeLibrary[];
+  navidromeLibrary?: string;
   plexLinkedUser?: string;
   plexHomeUserId?: string;
   plexHomeUsers?: PlexHomeUser[];
@@ -157,9 +196,25 @@ const _ma: {
   server: ServerModel | null;
   oidc: OidcStatus | null;
   imports: Partial<Record<'listenbrainz' | 'lastfm', ImportStatus>>;
+  scrobbling: MaScrobbling | null;
+  weather: MaWeather | null;
+  /** asks used in each limited kind's window, for "5 asks a week, 2 used" */
+  asksUsed: Partial<Record<LimitKind, number>> | null;
+  adminName: string;
   open: string | null;
   poll: ReturnType<typeof setTimeout> | null;
-} = { data: null, server: null, oidc: null, imports: {}, open: null, poll: null };
+} = {
+  data: null,
+  server: null,
+  oidc: null,
+  imports: {},
+  scrobbling: null,
+  weather: null,
+  asksUsed: null,
+  adminName: '',
+  open: null,
+  poll: null,
+};
 
 function _maProfile(): { id: number; name: string; color: string; avatar: string } {
   try {
@@ -235,7 +290,14 @@ export function openMyAccountsModal(): void {
   // beat the shell to knowing who is signed in, so the header redraws when it
   // finds out instead of staying on "?"
   window.addEventListener(PROFILE_CONTEXT_CHANGED_EVENT, _maRefreshHeader);
+  // an admin's change reaches the open card
+  window.addEventListener(PERMS_CHANGED_EVENT, _maRefreshCanDo);
   void _maLoad();
+}
+
+function _maRefreshCanDo(): void {
+  const box = document.getElementById('ma-cando');
+  if (box) box.outerHTML = _maCanDoSection();
 }
 
 function _maRefreshHeader(): void {
@@ -248,6 +310,7 @@ export function closeMyAccountsModal(): void {
   if (o) o.classList.add('hidden');
   document.removeEventListener('keydown', _maOnKeydown);
   window.removeEventListener(PROFILE_CONTEXT_CHANGED_EVENT, _maRefreshHeader);
+  window.removeEventListener(PERMS_CHANGED_EVENT, _maRefreshCanDo);
   _maStopPoll();
 }
 
@@ -273,14 +336,19 @@ async function _maJson<T>(url: string): Promise<T | null> {
 }
 
 async function _maLoad(): Promise<void> {
-  const [data, server, oidc] = await Promise.all([
+  const [data, server, oidc, scrobbling, weather] = await Promise.all([
     _maJson<MaConnections>('/api/profiles/me/connections'),
     _maLoadServer(),
     _maJson<OidcStatus>('/api/profiles/me/oidc'),
+    _maJson<MaScrobbling>('/api/profiles/me/scrobbling'),
+    _maJson<MaWeather>('/api/weather'),
+    _maLoadCanDo(),
   ]);
   _ma.data = data || { connections: {}, is_admin: false };
   _ma.server = server;
   _ma.oidc = oidc;
+  _ma.scrobbling = scrobbling;
+  _ma.weather = weather;
   _maRefreshHeader();
   _maRender();
   const last = oidc?.last;
@@ -295,6 +363,29 @@ async function _maLoad(): Promise<void> {
   await _maLoadImports();
 }
 
+/** what you can do (#2166): the server's map, fresh, and how many asks the
+ * window has used when there's a limit */
+async function _maLoadCanDo(): Promise<void> {
+  const [perms, admin] = await Promise.all([
+    loadMyPermissions({ force: true }).catch(() => getMyPermissions()),
+    loadAdminName(),
+  ]);
+  _ma.adminName = admin;
+  _ma.asksUsed = null;
+  if (LIMIT_KINDS.some((k) => requestLimit(perms, k))) {
+    // music, movies and TV each count on their own (/api/profiles/me/asks)
+    const q = await _maJson<{ asks?: Partial<Record<LimitKind, { used?: number }>> }>(
+      '/api/profiles/me/asks',
+    );
+    const used: Partial<Record<LimitKind, number>> = {};
+    for (const k of LIMIT_KINDS) {
+      const n = q?.asks?.[k]?.used;
+      if (typeof n === 'number') used[k] = n;
+    }
+    _ma.asksUsed = used;
+  }
+}
+
 /** who you are on the media server. the ACTIVE server decides the card, a
  * jellyfin install with a leftover plex token must not get the plex card
  * (#1265). */
@@ -307,7 +398,22 @@ async function _maLoadServer(): Promise<ServerModel> {
   const lib = current || {};
 
   if (activeServer === 'navidrome') {
-    return { type: 'navidrome', navidromeUser: lib.navidrome_username || '' };
+    const own = await _maJson<{
+      own_library?: boolean;
+      supported?: boolean;
+      message?: string | null;
+      selected?: string;
+      folders?: NavidromeLibrary[];
+    }>('/api/profiles/me/navidrome-libraries');
+    return {
+      type: 'navidrome',
+      navidromeUser: lib.navidrome_username || '',
+      navidromeOwn: !!own?.own_library,
+      navidromeOwnSupported: own?.supported !== false,
+      navidromeOwnMessage: own?.message || '',
+      navidromeLibraries: own?.folders || [],
+      navidromeLibrary: own?.selected || '',
+    };
   }
   if (activeServer === 'plex' || activeServer === '') {
     const plex = await _maJson<{ libraries?: Array<string | { name?: string; title?: string }> }>(
@@ -418,6 +524,7 @@ function _maRender(): void {
     return;
   }
   body.innerHTML = `
+    ${_maCanDoSection()}
     ${_maListeningCard()}
     <section class="ma-section" aria-labelledby="ma-server-h">
       <h4 class="ma-section-title" id="ma-server-h">Media server</h4>
@@ -427,11 +534,68 @@ function _maRender(): void {
       <h4 class="ma-section-title" id="ma-services-h">Music services</h4>
       <div class="ma-group">${_MA_SERVICES.map(_maServiceRow).join('')}</div>
     </section>
+    ${_maWeatherSection()}
     ${_maSignInSection()}
     <p class="ma-foot">The app's own accounts are set up by the admin in Settings. Anything you change here only affects you.</p>`;
   for (const s of ['listenbrainz', 'lastfm'] as const) _maPaintImport(s);
   const focus = body.querySelector<HTMLElement>('.ma-row.is-open input, .ma-row.is-open select');
   focus?.focus();
+}
+
+const _CAN_ICONS: Record<CanDoRow['id'], string> = {
+  music:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>',
+  movies:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="3" width="20" height="18" rx="2"/><path d="M7 3v18M17 3v18M2 9h5M17 9h5M2 15h5M17 15h5"/></svg>',
+  tv: '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M17 2l-5 5-5-5"/></svg>',
+  books:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20V3H6.5A2.5 2.5 0 0 0 4 5.5z"/><path d="M4 19.5A2.5 2.5 0 0 0 6.5 22H20v-5"/></svg>',
+  requests:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.5 5.1 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.5-6.9A2 2 0 0 0 16.8 4H7.2a2 2 0 0 0-1.7 1.1z"/></svg>',
+};
+
+/** what you can do (#2166): the same plain-words summary the admin's editor
+ * shows, read-only, with who to ask when something is off. built from the
+ * server's map, so it is the truth, not a copy of a form */
+export function _maCanDoSection(): string {
+  const perms = getMyPermissions();
+  if (perms.isAdmin) return '';
+  const can = describePermissions(perms, { used: _ma.asksUsed });
+  const rows = can.rows
+    .map((r) => {
+      const lead = r.strong
+        ? `<b>${escapeHtml(r.lead)}</b>`
+        : r.off
+          ? `<span class="ma-can-off">${escapeHtml(r.lead)}</span>`
+          : escapeHtml(r.lead);
+      const detail = r.detail.map((d) => ` · ${escapeHtml(d)}`).join('');
+      return `
+        <div class="ma-can-row" data-can="${r.id}">
+          <span class="ma-can-icon">${_CAN_ICONS[r.id]}</span>
+          <div class="ma-can-text">
+            <div class="ma-can-k">${escapeHtml(r.label)}</div>
+            <div class="ma-can-v">${lead}${detail}</div>
+          </div>
+        </div>`;
+    })
+    .join('');
+  const who = escapeHtml(_ma.adminName || 'your admin');
+  const ask = can.anyOff
+    ? `<p class="ma-can-ask">Something you'd like that isn't here? Ask ${who}. Changes reach you right away.</p>`
+    : '';
+  const never = can.never.length
+    ? `<div class="ma-can-never"><b>Not part of your profile:</b> ${escapeHtml(can.never.join(', '))}.</div>`
+    : '';
+  return `
+    <section class="ma-section" id="ma-cando" aria-labelledby="ma-cando-h">
+      <h4 class="ma-section-title" id="ma-cando-h">What you can do</h4>
+      <div class="ma-can">
+        <p class="ma-can-lead">${escapeHtml(can.sentence)}</p>
+        ${rows}
+        ${never}
+        ${ask}
+      </div>
+    </section>`;
 }
 
 /** sign in with oidc: connect this profile to your account at the provider,
@@ -464,6 +628,77 @@ export function _maSignInSection(): string {
     </section>`;
 }
 
+const _SUN = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>`;
+
+/** what the weather row says: your place and its sky, or how to turn it on */
+export function _maWeatherLine(w: MaWeather | null): string {
+  const loc = w?.location;
+  if (!loc) return 'Off. Add your town to see its weather and time in the sidebar.';
+  const name = loc.name || loc.query || 'Your place';
+  if (w?.enabled === false) return `${name}. Hidden from the sidebar.`;
+  const cur = w?.snapshot?.current;
+  if (!cur || typeof cur.temp !== 'number') return `${name}. Forecast on its way.`;
+  const unit = w?.units === 'celsius' ? 'C' : 'F';
+  const sky = cur.condition ? `, ${cur.condition.toLowerCase()}` : '';
+  return `${name}, ${Math.round(cur.temp)}°${unit}${sky}`;
+}
+
+/** your own sidebar weather (#2163). the admin's lives in Settings and is
+ * never shown here: the server answers each profile with its own */
+function _maWeatherSection(): string {
+  const w = _ma.weather;
+  if (!w) return '';
+  const open = _ma.open === 'weather';
+  const loc = w.location;
+  const trailing = open
+    ? ''
+    : `<button type="button" class="ma-btn ma-btn-outline" data-ma="toggle" data-id="weather" aria-expanded="false">${loc ? 'Change' : 'Set up'}</button>`;
+  const sw = (key: string, label: string, on: boolean) => `
+    <div class="ma-scrobble">
+      <span>${label}</span>
+      <label class="ma-switch">
+        <input type="checkbox" data-ma-weather="${key}" aria-label="${label}"${on ? ' checked' : ''}>
+        <span></span>
+      </label>
+    </div>`;
+  const panel = open
+    ? `
+      <div class="ma-panel">
+        ${_maField(
+          'ma-wx-loc',
+          'Your town',
+          `<input class="ma-input" id="ma-wx-loc" type="text" autocomplete="off" spellcheck="false"
+             placeholder="ZIP or city, e.g. 97501 or Berlin" value="${escapeHtml(loc?.query || '')}" data-submit="weather">`,
+          'Only you see this. The sidebar shows its weather and its local time.',
+        )}
+        ${loc ? sw('celsius', 'Use °C', w.units === 'celsius') : ''}
+        ${loc ? sw('holidays', 'Holiday decorations', w.holidays !== false) : ''}
+        <div class="ma-actions">
+          <button type="button" class="ma-btn ma-btn-quiet" data-ma="toggle" data-id="weather">Cancel</button>
+          ${loc ? '<button type="button" class="ma-btn ma-btn-quiet" data-ma="wx-clear">Turn off</button>' : ''}
+          <button type="button" class="ma-btn ma-btn-primary" data-ma="wx-save">Save</button>
+        </div>
+      </div>`
+    : '';
+  return `
+    <section class="ma-section" aria-labelledby="ma-weather-h">
+      <h4 class="ma-section-title" id="ma-weather-h">Sidebar weather</h4>
+      <div class="ma-group">
+        <div class="ma-row${open ? ' is-open' : ''}">
+          <div class="ma-row-main">
+            <span class="ma-logo ma-logo-key">${_SUN}</span>
+            <div class="ma-row-text">
+              <div class="ma-row-name">Weather</div>
+              <div class="ma-row-sub" id="ma-sub-weather">${escapeHtml(_maWeatherLine(w))}</div>
+            </div>
+            ${trailing}
+          </div>
+          ${panel}
+        </div>
+      </div>
+    </section>`;
+}
+
 const _KEY = `<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="8" cy="15" r="4"/><path d="M10.8 12.2 20 3M16 7l3 3M14 9l2 2"/></svg>`;
 
 /** the provider's logo when the admin set one, else a plain key. the url is
@@ -479,7 +714,7 @@ function _maSignInLogo(icon: string): string {
 function _maListeningCard(): string {
   const listening = _ma.data?.listening || {};
   const names = (listening.sources || [])
-    .map((s) => _MA_SERVICES.find((x) => x.id === s)?.name)
+    .map((s) => _MA_SERVICES.find((x) => x.id === s)?.name || _MA_SOURCE_NAMES[s])
     .filter(Boolean) as string[];
   if (listening.scope === 'profile' && names.length) {
     return `
@@ -539,8 +774,10 @@ function _maServerRow(): string {
 
 function _maServerLine(s: ServerModel): string {
   if (s.type === 'navidrome') {
+    const own = s.navidromeLibraries?.find((l) => l.id === s.navidromeLibrary)?.name;
+    const lib = s.navidromeOwn && own ? ` Your library: ${escapeHtml(own)}.` : '';
     return s.navidromeUser
-      ? `Signed in as ${escapeHtml(s.navidromeUser)}. Your playlists sync to your own account.`
+      ? `Signed in as ${escapeHtml(s.navidromeUser)}. Your playlists sync to your own account.${lib}`
       : "Using the app's account. Sign in so the playlists you sync are yours.";
   }
   if (s.type === 'plex') {
@@ -596,7 +833,8 @@ function _maServerForm(s: ServerModel): string {
       <div class="ma-actions">
         ${s.navidromeUser ? '<button type="button" class="ma-btn ma-btn-quiet" data-ma="nd-clear">Use app account</button>' : ''}
         <button type="button" class="ma-btn ma-btn-primary" data-ma="nd-save">Save</button>
-      </div>`;
+      </div>
+      ${_maNavidromeLibraryForm(s)}`;
   }
   if (s.type === 'plex') {
     const users = s.plexHomeUsers || [];
@@ -677,6 +915,74 @@ function _maServerForm(s: ServerModel): string {
     <div class="ma-actions"><button type="button" class="ma-btn ma-btn-primary" data-ma="jf-save">Save</button></div>`;
 }
 
+/** an own library on navidrome (#2031): the library this profile's scans,
+ * downloads and playlists use, picked from what its own login can see.
+ * nothing for a profile on the shared library. */
+function _maNavidromeLibraryForm(s: ServerModel): string {
+  if (!s.navidromeOwn) return '';
+  const libs = s.navidromeLibraries || [];
+  if (!s.navidromeOwnSupported || !libs.length) {
+    const why =
+      s.navidromeOwnMessage || 'Your Navidrome login sees no library yet. Ask your admin.';
+    return `
+      <div class="ma-divider"></div>
+      <p class="ma-panel-text">You have your own library.</p>
+      <div class="ma-hint" id="ma-nd-lib-note">${escapeHtml(why)}</div>`;
+  }
+  return `
+    <div class="ma-divider"></div>
+    <p class="ma-panel-text">You have your own library. Pick the Navidrome library that is yours: its scans, your downloads and your playlists use it.</p>
+    ${_maField(
+      'ma-nd-lib',
+      'Your library',
+      `<select class="ma-input" id="ma-nd-lib">${_maOptions(
+        libs.map((l) => ({ value: l.id, label: l.shared ? `${l.name} (shared)` : l.name })),
+        s.navidromeLibrary || '',
+        'Pick your library',
+      )}</select>`,
+    )}
+    <div class="ma-actions"><button type="button" class="ma-btn ma-btn-quiet" data-ma="nd-lib-save">Save library</button></div>`;
+}
+
+/** listening that isn't a music-service row: a linked media-server user */
+const _MA_SOURCE_NAMES: Record<string, string> = { plex: 'Plex', jellyfin: 'Jellyfin' };
+
+/** scrobbling your own plays: a switch for listenbrainz (it reuses the
+ * token), sign in for last.fm (writing scrobbles takes a session). nothing
+ * when the server can't do it for you */
+function _maScrobbleLine(svc: MaService): string {
+  const sc = _ma.scrobbling;
+  if (!sc || sc.managed_in_settings) return '';
+  if (svc.id === 'listenbrainz') {
+    if (!sc.listenbrainz?.available) return '';
+    const on = !!sc.listenbrainz.enabled;
+    return `
+      <div class="ma-scrobble">
+        <span>${on ? 'Scrobbling your plays to ListenBrainz' : 'Scrobble your plays to ListenBrainz'}</span>
+        <label class="ma-switch" title="Send what you play from now on to your ListenBrainz">
+          <input type="checkbox" data-ma-scrobble="listenbrainz" aria-label="Scrobble your plays to ListenBrainz"${on ? ' checked' : ''}>
+          <span></span>
+        </label>
+      </div>`;
+  }
+  if (svc.id === 'lastfm') {
+    if (!sc.lastfm?.available) return '';
+    if (sc.lastfm.connected) {
+      return `
+        <div class="ma-scrobble">
+          <span>Scrobbling your plays to <b>${escapeHtml(sc.lastfm.user || 'your Last.fm')}</b></span>
+          <button type="button" class="ma-btn ma-btn-quiet" data-ma="scrobble-stop">Stop</button>
+        </div>`;
+    }
+    return `
+      <div class="ma-scrobble">
+        <span>Scrobble your plays to Last.fm</span>
+        <button type="button" class="ma-btn ma-btn-outline" data-ma="scrobble-signin">Sign in</button>
+      </div>`;
+  }
+  return '';
+}
+
 function _maServiceRow(svc: MaService): string {
   const c = _ma.data?.connections?.[svc.id] || {};
   const connected = !!c.connected;
@@ -737,6 +1043,7 @@ function _maServiceRow(svc: MaService): string {
         ${trailing}
       </div>
       ${svc.history ? `<div class="ma-import" id="ma-import-${svc.id}" hidden></div>` : ''}
+      ${_maScrobbleLine(svc)}
       ${panel}
     </div>`;
 }
@@ -862,6 +1169,18 @@ function _maOnClick(e: Event): void {
         "Plex user unlinked, using the app's account",
       );
       break;
+    case 'nd-lib-save':
+      if (!_maValue('ma-nd-lib')) {
+        toast('Pick your library first', 'error');
+        break;
+      }
+      void _maServerCall(
+        '/api/profiles/me/server-library',
+        'POST',
+        { server_type: 'navidrome', library_id: _maValue('ma-nd-lib') },
+        'Navidrome library saved',
+      );
+      break;
     case 'plex-lib-save':
       void _maServerCall(
         '/api/profiles/me/server-library',
@@ -871,6 +1190,31 @@ function _maOnClick(e: Event): void {
           library_id: _maValue('ma-plex-lib') || null,
         },
         'Plex library saved',
+      );
+      break;
+    case 'scrobble-signin':
+      void _maLastfmScrobbleSignIn(btn);
+      break;
+    case 'wx-save': {
+      const place = _maValue('ma-wx-loc');
+      if (!place) {
+        toast('Type your town or ZIP first', 'info');
+        break;
+      }
+      void _maWeatherCall('/location', { location: place }, (w) =>
+        w.location?.name ? `Weather set to ${w.location.name}` : 'Weather saved',
+      );
+      break;
+    }
+    case 'wx-clear':
+      void _maWeatherCall('/location', { location: '' }, () => 'Sidebar weather turned off');
+      break;
+    case 'scrobble-stop':
+      void _maScrobbleCall(
+        '/api/profiles/me/lastfm/scrobble',
+        'DELETE',
+        null,
+        'Stopped scrobbling to Last.fm',
       );
       break;
     case 'jf-save':
@@ -890,6 +1234,29 @@ function _maOnClick(e: Event): void {
 
 function _maOnChange(e: Event): void {
   const el = e.target as HTMLElement;
+  if (el instanceof HTMLInputElement && el.dataset.maWeather) {
+    const on = el.checked;
+    if (el.dataset.maWeather === 'celsius') {
+      void _maWeatherCall('/units', { use_celsius: on }, () => `Using °${on ? 'C' : 'F'}`, true);
+    } else {
+      void _maWeatherCall(
+        '/holidays',
+        { enabled: on },
+        () => (on ? 'Holiday decorations on' : 'Holiday decorations off'),
+        true,
+      );
+    }
+    return;
+  }
+  if (el instanceof HTMLInputElement && el.dataset.maScrobble === 'listenbrainz') {
+    void _maScrobbleCall(
+      '/api/profiles/me/listenbrainz/scrobble',
+      'POST',
+      { enabled: el.checked },
+      el.checked ? 'Scrobbling to ListenBrainz' : 'Stopped scrobbling to ListenBrainz',
+    );
+    return;
+  }
   if (el.id !== 'ma-plex-user') return;
   const users = _ma.server?.plexHomeUsers || [];
   const picked = users.find((u) => String(u.id) === (el as HTMLSelectElement).value);
@@ -902,6 +1269,10 @@ function _maOnFieldKey(e: KeyboardEvent): void {
   const el = e.target as HTMLElement;
   if (e.key !== 'Enter' || !el.dataset.submit) return;
   e.preventDefault();
+  if (el.dataset.submit === 'weather') {
+    (document.querySelector('[data-ma="wx-save"]') as HTMLElement | null)?.click();
+    return;
+  }
   void saveMyAccountToken(el.dataset.submit);
 }
 
@@ -1167,6 +1538,140 @@ export async function _maPlexConnect(
     }
     popup?.close();
     toast('Connecting with Plex timed out. Try again.', 'error');
+    return false;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+  }
+}
+
+/**
+ * change your own sidebar weather, then redraw the row from what the server
+ * holds and let the sidebar pick it up without a reload. keepOpen leaves the
+ * panel open (a switch flipped inside it).
+ */
+async function _maWeatherCall(
+  path: string,
+  body: Record<string, unknown>,
+  done: (w: MaWeather) => string,
+  keepOpen = false,
+): Promise<boolean> {
+  let ok = false;
+  try {
+    const res = await fetch('/api/weather' + path, {
+      method: 'PUT',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = (await res.json().catch(() => ({}))) as MaWeather & {
+      success?: boolean;
+      error?: string;
+    };
+    if (!res.ok || data.success === false) {
+      toast(_maError(data as Record<string, unknown>, "Couldn't save the weather"), 'error');
+    } else {
+      ok = true;
+      if (!keepOpen) _ma.open = null;
+      _ma.weather = (await _maJson<MaWeather>('/api/weather')) || _ma.weather;
+      toast(done(_ma.weather || data), 'success');
+    }
+  } catch {
+    toast("Couldn't save the weather", 'error');
+  }
+  _maRender();
+  try {
+    void Promise.resolve(window.bootSidebarWeather?.()).catch(() => {});
+  } catch {
+    // the sidebar catches up on the next page load
+  }
+  return ok;
+}
+
+/** change where your plays scrobble, then redraw from what the server says */
+async function _maScrobbleCall(
+  url: string,
+  method: 'POST' | 'DELETE',
+  body: Record<string, unknown> | null,
+  done: string,
+): Promise<void> {
+  try {
+    const res = await fetch(url, {
+      method,
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!res.ok || data.success === false)
+      toast(_maError(data, "Couldn't change scrobbling"), 'error');
+    else toast(done, 'success');
+  } catch {
+    toast("Couldn't change scrobbling", 'error');
+  }
+  _ma.scrobbling = await _maJson<MaScrobbling>('/api/profiles/me/scrobbling');
+  _maRender();
+}
+
+const _MA_LASTFM_POLL_MS = 2000;
+const _MA_LASTFM_GIVE_UP_MS = 5 * 60 * 1000;
+
+/**
+ * sign in to last.fm for scrobbling: last.fm's page in a popup (opened
+ * straight from the click so a blocker lets it through), then wait until
+ * the callback has saved the session
+ */
+export async function _maLastfmScrobbleSignIn(
+  button: HTMLElement | null,
+  openPopup: () => Window | null = () =>
+    window.open('', 'soulsync-lastfm-connect', 'width=520,height=720'),
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<boolean> {
+  const btn = button instanceof HTMLButtonElement ? button : null;
+  const label = btn?.textContent || '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Waiting for Last.fm...';
+  }
+  const popup = openPopup();
+  try {
+    let start: { url?: string; error?: string } | null = null;
+    try {
+      const res = await fetch('/api/profiles/me/lastfm/scrobble/auth-url');
+      start = (await res.json()) as { url?: string; error?: string };
+    } catch {
+      start = null;
+    }
+    if (!start?.url) {
+      popup?.close();
+      toast(start?.error || "Couldn't reach Last.fm. Try again in a moment.", 'error');
+      return false;
+    }
+    if (popup) popup.location.href = start.url;
+    else window.open(start.url, '_blank', 'noopener');
+    const until = Date.now() + _MA_LASTFM_GIVE_UP_MS;
+    while (Date.now() < until) {
+      await sleep(_MA_LASTFM_POLL_MS);
+      const sc = await _maJson<MaScrobbling>('/api/profiles/me/scrobbling');
+      if (sc?.lastfm?.connected) {
+        popup?.close();
+        _ma.scrobbling = sc;
+        toast(`Scrobbling to ${sc.lastfm.user || 'Last.fm'}`, 'success');
+        _maRender();
+        return true;
+      }
+      if (popup?.closed) {
+        // closed without finishing: one last look, then stop
+        const last = await _maJson<MaScrobbling>('/api/profiles/me/scrobbling');
+        _ma.scrobbling = last || _ma.scrobbling;
+        _maRender();
+        if (last?.lastfm?.connected) return true;
+        toast('Signing in to Last.fm was cancelled', 'info');
+        return false;
+      }
+    }
+    popup?.close();
+    toast('Signing in to Last.fm timed out. Try again.', 'error');
     return false;
   } finally {
     if (btn) {

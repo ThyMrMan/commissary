@@ -31,6 +31,10 @@ export interface LibraryFile {
   audio_channels: number | null;
   dynamic_range: string | null;
   atmos: boolean;
+  /** the file's audio languages ('ja', 'en'); null until soulsync has read them */
+  audio_languages?: string[] | null;
+  /** its embedded subtitle tracks' languages, same shape */
+  subtitle_languages?: string[] | null;
   release_source: string | null;
   runtime_seconds: number | null;
   added_at: string | null;
@@ -44,6 +48,33 @@ export interface LibraryFile {
   naming?: { expected?: string; expected_name?: string; conforms: boolean } | null;
   best?: boolean;
   below_cutoff?: boolean;
+  /** the download that landed this file; absent for one soulsync didn't fetch */
+  source?: FileSource;
+}
+
+export interface FileSource {
+  release: string | null;
+  via: string | null;
+  indexer: string | null;
+  at: string | null;
+}
+
+/** copies beyond the best one of each movie or episode */
+export interface ExtraCopies {
+  titles: number;
+  files: number;
+  size_bytes: number;
+}
+
+export interface ShowFolder {
+  path: string | null;
+  files: number;
+  size_bytes?: number;
+  /** the drive or share the folder is on */
+  root?: string | null;
+  name?: string;
+  /** the fullest folder: where the rest would be brought */
+  main?: boolean;
 }
 
 export interface Identity {
@@ -83,7 +114,10 @@ export interface MovieLibrary {
   };
   quality: QualityBlock;
   copies: { count: number; roots: string[]; spans_drives: boolean; same_resolution: boolean };
+  extra_copies?: ExtraCopies;
   files: LibraryFile[];
+  /** the padlock: automation leaves this title and its files alone */
+  locked?: boolean;
   recycle: boolean;
   can_manage: boolean;
 }
@@ -97,15 +131,24 @@ export interface LibraryEpisode {
   monitored: boolean;
   watched: boolean;
   aired: boolean;
+  has_still?: boolean;
+  runtime_minutes?: number | null;
   files: LibraryFile[];
 }
 
 export interface LibrarySeason {
+  /** the season's own row, for its poster; absent on a show with no season rows */
+  id?: number | null;
+  has_poster?: boolean;
+  extra_copies?: ExtraCopies;
   season_number: number;
   title: string;
   owned: number;
   total: number;
+  /** aired, no file and monitored: what SoulSync hunts (#2177) */
   missing: number;
+  /** aired, no file, nobody hunting it */
+  missing_unmonitored?: number;
   upcoming: number;
   size_bytes: number;
   monitored: boolean;
@@ -123,21 +166,28 @@ export interface ShowLibrary {
   summary: {
     owned: number;
     total: number;
+    /** aired, no file and monitored: what SoulSync hunts (#2177) */
     missing: number;
+    /** aired, no file, nobody hunting it */
+    missing_unmonitored?: number;
     upcoming: number;
     specials_owned: number;
     files: number;
     size_bytes: number;
     res_mix: { label: string; count: number }[];
     roots: string[];
-    folders: { path: string | null; files: number }[];
+    folders: ShowFolder[];
+    seasons?: number;
     watched_episodes: number;
     series_type: string | null;
     monitored: boolean;
   };
   quality: QualityBlock;
+  extra_copies?: ExtraCopies;
   seasons: LibrarySeason[];
   detail_season: number | null;
+  /** the padlock: automation leaves this title and its files alone */
+  locked?: boolean;
   recycle: boolean;
   can_manage: boolean;
 }
@@ -150,4 +200,62 @@ export interface MatchCandidate {
   year: number | null;
   overview: string;
   poster_url: string | null;
+}
+
+/* ── the page's own episode list (video-detail.js hands these over) ───────── */
+
+/** one episode as the page's payload carries it: a library row or a TMDB one */
+export interface PageEpisode {
+  id?: number | null;
+  episode_number: number;
+  title?: string | null;
+  overview?: string | null;
+  air_date?: string | null;
+  runtime_minutes?: number | null;
+  owned?: boolean;
+  watched?: boolean;
+  view_offset_ms?: number | null;
+  resolution?: string | null;
+  rating?: number | null;
+  has_still?: boolean;
+  still_url?: string | null;
+  added_at?: string | null;
+  versions?: number | null;
+}
+
+export interface PageSeason {
+  id?: number | null;
+  season_number: number;
+  episodes: PageEpisode[];
+  episode_monitored?: number | null;
+}
+
+/** a grab in flight for one episode, from the page's download poller */
+export interface EpisodeDownload {
+  status?: string;
+  progress?: number;
+}
+
+export interface EpisodeListProps {
+  show: {
+    /** the library row id, or the tmdb id on a preview page */
+    id: number;
+    title: string;
+    year?: number | null;
+    posterUrl?: string | null;
+    tmdbId: number | null;
+    /** a title in the library, or a TMDB preview of one that is not */
+    source: 'library' | 'tmdb';
+  };
+  season: PageSeason;
+  missingOnly: boolean;
+  nextUp: { season_number: number; episode_number: number } | null;
+  /** this profile may grab and wishlist */
+  canDownload: boolean;
+  /** the grab engine is loaded */
+  canGrab: boolean;
+  /** live grabs, keyed "season_episode" */
+  downloads: Record<string, EpisodeDownload>;
+  /** grabs that finished while the page was open, same keys */
+  finished: Record<string, unknown>;
 }

@@ -31,10 +31,12 @@ _TYPED_ALBUM_CONVERTERS: Dict[str, Callable[[Dict[str, Any]], Album]] = {
 }
 
 __all__ = [
+    "get_album_artist_identity_for_source",
     "get_album_for_source",
     "get_album_tracks_for_source",
     "get_artist_album_tracks",
     "get_artist_albums_for_source",
+    "get_track_artist_identity_for_source",
     "resolve_album_reference",
 ]
 
@@ -55,6 +57,12 @@ def _extract_lookup_value(value: Any, *names: str, default: Any = None) -> Any:
 
 
 def _normalize_artist_name(value: Any) -> str:
+    """The single definition of the artist-name fold for this package.
+
+    `discography.py` carried a byte-identical copy; it imports this module
+    already, so the shared definition lives on THIS side of that edge. The
+    reverse direction is a circular import.
+    """
     return (value or '').strip().casefold()
 
 
@@ -192,6 +200,10 @@ def _normalize_track_artists(track_item: Any) -> List[str]:
 
 
 def _extract_album_track_items(album_data: Any, tracks_data: Any = None) -> List[Dict[str, Any]]:
+    # An explicitly fetched complete list wins over the album's embedded page.
+    supplied = _extract_track_items(tracks_data)
+    if supplied:
+        return supplied
     embedded_tracks = _extract_lookup_value(album_data, 'tracks', default=None)
     if isinstance(embedded_tracks, dict):
         items = embedded_tracks.get('items') or []
@@ -490,24 +502,21 @@ def _has_explicit_type_signal(album_data: Any) -> bool:
         v = album_data.get(key)
         if v is not None and str(v).strip().lower() in _EXPLICIT_TYPE_VALUES:
             return True
+    # apple classifies its own releases and says so in the name ('X - EP',
+    # no suffix for an album), so an itunes raw always carries the signal
+    raw = album_data.get('_raw_data')
+    for d in (album_data, raw if isinstance(raw, dict) else {}):
+        if d.get('collectionName') and d.get('wrapperType', 'collection') == 'collection':
+            return True
     return False
 
 
-def derive_album_type_from_count(track_count: Any) -> str:
-    """1-3 tracks → single, 4-6 → ep, more → album — the same inference the
-    iTunes converter has always used (iTunes doesn't tag types either).
-    Unknown count → album (never guess without a signal)."""
-    try:
-        tc = int(track_count or 0)
-    except (TypeError, ValueError):
-        tc = 0
-    if tc <= 0:
-        return 'album'
-    if tc <= 3:
-        return 'single'
-    if tc <= 6:
-        return 'ep'
-    return 'album'
+def derive_album_type_from_count(track_count: Any, total_ms: Any = None) -> str:
+    """single / ep / album by the store rule: 1-3 tracks under 30 minutes a
+    single, 4-6 under 30 an ep, anything else an album. runtime unknown:
+    count alone. unknown count: album (never guess without a signal)."""
+    from core.metadata.release_type import release_type_from_shape
+    return release_type_from_shape(track_count, total_ms)
 
 
 def _build_album_tracks_payload(
@@ -531,14 +540,20 @@ def _build_album_tracks_payload(
     # #1064: when the source carried no type signal, the builders defaulted the
     # type to a CONFIDENT 'album' — and by now we know the real track count, so
     # derive instead. Only fires on signal-less raws; explicit types are kept.
+    from core.metadata.release_type import tracklist_runtime_ms
+    _runtime = tracklist_runtime_ms(tracks, album_info.get('total_tracks') or len(tracks))
+    if _runtime and not album_info.get('duration_ms'):
+        # carried into the download's album context: $albumtype's store rule
+        album_info['duration_ms'] = _runtime
     if tracks and not _has_explicit_type_signal(album_data):
         if not album_info.get('total_tracks'):
             album_info['total_tracks'] = len(tracks)
         album_info['album_type'] = derive_album_type_from_count(
-            album_info.get('total_tracks') or len(tracks))
+            album_info.get('total_tracks') or len(tracks), _runtime)
 
     return {
         'success': bool(tracks),
+        'is_complete': bool(tracks) and len(tracks) >= int(album_info.get('total_tracks') or len(tracks)),
         'album': album_info,
         'tracks': tracks,
         'source': source,
@@ -593,6 +608,145 @@ def get_album_for_source(source: str, album_id: str, artist_name: str = '', albu
         return client.get_album(album_id)
     except Exception:
         return None
+
+
+def _full_artist_identity(
+    source: str, client: Any, provider_id: str, fallback_name: str,
+) -> Dict[str, Any]:
+    """Fetch the full artist record (image, genres) for an id we already
+    trust — a stub artist reference embedded in an album/track response only
+    carries id+name, not the picture/genre data a name search's result item
+    would (issues.md §16 Finding 1)."""
+    artist_raw = None
+    if client and hasattr(client, 'get_artist'):
+        try:
+            artist_raw = client.get_artist(provider_id)
+        except Exception as exc:
+            logger.debug("Could not fetch %s artist %s: %s", source, provider_id, exc)
+    name = str(
+        _extract_lookup_value(artist_raw, 'name', default='') or fallback_name or ''
+    ).strip()
+    image_url = _extract_lookup_value(
+        artist_raw, 'image_url', 'picture_xl', 'picture_big', 'picture',
+        'thumb_url', 'image',
+    ) if artist_raw else None
+    genres = _extract_lookup_value(artist_raw, 'genres', default=[]) if artist_raw else []
+    return {
+        'source': source,
+        'artist_id': provider_id,
+        'name': name or provider_id,
+        'image_url': image_url,
+        'genres': list(genres) if isinstance(genres, (list, tuple)) else [],
+    }
+
+
+def get_album_artist_identity_for_source(source: str, album_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve the artist embedded in an ALREADY-KNOWN album (by provider id).
+
+    Unlike :func:`resolve_artist_identity`, this never searches by name: the
+    caller already trusts ``album_id`` (a provider id already confirmed on a
+    catalog row, e.g. via a past import match), so the provider's own album
+    response is authoritative for who the artist is — Guide §2.5 ("starke IDs
+    schlagen Namensheuristiken"). Returns the same shape as
+    ``resolve_artist_identity``, or ``None`` when the album can't be fetched
+    or carries no artist id.
+    """
+    raw_album = get_album_for_source(source, album_id)
+    if not raw_album:
+        return None
+    info = _build_album_info(raw_album, album_id, source=source)
+    artist_provider_id = str(info.get('artist_id') or '').strip()
+    if not artist_provider_id:
+        return None
+    client = metadata_registry.get_client_for_source(source)
+    fallback_name = str(info.get('artist_name') or info.get('artist') or '')
+    return _full_artist_identity(source, client, artist_provider_id, fallback_name)
+
+
+def get_track_artist_identity_for_source(source: str, track_id: str) -> Optional[Dict[str, Any]]:
+    """Track-anchor sibling of :func:`get_album_artist_identity_for_source`.
+
+    Uses whichever single-track fetch the client exposes (``get_track_details``
+    on most sources, ``get_track`` on Tidal/Qobuz); a source with neither
+    method simply yields ``None`` — the caller tries its other anchors.
+    """
+    client = metadata_registry.get_client_for_source(source)
+    if not client:
+        return None
+    fetch = getattr(client, 'get_track_details', None) or getattr(client, 'get_track', None)
+    if not fetch:
+        return None
+    try:
+        raw_track = fetch(track_id)
+    except Exception as exc:
+        logger.debug("Could not fetch %s track %s: %s", source, track_id, exc)
+        return None
+    if not raw_track:
+        return None
+
+    artists = _extract_lookup_value(raw_track, 'artists', default=[]) or []
+    if isinstance(artists, dict):
+        artists = [artists]
+    primary = artists[0] if artists else {}
+    artist_provider_id = str(
+        _extract_lookup_value(primary, 'id', default='')
+        or _extract_lookup_value(raw_track, 'artist_id', default='')
+        or ''
+    ).strip()
+    if not artist_provider_id:
+        return None
+    fallback_name = str(
+        _extract_lookup_value(primary, 'name', default='')
+        or _extract_lookup_value(raw_track, 'artist_name', 'artist', default='')
+        or ''
+    )
+    return _full_artist_identity(source, client, artist_provider_id, fallback_name)
+
+
+def resolve_artist_identity(
+    artist_name: str,
+    *,
+    options: Optional[MetadataLookupOptions] = None,
+) -> Optional[Dict[str, Any]]:
+    """Resolve an artist NAME to a single provider identity.
+
+    Walks the source-priority chain; for each source it searches by name and
+    takes the strict ``_pick_best_artist_match`` result (exact name wins; the
+    §62.5 catalog-weight tiebreak; a ≥0.85 fuzzy at most; never an unrelated
+    popular artist). Returns the first source that yields a match as
+    ``{source, artist_id, name, image_url, genres}``, or ``None`` when no
+    provider models this exact name as one artist — the expected outcome for a
+    genuine collaboration string like "Ian Asher & Galantis".
+    """
+    name = str(artist_name or '').strip()
+    if not name:
+        return None
+    options = options or MetadataLookupOptions()
+    for source in _get_source_chain_for_lookup(options):
+        client = metadata_registry.get_client_for_source(source)
+        if not client:
+            continue
+        results = _search_artists_for_source(source, client, name, limit=5)
+        best = _pick_best_artist_match(results, name)
+        if best is None:
+            continue
+        provider_id = _extract_lookup_value(best, 'id', 'artist_id')
+        if not provider_id:
+            continue
+        genres = _extract_lookup_value(best, 'genres', default=[]) or []
+        return {
+            'source': source,
+            'artist_id': str(provider_id),
+            'name': str(
+                _extract_lookup_value(best, 'name', 'artist_name', 'title') or name
+            ),
+            'image_url': _extract_lookup_value(
+                best, 'image_url', 'picture_xl', 'picture_big', 'picture',
+                'thumb_url', 'image',
+            ),
+            'genres': list(genres) if isinstance(genres, (list, tuple)) else [],
+        }
+    return None
 
 
 def get_artist_albums_for_source(
@@ -680,11 +834,11 @@ def resolve_album_reference(
     try:
         from database.music_database import get_database
 
+        from core.library2.provider_ids import provider_id_sql
+
         database = get_database()
         with database._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("PRAGMA table_info(albums)")
-            album_columns = {row[1] for row in cursor.fetchall()}
 
             source_chain = list(metadata_registry.get_source_priority(preferred_source or metadata_registry.get_primary_source()))
             override = (preferred_source or '').strip().lower()
@@ -693,17 +847,20 @@ def resolve_album_reference(
 
             source_columns = _album_reference_source_columns()
 
+            # Each source's id, wherever the catalogue keeps it, under the name
+            # the reader below already looks for. No column probe: a provider
+            # without a column of its own resolves inside `external_ids`.
             select_columns = ["a.title", "ar.name as artist_name"]
-            for columns in source_columns.values():
-                for column in columns:
-                    if column in album_columns:
-                        select_columns.append(f"a.{column}")
+            for source, columns in source_columns.items():
+                expression = provider_id_sql(source, alias='a')
+                if expression and columns:
+                    select_columns.append(f"{expression} AS {columns[0]}")
 
             cursor.execute(
                 """
                 SELECT {select_columns}
-                FROM albums a
-                JOIN artists ar ON a.artist_id = ar.id
+                FROM lib2_albums a
+                JOIN lib2_artists ar ON ar.id = a.primary_artist_id
                 WHERE a.id = ?
                 """.format(select_columns=", ".join(select_columns)),
                 (album_id,),
@@ -796,6 +953,15 @@ def _served_album_name_acceptable(requested_name: str, album_data: Any) -> bool:
     return SequenceMatcher(None, a, b).ratio() >= 0.6
 
 
+def _needs_full_tracklist(album_data):
+    embedded = _extract_album_track_items(album_data)
+    total = _extract_lookup_value(album_data, 'total_tracks', 'track_count', default=0)
+    try:
+        return not embedded or len(embedded) < int(total or 0)
+    except (TypeError, ValueError):
+        return not embedded
+
+
 def get_artist_album_tracks(
     album_id: str,
     artist_name: str = '',
@@ -818,7 +984,7 @@ def get_artist_album_tracks(
             continue
 
         tracks_data = None
-        if not _extract_album_track_items(album_data):
+        if _needs_full_tracklist(album_data):
             tracks_data = get_album_tracks_for_source(source, album_id)
         payload = _build_album_tracks_payload(
             album_data,
@@ -864,7 +1030,7 @@ def get_artist_album_tracks(
                 continue
 
             tracks_data = None
-            if not _extract_album_track_items(album_data):
+            if _needs_full_tracklist(album_data):
                 tracks_data = get_album_tracks_for_source(source, resolved_album_id)
             payload = _build_album_tracks_payload(
                 album_data,

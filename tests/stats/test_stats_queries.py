@@ -31,67 +31,89 @@ def fix_url():
 _id_counter = {'n': 0}
 
 
-def _next_id(prefix):
+def _next_id():
+    """A legacy id, written on every seeded row and expected on none of them.
+
+    §50.4.4.13 read the id contract off the old artist-detail page, which
+    resolved a bare numeric id against the legacy table. That page is gone: the
+    route redirects `/artist-detail/library/<id>` into Library V2 as
+    `?artist=<id>`, and V2 reads a lib2 id (§50.4.4.22). The seeds keep a
+    legacy id precisely so a query that still hands one out fails here.
+    """
     _id_counter['n'] += 1
-    return f"{prefix}-{_id_counter['n']}"
+    return 1000 + _id_counter['n']
 
 
-def _seed_artist(db, name, thumb=None, lastfm_listeners=None, lastfm_playcount=None, soul_id=None):
-    aid = _next_id('art')
+def _lib2(db, sql, params=()):
     conn = db._get_connection()
     try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO artists (id, name, thumb_url, lastfm_listeners, lastfm_playcount, soul_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (aid, name, thumb, lastfm_listeners, lastfm_playcount, soul_id),
-        )
+        row_id = conn.execute(sql, params).lastrowid
         conn.commit()
-        return aid
+        return row_id
     finally:
         conn.close()
+
+
+def _seed_artist(db, name, thumb=None, lastfm_listeners=None, lastfm_playcount=None,
+                 soul_id=None, legacy_id=...):
+    from core.library2.importer import normalize_name
+
+    legacy = _next_id() if legacy_id is ... else legacy_id
+    enrichment = {}
+    if lastfm_listeners is not None or lastfm_playcount is not None:
+        enrichment['lastfm'] = {}
+        if lastfm_listeners is not None:
+            enrichment['lastfm']['listeners'] = lastfm_listeners
+        if lastfm_playcount is not None:
+            enrichment['lastfm']['playcount'] = lastfm_playcount
+    return _lib2(
+        db,
+        "INSERT INTO lib2_artists (name, name_key, sort_name, image_url, enrichment, "
+        "soul_id, legacy_artist_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, normalize_name(name), name, thumb, json.dumps(enrichment),
+         soul_id, legacy),
+    )
 
 
 def _seed_album(db, artist_id, title, thumb=None):
-    alb = _next_id('alb')
-    conn = db._get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO albums (id, artist_id, title, thumb_url) VALUES (?, ?, ?, ?)",
-            (alb, artist_id, title, thumb),
-        )
-        conn.commit()
-        return alb
-    finally:
-        conn.close()
+    return _lib2(
+        db,
+        "INSERT INTO lib2_albums (primary_artist_id, title, image_url, legacy_album_id) "
+        "VALUES (?, ?, ?, ?)",
+        (artist_id, title, thumb, _next_id()),
+    )
 
 
-def _seed_track(db, album_id, artist_id, title, file_path=None, bitrate=None, duration=None):
-    tid = _next_id('trk')
-    conn = db._get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO tracks (id, album_id, artist_id, title, file_path, bitrate, duration) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (tid, album_id, artist_id, title, file_path, bitrate, duration),
+def _seed_track(db, album_id, artist_id, title, file_path=None,
+                bitrate=None, duration=None):
+    track_id = _lib2(
+        db,
+        "INSERT INTO lib2_tracks (album_id, title, duration, legacy_track_id) "
+        "VALUES (?, ?, ?, ?)",
+        (album_id, title, duration, _next_id()),
+    )
+    if file_path is not None:
+        # The file half is a separate row in lib2 (ADR-03): a track's path and
+        # bitrate live on lib2_track_files, and "no file" is the absence of one.
+        _lib2(
+            db,
+            "INSERT INTO lib2_track_files (track_id, path, bitrate, is_primary) "
+            "VALUES (?, ?, ?, 1)",
+            (track_id, file_path, bitrate),
         )
-        conn.commit()
-        return tid
-    finally:
-        conn.close()
+    return track_id
 
 
 def _seed_history(db, title, artist, album, played_at, duration_ms=180000,
-                  server_source=None, db_track_id=None):
+                  server_source=None, db_track_id=None, lib2_track_id=None):
     conn = db._get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO listening_history (title, artist, album, played_at, duration_ms, "
-            "server_source, db_track_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (title, artist, album, played_at, duration_ms, server_source, db_track_id),
+            "server_source, db_track_id, lib2_track_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (title, artist, album, played_at, duration_ms, server_source,
+             db_track_id, lib2_track_id),
         )
         conn.commit()
     finally:
@@ -164,7 +186,7 @@ def test_get_recent_tracks_joins_album_art_through_db_track_id(db, fix_url):
     tid = _seed_track(db, alb, aid, "Money", file_path="/music/money.flac",
                       bitrate=1411, duration=383000)
     _seed_history(db, "Money", "Pink Floyd", "DSOTM", "2026-04-01 00:00:00",
-                  db_track_id=tid)
+                  lib2_track_id=tid)
     rows = queries.get_recent_tracks(db, limit=1, image_url_fixer=fix_url)
     assert rows[0]['image_url'] == "FIXED::local://thumb.jpg"
     assert rows[0]['artist_db_id'] == aid
@@ -235,8 +257,14 @@ def test_get_listening_events_caches_repeated_image_normalization(db):
     album_id = _seed_album(db, artist_id, "Album", thumb='/library/metadata/1/thumb/1')
     track_new = _seed_track(db, album_id, artist_id, "Repeat New")
     track_old = _seed_track(db, album_id, artist_id, "Repeat Old")
-    _seed_history(db, "Repeat New", "Artist", "Album", "2026-08-23 16:30:00", db_track_id=track_new)
-    _seed_history(db, "Repeat Old", "Artist", "Album", "2026-08-23 16:00:00", db_track_id=track_old)
+    # INT-02: the catalogue link is `lib2_track_id`. Seeding a native id into
+    # `db_track_id` (the media server's own id namespace) is the shape the bug
+    # had, and pinning it here is what let the chart detail read the wrong
+    # column for as long as it did.
+    _seed_history(db, "Repeat New", "Artist", "Album", "2026-08-23 16:30:00",
+                  lib2_track_id=track_new)
+    _seed_history(db, "Repeat Old", "Artist", "Album", "2026-08-23 16:00:00",
+                  lib2_track_id=track_old)
     calls = []
 
     def fixer(url):
@@ -342,7 +370,7 @@ def test_resolve_track_strips_whitespace(db, fix_url):
 # get_top_artists / get_top_albums / get_top_tracks — enrichment
 # ---------------------------------------------------------------------------
 
-def test_get_top_artists_enriches_with_artist_table_columns(db, fix_url, monkeypatch):
+def test_get_top_artists_enriches_from_the_native_catalogue(db, fix_url, monkeypatch):
     aid = _seed_artist(
         db, "Pink Floyd", thumb="local://pf.jpg",
         lastfm_listeners=5000000, lastfm_playcount=100000000, soul_id="soul-pf",
@@ -363,6 +391,68 @@ def test_get_top_artists_no_match_leaves_record_unenriched(db, fix_url, monkeypa
     monkeypatch.setattr(db, "get_top_artists", lambda tr, lim, profile_id=None: [{'name': 'Unknown', 'play_count': 1}])
     result = queries.get_top_artists(db, fix_url, time_range='all', limit=10)
     assert result == [{'name': 'Unknown', 'play_count': 1}]
+
+
+def test_get_top_artists_matches_on_the_normalized_name_key(db, fix_url, monkeypatch):
+    """lib2 indexes ``name_key``; ``LOWER(name)=LOWER(?)`` was a scan and — with
+    SQLite's ASCII-only ``lower()`` — missed every non-Latin name (iss29-D13)."""
+    aid = _seed_artist(db, "Björk", thumb="local://bjork.jpg")
+    monkeypatch.setattr(db, "get_top_artists",
+                        lambda tr, lim, profile_id=None: [{'name': 'BJÖRK', 'play_count': 3}])
+
+    result = queries.get_top_artists(db, fix_url, time_range='all', limit=10)
+    assert result[0]['id'] == aid
+
+
+def test_get_top_artists_links_a_native_artist_like_any_other(db, fix_url, monkeypatch):
+    """A row with no legacy twin used to get artwork and a null id, because the
+    id was the legacy one. The link goes to Library V2 now, which knows this
+    row — being native is no longer a reason to withhold it (§50.4.4.22)."""
+    aid = _seed_artist(db, "Native Only", thumb="local://native.jpg", legacy_id=None)
+    monkeypatch.setattr(db, "get_top_artists",
+                        lambda tr, lim, profile_id=None: [{'name': 'Native Only', 'play_count': 9}])
+
+    result = queries.get_top_artists(db, fix_url, time_range='all', limit=10)
+    assert result[0]['image_url'] == 'FIXED::local://native.jpg'
+    assert result[0]['id'] == aid
+
+
+def test_top_rows_never_hand_out_a_legacy_id(db, fix_url, monkeypatch):
+    """The one assertion that would have caught the drift: every id in this
+    payload is the id `/library?artist=` resolves, and a legacy id there opens
+    a different artist or none at all."""
+    aid = _seed_artist(db, "Pink Floyd")
+    alb = _seed_album(db, aid, "DSOTM", thumb="local://a.jpg")
+    _seed_track(db, alb, aid, "Time", file_path="/m/time.flac")
+    legacy_ids = set()
+    conn = db._get_connection()
+    try:
+        for table, column in (('lib2_artists', 'legacy_artist_id'),
+                              ('lib2_albums', 'legacy_album_id'),
+                              ('lib2_tracks', 'legacy_track_id')):
+            legacy_ids.update(
+                row[0] for row in conn.execute(f"SELECT {column} FROM {table}")
+                if row[0] is not None)
+    finally:
+        conn.close()
+    monkeypatch.setattr(db, "get_top_artists",
+                        lambda tr, lim, profile_id=None: [{'name': 'Pink Floyd', 'play_count': 1}])
+    monkeypatch.setattr(db, "get_top_albums",
+                        lambda tr, lim, profile_id=None: [{'name': 'DSOTM', 'play_count': 1}])
+    monkeypatch.setattr(db, "get_top_tracks",
+                        lambda tr, lim, profile_id=None: [{'name': 'Time', 'artist': 'Pink Floyd',
+                                          'play_count': 1}])
+
+    handed_out = set()
+    for row in queries.get_top_artists(db, fix_url, 'all', 10):
+        handed_out.add(row.get('id'))
+    for row in queries.get_top_albums(db, fix_url, 'all', 10):
+        handed_out.update((row.get('id'), row.get('artist_id')))
+    for row in queries.get_top_tracks(db, fix_url, 'all', 10):
+        handed_out.update((row.get('id'), row.get('artist_id')))
+
+    assert legacy_ids, 'the seeds must carry legacy ids for this to prove anything'
+    assert handed_out & legacy_ids == set()
 
 
 def test_get_top_albums_enriches_with_album_thumb(db, fix_url, monkeypatch):
@@ -502,6 +592,222 @@ def test_get_db_storage_delegates_to_db():
 
 
 # ---------------------------------------------------------------------------
+# Whole-library reports answer from their last result (review 5 perf)
+# ---------------------------------------------------------------------------
+
+class _ReportDB:
+    """a database whose report blocks until the test lets it finish."""
+
+    def __init__(self, path, value):
+        import threading
+        self.database_path = path
+        self.value = value
+        self.release = threading.Event()
+        self.calls = []
+
+    def _get_connection(self):
+        raise RuntimeError('no counter here')
+
+    def _slow(self):
+        import threading
+        self.calls.append(threading.current_thread().name)
+        assert self.release.wait(5)
+        return dict(self.value)
+
+    get_db_storage_stats = get_library_disk_usage = get_library_health = _slow
+
+
+def _wait_for(predicate):
+    import time as _time
+    for _ in range(500):
+        if predicate():
+            return
+        _time.sleep(0.01)
+    raise AssertionError('timed out')
+
+
+@pytest.mark.parametrize('fetch', ['get_db_storage', 'get_library_disk_usage', 'get_library_health'])
+def test_whole_library_report_never_runs_on_the_request(tmp_path, monkeypatch, fetch):
+    """db storage read every page of an 11 GB file on the request (11 s on the
+    300k copy), disk usage 9 s, health 3 s. a request now answers at once and
+    the read runs on its own thread; the next ask gets the result."""
+    import time as _time
+    from core import library_scope
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 0.05)
+    # no own libraries: asking would open (and first build) the default db
+    monkeypatch.setattr(library_scope, 'any_own_library_exists', lambda: False)
+    db = _ReportDB(str(tmp_path / 'a.db'), {'answer': 1})
+    started = _time.monotonic()
+    first = getattr(queries, fetch)(db)
+    assert _time.monotonic() - started < 2
+    assert first['refreshing'] is True
+    _wait_for(lambda: db.calls)
+    assert db.calls[0].startswith('stats-report-')
+    db.release.set()
+    _wait_for(lambda: getattr(queries, fetch)(db) == {'answer': 1})
+    # a fresh result is the plain payload, read once
+    assert getattr(queries, fetch)(db) == {'answer': 1}
+    assert len(db.calls) == 1
+
+
+def test_stale_report_answers_at_once_and_refreshes_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 2)
+    db = _ReportDB(str(tmp_path / 'b.db'), {'tables': ['old']})
+    db.release.set()
+    assert queries.get_db_storage(db) == {'tables': ['old']}
+    monkeypatch.setitem(queries.REPORT_MAX_AGE, 'db_storage', 0.000001)
+    db.release.clear()
+    db.value = {'tables': ['new']}
+    stale = [queries.get_db_storage(db) for _ in range(3)]
+    assert stale == [{'tables': ['old'], 'refreshing': True}] * 3
+    _wait_for(lambda: len(db.calls) == 2)
+    assert len(db.calls) == 2, 'three asks share one refresh'
+    db.release.set()
+    monkeypatch.setitem(queries.REPORT_MAX_AGE, 'db_storage', 600)
+    _wait_for(lambda: queries.get_db_storage(db) == {'tables': ['new']})
+
+
+def test_report_refreshes_when_the_library_files_change(db, monkeypatch):
+    """the file triggers bump files_version; a cached disk usage from before
+    a download is refreshed, not served for its whole max age."""
+    # a slow machine still has the first result inside the first ask
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 10)
+    # no gap: this checks that a change refreshes at all; the gap that stops
+    # an import from re-running it every poll has its own test (W3-TU-2)
+    monkeypatch.setattr(queries, 'REPORT_VERSION_GAP', 0)
+    calls = []
+    real = db.get_library_disk_usage
+
+    def counted():
+        calls.append(1)
+        return real()
+
+    monkeypatch.setattr(db, 'get_library_disk_usage', counted)
+    first = queries.get_library_disk_usage(db)
+    assert first['has_data'] is False and 'refreshing' not in first
+    with db._get_connection() as conn:
+        artist = conn.execute("INSERT INTO lib2_artists(name) VALUES('A')").lastrowid
+        album = conn.execute("INSERT INTO lib2_albums(primary_artist_id,title) VALUES(?,'X')",
+                             (artist,)).lastrowid
+        track = conn.execute("INSERT INTO lib2_tracks(album_id,title) VALUES(?,'t')", (album,)).lastrowid
+        conn.execute("INSERT INTO lib2_track_files(track_id,path,size) VALUES(?,'/m/t.flac',9)", (track,))
+        conn.commit()
+    _wait_for(lambda: queries.get_library_disk_usage(db).get('total_bytes') == 9)
+    assert len(calls) == 2
+
+
+class _CountingDB:
+    """a report that answers at once and counts its passes."""
+
+    def __init__(self, path, fail=False):
+        self.database_path = path
+        self.fail = fail
+        self.calls = 0
+
+    def get_library_disk_usage(self):
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError('disk report broke')
+        return {'total_bytes': 1, 'tracks_with_size': 1, 'tracks_without_size': 0,
+                'by_format': {}, 'has_data': True}
+
+
+def _settle():
+    _wait_for(lambda: not queries._report_jobs)
+
+
+def test_an_import_does_not_rerun_the_disk_report_every_poll(tmp_path, monkeypatch):
+    """review 5 W3-TU-2: every file an import writes bumps files_version, so
+    each 3 s poll found the result stale, ran the whole-library pass again and
+    answered refreshing, and the page polled for as long as the import ran."""
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 2)
+    version = {'n': 0}
+    monkeypatch.setattr(queries, '_files_version', lambda _db: version['n'])
+    db = _CountingDB(str(tmp_path / 'import.db'))
+    answers = []
+    for _poll in range(6):
+        answers.append(bool(queries.get_library_disk_usage(db).get('refreshing')))
+        _settle()
+        version['n'] += 1   # the import wrote a file before the next poll
+    assert answers == [False] * 6, answers
+    assert db.calls == 1
+
+
+def test_a_moved_counter_refreshes_once_the_gap_has_passed(tmp_path, monkeypatch):
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 2)
+    monkeypatch.setattr(queries, 'REPORT_VERSION_GAP', 0.05)
+    version = {'n': 0}
+    monkeypatch.setattr(queries, '_files_version', lambda _db: version['n'])
+    db = _CountingDB(str(tmp_path / 'gap.db'))
+    queries.get_library_disk_usage(db)
+    version['n'] = 1
+    import time as _time
+    _time.sleep(0.1)
+    assert queries.get_library_disk_usage(db)['refreshing'] is True
+    _settle()
+    assert db.calls == 2
+    # the new result carries the new counter: settled, no third pass
+    assert 'refreshing' not in queries.get_library_disk_usage(db)
+    assert db.calls == 2
+
+
+def test_a_report_that_keeps_failing_stops_the_polling(tmp_path, monkeypatch):
+    """review 5 W3-TU-2: a pass that raised stored nothing, so every poll
+    started another failing thread and the page said "measuring" forever."""
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 2)
+    monkeypatch.setattr(queries, '_files_version', lambda _db: 0)
+    db = _CountingDB(str(tmp_path / 'broken.db'), fail=True)
+    payloads = []
+    for _poll in range(5):
+        payloads.append(queries.get_library_disk_usage(db))
+        _settle()
+    assert db.calls == 1
+    assert all('refreshing' not in p for p in payloads), payloads
+    assert payloads[-1]['report_failed'] is True
+    # once the retry wait is over it tries again, and a success clears it
+    monkeypatch.setattr(queries, 'REPORT_RETRY_AFTER', 0)
+    db.fail = False
+    _wait_for(lambda: queries.get_library_disk_usage(db).get('has_data') is True)
+    assert 'report_failed' not in queries.get_library_disk_usage(db)
+
+
+def test_reports_keep_each_library_scope_apart(db, monkeypatch):
+    # a slow machine still has the first result inside the first ask
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 10)
+    from core import library_scope
+
+    with db._get_connection() as conn:
+        artist = conn.execute("INSERT INTO lib2_artists(name) VALUES('A')").lastrowid
+        album = conn.execute("INSERT INTO lib2_albums(primary_artist_id,title) VALUES(?,'X')",
+                             (artist,)).lastrowid
+        track = conn.execute("INSERT INTO lib2_tracks(album_id,title) VALUES(?,'t')", (album,)).lastrowid
+        conn.execute("INSERT INTO lib2_track_files(track_id,path,size,owner_profile_id)"
+                     " VALUES(?,'/m/t.flac',9,7)", (track,))
+        conn.commit()
+    monkeypatch.setattr(library_scope, 'any_own_library_exists', lambda: True)
+    with library_scope.library_scope(7):
+        assert queries.get_library_disk_usage(db)['tracks_with_size'] == 1
+    with library_scope.library_scope(8):
+        assert queries.get_library_disk_usage(db)['tracks_with_size'] == 0
+
+
+def test_first_health_ask_shows_the_workers_last_numbers(db, monkeypatch):
+    """the listening-stats worker stores a health snapshot; while the first
+    live result is worked out the route shows that, not an empty payload."""
+    import threading
+    monkeypatch.setattr(queries, 'REPORT_FIRST_WAIT', 0.05)
+    gate = threading.Event()
+    monkeypatch.setattr(db, 'get_library_health', lambda: gate.wait(5) and {'total_tracks': 2})
+    with db._get_connection() as conn:
+        conn.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('stats_cache_health', ?)",
+                     (json.dumps({'total_tracks': 1}),))
+        conn.commit()
+    assert queries.get_library_health(db) == {'total_tracks': 1, 'refreshing': True}
+    gate.set()
+    _wait_for(lambda: queries.get_library_health(db) == {'total_tracks': 2})
+
+
+# ---------------------------------------------------------------------------
 # Listening worker glue
 # ---------------------------------------------------------------------------
 
@@ -566,3 +872,35 @@ def test_trigger_listening_sync_swallows_worker_errors():
     # Counter not incremented because exception was raised before increment
     assert _BrokenWorker.stats['polls_completed'] == 0
 
+
+
+def test_resolve_track_finds_a_compilation_track_by_its_own_artist(db):
+    """INT-03, stats half: the local-playback resolution matched only the
+    album's primary artist, so a listening event that correctly named Muse
+    could not resolve a Muse track sitting on a Various Artists compilation —
+    the file was right there."""
+    va = _seed_artist(db, "Various Artists")
+    muse = _seed_artist(db, "Muse")
+    album_id = _seed_album(db, va, "Compilation")
+    track_id = _seed_track(db, album_id, va, "Uprising")
+    conn = db._get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO lib2_track_artists(track_id, artist_id, position)"
+            " VALUES(?,?,0)", (track_id, muse))
+        conn.execute(
+            "INSERT INTO lib2_track_files(track_id, path, is_primary, file_state)"
+            " VALUES(?, '/music/uprising.flac', 1, 'active')", (track_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    resolved = queries.resolve_track(db, None, "Uprising", "Muse")
+
+    assert resolved is not None
+    assert resolved["file_path"] == "/music/uprising.flac"
+
+    # The album artist stays a valid key.
+    assert queries.resolve_track(db, None, "Uprising", "Various Artists") is not None
+    # And an unrelated artist still does not match.
+    assert queries.resolve_track(db, None, "Uprising", "Def Leppard") is None

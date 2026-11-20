@@ -833,7 +833,7 @@ def downsample_hires_flac(final_path, context, enabled=None):
                 "-y", temp_path,
             ],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=300,
         )
 
@@ -993,7 +993,7 @@ def create_lossy_copy(final_path, settings=None):
             "-map_metadata", "0",
         ] + extra_args + ["-y", out_path]
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
 
         if result.returncode == 0:
             logger.info(f"[Lossy Copy] Created {quality_label} copy: {os.path.basename(out_path)}")
@@ -1052,9 +1052,13 @@ def create_lossy_copy(final_path, settings=None):
 # of the track (SoulSync even generates them) — imports used to move the audio
 # and strand the lyrics in the source folder (lilbob5769's report).
 _COMPANION_SIDECAR_EXTS = ('.lrc',)
+# a file already in the library: a same-stem .txt there is the plain lyrics
+# SoulSync writes when there are no synced ones (lyrics_client), not junk.
+# delete takes both along, a move has to as well
+LIBRARY_SIDECAR_EXTS = ('.lrc', '.txt')
 
 
-def move_companion_sidecars(src_audio, dst_audio) -> List[str]:
+def move_companion_sidecars(src_audio, dst_audio, exts=_COMPANION_SIDECAR_EXTS) -> List[str]:
     """Move same-stem companion sidecars along with their track, renamed to the
     destination stem. Called after the audio file itself has moved. Best-effort
     per sidecar — a lyrics problem must never fail the track import. Returns
@@ -1062,7 +1066,7 @@ def move_companion_sidecars(src_audio, dst_audio) -> List[str]:
     moved: List[str] = []
     src_stem, _ = os.path.splitext(str(src_audio))
     dst_stem, _ = os.path.splitext(str(dst_audio))
-    for ext in _COMPANION_SIDECAR_EXTS:
+    for ext in exts:
         for candidate in (src_stem + ext, src_stem + ext.upper()):
             if not os.path.isfile(candidate):
                 continue

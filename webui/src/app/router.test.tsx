@@ -7,6 +7,7 @@ import {
   type ShellProfileContext,
   type ShellPageId,
 } from '@/platform/shell/bridge';
+import { lastNavigationFrom } from '@/platform/shell/last-navigation';
 import { HttpResponse, http, server } from '@/test/msw';
 import { createTestQueryClient } from '@/test/query-client';
 import { createShellBridge } from '@/test/shell-bridge';
@@ -109,18 +110,18 @@ describe('createAppRouter', () => {
   });
 
   it('routes non-migrated paths through the legacy fallback handler', async () => {
-    // /settings, because /sync is React now (it was the example here until the
-    // sync flip, and /search before that). Any still-legacy path does.
+    // /hydrabase, because /settings is React now (SETTINGS_PORT.md step V4c;
+    // /sync and /search were the example before). Any still-legacy path does.
     window.SoulSyncWebShellBridge = createShellBridge();
 
     const queryClient = createTestQueryClient();
-    const history = createMemoryHistory({ initialEntries: ['/settings'] });
+    const history = createMemoryHistory({ initialEntries: ['/hydrabase'] });
     const router = createAppRouter({ history, queryClient });
 
     render(<AppRouterProvider router={router} queryClient={queryClient} />);
 
     await waitFor(() => {
-      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/settings');
+      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/hydrabase');
     });
   });
 
@@ -162,11 +163,31 @@ describe('createAppRouter', () => {
     });
   });
 
-  it('redirects the root route to the profile home page', async () => {
-    // A LEGACY home page, so the assertion is about the redirect reaching the
-    // legacy handler — sync is React now and would render in place instead.
+  it('keeps noting where navigations came from after a redirect', async () => {
+    // TanStack keeps the last redirect in its store, and onBeforeNavigate is
+    // skipped while one is there: the back button stopped seeing every page
+    // after the library's first header redirect
     window.SoulSyncWebShellBridge = createShellBridge({
       getProfileHomePage: vi.fn<() => ShellPageId>(() => 'settings'),
+    });
+    const queryClient = createTestQueryClient();
+    const history = createMemoryHistory({ initialEntries: ['/'] });
+    const router = createAppRouter({ history, queryClient });
+    render(<AppRouterProvider router={router} queryClient={queryClient} />);
+    await waitFor(() => expect(history.location.pathname).toBe('/settings'));
+
+    await router.navigate({ href: '/help' });
+    expect(lastNavigationFrom()?.pathname).toBe('/settings');
+    await router.navigate({ href: '/chat' });
+    expect(lastNavigationFrom()?.pathname).toBe('/help');
+  });
+
+  it('redirects the root route to the profile home page', async () => {
+    // A LEGACY home page, so the assertion is about the redirect reaching the
+    // legacy handler — sync and settings are React now and would render in
+    // place instead.
+    window.SoulSyncWebShellBridge = createShellBridge({
+      getProfileHomePage: vi.fn<() => ShellPageId>(() => 'hydrabase'),
     });
 
     const queryClient = createTestQueryClient();
@@ -176,10 +197,10 @@ describe('createAppRouter', () => {
     render(<AppRouterProvider router={router} queryClient={queryClient} />);
 
     await waitFor(() => {
-      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/settings');
+      expect(window.SoulSyncWebShellBridge?.activateLegacyPath).toHaveBeenCalledWith('/hydrabase');
     });
 
-    expect(history.location.pathname).toBe('/settings');
+    expect(history.location.pathname).toBe('/hydrabase');
   });
 });
 

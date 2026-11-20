@@ -106,8 +106,15 @@ def score_album_search_result(
     """Score a metadata-source ``search_albums`` hit against folder/tag inputs."""
     from core.imports.text_matching import album_similarity, artist_similarity
 
+    from core.text.title_match import numbers_conflict
+
     score = 0.0
     name = getattr(album_result, 'name', '') or ''
+    # the search for 'group therapy 701' lists 703 and 702 first. artist and
+    # track count alone still cleared the threshold, so a numbered release
+    # that isn't this one never is (#2134)
+    if numbers_conflict(target_album or '', name):
+        return 0.0
     score += album_similarity(target_album, name) * ALBUM_SEARCH_NAME_WEIGHT
 
     if target_artist:
@@ -285,8 +292,13 @@ def score_file_against_track(
     # ("<Album> <NN> <Title>" rips) and keep the better reading.
     from core.commissary.title_candidates import title_candidates
     track_name = track.get('name', '')
-    score += max(title_sim(title, track_name)
-                 for title in title_candidates(file_path, file_tags, target_album)) * TITLE_WEIGHT
+    titles = title_candidates(file_path, file_tags, target_album)
+    # another part or episode's file never fills this slot, whatever its
+    # position says: 699's intro landed in 696's intro slot by track 1 (#2134)
+    from core.text.title_match import numbers_conflict
+    if numbers_conflict(titles[0], track_name):
+        return 0.0
+    score += max(title_sim(title, track_name) for title in titles) * TITLE_WEIGHT
 
     # Artist similarity (ARTIST_WEIGHT). Partial credit when either side
     # lacks an artist tag so title-only pairs can still clear threshold.

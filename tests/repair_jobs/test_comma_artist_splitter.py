@@ -78,13 +78,46 @@ def _patch_clients(monkeypatch, mapping):
     monkeypatch.setattr(ms, 'get_client_for_source', lambda s: mapping.get(s))
 
 
+DUMMY, AR_C, AR_T = 1, 2, 3
+
+
+def _seed_artist(conn, name):
+    return conn.execute(
+        "INSERT INTO lib2_artists(name, sort_name) VALUES(?, ?)", (name, name)
+    ).lastrowid
+
+
+def _seed_album(conn, artist_id, title):
+    return conn.execute(
+        "INSERT INTO lib2_albums(primary_artist_id, title, album_type) "
+        "VALUES(?, ?, 'album')", (artist_id, title)
+    ).lastrowid
+
+
+def _seed_file(conn, album_id, title, path, artist_id=None):
+    track_id = conn.execute(
+        "INSERT INTO lib2_tracks(album_id, title) VALUES(?, ?)",
+        (album_id, title),
+    ).lastrowid
+    conn.execute(
+        "INSERT INTO lib2_track_files(track_id, path, file_state, is_primary) "
+        "VALUES(?, ?, 'active', 1)", (track_id, path),
+    )
+    if artist_id is not None:
+        conn.execute(
+            "INSERT INTO lib2_track_artists(track_id, artist_id, role, position) "
+            "VALUES(?, ?, 'primary', 0)", (track_id, artist_id),
+        )
+    return track_id
+
+
 def _db(tmp_path):
     d = MusicDatabase(str(tmp_path / "music.db"))
     with d._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('DUMMY', 'Camellia, Toby Fox', 'test')")
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('AR_C', 'Camellia', 'test')")
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('AR_T', 'Toby Fox', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'Deltarune', 'DUMMY', 'test')")
+        _seed_artist(conn, 'Camellia, Toby Fox')
+        _seed_artist(conn, 'Camellia')
+        _seed_artist(conn, 'Toby Fox')
+        _seed_album(conn, DUMMY, 'Deltarune')
         conn.commit()
     return d
 
@@ -97,9 +130,7 @@ def _add_track(db, tid, artist_id, path, title='Flower Man', file_artist=None):
         os.makedirs(os.path.dirname(file_path), exist_ok=True)
         _make_flac(path, tags={'artist': file_artist, 'title': title})
     with db._get_connection() as conn:
-        conn.execute(
-            "INSERT INTO tracks (id, title, file_path, artist_id, album_id, server_source) "
-            "VALUES (?, ?, ?, ?, 'AL1', 'test')", (tid, title, path, artist_id))
+        _seed_file(conn, 1, title, path, artist_id)
         conn.commit()
 
 
@@ -139,12 +170,12 @@ def test_normalize_artist_name():
 def test_whitelist_matches_commas_without_spaces(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('TY', 'Tyler,The Creator', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'Igor', 'TY', 'test')")
+        artist = _seed_artist(conn, 'Tyler,The Creator')
+        _seed_album(conn, artist, 'Igor')
         conn.commit()
     # Create real FLAC with whitelisted artist (no space after comma)
     file_path = str(tmp_path / 'ty.flac')
-    _add_track(db, 'T1', 'TY', file_path, file_artist='Tyler,The Creator')
+    _add_track(db, 'T1', artist, file_path, file_artist='Tyler,The Creator')
     client = _FakeArtistClient()
     result, findings = _run(db, monkeypatch, {'deezer': client}, tmp_path=tmp_path)
     assert findings == []
@@ -157,7 +188,7 @@ def test_flags_split_when_parts_in_library_and_api_says_not_real(tmp_path, monke
     db = _db(tmp_path)
     # Create actual FLAC file with multi-artist tag
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     result, findings = _run(db, monkeypatch, {'deezer': _FakeArtistClient()}, tmp_path=tmp_path)
     assert result.findings_created == 1
     f = findings[0]
@@ -177,12 +208,12 @@ def test_flags_split_when_parts_in_library_and_api_says_not_real(tmp_path, monke
 def test_whitelisted_comma_artist_never_flagged_and_no_api_spent(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('TY', 'Tyler, The Creator', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'Igor', 'TY', 'test')")
+        artist = _seed_artist(conn, 'Tyler, The Creator')
+        _seed_album(conn, artist, 'Igor')
         conn.commit()
     # Create real FLAC with whitelisted artist
     file_path = str(tmp_path / 'ty.flac')
-    _add_track(db, 'T1', 'TY', file_path, file_artist='Tyler, The Creator')
+    _add_track(db, 'T1', artist, file_path, file_artist='Tyler, The Creator')
     client = _FakeArtistClient()
     result, findings = _run(db, monkeypatch, {'deezer': client}, tmp_path=tmp_path)
     assert result.findings_created == 0
@@ -193,7 +224,7 @@ def test_whitelisted_comma_artist_never_flagged_and_no_api_spent(tmp_path, monke
 def test_full_string_found_on_api_is_skipped(tmp_path, monkeypatch):
     db = _db(tmp_path)
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     client = _FakeArtistClient(known=['Camellia, Toby Fox'])
     result, findings = _run(db, monkeypatch, {'deezer': client}, tmp_path=tmp_path)
     assert result.findings_created == 0
@@ -203,7 +234,7 @@ def test_full_string_found_on_api_is_skipped(tmp_path, monkeypatch):
 def test_no_api_reachable_is_failsafe_skip(tmp_path, monkeypatch):
     db = _db(tmp_path)
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     result, findings = _run(db, monkeypatch, {'deezer': _RaisingClient(),
                                               'itunes': None, 'spotify': None}, tmp_path=tmp_path)
     assert result.findings_created == 0
@@ -213,12 +244,12 @@ def test_no_api_reachable_is_failsafe_skip(tmp_path, monkeypatch):
 def test_unresolvable_part_kills_the_finding(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('D2', 'Nobody Knows', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'X', 'D2', 'test')")
+        artist = _seed_artist(conn, 'Nobody Knows, This Guy')
+        _seed_album(conn, artist, 'X')
         conn.commit()
     # Create file with unresolvable part "This Guy"
     file_path = str(tmp_path / 'y.flac')
-    _add_track(db, 'T1', 'D2', file_path, file_artist='Nobody Knows, This Guy')
+    _add_track(db, 'T1', artist, file_path, file_artist='Nobody Knows, This Guy')
     result, findings = _run(db, monkeypatch, {'deezer': _FakeArtistClient()}, tmp_path=tmp_path)
     assert result.findings_created == 0
     assert findings == []
@@ -227,12 +258,12 @@ def test_unresolvable_part_kills_the_finding(tmp_path, monkeypatch):
 def test_parts_can_resolve_via_api_when_not_in_library(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('D3', 'juno', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'All Nighter', 'D3', 'test')")
+        artist = _seed_artist(conn, 'juno')
+        _seed_album(conn, artist, 'All Nighter')
         conn.commit()
     # Create file where both parts can be resolved (one in library, one via API)
     file_path = str(tmp_path / 'b.flac')
-    _add_track(db, 'T1', 'D3', file_path, file_artist='juno, dltzk')
+    _add_track(db, 'T1', artist, file_path, file_artist='juno, dltzk')
     client = _FakeArtistClient(known=['dltzk'])
     result, findings = _run(db, monkeypatch, {'deezer': client}, tmp_path=tmp_path)
     assert result.findings_created == 1
@@ -248,7 +279,7 @@ def test_scan_skips_a_file_already_split_without_an_api_call(tmp_path, monkeypat
     f = str(tmp_path / "a.flac")
     _make_flac(f, {'artist': 'Camellia; Toby Fox', 'artists': ['Camellia', 'Toby Fox'],
                    'title': 'Flower Man'})
-    _add_track(db, 'T1', 'DUMMY', f)
+    _add_track(db, 'T1', DUMMY, f)
     client = _FakeArtistClient(known=[])
     result, findings = _run(db, monkeypatch, {'spotify': client}, tmp_path)
     assert findings == []
@@ -261,7 +292,7 @@ def test_scan_still_flags_a_display_only_tag(tmp_path, monkeypatch):
     db = _db(tmp_path)
     f = str(tmp_path / "a.flac")
     _make_flac(f, {'artist': 'Camellia; Toby Fox', 'title': 'Flower Man'})
-    _add_track(db, 'T1', 'DUMMY', f)
+    _add_track(db, 'T1', DUMMY, f)
     result, findings = _run(db, monkeypatch, {'spotify': _FakeArtistClient(known=[])}, tmp_path)
     assert len(findings) == 1
     assert findings[0]['details']['split_artists'] == ['Camellia', 'Toby Fox']
@@ -270,7 +301,7 @@ def test_scan_still_flags_a_display_only_tag(tmp_path, monkeypatch):
 def test_dedup_counts_when_create_finding_returns_false(tmp_path, monkeypatch):
     db = _db(tmp_path)
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     _patch_clients(monkeypatch, {'deezer': _FakeArtistClient()})
     ctx = JobContext(db=db, transfer_folder=str(tmp_path), config_manager=None,
                      create_finding=lambda **kw: False)
@@ -284,7 +315,7 @@ def test_live_mode_applies_verified_splits_without_creating_findings(tmp_path, m
 
     db = _db(tmp_path)
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     _patch_clients(monkeypatch, {'deezer': _FakeArtistClient()})
     job = CommaArtistSplitterJob()
     monkeypatch.setattr(job, '_get_settings', lambda context: {
@@ -305,7 +336,7 @@ def test_live_mode_applies_verified_splits_without_creating_findings(tmp_path, m
         row = conn.execute("""
             SELECT status, user_action FROM repair_findings
             WHERE job_id = 'comma_artist_splitter' AND finding_type = 'comma_artist_split'
-              AND entity_id = 'Camellia, Toby Fox'
+              AND entity_id = 'lib2:1'
             LIMIT 1
         """).fetchone()
     assert row is not None
@@ -316,7 +347,7 @@ def test_live_mode_applies_verified_splits_without_creating_findings(tmp_path, m
 def test_separator_toggles_can_disable_comma_splitting(tmp_path, monkeypatch):
     db = _db(tmp_path)
     file_path = str(tmp_path / 'a.flac')
-    _add_track(db, 'T1', 'DUMMY', file_path, file_artist='Camellia, Toby Fox')
+    _add_track(db, 'T1', DUMMY, file_path, file_artist='Camellia, Toby Fox')
     _patch_clients(monkeypatch, {'deezer': _FakeArtistClient()})
     job = CommaArtistSplitterJob()
     monkeypatch.setattr(job, '_get_settings', lambda context: {
@@ -335,11 +366,11 @@ def test_separator_toggles_can_disable_comma_splitting(tmp_path, monkeypatch):
 def test_band_name_whitelist_still_wins_when_ampersand_enabled(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, server_source) VALUES ('EWF', 'Earth, Wind & Fire', 'test')")
-        conn.execute("INSERT INTO albums (id, title, artist_id, server_source) VALUES ('AL1', 'Greatest', 'EWF', 'test')")
+        artist = _seed_artist(conn, 'Earth, Wind & Fire')
+        _seed_album(conn, artist, 'Greatest')
         conn.commit()
     file_path = str(tmp_path / 'ewf.flac')
-    _add_track(db, 'T1', 'EWF', file_path, file_artist='Earth, Wind & Fire')
+    _add_track(db, 'T1', artist, file_path, file_artist='Earth, Wind & Fire')
     client = _FakeArtistClient()
     result, findings = _run(db, monkeypatch, {'deezer': client}, tmp_path=tmp_path)
     assert result.findings_created == 0
@@ -381,9 +412,10 @@ def test_fix_splits_flac_artist_and_albumartist(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': 'Camellia, Toby Fox', 'albumartist': 'Camellia, Toby Fox'})
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split(
+        'artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is True
     assert result['action'] == 'artists_split'
 
@@ -398,9 +430,10 @@ def test_fix_leaves_unrelated_albumartist_alone(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': 'Camellia, Toby Fox', 'albumartist': 'Various Artists'})
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split(
+        'artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is True
     assert FLAC(str(f))['albumartist'] == ['Various Artists']
 
@@ -410,9 +443,10 @@ def test_fix_stale_tag_guard_skips_edited_file(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': 'Camellia'})     # user already fixed it by hand
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split(
+        'artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is False
     assert 'no longer carry' in result['error']
     assert FLAC(str(f))['artist'] == ['Camellia']   # untouched
@@ -425,10 +459,10 @@ def test_fix_already_multivalue_resolves_without_touching_the_file(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': ['Camellia', 'Toby Fox']})   # already split
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
     before = f.read_bytes()
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is True
     assert result['action'] == 'artists_split'
     assert result['fixed'] == 0
@@ -443,9 +477,10 @@ def test_fix_stale_result_carries_the_retire_flag(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': 'Camellia'})
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split(
+        'artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is False
     assert result.get('stale') is True
 
@@ -477,9 +512,9 @@ def test_zero_padded_id3_tpe1_is_fixed_not_stale(tmp_path):
     f = tmp_path / "a.mp3"
     _make_mp3(f, ['Camellia, Toby Fox', ''])
     assert ID3(str(f))['TPE1'].text == ['Camellia, Toby Fox', ''], 'fixture must reproduce the padding'
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
 
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert result['success'] is True, result
     assert result['fixed'] == 1
 
@@ -495,12 +530,12 @@ def test_fix_is_idempotent_on_its_own_output(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.mp3"
     _make_mp3(f, ['Camellia, Toby Fox'])
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
     w = _worker(db, tmp_path)
-    assert w._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))['fixed'] == 1
+    assert w._fix_comma_artist_split('artist', f'lib2:{DUMMY}', None, _details(str(f)))['fixed'] == 1
     after_first = f.read_bytes()
 
-    second = w._fix_comma_artist_split('artist', 'DUMMY', None, _details(str(f)))
+    second = w._fix_comma_artist_split('artist', f'lib2:{DUMMY}', None, _details(str(f)))
     assert second['success'] is True
     assert second['fixed'] == 0
     assert f.read_bytes() == after_first
@@ -519,14 +554,15 @@ def test_fix_no_tracks_resolves_as_already_gone(tmp_path):
     the fix on dev restored the behaviour the name promises.
     """
     db = _db(tmp_path)
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None, _details())
+    result = _worker(db, tmp_path)._fix_comma_artist_split(
+        'artist', f'lib2:{DUMMY}', None, _details())
     assert result['success'] is True
     assert result['action'] == 'already_gone'
 
 
 def test_fix_rejects_finding_without_parts(tmp_path):
     db = _db(tmp_path)
-    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', 'DUMMY', None,
+    result = _worker(db, tmp_path)._fix_comma_artist_split('artist', f'lib2:{DUMMY}', None,
                                                            {'combined_name': 'X'})
     assert result['success'] is False
 
@@ -538,8 +574,10 @@ def test_bulk_fixable_set_matches_fix_handlers(tmp_path):
     replaygain_retag / comma_artist_split in Fix All. Derivation pins them in."""
     db = MusicDatabase(str(tmp_path / "m.db"))
     handlers = _worker(db, tmp_path)._fix_handlers()
+    # duplicate_tracks belongs to a deliberately retired legacy job; native
+    # catalogue construction prevents that duplicate-row class.
     for ft in ('genre_cleanup', 'replaygain_retag', 'comma_artist_split',
-               'dead_file', 'duplicate_tracks'):
+               'dead_file'):
         assert ft in handlers
 
 
@@ -548,21 +586,26 @@ def test_bulk_fix_now_fixes_genre_cleanup_findings(tmp_path):
     fixed by bulk-fix (it used to be silently filtered out → 'Fixed 0')."""
     db = MusicDatabase(str(tmp_path / "m.db"))
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name, genres, server_source) VALUES "
-                     "('AR1', 'Dirty', ?, 'test')", (json.dumps(['Rock', 'junk']),))
+        artist_id = conn.execute(
+            "INSERT INTO lib2_artists(name, genres) VALUES('Dirty', ?)",
+            (json.dumps(['Rock', 'junk']),),
+        ).lastrowid
         conn.execute(
             "INSERT INTO repair_findings (job_id, finding_type, severity, status, "
             "entity_type, entity_id, title, details_json) VALUES "
-            "('genre_cleanup', 'genre_cleanup', 'info', 'pending', 'artist', 'AR1', "
+            "('genre_cleanup', 'genre_cleanup', 'info', 'pending', 'artist', ?, "
             "'Off-whitelist genres: Dirty', ?)",
-            (json.dumps({'kept_genres': ['Rock'], 'removed_genres': ['junk']}),))
+            (f'lib2:{artist_id}',
+             json.dumps({'kept_genres': ['Rock'], 'removed_genres': ['junk']})))
         conn.commit()
 
     result = _worker(db, tmp_path).bulk_fix_findings(job_id='genre_cleanup')
     assert result.get('fixed') == 1
 
     with db._get_connection() as conn:
-        genres = conn.execute("SELECT genres FROM artists WHERE id = 'AR1'").fetchone()[0]
+        genres = conn.execute(
+            "SELECT genres FROM lib2_artists WHERE id=?", (artist_id,)
+        ).fetchone()[0]
         status = conn.execute("SELECT status FROM repair_findings").fetchone()[0]
     assert json.loads(genres) == ['Rock']
     assert status == 'resolved'
@@ -573,14 +616,14 @@ def test_bulk_fix_comma_artist_split_end_to_end(tmp_path):
     db = _db(tmp_path)
     f = tmp_path / "a.flac"
     _make_flac(f, {'artist': 'Camellia, Toby Fox'})
-    _add_track(db, 'T1', 'DUMMY', str(f))
+    _add_track(db, 'T1', DUMMY, str(f))
     with db._get_connection() as conn:
         conn.execute(
             "INSERT INTO repair_findings (job_id, finding_type, severity, status, "
             "entity_type, entity_id, title, details_json) VALUES "
             "('comma_artist_splitter', 'comma_artist_split', 'warning', 'pending', "
-            "'artist', 'DUMMY', 'Combined artist: Camellia, Toby Fox', ?)",
-            (json.dumps(_details(str(f))),))
+            "'artist', ?, 'Combined artist: Camellia, Toby Fox', ?)",
+            (f'lib2:{DUMMY}', json.dumps(_details(str(f)))))
         conn.commit()
 
     result = _worker(db, tmp_path).bulk_fix_findings(job_id='comma_artist_splitter')
@@ -605,3 +648,291 @@ def test_the_findings_ui_carries_the_contract():
     assert "comma_artist_split: 'Split Artists'" in core     # fix button
     assert "artists_split: 'Artists Split'" in core          # resolved badge
     assert "case 'comma_artist_split':" in detail            # detail renderer
+
+
+def test_an_auto_applied_split_resolves_only_its_own_combined_credit(tmp_path):
+    """third #1062 review G11-6: "A, B" and "A, C" are both filed on artist
+    A's id. recording "A, B" as applied resolved the pending "A, C" review"""
+    import json
+    db = _db(tmp_path)
+    conn = db._get_connection()
+    for name in ("A, B", "A, C"):
+        conn.execute(
+            "INSERT INTO repair_findings(job_id, finding_type, severity, status, entity_type,"
+            " entity_id, title, description, details_json) VALUES"
+            " ('comma_artist_splitter','comma_artist_split','info','pending','artist','lib2:1',?, '', ?)",
+            (name, json.dumps({"combined_name": name})))
+    conn.commit()
+    conn.close()
+    CommaArtistSplitterJob()._record_resolved_finding(
+        _ctx(db, []), "A, B", {}, {"combined_name": "A, B"}, 3, "artist", "lib2:1")
+    conn = db._get_connection()
+    rows = dict(conn.execute("SELECT title, status FROM repair_findings").fetchall())
+    conn.close()
+    assert rows == {"A, B": "resolved", "A, C": "pending"}
+
+
+# ── review 5 R5-I-4: every file is read, not the same first window ──────────
+
+def _plain_library(tmp_path, count):
+    db = MusicDatabase(str(tmp_path / "walk.db"))
+    paths = []
+    with db._get_connection() as conn:
+        artist = _seed_artist(conn, 'Solo')
+        album = _seed_album(conn, artist, 'Album')
+        for n in range(count):
+            p = str(tmp_path / f'{n:05d}.mp3')
+            Path(p).write_bytes(b'')
+            _seed_file(conn, album, f'Song {n}', p, artist)
+            paths.append(p)
+        conn.commit()
+    return db, paths
+
+
+def _opened(monkeypatch):
+    import mutagen
+    opened = []
+    monkeypatch.setattr(mutagen, 'File', lambda path, *a, **k: opened.append(path))
+    return opened
+
+
+def test_one_run_reads_files_past_the_first_page(tmp_path, monkeypatch):
+    import core.repair_jobs.comma_artist_splitter as cas
+    monkeypatch.setattr(cas, '_FILE_PAGE', 4, raising=False)
+    # the old window was SCAN_ARTIST_LIMIT * 10 files: 10 here
+    monkeypatch.setattr(cas, 'SCAN_ARTIST_LIMIT', 1)
+    db, paths = _plain_library(tmp_path, 15)
+    opened = _opened(monkeypatch)
+    _run(db, monkeypatch, {})
+    assert opened == paths
+
+
+def test_a_capped_run_resumes_after_the_last_file_it_read(tmp_path, monkeypatch):
+    import core.repair_jobs.comma_artist_splitter as cas
+    monkeypatch.setattr(cas, '_FILE_PAGE', 4)
+    monkeypatch.setattr(cas, 'SCAN_ARTIST_LIMIT', 1)
+    db, paths = _plain_library(tmp_path, 10)
+    opened = _opened(monkeypatch)
+    # file 3 carries a splittable credit, so the run hits its one-finding cap
+    real = {paths[3]: 'Camellia, Toby Fox'}
+    monkeypatch.setattr(CommaArtistSplitterJob, '_get_artist_tag',
+                        lambda self, audio: real.get(opened[-1]))
+    import mutagen
+    monkeypatch.setattr(mutagen, 'File', lambda path, *a, **k: (
+        opened.append(path), type('A', (), {'tags': {}, 'get': lambda s, k, d=None: d})())[1])
+    monkeypatch.setattr(cas, 'file_already_split', lambda audio, parts: False)
+    monkeypatch.setattr(CommaArtistSplitterJob, '_full_string_is_real_artist',
+                        lambda self, *a, **k: (False, ['deezer']))
+    monkeypatch.setattr(CommaArtistSplitterJob, '_resolve_parts',
+                        lambda self, *a, **k: [{'name': 'Camellia'}, {'name': 'Toby Fox'}])
+    result, findings = _run(db, monkeypatch, {})
+    # stops once it has its one finding
+    assert opened == paths[:4] and len(findings) == 1
+    opened.clear()
+    _run(db, monkeypatch, {})
+    # carries on after file 3 and wraps round to the top
+    assert opened[:6] == paths[4:] and opened[6] == paths[0]
+
+
+# ── #2150: a name that is one artist is never split, and the user corrects ──
+
+KDA_CREDIT = 'K/DA; League Of Legends; Mimi Webb; Sophie Powers'
+
+
+class _Cfg:
+    """config manager stand-in: dotted get/set over one dict."""
+
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key, value):
+        self.data[key] = value
+
+
+def _kda_db(tmp_path, identified=False):
+    db = MusicDatabase(str(tmp_path / "kda.db"))
+    with db._get_connection() as conn:
+        combined = _seed_artist(conn, KDA_CREDIT)
+        # ghost rows an earlier blind split made, exactly as in a live library
+        for name in ('K', 'DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers'):
+            _seed_artist(conn, name)
+        if identified:
+            conn.execute("INSERT INTO lib2_artists(name, sort_name, spotify_id) "
+                         "VALUES('K/DA', 'K/DA', '4gOc8TsQed9eqnqJct2c5v')")
+        _seed_album(conn, combined, 'Kda Album')
+        conn.commit()
+    return db, combined
+
+
+def _kda_file(db, tmp_path, combined):
+    path = str(tmp_path / 'kda.flac')
+    _make_flac(path, tags={'artist': KDA_CREDIT, 'albumartist': KDA_CREDIT, 'title': 'Song'})
+    with db._get_connection() as conn:
+        _seed_file(conn, 1, 'Song', path, combined)
+        conn.commit()
+    return path
+
+
+def test_a_provider_known_slash_name_stays_one_artist(tmp_path, monkeypatch):
+    """#2150: "K/DA; Mimi Webb" proposed "K; DA; ..." and album artist "K"."""
+    db, combined = _kda_db(tmp_path)
+    _kda_file(db, tmp_path, combined)
+    result, findings = _run(db, monkeypatch, {'deezer': _FakeArtistClient(known=['K/DA'])},
+                            tmp_path=tmp_path)
+    assert len(findings) == 1
+    d = findings[0]['details']
+    assert d['split_artists'] == ['K/DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers']
+    assert d['primary_artist'] == 'K/DA'
+    assert d['new_display_artist'] == KDA_CREDIT
+
+
+def test_a_library_identified_slash_name_stays_one_artist(tmp_path, monkeypatch):
+    """#2150: the library holding K/DA with a provider id is enough."""
+    db, combined = _kda_db(tmp_path, identified=True)
+    _kda_file(db, tmp_path, combined)
+    result, findings = _run(db, monkeypatch, {'deezer': _FakeArtistClient()}, tmp_path=tmp_path)
+    assert findings[0]['details']['split_artists'][0] == 'K/DA'
+
+
+def test_a_kept_whole_name_stays_one_artist_with_no_provider(tmp_path, monkeypatch):
+    """#2150: a name on the job's Keep Whole Names list is one artist."""
+    db, combined = _kda_db(tmp_path)
+    _kda_file(db, tmp_path, combined)
+    _patch_clients(monkeypatch, {'deezer': _FakeArtistClient()})
+    cfg = _Cfg({'repair.jobs.comma_artist_splitter.settings': {'keep_whole_names': 'k/da'}})
+    findings = []
+    ctx = JobContext(db=db, transfer_folder=str(tmp_path), config_manager=cfg,
+                     create_finding=lambda **kw: findings.append(kw) or True)
+    CommaArtistSplitterJob().scan(ctx)
+    assert findings[0]['details']['split_artists'][0] == 'K/DA'
+
+
+def test_a_kept_whole_credit_is_not_proposed_at_all(tmp_path, monkeypatch):
+    """#2150: "One artist" on a finding means the scan never files it again."""
+    db = _db(tmp_path)
+    _add_track(db, 'T1', DUMMY, str(tmp_path / 'a.flac'), file_artist='Camellia, Toby Fox')
+    _patch_clients(monkeypatch, {'deezer': _FakeArtistClient()})
+    cfg = _Cfg({'repair.jobs.comma_artist_splitter.settings': {'keep_whole_names': 'camellia,toby fox'}})
+    findings = []
+    ctx = JobContext(db=db, transfer_folder=str(tmp_path), config_manager=cfg,
+                     create_finding=lambda **kw: findings.append(kw) or True)
+    CommaArtistSplitterJob().scan(ctx)
+    assert findings == []
+
+
+def test_custom_split_parts_only_regroups_the_tags_own_names():
+    from core.repair_jobs.comma_artist_splitter import custom_split_parts
+    parts, joined = custom_split_parts(KDA_CREDIT, 'K/DA; League Of Legends; Mimi Webb; Sophie Powers')
+    assert parts == ['K/DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers']
+    assert joined == ['K/DA']
+    # spelled as in the tag, whatever spacing was typed
+    parts, joined = custom_split_parts('Above & Beyond, Mat Zo', 'above &beyond; Mat Zo')
+    assert parts == ['Above & Beyond', 'Mat Zo'] and joined == ['Above & Beyond']
+    for bad in ('K/DA; Somebody Else; Mimi Webb; Sophie Powers',   # invents a name
+                'K/DA; League Of Legends',                            # drops names
+                'K/DA League Of Legends; Mimi Webb; Sophie Powers',   # runs over a ";"
+                ''):
+        with pytest.raises(ValueError):
+            custom_split_parts(KDA_CREDIT, bad)
+
+
+def _kda_details(path, parts):
+    return {
+        'combined_name': KDA_CREDIT,
+        'split_artists': parts,
+        'new_display_artist': '; '.join(parts),
+        'primary_artist': parts[0],
+        'all_files': [{'file_path': path}],
+        'library_v2_native': True,
+    }
+
+
+def test_fix_one_artist_keeps_the_credit_and_remembers_it(tmp_path):
+    """#2150: "One artist" on the finding re-tags nothing and is remembered."""
+    from mutagen.flac import FLAC
+    db, combined = _kda_db(tmp_path)
+    path = _kda_file(db, tmp_path, combined)
+    w = _worker(db, tmp_path)
+    w._config_manager = _Cfg()
+    details = _kda_details(path, ['K', 'DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers'])
+    details['_fix_action'] = 'keep_whole'
+    result = w._fix_comma_artist_split('artist', f'lib2:{combined}', None, details)
+    assert result['success'] is True and result['action'] == 'kept_whole'
+    assert FLAC(path)['artist'] == [KDA_CREDIT]
+    saved = w._config_manager.data['repair.jobs.comma_artist_splitter.settings']
+    assert saved['keep_whole_names'] == KDA_CREDIT
+
+
+def test_fix_with_an_edited_split_writes_it_and_remembers_the_joined_name(tmp_path):
+    """#2150: the user's own split is what gets written, album artist included."""
+    from mutagen.flac import FLAC
+    db, combined = _kda_db(tmp_path)
+    path = _kda_file(db, tmp_path, combined)
+    w = _worker(db, tmp_path)
+    w._config_manager = _Cfg({'repair.jobs.comma_artist_splitter.settings': {'dry_run': True}})
+    details = _kda_details(path, ['K', 'DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers'])
+    details['_fix_action'] = 'split:K/DA; League Of Legends; Mimi Webb; Sophie Powers'
+    result = w._fix_comma_artist_split('artist', f'lib2:{combined}', None, details)
+    assert result['success'] is True and result['action'] == 'artists_split'
+    audio = FLAC(path)
+    assert list(audio['artists']) == ['K/DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers']
+    assert audio['albumartist'] == ['K/DA']
+    saved = w._config_manager.data['repair.jobs.comma_artist_splitter.settings']
+    assert saved == {'dry_run': True, 'keep_whole_names': 'K/DA'}
+
+
+def test_fix_refuses_an_edit_that_invents_a_name(tmp_path):
+    from mutagen.flac import FLAC
+    db, combined = _kda_db(tmp_path)
+    path = _kda_file(db, tmp_path, combined)
+    w = _worker(db, tmp_path)
+    w._config_manager = _Cfg()
+    details = _kda_details(path, ['K', 'DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers'])
+    details['_fix_action'] = 'split:KDA Fans; League Of Legends; Mimi Webb; Sophie Powers'
+    result = w._fix_comma_artist_split('artist', f'lib2:{combined}', None, details)
+    assert result['success'] is False
+    assert FLAC(path)['artist'] == [KDA_CREDIT]
+    assert w._config_manager.data == {}
+
+
+def test_fix_refuses_an_old_finding_that_breaks_a_known_name(tmp_path):
+    """#2150: a finding filed before the fix still says "K", "DA". applying
+    it must not write the fragments once K/DA is known as one artist."""
+    from mutagen.flac import FLAC
+    db, combined = _kda_db(tmp_path, identified=True)
+    path = _kda_file(db, tmp_path, combined)
+    w = _worker(db, tmp_path)
+    w._config_manager = _Cfg()
+    details = _kda_details(path, ['K', 'DA', 'League Of Legends', 'Mimi Webb', 'Sophie Powers'])
+    result = w._fix_comma_artist_split('artist', f'lib2:{combined}', None, details)
+    assert result['success'] is False
+    assert '"K/DA" is one artist' in result['error']
+    assert FLAC(path)['artist'] == [KDA_CREDIT]
+
+
+def test_the_other_splitters_honour_kept_names(tmp_path, monkeypatch):
+    """#2150: a name kept whole from the Tools page is one artist for the
+    import credit split, the folder rule and the library's combined-artist
+    split too, not just for this job."""
+    import core.settings as settings_mod
+    from core.imports.collab_artist import library_has_identified_artist
+    from core.library2.importer import _credit_names_for_import
+    from core.library2.native_enrich import _identified_name_keys
+
+    cfg = _Cfg({'repair.jobs.comma_artist_splitter.settings': {'keep_whole_names': 'K/DA; Above & Beyond'}})
+    monkeypatch.setattr(settings_mod, 'config_manager', cfg)
+    db = MusicDatabase(str(tmp_path / 'h.db'))
+    with db._get_connection() as conn:
+        assert library_has_identified_artist('k/da', conn=conn) is True
+        assert library_has_identified_artist('K', conn=conn) is False
+        assert {'k/da', 'above & beyond'} <= _identified_name_keys(conn)
+
+    from core.library2.importer import _ArtistResolver
+    with db._get_connection() as conn:
+        resolver = _ArtistResolver(conn.cursor(), 1)
+        assert resolver.known_name('K/DA') is True
+        assert _credit_names_for_import('K/DA, Mimi Webb', resolver.known_name,
+                                        split_with_known_anchor=True) == ['K/DA', 'Mimi Webb']

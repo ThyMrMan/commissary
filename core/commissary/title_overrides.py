@@ -219,9 +219,26 @@ WISHLIST_SERIES_TYPE_SQL = (
     "AND o.tmdb_id = w.tmdb_id AND o.series_type IN ('standard','daily','anime'))")
 
 
+def adopt_after_scan(db) -> int:
+    """After a scan's shows: :func:`adopt_series_types` on its own connection.
+    Never raises (a scan must not fail on it)."""
+    try:
+        conn = db._get_connection()
+    except Exception:   # noqa: BLE001
+        return 0
+    try:
+        n = adopt_series_types(conn)
+        conn.commit()
+        if n:
+            logger.info("%d show(s) took the series type set before they were owned", n)
+        return n
+    finally:
+        conn.close()
+
+
 def adopt_series_types(conn) -> int:
     """Shows scanned in with no type of their own take the one set before
-    they were owned. Runs before a library's default is applied."""
+    they were owned."""
     try:
         cur = conn.execute(
             "UPDATE shows SET series_type = (SELECT o.series_type FROM video_title_overrides o "

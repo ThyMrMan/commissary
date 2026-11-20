@@ -33,6 +33,42 @@ def _int(val, default):
         return default
 
 
+def finding_poster(item: dict):
+    """The poster to show beside a video finding, or None.
+
+    The finding says what it is about: a poster it already carries, or the
+    movie or show it names. A bare number with nothing saying which it is
+    (movie or show) gets no poster rather than the wrong one.
+    """
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    poster = str(details.get("poster_url") or details.get("thumb_url") or "").strip()
+    if poster:
+        if poster.startswith("http") or poster.startswith("/api/"):
+            return poster
+        return "https://image.tmdb.org/t/p/w342" + poster
+
+    def _id(value):
+        text = str(value if value is not None else "").strip()
+        return text if text.isdigit() else None
+
+    if _id(details.get("movie_id")):
+        return f"/api/video/poster/movie/{_id(details.get('movie_id'))}"
+    if _id(details.get("show_id")):
+        return f"/api/video/poster/show/{_id(details.get('show_id'))}"
+    kind = str(details.get("kind") or item.get("entity_type") or "").lower()
+    library_id = _id(details.get("library_id")) or (
+        _id(item.get("entity_id")) if kind in ("movie", "show") else None)
+    if library_id and kind in ("movie", "show", "episode", "season"):
+        return f"/api/video/poster/{'movie' if kind == 'movie' else 'show'}/{library_id}"
+    return None
+
+
+# how many of a type's newest open findings are read for its posters, and how
+# many distinct ones the inbox row shows (the music side's numbers)
+_GROUP_ART_SAMPLE = 24
+_GROUP_ART_SHOWN = 4
+
+
 def _with_schedules(jobs: list) -> list:
     """the schedule lives on each job's system automation (in the app db,
     where the shared automation engine keeps its rows). hand the tools page the
@@ -54,6 +90,19 @@ def _with_schedules(jobs: list) -> list:
         if sched.get("next_run"):
             job["next_run"] = sched["next_run"]
     return jobs
+
+
+_VIEW_KEYS = ("job_id", "status", "severity", "finding_type", "q")
+
+
+def _view_filters(body) -> dict:
+    """the filters of the view a selection was made in (``scope`` in the
+    body). fix selected and dismiss selected act only on ids that view still
+    lists, checked here (review 5 W3-TT, same contract as music)."""
+    scope = body.get("scope") if isinstance(body, dict) else None
+    if not isinstance(scope, dict):
+        scope = {}
+    return {key: (scope.get(key) or None) for key in _VIEW_KEYS}
 
 
 def register_routes(bp):
@@ -139,11 +188,17 @@ def register_routes(bp):
     def video_repair_findings():
         from . import get_video_db
         q = request.args
-        return jsonify(get_video_db().repair_get_findings(
+        result = get_video_db().repair_get_findings(
             job_id=q.get("job_id") or None, status=q.get("status") or None,
             severity=q.get("severity") or None, finding_type=q.get("finding_type") or None,
             sort=q.get("sort") or None, q=q.get("q") or None,
-            page=_int(q.get("page"), 0), limit=_int(q.get("limit"), 50)))
+            page=_int(q.get("page"), 0), limit=_int(q.get("limit"), 50))
+        # the row's picture, under the name the shared findings list reads
+        for item in result.get("items") or []:
+            poster = finding_poster(item)
+            if poster:
+                item["album_thumb_url"] = poster
+        return jsonify(result)
 
     @bp.route("/repair/findings/counts", methods=["GET"])
     def video_repair_findings_counts():
@@ -152,7 +207,31 @@ def register_routes(bp):
 
     @bp.route("/repair/findings/groups", methods=["GET"])
     def video_repair_findings_groups():
-        return jsonify({"groups": _worker().get_finding_groups()})
+        # the inbox's job / severity filters: a row counts what its bulk
+        # buttons act on (review 5 W3-TT)
+        from . import get_video_db
+        job_id = request.args.get("job_id") or None
+        severity = request.args.get("severity") or None
+        groups = _worker().get_finding_groups(job_id=job_id, severity=severity)
+        # a few posters per type, off its newest open findings
+        for group in groups:
+            group["art"] = []
+            if not group.get("pending"):
+                continue
+            try:
+                sample = get_video_db().repair_get_findings(
+                    job_id=job_id, severity=severity, status="pending",
+                    finding_type=group.get("finding_type"), sort="newest",
+                    page=0, limit=_GROUP_ART_SAMPLE)
+                for item in sample.get("items") or []:
+                    poster = finding_poster(item)
+                    if poster and poster not in group["art"]:
+                        group["art"].append(poster)
+                        if len(group["art"]) >= _GROUP_ART_SHOWN:
+                            break
+            except Exception as exc:  # noqa: BLE001 - posters are not worth a 500
+                logger.debug("video group posters unavailable: %s", exc)
+        return jsonify({"groups": groups})
 
     @bp.route("/repair/finding-types", methods=["GET"])
     def video_repair_finding_types():
@@ -169,12 +248,19 @@ def register_routes(bp):
     def video_repair_findings_reopen_all():
         body = request.get_json(silent=True) or {}
         n = _worker().reopen_findings_bulk(job_id=body.get("job_id"),
-                                           finding_type=body.get("finding_type"))
+                                           finding_type=body.get("finding_type"),
+                                           severity=body.get("severity") or None)
         return jsonify({"success": True, "reopened": n})
 
     @bp.route("/repair/findings/<int:fid>/fix", methods=["POST"])
     def video_repair_finding_fix(fid):
         body = request.get_json(silent=True) or {}
+        if body.get("bulk"):
+            # fix selected: only a row its view still lists (review 5 W3-TT)
+            from . import get_video_db
+            if not get_video_db().repair_ids_in_view([fid], **_view_filters(body)):
+                return jsonify({"success": False, "refused": True,
+                                "error": "Not in the list you picked it from any more"}), 409
         res = _worker().fix_finding(fid, body.get("fix_action"))
         return jsonify(res), (200 if res.get("success") else 400)
 
@@ -208,6 +294,73 @@ def register_routes(bp):
         # an unscoped fix_action is a caller bug, not "nothing matched"
         return jsonify(res), (400 if res.get("invalid") else 200)
 
+    @bp.route("/repair/shelf-life/plan", methods=["POST"])
+    def video_repair_shelf_life_plan():
+        """which Shelf Life titles a cleanup would delete: lowest score first
+        up to ``target_gb``, or exactly ``ids``, or every open finding."""
+        from core.video.repair import shelf_life
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        target = None
+        if body.get("target_gb") not in (None, ""):
+            try:
+                target = int(float(body["target_gb"]) * 1024 ** 3)
+            except (TypeError, ValueError):
+                return jsonify({"error": "target_gb must be a number"}), 400
+            if target <= 0:
+                return jsonify({"error": "target_gb must be more than 0"}), 400
+        ids = body.get("ids")
+        if ids is not None and not isinstance(ids, list):
+            return jsonify({"error": "ids must be a list"}), 400
+        return jsonify(shelf_life.plan_cleanup(get_video_db(), target_bytes=target, ids=ids))
+
+    @bp.route("/repair/shelf-life/delete", methods=["POST"])
+    def video_repair_shelf_life_delete():
+        """delete a batch of Shelf Life titles in the background, each through
+        Delete Title. one typed phrase covers the batch ('delete 14 titles'),
+        checked here; each title then goes with its own name."""
+        from core.video.repair import shelf_life
+        from . import get_video_db
+        body = request.get_json(silent=True) or {}
+        db = get_video_db()
+        actions, error = shelf_life.batch_delete_actions(db, body.get("ids"), body.get("phrase"))
+        if error:
+            return jsonify({"started": False, "error": error}), 400
+        res = _worker().start_bulk_fix(ids=list(actions), finding_type=shelf_life.FINDING_TYPE,
+                                       fix_actions=actions)
+        if not res.get("started"):
+            shelf_life.forget_precheck(db, list(actions))
+        return jsonify(res), (200 if res.get("started") or res.get("already_running") else 400)
+
+    @bp.route("/repair/shelf-life/<kind>/<int:item_id>", methods=["GET"])
+    def video_repair_shelf_life_title(kind, item_id):
+        """one title's Shelf Life for its detail page: score or gate, reasons,
+        when it was scored, and Keep."""
+        from core.video.repair import shelf_life
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "kind must be movie or show"}), 400
+        view = shelf_life.title_view(get_video_db(), kind, item_id)
+        if view is None:
+            return jsonify({"error": "not in the library"}), 404
+        return jsonify({"success": True, **view})
+
+    @bp.route("/repair/shelf-life/<kind>/<int:item_id>/keep", methods=["POST"])
+    def video_repair_shelf_life_keep(kind, item_id):
+        """mark a title Keep (``{"keep": true}``) or take it off."""
+        from core.video.repair import shelf_life
+        from . import get_video_db
+        if kind not in ("movie", "show"):
+            return jsonify({"error": "kind must be movie or show"}), 400
+        body = request.get_json(silent=True) or {}
+        if not isinstance(body.get("keep"), bool):
+            return jsonify({"error": "keep must be true or false"}), 400
+        res = shelf_life.set_title_keep(get_video_db(), kind, item_id, body["keep"],
+                                        set_by=shelf_life._resolver_id())
+        if res is None:
+            return jsonify({"error": "not in the library"}), 404
+        return jsonify(res), (200 if res.get("success") else 400)
+
     @bp.route("/repair/bulk-fix/status", methods=["GET"])
     def video_repair_bulk_fix_status():
         return jsonify(_worker().get_bulk_fix_status())
@@ -227,11 +380,17 @@ def register_routes(bp):
             if action != "dismiss":
                 return jsonify({"error": "Only dismiss is supported for a type-scoped bulk"}), 400
             return jsonify({"success": True,
-                            "updated": _worker().dismiss_findings_by_type(finding_type)})
-        if action not in ("dismiss", "resolve") or not ids:
+                            "updated": _worker().dismiss_findings_by_type(
+                                finding_type, job_id=body.get("job_id") or None,
+                                severity=body.get("severity") or None)})
+        if action not in ("dismiss", "resolve") or not ids or not isinstance(ids, list):
             return jsonify({"error": "bad request"}), 400
-        return jsonify({"success": True,
-                        "updated": _worker().bulk_update_findings(ids, action)})
+        # only ids the view they were picked in still lists (review 5 W3-TT)
+        from . import get_video_db
+        allowed = get_video_db().repair_ids_in_view(ids, **_view_filters(body))
+        updated = _worker().bulk_update_findings(allowed, action) if allowed else 0
+        return jsonify({"success": True, "updated": updated,
+                        "refused": max(0, len({str(i) for i in ids}) - len(allowed))})
 
     @bp.route("/repair/findings/clear", methods=["POST"])
     def video_repair_clear():

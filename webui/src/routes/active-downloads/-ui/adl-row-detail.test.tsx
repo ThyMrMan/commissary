@@ -181,6 +181,39 @@ describe('AdlRow expansion (#1156)', () => {
   const facts = (c: HTMLElement) =>
     (c.querySelector('.dlc-facts') as HTMLElement).textContent ?? '';
 
+  it('keeps completed downloads compact without a metadata badge', () => {
+    const view = render(<AdlRow dl={row({ status: 'completed', metadata_status: 'issues' })} />);
+    expect(view.queryByTitle('Final file metadata validation')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      '8 results, 1 passed filters but download failed to start | "other": no results found',
+      'Matching results found, but the download could not start. No specific failure reason was recorded.',
+    ],
+    [
+      // #1981: newer workers say why the matched files didn't start
+      '8 results, 1 passed filters but download failed to start (why: deezer_dl: the download client refused it)',
+      'Matching results found, but the download could not start: deezer_dl: the download client refused it.',
+    ],
+    [
+      '1 results but none passed quality/artist filters',
+      'Results found, but none passed the quality or artist filters.',
+    ],
+    ['no results found', 'No results found from the searched sources.'],
+    ['search error — timeout', 'Some searches failed. Expand details for the source errors.'],
+  ])(
+    'summarizes search failure (%s) and keeps diagnostics in the sheet',
+    async (diagnostic, message) => {
+      const error = `No match found for "Xtal" by Aphex Twin after 3 queries. Breakdown: "q": ${diagnostic}`;
+      const view = render(<AdlRow dl={row({ status: 'not_found', error })} />);
+      expect(view.getByText(message)).toBeInTheDocument();
+      expect(view.queryByText(error, { exact: false })).not.toBeInTheDocument();
+      await act(async () => fireEvent.click(rowEl(view.container)));
+      expect(view.container.querySelector('.dlc-sheet')?.textContent).toContain(diagnostic);
+    },
+  );
+
   it('an in-flight row expands to the full live narration on click', () => {
     const { container } = render(
       <AdlRow
@@ -278,21 +311,27 @@ describe('AdlRow expansion (#1156)', () => {
     expect(facts(container).match(/Tidal/g)).toHaveLength(1);
   });
 
-  it('shows what we asked for only when it differs from what we got', () => {
+  it('shows what we got only when it differs from what we asked for', () => {
+    // in-app chat (makiel): asked for and got were reversed. the row's
+    // title is the ask, so the fact line names the file the source sent.
     const { container } = render(
       <AdlRow
         dl={row({
           task_id: 'history-4',
           status: 'completed',
           is_persistent_history: true,
-          title: 'XO (Live)',
+          title: 'XO',
           expected_title: 'XO',
           expected_artist: 'John Mayer',
+          got_title: 'XO (Live)',
+          got_artist: 'John Mayer',
         })}
       />,
     );
     fireEvent.click(rowEl(container));
-    expect(facts(container)).toContain('John Mayer · XO');
+    expect(facts(container)).toContain('Got');
+    expect(facts(container)).toContain('John Mayer · XO (Live)');
+    expect(facts(container)).not.toContain('Asked for');
     cleanup();
     const same = render(
       <AdlRow
@@ -300,14 +339,14 @@ describe('AdlRow expansion (#1156)', () => {
           task_id: 'history-5',
           status: 'completed',
           is_persistent_history: true,
-          expected_title: 'xtal',
+          title: 'Xtal',
+          expected_title: 'Xtal',
+          got_title: 'xtal',
         })}
       />,
     );
     fireEvent.click(rowEl(same.container));
-    expect(same.container.querySelector('.dlc-facts')?.textContent ?? '').not.toContain(
-      'Asked for',
-    );
+    expect(same.container.querySelector('.dlc-facts')?.textContent ?? '').not.toContain('Got');
   });
 
   it('the cancel button still cancels without toggling the row open', async () => {

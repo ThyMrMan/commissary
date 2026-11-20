@@ -1,6 +1,8 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useEffect, useState } from 'react';
 
+import { RELEASE_STATUS_COPY, RELEASE_STATUSES, toggleStatus } from '@/components/release-statuses';
+
 import type { WatchlistGlobalConfig } from '../-watchlist.types';
 
 import {
@@ -20,6 +22,7 @@ const RELEASE_TYPE_KEYS = ['include_albums', 'include_eps', 'include_singles'] a
 
 const CONTENT_FILTER_KEYS = [
   'include_live',
+  'include_live_tracks',
   'include_remixes',
   'include_acoustic',
   'include_compilations',
@@ -39,10 +42,16 @@ const OPTION_COPY: Record<IncludeKey, { icon: string; title: string; description
     title: 'Singles',
     description: 'Single tracks and 2-3 track releases',
   },
+  // #2082: a live album and a live track are two rules
   include_live: {
     icon: '🎤',
-    title: 'Include Live Versions',
-    description: 'Live performances and concerts',
+    title: 'Include Live Albums',
+    description: 'Concert recordings and unplugged sets',
+  },
+  include_live_tracks: {
+    icon: '🎙️',
+    title: 'Include Live Tracks',
+    description: 'Live versions on other releases, like a live bonus track',
   },
   include_remixes: {
     icon: '🎧',
@@ -77,6 +86,7 @@ export const EMPTY_GLOBAL_CONFIG: WatchlistGlobalConfig = {
   include_eps: true,
   include_singles: true,
   include_live: false,
+  include_live_tracks: false,
   include_remixes: false,
   include_acoustic: false,
   include_compilations: false,
@@ -87,6 +97,8 @@ export const EMPTY_GLOBAL_CONFIG: WatchlistGlobalConfig = {
   // #1450: defaults match the server ("all" = today's behaviour, opt-in).
   edition_preference: 'all',
   prefer_explicit_edition: true,
+  // #2175: every status until someone picks
+  release_statuses: [...RELEASE_STATUSES],
 };
 
 /**
@@ -273,6 +285,41 @@ export function WatchlistGlobalSettingsModal({ profileId, initialConfig, onClose
                       {...OPTION_COPY[key]}
                     />
                   ))}
+                </div>
+              </div>
+
+              {/* #2175: MusicBrainz statuses. Pills like the edition rows below,
+                  not another checkbox stack. The last one on can't be turned
+                  off: a filter that lets nothing through is never meant. */}
+              <div className="config-section">
+                <h3 className="config-section-title">Release Status</h3>
+                <p className="config-section-subtitle">
+                  Which MusicBrainz statuses to grab. A release from another source, or with no
+                  status, always gets through.
+                </p>
+                <div className="discog-future-pills" role="group" aria-label="Release statuses">
+                  {RELEASE_STATUSES.map((status) => {
+                    const on = config.release_statuses.includes(status);
+                    const last = on && config.release_statuses.length === 1;
+                    return (
+                      <button
+                        key={status}
+                        type="button"
+                        aria-pressed={on}
+                        disabled={last}
+                        title={last ? 'Keep at least one status' : RELEASE_STATUS_COPY[status].hint}
+                        className={`watchlist-filter-btn${on ? ' active' : ''}`}
+                        onClick={() =>
+                          setConfig((previous) => ({
+                            ...previous,
+                            release_statuses: toggleStatus(previous.release_statuses, status, !on),
+                          }))
+                        }
+                      >
+                        {RELEASE_STATUS_COPY[status].label}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
 

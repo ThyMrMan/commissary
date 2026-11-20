@@ -94,6 +94,22 @@ def audio_channel_label(channels: Any, layout: Any = None) -> Optional[str]:
     return None
 
 
+def _channels(value: Any) -> str:
+    """The layout as a scheme writes it: upstream's probe stores the count (8),
+    the fork's own facts already carry the label ('7.1')."""
+    if isinstance(value, str) and "." in value:
+        return value.strip()
+    return audio_channel_label(value) or ""
+
+
+def _languages(value: Any, limit: int = 3) -> str:
+    """'EN+JA': upstream's probe stores a list of codes, the fork's facts a string."""
+    if isinstance(value, (list, tuple)):
+        codes = [str(v).strip().upper() for v in value if str(v or "").strip()]
+        return "+".join(codes[:limit])
+    return _str(value)
+
+
 def video_bit_depth(video: Any) -> Optional[int]:
     v = video if isinstance(video, dict) else {}
     declared = _int(v.get("bits_per_raw_sample"))
@@ -190,8 +206,8 @@ def _media_tokens(f: dict) -> dict:
         "Quality Title": _str(f.get("resolution")),
         "MediaInfo VideoCodec": _codec_label(f.get("codec"), _VIDEO_CODEC_LABELS),
         "MediaInfo AudioCodec": _codec_label(f.get("audio_codec"), _AUDIO_CODEC_LABELS),
-        "MediaInfo AudioChannels": _str(f.get("audio_channels")),
-        "MediaInfo AudioLanguages": _str(f.get("audio_languages")),
+        "MediaInfo AudioChannels": _channels(f.get("audio_channels")),
+        "MediaInfo AudioLanguages": _languages(f.get("audio_languages")),
         "MediaInfo VideoBitDepth": _str(f.get("video_bit_depth")),
         "MediaInfo VideoDynamicRange": "HDR" if f.get("dynamic_range_type") else "",
         "MediaInfo VideoDynamicRangeType": _str(f.get("dynamic_range_type")),
@@ -560,9 +576,9 @@ def rename_before_import(db, dl: dict) -> None:
         if len(_RENAMED_PACKS) > 500:
             _RENAMED_PACKS.clear()
     try:
-        from core.commissary.import_lock import refusal
-        if refusal(db, dl):
-            return                      # a locked title takes no automatic edits at all
+        from core.video.importer import title_locked
+        if title_locked(db, dl):
+            return                      # a padlocked title takes no automatic edits at all
         from core.commissary.title_overrides import library_row
         from core.video import mass_rename
         from core.video.download_monitor import _wishlist_ids

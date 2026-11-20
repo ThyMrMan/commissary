@@ -105,9 +105,11 @@ class ConfigManager:
         'plex.token',
         'jellyfin.api_key',
         'navidrome.password',
+        'music_assistant.token',
         # Download sources
         'soulseek.api_key',
         'deezer_download.arl',
+        'soundcloud_download.oauth_token',
         'lidarr_download.api_key',
         'prowlarr.api_key',
         'torrent_client.password',
@@ -121,6 +123,7 @@ class ConfigManager:
         'lastfm.session_key',
         'genius.access_token',
         'pollinations.api_key',
+        'fanart.api_key',
         # Deezer OAuth
         'deezer.app_id',
         'deezer.app_secret',
@@ -539,6 +542,18 @@ class ConfigManager:
                 "password": "",
                 "auto_detect": True
             },
+            "music_assistant": {
+                "base_url": "",
+                # a long-lived token from Music Assistant (Settings > Users)
+                "token": "",
+                # instance id of the Local files / SMB source the scan reads
+                "source_instance": "",
+                # the folder that source reads, as music assistant sees it. only
+                # used when music assistant won't say (2.10.9 keeps it private)
+                "source_folder": "",
+                "auto_detect": True,
+                "request_timeout_seconds": 30
+            },
             "soulseek": {
                 "slskd_url": "",
                 "api_key": "",
@@ -645,6 +660,11 @@ class ConfigManager:
             },
             "tidal_download": {
                 "quality": "lossless",  # Options: "low", "high", "lossless", "hires"
+                # #2069: seconds between two download requests (search or
+                # manifest). Downloads are one at a time already; this spaces
+                # the requests one track makes as it steps down the quality
+                # chain. 0 turns it off.
+                "min_request_gap_seconds": 1.0,
                 "session": {
                     "token_type": "",
                     "access_token": "",
@@ -678,6 +698,15 @@ class ConfigManager:
             "lidarr_compat": {
                 "enabled": False,
                 "profile_id": 1,
+            },
+            # soulsync answering as seerr for video request apps (#2151). off
+            # by default. a missing or unknown X-Api-User is refused on a new
+            # install (#2166); an install from before has no refuse_unknown
+            # key and keeps acting as profile_id until the admin switches it
+            "seerr_compat": {
+                "enabled": False,
+                "profile_id": 1,
+                "refuse_unknown": True,
             },
             # ai clients over /mcp, with an api key. off by default
             "mcp": {
@@ -729,6 +758,10 @@ class ConfigManager:
                 "password": "",
                 "category": "soulsync",
                 "save_path": "",
+                # qBittorrent only (#2087): start what SoulSync adds even when the
+                # client is set to add torrents stopped, or to stop them once the
+                # metadata is in. Off = the client's own setting decides.
+                "start_torrents": False,
                 # Seeding lifecycle (mirror of the video side): seed a completed
                 # music torrent grab until the ratio/time goal is met, then remove
                 # it from the client. BOTH goals default 0 = sweep OFF = grabs seed
@@ -754,13 +787,21 @@ class ConfigManager:
                 "username": "",
                 "password": "",
                 "category": "soulsync",
+                "acquisition_monitor_interval_seconds": 15,
+                # Remove Completed: what happens to a music usenet job once it
+                # has imported -- "off" (default, leave it in the client),
+                # "history" (remove it from the client's history) or "files"
+                # (remove it and delete what's left in its folder). Album and
+                # track grabs COPY the audio out, so without this the whole
+                # release stays in the client's completed folder.
+                "remove_completed": "off",
             },
             "soundcloud_download": {
-                # Anonymous-only for now — SoundCloud Go+ OAuth tier could be
-                # added later, with credentials living under a "session" subkey
-                # alongside Tidal/Qobuz. No quality knob: anonymous SoundCloud
-                # caps at the upload's transcoding (typically 128 kbps MP3 or
-                # AAC). yt-dlp resolves bestaudio at download time.
+                # a free account's oauth_token cookie. with it, a track whose
+                # uploader turned on the free download comes as the original
+                # file instead of the ~128 kbps stream (#2116). empty stays
+                # anonymous. never go+, that needs a paid account.
+                "oauth_token": "",
             },
             "listenbrainz": {
                 "base_url": "",
@@ -792,6 +833,11 @@ class ConfigManager:
             # optional. cover art works without it (one image every 45s with
             # their logo); a key from enter.pollinations.ai lifts both
             "pollinations": {
+                "api_key": ""
+            },
+            # optional. HD artist photos and backgrounds for Plex/Jellyfin
+            # (#1957); a free personal key from fanart.tv
+            "fanart": {
                 "api_key": ""
             },
             # Two providers answering two different questions: Ticketmaster for
@@ -941,7 +987,13 @@ class ConfigManager:
                 # import creates it. Jellyfin/Kodi/Emby use it to identify
                 # the artist instead of guessing by name. Off by default —
                 # the Artist NFO Backfill repair job covers existing folders.
+                # #2138: the same switch writes poster.jpg / background.jpg
+                # beside it when the artist folder has no artwork.
                 "write_artist_nfo": False,
+                # Library v2: a monitored track whose file was deleted outside
+                # SoulSync is downloaded again (Lidarr behaviour). Off, the
+                # deletion counts as "don't download again" for that track.
+                "redownload_externally_deleted": True,
             },
             "file_organization": {
                 "enabled": True,
@@ -1019,7 +1071,10 @@ class ConfigManager:
                 # off: staging keeps whatever an import didn't move (the user's
                 # own files). on: a folder whose every track was imported or
                 # found already in the library is removed from staging.
-                "clear_finished_from_staging": False
+                "clear_finished_from_staging": False,
+                # the import matcher's search picker opens on this source
+                # (#2203). '' is Any source: the primary, then the chain.
+                "default_search_source": ""
             },
             "m3u_export": {
                 "enabled": False,
@@ -1126,6 +1181,19 @@ class ConfigManager:
                 # copy, and a listener who prefers the per-file layout opts
                 # out by leaving this off.
                 "merge_m4b": False,
+            },
+            "server_activity": {
+                # remote upload speed in Mbps; None hides the bar
+                "upload_mbps": None,
+                "geo_lookup": True,
+                # play log days; 0 keeps it forever
+                "retention_days": 0,
+                "stop_presets": [
+                    "The server is restarting for an update. Back in 5 minutes.",
+                    "Server maintenance, back soon.",
+                    "Too many streams right now, please try again later.",
+                    "Please watch at home tonight.",
+                ],
             },
             "podcasts": {
                 "download_path": default_podcast_path,

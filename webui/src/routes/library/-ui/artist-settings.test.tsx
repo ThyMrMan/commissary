@@ -1,0 +1,333 @@
+import { QueryClientProvider } from '@tanstack/react-query';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+
+import { HttpResponse, http, server } from '@/test/msw';
+import { createTestQueryClient } from '@/test/query-client';
+
+import type { LibraryV2ArtistDetail } from '../-library-v2.types';
+
+import {
+  ArtistSettingsModal,
+  LibraryV2CanWatchContext,
+  LibraryV2CanWishContext,
+  LibraryV2CanWriteContext,
+} from './library-v2-page';
+
+const artist: LibraryV2ArtistDetail = {
+  id: 7,
+  name: 'Drake',
+  image_url: '/api/library/v2/artwork/artist/7',
+  summary: null,
+  style: null,
+  mood: null,
+  label: null,
+  genres: ['hip hop'],
+  monitored: true,
+  monitor_new_items: 'all',
+  quality_profile: {
+    id: 1,
+    name: 'Lossless',
+    description: null,
+    upgrade_policy: 'acceptable',
+    upgrade_cutoff_index: 0,
+    ranked_targets: [],
+    repair_settings: {},
+    repair_job_id: '',
+    is_default: false,
+  },
+  quality_profile_source: 'artist',
+  quality_profile_source_id: 7,
+  quality_profile_explicit: true,
+  albums: [],
+  eps: [],
+  singles: [],
+  album_count: 0,
+  single_count: 0,
+  discography_count: 0,
+  total_size_bytes: 0,
+  user_overrides: {},
+};
+
+const settings = {
+  artist_id: 7,
+  watchlist_row_id: 11,
+  watchlist_name: 'Drake',
+  watchlist_image_url: 'https://img/drake.jpg',
+  provider_ids: { spotify: 'sp-drake', deezer: '246791', amazon: 'B01' },
+  monitor_new_items: 'all' as const,
+  include_albums: true,
+  include_eps: true,
+  include_singles: true,
+  include_live: false,
+  include_live_tracks: false,
+  include_remixes: false,
+  include_acoustic: false,
+  include_compilations: false,
+  include_instrumentals: false,
+  auto_download: true,
+  lookback_days: 30,
+  preferred_metadata_source: 'deezer',
+};
+
+function handlers() {
+  server.use(
+    http.get('/api/library/v2/artists/7/settings', () =>
+      HttpResponse.json({
+        success: true,
+        settings,
+        metadata_sources: ['spotify', 'deezer', 'musicbrainz'],
+        global_metadata_source: 'spotify',
+      }),
+    ),
+    http.get('/api/library/v2/quality-profiles', () =>
+      HttpResponse.json({ success: true, profiles: [artist.quality_profile] }),
+    ),
+    http.get('/api/library/v2/artists/7/match-status', () =>
+      HttpResponse.json({ success: true, services: [] }),
+    ),
+    http.get('/api/library/v2/artists/7/naming', () =>
+      HttpResponse.json({
+        success: true,
+        artist_id: 7,
+        library_name: 'Drake',
+        scanned_name: 'Drake',
+        pinned: false,
+        source: null,
+        renamed: false,
+        kept_source_name: false,
+        folder: 'Drake/Drake - Views',
+      }),
+    ),
+  );
+}
+
+function renderModal(canWrite = true) {
+  return render(
+    <QueryClientProvider client={createTestQueryClient()}>
+      <LibraryV2CanWriteContext.Provider value={canWrite}>
+        <ArtistSettingsModal artist={artist} onClose={vi.fn()} />
+      </LibraryV2CanWriteContext.Provider>
+    </QueryClientProvider>,
+  );
+}
+
+describe('Library v2 Artist Settings', () => {
+  it('keeps every settings submit path read-only without issuing writes', async () => {
+    handlers();
+    let writes = 0;
+    server.use(
+      http.put('/api/library/v2/artists/7/settings', () => {
+        writes += 1;
+        return HttpResponse.json({ success: true, settings });
+      }),
+      http.post('/api/library/v2/artists/7/releases/monitor', () => {
+        writes += 1;
+        return HttpResponse.json({ success: true, job_id: 'unexpected' });
+      }),
+    );
+
+    renderModal(false);
+    await screen.findByText('Watchlist identity');
+
+    // #2210: a read-only profile gets none of them, not dead buttons
+    for (const name of [
+      'Save name',
+      'Save future-release settings',
+      'Wishlist all',
+      'Wishlist missing only',
+      'Remove all from Wishlist',
+      'Use inherited profile',
+    ]) {
+      expect(screen.queryByRole('button', { name })).toBeNull();
+    }
+    expect(screen.queryByRole('checkbox', { name: /Auto-download new releases/ })).toBeNull();
+    expect(await screen.findByText(/Quality profiles are up to the admin/)).toBeInTheDocument();
+    expect(writes).toBe(0);
+  });
+
+  it("a household member saves their own watchlist settings, nothing of the admin's", async () => {
+    // third #1062 review G03-5: the sheet edits the acting profile's own
+    // watchlist row (3.6.1's watchlist config); quality, bulk wishlist and the
+    // shared discography rule stay the admin's
+    handlers();
+    let submitted = 0;
+    server.use(
+      http.put('/api/library/v2/artists/7/settings', () => {
+        submitted += 1;
+        return HttpResponse.json({ success: true, settings });
+      }),
+    );
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <LibraryV2CanWriteContext.Provider value={false}>
+          <LibraryV2CanWishContext.Provider value={true}>
+            <LibraryV2CanWatchContext.Provider value={true}>
+              <ArtistSettingsModal artist={artist} onClose={vi.fn()} />
+            </LibraryV2CanWatchContext.Provider>
+          </LibraryV2CanWishContext.Provider>
+        </LibraryV2CanWriteContext.Provider>
+      </QueryClientProvider>,
+    );
+    await screen.findByText('Watchlist identity');
+    expect(screen.getByText('Linked to your Watchlist.')).toBeInTheDocument();
+    // #2210: the admin's parts aren't drawn for them at all
+    expect(screen.queryByRole('button', { name: 'Wishlist all' })).toBeNull();
+    expect(screen.queryByDisplayValue('Add newly found releases to Wishlist')).toBeNull();
+    const save = screen.getByRole('button', { name: 'Save future-release settings' });
+    expect(save).not.toBeDisabled();
+    fireEvent.click(save);
+    await waitFor(() => expect(submitted).toBe(1));
+  });
+
+  it('#2209: a member without the Watchlist gets no watchlist part to save', async () => {
+    handlers();
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <LibraryV2CanWriteContext.Provider value={false}>
+          <LibraryV2CanWishContext.Provider value={true}>
+            <LibraryV2CanWatchContext.Provider value={false}>
+              <ArtistSettingsModal artist={artist} onClose={vi.fn()} />
+            </LibraryV2CanWatchContext.Provider>
+          </LibraryV2CanWishContext.Provider>
+        </LibraryV2CanWriteContext.Provider>
+      </QueryClientProvider>,
+    );
+    await screen.findByText('Artist Settings');
+    expect(screen.queryByRole('button', { name: 'Save future-release settings' })).toBeNull();
+    expect(screen.queryByRole('checkbox', { name: /Auto-download new releases/ })).toBeNull();
+  });
+
+  it('edits the existing Watchlist settings through one combined contract', async () => {
+    handlers();
+    let submitted: unknown;
+    server.use(
+      http.put('/api/library/v2/artists/7/settings', async ({ request }) => {
+        submitted = await request.json();
+        return HttpResponse.json({
+          success: true,
+          settings: {
+            ...settings,
+            auto_download: false,
+            include_singles: false,
+          },
+          metadata_sources: ['spotify', 'deezer', 'musicbrainz'],
+          global_metadata_source: 'spotify',
+        });
+      }),
+    );
+
+    renderModal();
+
+    expect(await screen.findByText('Watchlist identity')).toBeInTheDocument();
+    // A provider id the catalogue can turn into a page is a link now, not
+    // just something to copy into a browser bar by hand.
+    const spotify = screen.getByTitle('Open on spotify: sp-drake');
+    expect(spotify).toHaveAttribute('href', 'https://open.spotify.com/artist/sp-drake');
+    // Amazon has no artist page, so that one keeps the copy button.
+    expect(screen.getByTitle('Copy amazon ID: B01')).toBeInTheDocument();
+    expect(await screen.findByText(/Effective: Lossless/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('checkbox', { name: /Auto-download new releases/ }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Singles' }));
+    fireEvent.change(screen.getByLabelText('Preferred metadata provider'), {
+      target: { value: 'spotify' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save future-release settings' }));
+
+    expect(await screen.findByText('Watchlist Artist Settings saved.')).toBeInTheDocument();
+    expect(submitted).toMatchObject({
+      auto_download: false,
+      include_singles: false,
+      preferred_metadata_source: 'spotify',
+      monitor_new_items: 'all',
+    });
+  });
+
+  it('keeps existing-release Wanted actions separate from future-release settings', async () => {
+    handlers();
+    const submitted: unknown[] = [];
+    server.use(
+      http.post('/api/library/v2/artists/7/releases/monitor', async ({ request }) => {
+        submitted.push(await request.json());
+        return HttpResponse.json({
+          success: true,
+          job_id: 'settings-monitor-job',
+        });
+      }),
+      http.get('/api/library/v2/jobs/status', () =>
+        HttpResponse.json({ running: false, error: null }),
+      ),
+    );
+
+    renderModal();
+    fireEvent.click(await screen.findByRole('button', { name: 'Wishlist missing only' }));
+
+    expect(
+      await screen.findByText('Add missing releases to Wishlist applied.'),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(submitted).toEqual([{ scope: 'missing', monitored: true }]));
+  });
+
+  // #2175: MusicBrainz release statuses, inherited from the library or its own
+  function statusHandlers(own: string[] | null) {
+    handlers();
+    const submitted: unknown[] = [];
+    const withStatuses = {
+      ...settings,
+      release_statuses: own,
+      library_release_statuses: ['official', 'promotion'],
+    };
+    server.use(
+      http.get('/api/library/v2/artists/7/settings', () =>
+        HttpResponse.json({
+          success: true,
+          settings: withStatuses,
+          metadata_sources: ['spotify'],
+          global_metadata_source: 'spotify',
+        }),
+      ),
+      http.put('/api/library/v2/artists/7/settings', async ({ request }) => {
+        submitted.push(await request.json());
+        return HttpResponse.json({ success: true, settings: withStatuses });
+      }),
+    );
+    return submitted;
+  }
+
+  it("follows the library's release statuses until it picks its own", async () => {
+    const submitted = statusHandlers(null);
+    renderModal();
+
+    const follow = await screen.findByRole('checkbox', { name: /Use the library's statuses/ });
+    expect(follow).toBeChecked();
+    expect(screen.getByText(/Grabbing Official, Promotion\./)).toBeInTheDocument();
+    // the library's shown, but they are not this artist's to change
+    expect(screen.getByRole('checkbox', { name: 'Official' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Bootleg' })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Bootleg' })).toBeDisabled();
+
+    fireEvent.click(follow);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Bootleg' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save future-release settings' }));
+
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0]).toMatchObject({ release_statuses: ['official', 'promotion', 'bootleg'] });
+  });
+
+  it('puts an artist with its own statuses back on the library with null', async () => {
+    const submitted = statusHandlers(['bootleg']);
+    renderModal();
+
+    const follow = await screen.findByRole('checkbox', { name: /Use the library's statuses/ });
+    expect(follow).not.toBeChecked();
+    // the last one on can't be turned off
+    expect(screen.getByRole('checkbox', { name: 'Bootleg' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Bootleg' })).toBeDisabled();
+
+    fireEvent.click(follow);
+    fireEvent.click(screen.getByRole('button', { name: 'Save future-release settings' }));
+
+    await waitFor(() => expect(submitted).toHaveLength(1));
+    expect(submitted[0]).toMatchObject({ release_statuses: null });
+  });
+});

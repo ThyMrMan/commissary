@@ -13,6 +13,8 @@ export interface ServerPlaylist {
   track_count?: number;
   /** the server user it belongs to, where the server says (navidrome) */
   owner?: string | null;
+  /** the server won't let you edit it: a smart playlist, or someone else's */
+  readonly?: boolean;
   /** Set by the split below, not by the backend. */
   _synced?: boolean;
 }
@@ -156,6 +158,8 @@ export interface MirroredMatch {
   sync_name?: string;
   /** The server playlist this mirror was last opened against, once linked. */
   server_playlist_id?: string | null;
+  /** which server that id belongs to; an id from another server means nothing here */
+  server_type?: string | null;
   source?: string;
   source_ref?: string;
   owner?: string;
@@ -218,6 +222,66 @@ export async function fetchMirroredPlaylistById(mirroredId: number): Promise<Mir
   return (await response.json()) as MirroredMatch;
 }
 
+/**
+ * A mirror's copy on the server, the other way round from fetchMirroredMatches:
+ * the playlist the mirror links to when that link is for this server, else the
+ * one named what sync writes it as, else its alias, else its upstream name.
+ * Names compare trimmed and case-insensitive. Only the profile's own playlists
+ * count, which is where sync writes.
+ */
+export function findMirrorServerPlaylist(
+  mirror: MirroredMatch,
+  playlists: readonly ServerPlaylist[],
+  serverType: string | undefined,
+): ServerPlaylist | null {
+  const linked = mirror.server_playlist_id ? String(mirror.server_playlist_id) : '';
+  if (linked && (!mirror.server_type || mirror.server_type === serverType)) {
+    const hit = playlists.find((p) => p.id === linked);
+    if (hit) return hit;
+  }
+  const norm = (value: string | null | undefined) => (value ?? '').trim().toLowerCase();
+  for (const name of [mirror.sync_name, mirror.display_name, mirror.name]) {
+    const key = norm(name);
+    if (!key) continue;
+    const hit = playlists.find((p) => norm(p.name) === key);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+export type MirrorServerLookup =
+  | { status: 'found'; playlist: ServerPlaylist; mirror: MirroredMatch; serverType?: string }
+  | { status: 'not-synced'; mirror: MirroredMatch | null; serverType?: string }
+  | { status: 'error'; message: string };
+
+/** Where a mirror sits on the server, for opening the server editor from it. */
+export async function locateMirrorOnServer(mirrorId: number): Promise<MirrorServerLookup> {
+  try {
+    const [serverRes, mirroredRes] = await Promise.all([
+      fetch('/api/server/playlists'),
+      fetch('/api/mirrored-playlists'),
+    ]);
+    const data = (await serverRes.json()) as ServerPlaylistsResponse;
+    if (!data.success || !data.playlists) {
+      return { status: 'error', message: data.error || 'Could not reach your media server' };
+    }
+    const rows = (await mirroredRes.json()) as unknown;
+    const mirror = Array.isArray(rows)
+      ? ((rows as MirroredMatch[]).find((r) => r.id === mirrorId) ?? null)
+      : null;
+    if (!mirror) return { status: 'not-synced', mirror: null, serverType: data.server_type };
+    const playlist = findMirrorServerPlaylist(mirror, data.playlists, data.server_type);
+    return playlist
+      ? { status: 'found', playlist, mirror, serverType: data.server_type }
+      : { status: 'not-synced', mirror, serverType: data.server_type };
+  } catch (error) {
+    return {
+      status: 'error',
+      message: error instanceof Error ? error.message : 'Could not reach your media server',
+    };
+  }
+}
+
 /* ── The compare editor (247-354, 356-383, 490-583) ───────────────────────── */
 
 export interface CompareTrack {
@@ -275,6 +339,8 @@ export interface CompareResponse {
   order_status?: { out_of_order?: boolean } | null;
   server_order?: unknown[];
   tracks?: CompareTrack[];
+  /** this profile may add a plex mood to the playlist's songs (admin, plex) */
+  can_tag?: boolean;
 }
 
 /**
@@ -359,6 +425,55 @@ export function compareFilterLabel(filter: string, stats: CompareStats): string 
   return filter;
 }
 
+/**
+ * Source rows that are one song on the server (#2059): row index -> the source
+ * numbers of the other rows matched to the same server track.
+ *
+ * A playlist can carry a song twice (the album cut and the single, or simply
+ * the same entry again) and both match the one copy in the library. The
+ * server holds that track once, so 55 source tracks read as 54 on the server
+ * with nothing missing and nothing extra, and nothing said which two.
+ */
+export function sharedServerRows(tracks: readonly CompareTrack[]): Map<number, number[]> {
+  const rowsByServerId = new Map<string, number[]>();
+  tracks.forEach((track, index) => {
+    const id = track.server_track?.id;
+    if (track.match_status !== 'matched' || id == null || id === '') return;
+    const rows = rowsByServerId.get(String(id));
+    if (rows) rows.push(index);
+    else rowsByServerId.set(String(id), [index]);
+  });
+  const number = (index: number) => tracks[index].source_track?.position ?? index + 1;
+  const shared = new Map<number, number[]>();
+  for (const rows of rowsByServerId.values()) {
+    if (rows.length < 2) continue;
+    for (const row of rows) shared.set(row, rows.filter((other) => other !== row).map(number));
+  }
+  return shared;
+}
+
+/** The pill that shows only those rows. */
+export function compareSharedLabel(sharedRows: number): string {
+  return `Same song (${sharedRows})`;
+}
+
+/** The mark on a shared row: which other source tracks it stands for. */
+export function compareSharedMark(others: readonly number[]): string {
+  return `Same song as ${others.map((n) => `#${n}`).join(', ')}`;
+}
+
+/** Why the two columns' counts differ, for the footer. */
+export function compareSharedText(shared: ReadonlyMap<number, readonly number[]>): string {
+  if (shared.size === 0) return '';
+  let songs = 0;
+  for (const others of shared.values()) songs += 1 / (others.length + 1);
+  const onServer = Math.round(songs);
+  return (
+    `${shared.size} source tracks are ${onServer === 1 ? 'one song' : `${onServer} songs`} ` +
+    `on the server, so it holds ${shared.size - onServer} fewer`
+  );
+}
+
 /** The header meta line (301). */
 export function compareMetaText(data: CompareResponse): string {
   return (
@@ -398,6 +513,76 @@ export async function fetchComparePlaylist(
   let url = `/api/server/playlist/${playlistId}/tracks?name=${encodeURIComponent(playlistName)}`;
   if (mirroredId) url += `&mirrored_playlist_id=${mirroredId}`;
   return (await (await fetch(url)).json()) as CompareResponse;
+}
+
+/* ── The pre-sync match editor (#1958) ────────────────────────────────────── */
+
+/**
+ * A mirrored playlist that has not synced has no server playlist to compare
+ * with. What it has is the library track each song will sync as, so the editor
+ * shows that and lets the user change it before the first sync. Same row shape
+ * as the compare editor so the rows render the same.
+ */
+export interface PresyncTrack extends CompareTrack {
+  mirror_track_id: number;
+}
+
+export interface PresyncResponse {
+  success?: boolean;
+  error?: string;
+  server_type?: string;
+  source_track_count?: number;
+  server_track_count?: number;
+  /** songs the background library check has not reached yet */
+  unchecked?: number;
+  tracks?: PresyncTrack[];
+}
+
+export async function fetchPresyncMatches(mirrorId: number): Promise<PresyncResponse> {
+  return (await (
+    await fetch(`/api/mirrored-playlists/${mirrorId}/presync`)
+  ).json()) as PresyncResponse;
+}
+
+/** One slice of the background library check, so the editor opens checked. */
+export async function checkMirrorLibrarySlice(
+  mirrorId: number,
+): Promise<{ success?: boolean; remaining?: number; error?: string }> {
+  const response = await fetch(`/api/mirrored-playlists/${mirrorId}/check-library`, {
+    method: 'POST',
+  });
+  return (await response.json()) as { success?: boolean; remaining?: number; error?: string };
+}
+
+export async function setPresyncMatch(
+  mirrorId: number,
+  mirrorTrackId: number,
+  trackId: string,
+  trackTitle: string,
+): Promise<ServerMutationResponse> {
+  const response = await fetch(`/api/mirrored-playlists/${mirrorId}/presync/match`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mirror_track_id: mirrorTrackId,
+      track_id: trackId,
+      track_title: trackTitle,
+    }),
+  });
+  return (await response.json()) as ServerMutationResponse;
+}
+
+export async function presyncUnmatch(
+  mirrorId: number,
+  mirrorTrackId: number,
+  trackId: string,
+): Promise<ServerMutationResponse> {
+  const response = await fetch(`/api/mirrored-playlists/${mirrorId}/presync/unmatch`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mirror_track_id: mirrorTrackId, track_id: trackId }),
+  });
+  return (await response.json()) as ServerMutationResponse;
 }
 
 /* ── Search / Replace / Remove (746-1020) ─────────────────────────────────── */
@@ -731,6 +916,51 @@ export async function deleteServerPlaylist(
     body: JSON.stringify({ playlist_name: playlistName }),
   });
   return (await response.json()) as ServerMutationResponse;
+}
+
+export interface AdoptResponse {
+  success?: boolean;
+  error?: string;
+  id?: number;
+  name?: string;
+  track_count?: number;
+  skipped?: number;
+}
+
+/** a server playlist soulsync didn't make becomes a My Playlist under the
+ *  same name, each track pinned to its server track */
+export async function adoptServerPlaylist(
+  playlistId: string,
+  playlistName: string,
+): Promise<AdoptResponse> {
+  const response = await fetch(`/api/server/playlist/${playlistId}/adopt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: playlistName }),
+  });
+  return (await response.json()) as AdoptResponse;
+}
+
+export interface TagMoodResponse {
+  success: boolean;
+  error?: string;
+  tag?: string;
+  total?: number;
+}
+
+/** add a mood tag to every song on a plex playlist (admin, plex only), so a
+ *  plex smart playlist can start from "mood is <tag>". runs in the background */
+export async function tagServerPlaylistMood(
+  playlistId: string,
+  playlistName: string,
+  tag: string,
+): Promise<TagMoodResponse> {
+  const response = await fetch(`/api/server/playlist/${playlistId}/tag-mood`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: playlistName, tag }),
+  });
+  return (await response.json()) as TagMoodResponse;
 }
 
 /* ── M3U export (632-696) ─────────────────────────────────────────────────── */

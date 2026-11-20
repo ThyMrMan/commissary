@@ -1,4 +1,5 @@
 import asyncio
+from core.async_utils import run_blocking
 import contextvars
 import re
 import threading
@@ -28,6 +29,13 @@ _POOL_FETCH_LIMIT = 10000
 # 180s server scan).
 _WRITE_LOCKS: Dict[str, threading.Lock] = {}
 _WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _db_backed(server_type: str) -> bool:
+    """every server but plex takes a playlist track as the db row's server
+    id. plex wants its own item from fetchItem. a list of the others left
+    music assistant out (#2111)."""
+    return bool(server_type) and server_type != "plex"
 
 
 def _playlist_write_lock(server_type: str) -> threading.Lock:
@@ -186,17 +194,26 @@ def navidrome_client_for_profile(profile_id, client):
     authenticated, so this is what puts a profile's playlist on their
     navidrome user instead of the app account's (#1265). a view, never a
     change to the shared client. no saved login, no profile, or a db that
-    will not answer = the client as-is."""
+    will not answer = the client as-is. an own-library profile's view also
+    reads its own navidrome library only (#2031)."""
     if not profile_id or client is None:
         return client
     try:
         from database.music_database import MusicDatabase
-        login = MusicDatabase().get_profile_navidrome_login(profile_id)
+        db = MusicDatabase()
+        login = db.get_profile_navidrome_login(profile_id)
+        from core.library_scope import own_navidrome_folder
+        folder = own_navidrome_folder(profile_id, db)
     except Exception as e:
         logger.error(f"Per-profile: could not read navidrome login for profile {profile_id}: {e}")
         return client
-    if not login or not hasattr(client, 'as_user'):
+    if not hasattr(client, 'as_user') or not (login or folder):
         return client
+    if folder:
+        logger.info(f"Per-profile: navidrome runs as '{login[0] if login else 'the app account'}' "
+                    f"in library {folder} for profile {profile_id}")
+        return client.as_user(login[0] if login else None, login[1] if login else None,
+                              music_folder_id=folder)
     logger.info(f"Per-profile: navidrome playlist writes run as '{login[0]}' for profile {profile_id}")
     return client.as_user(*login)
 
@@ -299,6 +316,7 @@ def reresolve_manual_match_live_plex(cache_db, media_client, m, *, profile_id,
                 source_album=m.get('source_album'),
                 server_source=server_source,
                 library_file_path=file_path or _plex_track_file(live),
+                library_track_id_kind='server',
             )
         except Exception as _heal_err:
             logger.debug("manual-match heal (save) failed: %s", _heal_err)
@@ -452,6 +470,15 @@ class PlaylistSyncService:
                     logger.error("SoulSync library client not provided to sync service")
                     return None, "soulsync"
                 return client, "soulsync"
+            elif active_server and active_server != "plex":
+                # music assistant and any server added later: by its registered
+                # name. it used to fall through to plex, so a music assistant
+                # sync logged "syncing to PLEX" and failed (#2111)
+                client = self._media_client(active_server)
+                if not client:
+                    logger.error("%s client not provided to sync service", active_server)
+                    return None, active_server
+                return client, active_server
             else:  # Default to Plex
                 client = self._media_client('plex')
                 if profile_id and client:
@@ -560,8 +587,10 @@ class PlaylistSyncService:
         accept it — Plex/Jellyfin keep their existing signatures.
         """
         fn = getattr(client, 'reconcile_playlist', None)
+        # only a client that follows a playlist by id is ever handed one
+        id_kw = {'playlist_id': playlist_id} if playlist_id is not None else {}
         if fn is None:
-            return client.update_playlist(playlist_name, tracks)
+            return client.update_playlist(playlist_name, tracks, **id_kw)
         from core.navidrome_client import NavidromeClient
         if isinstance(client, NavidromeClient):
             # A refused/failed Navidrome write must not trigger another destructive attempt.
@@ -571,7 +600,7 @@ class PlaylistSyncService:
                 logger.error("Navidrome reconcile failed for %r: %s", playlist_name, exc)
                 return False
         try:
-            if fn(playlist_name, tracks):
+            if fn(playlist_name, tracks, **id_kw):
                 return True
             logger.warning(
                 "Reconcile sync failed for '%s' — falling back to replace "
@@ -579,7 +608,7 @@ class PlaylistSyncService:
         except Exception as e:
             logger.warning(
                 "Reconcile sync errored for '%s' (%s) — falling back to replace", playlist_name, e)
-        return client.update_playlist(playlist_name, tracks)
+        return client.update_playlist(playlist_name, tracks, **id_kw)
 
     def _resolve_mirrored_server_playlist_id(
         self,
@@ -635,7 +664,7 @@ class PlaylistSyncService:
             is_request_list = _sync_is_request_list.get()
         if auto_remove_fulfilled is None:
             auto_remove_fulfilled = _sync_auto_remove_fulfilled.get()
-        request_row = await asyncio.to_thread(_request_list_row, getattr(playlist, 'id', None))
+        request_row = await run_blocking(_request_list_row, getattr(playlist, 'id', None))
         if request_row:
             is_request_list = True
             auto_remove_fulfilled = bool(request_row.get('auto_remove_fulfilled'))
@@ -781,7 +810,7 @@ class PlaylistSyncService:
                 if is_request_list and auto_remove_fulfilled and matched_tracks and request_row:
                     # db reads and spotify calls: off the shared loop
                     try:
-                        await asyncio.to_thread(
+                        await run_blocking(
                             self._handle_request_list_spotify_removal,
                             request_row, matched_tracks, profile_id)
                     except Exception as rm_err:
@@ -877,7 +906,7 @@ class PlaylistSyncService:
                             with _playlist_write_lock(server_type):
                                 return media_client.create_playlist(
                                     playlist.name, [])
-                        _created = await asyncio.to_thread(_create_empty)
+                        _created = await run_blocking(_create_empty)
                         if _created:
                             # Link it so the next sync follows the server ID.
                             self._resolve_mirrored_server_playlist_id(
@@ -909,9 +938,11 @@ class PlaylistSyncService:
                     # media server calls block, keep them off the shared loop.
                     # Only the Navidrome client accepts playlist_id; Plex /
                     # Jellyfin keep their existing signatures.
+                    from core.sync.mirrored_server_link import follows_by_id
                     _navidrome_id_kw = (
                         {'playlist_id': server_playlist_id}
-                        if server_type == 'navidrome' else {}
+                        if follows_by_id(server_type) and server_playlist_id is not None
+                        else {}
                     )
                     # what each source track matched, so append can drop an
                     # old wrong match the right track replaced (#1801)
@@ -946,10 +977,10 @@ class PlaylistSyncService:
                             return bool(ok), (
                                 list(skipped)
                                 if isinstance(skipped, (list, tuple, set)) else [])
-                    sync_success, _write_skipped_ids = await asyncio.to_thread(
+                    sync_success, _write_skipped_ids = await run_blocking(
                         _dispatch_write)
 
-                    if (sync_success and server_type == 'navidrome'
+                    if (sync_success and follows_by_id(server_type)
                             and server_playlist_id is None and media_client is not None):
                         # Nothing was linked and the name-match found nothing,
                         # so the write above created the playlist — record its
@@ -1067,12 +1098,16 @@ class PlaylistSyncService:
                 return self._create_error_result(playlist.name, ["Sync cancelled"])
 
             wishlist_added_count = 0
-            unmatched_tracks = self._drop_skipped_unmatched_wishlist(
+            # #1621/#1689: a skipped sync-time wishlist is reported; the owned
+            # check still runs so sync history shows current library presence.
+            skip_wishlist = getattr(self, '_skip_unmatched_wishlist', False)
+            self._drop_skipped_unmatched_wishlist(
                 playlist, unmatched_tracks,
                 total_tracks=total_tracks, matched_tracks=matched_tracks)
             if unmatched_tracks:
-                wishlist_added_count = await asyncio.to_thread(
-                    self._wishlist_unmatched, playlist, unmatched_tracks)
+                wishlist_added_count = await run_blocking(
+                    self._wishlist_unmatched, playlist, unmatched_tracks,
+                    add_to_wishlist=not skip_wishlist)
 
             # Build per-track match details for sync history
             _match_details = []
@@ -1119,6 +1154,11 @@ class PlaylistSyncService:
                         # the file was deleted (#1417)
                         'id': str(getattr(mr.plex_track, 'ratingKey', '') or ''),
                     }
+                if getattr(mr, 'owned_in_library', False):
+                    detail['owned_in_library'] = True
+                    detail['download_status'] = None
+                elif skip_wishlist and not _is_found:
+                    detail['download_status'] = None
                 if id(mr) in server_missing_results:
                     # matched a library row the server no longer has; the
                     # matched_track id above is that dead id, kept so the
@@ -1190,7 +1230,7 @@ class PlaylistSyncService:
             return []  # Clear so the wishlist loop below doesn't run
         return unmatched_tracks
 
-    def _wishlist_unmatched(self, playlist, unmatched_tracks) -> int:
+    def _wishlist_unmatched(self, playlist, unmatched_tracks, *, add_to_wishlist=True) -> int:
         """put the tracks the library doesn't have on the wishlist, returns
         how many went on. a db write per track, so the sync runs this off the
         shared event loop (see _find_track_in_media_server)."""
@@ -1214,10 +1254,29 @@ class PlaylistSyncService:
                 # stringify past it instead of matching "unknown artist".
                 stub_artist = _artist_name((spotify_track.artists or [None])[0])
                 if is_stub_id(spotify_track.id) and not should_wishlist_stub(
-                    stub_artist, spotify_track.name,
+                    stub_artist, spotify_track.name, spotify_track.id,
                 ):
                     logger.info(f"Skipping wishlist for wing-it track: {spotify_track.name}")
                     drop_reasons["wing-it stub (ineligible)"] = drop_reasons.get("wing-it stub (ineligible)", 0) + 1
+                    continue
+
+                # File ownership and server recognition are separate in
+                # Library v2. Do not download a published file again while
+                # its media-server mapping is awaiting a scan.
+                from core.wishlist.library_match import find_owned_match
+                from core.settings import config_manager
+                owned = find_owned_match(
+                    getattr(wishlist_service, 'database', None), spotify_track.name, spotify_track.artists,
+                    getattr(spotify_track, 'album', None), config_manager.get_active_media_server(),
+                    strict_identity=True,
+                )
+                if owned:
+                    match_result.owned_in_library = True
+                    logger.info("Skipping wishlist for already-owned recording: %s", spotify_track.name)
+                    wishlist_covered_count += 1  # you have it: nothing is missing
+                    continue
+
+                if not add_to_wishlist:
                     continue
 
                 # Check if we have original track data with full album objects
@@ -1280,7 +1339,7 @@ class PlaylistSyncService:
                     drop_reasons[drop_reason] = drop_reasons.get(drop_reason, 0) + 1
 
             logger.info(f"Successfully added {wishlist_added_count}/{len(unmatched_tracks)} tracks to wishlist")
-            if unmatched_tracks and wishlist_covered_count == 0:
+            if add_to_wishlist and unmatched_tracks and wishlist_covered_count == 0:
                 # #1621: the "doesn't seem to try" silence — every miss dropped
                 # without a trace (wing-it stub gate / ignore-list swallows).
                 # Loud at WARNING so a 0-of-N wishlist add is diagnosable.
@@ -1344,10 +1403,10 @@ class PlaylistSyncService:
         the matcher is all blocking work (sqlite, fuzzy scoring, plex
         fetchItem) and never awaits, so run inline it held that loop for the
         whole matching pass and the app froze until the sync finished. the
-        thread keeps the loop free; to_thread copies the context, so the sync's
+        shared pool keeps the loop free and copies the context, so the sync's
         profile id comes along.
         """
-        return await asyncio.to_thread(self._find_track_blocking, spotify_track, candidate_pool)
+        return await run_blocking(self._find_track_blocking, spotify_track, candidate_pool)
 
     def _match_was_rejected(self, spotify_track, server_source, library_track_id) -> bool:
         """whether the user unmatched this source track from this library track
@@ -1392,10 +1451,10 @@ class PlaylistSyncService:
                 sync needs (DB row for Jellyfin/Navidrome/SoulSync, Plex fetchItem)."""
                 if server_track_id is None:
                     return None
-                dbt = cache_db.get_track_by_id(server_track_id)
+                dbt = cache_db.get_track_by_server_id(server_track_id, active_server)
                 if not dbt:
                     return None
-                if server_type in ("jellyfin", "navidrome", "soulsync"):
+                if _db_backed(server_type):
                     class DbTrackFromCache:
                         def __init__(self, db_t):
                             self.ratingKey = db_t.id
@@ -1435,7 +1494,7 @@ class PlaylistSyncService:
                                 album=getattr(spotify_track, 'album', None),
                                 server_source=active_server,
                                 cached_track_id=cached['server_track_id'],
-                                cached_track_row=cache_db.get_track_by_id(cached['server_track_id']),
+                                cached_track_row=cache_db.get_track_by_server_id(cached['server_track_id'], active_server),
                                 threshold=0.7,
                             ):
                                 logger.info(
@@ -1469,10 +1528,16 @@ class PlaylistSyncService:
                     m = cache_db.find_manual_library_match_by_source_track_id(
                         _profile_id, str(_match_id), active_server)
                     if m:
-                        actual_track = _materialize(m.get('library_track_id'))
+                        # the stored id is a catalogue id; _materialize speaks
+                        # the server's (Library v2 keeps the two apart)
+                        from core.sync.match_overrides import manual_match_server_id
+                        actual_track = _materialize(manual_match_server_id(
+                            cache_db, m.get('library_track_id'), active_server,
+                            m.get('library_track_id_kind')))
                         if not actual_track and m.get('library_file_path'):
                             new_id = cache_db.find_track_id_by_file_path(m['library_file_path'])
-                            actual_track = _materialize(new_id)
+                            actual_track = _materialize(manual_match_server_id(
+                                cache_db, new_id, active_server) if new_id else None)
                         # Plex re-keys tracks on a metadata refresh, and the SoulSync
                         # DB id IS that ratingKey — so both lookups above can land on
                         # the same stale key and 404. Re-resolve against LIVE Plex by
@@ -1601,7 +1666,7 @@ class PlaylistSyncService:
                         
                         # Fetch the actual track object from active media server using the database track ID
                         try:
-                            if server_type in ("jellyfin", "navidrome", "soulsync"):
+                            if _db_backed(server_type):
                                 # DB-backed servers — no remote fetchItem (SoulSync standalone included).
                                 class DbTrackFromDB:
                                     def __init__(self, db_track):
@@ -1880,14 +1945,25 @@ class PlaylistSyncService:
 
 
 def _library_spotify_id(db, library_track_id) -> Optional[str]:
-    """the spotify id a library track is stored under, or None."""
+    """the spotify id a library track is stored under, or None. the sync's
+    track id is the active server's, so it resolves to the catalogue track
+    the way get_track_by_server_id does: the mapping first, then the
+    compatibility pair."""
     if library_track_id in (None, ''):
         return None
     try:
+        from core.settings import config_manager
+        server = config_manager.get_active_media_server()
+        row = None
         with db._get_connection() as conn:
-            row = conn.execute(
-                "SELECT spotify_track_id FROM tracks WHERE id = ?", (str(library_track_id),)
-            ).fetchone()
+            for where in ("t.id = (SELECT m.entity_id FROM lib2_media_server_mappings m"
+                          " WHERE m.entity_type='track' AND m.server_source=? AND m.server_id=?"
+                          " LIMIT 1)",
+                          "t.server_source=? AND t.server_id=?"):
+                row = conn.execute(f"SELECT t.spotify_id FROM lib2_tracks t WHERE {where} LIMIT 1",
+                                   (server, str(library_track_id))).fetchone()
+                if row:
+                    break
     except Exception as e:  # noqa: BLE001 - no proof means keep the track
         logger.debug("library spotify id lookup for %s failed: %s", library_track_id, e)
         return None

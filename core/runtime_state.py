@@ -14,7 +14,28 @@ matched_context_lock = threading.Lock()
 matched_downloads_context: Dict[str, Dict[str, Any]] = {}
 tasks_lock = threading.Lock()
 download_tasks: Dict[str, Dict[str, Any]] = {}
-download_batches: Dict[str, Dict[str, Any]] = {}
+class _BatchRegistry(dict):
+    """``download_batches``, which decides a new batch's library on arrival.
+
+    Where a download lands is decided while a request -- and an admin's pick --
+    still exists (#1199), and every creator is meant to stamp it. There are a
+    dozen creators, and upstream adds more every release; one that forgets
+    would send an admin's grab for someone else's library into the shared one.
+    So a batch registered without a decision gets one here, the same one
+    ``core.library_scope.owner_for_new_file`` would give for its profile.
+    """
+
+    def __setitem__(self, key, value):
+        if isinstance(value, dict):
+            try:
+                from core.library_scope import stamp_batch_owner
+                stamp_batch_owner(value)
+            except Exception:  # noqa: BLE001, S110 - undecided still resolves by profile
+                pass
+        super().__setitem__(key, value)
+
+
+download_batches: Dict[str, Dict[str, Any]] = _BatchRegistry()
 batch_locks: Dict[str, threading.Lock] = {}
 processed_download_ids = set()
 post_process_locks: Dict[str, threading.Lock] = {}
@@ -49,6 +70,34 @@ def set_activity_toast_emitter(emitter) -> None:
     _activity_toast_emitter = emitter
 
 
+def _acting_profile_id():
+    """the profile a web request acts as, or None for background work. the
+    feed shows a member only what their own requests did; the rest is the
+    install's, the admin's to see."""
+    try:
+        from flask import g, has_request_context
+        if not has_request_context():
+            return None
+        pid = getattr(g, "profile_id", None)
+        return int(pid) if pid is not None else None
+    except Exception:  # noqa: BLE001 - no profile is the safe answer
+        return None
+
+
+def activity_visible_to(items, profile_id, is_admin):
+    """the activity items this viewer may see: an admin, all of them; anyone
+    else, the ones their own requests made."""
+    if is_admin:
+        return list(items)
+    if profile_id is None:
+        return []
+    try:
+        me = int(profile_id)
+    except (TypeError, ValueError):
+        return []
+    return [a for a in items if a.get("profile_id") == me]
+
+
 def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
     """Append an activity item and emit a toast if an emitter is configured."""
     activity_item = {
@@ -58,6 +107,7 @@ def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
         "time": time_ago,
         "timestamp": time.time(),
         "show_toast": show_toast,
+        "profile_id": _acting_profile_id(),
     }
     with activity_feed_lock:
         activity_feed.append(activity_item)

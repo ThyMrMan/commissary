@@ -248,9 +248,12 @@ def test_usenet_cancel_during_submission_cleans_up_late_job(monkeypatch, remove,
 
     assert removals == [('late-job', remove)]
     assert polls == []
-    if remove or clear_after_cancel:
+    if remove:
         assert 'dl' not in plugin.active_downloads
     else:
+        # Ours (P1-21): a cancel the client has not confirmed yet stays listed
+        # as 'Cancelling', so "clear completed" keeps it; the late job's
+        # confirmed removal settles it as 'Cancelled'.
         assert plugin.active_downloads['dl']['state'] == 'Cancelled'
 
 
@@ -310,6 +313,91 @@ def test_usenet_cancel_during_file_collection_cannot_restore_success(monkeypatch
     monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
     monkeypatch.setattr(module, 'collect_audio_after_extraction', collect)
     plugin._finalize_download('dl', str(tmp_path))
+    assert plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+class _TorrentCancelAdapter:
+    """review 5 W2-WC-5 fixture: a client that answers add_torrent_smart late"""
+
+    def __init__(self, plugin, *, cancel_on_add=False, cancel_on_poll=False, remove=False):
+        self.plugin, self.remove_files = plugin, remove
+        self.cancel_on_add, self.cancel_on_poll = cancel_on_add, cancel_on_poll
+        self.removals, self.polls = [], []
+
+    def is_configured(self):
+        return True
+
+    async def remove(self, torrent_hash, delete_files=False):
+        self.removals.append((torrent_hash, delete_files))
+        return True
+
+    async def get_status(self, torrent_hash):
+        self.polls.append(torrent_hash)
+        if self.cancel_on_poll:
+            await self.plugin.cancel_download('dl', remove=False)
+        return TorrentStatus(id=torrent_hash, name='Release', state='downloading',
+                             progress=0.25, size=100, downloaded=25, download_speed=1)
+
+
+def _drive_torrent_cancel(monkeypatch, adapter):
+    import core.download_plugins.torrent as module
+    import core.torrent_clients.base as client_base
+    plugin = adapter.plugin
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'torrent_hash': None}
+    polls_left = [3]
+    plugin.set_shutdown_check(lambda: polls_left.__setitem__(0, polls_left[0] - 1) or polls_left[0] < 0)
+
+    async def add(client, url, **kwargs):
+        if adapter.cancel_on_add:
+            await plugin.cancel_download('dl', remove=adapter.remove_files)
+        return 'late-hash'
+
+    monkeypatch.setattr(module, 'get_active_torrent_adapter', lambda: adapter)
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    monkeypatch.setattr(module.time, 'sleep', lambda *_: None)
+    monkeypatch.setattr(client_base, 'add_torrent_smart', add)
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.torrent', 'Release')
+
+
+@pytest.mark.parametrize('remove', [False, True])
+def test_torrent_cancel_during_submission_retires_the_late_torrent(monkeypatch, remove):
+    """review 5 W2-WC-5: a cancel before the client returned the hash removed
+    nothing, then the worker stored the hash and polled the torrent to the end"""
+    adapter = _TorrentCancelAdapter(TorrentDownloadPlugin(), cancel_on_add=True, remove=remove)
+    _drive_torrent_cancel(monkeypatch, adapter)
+
+    assert adapter.removals == [('late-hash', remove)]
+    assert adapter.polls == []
+    if remove:
+        assert 'dl' not in adapter.plugin.active_downloads
+    else:
+        assert adapter.plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+def test_torrent_cancel_during_status_poll_cannot_restore_downloading(monkeypatch):
+    adapter = _TorrentCancelAdapter(TorrentDownloadPlugin(), cancel_on_poll=True)
+    _drive_torrent_cancel(monkeypatch, adapter)
+
+    assert adapter.removals == [('late-hash', False)]
+    assert adapter.polls == ['late-hash']
+    assert adapter.plugin.active_downloads['dl']['state'] == 'Cancelled'
+
+
+def test_torrent_add_failure_after_cancel_preserves_cancelled_state(monkeypatch):
+    import core.download_plugins.torrent as module
+    import core.torrent_clients.base as client_base
+    plugin = TorrentDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'torrent_hash': None}
+
+    async def add(client, url, **kwargs):
+        await plugin.cancel_download('dl', remove=False)
+        return None
+
+    adapter = _TorrentCancelAdapter(plugin)
+    monkeypatch.setattr(module, 'get_active_torrent_adapter', lambda: adapter)
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    monkeypatch.setattr(client_base, 'add_torrent_smart', add)
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.torrent', 'Release')
     assert plugin.active_downloads['dl']['state'] == 'Cancelled'
 
 
@@ -471,15 +559,18 @@ def test_torrent_project_results_encodes_token_and_title_in_filename() -> None:
     assert display == 'Danny Brown - Atrocity Exhibition [FLAC]'
 
 
-def test_torrent_project_falls_back_to_indexer_name_when_title_lacks_dash() -> None:
+def test_torrent_project_falls_back_to_placeholder_when_title_lacks_dash() -> None:
     """When the title has no 'Artist -' prefix we'd auto-parse the
     filename (which starts with the indexer download URL) and end
     up showing the URL in the UI's 'by' field. Pre-filling artist
-    with the indexer name avoids that."""
+    with a generic placeholder avoids that — the indexer name (e.g.
+    "NZBGeek") must NOT be used as a stand-in artist: it's a source,
+    not a performer, and showing it as one is misleading."""
     plugin = TorrentDownloadPlugin()
     tracks, _ = plugin._project_results([_make_torrent_result(title='JustATitle')])
-    assert tracks[0].artist == 'Indexer'
-    # And the URL is definitely not the artist.
+    assert tracks[0].artist == 'Unknown Artist'
+    # The indexer name only belongs in source metadata, never the artist.
+    assert tracks[0].artist != 'Indexer'
     assert 'http' not in tracks[0].artist
     assert '||' not in tracks[0].artist
 
@@ -900,11 +991,24 @@ def test_usenet_project_encodes_token_in_filename() -> None:
     # Artist + title should be parsed out, not auto-extracted from filename.
     assert tracks[0].artist == 'Some Artist'
     assert tracks[0].title == 'Some Album'
+    assert tracks[0]._source_metadata['release_title'] == 'Some Artist - Some Album'
     # The helper's category is Audio/MP3, structured quality evidence even when
     # the title is bare; bitrate remains unknown until title/file says it.
     assert tracks[0].quality == 'mp3'
     assert tracks[0].bitrate is None
     assert tracks[0]._source_metadata['categories'] == [3010]
+
+
+def test_usenet_project_falls_back_to_placeholder_when_title_lacks_dash() -> None:
+    """Sibling of the torrent-plugin regression: an indexer name (e.g.
+    "NZBGeek") must never stand in for the artist when the release title
+    has no 'Artist - Title' separator."""
+    plugin = UsenetDownloadPlugin()
+    tracks, _ = plugin._project_results(
+        [_make_usenet_result(title='JustATitle', indexer_name='NZBGeek')]
+    )
+    assert tracks[0].artist == 'Unknown Artist'
+    assert tracks[0].artist != 'NZBGeek'
 
 
 def test_usenet_project_results_carries_lossy_bitrate() -> None:
@@ -1310,6 +1414,42 @@ def test_torrent_album_to_staging_no_results_flags_fallback(tmp_path: Path) -> N
     fake_adapter.add_torrent.assert_not_called()
 
 
+def test_torrent_album_to_staging_hands_the_torrent_to_the_seed_policy(tmp_path: Path) -> None:
+    """review 5 W2-WC-6: only the per-track flow applied the seed policy, so
+    every album torrent seeded forever whatever ratio/time goals were set"""
+    from types import SimpleNamespace
+
+    plugin = TorrentDownloadPlugin()
+    release = _make_torrent_result(title='Artist - Album [FLAC]')
+    audio = tmp_path / '01.flac'
+    audio.write_bytes(b'x')
+    adapter = MagicMock()
+    adapter.is_configured.return_value = True
+    adapter.get_status = AsyncMock(return_value=SimpleNamespace(
+        name='Artist - Album', content_path=None, state='seeding'))
+    applied = []
+    with patch.object(TorrentDownloadPlugin, 'is_configured', return_value=True), \
+         patch('core.download_plugins.torrent.get_active_torrent_adapter', return_value=adapter), \
+         patch('core.download_plugins.torrent.prowlarr_search_with_variants',
+               AsyncMock(return_value=[release])), \
+         patch('core.download_plugins.torrent.pick_best_album_release', return_value=release), \
+         patch('core.download_plugins.torrent.profile_allowed_formats', return_value=None), \
+         patch('core.download_plugins.torrent.profile_quality_targets', return_value=([], True)), \
+         patch('core.download_plugins.torrent.release_sources', return_value=[release]), \
+         patch('core.torrent_clients.base.add_torrent_smart', AsyncMock(return_value='hash-album')), \
+         patch('core.download_plugins.torrent.poll_album_download', return_value=str(tmp_path)), \
+         patch('core.download_plugins.torrent._collect_album_audio', return_value=([audio], tmp_path)), \
+         patch('core.download_plugins.torrent.copy_audio_files_atomically', return_value=[str(audio)]), \
+         patch.object(TorrentDownloadPlugin, '_apply_seed_policy',
+                      lambda self, h, t: applied.append((h, t))):
+        outcome = plugin.download_album_to_staging('Album', 'Artist', str(tmp_path / 'stage'))
+
+    assert outcome['success'] is True
+    assert applied == [('hash-album', 'Artist - Album')]
+    assert outcome['client_job_id'] == 'hash-album'
+    assert outcome['client_job_label'] == 'Artist - Album [FLAC]'
+
+
 def test_usenet_album_to_staging_no_results_flags_fallback(tmp_path: Path) -> None:
     """Same contract for usenet: an empty search must fall back to the
     per-track flow rather than hard-failing the album batch."""
@@ -1480,3 +1620,57 @@ def test_audio_from_single_file_archive_ignores_neighbours(tmp_path: Path) -> No
     out = _audio_from_single_file(archive)
     assert [p.name for p in out] == ['track.flac']
     assert out[0].parent == tmp_path / 'Album'
+
+
+@pytest.mark.parametrize('remove', [False, True])
+def test_usenet_cancel_before_the_job_id_says_yes(monkeypatch, remove):
+    """the submit thread retires the late job itself, so a cancel sent while
+    it waits for the client's id will happen. 3.6.1 said yes; v2 said the
+    cancel failed and the ui showed an error for a cancel that worked."""
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'job_id': None}
+    grabs = []
+    monkeypatch.setattr(plugin, '_update_grab', lambda did, **kw: grabs.append(kw))
+    monkeypatch.setattr(plugin, '_persisted_job_id', lambda did: None)
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: None)
+
+    assert asyncio.run(plugin.cancel_download('dl', remove=remove)) is True
+    # the intent is on disk, so a restart still retires the job
+    assert grabs and grabs[-1].get('status') == 'cancel_pending'
+    if remove:
+        assert 'dl' not in plugin.active_downloads
+    else:
+        assert plugin.active_downloads['dl']['state'] == 'Cancelling'
+        assert plugin.active_downloads['dl']['cancel_requested'] is True
+
+
+def test_usenet_cancel_with_no_client_job_and_no_submission_still_says_no(monkeypatch):
+    """a grab with no row and no job anywhere is not a cancel that will happen."""
+    import core.download_plugins.usenet as module
+    plugin = UsenetDownloadPlugin()
+    monkeypatch.setattr(plugin, '_update_grab', lambda did, **kw: None)
+    monkeypatch.setattr(plugin, '_persisted_job_id', lambda did: None)
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: None)
+    assert asyncio.run(plugin.cancel_download('gone', remove=False)) is False
+
+
+def test_usenet_failed_nzb_fetch_marks_the_download_failed_with_the_reason(monkeypatch):
+    # #2030: the adapter fetches the nzb itself; a failed fetch is the grab's
+    # failure, said plainly, so the retry path picks it up
+    import core.download_plugins.usenet as module
+    from core.usenet_clients.nzb_fetch import NzbFetchError
+    plugin = UsenetDownloadPlugin()
+    plugin.active_downloads['dl'] = {'id': 'dl', 'state': 'Initializing', 'job_id': None}
+    errors = []
+
+    class Adapter:
+        def is_configured(self): return True
+        async def add_nzb(self, url):
+            raise NzbFetchError("could not download the NZB from the indexer (HTTP 429)")
+
+    monkeypatch.setattr(module, 'get_active_usenet_adapter', lambda: Adapter())
+    monkeypatch.setattr(module, 'run_async', asyncio.run)
+    monkeypatch.setattr(plugin, '_mark_error', lambda dl, msg: errors.append((dl, msg)))
+    plugin._download_thread('dl', 'https://indexer.invalid/synthetic.nzb?apikey=s')
+    assert errors == [('dl', 'Usenet grab failed: could not download the NZB from the indexer (HTTP 429)')]

@@ -31,6 +31,7 @@ from core.repair_jobs.album_release_year_repair import (
 from core.repair_jobs.base import JobContext
 from core.repair_worker import FINDING_TYPE_META, JOB_CATEGORIES, RepairWorker
 from database.music_database import MusicDatabase
+from tests import lib2_seed
 
 
 def _make_flac(path, tags=None):
@@ -128,9 +129,9 @@ def test_is_folder_exclusive_to_album(tmp_path):
     t2 = str(folder / "02.flac")
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Artist')")
-        conn.execute("INSERT INTO albums (id, artist_id, title) VALUES (10, 1, 'Album 1')")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (101, 10, 1, 'T1', ?)", (t1,))
+        lib2_seed.artist(conn, 'Artist')
+        conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (10, 1, 'Album 1')")
+        lib2_seed.file_track(conn, 101, 10, 'T1', t1)
         conn.commit()
 
     # Folder has only tracks from album 10
@@ -140,8 +141,8 @@ def test_is_folder_exclusive_to_album(tmp_path):
 
     # Insert a track from another album into the same folder
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO albums (id, artist_id, title) VALUES (20, 1, 'Album 2')")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (102, 20, 1, 'T2', ?)", (t2,))
+        conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (20, 1, 'Album 2')")
+        lib2_seed.file_track(conn, 102, 20, 'T2', t2)
         conn.commit()
 
     # Now folder contains multiple albums
@@ -175,9 +176,8 @@ def test_rename_album_folder_updates_db(tmp_path):
     t1_old.write_bytes(b"dummy")
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Queen')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, year) VALUES (1, 1, 'Jazz', 2011)")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (1, 1, 1, 'Mustapha', ?)", (str(t1_old),))
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=2011)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', str(t1_old))
         conn.commit()
 
     new_folder_path = rename_album_folder(db, str(old_folder), "Jazz (1978)", 1)
@@ -188,7 +188,7 @@ def test_rename_album_folder_updates_db(tmp_path):
     # Verify track file_path in DB was updated
     with db._get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT file_path FROM tracks WHERE id = 1")
+        cursor.execute("SELECT path FROM lib2_track_files WHERE track_id = 1")
         new_db_fp = cursor.fetchone()[0]
         assert "Jazz (1978)" in new_db_fp
         assert os.path.exists(new_db_fp)
@@ -262,16 +262,15 @@ def test_resolve_canonical_album_year_waterfall():
     assert res_search[0] == "1978"
 
 
-def test_scan_dry_run_generates_findings(tmp_path):
+def test_scan_dry_run_generates_findings(tmp_path, monkeypatch):
     db = MusicDatabase(str(tmp_path / "test.db"))
     album_dir = tmp_path / "Queen" / "Jazz (2011)"
     f1 = album_dir / "01.flac"
     _make_flac(f1, {'DATE': '2011', 'ALBUM': 'Jazz', 'ARTIST': 'Queen'})
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Queen')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, year) VALUES (1, 1, 'Jazz', 2011)")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (1, 1, 1, 'Mustapha', ?)", (str(f1),))
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=2011)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', str(f1))
         conn.commit()
 
     mb_client = MagicMock()
@@ -295,8 +294,17 @@ def test_scan_dry_run_generates_findings(tmp_path):
         create_finding=create_finding,
     )
 
+    import core.repair_jobs.album_release_year_repair as repair
+    original_resolve = repair.resolve_canonical_album_year
+    requested_titles = []
+    def resolve_with_titles(**kwargs):
+        requested_titles.extend(kwargs.get('track_titles') or [])
+        return original_resolve(**kwargs)
+    monkeypatch.setattr(repair, 'resolve_canonical_album_year', resolve_with_titles)
     job = AlbumReleaseYearRepairJob()
     result = job.scan(ctx)
+    assert requested_titles == ['Mustapha']
+
 
     assert result.scanned == 1
     assert result.findings_created == 1
@@ -310,7 +318,7 @@ def test_scan_dry_run_generates_findings(tmp_path):
     # In dry run, files and DB are untouched
     assert os.path.exists(str(f1))
     with db._get_connection() as conn:
-        yr = conn.execute("SELECT year FROM albums WHERE id = 1").fetchone()[0]
+        yr = conn.execute("SELECT year FROM lib2_albums WHERE id = 1").fetchone()[0]
         assert yr == 2011
 
 
@@ -321,9 +329,8 @@ def test_repair_worker_fix_execution(tmp_path):
     _make_flac(f1, {'DATE': '2011', 'ALBUM': 'Jazz', 'ARTIST': 'Queen'})
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Queen')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, year) VALUES (1, 1, 'Jazz', 2011)")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (1, 1, 1, 'Mustapha', ?)", (str(f1),))
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=2011)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', str(f1))
         conn.commit()
 
     worker = RepairWorker(db, transfer_folder=str(tmp_path))
@@ -338,7 +345,7 @@ def test_repair_worker_fix_execution(tmp_path):
         'new_folder_name': 'Jazz (1978)',
     }
 
-    outcome = worker._execute_fix('album_release_year_mismatch', 'album', '1', str(f1), details)
+    outcome = worker._execute_fix('album_release_year_mismatch', 'album', 'lib2:1', str(f1), details)
     assert outcome['success'] is True
     assert outcome['action'] == 'aligned_release_year'
 
@@ -355,9 +362,9 @@ def test_repair_worker_fix_execution(tmp_path):
 
     # Verify database album year was updated
     with db._get_connection() as conn:
-        yr = conn.execute("SELECT year FROM albums WHERE id = 1").fetchone()[0]
+        yr = conn.execute("SELECT year FROM lib2_albums WHERE id = 1").fetchone()[0]
         assert yr == 1978
-        new_fp = conn.execute("SELECT file_path FROM tracks WHERE id = 1").fetchone()[0]
+        new_fp = conn.execute("SELECT path FROM lib2_track_files WHERE track_id = 1").fetchone()[0]
         assert "Jazz (1978)" in new_fp
 
 
@@ -383,9 +390,8 @@ def test_rename_album_folder_docker_paths(tmp_path):
     docker_fp = "/docker_media/Queen/Jazz (2011)/01.flac"
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES (1, 'Queen')")
-        conn.execute("INSERT INTO albums (id, artist_id, title, year) VALUES (1, 1, 'Jazz', 2011)")
-        conn.execute("INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES (1, 1, 1, 'Mustapha', ?)", (docker_fp,))
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=2011)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', docker_fp)
         conn.commit()
 
     renamed = rename_album_folder(db, str(host_album_dir), "Jazz (1978)", 1)
@@ -394,67 +400,331 @@ def test_rename_album_folder_docker_paths(tmp_path):
 
     # Verify track in DB was updated correctly despite host vs docker path prefix difference
     with db._get_connection() as conn:
-        new_db_fp = conn.execute("SELECT file_path FROM tracks WHERE id = 1").fetchone()[0]
+        new_db_fp = conn.execute("SELECT path FROM lib2_track_files WHERE track_id = 1").fetchone()[0]
         assert new_db_fp == "/docker_media/Queen/Jazz (1978)/01.flac"
 
 
 
 def test_repair_worker_fix_execution_with_text_album_id(tmp_path):
-    """#1633: Navidrome-backed libraries use TEXT soul ids for albums.
-
-    The fix handler used to cast album_id to int, which raised
-    "invalid literal for int()" on ids like '2G0CgWoRXSwDbwnkmPpg6e' and
-    failed every album_release_year_mismatch finding with HTTP 400.
-    """
+    """#1633 on Library v2: a Navidrome-backed album's TEXT id is its server
+    id; the finding names the catalogue row, and the fix must not trip over
+    the text id riding in the details."""
     db = MusicDatabase(str(tmp_path / "test.db"))
-    album_id = "2G0CgWoRXSwDbwnkmPpg6e"
+    soul_id = "2G0CgWoRXSwDbwnkmPpg6e"
     album_dir = tmp_path / "10 Years" / "Deconstructed (2022)"
     f1 = album_dir / "01.flac"
     _make_flac(f1, {'DATE': '2022', 'ALBUM': 'Deconstructed', 'ARTIST': '10 Years'})
 
     with db._get_connection() as conn:
-        conn.execute("INSERT INTO artists (id, name) VALUES ('ar1', '10 Years')")
-        conn.execute(
-            "INSERT INTO albums (id, artist_id, title, year) VALUES (?, 'ar1', 'Deconstructed', 2022)",
-            (album_id,),
-        )
-        conn.execute(
-            "INSERT INTO tracks (id, album_id, artist_id, title, file_path) VALUES ('t1', ?, 'ar1', 'Track 1', ?)",
-            (album_id, str(f1)),
-        )
+        album_id = lib2_seed.album(conn, '10 Years', 'Deconstructed', year=2022,
+                                   server_source='navidrome', server_id=soul_id)
+        lib2_seed.file_track(conn, 1, album_id, 'Track 1', str(f1))
         conn.commit()
 
     worker = RepairWorker(db, transfer_folder=str(tmp_path))
     worker._config_manager = _MockConfig()
 
     details = {
-        'album_id': album_id,
+        'album_id': soul_id,
         'canonical_year': '2021',
         'canonical_date': '2021-06-04',
-        'tracks': [{'id': 't1', 'file_path': str(f1)}],
+        'tracks': [{'id': 'lib2:1', 'file_path': str(f1)}],
         'folder_path': str(album_dir),
         'new_folder_name': 'Deconstructed (2021)',
     }
 
-    outcome = worker._execute_fix('album_release_year_mismatch', 'album', album_id, str(f1), details)
+    outcome = worker._execute_fix('album_release_year_mismatch', 'album', f'lib2:{album_id}', str(f1), details)
     assert outcome['success'] is True
     assert outcome['action'] == 'aligned_release_year'
 
-    # Verify folder was renamed
     new_dir = tmp_path / "10 Years" / "Deconstructed (2021)"
     assert os.path.isdir(new_dir)
     assert not os.path.exists(album_dir)
-
-    # Verify audio file tags were written
     tags = read_file_year_tags(str(new_dir / "01.flac"))
     assert tags['original_year'] == '2021'
     assert tags['date'] == '2021-06-04'
 
-    # Verify the database album year was updated (TEXT id matched correctly)
     with db._get_connection() as conn:
-        yr = conn.execute("SELECT year FROM albums WHERE id = ?", (album_id,)).fetchone()[0]
-        assert yr == 2021
-        tyr = conn.execute("SELECT year FROM tracks WHERE id = 't1'").fetchone()[0]
-        assert tyr == 2021
-        new_fp = conn.execute("SELECT file_path FROM tracks WHERE id = 't1'").fetchone()[0]
+        assert conn.execute("SELECT year FROM lib2_albums WHERE id = ?", (album_id,)).fetchone()[0] == 2021
+        new_fp = conn.execute("SELECT path FROM lib2_track_files WHERE track_id = 1").fetchone()[0]
         assert "Deconstructed (2021)" in new_fp
+
+
+def test_rename_leaves_another_librarys_copy_where_it_is(tmp_path):
+    """third #1062 review G11-4: the folder-name fallback also rewrote another
+    library's copy of the album (a same-named folder elsewhere) into a folder
+    that was never renamed: it read as missing and was re-downloaded"""
+    db = MusicDatabase(str(tmp_path / "test.db"))
+    shared = tmp_path / "music" / "Queen" / "Jazz (2011)"
+    own = tmp_path / "own" / "bob" / "Queen" / "Jazz (2011)"
+    for folder in (shared, own):
+        folder.mkdir(parents=True)
+        (folder / "01.flac").write_bytes(b"dummy")
+    with db._get_connection() as conn:
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=2011)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', str(shared / "01.flac"))
+        conn.execute("INSERT INTO lib2_track_files(track_id, path) VALUES(1, ?)", (str(own / "01.flac"),))
+        conn.commit()
+
+    assert rename_album_folder(db, str(shared), "Jazz (1978)", album_id)
+
+    with db._get_connection() as conn:
+        paths = sorted(r[0] for r in conn.execute("SELECT path FROM lib2_track_files"))
+    assert str(own / "01.flac") in paths
+    assert str(shared.parent / "Jazz (1978)" / "01.flac") in paths
+
+
+# --- #2053: a stored id that names some other release, and compilations ---
+
+_EAGLES_BOOTLEG = {
+    'id': 'rel-bootleg', 'title': 'Eagles', 'date': '1996', 'status': 'Bootleg',
+    'release-group': {'id': 'rg-live', 'first-release-date': '1996',
+                      'secondary-types': ['Live']},
+    'media': [{'tracks': [{'title': 'Hotel California'}, {'title': 'Take It Easy'},
+                          {'title': 'Get Over It'}]}],
+}
+
+
+def _eagles_recordings(title, artist, limit=25):
+    def rel(rel_id, rg_id, types, status='Official'):
+        return {'id': rel_id, 'title': 'Eagles', 'status': status,
+                'release-group': {'id': rg_id, 'secondary-types': types}}
+    return [{'title': title, 'releases': [
+        rel('rel-comp', 'rg-comp', ['Compilation']),
+        rel('rel-1972', 'rg-1972', None),
+        rel('rel-comp2', 'rg-comp2', ['Compilation'], status=None),
+    ]}]
+
+
+def _eagles_client():
+    mb_client = MagicMock()
+    mb_client.get_release.return_value = _EAGLES_BOOTLEG
+    mb_client.search_recording.side_effect = _eagles_recordings
+    mb_client.get_release_group.side_effect = lambda rg_id, includes=None: {
+        'rg-1972': {'id': 'rg-1972', 'first-release-date': '1972-06-01'},
+        'rg-comp': {'id': 'rg-comp', 'first-release-date': '2005-03-15',
+                    'secondary-types': ['Compilation']},
+    }.get(rg_id)
+    return mb_client
+
+
+def test_a_stored_bootleg_id_does_not_date_the_studio_album():
+    # the eagles' 1972 album, three tracks held, carried the id of a 1996 live
+    # bootleg with the same name. one song in common is not the same album
+    res = resolve_canonical_album_year(
+        mb_client=_eagles_client(), album_title='Eagles', artist_name='Eagles',
+        musicbrainz_release_id='rel-bootleg',
+        track_titles=['Take It Easy', 'Witchy Woman', 'Peaceful Easy Feeling'],
+    )
+    assert res is not None
+    assert (res[0], res[3]) == ('1972', 'rg-1972')
+
+
+def test_the_studio_album_wins_even_when_a_compilation_shows_up_more_often():
+    # a search answer lists only some of a recording's releases. on one live
+    # call the first song came back on the compilation alone, which made the
+    # compilation the "clear winner" over the album the songs were written for
+    mb_client = _eagles_client()
+    mb_client.get_release.return_value = {
+        **_EAGLES_BOOTLEG,
+        'release-group': {**_EAGLES_BOOTLEG['release-group'], 'disambiguation': 'bootleg'},
+    }
+
+    def recordings(title, artist, limit=25):
+        comp = {'id': 'rel-comp', 'title': 'Eagles', 'status': 'Official',
+                'release-group': {'id': 'rg-comp', 'secondary-types': ['Compilation']}}
+        album = {'id': 'rel-1972', 'title': 'Eagles', 'status': 'Official',
+                 'release-group': {'id': 'rg-1972', 'secondary-types': None}}
+        return [{'title': title, 'releases': [comp] if title == 'Take It Easy' else [comp, album]}]
+    mb_client.search_recording.side_effect = recordings
+    res = resolve_canonical_album_year(
+        mb_client=mb_client, album_title='Eagles', artist_name='Eagles',
+        musicbrainz_release_id='rel-bootleg',
+        track_titles=['Take It Easy', 'Witchy Woman', 'Peaceful Easy Feeling'],
+    )
+    assert res is not None
+    assert (res[0], res[3]) == ('1972', 'rg-1972')
+
+
+def test_a_live_album_that_carries_the_tracks_keeps_its_own_year():
+    mb_client = _eagles_client()
+    res = resolve_canonical_album_year(
+        mb_client=mb_client, album_title='Eagles', artist_name='Eagles',
+        musicbrainz_release_id='rel-bootleg',
+        track_titles=['Hotel California', 'Take It Easy', 'Get Over It'],
+    )
+    assert res is not None and res[0] == '1996'
+    mb_client.search_recording.assert_not_called()
+
+
+def test_a_refuted_id_with_no_clear_studio_album_is_not_guessed():
+    mb_client = _eagles_client()
+    # two plain albums tie: nothing says which
+    mb_client.search_recording.side_effect = lambda title, artist, limit=25: [{
+        'title': title, 'releases': [
+            {'id': 'a', 'title': 'Eagles', 'status': 'Official', 'release-group': {'id': 'rg-a'}},
+            {'id': 'b', 'title': 'Eagles', 'status': 'Official', 'release-group': {'id': 'rg-b'}},
+        ]}]
+    # either would have a year to give, were one of them picked
+    mb_client.get_release_group.side_effect = lambda rg_id, includes=None: {
+        'id': rg_id, 'first-release-date': '1972-06-01'}
+    res = resolve_canonical_album_year(
+        mb_client=mb_client, album_title='Eagles', artist_name='Eagles',
+        musicbrainz_release_id='rel-bootleg',
+        track_titles=['Witchy Woman', 'Peaceful Easy Feeling'],
+    )
+    assert res is None
+
+
+def test_one_held_track_cannot_refute_a_stored_id():
+    res = resolve_canonical_album_year(
+        mb_client=_eagles_client(), album_title='Eagles', artist_name='Eagles',
+        musicbrainz_release_id='rel-bootleg', track_titles=['Witchy Woman'],
+    )
+    assert res is not None and res[0] == '1996'
+
+
+def test_song_title_drops_pressing_words_only():
+    from core.repair_jobs.album_release_year_repair import song_title
+    assert song_title('Hotel California - 2013 Remaster') == 'Hotel California'
+    assert song_title('Precious (Remastered)') == 'Precious'
+    assert song_title('Enjoy the Silence (Single Version)') == 'Enjoy the Silence'
+    assert song_title('Precious (Sasha Remix)') == 'Precious (Sasha Remix)'
+    assert song_title('Take It Easy (Live)') == 'Take It Easy (Live)'
+    assert song_title('Remastered') == 'Remastered'
+
+
+def test_track_original_dates_come_from_the_release_track_list():
+    from core.repair_jobs.album_release_year_repair import release_track_original_dates
+    mb_client = MagicMock()
+    mb_client.get_release.return_value = {'media': [
+        {'tracks': [
+            {'title': 'Precious', 'recording': {'first-release-date': '2005-09-30'}},
+            {'title': 'Just Can’t Get Enough', 'recording': {'first-release-date': '1981-09-07'}},
+            {'title': 'Martyr', 'recording': {'first-release-date': '2006-09'}},
+            {'title': 'No Date', 'recording': {}},
+            {'title': 'Twice', 'recording': {'first-release-date': '1984'}},
+            {'title': 'From The Future', 'recording': {'first-release-date': '2011'}},
+        ]},
+        {'tracks': [
+            {'title': 'Precious (Sasha remix)', 'recording': {'first-release-date': '2006-09'}},
+            {'title': 'Twice', 'recording': {'first-release-date': '1996'}},
+        ]},
+    ]}
+    memo = {}
+    dates = release_track_original_dates(mb_client, 'rel-best', memo, not_after='2006')
+    assert dates['precious'] == ('2005', '2005-09-30')
+    assert dates["just can't get enough"] == ('1981', '1981-09-07')
+    assert dates['martyr'] == ('2006', '2006-09')
+    assert dates['precious (sasha remix)'] == ('2006', '2006-09')
+    # no date, two different years for one title, newer than the album: no answer
+    assert 'no date' not in dates and 'twice' not in dates and 'from the future' not in dates
+    mb_client.get_release.assert_called_once_with('rel-best', includes=['recordings'])
+    # one lookup per album, however often it is asked
+    release_track_original_dates(mb_client, 'rel-best', memo, not_after='2006')
+    assert mb_client.get_release.call_count == 1
+    assert release_track_original_dates(mb_client, None, memo) == {}
+
+
+def _compilation_fixture(tmp_path, settings, tags2=None):
+    db = MusicDatabase(str(tmp_path / "test.db"))
+    album_dir = tmp_path / "Depeche Mode" / "2006 - The Best of Depeche Mode"
+    f1, f2, f3 = album_dir / "01.flac", album_dir / "02.flac", album_dir / "03.flac"
+    _make_flac(f1, {'DATE': '2006', 'ORIGINALDATE': '2006'})
+    _make_flac(f2, tags2 or {'DATE': '2006', 'ORIGINALDATE': '2006'})
+    _make_flac(f3, {'DATE': '2006', 'ORIGINALDATE': '1999'})
+    with db._get_connection() as conn:
+        album_id = lib2_seed.album(conn, 'Depeche Mode', 'The Best of Depeche Mode', year=2006)
+        lib2_seed.file_track(conn, 1, album_id, 'Precious', str(f1))
+        lib2_seed.file_track(conn, 2, album_id, 'Just Can\'t Get Enough', str(f2))
+        lib2_seed.file_track(conn, 3, album_id, 'Some Obscure B Side', str(f3))
+        conn.commit()
+
+    mb_client = MagicMock()
+    mb_client.search_release.return_value = [{
+        'id': 'rel-best', 'title': 'The Best of Depeche Mode',
+        'release-group': {'id': 'rg-best', 'first-release-date': '2006-11-13',
+                          'secondary-types': ['Compilation']},
+    }]
+    mb_client.get_release.return_value = {'id': 'rel-best', 'media': [{'tracks': [
+        {'title': 'Precious (Remastered)', 'recording': {'first-release-date': '2005-10-03'}},
+        {'title': 'Just Can’t Get Enough', 'recording': {'first-release-date': '1981-09-07'}},
+        {'title': 'Some Obscure B Side', 'recording': {}},
+    ]}]}
+
+    findings = []
+    ctx = JobContext(
+        db=db, transfer_folder=str(tmp_path),
+        config_manager=_MockConfig({'repair.jobs.album_release_year_repair.settings': settings}),
+        mb_client=mb_client,
+        create_finding=lambda **kw: findings.append(kw) or True,
+    )
+    return db, ctx, mb_client, findings, (f1, f2, f3), album_id
+
+
+def test_compilation_songs_are_left_alone_unless_asked(tmp_path):
+    _db, ctx, mb_client, findings, _files, _aid = _compilation_fixture(tmp_path, {'dry_run': True})
+    AlbumReleaseYearRepairJob().scan(ctx)
+    assert findings == []
+    mb_client.get_release.assert_not_called()
+
+
+def test_compilation_songs_get_the_year_they_first_came_out(tmp_path):
+    from mutagen.flac import FLAC
+    settings = {'dry_run': True, 'compilation_track_years': True}
+    db, ctx, _mb, findings, (f1, f2, f3), album_id = _compilation_fixture(tmp_path, settings)
+    AlbumReleaseYearRepairJob().scan(ctx)
+    assert len(findings) == 1
+    details = findings[0]['details']
+    assert details['canonical_year'] == '2006'
+    assert details['new_folder_name'] is None
+    by_title = {t['title']: t for t in details['tracks']}
+    assert by_title['Precious']['original_year'] == '2005'
+    assert by_title["Just Can't Get Enough"]['original_year'] == '1981'
+    assert by_title['Some Obscure B Side'].get('original_year') is None
+    assert by_title['Some Obscure B Side']['keep_original'] is True
+    assert '2 song(s) get the year they first came out (1981 to 2005)' in findings[0]['description']
+    assert 'Year 2006 is right' in findings[0]['description']
+
+    res = apply_album_year_fix(
+        db=db, album_id=str(album_id), canonical_year='2006', canonical_date='2006-11-13',
+        tracks=details['tracks'], transfer_folder=str(tmp_path),
+    )
+    assert res['success'] and res['errors'] == 0
+    a1, a2, a3 = FLAC(str(f1)), FLAC(str(f2)), FLAC(str(f3))
+    assert (a1['ORIGINALYEAR'], a1['ORIGINALDATE'], a1['DATE']) == (['2005'], ['2005-10-03'], ['2006-11-13'])
+    assert (a2['ORIGINALYEAR'], a2['DATE']) == (['1981'], ['2006-11-13'])
+    # nothing was found for it: the original date it had stays
+    assert a3['ORIGINALDATE'] == ['1999'] and a3['DATE'] == ['2006-11-13']
+    with db._get_connection() as conn:
+        assert conn.execute("SELECT year FROM lib2_albums WHERE id=?", (album_id,)).fetchone()[0] == 2006
+
+    # and the next scan has nothing left to say (no flip back to the album year)
+    findings.clear()
+    AlbumReleaseYearRepairJob().scan(ctx)
+    assert findings == []
+
+
+def test_a_same_year_finding_says_what_it_writes(tmp_path):
+    db = MusicDatabase(str(tmp_path / "test.db"))
+    f1 = tmp_path / "Queen" / "Jazz (1978)" / "01.flac"
+    _make_flac(f1, {'DATE': '1978'})
+    with db._get_connection() as conn:
+        album_id = lib2_seed.album(conn, 'Queen', 'Jazz', year=1978)
+        lib2_seed.file_track(conn, 1, album_id, 'Mustapha', str(f1))
+        conn.commit()
+    mb_client = MagicMock()
+    mb_client.search_release.return_value = [{
+        'id': 'rel-123', 'title': 'Jazz',
+        'release-group': {'id': 'rg-123', 'first-release-date': '1978-11-10'},
+    }]
+    findings = []
+    ctx = JobContext(
+        db=db, transfer_folder=str(tmp_path),
+        config_manager=_MockConfig({'repair.jobs.album_release_year_repair.settings': {'dry_run': True}}),
+        mb_client=mb_client, create_finding=lambda **kw: findings.append(kw) or True,
+    )
+    AlbumReleaseYearRepairJob().scan(ctx)
+    assert len(findings) == 1
+    assert 'Year 1978 is right; the files have no original date tag yet' in findings[0]['description']
+    assert '→' not in findings[0]['description']

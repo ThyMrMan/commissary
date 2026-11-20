@@ -19,7 +19,7 @@ import requests as http_requests
 
 from core.settings import config_manager
 from core.async_utils import run_control
-from core.torrent_clients.base import TorrentStatus, normalize_client_url
+from core.torrent_clients.base import TorrentStatus, normalize_client_url, tracker_host
 from utils.logging_config import get_logger
 
 logger = get_logger("torrent.qbittorrent")
@@ -102,12 +102,25 @@ class QBittorrentAdapter:
             config_manager.get('torrent_client.category', 'soulsync') or 'soulsync'
         ).strip() or 'soulsync'
         self._save_path = config_manager.get('torrent_client.save_path', '') or ''
+        # Start what SoulSync adds even when qBittorrent's "add torrents stopped"
+        # preference is on (other clients sharing qBittorrent keep that default).
+        self._start_torrents = bool(config_manager.get('torrent_client.start_torrents', False))
         # Drop any existing session — credentials may have changed.
         with self._session_lock:
             self._session = None
 
     def reload_settings(self) -> None:
         self._load_config()
+
+    def _apply_start_flags(self, data: dict) -> None:
+        """With torrent_client.start_torrents on, ask qBittorrent to start the
+        torrent: ``stopped`` is the 5.x add parameter, ``paused`` the 4.x one.
+        ``stopCondition=None`` overrides a global "stop when metadata received"
+        condition, which would otherwise stop a magnet right after it starts."""
+        if getattr(self, '_start_torrents', False):
+            data['stopped'] = 'false'
+            data['paused'] = 'false'
+            data['stopCondition'] = 'None'
 
     def is_configured(self) -> bool:
         # qBittorrent allows no-auth setups (LAN), so credentials are
@@ -194,7 +207,7 @@ class QBittorrentAdapter:
     async def add_torrent(
         self,
         url_or_magnet: str,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         return await run_control(
@@ -219,6 +232,7 @@ class QBittorrentAdapter:
         data = {'urls': url_or_magnet, 'category': cat}
         if save_path or self._save_path:
             data['savepath'] = save_path or self._save_path
+        self._apply_start_flags(data)
         resp = self._call('POST', '/api/v2/torrents/add', data=data)
         if not resp or not resp.ok:
             logger.warning("qBittorrent /torrents/add returned HTTP %s body=%r",
@@ -324,7 +338,7 @@ class QBittorrentAdapter:
     async def add_torrent_file(
         self,
         file_bytes: bytes,
-        category: str = "soulsync",
+        category: Optional[str] = None,
         save_path: Optional[str] = None,
     ) -> Optional[str]:
         return await run_control(
@@ -354,6 +368,7 @@ class QBittorrentAdapter:
         data = {'category': cat}
         if save_path or self._save_path:
             data['savepath'] = save_path or self._save_path
+        self._apply_start_flags(data)
         files = {'torrents': ('soulsync.torrent', file_bytes, 'application/x-bittorrent')}
         resp = self._call('POST', '/api/v2/torrents/add', data=data, files=files)
         if not resp or not resp.ok:
@@ -419,6 +434,11 @@ class QBittorrentAdapter:
             ratio=float(item['ratio']) if item.get('ratio') is not None else None,
             seeding_time=int(item['seeding_time']) if isinstance(item.get('seeding_time'), (int, float)) else None,
             category=str(item.get('category') or '') or None,
+            # the tracker qbittorrent is talking to, empty while none answers
+            tracker=tracker_host(item.get('tracker')),
+            # pausedUP / stoppedUP map to completed, still stopped all the same
+            paused=str(item.get('state') or '').startswith(('paused', 'stopped')),
+            moving=str(item.get('state') or '') == 'moving',
         )
 
     async def remove(self, torrent_id: str, delete_files: bool = False) -> bool:

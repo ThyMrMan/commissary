@@ -148,7 +148,10 @@ def completed_for_save(pick: Any, client_for_source: Callable[[str], Any] = None
 def register(app) -> None:
     from flask import jsonify, request
 
+    from core.permissions import requires
+
     @app.route('/api/commissary/fix-pick/complete', methods=['POST'])
+    @requires("music.playlist_sync")   # as upstream's Fix routes
     def commissary_fix_pick_complete():
         data = request.get_json(silent=True) or {}
         track = data.get('track')

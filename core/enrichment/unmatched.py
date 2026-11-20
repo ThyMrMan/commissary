@@ -1,10 +1,8 @@
-"""Read-side helpers for browsing the items an enrichment source hasn't matched.
+"""Browse Library-v2 entities that a provider has not matched.
 
 The dashboard "Manage Enrichment Workers" modal lists, per source, the
-artists / albums / tracks whose ``<service>_match_status`` is ``'not_found'``
-(or still pending = ``NULL``) so the user can manually match them. Every
-enrichment source writes a uniform ``<service>_match_status`` column, so one
-parametric query serves all 11 workers.
+artists / albums / tracks whose provider-attempt ledger entry is ``not_found``
+(or absent, meaning pending) so the user can manually match them.
 
 This module owns the column mapping and SQL construction. ``service`` and
 ``entity_type`` are whitelisted against :data:`SERVICE_ENTITY_SUPPORT` and the
@@ -14,7 +12,9 @@ entity table map before any column name is interpolated — user-supplied values
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # Which entity types each enrichment source covers. Mirrors the authoritative
 # ``_SERVICE_ID_COLUMNS`` map in web_server.py (used by manual-match), kept here
@@ -48,19 +48,19 @@ SERVICE_ENTITY_SUPPORT = {
 # tracks carry no artwork column of their own, so we borrow the parent album's.
 _ENTITY_TABLE = {
     'artist': {
-        'table': 'artists', 'name': 'name',
-        'image': 'artists.thumb_url', 'join': '', 'parent': None,
+        'table': 'lib2_artists', 'name': 'name',
+        'image': 'e.image_url', 'join': '', 'parent': None,
     },
     'album': {
-        'table': 'albums', 'name': 'title',
-        'image': 'albums.thumb_url',
-        'join': 'LEFT JOIN artists par ON albums.artist_id = par.id',
+        'table': 'lib2_albums', 'name': 'title',
+        'image': 'e.image_url',
+        'join': 'LEFT JOIN lib2_artists par ON e.primary_artist_id = par.id',
         'parent': 'par.name',
     },
     'track': {
-        'table': 'tracks', 'name': 'title',
-        'image': 'al.thumb_url',
-        'join': 'LEFT JOIN albums al ON tracks.album_id = al.id',
+        'table': 'lib2_tracks', 'name': 'title',
+        'image': 'al.image_url',
+        'join': 'LEFT JOIN lib2_albums al ON e.album_id = al.id',
         'parent': 'al.title',
     },
 }
@@ -101,14 +101,40 @@ def _validate(service: str, entity_type: str) -> None:
         raise UnmatchedQueryError(f"No table mapping for entity type {entity_type!r}")
 
 
+def _universe(service: str, entity_type: str) -> List[str]:
+    """the rows the worker for ``service`` actually enriches (third #1062
+    review G06-2): the owned library, credits resolved, and for similar
+    artists a provider id. 3.6.1's tables held only library rows; v2 keeps a
+    watched artist's discography and the wishlist in the same tables, so
+    without this the list and the breakdown counted pending rows the worker
+    never hands out and the modal never reached the worker's own 100%.
+    The same predicates as core/library2/worker_queue.status_counts."""
+    from core.library2.artist_credit_gate import unresolved_credit_sql, worker_credit_ready_sql
+    from core.library2.sql_util import ANY_OWNER, owned_sql
+    if entity_type == 'track':
+        # the credit gate is the album's: the gated albums are listed once
+        # instead of an album + artist lookup per track (review 5 R5-D-1).
+        # a track with no album, or one whose album is not gated, passes,
+        # exactly as worker_credit_ready_sql's NOT EXISTS lets it
+        credit = ("(e.album_id IS NULL OR e.album_id NOT IN ("
+                  "SELECT gal.id FROM lib2_albums gal "
+                  "JOIN lib2_artists a ON a.id = gal.primary_artist_id "
+                  f"WHERE {unresolved_credit_sql('a')}))")
+    else:
+        credit = worker_credit_ready_sql(entity_type)
+    out = [owned_sql(entity_type, 'e', scope=ANY_OWNER), credit]
+    if service == 'similar_artists':
+        from core.library2.worker_queue import _HAS_PROVIDER_ID
+        out.append(f"({_HAS_PROVIDER_ID})")
+    return out
+
+
 def _status_predicate(service: str, status: str, qualifier: str) -> str:
     """SQL predicate selecting rows in the requested match state.
 
-    ``qualifier`` (the table name/alias) is always prefixed so the predicate is
-    unambiguous even when the query joins a second table that also carries a
-    ``<service>_match_status`` column (tracks LEFT JOIN albums).
+    ``qualifier`` is always prefixed so joined queries stay unambiguous.
     """
-    col = f"{qualifier}.{match_status_column(service)}"
+    col = f"{qualifier}.status"
     if status == 'not_found':
         return f"{col} = 'not_found'"
     if status == 'pending':
@@ -138,24 +164,22 @@ def build_unmatched_query(
     table, name_col, image_expr, join = (
         meta['table'], meta['name'], meta['image'], meta['join'],
     )
-    ms = match_status_column(service)
-    la = last_attempted_column(service)
-
-    where = [_status_predicate(service, status, table)]
-    params: List = []
+    where = [_status_predicate(service, status, 'pa'), *_universe(service, entity_type)]
+    params: List = [entity_type, service]
     if query:
-        where.append(f"{table}.{name_col} LIKE ?")
+        where.append(f"e.{name_col} LIKE ?")
         params.append(f"%{query}%")
 
     parent_expr = meta.get('parent')
     parent_select = f"{parent_expr} AS parent" if parent_expr else "NULL AS parent"
     sql = (
-        f"SELECT {table}.id AS id, {table}.{name_col} AS name, "
-        f"{image_expr} AS image_url, {parent_select}, {table}.{ms} AS status, "
-        f"{table}.{la} AS last_attempted "
-        f"FROM {table} {join} "
+        f"SELECT e.id AS id, e.{name_col} AS name, "
+        f"{image_expr} AS image_url, {parent_select}, pa.status AS status, "
+        f"pa.last_attempted_at AS last_attempted "
+        f"FROM {table} e {join} LEFT JOIN lib2_provider_attempts pa "
+        f"ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
         f"WHERE {' AND '.join(where)} "
-        f"ORDER BY {table}.{name_col} COLLATE NOCASE "
+        f"ORDER BY e.{name_col} COLLATE NOCASE "
         f"LIMIT ? OFFSET ?"
     ).replace('  ', ' ')
 
@@ -178,13 +202,15 @@ def build_count_query(
     meta = _ENTITY_TABLE[entity_type]
     table, name_col = meta['table'], meta['name']
 
-    where = [_status_predicate(service, status, table)]
-    params: List = []
+    where = [_status_predicate(service, status, 'pa'), *_universe(service, entity_type)]
+    params: List = [entity_type, service]
     if query:
-        where.append(f"{table}.{name_col} LIKE ?")
+        where.append(f"e.{name_col} LIKE ?")
         params.append(f"%{query}%")
 
-    sql = f"SELECT COUNT(*) FROM {table} WHERE {' AND '.join(where)}"
+    sql = (f"SELECT COUNT(*) FROM {table} e LEFT JOIN lib2_provider_attempts pa "
+           f"ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
+           f"WHERE {' AND '.join(where)}")
     return sql, params
 
 
@@ -198,14 +224,7 @@ def build_reset_query(
     scope: str = 'item',
     entity_id=None,
 ) -> Tuple[str, List]:
-    """Build the UPDATE that re-queues item(s) for enrichment.
-
-    Re-queuing means clearing ``<service>_match_status`` back to NULL (and
-    ``<service>_last_attempted`` to NULL): every worker's pending query selects
-    ``match_status IS NULL`` first, so the item is retried on the next pass.
-    Nulling last_attempted alone is NOT enough — the not_found retry path uses
-    ``last_attempted < cutoff`` and ``NULL < cutoff`` is false, so the item
-    would never be picked up.
+    """Select the native entity IDs whose attempts should be cleared.
 
       * scope='item'   -> a single row (requires entity_id)
       * scope='failed' -> every 'not_found' row for this entity type
@@ -216,37 +235,28 @@ def build_reset_query(
 
     meta = _ENTITY_TABLE[entity_type]
     table = meta['table']
-    ms = match_status_column(service)
-    la = last_attempted_column(service)
-    set_parts = [f"{ms} = NULL", f"{la} = NULL"]
-
-    # Also forget the stored source ID so re-matching actually RE-RESOLVES the
-    # entity. Without this, the worker hits its existing-id short-circuit, sees
-    # the old (possibly WRONG) id and just re-confirms it — which is why "click
-    # to rematch" never fixed a mis-matched same-name artist (#868). That
-    # applies to ALL entity types: tracks carry per-service id columns too
-    # (spotify_track_id, itunes_track_id, deezer_id, ... — see
-    # core/source_ids), and leaving one in place made a track rematch an
-    # instant no-op re-confirmation of the old id.
-    try:
-        from core.source_ids import id_column
-        id_col = id_column(service, entity_type)
-    except Exception:
-        id_col = None
-    if id_col:
-        set_parts.append(f"{id_col} = NULL")
-    # Bandcamp carries a supplementary numeric id alongside its canonical URL;
-    # clear it too so a stale id can't linger past a reset.
-    if service == 'bandcamp':
-        set_parts.append("bandcamp_id = NULL")
-    set_clause = "SET " + ", ".join(set_parts)
-
     if scope == 'item':
         if not entity_id:
             raise UnmatchedQueryError("entity_id is required for an item reset")
-        return f"UPDATE {table} {set_clause} WHERE id = ?", [entity_id]
+        return f"SELECT id FROM {table} WHERE id = ?", [entity_id]
     # 'failed' — re-queue everything this source explicitly gave up on.
-    return f"UPDATE {table} {set_clause} WHERE {ms} = 'not_found'", []
+    return (f"SELECT e.id FROM {table} e JOIN lib2_provider_attempts pa "
+            "ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
+            "WHERE pa.status='not_found' AND "
+            + " AND ".join(_universe(service, entity_type)), [entity_type, service])
+
+
+def reset_carrier_sql(service: str, alias: str, columns) -> Tuple[str, List]:
+    """True for a row that still holds ``service``'s id: a key in
+    external_ids, the spotify_id/musicbrainz_id column, or external_ids that
+    don't parse. those need the full per-row clear on a reset; the rest only
+    lose their attempt rows (review 5 W3-TD-2)."""
+    ext = f"COALESCE({alias}.external_ids, '{{}}')"
+    parts = [f"(CASE WHEN json_valid({ext}) THEN json_type({ext}, ?) IS NOT NULL ELSE 1 END)"]
+    column = f"{service}_id"
+    if service in ('spotify', 'musicbrainz') and column in set(columns or ()):
+        parts.append(f"{alias}.{column} IS NOT NULL")
+    return "(" + " OR ".join(parts) + ")", [f'$."{service}"']
 
 
 # ── Verify matches — targeted repair of the pre-fix corruption classes ──────
@@ -287,65 +297,72 @@ def degenerate_title(text) -> bool:
     return not s
 
 
+def _artist_provider_id_expr(service: str, alias: str = "a") -> Optional[str]:
+    """Library-v2 expression holding an artist's id for ``service``."""
+    if service not in SERVICE_ENTITY_SUPPORT or service in ('similar_artists', 'bandcamp'):
+        return None
+    json_id = f"NULLIF(json_extract({alias}.external_ids, '$.{service}'), '')"
+    promoted = {
+        'spotify': f"NULLIF({alias}.spotify_id, '')",
+        'musicbrainz': f"NULLIF({alias}.musicbrainz_id, '')",
+    }.get(service)
+    return f"COALESCE({promoted}, {json_id})" if promoted else json_id
+
+
 def build_artist_collision_queries(service: str) -> Optional[Tuple[str, str, str]]:
-    """(count_clusters_sql, count_rows_sql, reset_sql) for the artist
-    id-smear fingerprint, or None when the service has no artist id column.
-    All three take no parameters. The reset clears the id + match_status +
-    last_attempted for EVERY row in a colliding cluster."""
+    """Return SQL to count and select Library-v2 artist id-smear clusters.
+
+    The third query SELECTs affected native artist IDs; the database boundary
+    clears them through :func:`set_library_v2_match`, which keeps promoted
+    columns, ``external_ids``, provenance and the attempt ledger consistent.
+    Same-named duplicate/alias rows are allowed to share an id. A collision is
+    only the corruption signature we care about: one provider id attached to
+    more than one distinct artist name.
+    """
     if 'artist' not in SERVICE_ENTITY_SUPPORT.get(service, ()):
         return None
-    try:
-        from core.source_ids import id_column
-        id_col = id_column(service, 'artist')
-    except Exception:
-        id_col = None
-    if not id_col:
+    provider_id = _artist_provider_id_expr(service)
+    if not provider_id:
         return None
-    ms, la = match_status_column(service), last_attempted_column(service)
     colliding = (
-        f"SELECT {id_col} FROM artists "
-        f"WHERE {id_col} IS NOT NULL AND {id_col} != '' "
-        f"GROUP BY {id_col} HAVING COUNT(*) > 1"
+        f"SELECT {provider_id} AS provider_id FROM lib2_artists a "
+        f"WHERE {provider_id} IS NOT NULL AND a.canonical_artist_id IS NULL "
+        f"GROUP BY {provider_id} "
+        "HAVING COUNT(DISTINCT LOWER(TRIM(a.name))) > 1"
     )
     count_clusters = f"SELECT COUNT(*) FROM ({colliding})"
-    count_rows = f"SELECT COUNT(*) FROM artists WHERE {id_col} IN ({colliding})"
-    reset = (
-        f"UPDATE artists SET {id_col} = NULL, {ms} = NULL, {la} = NULL "
-        f"WHERE {id_col} IN ({colliding})"
+    count_rows = (
+        f"SELECT COUNT(*) FROM lib2_artists a WHERE {provider_id} IN ({colliding})"
     )
-    return count_clusters, count_rows, reset
+    select_rows = (
+        f"SELECT a.id FROM lib2_artists a WHERE {provider_id} IN ({colliding})"
+    )
+    return count_clusters, count_rows, select_rows
 
 
 def build_degenerate_reset_query(service: str, entity_type: str,
                                  entity_ids: List) -> Optional[Tuple[str, List]]:
-    """Reset the given rows' match for this service IF currently matched —
-    the empty-normalization repair. Returns (sql, params) or None when the
-    service doesn't enrich this entity type or the id list is empty. Reuses
-    build_reset_query's column semantics (id column + supplementary
-    bandcamp_id) so a repair reset and a manual re-queue behave identically."""
+    """Select degenerate native rows this service previously matched.
+
+    The caller clears each selected row through the native match boundary.
+    Selecting rather than issuing a raw UPDATE prevents the attempt ledger and
+    provider-id JSON from disagreeing.
+    """
     if not entity_ids:
         return None
     support = SERVICE_ENTITY_SUPPORT.get(service)
     if not support or entity_type not in support or entity_type not in _ENTITY_TABLE:
         return None
+    if service == 'similar_artists':
+        return None
     table = _ENTITY_TABLE[entity_type]['table']
-    ms, la = match_status_column(service), last_attempted_column(service)
-    set_parts = [f"{ms} = NULL", f"{la} = NULL"]
-    try:
-        from core.source_ids import id_column
-        id_col = id_column(service, entity_type)
-    except Exception:
-        id_col = None
-    if id_col:
-        set_parts.append(f"{id_col} = NULL")
-    if service == 'bandcamp':
-        set_parts.append("bandcamp_id = NULL")
     placeholders = ", ".join("?" for _ in entity_ids)
     sql = (
-        f"UPDATE {table} SET {', '.join(set_parts)} "
-        f"WHERE {ms} = 'matched' AND id IN ({placeholders})"
+        f"SELECT e.id FROM {table} e JOIN lib2_provider_attempts pa "
+        "ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
+        f"WHERE pa.status='matched' AND e.id IN ({placeholders})"
     )
-    return sql, list(entity_ids)
+    return sql, [entity_type, service, *entity_ids]
 
 
 def build_breakdown_query(service: str, entity_type: str) -> Tuple[str, List]:
@@ -353,16 +370,314 @@ def build_breakdown_query(service: str, entity_type: str) -> Tuple[str, List]:
     _validate(service, entity_type)
     meta = _ENTITY_TABLE[entity_type]
     table = meta['table']
-    ms = f"{table}.{match_status_column(service)}"
+    ms = "pa.status"
     sql = (
         "SELECT "
         f"SUM(CASE WHEN {ms} = 'matched' THEN 1 ELSE 0 END) AS matched, "
         f"SUM(CASE WHEN {ms} = 'not_found' THEN 1 ELSE 0 END) AS not_found, "
         f"SUM(CASE WHEN {ms} IS NULL THEN 1 ELSE 0 END) AS pending, "
         f"COUNT(*) AS total "
-        f"FROM {table}"
+        f"FROM {table} e LEFT JOIN lib2_provider_attempts pa "
+        f"ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
+        f"WHERE {' AND '.join(_universe(service, entity_type))}"
     )
-    return sql, []
+    return sql, [entity_type, service]
+
+
+# ── one pass per (service, entity type), kept briefly ───────────────────────
+#
+# review 5 R5-D-1: every list page, count and breakdown scanned the whole
+# owned universe (311k tracks live: the owned check and the attempts lookup
+# per row), 17-21s for one tracks page and 13s for a breakdown. one pass now
+# reads every row of the universe with its attempt status, keeps the counts
+# and the still-unmatched rows (display columns are read for those only), and
+# every page, search, status filter and breakdown is served from it, like the
+# worker progress snapshot. a manual match or a reset drops it; the workers'
+# own progress shows up within SNAPSHOT_TTL.
+
+SNAPSHOT_TTL = 120.0
+_snapshot_lock = threading.Lock()
+_snapshots: Dict[tuple, Dict[str, Any]] = {}
+_snapshot_builds: Dict[tuple, threading.Event] = {}
+_generation = 0
+
+_SNAPSHOT_DISPLAY = {
+    'artist': ('e.name', 'e.image_url', 'NULL'),
+    'album': ('e.title', 'e.image_url',
+              '(SELECT sar.name FROM lib2_artists sar WHERE sar.id = e.primary_artist_id)'),
+    'track': ('e.title',
+              '(SELECT sal.image_url FROM lib2_albums sal WHERE sal.id = e.album_id)',
+              '(SELECT sal.title FROM lib2_albums sal WHERE sal.id = e.album_id)'),
+}
+
+_ASCII_FOLD = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+
+
+def _nocase(text) -> str:
+    """SQLite's NOCASE: ASCII letters fold, nothing else does."""
+    return str(text).translate(_ASCII_FOLD)
+
+
+def validate_request(service: str, entity_type: str, status: Optional[str] = None) -> None:
+    _validate(service, entity_type)
+    if status is not None and status not in VALID_STATUSES:
+        raise UnmatchedQueryError(f"Invalid status: {status!r}")
+
+
+def build_snapshot_query(service: str, entity_type: str) -> Tuple[str, List]:
+    """Every row of the worker's universe with its attempt status; name,
+    artwork and parent only for the rows still unmatched."""
+    _validate(service, entity_type)
+    table = _ENTITY_TABLE[entity_type]['table']
+    name, image, parent = _SNAPSHOT_DISPLAY[entity_type]
+    open_ = "(pa.status IS NULL OR pa.status = 'not_found')"
+    sql = (
+        f"SELECT e.id, pa.status, "
+        f"CASE WHEN {open_} THEN {name} END, "
+        f"CASE WHEN {open_} THEN {image} END, "
+        f"CASE WHEN {open_} THEN {parent} END, "
+        f"CASE WHEN {open_} THEN pa.last_attempted_at END "
+        f"FROM {table} e LEFT JOIN lib2_provider_attempts pa "
+        f"ON pa.entity_type=? AND pa.entity_id=e.id AND pa.service=? "
+        f"WHERE {' AND '.join(_universe(service, entity_type))}"
+    )
+    return sql, [entity_type, service]
+
+
+# ── what is owned is the same for every worker ──────────────────────────────
+#
+# the pass above still cost what it cost: musicbrainz tracks took a minute on
+# the live library, and so did deezer tracks, and so did every other worker's,
+# because each one worked out the owned library again before looking at its
+# own attempts. 85% of that minute is the owned check (a file per track, the
+# credit gate), and it does not depend on the worker at all. so it is done once
+# per entity type and kept for longer than a snapshot, and a worker's snapshot
+# is that list plus one read of its own attempts. the Manage Workers window
+# asked for three snapshots per worker to draw three numbers; the numbers for
+# every worker now come from one read of the attempts table.
+
+UNIVERSE_TTL = 600.0
+_universes: Dict[tuple, Dict[str, Any]] = {}
+_universe_builds: Dict[tuple, threading.Event] = {}
+_tallies: Dict[tuple, Dict[str, Any]] = {}
+_tally_builds: Dict[tuple, threading.Event] = {}
+
+
+def _universe_variant(service: str) -> str:
+    """similar artists enriches a narrower set (an artist with a provider id);
+    every other worker shares one."""
+    return 'similar_artists' if service == 'similar_artists' else ''
+
+
+def build_universe_query(service: str, entity_type: str) -> Tuple[str, List]:
+    """The ids of the rows a worker enriches. No attempts, and no names: this
+    is the part that is the same whoever asks, and ids alone come off the
+    indexes without opening a row."""
+    _validate(service, entity_type)
+    table = _ENTITY_TABLE[entity_type]['table']
+    return (f"SELECT e.id FROM {table} e "
+            f"WHERE {' AND '.join(_universe(service, entity_type))}"), []
+
+
+#: ids per display read (SQLite's default variable limit is 999)
+_DISPLAY_CHUNK = 900
+
+
+def _display_rows(conn: Any, entity_type: str, ids: List[Any]) -> Dict[Any, tuple]:
+    """name, artwork and parent for these rows only: the ones still unmatched,
+    which is what a list shows."""
+    table = _ENTITY_TABLE[entity_type]['table']
+    name, image, parent = _SNAPSHOT_DISPLAY[entity_type]
+    out: Dict[Any, tuple] = {}
+    for start in range(0, len(ids), _DISPLAY_CHUNK):
+        chunk = ids[start:start + _DISPLAY_CHUNK]
+        marks = ','.join('?' for _ in chunk)
+        for row in conn.execute(
+                f"SELECT e.id, {name}, {image}, {parent} FROM {table} e WHERE e.id IN ({marks})",
+                chunk):
+            out[row[0]] = (row[1], row[2], row[3])
+    return out
+
+
+def _kept(cache: Dict[tuple, Dict[str, Any]], builds: Dict[tuple, threading.Event],
+          key: tuple, ttl: float, build: Callable[[], Dict[str, Any]],
+          follow_generation: bool) -> Dict[str, Any]:
+    """One build at a time per key; a caller arriving mid-build waits for it."""
+    while True:
+        with _snapshot_lock:
+            kept = cache.get(key)
+            if kept is not None and time.monotonic() - kept['at'] < ttl:
+                return kept
+            building = builds.get(key)
+            if building is None:
+                building = threading.Event()
+                builds[key] = building
+                generation = _generation
+                break
+        building.wait(timeout=300)
+    try:
+        data = build()
+        data['at'] = time.monotonic()
+        with _snapshot_lock:
+            now = time.monotonic()
+            for stale in [k for k, v in cache.items() if now - v['at'] >= ttl]:
+                del cache[stale]
+            if not follow_generation or generation == _generation:
+                # an invalidation during the build means this pass may predate it
+                cache[key] = data
+        return data
+    finally:
+        with _snapshot_lock:
+            builds.pop(key, None)
+        building.set()
+
+
+def _compute_universe(connect: Callable[[], Any], service: str, entity_type: str) -> Dict[str, Any]:
+    sql, params = build_universe_query(service, entity_type)
+    conn = connect()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+    ids = [r[0] for r in rows]
+    return {'ids': ids, 'members': frozenset(ids)}
+
+
+def owned_universe(connect: Callable[[], Any], db_key: Any, service: str,
+                   entity_type: str) -> Dict[str, Any]:
+    """The owned rows of one entity type, kept for UNIVERSE_TTL and shared by
+    every worker. Not dropped by a match or a reset: neither changes what is
+    owned."""
+    _validate(service, entity_type)
+    key = (str(db_key), entity_type, _universe_variant(service))
+    return _kept(_universes, _universe_builds, key, UNIVERSE_TTL,
+                 lambda: _compute_universe(connect, service, entity_type),
+                 follow_generation=False)
+
+
+def _compute_snapshot(connect: Callable[[], Any], service: str, entity_type: str,
+                      universe: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if universe is None:
+        universe = _compute_universe(connect, service, entity_type)
+    counts = {'matched': 0, 'not_found': 0, 'pending': 0, 'total': len(universe['ids'])}
+    open_rows = []
+    none = (None, None)
+    conn = connect()
+    try:
+        attempts = {entity_id: (status, attempted) for entity_id, status, attempted in conn.execute(
+            "SELECT entity_id, status, last_attempted_at FROM lib2_provider_attempts "
+            "WHERE entity_type=? AND service=?", (entity_type, service))}
+        for entity_id in universe['ids']:
+            status, attempted = attempts.get(entity_id, none)
+            if status == 'matched':
+                counts['matched'] += 1
+            elif status == 'not_found' or status is None:
+                counts['not_found' if status else 'pending'] += 1
+                open_rows.append((entity_id, status, attempted if status else None))
+        shown = _display_rows(conn, entity_type, [row[0] for row in open_rows])
+    finally:
+        conn.close()
+    blank = (None, None, None)
+    items = []
+    for entity_id, status, attempted in open_rows:
+        name, image, parent = shown.get(entity_id, blank)
+        items.append({'id': entity_id, 'name': name, 'image_url': image, 'parent': parent,
+                      'status': status, 'last_attempted': attempted})
+    # ORDER BY name COLLATE NOCASE: NULL first, ties in row order
+    items.sort(key=lambda i: (i['name'] is not None, _nocase(i['name'] or '')))
+    return {'counts': counts, 'items': items}
+
+
+def unmatched_snapshot(connect: Callable[[], Any], db_key: Any, service: str,
+                       entity_type: str) -> Dict[str, Any]:
+    """The kept pass for one (service, entity type), built at most once at a
+    time per library; a caller arriving mid-build waits for it."""
+    _validate(service, entity_type)
+    key = (str(db_key), service, entity_type)
+
+    def build() -> Dict[str, Any]:
+        universe = owned_universe(connect, db_key, service, entity_type)
+        return _compute_snapshot(connect, service, entity_type, universe)
+
+    return _kept(_snapshots, _snapshot_builds, key, SNAPSHOT_TTL, build, follow_generation=True)
+
+
+def _compute_tallies(connect: Callable[[], Any], entity_type: str,
+                     universe: Dict[str, Any]) -> Dict[str, Any]:
+    """matched / not_found / any-status per worker, for owned rows only: one
+    read of the attempts of this entity type."""
+    members = universe['members']
+    tallies: Dict[str, List[int]] = {}
+    conn = connect()
+    try:
+        cursor = conn.execute(
+            "SELECT entity_id, service, status FROM lib2_provider_attempts WHERE entity_type=?",
+            (entity_type,))
+        while True:
+            batch = cursor.fetchmany(20000)
+            if not batch:
+                break
+            for entity_id, service, status in batch:
+                if entity_id not in members:
+                    continue
+                row = tallies.get(service)
+                if row is None:
+                    row = tallies[service] = [0, 0, 0]
+                row[2] += 1
+                if status == 'matched':
+                    row[0] += 1
+                elif status == 'not_found':
+                    row[1] += 1
+    finally:
+        conn.close()
+    return {'services': tallies, 'total': len(universe['ids'])}
+
+
+def enrichment_counts(connect: Callable[[], Any], db_key: Any, service: str,
+                      entity_type: str) -> Dict[str, int]:
+    """``{matched, not_found, pending, total}`` for one worker and entity type,
+    the same numbers a snapshot's counts hold, without building the snapshot:
+    the tallies for every worker come from one kept read."""
+    _validate(service, entity_type)
+    universe = owned_universe(connect, db_key, service, entity_type)
+    key = (str(db_key), entity_type, _universe_variant(service))
+    kept = _kept(_tallies, _tally_builds, key, SNAPSHOT_TTL,
+                 lambda: _compute_tallies(connect, entity_type, universe),
+                 follow_generation=True)
+    matched, not_found, seen = kept['services'].get(service, (0, 0, 0))
+    total = kept['total']
+    return {'matched': matched, 'not_found': not_found,
+            'pending': max(0, total - seen), 'total': total}
+
+
+def invalidate_unmatched_snapshots(universe: bool = False) -> None:
+    """A manual match, clear or reset changed what is unmatched. What is owned
+    did not change, so that list stays unless the caller says the library
+    itself moved (``universe=True``: a refresh asked for by hand)."""
+    global _generation
+    with _snapshot_lock:
+        _generation += 1
+        _snapshots.clear()
+        _tallies.clear()
+        if universe:
+            _universes.clear()
+
+
+def page_unmatched(snapshot: Dict[str, Any], status: str, query: Optional[str],
+                   limit, offset) -> Dict[str, Any]:
+    """One page of a snapshot: the same rows, order and total the SQL list
+    and count gave for (status, name search, limit, offset)."""
+    if status not in VALID_STATUSES:
+        raise UnmatchedQueryError(f"Invalid status: {status!r}")
+    wanted = {'not_found': ('not_found',), 'pending': (None,),
+              'unmatched': ('not_found', None)}[status]
+    needle = _nocase(query) if query else None
+    rows = [item for item in snapshot['items']
+            if item['status'] in wanted
+            and (needle is None or (item['name'] is not None and needle in _nocase(item['name'])))]
+    start = max(int(offset or 0), 0)
+    return {'total': len(rows),
+            'items': [dict(r) for r in rows[start:start + _clamp_limit(limit)]]}
 
 
 def _clamp_limit(limit) -> int:
@@ -386,7 +701,16 @@ __all__ = [
     'build_unmatched_query',
     'build_count_query',
     'build_breakdown_query',
+    'build_snapshot_query',
+    'unmatched_snapshot',
+    'owned_universe',
+    'enrichment_counts',
+    'build_universe_query',
+    'invalidate_unmatched_snapshots',
+    'page_unmatched',
+    'validate_request',
     'build_reset_query',
+    'reset_carrier_sql',
     'RESET_SCOPES',
     'degenerate_title',
     'build_artist_collision_queries',

@@ -158,16 +158,11 @@ body[data-side="video"] .page.video-page {
 /* ── Shared pages: show the REAL music page on the video side ───────────── */
 /* The shared Settings page is filtered per side: video-only groups/sections carry
    data-video-only, music-only ones carry data-music-only (plus the per-tab rules
-   below hide whole music tabs on the video side). The id selector + extra
-   attribute outrank the blanket music-page hide rule. */
-body[data-side="video"][data-video-page="video-settings"] #settings-page {
-    display: block !important;
-}
-body[data-side="video"][data-video-page="video-settings"] #video-page-host {
-    display: none !important;
-}
+   below hide whole music tabs on the video side). It is the React /settings page
+   on ?media=video, revealed with the other React pages below. */
 /* Help & Docs is the SAME docs page as the music side — reuse it verbatim (it'll
-   carry both music + video docs). Same reveal mechanism as Settings above. */
+   carry both music + video docs). The id selector + extra attribute outrank the
+   blanket music-page hide rule. */
 body[data-side="video"][data-video-page="video-help"] #help-page {
     display: block !important;
 }
@@ -195,14 +190,23 @@ body[data-side="video"][data-video-page="video-downloads"] #webui-react-root,
 body[data-side="video"][data-video-page="video-wishlist"] #webui-react-root,
 body[data-side="video"][data-video-page="video-tools"] #webui-react-root,
 body[data-side="video"][data-video-page="video-calendar"] #webui-react-root,
-body[data-side="video"][data-video-page="video-dashboard"] #webui-react-root {
+body[data-side="video"][data-video-page="video-dashboard"] #webui-react-root,
+/* The automations page too (/automations?media=video). Its builder is still
+   the shared vanilla one, in this shell's own automations subpage: while it
+   is open the React page puts vauto-building on the body, and the screen
+   goes back to the video host until it closes. */
+body[data-side="video"][data-video-page="video-automations"]:not(.vauto-building) #webui-react-root,
+/* Settings too (/settings?media=video, SETTINGS_PORT.md step V4c) */
+body[data-side="video"][data-video-page="video-settings"] #webui-react-root {
     display: block !important;
 }
 body[data-side="video"][data-video-page="video-downloads"] #video-page-host,
 body[data-side="video"][data-video-page="video-wishlist"] #video-page-host,
 body[data-side="video"][data-video-page="video-tools"] #video-page-host,
 body[data-side="video"][data-video-page="video-calendar"] #video-page-host,
-body[data-side="video"][data-video-page="video-dashboard"] #video-page-host {
+body[data-side="video"][data-video-page="video-dashboard"] #video-page-host,
+body[data-side="video"][data-video-page="video-automations"]:not(.vauto-building) #video-page-host,
+body[data-side="video"][data-video-page="video-settings"] #video-page-host {
     display: none !important;
 }
 /* Video-only additions inside the shared settings page (e.g. the Movies/TV
@@ -432,21 +436,6 @@ body[data-side="video"] .dashboard-header-sweep {
     font-size: 14px;
 }
 
-/* Empty-state line inside reused dashboard cards (e.g. Recent Downloads). */
-
-/* ── Library page ──────────────────────────────────────────────────────── */
-/* The grid/cards/search/alphabet all reuse the music library CSS verbatim.
-   The only video-specific bit is the Movies/Shows tab pill. */
-.video-library-tabs {
-    display: flex;
-    gap: 6px;
-    padding: 4px;
-    margin: 0 auto 4px;
-    width: max-content;
-    background: var(--black-a25);
-    border: 1px solid var(--white-a07);
-    border-radius: var(--radius-lg);
-}
 .video-lib-tab {
     padding: 8px 22px;
     font-size: 13px;
@@ -463,19 +452,11 @@ body[data-side="video"] .dashboard-header-sweep {
     color: #fff;
     background: rgb(var(--accent-rgb));
 }
-.video-library-filters {
-    display: flex;
-    gap: 10px;
-    justify-content: center;
-    margin: 4px 0;
-}
+
+
 /* Phones: the centered no-wrap row (3 selects + Select) overflowed BOTH edges
    — wrap it into a tidy 2-up grid instead. */
-@media (max-width: 640px) {
-    .video-library-filters { flex-wrap: wrap; gap: 8px; }
-    .video-library-filters .library-source-filter-select { flex: 1 1 calc(50% - 4px); min-width: 0; }
-    .video-library-filters .video-lib-select-btn { flex: 1 1 calc(50% - 4px); }
-}
+
 /* Resolution chip on a poster card (top-left, above the gradient overlay). */
 .library-artist-card .video-card-badge {
     position: absolute;
@@ -505,6 +486,30 @@ body[data-side="video"] .dashboard-header-sweep {
        fallback for the theme accent before any artwork has been sampled. */
     --vd-accent-fg: #fff;
     position: relative; margin: -40px -40px -90px;
+    /* the premier pass (end of this file) reads these */
+    --vdp-ink-rgb: 12, 12, 12;
+    --vdp-deep-rgb: 9, 9, 11;
+    --vdp-panel-rgb: 20, 20, 22;
+    --vdp-menu-rgb: 30, 30, 33;
+    --vdp-lift-1-rgb: 32, 32, 36;
+    --vdp-lift-2-rgb: 38, 38, 42;
+    --vdp-lift-3-rgb: 44, 44, 48;
+    --vdp-lift-4-rgb: 60, 60, 66;
+    --vdp-lift-5-rgb: 64, 64, 70;
+    --vdp-text: var(--white-a90);
+    --vdp-soft: var(--white-a70);
+    --vdp-dim: var(--white-a50);
+    --vdp-faint: var(--white-a35);
+    --vdp-line: var(--white-a09);
+    --vdp-glass: var(--white-a12);
+    --vdp-glass-hover: var(--white-a20);
+    --vdp-card: var(--white-a05);
+    --vdp-radius: 14px;
+    --vdp-gutter: clamp(24px, 4.4vw, 72px);
+    --vdp-ease: cubic-bezier(0.22, 0.61, 0.36, 1);
+    color: var(--vdp-text);
+    -webkit-font-smoothing: antialiased;
+    font-feature-settings: "ss01", "cv11";
 }
 /* Sticky so it stays reachable on these long detail pages (negative bottom margin
    pulls the billboard up under it, keeping the full-bleed overlay look). */
@@ -543,7 +548,9 @@ body[data-side="video"] .dashboard-header-sweep {
     /* the polish section's copy overrides this max-width; it stays because
        video-detail-page-measure.test.ts pins it */
     position: relative; z-index: 2; max-width: 720px; padding: 0 0 52px 56px;
-    animation: vdRise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) both;
+    /* backwards, not both: a rise held at its end keeps an identity transform,
+       which traps the fixed More menu inside the clipped billboard (#2124) */
+    animation: vdRise 0.7s cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
 }
 .vd-title {
     font-size: clamp(2.6em, 5vw, 4.4em); line-height: 0.98; font-weight: 900; margin: 0 0 18px;
@@ -554,8 +561,8 @@ body[data-side="video"] .dashboard-header-sweep {
 .vd-meta > span { position: relative; }
 .vd-meta > span + span::before { content: ''; position: absolute; left: -8px; top: 50%; width: 3px; height: 3px;
     border-radius: var(--radius-circle); background: var(--white-a40); transform: translateY(-50%); }
-.vd-match { color: #4ade80 !important; font-weight: 800; }
-.vd-score { color: #fbbf24 !important; font-weight: 800; }
+.vd-match:not(.vd-page .vd-meta .vd-match) { color: #4ade80 !important; font-weight: 800; }
+.vd-score:not(.vd-page .vd-meta .vd-score) { color: #fbbf24 !important; font-weight: 800; }
 .vd-tagline { font-size: 16px; font-style: italic; color: var(--white-a70); margin: -8px 0 14px;
     text-shadow: 0 2px 12px var(--black-a60); }
 .vd-genres { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
@@ -668,6 +675,37 @@ body[data-side="video"] .dashboard-header-sweep {
     display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
     margin: 0 0 14px; max-width: 780px;
 }
+/* Shelf Life on the detail page (admins only): score or gate, reasons, Keep */
+.vd-shelf {
+    margin: 0 0 14px; max-width: 780px; padding: 10px 12px; border-radius: var(--radius-md);
+    background: var(--black-a45); border: 1px solid var(--white-a12); backdrop-filter: blur(8px);
+    color: var(--white-a75); font-size: 13px;
+}
+.vd-shelf-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.vd-shelf-label { font-weight: 700; color: var(--text-bright); }
+.vd-shelf-chip {
+    display: inline-flex; align-items: center; min-height: 22px; padding: 1px 9px; border-radius: var(--radius-pill);
+    font-weight: 800; border: 1px solid var(--white-a18); background: var(--black-a70);
+}
+.vd-shelf-chip--low { color: var(--danger-soft); border-color: rgba(var(--danger-soft-rgb), 0.5); }
+.vd-shelf-chip--mid { color: var(--gold); border-color: rgba(var(--gold-rgb), 0.45); }
+.vd-shelf-chip--ok { color: var(--success); border-color: rgba(var(--success-strong-rgb), 0.4); }
+.vd-shelf-chip--gate { font-weight: 600; }
+.vd-shelf-chip--gate svg { width: 1em; height: 1em; vertical-align: -0.125em; }
+.vd-shelf-flag { color: var(--danger-soft); }
+.vd-shelf-when { color: var(--white-a50); font-size: 12px; }
+.vd-shelf-keep {
+    margin-left: auto; padding: 4px 14px; border-radius: var(--radius-pill); cursor: pointer; font: inherit;
+    font-weight: 600; color: rgb(var(--success-strong-rgb)); background: rgba(var(--success-strong-rgb), 0.16);
+    border: 1px solid rgba(var(--success-strong-rgb), 0.35);
+}
+.vd-shelf-keep:hover { background: rgba(var(--success-strong-rgb), 0.26); }
+.vd-shelf-keep--on { color: var(--bg-primary); background: rgb(var(--success-strong-rgb)); border-color: rgb(var(--success-strong-rgb)); }
+.vd-shelf-keep--on:hover { background: rgba(var(--success-strong-rgb), 0.85); }
+.vd-shelf-keep:disabled { opacity: 0.5; cursor: default; }
+.vd-shelf-note { margin-top: 6px; color: var(--white-a60); }
+.vd-shelf-reasons { margin: 6px 0 0; padding-left: 18px; }
+.vd-shelf-reasons li { margin: 2px 0; }
 .vd-health-chip {
     display: inline-flex; align-items: center; gap: 7px; min-height: 28px; max-width: 100%;
     padding: 5px 10px; border-radius: var(--radius-md);
@@ -711,6 +749,13 @@ body[data-side="video"] .dashboard-header-sweep {
     background: rgba(16, 18, 24, 0.97); border: 1px solid var(--white-a12);
     box-shadow: 0 18px 46px var(--black-a55); backdrop-filter: blur(14px);
 }
+/* Once opened, the page pins it to the screen (placeMoreMenu in video-detail.js):
+   up or down, whichever side has the room, never taller than what you can see.
+   Fixed is what gets it past the billboard's overflow and the scroll edge, which
+   cut the top items off a long menu (#2124). */
+.vd-more .vd-more-menu.vd-more-menu--placed { position: fixed; bottom: auto; margin: 0; }
+/* the hero sits under the sticky back button; lift it while its menu is open */
+.vd-bb-content:has(.vd-more--open) { z-index: 9; }
 .vd-more-menu .vd-manage-btn {
     width: 100%; justify-content: flex-start; margin: 0; background: transparent;
     border-color: transparent; box-shadow: none;
@@ -747,9 +792,6 @@ body[data-side="video"] .dashboard-header-sweep {
 .vd-acq-note { margin-top: 8px; font-size: 11.5px; color: rgba(255,255,255,0.38); }
 
 /* An unmonitored season reads as switched-off, not as an error: it's a choice. */
-.vd-season-mon { opacity: 0.62; }
-.vd-season-mon--on { opacity: 1; }
-.vd-season-mon--on .discog-btn-icon { color: rgb(var(--vd-accent-text-rgb, var(--vd-accent-rgb))); }
 .vd-health-chip--fix { cursor: pointer; font: inherit; }
 .vd-health-chip--fix:hover {
     border-color: rgba(var(--warning-strong-rgb), 0.55); background: rgba(var(--warning-strong-rgb), 0.16);
@@ -967,7 +1009,7 @@ body[data-side="video"] .dashboard-header-sweep {
     background: rgba(var(--vd-accent-rgb, 255, 59, 59), 0.05); }
 .vd-ep--next:hover { background: rgba(var(--vd-accent-rgb, 255, 59, 59), 0.09); }
 /* hero: watched tag in the meta line + the S/E tag inside the play button */
-.vd-watched-tag { color: #4ade80 !important; font-weight: 700; }
+.vd-watched-tag:not(.vd-page .vd-watched-tag) { color: #4ade80 !important; font-weight: 700; }
 .vd-play-ep { font-weight: 800; padding: 2px 8px; border-radius: var(--radius-sm);
     background: var(--white-a16); font-size: 0.85em; }
 
@@ -1155,6 +1197,13 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
     border: 1px solid var(--white-a12); backdrop-filter: blur(6px);
 }
 .vd-rt-tag { font-size: 11px; font-weight: 900; padding: 1px 5px; border-radius: var(--radius-xs); letter-spacing: 0.02em; }
+/* a linked chip (a.vd-rt, its hover lift lives with the rating links further
+   down) gets a keyboard focus ring */
+a.vd-rt:focus-visible { outline: 2px solid var(--white-a50); outline-offset: 2px; }
+/* the provider pages with no score: quieter than a rating */
+.vd-rt--site { font-size: 12px; font-weight: 700; padding: 5px 10px; color: var(--text-2); }
+.vd-rt--site:hover { color: var(--text-1); }
+.vd-rt-out { font-size: 11px; opacity: 0.6; }
 .vd-rt-ic { font-size: 15px; line-height: 1; }
 .vd-rt--imdb .vd-rt-tag { background: #f5c518; color: #000; }
 .vd-rt--mc .vd-rt-tag { background: #fff; color: #000; }
@@ -1164,6 +1213,14 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
 .vd-rt--trakt .vd-rt-tag { background: #ed1c24; color: #fff; }
 .vd-rt--tvmaze .vd-rt-tag { background: #3dd6c0; color: #00211d; }
 .vd-rt--anilist .vd-rt-tag { background: #02a9ff; color: #fff; }
+/* each season's AniList page, in the About section (the anime layer) */
+.vd-anilist-link {
+    display: inline-flex; align-items: center; gap: 6px; margin: 0 6px 6px 0; padding: 3px 10px;
+    border: 1px solid var(--white-a10); border-radius: var(--radius-pill);
+    color: var(--text-1); font-size: 12px; text-decoration: none;
+}
+.vd-anilist-link:hover { background: var(--white-a06); }
+.vd-anilist-score { color: var(--text-3); font-variant-numeric: tabular-nums; }
 /* DeArrow crowd title (YouTube video expand panel) */
 .vd-dearrow { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; font-weight: 600; color: #cfe0ff; }
 .vd-dearrow-tag { font-size: 10px; font-weight: 900; letter-spacing: 0.04em; padding: 2px 6px; border-radius: var(--radius-xs);
@@ -1889,7 +1946,7 @@ a.vd-prov:hover img, a.vd-prov:hover .vd-prov-ph { border-color: rgba(var(--vd-a
     .vsr-hero { padding: 28px 14px 20px; }
     .vsr-hero-title { font-size: 26px; }
     .vsr-searchbar { height: 50px; border-radius: 13px; }
-    .vsr-tabs { width: calc(100% - 4px); grid-template-columns: 1fr 1fr; }
+    .vsr-tabs { width: calc(100% - 4px); grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .vsr-basic { padding: 10px; border-radius: var(--radius-card); }
     .vsr-basic-row { grid-template-columns: 1fr; }
     .vsr-basic-submit { min-height: 42px; width: 100%; }
@@ -2325,6 +2382,8 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vreq-status--available { color: rgb(var(--accent-light-rgb)); }
 .vreq-status--denied { color: rgba(252, 165, 165, 0.8); }
 .vreq-status--partial { color: rgba(147, 197, 253, 0.85); }
+/* approved, held until an admin picks the release (#2199): a sentence, so it wraps */
+.vreq-status--held { color: rgb(var(--gold-rgb)); white-space: normal; max-width: 200px; text-align: right; line-height: 1.35; }
 .vreq-status--failed { color: rgba(253, 186, 116, 0.85); }
 /* a show still arriving: episodes here out of everything asked for */
 .vreq-progress { height: 3px; max-width: 220px; margin-top: 8px; border-radius: var(--radius-pill); overflow: hidden;
@@ -2384,6 +2443,60 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     font: inherit; font-size: 13px; border: 1px solid var(--white-a12); background: var(--black-a30); color: #fff; }
 .vreq-sheet-select:focus-visible { outline: none; border-color: rgba(var(--accent-rgb), 0.7); }
 .vreq-sheet-select option { background: #18181c; color: #fff; }
+/* the member's ask (#2168): the title as art, then plain facts: the quality
+   (a line when there is one, a short radio list when there are more), who
+   gets asked or "starts downloading", and the quota with its meter */
+.vreq-sheet--ask { max-width: 440px; padding: 0; overflow: hidden auto; max-height: calc(100dvh - 32px);
+    overscroll-behavior: contain; }
+.vreq-ask-art { position: relative; min-height: 136px; display: flex; align-items: flex-end; padding: 16px 20px;
+    background: radial-gradient(120% 130% at 80% 0%, rgba(var(--accent-rgb), 0.5) 0%,
+        rgba(var(--accent-rgb), 0.12) 45%, var(--black-a60) 90%); }
+.vreq-ask-art.has-art { background-image: linear-gradient(180deg, var(--black-a10) 15%, var(--black-a85) 100%),
+    var(--vreq-art); background-size: cover; background-position: center 22%; }
+.vreq-ask-art-in { position: relative; min-width: 0; }
+.vreq-ask-title { font-size: 20px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.2;
+    overflow-wrap: anywhere; }
+.vreq-ask-meta { font-size: 12.5px; color: var(--white-a70); margin-top: 3px; }
+.vreq-ask-body { padding: 14px 20px 20px; }
+.vreq-ask-body .vreq-choices { margin-bottom: 6px; }
+.vreq-ask-fact { display: flex; gap: 12px; align-items: flex-start; padding: 11px 0; font-size: 13.5px;
+    line-height: 1.45; border-top: 1px solid var(--white-a06); }
+.vreq-ask-body > .vreq-ask-fact:first-child { border-top: 0; }
+.vreq-ask-fact > svg { flex: none; width: 18px; height: 18px; margin-top: 1px; fill: none; stroke: var(--white-a60);
+    stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+.vreq-ask-fact b { font-weight: 650; }
+.vreq-ask-soft { color: var(--white-a60); }
+.vreq-ask-grow { flex: 1; min-width: 0; }
+.vreq-qpick { margin-top: 8px; border: 1px solid var(--white-a08); border-radius: var(--radius-control); overflow: hidden; }
+.vreq-qopt { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; gap: 10px; align-items: center;
+    width: 100%; padding: 10px 12px; border: 0; border-top: 1px solid var(--white-a06); background: transparent;
+    color: inherit; font: inherit; font-size: 13px; text-align: left; cursor: pointer; }
+.vreq-qopt:first-child { border-top: 0; }
+.vreq-qopt:hover { background: var(--white-a04); }
+.vreq-qopt[aria-checked="true"] { background: var(--white-a05); }
+.vreq-qopt:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.7); outline-offset: -2px; }
+.vreq-qrad { width: 16px; height: 16px; border-radius: var(--radius-circle); border: 1.5px solid var(--white-a40);
+    position: relative; box-sizing: border-box; }
+.vreq-qopt[aria-checked="true"] .vreq-qrad { border-color: rgb(var(--accent-rgb)); }
+.vreq-qopt[aria-checked="true"] .vreq-qrad::after { content: ""; position: absolute; inset: 3px;
+    border-radius: var(--radius-circle); background: rgb(var(--accent-rgb)); }
+.vreq-qname { min-width: 0; overflow-wrap: anywhere; }
+.vreq-qtag { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: var(--radius-pill); white-space: nowrap;
+    color: rgb(var(--success-rgb)); background: rgba(var(--success-rgb), 0.14); }
+.vreq-qtag--ask { color: rgb(var(--warning-rgb)); background: rgba(var(--warning-rgb), 0.14); }
+.vreq-ask-quota { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--white-a50);
+    min-height: 4px; }
+.vreq-ask-quota:empty { display: none; }
+.vreq-ask-meter { flex: 1; height: 5px; border-radius: 3px; background: var(--white-a08); overflow: hidden; }
+.vreq-ask-meter i { display: block; height: 100%; border-radius: 3px; background: rgb(var(--accent-rgb)); }
+.vreq-sheet--ask .vreq-sheet-foot { margin-top: 18px; }
+@media (max-width: 640px) {
+    .vreq-sheet-overlay:has(.vreq-sheet--ask) { align-items: flex-end; padding: 0; }
+    .vreq-sheet--ask { max-width: none; max-height: calc(100dvh - 24px);
+        border-radius: var(--radius-xl) var(--radius-xl) 0 0; }
+    .vreq-sheet--ask .vreq-ask-body { padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px)); }
+    .vreq-sheet--ask .vreq-sheet-foot .vreq-btn { flex: 1; padding: 11px 14px; }
+}
 /* cards, for profiles that ask instead of download: the quick Request
    action (same shape as the get button) and the Requested / Available ribbon */
 .vreq-card-btn { width: 30px; height: 30px; border-radius: 9px; padding: 0;
@@ -2402,6 +2515,62 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 @media (hover: none) { .vreq-card-btn { opacity: 1; transform: none; } }
 .vsr-ribbon--req { background: rgba(59, 130, 246, 0.9); border: none; }
 .vsr-ribbon--req-here { background: rgba(var(--success-strong-rgb), 0.95); }
+
+/* where a title stands (#2160, video-title-status.js). the same few looks on
+   every poster: In Library (owned), Partial, Requested (req), on the way
+   (wish), Searching / Downloading (active), Failed. */
+.vsr-ribbon--partial { background: var(--black-a65); color: rgb(var(--success-rgb));
+    border: 1px solid rgba(var(--success-rgb), 0.5); }
+.vsr-ribbon--active { background: rgba(var(--accent-rgb), 0.92); border: none; }
+.vsr-ribbon--failed { background: var(--black-a65); color: rgb(var(--warning-rgb));
+    border: 1px solid rgba(var(--warning-rgb), 0.5); }
+.vsr-ribbon--active::before, .vd-sim-wishchip--active::before, .vts-block--active .vts-dot {
+    animation: vsrBasicPulse 1.6s ease-in-out infinite; }
+.vsr-ribbon--active::before { content: ''; display: inline-block; width: 6px; height: 6px; margin-right: 5px;
+    border-radius: 50%; background: currentColor; vertical-align: 1px; }
+.vdsc-page .vsr-ribbon--req, .vdsc-page .vsr-ribbon--active {
+    background: var(--black-a60); color: rgb(var(--accent-light-rgb));
+    border: 1px solid rgba(var(--accent-rgb), 0.5); }
+.vdsc-page .vsr-ribbon--req { color: rgb(var(--info-rgb)); border-color: rgba(var(--info-rgb), 0.5); }
+.vdsc-page .vsr-ribbon--partial, .vdsc-page .vsr-ribbon--failed { background: var(--black-a60); }
+.vd-sim-wishchip--req { background: rgba(var(--info-rgb), 0.92); }
+.vd-sim-wishchip--partial { background: var(--black-a65); color: rgb(var(--success-rgb)); }
+.vd-sim-wishchip--failed { background: var(--black-a65); color: rgb(var(--warning-rgb)); }
+
+/* the detail page's block above the actions */
+.vts-host { margin: 0 0 14px; }
+.vts-host[hidden] { display: none; }
+.vts-block { --vts-c: var(--accent-rgb); display: flex; align-items: flex-start; gap: 11px;
+    max-width: 560px; padding: 10px 14px; border-radius: var(--radius-md);
+    background: var(--black-a35); border: 1px solid var(--white-a10);
+    -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); }
+.vts-block--owned, .vts-block--partial { --vts-c: var(--success-rgb); }
+.vts-block--req { --vts-c: var(--info-rgb); }
+.vts-block--wish { --vts-c: var(--accent-light-rgb); }
+.vts-block--failed { --vts-c: var(--warning-rgb); }
+.vts-dot { flex: none; width: 8px; height: 8px; margin-top: 6px; border-radius: 50%;
+    background: rgb(var(--vts-c)); box-shadow: 0 0 0 4px rgba(var(--vts-c), 0.16); }
+.vts-main { min-width: 0; flex: 1; }
+.vts-title { font-size: 14px; font-weight: 600; color: var(--text-1); }
+.vts-sub { margin-top: 2px; font-size: 12.5px; color: var(--white-a60); }
+.vts-link { margin-left: 4px; padding: 0; border: 0; background: none; font: inherit;
+    color: rgb(var(--vts-c)); cursor: pointer; text-decoration: underline;
+    text-underline-offset: 2px; text-decoration-color: rgba(var(--vts-c), 0.45); }
+.vts-link:hover, .vts-link:focus-visible { text-decoration-color: currentColor; outline: none; }
+.vts-bar { margin-top: 8px; height: 3px; border-radius: var(--radius-pill); background: var(--white-a10);
+    overflow: hidden; }
+.vts-bar-fill { display: block; height: 100%; border-radius: inherit; background: rgb(var(--vts-c));
+    transition: width var(--dur-slow) ease; }
+.vts-seasons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.vts-season { padding: 2px 9px; border-radius: var(--radius-pill); font-size: 11.5px; font-weight: 600;
+    background: var(--white-a06); border: 1px solid var(--white-a12); color: var(--white-a75); }
+.vts-season-tail { font-weight: 500; color: var(--white-a50); }
+.vts-season--available { border-color: rgba(var(--success-rgb), 0.4); }
+.vts-season--available .vts-season-tail { color: rgb(var(--success-rgb)); }
+.vts-season--processing .vts-season-tail { color: rgb(var(--accent-light-rgb)); }
+@media (prefers-reduced-motion: reduce) {
+    .vsr-ribbon--active::before, .vd-sim-wishchip--active::before, .vts-block--active .vts-dot { animation: none; }
+}
 @media (max-width: 640px) {
     .vreq-page { padding: 22px 16px 48px; }
     .vreq-row { flex-wrap: wrap; }
@@ -2901,6 +3070,9 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 
 /* ── Page canvas ────────────────────────────────────────────────────────── */
 .vdsc-page {
+    /* one poster width for every rail (ranked ones too); the breakpoints below step it down */
+    --vdsc-card-w: 168px;
+    --vdsc-gap: 18px;
     position: relative;
     max-width: 1480px;
     margin: 0 auto;
@@ -3157,43 +3329,42 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 /* ── Sticky jump-nav ────────────────────────────────────────────────────── */
 .vdsc-jumpnav {
     position: sticky; top: 0; z-index: 20;
-    display: flex; gap: 8px; overflow-x: auto; flex-wrap: nowrap;
-    margin: 0 0 30px; padding: 12px 2px;
+    display: flex; gap: 6px; overflow-x: auto; flex-wrap: nowrap;
+    margin: 0; padding: 12px 2px;
     scrollbar-width: none;
-    background: linear-gradient(180deg, rgba(10, 13, 20, 0.94) 0%, rgba(10, 13, 20, 0.86) 70%, transparent 100%);
+    background: linear-gradient(180deg, var(--black-a75) 0%, var(--black-a60) 70%, transparent 100%);
     -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
 }
 .vdsc-jumpnav::-webkit-scrollbar { display: none; }
 .vdsc-jump {
-    flex: 0 0 auto; height: 34px; padding: 0 16px; border-radius: var(--radius-pill);
+    flex: 0 0 auto; height: 32px; padding: 0 14px; border-radius: var(--radius-pill);
     border: 1px solid var(--white-a08);
-    background: var(--white-a06);
-    color: rgba(255, 255, 255, 0.78);
-    font-size: 0.86rem; font-weight: 600; white-space: nowrap; cursor: pointer;
+    background: var(--white-a05);
+    color: var(--white-a70);
+    font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer;
     transition: background 160ms ease, color 160ms ease, border-color 160ms ease;
 }
-.vdsc-jump:hover { background: rgba(255, 255, 255, 0.13); color: #fff; border-color: var(--white-a16); }
+.vdsc-jump:hover { background: var(--white-a12); color: var(--text-bright); border-color: var(--white-a16); }
+/* the group you're reading */
+.vdsc-jump--on, .vdsc-jump--on:hover { background: var(--white-a90); border-color: transparent; color: var(--bg-primary); }
 
 /* ── Groups, shelves, rails ─────────────────────────────────────────────── */
-.vdsc-group { margin: 0 0 54px; content-visibility: auto; contain-intrinsic-size: auto 760px; }
+.vdsc-group { margin: 0; padding: 36px 0 8px; border-top: 1px solid var(--white-a06); scroll-margin-top: 56px; }
+.vdsc-jumpnav + .vdsc-group { border-top: 0; padding-top: 20px; }
 .vdsc-group--empty { display: none; }
-.vdsc-group-head { margin: 0 0 18px; }
+.vdsc-group-head { margin: 0 0 20px; }
 .vdsc-group-head h2 {
     margin: 0; font-size: 1.75rem; font-weight: 800; letter-spacing: -0.03em;
     line-height: 1.1; color: #fff;
 }
 .vdsc-group-head p { margin: 6px 0 0; font-size: 0.9rem; color: var(--white-a50); }
-.vdsc-shelf { margin: 0 0 34px; }
-.vdsc-shelf-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 18px; }
+.vdsc-shelf { margin: 0 0 24px; }
+.vdsc-shelf:last-child { margin-bottom: 16px; }
+.vdsc-shelf-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 10px; min-height: 32px; }
 .vdsc-shelf-title {
     margin: 0; font-size: 1.4rem; font-weight: 800; letter-spacing: -0.02em;
     line-height: 1.2; color: #fff;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-/* ML-personalized shelves keep their gradient-title accent */
-.vdsc-shelf--ml .vdsc-shelf-title {
-    background: linear-gradient(135deg, #fff 30%, rgb(var(--accent-rgb)) 130%);
-    -webkit-background-clip: text; background-clip: text; color: transparent;
 }
 .vdsc-shelf--in .vdsc-rail .vsr-card { animation: vdscCardIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) backwards; }
 .vdsc-shelf--in .vdsc-rail .vsr-card:nth-child(2) { animation-delay: 0.04s; }
@@ -3206,15 +3377,15 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 @keyframes vdscCardIn { from { opacity: 0; transform: translateY(18px) scale(0.97); } to { opacity: 1; transform: none; } }
 @keyframes vdscKenBurns { from { transform: scale(1) translate(0, 0); } to { transform: scale(1.12) translate(-1.5%, 1%); } }
 .vdsc-rail {
-    display: flex; gap: 18px; overflow-x: auto; overscroll-behavior-x: contain;
-    padding: 6px 2px 20px;
+    display: flex; gap: var(--vdsc-gap); overflow-x: auto; overscroll-behavior-x: contain;
+    padding: 8px 2px 14px;
     scroll-snap-type: x mandatory;
     scrollbar-width: thin; scrollbar-color: var(--white-a18) transparent;
 }
 .vdsc-rail::-webkit-scrollbar { height: 6px; }
 .vdsc-rail::-webkit-scrollbar-thumb { background: var(--white-a16); border-radius: 3px; }
 .vdsc-rail::-webkit-scrollbar-track { background: transparent; }
-.vdsc-rail .vsr-card { flex: 0 0 180px; width: 180px; scroll-snap-align: start; }
+.vdsc-rail .vsr-card { flex: 0 0 var(--vdsc-card-w); width: var(--vdsc-card-w); scroll-snap-align: start; }
 
 /* ── Cards: the music side's tactile treatment ──────────────────────────── */
 .vdsc-rail .vsr-card,
@@ -3273,15 +3444,17 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 @media (hover: none) { .vdsc-page .vsr-notint { opacity: 0.95; } }
 
 /* ── Ranked (Top 10) rails ──────────────────────────────────────────────── */
-.vdsc-shelf--ranked .vdsc-rail { gap: 6px; align-items: center; }
+.vdsc-shelf--ranked .vdsc-rail { gap: calc(var(--vdsc-gap) + 6px); align-items: flex-start; }
+.vsr-ranked { display: flex; align-items: flex-start; gap: 8px; flex: 0 0 auto; scroll-snap-align: start; }
 .vsr-rank {
     display: flex; align-items: flex-end; flex: 0 0 auto;
-    font-size: 120px; font-weight: 900; line-height: 0.8; letter-spacing: -0.05em;
-    color: transparent;
-    -webkit-text-stroke: 2px var(--white-a35);
-    margin-right: -6px; user-select: none;
+    height: calc(var(--vdsc-card-w) * 1.5);
+    font-size: calc(var(--vdsc-card-w) * 1.1); font-weight: 900; line-height: 0.74; letter-spacing: -0.07em;
+    color: var(--white-a04);
+    -webkit-text-stroke: 2px var(--white-a40);
+    user-select: none;
 }
-.vdsc-shelf--ranked .vsr-card { flex: 0 0 150px; width: 150px; }
+.vdsc-shelf--ranked .vsr-card { flex: 0 0 var(--vdsc-card-w); width: var(--vdsc-card-w); }
 .vdsc-shelf--ranked .vsr-card:hover {
     box-shadow: 0 10px 28px var(--black-a50), 0 0 18px var(--white-a18);
 }
@@ -3289,20 +3462,31 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vdsc-shelf--ranked .vsr-ranked:first-child .vsr-rank { -webkit-text-stroke-color: var(--white-a90); }
 
 /* ── Skeletons ──────────────────────────────────────────────────────────── */
-.vdsc-skel { display: flex; gap: 18px; overflow: hidden; padding: 6px 2px 20px; }
-.vdsc-skel-card {
-    flex: 0 0 180px; height: 302px; border-radius: var(--radius-xl);
-    background: linear-gradient(100deg, var(--white-a04) 40%, var(--white-a10) 50%, var(--white-a04) 60%);
+/* the skeleton fills the rail; as a shrinkable flex item firefox squeezed it to one card */
+.vdsc-skel { display: flex; flex: 0 0 100%; gap: var(--vdsc-gap); overflow: hidden; }
+.vdsc-skel-card { flex: 0 0 var(--vdsc-card-w); }
+.vdsc-skel-poster, .vdsc-skel-line {
+    background: linear-gradient(100deg, var(--white-a04) 40%, var(--white-a08) 50%, var(--white-a04) 60%);
     background-size: 200% 100%;
     animation: vdscShimmer 1.6s linear infinite;
-    border: 1px solid var(--white-a05);
 }
+.vdsc-skel-poster { aspect-ratio: 2 / 3; border-radius: var(--radius-lg); }
+.vdsc-skel-line { height: 11px; width: 78%; margin-top: 12px; border-radius: var(--radius-xs); }
+.vdsc-skel-line--short { width: 46%; margin-top: 7px; }
+/* a row that couldn't load: one quiet line and a retry, not a poster-tall hole */
+.vdsc-rail-msg {
+    display: flex; align-items: center; gap: 14px; flex: 1 1 auto;
+    min-height: 56px; padding: 0 18px;
+    border: 1px dashed var(--white-a10); border-radius: var(--radius-lg);
+    color: var(--white-a55); font-size: 13.5px;
+}
+.vdsc-shelf--failed .vdsc-arrow { display: none; }
 @keyframes vdscShimmer { to { background-position: -200% 0; } }
 
 /* ── Rail controls ──────────────────────────────────────────────────────── */
 .vdsc-shelf-nav { display: flex; align-items: center; gap: 8px; }
 .vdsc-arrow {
-    flex: 0 0 auto; width: 34px; height: 34px; border-radius: var(--radius-circle);
+    flex: 0 0 auto; width: 32px; height: 32px; border-radius: var(--radius-circle);
     display: inline-flex; align-items: center; justify-content: center;
     background: var(--white-a08);
     border: 1px solid var(--white-a12);
@@ -3310,20 +3494,22 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     transition: background 160ms ease, transform 160ms ease;
 }
 .vdsc-arrow:hover { background: var(--white-a18); transform: scale(1.06); }
-.vdsc-seeall {
+.vdsc-seeall, .vdsc-rail-retry {
     flex: 0 0 auto; align-self: center;
     background: none; border: none; cursor: pointer;
     font-size: 13px; font-weight: 600; color: var(--white-a55);
     padding: 8px 10px; border-radius: var(--radius-md); white-space: nowrap;
     transition: color 160ms ease, background 160ms ease;
 }
-.vdsc-seeall:hover { color: #fff; background: var(--white-a08); }
+.vdsc-seeall:hover, .vdsc-rail-retry:hover { color: var(--text-bright); background: var(--white-a08); }
+.vdsc-rail-retry { color: var(--text-bright); border: 1px solid var(--white-a14); }
 
 /* ── Browse strip ───────────────────────────────────────────────────────── */
 .vdsc-browse-strip { margin: 0 0 8px; }
-.vdsc-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+/* the genres in even rows, Browse all as one slim bar under them (no ragged last row) */
+.vdsc-tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
 .vdsc-tile {
-    position: relative; height: 148px; border-radius: var(--radius-sheet); overflow: hidden;
+    position: relative; height: 104px; border-radius: var(--radius-sheet); overflow: hidden; scroll-snap-align: start;
     border: 1px solid var(--white-a10);
     background: rgba(28, 34, 48, 0.7);
     cursor: pointer; text-align: left; padding: 0;
@@ -3366,11 +3552,14 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     box-shadow: 0 12px 28px var(--black-a45), 0 0 22px rgba(var(--c, 88, 101, 242), 0.22);
 }
 .vdsc-tile-name {
-    position: absolute; left: 16px; bottom: 14px; z-index: 2;
-    font-size: 18px; font-weight: 800; letter-spacing: -0.02em; color: #fff;
+    position: absolute; left: 16px; right: 14px; bottom: 14px; z-index: 2;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 17px; font-weight: 800; letter-spacing: -0.02em; color: #fff;
     text-shadow: 0 2px 14px var(--black-a75);
 }
-.vdsc-tile--all { border-style: dashed; }
+.vdsc-tile--all { border-style: dashed; grid-column: 1 / -1; height: 52px; }
+.vdsc-tile--all .vdsc-tile-name { bottom: 50%; transform: translateY(50%); font-size: 15px; }
+.vdsc-tile--all .vdsc-tile-name::before { display: none; }
 
 /* ── Filter bar: monochrome pills (music standard) ──────────────────────── */
 .vdsc-filterbar {
@@ -3606,14 +3795,8 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     .vdsc-hero-body { max-width: 100%; padding: 24px 24px 78px; }
     .vdsc-dots { padding: 0 24px 22px; }
     .vdsc-hero-nav { display: none; }
-    .vdsc-rail .vsr-card { flex-basis: 140px; width: 140px; }
-    .vdsc-shelf--ranked .vsr-card { flex-basis: 128px; width: 128px; }
-    .vdsc-skel-card { flex-basis: 140px; }
-    .vsr-rank { font-size: 88px; }
     .vdsc-grid { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 14px; }
-    .vdsc-group-head h2 { font-size: 1.4rem; }
-    .vdsc-shelf-title { font-size: 1.15rem; }
-    .vdsc-tiles { grid-template-columns: repeat(2, 1fr); }
+
     .vdsc-bar-title { font-size: 1.4rem; }
 }
 
@@ -3873,6 +4056,10 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vq-chip:hover { color: #fff; border-color: var(--white-a25); }
 .vq-chip.on { background: rgba(239,68,68,0.18); border-color: rgba(239,68,68,0.55); color: #fecaca; }
 .vq-chip.on::before { content: '⊘ '; font-weight: 800; }
+/* audio languages are things you WANT (prefer / require), so a picked one is
+   the accent with a tick, never the reject chip's red ⊘ */
+.vq-chip.vq-chip--pick.on { background: rgba(var(--accent-rgb), 0.18); border-color: rgba(var(--accent-rgb), 0.6); color: var(--white-a90); }
+.vq-chip.vq-chip--pick.on::before { content: '✓ '; }
 /* preference rows (label + segmented control) */
 .vq-prefs { display: flex; flex-direction: column; gap: 11px; }
 .vq-pref-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
@@ -4130,8 +4317,15 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vdl-season-grab:disabled { opacity: 0.7; cursor: progress; transform: none; }
 .vdl-season-chev { flex-shrink: 0; font-size: 13px; color: var(--white-a50); transition: transform var(--dur-moderate) ease; }
 .vdl-season--open .vdl-season-chev { transform: rotate(180deg); }
-.vdl-season-body { max-height: 0; overflow: hidden; transition: max-height 0.32s var(--ease-out); }
-.vdl-season--open .vdl-season-body { max-height: 5000px; }
+/* grid rows, not max-height. an open season was capped at 5000px with the
+   rest hidden, so with a few episodes' search results expanded the later
+   episodes and the next season's results were cut off and you couldn't
+   scroll to them (SeadogsBooty, Dexter: Resurrection S1). 1fr is whatever
+   the content needs, and it still animates. */
+.vdl-season-body { display: grid; grid-template-rows: 0fr; grid-template-columns: minmax(0, 1fr); overflow: hidden;
+    transition: grid-template-rows 0.32s var(--ease-out); }
+.vdl-season-inner { min-height: 0; }
+.vdl-season--open .vdl-season-body { grid-template-rows: 1fr; }
 .vdl-season-empty { padding: 12px 16px; font-size: 12.5px; color: var(--white-a40); }
 
 .vdl-ep { position: relative; border-top: 1px solid var(--white-a05); }
@@ -4174,8 +4368,21 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     border-radius: 2px; background: linear-gradient(90deg, transparent, hsl(var(--vgm-h, 220), 85%, 62%), transparent);
     box-shadow: 0 0 9px 1px hsla(var(--vgm-h, 220), 85%, 62%, 0.7); animation: vdlScan 0.9s ease-in-out infinite; }
 /* inline per-episode source search */
-.vdl-ep-search { max-height: 0; overflow: hidden; transition: max-height var(--dur-slow) var(--ease-out); }
-.vdl-ep-srcs { display: flex; flex-direction: column; gap: 7px; padding: 3px 14px 12px 42px; }
+/* opens to the results' real height: a max-height cap (2400px) cut a long
+   result list off mid-card with the next episode right under it */
+/* minmax(0, 1fr): a bare track grows to the longest release name (titles are
+   nowrap), the panel then scrolls sideways when a card is scrolled into view,
+   and both edges get cut off (SeadogsBooty) */
+.vdl-ep-search { display: grid; grid-template-rows: 0fr; grid-template-columns: minmax(0, 1fr); overflow: hidden;
+    transition: grid-template-rows var(--dur-slow) var(--ease-out); }
+/* the row closes to 0fr, but only as far as its child will shrink. the
+   child's own top and bottom padding can't shrink, so a closed episode kept
+   15px of it with the first source's edge showing through (#2040). the space
+   is margin on what's inside now, and the child clips it */
+.vdl-ep-search > * { min-height: 0; overflow: hidden; }
+.vdl-ep-srcs { display: flex; flex-direction: column; gap: 7px; padding: 0 14px 0 42px; }
+.vdl-ep-srcs > :first-child { margin-top: 3px; }
+.vdl-ep-srcs > :last-child { margin-bottom: 12px; }
 .vdl-src--mini { padding: 8px 11px; border-radius: 0; animation: none; }
 .vdl-src--mini .vdl-src-icon { width: 30px; height: 30px; border-radius: 0; }
 .vdl-src--mini .vdl-src-emoji { font-size: 15px; }
@@ -4189,7 +4396,7 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vdl-results { margin-top: 12px; }
 .vdl-results[hidden] { display: none; }
 .vdl-results--season { margin: 2px 14px 12px 14px; }
-.vdl-ep--open .vdl-ep-search { max-height: 2400px; }   /* room for result cards */
+.vdl-ep--open .vdl-ep-search { grid-template-rows: 1fr; }
 .vdl-res-loading { display: flex; align-items: center; gap: 9px; font-size: 12.5px; font-weight: 600;
     color: var(--white-a60); padding: 9px 2px; }
 .vdl-res-spin { width: 14px; height: 14px; border-radius: var(--radius-circle); flex-shrink: 0;
@@ -4204,6 +4411,42 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vdl-res-head { display: flex; align-items: center; gap: 8px; font-size: 11.5px; font-weight: 700;
     color: var(--white-a50); margin: 4px 0 10px; }
 .vdl-res-head strong { color: #fff; }
+.vdl-res-shown { color: rgb(var(--accent-light-rgb)); }
+/* filter + sort bar over the results (SeadogsBooty): square and mono like the cards */
+.vdl-rf { margin: 0 0 10px; font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace; }
+.vdl-rf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.vdl-rf-q { flex: 1 1 180px; min-width: 0; }
+.vdl-rf-q, .vdl-rf-sel, .vdl-rf-in { height: 30px; padding: 0 9px; border-radius: 0; font: inherit; font-size: 11.5px;
+    color: var(--white-a90); background: var(--white-a03); border: 1px solid var(--white-a14); }
+.vdl-rf-sel { padding-right: 6px; cursor: pointer; }
+.vdl-rf-sel option { background: var(--bg-surface); color: var(--white-a90); }
+.vdl-rf-q:focus, .vdl-rf-sel:focus, .vdl-rf-in:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.7); }
+.vdl-rf-btn { height: 30px; padding: 0 11px; border-radius: 0; font: inherit; font-size: 11px; font-weight: 800;
+    letter-spacing: 0.04em; text-transform: uppercase; cursor: pointer; color: var(--white-a80);
+    background: transparent; border: 1px solid var(--white-a25); transition: background var(--dur-xfast), border-color var(--dur-xfast); }
+.vdl-rf-btn:hover { background: var(--white-a08); border-color: var(--white-a40); }
+.vdl-rf-btn.is-on { color: var(--bg-surface); background: rgb(var(--accent-rgb)); border-color: rgb(var(--accent-rgb)); }
+.vdl-rf-btn.is-primary { color: var(--bg-surface); background: rgb(var(--accent-rgb)); border-color: rgb(var(--accent-rgb)); }
+.vdl-rf-btn.is-danger { color: var(--warning); border-color: rgba(var(--warning-strong-rgb), 0.5); }
+.vdl-rf-dir { width: 30px; padding: 0; font-size: 14px; }
+.vdl-rf-builder { margin-top: 8px; padding: 10px; border: 1px solid var(--white-a14); background: var(--black-a20);
+    display: flex; flex-direction: column; gap: 8px; }
+.vdl-rf-builder[hidden] { display: none; }
+.vdl-rf-match { font-size: 11.5px; color: var(--white-a60); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.vdl-rf-conds { display: flex; flex-direction: column; gap: 6px; }
+.vdl-rf-cond { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1.2fr) 30px; gap: 6px; }
+.vdl-rf-x { height: 30px; border-radius: 0; cursor: pointer; font-size: 15px; color: var(--white-a50);
+    background: transparent; border: 1px solid var(--white-a14); }
+.vdl-rf-x:hover { color: var(--warning); border-color: rgba(var(--warning-strong-rgb), 0.5); }
+.vdl-rf-link { align-self: flex-start; padding: 0; border: 0; background: none; cursor: pointer; font: inherit;
+    font-size: 11.5px; font-weight: 700; color: rgb(var(--accent-light-rgb)); }
+.vdl-rf-link:hover { text-decoration: underline; }
+.vdl-rf-foot { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.vdl-rf-name { flex: 1 1 160px; min-width: 0; }
+@media (max-width: 560px) {
+    .vdl-rf-cond { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 30px; }
+    .vdl-rf-cond [data-rf-value] { grid-column: 1 / 3; }
+}
 .vdl-res-okn { color: #8fe7af; }
 .vdl-res-live, .vdl-res-demo { margin-left: auto; font-size: 10px; font-weight: 800; padding: 2px 8px; border-radius: var(--radius-pill);
     text-transform: uppercase; letter-spacing: 0.04em; }
@@ -4249,6 +4492,21 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vdl-r-formats span { color: rgba(var(--accent-light-rgb), 0.92);
     text-transform: uppercase; letter-spacing: 0.04em; font-size: 9.5px; font-weight: 900; }
 .vdl-r-formats b { color: #6cd391; font-weight: 900; }
+/* why this rank (#2033): each factor and its points, in compare order */
+.vdl-why { margin-top: 2px; font-size: 10.5px; line-height: 1.4; color: var(--white-a70); }
+.vdl-why summary { cursor: pointer; width: max-content; font-size: 9.5px; font-weight: 900; letter-spacing: 0.04em;
+    text-transform: uppercase; color: rgba(var(--accent-light-rgb), 0.92); list-style: none; }
+.vdl-why summary::-webkit-details-marker { display: none; }
+.vdl-why summary::before { content: '\25B8'; display: inline-block; margin-right: 5px; transition: transform 0.15s ease; }
+.vdl-why[open] summary::before { transform: rotate(90deg); }
+.vdl-why summary:focus-visible { outline: 1px solid rgb(var(--accent-rgb)); outline-offset: 2px; }
+.vdl-why-group { margin-top: 6px; padding-left: 8px; border-left: 2px solid rgba(var(--accent-rgb), 0.35); }
+.vdl-why-head, .vdl-why-row { display: flex; justify-content: space-between; gap: 12px; min-width: 0; }
+.vdl-why-head span { font-weight: 800; color: var(--white-a85); }
+.vdl-why-head b { color: var(--success); font-weight: 900; font-variant-numeric: tabular-nums; }
+.vdl-why-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vdl-why-row em { flex-shrink: 0; font-style: normal; font-variant-numeric: tabular-nums; color: var(--white-a60); }
+.vdl-why-foot { margin-top: 6px; color: var(--white-a50); }
 .vdl-r-l3 { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .vdl-r-verdict { font-size: 10.5px; font-weight: 700; letter-spacing: 0.05em; min-width: 0;
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -4280,6 +4538,25 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     background: rgba(0, 0, 0, 0.22);
     font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace; }
 .vdl-res-track-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+/* what the retry took after this release failed (SeadogsBooty) */
+.vdl-res-track-chain { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
+.vdl-res-track-chain-head { font-size: 9.5px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--white-a40); }
+.vdl-res-track-step { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 11px; }
+.vdl-res-track-step-ic { flex-shrink: 0; width: 12px; text-align: center; font-weight: 800; }
+.vdl-res-track-step-rel { flex: 1; min-width: 0; color: var(--white-a70); white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; }
+.vdl-res-track-step-st { flex-shrink: 0; font-weight: 700; font-variant-numeric: tabular-nums; }
+.vdl-res-track-step--done .vdl-res-track-step-ic, .vdl-res-track-step--done .vdl-res-track-step-st { color: var(--success); }
+.vdl-res-track-step--fail .vdl-res-track-step-ic, .vdl-res-track-step--fail .vdl-res-track-step-st { color: var(--warning); }
+.vdl-res-track-step--active .vdl-res-track-step-ic, .vdl-res-track-step--active .vdl-res-track-step-st {
+    color: hsl(var(--vgm-h, 220), 85%, 74%); }
+.vdl-r-chain { flex-shrink: 0; font-size: 9.5px; font-weight: 900; letter-spacing: 0.04em; text-transform: uppercase;
+    padding: 2px 7px; border-radius: 0; color: var(--bg-surface); }
+.vdl-r-chain--done { background: var(--success); }
+.vdl-r-chain--active { background: hsl(var(--vgm-h, 220), 85%, 70%); }
+.vdl-r-chain--fail { background: var(--warning-strong); }
+.vdl-res--chain { border-color: var(--white-a20); }
 .vdl-res-track-state { display: inline-flex; align-items: center; gap: 7px; font-size: 11px; font-weight: 700;
     letter-spacing: 0.06em; text-transform: uppercase; color: #fff; }
 .vdl-res-track-pct { font-size: 11px; font-weight: 700; color: var(--white-a60); font-variant-numeric: tabular-nums; }
@@ -4331,9 +4608,7 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
     .vdl-active, .vdl-active--active { animation: none !important; }
 }
 
-/* ── Library cards: rating · watched tick · show status chip · progress line ── */
-.vlib-rate { color: #fbbf24; font-weight: 700; white-space: nowrap; }
-.vlib-watched { color: #2bd17e; font-weight: 800; }
+
 /* Show lifecycle on the poster corner (movies wear resolution there) — the
    stat line is too tight on small cards to carry it. */
 .library-artist-card .video-card-badge--airing { color: #2bd17e; background: rgba(10, 40, 22, 0.82);
@@ -4343,10 +4618,6 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .library-artist-card .video-card-badge--upcoming { color: #60a5fa; background: rgba(12, 25, 48, 0.82);
     border: 1px solid rgba(96, 165, 250, 0.38); }
 
-/* slim owned-episodes progress under a show card's stats */
-.vlib-prog { margin-top: 7px; height: 3px; border-radius: var(--radius-pill); background: var(--white-a09); overflow: hidden; }
-.vlib-prog-fill { height: 100%; border-radius: var(--radius-pill); background: linear-gradient(90deg, rgba(164, 114, 245, 0.65), rgb(164, 114, 245)); }
-.vlib-prog-fill--full { background: linear-gradient(90deg, rgba(var(--success-strong-rgb), 0.65), #2bd17e); }
 
 /* first-visit loading skeleton (removed on the first render) */
 .vdpg-skel-row { display: flex; align-items: center; gap: 14px; padding: 14px 16px; margin-bottom: 10px;
@@ -4501,6 +4772,26 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vimp-btn--danger:hover:not(:disabled) { background: rgba(239, 68, 68, 0.2); color: #fca5a5; }
 .vimp-btn--danger:disabled { opacity: 0.45; cursor: default; }
 
+/* the import folder (#2129): a section head with the folder and the auto switch,
+   then the same cards as the queue below it */
+.vimp-folder { margin-bottom: 28px; }
+.vimp-section-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; margin: 0 0 12px; }
+.vimp-section-h { margin: 0; font-size: 15px; font-weight: 700; color: var(--text-1); }
+.vimp-folder-path { flex: 1; min-width: 0; font-size: 12px; color: var(--text-3);
+    font-family: 'JetBrains Mono', ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.vimp-auto { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--text-2); cursor: pointer; }
+.vimp-auto input { accent-color: rgb(var(--accent-rgb)); }
+.vimp-folder-note { padding: 18px 16px; border-radius: var(--radius-card); font-size: 13px; color: var(--text-3);
+    background: var(--white-a04); border: 1px dashed var(--white-a12); }
+.vimp-folder-note[hidden] { display: none; }
+.vimp-card--folder { cursor: default; }
+.vimp-folder-why { margin-top: 5px; font-size: 12px; color: var(--text-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 640px) {
+    .vimp-folder-path { flex-basis: 100%; order: 3; }
+    .vimp-card--folder .vimp-card-row { flex-wrap: wrap; }
+    .vimp-card--folder .vimp-card-side { width: 100%; justify-content: flex-end; }
+}
+
 .vimp-state { text-align: center; padding: 64px 20px; }
 .vimp-state-ic { font-size: 38px; color: #6cd391; }
 .vimp-state-title { font-size: 17px; font-weight: 700; color: #fff; margin-top: 10px; }
@@ -4521,7 +4812,12 @@ body[data-side="video"] .settings-group[data-svc-side="music"].svc-side-active #
 .vimp-kindtab { padding: 7px 16px; border-radius: 9px; cursor: pointer; font-size: 13px; font-weight: 700;
     color: var(--white-a70); background: var(--white-a05); border: 1px solid var(--white-a10); }
 .vimp-kindtab--on { color: #06210f; background: rgb(var(--accent-rgb)); border-color: transparent; }
-.vimp-search { padding: 0 20px 10px; }
+/* the modal lives on body, outside .vd-page and its [hidden] rule */
+.vimp-modal [hidden] { display: none; }
+.vimp-search { position: relative; padding: 0 20px 10px; }
+.vimp-search-icon { position: absolute; left: 32px; top: 12px; width: 16px; height: 16px;
+    color: var(--text-3); pointer-events: none; }
+.vimp-search .vimp-search-input { padding-left: 36px; }
 .vimp-search-input { width: 100%; padding: 10px 13px; border-radius: var(--radius-control); font-size: 14px; color: #fff;
     background: var(--white-a05); border: 1px solid var(--white-a14); }
 .vimp-search-input:focus { outline: none; border-color: rgba(var(--accent-rgb), 0.6); }
@@ -4648,16 +4944,6 @@ img.vdh-poster--none { font-size: 0; }
     transition: all var(--dur-fast) ease; }
 .vdh-more:hover { color: #fff; background: var(--white-a10); }
 @media (max-width: 620px) { .vdh-detail { grid-template-columns: 1fr; padding-left: 16px; } }
-
-/* ── Video Tools scan cards ──────────────────────────────────────────────
-   The video scan cards carry THREE controls (target + mode + action button),
-   one more than music's two, so the shared no-wrap flex row overflowed and clipped
-   the button. Scoped to the video Tools page (music's .tool-card-controls is
-   untouched): let the row wrap, two selects share the top row, the button drops
-   to its own full-width row. The page is the React tools page on ?media=video. */
-.tools-page--video .tool-card-controls {
-    flex-wrap: wrap;
-}
 .tools-page--video .tool-card-controls select {
     flex: 1 1 140px;          /* two selects share the top row, each ≥140px */
     min-width: 0;
@@ -4758,6 +5044,34 @@ body[data-side="video"] #gsearch-aura {
 .vms-title { font-size: 22px; font-weight: 700; color: #fff; margin-top: 4px; }
 .vms-scope { font-size: 13px; font-weight: 600; color: var(--white-a60); margin-top: 2px; }
 .vms-sub { font-size: 12px; color: var(--white-a45); margin-top: 8px; }
+.vms-prof { margin-top: 10px; }
+.vms-prof[hidden] { display: none; }
+/* the editable query, prefilled with what the search starts from (#2121) */
+.vms-query { display: flex; gap: 8px; margin-top: 12px; }
+.vms-query-input { flex: 1; min-width: 0; padding: 8px 12px; border-radius: var(--radius-md);
+    border: 1px solid var(--white-a12); background: var(--white-a06); color: var(--text-1); font: inherit; font-size: 13.5px; }
+.vms-query-input:focus-visible { outline: 2px solid var(--white-a50); outline-offset: 1px; }
+.vms-query-btn { flex-shrink: 0; padding: 8px 16px; border-radius: var(--radius-md); border: 1px solid var(--white-a12);
+    background: var(--white-a10); color: var(--text-1); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
+.vms-query-btn:hover { background: var(--white-a14); }
+/* the title's quality profile picker (Get + Manual search) */
+.vdl-prof { display: inline-flex; align-items: center; gap: 8px; padding: 3px 4px 3px 12px;
+    border-radius: var(--radius-pill); background: var(--white-a06); border: 1px solid var(--white-a12); }
+.vdl-prof-lab { font-size: 11px; font-weight: 800; letter-spacing: 0.04em; text-transform: uppercase; color: var(--white-a50); }
+.vdl-prof-sel { appearance: none; -webkit-appearance: none; border: 0; border-radius: var(--radius-pill);
+    padding: 4px 26px 4px 10px; font: inherit; font-size: 12.5px; font-weight: 700; color: var(--text-1); cursor: pointer;
+    background: var(--white-a10) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23fff' stroke-width='1.6' fill='none' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 9px center; }
+.vdl-prof-sel:hover { background-color: var(--white-a14); }
+.vdl-prof-sel:focus-visible { outline: 2px solid var(--white-a50); outline-offset: 2px; }
+.vdl-prof-sel:disabled { opacity: 0.55; cursor: progress; }
+.vdl-prof-sel option { background: var(--bg-raised); color: var(--text-1); }
+/* #2029: a movie's copies in other libraries, beside the library picker */
+.vdl-copies { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.vdl-copy { display: inline-flex; align-items: center; gap: 4px; }
+.vdl-copy-x { border: 0; background: none; color: inherit; font: inherit; line-height: 1; padding: 0 2px;
+    cursor: pointer; opacity: 0.7; }
+.vdl-copy-x:hover, .vdl-copy-x:focus-visible { opacity: 1; }
+.vdl-copy-x:disabled { opacity: 0.4; cursor: progress; }
 .vms-body { padding: 16px 24px 24px; display: flex; flex-direction: column; gap: 18px; }
 .vms-src-head { font-size: 13px; font-weight: 700; color: var(--white-a85); margin-bottom: 8px; }
 .vms-grabbed { color: #4ade80 !important; border-color: rgba(74,222,128,0.5) !important; }
@@ -4790,41 +5104,6 @@ body[data-side="video"] #gsearch-aura {
 .vdl-res-grab--override { color: #fbbf24; border-color: rgba(251,191,36,0.55); }
 .vdl-res-grab--override:hover { color: #fde68a; background: rgba(251,191,36,0.12); }
 
-/* ── Library bulk select mode + action bar ─────────────────────────────────
-   Select N cards → floating action bar (bulk metadata via /api/video/bulk —
-   the same edit-and-lock engine as the Manage sidebar). */
-.video-lib-select-btn {
-    padding: 8px 16px; border-radius: var(--radius-control); font-size: 12.5px; font-weight: 700;
-    cursor: pointer; background: var(--white-a06);
-    border: 1px solid var(--white-a12); color: var(--white-a75);
-    transition: all .13s; white-space: nowrap;
-}
-.video-lib-select-btn:hover { background: rgba(255,255,255,0.11); color: #fff; }
-.video-lib-select-btn.active {
-    background: rgba(var(--accent-rgb), 0.22);
-    border-color: rgba(var(--accent-rgb), 0.55); color: #fff;
-}
-
-/* Cards in select mode: no nav affordance, overlay controls parked, and a
-   pick ring — the circle appears on every card, the check fills the picked. */
-.video-lib--selecting .library-artist-card { cursor: copy; position: relative; }
-.video-lib--selecting .library-artist-card button { pointer-events: none; opacity: 0 !important; }
-.video-lib--selecting .library-artist-card::after {
-    content: ""; position: absolute; top: 10px; right: 10px; width: 22px; height: 22px;
-    border-radius: var(--radius-circle); border: 2px solid var(--white-a55);
-    background: var(--black-a45); z-index: 5; transition: all var(--dur-xfast);
-}
-.video-lib--selecting .video-card--picked::after {
-    content: "\2713"; display: flex; align-items: center; justify-content: center;
-    font-size: 13px; font-weight: 900; color: #fff;
-    background: rgb(var(--accent-rgb));
-    border-color: rgb(var(--accent-rgb));
-    box-shadow: 0 2px 10px var(--black-a50);
-}
-.video-lib--selecting .video-card--picked {
-    outline: 2px solid rgba(var(--accent-rgb), 0.85);
-    outline-offset: 2px; border-radius: var(--radius-lg);
-}
 
 /* The floating bar (fixed; hides with the page since ancestors display:none) */
 .video-bulkbar {
@@ -4833,84 +5112,10 @@ body[data-side="video"] #gsearch-aura {
     max-width: min(860px, calc(100vw - 32px));
 }
 .video-bulkbar.hidden { display: none; }
-.vbb-row {
-    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    background: rgba(14,14,19,0.96); border: 1px solid rgba(255,255,255,0.11);
-    border-radius: var(--radius-xl); box-shadow: 0 18px 50px var(--black-a60);
-    backdrop-filter: blur(12px); flex-wrap: wrap;
-}
-.vbb-count { font-size: 12.5px; font-weight: 800; color: #fff; white-space: nowrap; }
-.vbb-link {
-    all: unset; cursor: pointer; font-size: 11.5px; font-weight: 700;
-    color: var(--white-a55); padding: 2px 4px;
-}
-.vbb-link:hover { color: #fff; }
-.vbb-link[disabled] { opacity: 0.35; cursor: default; }
-.vbb-sep { width: 1px; height: 18px; background: var(--white-a12); }
+
+
 .vbb-spacer { flex: 1; min-width: 6px; }
-.vbb-act {
-    padding: 7px 13px; border-radius: var(--radius-control); font-size: 12px; font-weight: 700;
-    cursor: pointer; background: var(--white-a06);
-    border: 1px solid var(--white-a12); color: var(--white-a80);
-    transition: all var(--dur-xfast); white-space: nowrap;
-}
-.vbb-act:hover:not(:disabled) { background: var(--white-a12); color: #fff; }
-.vbb-act:disabled { opacity: 0.35; cursor: default; }
-.vbb-act--on {
-    background: rgba(var(--accent-rgb), 0.22);
-    border-color: rgba(var(--accent-rgb), 0.55); color: #fff;
-}
-.vbb-close {
-    all: unset; cursor: pointer; width: 28px; height: 28px; border-radius: var(--radius-circle);
-    display: flex; align-items: center; justify-content: center; font-size: 17px;
-    color: var(--white-a60); border: 1px solid var(--white-a14);
-}
-.vbb-close:hover { color: #fff; background: var(--white-a08); }
 
-/* The action popover (rendered above the row) */
-.vbb-pop {
-    display: flex; align-items: center; gap: 10px; padding: 10px 14px;
-    background: rgba(14,14,19,0.96); border: 1px solid rgba(255,255,255,0.11);
-    border-radius: var(--radius-card); box-shadow: 0 18px 50px var(--black-a60);
-    backdrop-filter: blur(12px); flex-wrap: wrap;
-}
-.vbb-pop-label { font-size: 12px; font-weight: 700; color: var(--white-a60); white-space: nowrap; }
-.vbb-input {
-    padding: 8px 11px; border-radius: 9px; font-size: 12.5px; font-family: inherit;
-    background: var(--white-a06); border: 1px solid var(--white-a12);
-    color: #eef1f7; outline: none; min-width: 150px; transition: border .13s, box-shadow .13s;
-}
-.vbb-input:focus {
-    border-color: rgba(var(--accent-rgb), 0.6);
-    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.14);
-}
-.vbb-select { min-width: 190px; }
-.vbb-select option { background: #16161d; color: #eef1f7; }
-.vbb-apply {
-    padding: 8px 14px; border-radius: var(--radius-control); font-size: 12px; font-weight: 800;
-    cursor: pointer; border: none; color: #fff;
-    background: rgb(var(--accent-rgb));
-    box-shadow: 0 5px 14px rgba(var(--accent-rgb), 0.3);
-    transition: filter .13s; white-space: nowrap;
-}
-.vbb-apply:hover { filter: brightness(1.12); }
-.vbb-apply--ghost {
-    background: var(--white-a07); border: 1px solid var(--white-a14);
-    box-shadow: none; color: var(--white-a85);
-}
-.vbb-apply--ghost:hover { background: rgba(255,255,255,0.13); filter: none; }
-
-/* Progress view while a bulk job runs */
-.vbb-row--progress { flex-wrap: nowrap; min-width: min(430px, calc(100vw - 60px)); }
-.vbb-track {
-    flex: 1; height: 7px; border-radius: var(--radius-pill); background: var(--white-a10);
-    overflow: hidden; min-width: 120px;
-}
-.vbb-fill {
-    height: 100%; border-radius: var(--radius-pill);
-    background: rgb(var(--accent-rgb)); transition: width var(--dur-slower) ease;
-}
-@media (prefers-reduced-motion: reduce) { .vbb-fill { transition: none; } }
 
 /* ── Detail hero: the Manage (metadata editor) button ──────────────────────
    Deliberately unlike the accent-filled content actions (Trailer / Get /
@@ -4980,6 +5185,10 @@ body[data-side="video"] #gsearch-aura {
     color: rgb(var(--accent-rgb));
 }
 .vrf-chip--got { background: rgba(80,200,120,0.14); border-color: rgba(80,200,120,0.4); color: #6fdb96; }
+/* Shelf Life signal pills: red argues for cutting, green for keeping */
+.vrf-chip--sl-low { background: rgba(var(--danger-soft-rgb), 0.14); border-color: rgba(var(--danger-soft-rgb), 0.45); color: var(--danger-soft); }
+.vrf-chip--sl-mid { background: rgba(var(--gold-rgb), 0.14); border-color: rgba(var(--gold-rgb), 0.45); color: var(--gold); }
+.vrf-chip--sl-high { background: rgba(var(--success-rgb), 0.14); border-color: rgba(var(--success-rgb), 0.4); color: var(--success); }
 .vrf-show-overview {
     font-size: 12.5px; color: var(--white-a60); line-height: 1.55; margin: 8px 0 0;
     display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
@@ -5517,7 +5726,9 @@ body[data-side="video"] #gsearch-aura {
     .vsr-fresh-stat em { display: block; }
 }
 @media (max-width: 520px) {
-    .vsr-tabs { width: calc(100% - 4px); grid-template-columns: 1fr; }
+    /* titles / releases / fresh are short enough to stay one row (#1909);
+       stacked they were a tall column before you could search */
+    .vsr-tabs { width: calc(100% - 4px); grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .vsr-tab { min-height: 36px; }
 }
 
@@ -5711,6 +5922,9 @@ body[data-side="video"] #gsearch-aura {
     display: inline-flex; align-items: center; min-height: 22px; border-radius: var(--radius-sm); font-size: 10.5px; font-weight: 800;
 }
 .vsr-basic-query-label { color: rgba(255,255,255,0.42); text-transform: uppercase; letter-spacing: 0.06em; }
+/* every result past the first page of a releases source (#2127) */
+.vsr-basic-more { display: block; margin: 10px auto 0; }
+
 .vsr-basic-query-chip {
     max-width: min(360px, 100%); padding: 3px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     color: rgba(255,255,255,0.68); background: rgba(0,0,0,0.18); border: 1px solid var(--white-a07);
@@ -7021,7 +7235,7 @@ body[data-side="video"] #gsearch-aura {
    eyebrow, big title, subtitle, actions, drifting backdrop art, scrim. */
 .vdsc-stories { margin: 26px 0 8px; }
 .vdsc-stories-row {
-    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px;
+    display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 16px;
 }
 .vdsc-story {
     position: relative; overflow: hidden; border-radius: 20px;
@@ -7097,7 +7311,7 @@ body[data-side="video"] #gsearch-aura {
     position: relative; overflow: hidden; border-radius: 26px;
     min-height: 430px; display: flex; align-items: flex-end;
     border: 1px solid var(--white-a10);
-    isolation: isolate; margin: 46px 0;
+    isolation: isolate; margin: 12px 0 28px;
     opacity: 0; transform: translateY(30px);
     transition: opacity 0.9s ease, transform 0.9s var(--ease-emphasized);
     box-shadow: 0 30px 80px var(--black-a50);
@@ -7241,7 +7455,7 @@ body[data-side="video"] #gsearch-aura {
 
 /* ── Story blocks: phone + reduced motion ──────────────────────────────────── */
 @media (max-width: 900px) {
-    .vdsc-stories-row { grid-template-columns: 1fr; }
+    .vdsc-stories-row { grid-auto-flow: row; grid-template-columns: 1fr; }
     .vdsc-story { min-height: 300px; }
     .vdsc-story-title { font-size: 1.6rem; }
     .vdsc-hero-picks { right: 20px; bottom: 18px; padding: 8px 14px; }
@@ -7296,36 +7510,14 @@ body[data-side="video"] #gsearch-aura {
    Detail page, Oct 2026 pass: one primary action, tabs, quieter rows.
    ════════════════════════════════════════════════════════════════════════════ */
 
-/* ── tabs: the page, and Your library (React, features/video-library) ── */
-.vd-tabs {
-    display: flex; gap: 4px; margin: 0 0 26px; padding: 4px; width: max-content; max-width: 100%;
-    border-radius: var(--radius-card); background: var(--white-a05); border: 1px solid var(--white-a08);
-}
-.vd-tabs[hidden] { display: none; }
-.vd-tab {
-    min-height: 38px; padding: 0 20px; border: 0; border-radius: var(--radius-control); cursor: pointer;
-    font: inherit; font-size: 14px; font-weight: 700; color: var(--white-a60); background: transparent;
-    transition: color var(--dur-fast), background var(--dur-fast);
-}
-.vd-tab:hover { color: var(--text-1); }
-.vd-tab--active, .vd-tab[aria-selected="true"] {
-    color: var(--text-1); background: rgba(var(--vd-accent-rgb), 0.28);
-    box-shadow: inset 0 0 0 1px rgba(var(--vd-accent-rgb), 0.45);
-}
-.vd-tab:focus-visible { outline: 2px solid rgba(var(--vd-accent-rgb), 0.8); outline-offset: 2px; }
-/* the tab names the list, so the list's own heading would say it twice */
-.vd-body--tabbed .vd-ep-heading { display: none; }
-.vd-body--tabbed .vd-ep-toolbar { justify-content: flex-end; }
-/* Your library: everything else on the page steps aside; the management
-   sections that used to sit in the main flow (subtitle languages, acquisition
-   history) come along, under the tab. */
-.vd-body--library { display: flex; flex-direction: column; }
-.vd-body.vd-body--library > :not(.vd-tabs):not(.vd-library-panel):not(.vd-lib-extra) { display: none; }
-.vd-body:not(.vd-body--library) > .vd-lib-extra { display: none; }
-.vd-body--library > .vd-tabs { order: 0; }
-.vd-body--library > .vd-library-panel { order: 1; }
-.vd-body--library > .vd-subcfg-section { order: 2; margin-top: 34px; }
-.vd-body--library > .vd-history-section { order: 3; margin-top: 34px; }
+/* ── one page: a title you own carries its library parts in the page ──
+   (React, features/video-library). the panel holds what needs attention and
+   a movie's files; the old acquisition block is a row in that list. */
+.vd-body:not(.vd-body--one) > .vd-lib-extra { display: none; }
+.vd-body--one > .vd-acq-section { display: none; }
+.vd-body--one > .vd-library-panel { margin-top: 28px; }
+.vd-body--one > .vd-subcfg-section { margin-top: 36px; }
+.vd-body--one > .vd-lib-extra .vd-section-h { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 12px; }
 .vd-library-panel[hidden] { display: none; }
 
 /* ── the hero's More menu: grouped, with links ── */
@@ -7372,16 +7564,27 @@ body[data-side="video"] #gsearch-aura {
 .vd-ep-badge--versions { color: var(--white-a70); background: var(--white-a05); border: 1px solid var(--white-a12); }
 /* the management sections that moved under Your library read like its own
    cards: same heading size, same card, the page accent on Save */
-.vd-body--library > .vd-lib-extra .vd-section-h { font-size: 20px; font-weight: 800; margin-bottom: 14px; }
-.vd-body--library .vd-subcfg .vsub-card {
-    max-width: 720px; padding: 20px 22px; border-radius: var(--radius-xl);
-    background: var(--white-a04); border-color: var(--white-a08);
+.vd-body--one .vd-subcfg .vsub-card {
+    max-width: none; padding: 18px 20px; border: 0; border-radius: var(--radius-xl);
+    background: var(--white-a04); box-shadow: inset 0 0 0 1px var(--white-a08);
 }
-.vd-body--library .vd-subcfg .vsub-btn--primary {
-    background: rgba(var(--vd-accent-rgb), 0.85); border-color: rgba(var(--vd-accent-rgb), 0.7);
-    color: var(--vd-accent-fg);
+.vd-body--one .vd-subcfg .vsub-head { margin-bottom: 8px; }
+.vd-body--one .vd-subcfg .vsub-badge {
+    padding: 2px 9px; border: 0; border-radius: var(--radius-pill); background: var(--white-a08);
+    font-size: 12px; font-weight: 500; letter-spacing: 0; text-transform: none; color: var(--white-a75);
 }
-.vd-body--library .vd-subcfg .vsub-btn--primary:hover { background: rgb(var(--vd-accent-rgb)); }
+.vd-body--one .vd-subcfg .vsub-hint { font-size: 13px; color: var(--white-a50); }
+.vd-body--one .vd-subcfg .vsub-label { font-size: 12px; font-weight: 500; color: var(--white-a50); }
+.vd-body--one .vd-subcfg .vsub-input {
+    max-width: 360px; min-height: 40px; border: 0; border-radius: var(--radius-lg); background: var(--white-a08);
+}
+.vd-body--one .vd-subcfg .vsub-btn {
+    height: 32px; padding: 0 14px; border: 0; border-radius: var(--radius-pill);
+    background: var(--white-a10); color: var(--text-1); font-size: 13px; font-weight: 600;
+}
+.vd-body--one .vd-subcfg .vsub-btn:hover { background: var(--white-a16); }
+.vd-body--one .vd-subcfg .vsub-btn--primary { background: rgba(var(--vd-accent-rgb), 0.9); color: var(--text-1); }
+.vd-body--one .vd-subcfg .vsub-btn--primary:hover { background: rgb(var(--vd-accent-rgb)); }
 
 /* the synopsis opens in place when it ran past its three lines */
 .vd-overview.vd-overview--open { display: block; -webkit-line-clamp: unset; overflow: visible; }
@@ -7508,3 +7711,1349 @@ a.vd-rt:hover { transform: translateY(-1px); border-color: var(--white-a35); }
 }
 .vd-subs-more:hover { color: var(--text-1); }
 .vd-detail-row--subs { grid-column: span 2; }
+
+/*
+ * Video detail pages (movie + show), the premier pass.
+ *
+ * A layer over the .vd-* rules above: same markup, same hooks,
+ * calmer type and surfaces. One weight scale (400/500/600), one text ramp,
+ * no boxed badges, a white primary action and glass secondaries. The video
+ * backdrop on the billboard is untouched.
+ */
+
+
+/* ── back ─────────────────────────────────────────────────────────────── */
+
+.vd-page .vd-back {
+    background: rgba(var(--vdp-panel-rgb), 0.55);
+    -webkit-backdrop-filter: blur(22px) saturate(1.5);
+    backdrop-filter: blur(22px) saturate(1.5);
+    border: 0;
+    box-shadow: inset 0 0 0 1px var(--white-a10);
+    color: var(--vdp-text);
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 500;
+    padding: 8px 15px 8px 12px;
+    transition: background 0.2s var(--vdp-ease);
+}
+.vd-page .vd-back:hover { background: rgba(var(--vdp-lift-3-rgb), 0.7); transform: none; }
+
+/* ── billboard ────────────────────────────────────────────────────────── */
+
+/* a reading scrim on the left and a long fade into the page, so the body
+   starts on the picture instead of under a hard edge */
+.vd-page .vd-bb-fade {
+    background:
+        linear-gradient(90deg, rgba(var(--vdp-deep-rgb), 0.9) 0%, rgba(var(--vdp-deep-rgb), 0.62) 26%, rgba(var(--vdp-deep-rgb), 0.18) 52%, rgba(var(--vdp-deep-rgb), 0) 68%),
+        linear-gradient(0deg, rgb(var(--vdp-ink-rgb)) 0%, rgba(var(--vdp-ink-rgb), 0.86) 12%, rgba(var(--vdp-ink-rgb), 0.36) 30%, rgba(var(--vdp-ink-rgb), 0) 50%);
+}
+
+.vd-page .vd-bb-content {
+    padding: 0 var(--vdp-gutter) 44px var(--vdp-gutter);
+    align-items: end;
+}
+.vd-page .vd-copy { max-width: 620px; display: flex; flex-direction: column; align-items: flex-start; }
+.vd-page .vd-copy > * { margin: 0; }
+
+.vd-page .vd-cover {
+    border-radius: 12px;
+    border: 0;
+    box-shadow: 0 30px 60px -20px var(--black-a80), 0 0 0 1px var(--white-a08);
+}
+
+.vd-page .vd-logo {
+    max-width: min(440px, 100%);
+    max-height: 168px;
+    object-fit: contain;
+    object-position: left bottom;
+    filter: drop-shadow(0 6px 28px var(--black-a55));
+}
+.vd-page .vd-title:not(.vd-title--logo) {
+    font-size: clamp(38px, 4.4vw, 64px);
+    font-weight: 700;
+    line-height: 1.04;
+    letter-spacing: -0.028em;
+    text-shadow: 0 2px 30px var(--black-a50);
+}
+
+.vd-page .vd-tagline {
+    margin-top: 16px;
+    font-size: 15px;
+    font-style: normal;
+    font-weight: 400;
+    letter-spacing: 0.005em;
+    color: var(--vdp-soft);
+}
+
+/* one quiet line: state first, then the facts */
+/* every item carries its own leading dot inside 18px of padding, and the row
+   is pulled left and clipped by the same 18px: the first item of ANY line
+   loses its dot, so a wrapped line never starts with one */
+.vd-page .vd-meta,
+.vd-page .vd-genres {
+    margin-left: -18px;
+    clip-path: inset(0 0 0 18px);
+    gap: 4px 0;
+}
+.vd-page .vd-meta {
+    margin-top: 18px;
+    margin-bottom: 0;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1.5;
+    color: var(--vdp-soft);
+}
+.vd-page .vd-tagline + .vd-meta { margin-top: 10px; }
+.vd-page .vd-meta > * { position: relative; padding-left: 18px; font-weight: 500; color: inherit; }
+.vd-page .vd-meta > *::before,
+.vd-page .vd-meta > span + span::before {
+    content: '';
+    display: block;
+    position: absolute;
+    left: 7px;
+    top: 50%;
+    width: 3px;
+    height: 3px;
+    margin-top: -1px;
+    border-radius: 50%;
+    background: var(--vdp-faint);
+    transform: none;
+}
+.vd-page.vd-page.vd-page .vd-meta .vd-match {
+    color: var(--vdp-text);
+    font-weight: 600;
+    padding-left: 33px;
+}
+.vd-page .vd-meta .vd-match::after {
+    content: '';
+    position: absolute;
+    left: 18px;
+    top: 50%;
+    width: 8px;
+    height: 8px;
+    margin-top: -4px;
+    border-radius: 50%;
+    background: var(--success-strong);
+    box-shadow: 0 0 0 3px rgba(var(--success-strong-rgb), 0.18);
+}
+.vd-page.vd-page.vd-page .vd-meta .vd-watched-tag,
+.vd-page.vd-page.vd-page .vd-meta .vd-stinger,
+.vd-page.vd-page.vd-page .vd-meta .vd-status { color: var(--vdp-soft); font-weight: 500; }
+.vd-page .vd-meta .vd-fmt,
+.vd-page .vd-meta .vd-meta-rating {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    padding: 0 0 0 25px;
+    border: 0;
+    background: none;
+    color: var(--white-a85);
+    align-self: center;
+    margin-right: 6px;
+}
+/* the boxed look (PG-13, 1080p) is drawn on an inner outline so the item
+   keeps the shared leading-dot padding */
+.vd-page .vd-meta .vd-fmt::after,
+.vd-page .vd-meta .vd-meta-rating::after {
+    content: '';
+    position: absolute;
+    inset: -4px -6px -4px 19px;
+    border-radius: 4px;
+    border: 1px solid var(--white-a40);
+    pointer-events: none;
+}
+
+/* genres read as part of the facts, not as a row of buttons */
+.vd-page .vd-genres { margin-top: 6px; }
+.vd-page .vd-genres .vd-genre {
+    position: relative;
+    background: none;
+    border: 0;
+    padding: 0 0 0 18px;
+    border-radius: 0;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+    transition: color 0.15s;
+}
+.vd-page .vd-genres .vd-genre:hover { color: var(--text-1); background: none; transform: none; }
+.vd-page .vd-genres .vd-genre::before {
+    content: '';
+    position: absolute;
+    left: 7px;
+    top: 50%;
+    width: 3px;
+    height: 3px;
+    margin-top: -1px;
+    border-radius: 50%;
+    background: var(--vdp-faint);
+}
+
+.vd-page .vd-next-ep {
+    margin-top: 14px;
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+    background: none;
+    border: 0;
+    padding: 0;
+}
+
+.vd-page .vd-overview {
+    margin-top: 18px;
+    max-width: 580px;
+    font-size: 16px;
+    line-height: 1.55;
+    font-weight: 400;
+    color: var(--white-a85);
+    text-shadow: 0 1px 16px var(--black-a45);
+}
+.vd-page .vd-overview-more {
+    margin-top: 6px;
+    padding: 0;
+    background: none;
+    border: 0;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-1);
+    text-decoration: none;
+    opacity: 0.9;
+}
+.vd-page .vd-overview-more:hover { opacity: 1; text-decoration: none; }
+
+/* actions: one white primary, everything else glass */
+.vd-page .vd-actions {
+    margin-top: 26px;
+    gap: 10px;
+    align-items: center;
+}
+.vd-page .vd-actions > button,
+.vd-page .vd-actions > a,
+.vd-page .vd-actions > .vd-more > .vd-more-btn,
+.vd-page .vd-actions > .vd-pop > button {
+    height: 44px;
+    min-height: 44px;
+    padding: 0 20px;
+    border-radius: 999px;
+    border: 0;
+    box-shadow: none;
+    background: var(--vdp-glass);
+    -webkit-backdrop-filter: blur(24px) saturate(1.6);
+    backdrop-filter: blur(24px) saturate(1.6);
+    color: var(--text-1);
+    font-family: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    text-transform: none;
+    text-shadow: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    transition: background 0.2s var(--vdp-ease), transform 0.2s var(--vdp-ease);
+}
+.vd-page .vd-actions > button:hover,
+.vd-page .vd-actions > a:hover,
+.vd-page .vd-actions > .vd-more > .vd-more-btn:hover,
+.vd-page .vd-actions > .vd-pop > button:hover {
+    background: var(--vdp-glass-hover);
+    transform: none;
+    box-shadow: none;
+    filter: none;
+}
+.vd-page .vd-actions > button:active,
+.vd-page .vd-actions > a:active { transform: scale(0.98); }
+/* the first action is the primary */
+.vd-page .vd-actions > :first-child:is(button, a) {
+    background: var(--text-1);
+    color: var(--bg-primary);
+    padding: 0 24px;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+}
+.vd-page .vd-actions > :first-child:is(button, a):hover { background: var(--white-a85); }
+.vd-page .vd-actions > :first-child:is(button, a) * { color: inherit; }
+.vd-page .vd-actions .vd-trailer-ic,
+.vd-page .vd-actions .vd-play-ic { font-size: 12px; }
+.vd-page .vd-actions .discog-btn-shimmer { display: none; }
+.vd-page .vd-actions .watchlist-icon,
+.vd-page .vd-actions .vd-manage-ic,
+.vd-page .vd-actions .discog-btn-icon { font-size: 15px; line-height: 1; opacity: 0.95; }
+.vd-page .vd-actions .library-artist-watchlist-btn.watching { background: var(--vdp-glass); color: var(--text-1); }
+.vd-page .vd-actions .library-artist-watchlist-btn.watching .watchlist-icon { color: var(--success-strong); }
+
+.vd-page .vd-more-menu {
+    margin-top: 10px;
+    min-width: 260px;
+    padding: 8px;
+    border-radius: 16px;
+    border: 0;
+    /* it sits on the picture: it has to read on its own */
+    background: rgba(var(--vdp-menu-rgb), 0.97);
+    -webkit-backdrop-filter: blur(40px) saturate(1.8);
+    backdrop-filter: blur(40px) saturate(1.8);
+    box-shadow: 0 24px 60px var(--black-a60), inset 0 0 0 1px var(--white-a09);
+}
+.vd-page .vd-more-group + .vd-more-group { border-top: 1px solid var(--vdp-line); margin-top: 6px; padding-top: 6px; }
+.vd-page .vd-more-label {
+    padding: 6px 10px 4px;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: none;
+    color: var(--vdp-dim);
+}
+.vd-page .vd-more-menu .vd-manage-btn,
+.vd-page .vd-more-menu .vd-more-link {
+    width: 100%;
+    justify-content: flex-start;
+    height: auto;
+    min-height: 36px;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 9px;
+    background: none;
+    box-shadow: none;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--vdp-text);
+    text-align: left;
+}
+.vd-page .vd-more-menu .vd-manage-btn:hover,
+.vd-page .vd-more-menu .vd-more-link:hover { background: var(--white-a10); transform: none; }
+.vd-page .vd-more-menu .vd-manage-ic { width: 18px; text-align: center; opacity: 0.7; }
+
+/* ratings: numbers in a line, no boxes */
+.vd-page .vd-kudos { margin-top: 24px; display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; }
+.vd-page .vd-kudos > * { margin: 0; }
+.vd-page .vd-ratings { gap: 8px 20px; align-items: center; }
+.vd-page .vd-ratings .vd-rt {
+    background: none;
+    border: 0;
+    box-shadow: none;
+    padding: 0;
+    border-radius: 0;
+    gap: 7px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--vdp-text);
+    transition: opacity 0.15s;
+}
+.vd-page .vd-ratings .vd-rt:hover { background: none; transform: none; opacity: 0.78; }
+.vd-page .vd-ratings .vd-rt-tag {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    padding: 2px 5px;
+    border-radius: 4px;
+}
+.vd-page .vd-ratings .vd-rt-ic { font-size: 14px; }
+.vd-page .vd-ratings .vd-rt--site { color: var(--vdp-dim); font-weight: 500; font-size: 13.5px; gap: 3px; }
+.vd-page .vd-ratings .vd-rt--site:hover { color: var(--text-1); opacity: 1; }
+.vd-page .vd-ratings .vd-rt-out { font-size: 11px; opacity: 0.7; }
+.vd-page .vd-awards {
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+    background: none;
+    border: 0;
+    padding: 0;
+    gap: 6px;
+}
+.vd-page .vd-awards-ic { font-size: 13px; filter: saturate(0.85); }
+
+.vd-page .vd-crew-line {
+    margin-top: 12px;
+    font-size: 13.5px;
+    font-weight: 400;
+    color: var(--vdp-dim);
+}
+.vd-page .vd-crew-line-k { color: var(--vdp-dim); font-weight: 400; }
+.vd-page .vd-crew-line .vd-person-link { color: var(--vdp-text); font-weight: 500; text-decoration: none; }
+.vd-page .vd-crew-line .vd-person-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+
+.vd-page .vd-essentials,
+.vd-page .vd-health,
+.vd-page .vd-subs,
+.vd-page .vd-links { margin-top: 14px; }
+
+/* trailer controls on the picture */
+.vd-page .vd-bb-tctrls { right: var(--vdp-gutter); bottom: 44px; gap: 10px; }
+.vd-page .vd-bb-tbtn {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 0;
+    background: rgba(var(--vdp-menu-rgb), 0.5);
+    -webkit-backdrop-filter: blur(20px) saturate(1.5);
+    backdrop-filter: blur(20px) saturate(1.5);
+    box-shadow: inset 0 0 0 1px var(--white-a14);
+    color: var(--text-1);
+}
+.vd-page .vd-bb-tbtn:hover { background: rgba(var(--vdp-lift-4-rgb), 0.7); }
+
+/* ── body ─────────────────────────────────────────────────────────────── */
+
+.vd-page .vd-body { padding: 4px var(--vdp-gutter) 110px; }
+
+.vd-page .vd-section-h,
+.vd-page .vd-ep-heading {
+    font-size: 22px;
+    font-weight: 600;
+    letter-spacing: -0.018em;
+    line-height: 1.2;
+    color: var(--text-1);
+}
+.vd-page .vd-body > [class$="-section"] { margin-top: 60px; }
+.vd-page .vd-section-head { align-items: baseline; margin-bottom: 4px; }
+
+.vd-page .vd-viewall {
+    background: none;
+    border: 0;
+    padding: 0;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+}
+.vd-page .vd-viewall::after { content: ' ›'; }
+.vd-page .vd-viewall:hover { color: var(--text-1); background: none; }
+
+/* strips */
+.vd-page .vd-strip-btn {
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    border: 0;
+    background: rgba(var(--vdp-lift-2-rgb), 0.78);
+    -webkit-backdrop-filter: blur(20px) saturate(1.5);
+    backdrop-filter: blur(20px) saturate(1.5);
+    box-shadow: 0 8px 24px var(--black-a50), inset 0 0 0 1px var(--white-a10);
+    color: var(--text-1);
+}
+.vd-page .vd-strip-btn:hover { background: rgba(var(--vdp-lift-5-rgb), 0.9); }
+
+/* cast */
+.vd-page .vd-crew { margin-top: 10px; gap: 6px 28px; font-size: 14px; color: var(--vdp-dim); }
+.vd-page .vd-crew-job { color: var(--vdp-dim); font-weight: 400; }
+.vd-page .vd-crew .vd-person-link,
+.vd-page .vd-crew-item a { color: var(--vdp-text); font-weight: 500; }
+.vd-page .vd-cast { gap: 22px; margin-top: 22px; }
+.vd-page .vd-cast-card { width: 116px; background: none; border: 0; padding: 0; }
+.vd-page .vd-cast-photo {
+    width: 116px;
+    height: 116px;
+    border: 0;
+    box-shadow: 0 0 0 1px var(--white-a07);
+    background-color: var(--vdp-card);
+    transition: transform 0.3s var(--vdp-ease), box-shadow 0.3s var(--vdp-ease);
+}
+.vd-page .vd-cast-card--link:hover .vd-cast-photo { transform: scale(1.04); box-shadow: 0 0 0 2px var(--white-a85); }
+.vd-page .vd-cast-name { margin-top: 12px; font-size: 13.5px; font-weight: 600; letter-spacing: -0.005em; color: var(--vdp-text); }
+.vd-page .vd-cast-char { margin-top: 2px; font-size: 12.5px; font-weight: 400; color: var(--vdp-dim); }
+
+/* poster rows */
+.vd-page .vd-similar { gap: 18px; margin-top: 20px; }
+.vd-page .vd-sim-card { background: none; border: 0; padding: 0; }
+.vd-page .vd-sim-poster {
+    border-radius: 12px;
+    border: 0;
+    box-shadow: 0 0 0 1px var(--white-a07);
+    background-color: var(--vdp-card);
+    transition: transform 0.3s var(--vdp-ease), box-shadow 0.3s var(--vdp-ease);
+}
+.vd-page .vd-sim-card:hover .vd-sim-poster {
+    transform: translateY(-4px);
+    box-shadow: 0 18px 36px -12px var(--black-a80), 0 0 0 2px var(--white-a85);
+}
+.vd-page .vd-sim-title { margin-top: 10px; font-size: 13.5px; font-weight: 500; line-height: 1.35; color: var(--vdp-text); }
+.vd-page .vd-sim-card .vd-sim-year,
+.vd-page .vd-sim-card .vd-sim-sub { font-size: 12.5px; color: var(--vdp-dim); }
+.vd-page .vd-sim-wishchip {
+    top: 8px;
+    left: 8px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    border: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.01em;
+    text-transform: lowercase;
+    background: rgba(var(--vdp-panel-rgb), 0.62);
+    -webkit-backdrop-filter: blur(14px) saturate(1.5);
+    backdrop-filter: blur(14px) saturate(1.5);
+    color: var(--text-1);
+    box-shadow: none;
+}
+.vd-page .vd-sim-wishchip::first-letter { text-transform: uppercase; }
+.vd-page .vd-sim-wishchip--owned { padding-left: 18px; }
+.vd-page .vd-sim-wishchip--owned::before {
+    content: '';
+    position: absolute;
+    left: 8px;
+    top: 50%;
+    width: 6px;
+    height: 6px;
+    margin-top: -3px;
+    border-radius: 50%;
+    background: var(--success-strong);
+}
+/* the other title states (#2160): the same quiet glass, the dot says which */
+.vd-page .vd-sim-wishchip--req, .vd-page .vd-sim-wishchip--wish, .vd-page .vd-sim-wishchip--active,
+.vd-page .vd-sim-wishchip--partial, .vd-page .vd-sim-wishchip--failed { padding-left: 18px; }
+.vd-page .vd-sim-wishchip--req::before, .vd-page .vd-sim-wishchip--wish::before,
+.vd-page .vd-sim-wishchip--active::before, .vd-page .vd-sim-wishchip--partial::before,
+.vd-page .vd-sim-wishchip--failed::before {
+    content: ''; position: absolute; left: 8px; top: 50%; width: 6px; height: 6px; margin-top: -3px;
+    border-radius: 50%; background: rgb(var(--accent-light-rgb)); }
+.vd-page .vd-sim-wishchip--req::before { background: rgb(var(--info-rgb)); }
+.vd-page .vd-sim-wishchip--partial::before { background: rgb(var(--success-rgb)); }
+.vd-page .vd-sim-wishchip--failed::before { background: rgb(var(--warning-rgb)); }
+
+/* videos + photos */
+.vd-page .vd-videos { gap: 18px; margin-top: 20px; }
+.vd-page .vd-video-card { background: none; border: 0; padding: 0; }
+.vd-page .vd-video-thumb { border-radius: 12px; border: 0; box-shadow: 0 0 0 1px var(--white-a07); overflow: hidden; }
+.vd-page .vd-video-play {
+    position: absolute;
+    inset: auto;
+    top: 50%;
+    left: 50%;
+    width: 46px;
+    height: 46px;
+    margin: -23px 0 0 -23px;
+    border-radius: 50%;
+    display: grid;
+    place-items: center;
+    opacity: 1;
+    font-size: 15px;
+    padding-left: 3px;
+    background: rgba(var(--vdp-panel-rgb), 0.5);
+    -webkit-backdrop-filter: blur(16px) saturate(1.5);
+    backdrop-filter: blur(16px) saturate(1.5);
+    box-shadow: inset 0 0 0 1px var(--white-a20);
+    color: var(--text-1);
+    text-shadow: none;
+    transition: transform 0.25s var(--vdp-ease), background 0.25s;
+}
+.vd-page .vd-video-card:hover .vd-video-play { transform: scale(1.08); background: var(--white-a90); color: var(--bg-primary); }
+.vd-page .vd-video-name { margin-top: 10px; font-size: 13.5px; font-weight: 500; color: var(--vdp-text); }
+.vd-page .vd-video-type { font-size: 12.5px; color: var(--vdp-dim); }
+.vd-page .vd-gallery { gap: 14px; margin-top: 20px; }
+.vd-page .vd-shot { border-radius: 12px; border: 0; box-shadow: 0 0 0 1px var(--white-a07); overflow: hidden; }
+
+/* about: a ruled table of facts */
+.vd-page .vd-facts { margin-top: 18px; }
+.vd-page .vd-detail-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 0 28px;
+}
+.vd-page .vd-detail-row {
+    padding: 14px 0 16px;
+    border: 0;
+    border-top: 1px solid var(--vdp-line);
+    background: none;
+    border-radius: 0;
+    min-width: 0;
+}
+.vd-page .vd-detail-k {
+    font-size: 12.5px;
+    font-weight: 500;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--vdp-dim);
+}
+.vd-page .vd-detail-k::first-letter { text-transform: uppercase; }
+.vd-page .vd-detail-v { margin-top: 4px; font-size: 15px; font-weight: 500; line-height: 1.4; color: var(--vdp-text); }
+.vd-page .vd-detail-v a { color: inherit; }
+.vd-page .vd-studios { margin-top: 22px; gap: 10px; }
+.vd-page .vd-studio-chip {
+    border: 0;
+    background: var(--vdp-card);
+    border-radius: 12px;
+    padding: 8px 14px 8px 8px;
+    font-size: 13.5px;
+    font-weight: 500;
+    color: var(--vdp-text);
+}
+.vd-page .vd-studio-chip:hover { background: var(--white-a10); }
+.vd-page .vd-keywords { margin-top: 14px; gap: 8px; }
+.vd-page .vd-kw {
+    border: 0;
+    background: var(--vdp-card);
+    border-radius: 999px;
+    padding: 6px 12px;
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+}
+.vd-page .vd-kw:hover { background: var(--white-a10); color: var(--text-1); }
+
+/* where to watch */
+.vd-page .vd-providers { gap: 22px; margin-top: 20px; }
+.vd-page .vd-prov { background: none; border: 0; padding: 0; width: 76px; }
+.vd-page .vd-prov img,
+.vd-page .vd-prov .vd-prov-logo { width: 60px; height: 60px; border-radius: 15px; box-shadow: 0 0 0 1px var(--white-a08); }
+.vd-page .vd-prov-name { margin-top: 8px; font-size: 12px; font-weight: 500; line-height: 1.3; color: var(--vdp-dim); }
+
+/* review */
+.vd-page .vd-review {
+    margin-top: 18px;
+    border: 0;
+    border-radius: 18px;
+    background: var(--vdp-card);
+    padding: 22px 24px;
+}
+.vd-page .vd-review-author { font-weight: 600; }
+.vd-page .vd-review-date { color: var(--vdp-dim); }
+.vd-page .vd-review-body { font-size: 15px; line-height: 1.6; color: var(--vdp-soft); }
+
+/* ── episodes ─────────────────────────────────────────────────────────── */
+
+.vd-page .vd-ep-toolbar { margin-top: 26px; gap: 10px; }
+.vd-page .vd-missing-toggle {
+    height: 34px;
+    padding: 0 14px;
+    border-radius: 999px;
+    border: 0;
+    background: var(--vdp-card);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--vdp-soft);
+    transition: background 0.18s, color 0.18s;
+}
+.vd-page .vd-missing-toggle:hover { background: var(--white-a10); color: var(--text-1); }
+.vd-page .vd-missing-toggle[aria-pressed="true"],
+.vd-page .vd-missing-toggle.is-on,
+.vd-page .vd-missing-toggle.active { background: var(--text-1); color: var(--bg-primary); }
+.vd-page .vd-view-toggle {
+    height: 34px;
+    padding: 3px;
+    gap: 2px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--vdp-card);
+}
+.vd-page .vd-vt-btn {
+    width: 34px;
+    height: 28px;
+    border: 0;
+    border-radius: 999px;
+    background: none;
+    color: var(--vdp-dim);
+    box-shadow: none;
+}
+.vd-page .vd-vt-btn:hover { color: var(--text-1); }
+.vd-page .vd-vt-btn.vd-vt-btn--active { background: var(--white-a16); color: var(--text-1); }
+
+/* season rail */
+.vd-page .vd-rail { gap: 16px; padding: 6px 2px 10px; }
+.vd-page .vd-rcard {
+    border: 0;
+    border-radius: var(--vdp-radius);
+    background: var(--vdp-card);
+    box-shadow: 0 0 0 1px var(--white-a07);
+    overflow: hidden;
+    transition: transform 0.3s var(--vdp-ease), box-shadow 0.3s var(--vdp-ease);
+}
+.vd-page .vd-rcard:hover { transform: translateY(-3px); box-shadow: 0 0 0 1px var(--white-a20); }
+.vd-page .vd-rcard.vd-rcard--active { box-shadow: 0 0 0 2px var(--text-1); transform: none; }
+.vd-page .vd-rcard-name { font-size: 14px; font-weight: 600; letter-spacing: -0.005em; }
+.vd-page .vd-rcard-sub { font-size: 12.5px; font-weight: 400; color: var(--vdp-dim); }
+.vd-page .vd-rcard-pct {
+    border: 0;
+    border-radius: 999px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    background: rgba(var(--vdp-panel-rgb), 0.6);
+    -webkit-backdrop-filter: blur(14px);
+    backdrop-filter: blur(14px);
+    color: var(--text-1);
+}
+.vd-page .vd-rcard-bar { height: 3px; border-radius: 3px; background: var(--white-a12); }
+.vd-page .vd-rcard-bar > * { background: var(--text-1); border-radius: 3px; }
+
+.vd-page .vd-season-overview {
+    margin-top: 22px;
+    max-width: 820px;
+    font-size: 15px;
+    line-height: 1.55;
+    color: var(--vdp-soft);
+}
+.vd-page .vd-season-actions {
+    margin-top: 22px;
+    padding: 14px 0;
+    border: 0;
+    border-bottom: 1px solid var(--vdp-line);
+    background: none;
+    border-radius: 0;
+}
+.vd-page .vd-season-actions-count { font-size: 13.5px; font-weight: 500; color: var(--vdp-soft); }
+
+/* episode rows */
+.vd-page .vd-ep {
+    padding: 18px 0;
+    border: 0;
+    border-bottom: 1px solid var(--vdp-line);
+    border-radius: 0;
+    background: none;
+    transition: background 0.2s;
+}
+.vd-page .vd-ep:hover { background: linear-gradient(90deg, transparent 0, var(--white-a04) 8%, var(--white-a04) 92%, transparent 100%); }
+.vd-page .vd-ep-index {
+    width: 44px;
+    font-size: 17px;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+    color: var(--vdp-faint);
+}
+.vd-page .vd-ep-thumb {
+    border-radius: 10px;
+    border: 0;
+    box-shadow: 0 0 0 1px var(--white-a07);
+    background-color: var(--vdp-card);
+    overflow: hidden;
+}
+.vd-page .vd-ep-title { font-size: 16px; font-weight: 600; letter-spacing: -0.008em; color: var(--vdp-text); }
+.vd-page .vd-ep--watched .vd-ep-title { color: var(--vdp-soft); }
+.vd-page .vd-ep-rt { font-size: 13px; font-weight: 400; color: var(--vdp-dim); }
+.vd-page .vd-ep-desc { margin-top: 5px; font-size: 14px; line-height: 1.5; color: var(--vdp-soft); }
+.vd-page .vd-ep-check { color: var(--success-strong); font-size: 13px; }
+.vd-page .vd-ep-chev { color: var(--vdp-faint); }
+.vd-page .vd-ep-badge {
+    border: 0;
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: 0;
+    text-transform: none;
+}
+.vd-page .vd-ep-badge--versions { background: var(--vdp-card); color: var(--vdp-soft); }
+
+/* ── small screens ────────────────────────────────────────────────────── */
+
+@media (max-width: 820px) {
+    .vd-page { --vdp-gutter: 18px; }
+    .vd-page .vd-billboard { min-height: 72vh; }
+    .vd-page .vd-bb-fade {
+        background:
+            linear-gradient(0deg, rgb(var(--vdp-ink-rgb)) 0%, rgba(var(--vdp-ink-rgb), 0.92) 24%, rgba(var(--vdp-ink-rgb), 0.5) 52%, rgba(var(--vdp-ink-rgb), 0.1) 78%);
+    }
+    .vd-page .vd-bb-content { padding-bottom: 28px; }
+    .vd-page .vd-logo { max-height: 110px; max-width: 78%; }
+    .vd-page .vd-overview { font-size: 15px; }
+    .vd-page .vd-actions > button,
+    .vd-page .vd-actions > a,
+    .vd-page .vd-actions > .vd-more > .vd-more-btn { height: 46px; }
+    .vd-page .vd-section-h, .vd-page .vd-ep-heading { font-size: 20px; }
+    .vd-page .vd-body > [class$="-section"] { margin-top: 44px; }
+    .vd-page .vd-cast-card, .vd-page .vd-cast-photo { width: 92px; }
+    .vd-page .vd-cast-photo { height: 92px; }
+    .vd-page .vd-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .vd-page .vd-bb-tctrls { bottom: auto; top: 14px; right: 14px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .vd-page.vd-page.vd-page * { transition: none; }
+}
+
+/* ── second pass: the pieces other stylesheets style harder ───────────── */
+
+/* Get / Watchlist / Request arrive with their own music-side button skins */
+.vd-page.vd-page.vd-page .vd-actions > .discog-download-btn,
+.vd-page.vd-page.vd-page .vd-actions > .library-artist-watchlist-btn,
+.vd-page.vd-page.vd-page .vd-actions > .vd-play-btn,
+.vd-page.vd-page.vd-page .vd-actions > .vd-trailer-btn {
+    border-radius: 999px;
+    border: 0;
+    font-size: 15px;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: -0.005em;
+    box-shadow: none;
+}
+.vd-page .vd-actions > .discog-download-btn .discog-btn-text,
+.vd-page .vd-actions > .library-artist-watchlist-btn .watchlist-text { font-size: 15px; font-weight: 600; letter-spacing: -0.005em; text-transform: none; }
+.vd-page.vd-page.vd-page .vd-actions > :not(:first-child):is(.discog-download-btn, .library-artist-watchlist-btn, .vd-play-btn, .vd-trailer-btn) {
+    background: var(--vdp-glass);
+    color: var(--text-1);
+}
+.vd-page.vd-page.vd-page .vd-actions > :not(:first-child):is(.discog-download-btn, .library-artist-watchlist-btn, .vd-play-btn, .vd-trailer-btn):hover {
+    background: var(--vdp-glass-hover);
+}
+.vd-page.vd-page.vd-page .vd-actions > :first-child:is(.discog-download-btn, .library-artist-watchlist-btn, .vd-play-btn, .vd-trailer-btn) {
+    background: var(--text-1);
+    color: var(--bg-primary);
+}
+.vd-page.vd-page.vd-page .vd-actions > :first-child:is(.discog-download-btn, .library-artist-watchlist-btn, .vd-play-btn, .vd-trailer-btn):hover {
+    background: var(--white-a85);
+}
+.vd-page .vd-actions .vd-play-logo { height: 18px; width: auto; border-radius: 4px; }
+.vd-page .vd-actions .vd-play-ep { font-weight: 500; opacity: 0.7; }
+
+.vd-page .vd-more-menu .vd-manage-ic,
+.vd-page .vd-actions .vd-more-btn .vd-manage-ic { filter: grayscale(1) brightness(1.7); }
+
+/* preview + score in the facts line */
+.vd-page.vd-page.vd-page .vd-meta .vd-status--preview {
+    background: none;
+    border: 0;
+    border-radius: 0;
+    padding: 0 0 0 18px;
+    font-size: 14px;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--vdp-text);
+    font-weight: 600;
+}
+.vd-page.vd-page.vd-page .vd-meta .vd-score { color: var(--vdp-text); font-weight: 500; }
+
+/* season + episode controls: quiet until you reach for them */
+.vd-page.vd-page.vd-page .vd-pop-btn,
+.vd-page.vd-page.vd-page .vd-season-actions .vd-pop-btn,
+.vd-page.vd-page.vd-page .vd-ep .vd-pop-btn {
+    width: 34px;
+    height: 34px;
+    min-height: 34px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: var(--vdp-card);
+    color: var(--vdp-soft);
+    box-shadow: none;
+}
+.vd-page.vd-page.vd-page .vd-pop-btn:hover,
+.vd-page.vd-page.vd-page .vd-pop-btn[aria-expanded="true"] { background: var(--white-a14); color: var(--text-1); }
+.vd-page .vd-pop-menu {
+    padding: 6px;
+    border: 0;
+    border-radius: 14px;
+    background: rgba(var(--vdp-menu-rgb), 0.97);
+    box-shadow: 0 24px 60px var(--black-a60), inset 0 0 0 1px var(--white-a09);
+}
+.vd-page .vd-pop-menu > button,
+.vd-page .vd-pop-menu > a {
+    border: 0;
+    border-radius: 9px;
+    background: none;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--vdp-text);
+}
+.vd-page .vd-pop-menu > button:hover,
+.vd-page .vd-pop-menu > a:hover { background: var(--white-a10); }
+
+.vd-page.vd-page.vd-page .vd-season-actions .discog-download-btn,
+.vd-page.vd-page.vd-page .vd-ep .vd-ep-getbtn {
+    height: 34px;
+    min-height: 34px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--white-a10);
+    color: var(--text-1);
+    box-shadow: none;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: none;
+    letter-spacing: 0;
+}
+.vd-page.vd-page.vd-page .vd-season-actions .discog-download-btn:hover,
+.vd-page.vd-page.vd-page .vd-ep .vd-ep-getbtn:hover { background: var(--white-a18); transform: none; }
+.vd-page .vd-season-actions .discog-download-btn .discog-btn-text { font-size: 13px; font-weight: 600; color: inherit; }
+.vd-page .vd-season-actions .discog-btn-shimmer { display: none; }
+.vd-page .vd-ep .vd-ep-getbtn { width: 34px; padding: 0; }
+
+.vd-page .vd-ep-badge--none,
+.vd-page .vd-ep-badge[class*="--missing"] {
+    background: rgba(var(--warning-strong-rgb), 0.14);
+    color: var(--warning);
+}
+
+/* Your library tab (a React island with its own module styles): only the
+   headings are brought onto this page's scale */
+.vd-page .vd-body .vd-section-h { font-size: 22px; font-weight: 600; letter-spacing: -0.018em; }
+.vd-page .vd-library-panel [class*="_sectionTitle_"] { font-size: 22px; font-weight: 600; letter-spacing: -0.018em; }
+.vd-page .vd-library-panel [class*="_cardTitle_"] { font-weight: 600; letter-spacing: 0.04em; color: var(--vdp-dim); }
+.vd-page .vd-library-panel { margin-top: 26px; }
+
+/* inline "more" links: white, not the per-title accent */
+.vd-page .vd-review-more,
+.vd-page .vd-detail-v button,
+.vd-page .vd-ep-extra button[data-vd-guests-more] {
+    padding: 0;
+    background: none;
+    border: 0;
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-1);
+    text-decoration: none;
+    opacity: 0.9;
+}
+.vd-page .vd-review-more:hover,
+.vd-page .vd-detail-v button:hover { opacity: 1; text-decoration: none; }
+.vd-page .vd-review-rating { color: var(--vdp-text); font-weight: 600; }
+
+/* ── one page: the episode list carries each episode's file ──────────────── */
+/* the file as one quiet line on the row, a tick box to act on several, and
+   the cards (a React island of their own) when the row is opened */
+.vd-page .vd-ep-file {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px;
+    margin-top: 10px; font-size: 13px; color: var(--white-a55);
+}
+.vd-page .vd-ep-file-res {
+    padding: 1px 8px; border-radius: var(--radius-sm); font-size: 12px; font-weight: 600;
+    color: var(--white-a75); background: var(--white-a08);
+}
+.vd-page .vd-ep-file-res[data-tone="uhd"] { color: var(--gold); background: rgba(var(--gold-rgb), 0.14); }
+.vd-page .vd-ep-file-res[data-tone="hd"] { color: var(--text-1); background: rgba(var(--vd-accent-rgb), 0.24); }
+.vd-page .vd-ep-file-res[data-tone="mid"] { color: var(--white-a90); background: var(--white-a16); }
+.vd-page .vd-ep-file-chip {
+    padding: 1px 8px; border-radius: var(--radius-pill); font-size: 12px; font-weight: 500;
+    color: var(--white-a75); background: var(--white-a08);
+}
+.vd-page .vd-ep-file-chip--warn { color: var(--warning); background: rgba(var(--warning-rgb), 0.12); }
+.vd-page .vd-ep-pick { display: block; margin-top: 10px; line-height: 0; cursor: pointer; }
+.vd-page .vd-ep-pick input {
+    width: 18px; height: 18px; margin: 0; appearance: none; cursor: pointer;
+    display: inline-grid; place-items: center; border-radius: var(--radius-xs);
+    background: var(--white-a10); box-shadow: inset 0 0 0 1.5px var(--white-a25);
+    opacity: 0; transition: opacity var(--dur-base) ease, background var(--dur-base) ease;
+}
+/* the boxes stay out of the way until a row is hovered, focused or one is ticked */
+.vd-page .vd-ep:hover .vd-ep-pick input,
+.vd-page .vd-ep-pick input:focus-visible,
+.vd-page .vd-ep-pick input:checked,
+.vd-page .vd-episodes:has(.vd-ep-pick input:checked) .vd-ep-pick input { opacity: 1; }
+.vd-page .vd-ep-pick input:checked { background: rgb(var(--vd-accent-rgb)); box-shadow: none; }
+.vd-page .vd-ep-pick input:checked::after {
+    content: ''; width: 9px; height: 5px; margin-top: -2px;
+    border-left: 2px solid var(--text-1); border-bottom: 2px solid var(--text-1); transform: rotate(-45deg);
+}
+.vd-page .vd-ep-pick input:focus-visible { outline: 2px solid rgba(var(--vd-accent-rgb), 0.8); outline-offset: 2px; }
+@media (hover: none) { .vd-page .vd-ep-pick input { opacity: 1; } }
+.vd-page .vd-ep-files { padding: 4px 14px 0 82px; }
+.vd-page .vd-ep-files[hidden] { display: none; }
+.vd-page .vd-season-lib {
+    display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px;
+    font-size: 13px; color: var(--white-a55);
+}
+.vd-page .vd-libfoot:empty, .vd-page .vd-libline:empty { display: none; }
+.vd-page .vd-libfoot { margin-top: 36px; }
+@media (max-width: 720px) { .vd-page .vd-ep-files { padding: 4px 0 0; } }
+
+/* the season's Monitored switch: on the bar, not in its menu */
+.vd-page .vd-season-switch {
+    display: inline-flex; align-items: center; gap: 8px; height: 34px; padding: 0 4px;
+    border: 0; background: none; cursor: pointer; font: inherit; font-size: 13px; font-weight: 500;
+    color: var(--white-a55);
+}
+.vd-page .vd-season-switch-track {
+    position: relative; width: 38px; height: 22px; border-radius: var(--radius-pill);
+    background: var(--white-a16); transition: background var(--dur-base) ease;
+}
+.vd-page .vd-season-switch-track::after {
+    content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: var(--radius-circle); background: var(--text-1); transition: transform var(--dur-base) ease;
+}
+.vd-page .vd-season-switch--on { color: var(--text-1); }
+.vd-page .vd-season-switch--on .vd-season-switch-track { background: rgb(var(--vd-accent-rgb)); }
+.vd-page .vd-season-switch--on .vd-season-switch-track::after { transform: translateX(16px); }
+.vd-page .vd-season-switch:disabled { opacity: 0.5; cursor: default; }
+.vd-page .vd-season-switch:focus-visible { outline: 2px solid rgba(var(--vd-accent-rgb), 0.8); outline-offset: 2px; border-radius: var(--radius-pill); }
+
+/* Play / Resume on <server>: black with white text. the server's logo is
+   white lettering, and on the white primary button it could not be read */
+.vd-page.vd-page.vd-page .vd-actions > .vd-play-btn:first-child {
+    background: var(--bg-primary); color: var(--text-1);
+    box-shadow: inset 0 0 0 1px var(--white-a18);
+}
+.vd-page.vd-page.vd-page .vd-actions > .vd-play-btn:first-child:hover {
+    background: var(--bg-raised, var(--bg-primary)); box-shadow: inset 0 0 0 1px var(--white-a35);
+}
+
+/* ═══════════════════════════════════════════════
+   WATCHLIST, redrawn (.vwlp-page.vwl2)
+   The same quiet language as the music watchlist: one pill row of tabs, chips
+   for what needs a look, and posters that only speak up for an exception (an
+   ended show, a gap in the episodes). Everything on the page is followed, so
+   the follow and get controls wait for a hover instead of sitting on all sixty
+   posters at once.
+   ═══════════════════════════════════════════════ */
+.vwlp-page.vwl2 { max-width: 1680px; margin: 0 auto; }
+.vwlp-page.vwl2 .vwlp-head { padding-top: 36px; overflow: visible; }
+.vwlp-page.vwl2 .vwlp-head-glow { display: none; }
+.vwlp-page.vwl2 .vwlp-head-row { align-items: flex-end; }
+.vwlp-page.vwl2 .vwlp-title { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
+.vwlp-page.vwl2 .vwlp-sub { margin-top: 8px; font-weight: 500; color: var(--white-a55);
+    font-variant-numeric: tabular-nums; }
+
+/* tabs: one pill row */
+.vwlp-page.vwl2 .vwlp-tabs { gap: 2px; padding: 4px; border-radius: var(--radius-pill);
+    background: var(--white-a04); border: 1px solid var(--white-a08); }
+.vwlp-page.vwl2 .vwlp-tab { border: 0; background: none; box-shadow: none; padding: 8px 16px;
+    border-radius: var(--radius-pill); font-weight: 600; color: var(--white-a60); }
+.vwlp-page.vwl2 .vwlp-tab:hover { background: var(--white-a05); color: var(--text-primary); }
+.vwlp-page.vwl2 .vwlp-tab--on,
+.vwlp-page.vwl2 .vwlp-tab--on:hover { background: var(--white-a12); color: var(--text-primary); }
+.vwlp-page.vwl2 .vwlp-tab:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.7); outline-offset: 2px; }
+.vwlp-page.vwl2 .vwlp-tab-n { background: none; padding: 0; min-width: 0; font-weight: 600;
+    color: var(--white-a40); font-variant-numeric: tabular-nums; }
+.vwlp-page.vwl2 .vwlp-tab--on .vwlp-tab-n { background: none; color: var(--white-a60); }
+
+/* toolbar: chips on the left, search and sort on the right */
+.vwlp-page.vwl2 .vwlp-toolbar { padding-top: 22px; gap: 10px; }
+.vwlp-chips { display: flex; flex-wrap: wrap; gap: 8px; margin-right: auto; }
+.vwlp-chips[hidden] { display: none; }
+.vwlp-chip { height: 34px; padding: 0 14px; border-radius: var(--radius-pill); cursor: pointer;
+    border: 1px solid var(--white-a08); background: var(--white-a04); color: var(--white-a70);
+    font: inherit; font-size: 13px; font-weight: 600; display: inline-flex; align-items: center; gap: 7px;
+    transition: background var(--dur-quick) ease, color var(--dur-quick) ease, border-color var(--dur-quick) ease; }
+.vwlp-chip:hover { background: var(--white-a08); color: var(--text-primary); }
+.vwlp-chip:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.7); outline-offset: 2px; }
+.vwlp-chip small { font-size: 12px; font-weight: 600; opacity: 0.6; font-variant-numeric: tabular-nums; }
+.vwlp-chip--alert small { color: rgb(var(--warning-rgb)); opacity: 1; }
+.vwlp-chip--on, .vwlp-chip--on:hover { background: var(--text-primary); border-color: var(--text-primary);
+    color: var(--bg-primary); }
+.vwlp-chip--on small { color: inherit; opacity: 0.65; }
+.vwlp-page.vwl2 .vwlp-search { flex: 0 1 280px; min-width: 200px; height: 34px; border-radius: var(--radius-pill);
+    background: var(--white-a04); border-color: var(--white-a08); }
+.vwlp-page.vwl2 .vwlp-search-input { font-size: 13px; }
+.vwlp-page.vwl2 .vwlp-sort { height: 34px; border-radius: var(--radius-pill); font-size: 13px;
+    background-color: var(--white-a04); border-color: var(--white-a08); }
+.vwlp-page.vwl2 .vwlp-sort[hidden] { display: none; }
+.vwlp-page.vwl2 .vwlp-import-btn { height: 34px; padding: 0 14px; border-radius: var(--radius-pill);
+    background: var(--white-a04); border: 1px solid var(--white-a08); color: var(--white-a85);
+    font-size: 13px; font-weight: 600; box-shadow: none; }
+.vwlp-page.vwl2 .vwlp-import-btn:hover { background: var(--white-a08); color: var(--text-primary);
+    border-color: var(--white-a14); }
+
+/* cards */
+.vwlp-page.vwl2 .vwlp-body { padding-top: 22px; }
+.vwlp-page.vwl2 .vwlp-grid { grid-template-columns: repeat(auto-fill, minmax(164px, 1fr)); gap: 26px 18px; }
+.vwlp-page.vwl2 .vwlp-card:hover { transform: translateY(-3px); }
+.vwlp-page.vwl2 .vwlp-card:focus-visible { outline: none; }
+.vwlp-page.vwl2 .vwlp-card:focus-visible .vwlp-card-art { border-color: rgba(var(--accent-rgb), 0.8); }
+.vwlp-page.vwl2 .vwlp-card-art { box-shadow: 0 10px 26px var(--black-a40); }
+.vwlp-page.vwl2 .vwlp-card:hover .vwlp-card-art { border-color: var(--white-a30);
+    box-shadow: 0 18px 40px var(--black-a55); }
+.vwlp-page.vwl2 .vwlp-card-info { padding: 10px 2px 0; }
+.vwlp-page.vwl2 .vwlp-card-title { font-size: 13.5px; font-weight: 600; }
+.vwlp-page.vwl2 .vwlp-card-meta { font-size: 12px; font-weight: 500; color: var(--white-a45);
+    font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vwlp-page.vwl2 .vwlp-card-meta b { font-weight: 600; color: rgb(var(--warning-rgb)); }
+/* how much of what has aired is on disk: only drawn when something is missing */
+.vwlp-card-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 4px; z-index: 2;
+    background: var(--black-a55); }
+.vwlp-card-bar i { display: block; height: 100%; background: rgb(var(--warning-rgb)); }
+.vwlp-page.vwl2 .vwlp-pill { background: var(--black-a65); color: var(--white-a80);
+    border-color: var(--white-a12); font-weight: 700; }
+
+/* everything here is followed: the controls wait for the pointer (touch keeps them) */
+@media (hover: hover) {
+    .vwlp-page.vwl2 .vwlp-card .vcard-ctrls,
+    .vwlp-page.vwl2 .vwlp-card .vwl-btn,
+    .vwlp-page.vwl2 .vwlp-card [data-vwlp-psettings],
+    .vwlp-page.vwl2 .vwlp-card .vwlp-studio-cog {
+        opacity: 0; transition: opacity var(--dur-quick) ease; }
+    .vwlp-page.vwl2 .vwlp-card:hover .vcard-ctrls,
+    .vwlp-page.vwl2 .vwlp-card:focus-within .vcard-ctrls,
+    .vwlp-page.vwl2 .vwlp-card:hover .vwl-btn,
+    .vwlp-page.vwl2 .vwlp-card:focus-within .vwl-btn,
+    .vwlp-page.vwl2 .vwlp-card:hover [data-vwlp-psettings],
+    .vwlp-page.vwl2 .vwlp-card:focus-within [data-vwlp-psettings],
+    .vwlp-page.vwl2 .vwlp-card:hover .vwlp-studio-cog,
+    .vwlp-page.vwl2 .vwlp-card:focus-within .vwlp-studio-cog { opacity: 1; }
+}
+
+.vwlp-page.vwl2 .vwlp-state { padding: 80px 20px; }
+.vwlp-page.vwl2 .vwlp-state-ic { display: none; }
+.vwlp-page.vwl2 .vwlp-state-title { font-size: 17px; font-weight: 600; margin-top: 0; }
+.vwlp-page.vwl2 .vwlp-page-btn { border-radius: var(--radius-pill); font-weight: 600; }
+
+@media (max-width: 900px) {
+    .vwlp-page.vwl2 .vwlp-grid { grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 20px 12px; }
+    .vwlp-page.vwl2 .vwlp-head-row { align-items: flex-start; flex-direction: column; }
+}
+@media (max-width: 640px) {
+    .vwlp-page.vwl2 .vwlp-title { font-size: 26px; }
+    .vwlp-page.vwl2 .vwlp-tabs { flex-wrap: nowrap; max-width: 100%; overflow-x: auto; scrollbar-width: none; }
+    .vwlp-page.vwl2 .vwlp-tab { flex: 1 0 auto; justify-content: center; padding: 8px 9px; gap: 5px;
+        font-size: 12.5px; }
+    .vwlp-page.vwl2 .vwlp-chips { margin-right: 0; flex: 1 1 100%; }
+    .vwlp-page.vwl2 .vwlp-search { flex: 1 1 150px; min-width: 0; }
+}
+
+/* ═══════════════════════════════════════════════
+   SEARCH, redrawn (.vsr-page.vsr2)
+   The same quiet language as the watchlist and the automations page: the
+   title top left, one pill row of tabs, neutral fields, and the accent kept
+   for the one thing you press and for focus. Posters speak up for what you
+   own, not for what you do not.
+   ═══════════════════════════════════════════════ */
+.vsr-page.vsr2 { max-width: 1760px; margin-left: auto; margin-right: auto; }
+.vsr-page.vsr2 .vsr-hero { display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 20px;
+    align-items: end; text-align: left; padding: 36px 40px 0; overflow: visible; }
+.vsr-page.vsr2 .vsr-hero-glow { display: none; }
+.vsr-page.vsr2 .vsr-hero-title { grid-column: 1; margin: 0; font-size: 32px; font-weight: 700;
+    letter-spacing: -0.02em; line-height: 1.1; text-shadow: none; }
+.vsr-page.vsr2 .vsr-hero-sub { grid-column: 1; margin: 8px 0 0; font-size: 14px; font-weight: 500;
+    color: var(--white-a55); }
+.vsr-page.vsr2 .vsr-tabs { grid-column: 2; grid-row: 1 / span 2; display: inline-flex; gap: 2px; margin: 0;
+    padding: 4px; width: auto; border-radius: var(--radius-pill); background: var(--white-a04);
+    border: 1px solid var(--white-a08); box-shadow: none; }
+.vsr-page.vsr2 .vsr-tab { min-height: 0; padding: 8px 18px; border-radius: var(--radius-pill);
+    font-size: 13px; font-weight: 600; color: var(--white-a60);
+    transition: background var(--dur-quick) ease, color var(--dur-quick) ease; }
+.vsr-page.vsr2 .vsr-tab:hover { background: var(--white-a05); color: var(--text-primary); }
+.vsr-page.vsr2 .vsr-tab.active,
+.vsr-page.vsr2 .vsr-tab.active:hover { background: var(--white-a12); color: var(--text-primary); box-shadow: none; }
+.vsr-page.vsr2 .vsr-tab:focus-visible { outline: 2px solid rgba(var(--accent-rgb), 0.7); outline-offset: 2px; }
+.vsr-page.vsr2 .vsr-panel { grid-column: 1 / -1; margin-top: 22px; }
+.vsr-page.vsr2 .vsr-panel[hidden] { display: none; }
+
+/* the title search: one long pill */
+.vsr-page.vsr2 .vsr-searchbar { max-width: 720px; margin: 0; height: 50px; padding: 0 20px;
+    border-radius: var(--radius-pill); background: var(--white-a04); border-color: var(--white-a10);
+    backdrop-filter: none; box-shadow: none; }
+.vsr-page.vsr2 .vsr-searchbar:focus-within { background: var(--white-a06);
+    border-color: rgba(var(--accent-rgb), 0.6); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16); }
+.vsr-page.vsr2 .vsr-search-ic { flex: 0 0 auto; opacity: 1; color: var(--white-a40); }
+.vsr-page.vsr2 .vsr-searchbar:focus-within .vsr-search-ic,
+.vsr-page.vsr2 .vsr-basic-main:focus-within .vsr-search-ic { color: rgb(var(--accent-rgb)); }
+.vsr-page.vsr2 .vsr-input { font-size: 15.5px; font-weight: 500; }
+.vsr-page.vsr2 .vsr-context { font-weight: 500; }
+.vsr-page.vsr2 .vsr-context span { text-transform: none; letter-spacing: 0; }
+.vsr-page.vsr2 .vsr-context strong { font-weight: 600; }
+
+/* results */
+.vsr-page.vsr2 .vsr-body { padding: 26px 40px 70px; }
+.vsr-page.vsr2 .vsr-group-title { gap: 10px; margin-bottom: 16px; font-size: 18px; font-weight: 700; }
+.vsr-page.vsr2 .vsr-group-ic { display: none; }
+.vsr-page.vsr2 .vsr-group-count { padding: 0; border: 0; background: none; font-size: 13px; font-weight: 500;
+    color: var(--white-a40); font-variant-numeric: tabular-nums; }
+.vsr-page.vsr2 .vsr-recent-label { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.vsr-page.vsr2 .vsr-grid { grid-template-columns: repeat(auto-fill, minmax(164px, 1fr)); gap: 26px 18px; }
+.vsr-page.vsr2 .vsr-poster { background: var(--white-a04); box-shadow: 0 10px 26px var(--black-a40);
+    border-color: var(--white-a07); }
+.vsr-page.vsr2 .vsr-card:hover .vsr-poster { border-color: var(--white-a30);
+    box-shadow: 0 18px 40px var(--black-a55); }
+.vsr-page.vsr2 .vsr-name { font-size: 13.5px; font-weight: 600; }
+.vsr-page.vsr2 .vsr-sub { font-weight: 500; color: var(--white-a45); }
+/* a label for what you own. most results are not yours, so "preview" on each said nothing */
+.vsr-page.vsr2 .vsr-ribbon { top: 8px; left: 8px; padding: 3px 8px; font-size: 10.5px; font-weight: 700;
+    letter-spacing: 0.02em; text-transform: none; box-shadow: none; }
+.vsr-page.vsr2 .vsr-ribbon--owned { background: var(--black-a65); color: rgb(var(--accent-light-rgb));
+    border: 1px solid rgba(var(--accent-rgb), 0.45); }
+.vsr-page.vsr2 .vsr-ribbon--preview { display: none; }
+.vsr-page.vsr2 .vsr-rating { top: 8px; right: 8px; font-size: 11px; font-weight: 600;
+    background: var(--black-a65); }
+.vsr-page.vsr2 .vsr-state-ic { display: none; }
+.vsr-page.vsr2 .vsr-state-title { font-size: 17px; font-weight: 600; }
+
+/* Releases: the form, flat */
+.vsr-page.vsr2 .vsr-basic { margin: 0; max-width: 980px; padding: 0; border: 0; border-radius: 0;
+    background: none; box-shadow: none; backdrop-filter: none; }
+.vsr-page.vsr2 .vsr-basic-main { min-height: 50px; background: var(--white-a04); border-color: var(--white-a10);
+    box-shadow: none; }
+.vsr-page.vsr2 .vsr-basic-main:focus-within { background: var(--white-a06);
+    border-color: rgba(var(--accent-rgb), 0.6); box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16); }
+.vsr-page.vsr2 .vsr-basic-input { height: 48px; font-size: 15px; font-weight: 500; }
+.vsr-page.vsr2 .vsr-basic-field { min-height: 38px; background: var(--white-a04); }
+.vsr-page.vsr2 .vsr-basic-field select { font-size: 13.5px; font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-field:focus-within { background: var(--white-a06);
+    border-color: rgba(var(--accent-rgb), 0.6); }
+.vsr-page.vsr2 .vsr-basic-field span { text-transform: none; letter-spacing: 0; font-size: 12.5px;
+    font-weight: 500; color: var(--white-a45); }
+.vsr-page.vsr2 .vsr-basic-submit,
+.vsr-page.vsr2 .vsr-basic-ghost { min-height: 38px; padding: 0 22px; font-size: 13px; font-weight: 600;
+    letter-spacing: 0; text-transform: none; box-shadow: none; }
+.vsr-page.vsr2 .vsr-basic-submit { background: rgb(var(--accent-rgb)); border-color: rgb(var(--accent-rgb));
+    color: var(--bg-primary); }
+.vsr-page.vsr2 .vsr-basic-submit:hover { background: rgb(var(--accent-light-rgb));
+    border-color: rgb(var(--accent-light-rgb)); transform: none; }
+.vsr-page.vsr2 .vsr-basic-ghost { background: var(--white-a04); border-color: var(--white-a10);
+    color: var(--white-a85); }
+.vsr-page.vsr2 .vsr-basic-ghost:hover { background: var(--white-a08); border-color: var(--white-a14);
+    color: var(--text-primary); transform: none; }
+.vsr-page.vsr2 .vsr-basic-sources label { font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-sources label:hover { background: var(--white-a08); border-color: var(--white-a14); }
+.vsr-page.vsr2 .vsr-basic-sources label:has(input:checked) { background: var(--white-a08);
+    border-color: var(--white-a20); color: var(--text-primary); }
+.vsr-page.vsr2 .vsr-basic-results { margin: 0; max-width: 1180px; }
+.vsr-page.vsr2 .vsr-basic-results-head { background: none; border: 0; box-shadow: none; padding: 0;
+    border-radius: 0; overflow: visible; }
+.vsr-page.vsr2 .vsr-basic-results-head::before { display: none; }
+.vsr-page.vsr2 .vsr-basic-results-head span { text-transform: none; letter-spacing: 0; font-size: 12.5px;
+    font-weight: 500; color: var(--white-a45); }
+.vsr-page.vsr2 .vsr-basic-results-head h2 { font-size: 20px; font-weight: 700; }
+.vsr-page.vsr2 .vsr-basic-empty { background: var(--white-a03); border-color: var(--white-a08); box-shadow: none; }
+.vsr-page.vsr2 .vsr-basic-empty-mark { font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-count,
+.vsr-page.vsr2 .vsr-basic-query-label,
+.vsr-page.vsr2 .vsr-basic-hit-kicker,
+.vsr-page.vsr2 .vsr-basic-hit-note span,
+.vsr-page.vsr2 .vsr-basic-hit-linkstate,
+.vsr-page.vsr2 .vsr-basic-hit-verdict,
+.vsr-page.vsr2 .vsr-basic-hit-tags span { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-source-tab span,
+.vsr-page.vsr2 .vsr-basic-source-main strong { font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-source-tab em,
+.vsr-page.vsr2 .vsr-basic-source-query,
+.vsr-page.vsr2 .vsr-basic-query-chip,
+.vsr-page.vsr2 .vsr-basic-query-more,
+.vsr-page.vsr2 .vsr-basic-hit-side span,
+.vsr-page.vsr2 .vsr-basic-hit-size { font-weight: 600; }
+.vsr-page.vsr2 .vsr-basic-source-tab.active { background: var(--white-a12); border-color: var(--white-a20);
+    box-shadow: none; }
+.vsr-page.vsr2 .vsr-basic-source-tab.active::after { display: none; }
+.vsr-page.vsr2 .vsr-basic-hit-grab { text-transform: none; letter-spacing: 0; font-size: 12.5px;
+    font-weight: 600; background: var(--white-a06); border-color: var(--white-a12);
+    color: var(--text-primary); box-shadow: none; }
+.vsr-page.vsr2 .vsr-basic-hit-grab:hover:not(:disabled) { background: rgb(var(--accent-rgb));
+    border-color: rgb(var(--accent-rgb)); color: var(--bg-primary); box-shadow: none; transform: none; }
+
+/* Fresh: the same pills, and a board whose buttons do not all shout */
+.vsr-page.vsr2 .vsr-fresh-head { background: none; border: 0; box-shadow: none; padding: 0;
+    border-radius: 0; overflow: visible; }
+.vsr-page.vsr2 .vsr-fresh-head::before { display: none; }
+.vsr-page.vsr2 .vsr-fresh-head span,
+.vsr-page.vsr2 .vsr-fresh-board-head span { text-transform: none; letter-spacing: 0; font-size: 12.5px;
+    font-weight: 500; color: var(--white-a45); }
+.vsr-page.vsr2 .vsr-fresh-head h2,
+.vsr-page.vsr2 .vsr-fresh-board-head h2 { font-size: 20px; font-weight: 700; }
+.vsr-page.vsr2 .vsr-fresh-period,
+.vsr-page.vsr2 .vsr-fresh-pill,
+.vsr-page.vsr2 .vsr-fresh-view-btn { font-weight: 600; text-transform: none; letter-spacing: 0; }
+.vsr-page.vsr2 .vsr-fresh-period.active,
+.vsr-page.vsr2 .vsr-fresh-pill.active,
+.vsr-page.vsr2 .vsr-fresh-view-btn.active { background: var(--white-a12); color: var(--text-primary);
+    box-shadow: none; border-color: transparent; }
+.vsr-page.vsr2 .vsr-fresh-refresh { background: var(--white-a04); border-color: var(--white-a10);
+    color: var(--white-a85); box-shadow: none; text-transform: none; letter-spacing: 0; font-size: 13px;
+    font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-refresh:hover { background: var(--white-a08); border-color: var(--white-a14);
+    color: var(--text-primary); transform: none; }
+.vsr-page.vsr2 .vsr-fresh-filter-input:focus { border-color: rgba(var(--accent-rgb), 0.6);
+    box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16); }
+.vsr-page.vsr2 .vsr-fresh-stat em,
+.vsr-page.vsr2 .vsr-fresh-table-head,
+.vsr-page.vsr2 .vsr-fresh-fact span { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.vsr-page.vsr2 .vsr-fresh-stat strong,
+.vsr-page.vsr2 .vsr-fresh-meta b,
+.vsr-page.vsr2 .vsr-fresh-release span b { font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-card::before { display: none; }
+.vsr-page.vsr2 .vsr-fresh-card { background: var(--white-a03); border-color: var(--white-a08); box-shadow: none; }
+.vsr-page.vsr2 .vsr-fresh-card:hover { border-color: var(--white-a20); }
+.vsr-page.vsr2 .vsr-fresh-card-title { font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-badge--quality,
+.vsr-page.vsr2 .vsr-fresh-badge--ep,
+.vsr-page.vsr2 .vsr-fresh-card-sub-pill { text-transform: none; letter-spacing: 0; font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-badge--rating,
+.vsr-page.vsr2 .vsr-fresh-badge--swarm,
+.vsr-page.vsr2 .vsr-fresh-badge--seeds,
+.vsr-page.vsr2 .vsr-fresh-badge--size { font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-pick { background: var(--white-a06); border-color: var(--white-a12);
+    color: var(--text-primary); box-shadow: none; text-transform: none; letter-spacing: 0; font-size: 12.5px;
+    font-weight: 600; }
+.vsr-page.vsr2 .vsr-fresh-pick:hover:not(:disabled) { background: rgb(var(--accent-rgb));
+    border-color: rgb(var(--accent-rgb)); color: var(--bg-primary); transform: none; }
+
+@media (max-width: 900px) {
+    .vsr-page.vsr2 .vsr-hero { padding: 60px 18px 0; grid-template-columns: minmax(0, 1fr); }
+    .vsr-page.vsr2 .vsr-tabs { grid-column: 1; grid-row: auto; justify-self: start; margin-top: 16px; }
+    .vsr-page.vsr2 .vsr-body { padding-left: 18px; padding-right: 18px; }
+    .vsr-page.vsr2 .vsr-grid { grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); gap: 20px 12px; }
+}
+@media (max-width: 640px) {
+    .vsr-page.vsr2 .vsr-hero-title { font-size: 26px; }
+    .vsr-page.vsr2 .vsr-tabs { display: flex; width: 100%; }
+    .vsr-page.vsr2 .vsr-tab { flex: 1 1 0; padding: 8px 10px; }
+    .vsr-page.vsr2 .vsr-searchbar { height: 46px; border-radius: var(--radius-pill); }
+    .vsr-page.vsr2 .vsr-grid { grid-template-columns: repeat(auto-fill, minmax(108px, 1fr)); gap: 16px 10px; }
+}
+
+/* ═══════════════════════════════════════════════
+   DISCOVER, redrawn (.vdsc-page.vdsc2)
+   The page keeps its shape (the hero, the genre tiles, the rails). What
+   changes is the voice: lighter headings, posters that stand on their own
+   instead of each in a box, and a label only on what you already own.
+   ═══════════════════════════════════════════════ */
+.vdsc-page.vdsc2 .vdsc-bar-title { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.1; }
+.vdsc-page.vdsc2 .vdsc-bar-sub { font-size: 14px; font-weight: 500; color: var(--white-a55); }
+.vdsc-page.vdsc2 .vdsc-btn { border-radius: var(--radius-pill); font-weight: 600; }
+.vdsc-page.vdsc2 .vdsc-group-head h2 { font-size: 24px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; }
+.vdsc-page.vdsc2 .vdsc-group-head p { margin-top: 4px; font-size: 13.5px; font-weight: 500; color: var(--white-a45); }
+.vdsc-page.vdsc2 .vdsc-shelf-title { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; color: var(--white-a90); }
+.vdsc-page.vdsc2 .vdsc-tile-name { font-weight: 700; }
+.vdsc-page.vdsc2 .vdsc-grid-title,
+.vdsc-page.vdsc2 .vdsc-ig-title,
+.vdsc-page.vdsc2 .vdsc-empty-title { font-weight: 700; }
+.vdsc-page.vdsc2 .vdsc-story-title { font-weight: 700; }
+.vdsc-page.vdsc2 .vdsc-hero-title { font-weight: 700; }
+
+/* rail and grid posters: no box around each, the poster is the card */
+.vdsc-page.vdsc2 .vdsc-rail .vsr-card,
+.vdsc-page.vdsc2 .vsr-grid .vsr-card { padding: 0; background: none; border: 0; border-radius: 0;
+    box-shadow: none; }
+.vdsc-page.vdsc2 .vsr-poster { background: var(--white-a04); border-color: var(--white-a07);
+    box-shadow: 0 10px 26px var(--black-a40); }
+.vdsc-page.vdsc2 .vsr-card:hover .vsr-poster { border-color: var(--white-a30);
+    box-shadow: 0 18px 40px var(--black-a55); }
+.vdsc-page.vdsc2 .vsr-name { font-size: 13.5px; font-weight: 600; }
+.vdsc-page.vdsc2 .vsr-sub { font-weight: 500; color: var(--white-a45); }
+.vdsc-page.vdsc2 .vsr-ribbon { top: 8px; left: 8px; padding: 3px 8px; font-size: 10.5px; font-weight: 700;
+    letter-spacing: 0.02em; text-transform: none; box-shadow: none; }
+.vdsc-page.vdsc2 .vsr-ribbon--owned { background: var(--black-a65); color: rgb(var(--accent-light-rgb));
+    border: 1px solid rgba(var(--accent-rgb), 0.45); }
+.vdsc-page.vdsc2 .vsr-ribbon--preview { display: none; }
+.vdsc-page.vdsc2 .vsr-rating { top: 8px; right: 8px; font-size: 11px; font-weight: 600;
+    background: var(--black-a65); }
+.vdsc-page.vdsc2 .vsr-new { font-weight: 700; }
+.vdsc-page.vdsc2 .vdsc-stories:not(.hidden) { margin-bottom: 26px; }
+
+/* discover rhythm on smaller screens: one poster width per size, tighter groups */
+@media (max-width: 1100px) {
+    .vdsc-page.vdsc2 .vdsc-tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 900px) {
+    /* touch sizes: the genres become one swipeable row */
+    .vdsc-page.vdsc2 .vdsc-tiles {
+        grid-template-columns: none; grid-auto-flow: column; grid-auto-columns: 150px;
+        overflow-x: auto; overscroll-behavior-x: contain; scroll-snap-type: x mandatory; padding-bottom: 8px;
+    }
+    .vdsc-page.vdsc2 .vdsc-tile { height: 88px; }
+    .vdsc-page.vdsc2 .vdsc-tile--all { grid-column: auto; height: 88px; }
+    .vdsc-page.vdsc2 { --vdsc-card-w: 146px; --vdsc-gap: 14px; }
+    .vdsc-page.vdsc2 .vdsc-group { padding-top: 28px; }
+    .vdsc-page.vdsc2 .vdsc-group-head h2 { font-size: 21px; }
+    .vdsc-page.vdsc2 .vdsc-shelf-title { font-size: 16px; }
+}
+@media (max-width: 560px) {
+    .vdsc-page.vdsc2 { --vdsc-card-w: 118px; --vdsc-gap: 12px; }
+    .vdsc-page.vdsc2 .vdsc-group { padding-top: 24px; }
+    .vdsc-page.vdsc2 .vdsc-group-head { margin-bottom: 14px; }
+    .vdsc-page.vdsc2 .vdsc-group-head h2 { font-size: 19px; }
+    .vdsc-page.vdsc2 .vdsc-shelf-title { font-size: 15px; }
+    .vdsc-page.vdsc2 .vdsc-arrow { display: none; }
+    .vdsc-page.vdsc2 .vsr-name { font-size: 12.5px; }
+    .vdsc-page.vdsc2 .vsr-rank { -webkit-text-stroke-width: 1.5px; }
+}
+/* with a mouse the rail arrows wait until you're on the rail, calmer at rest */
+@media (hover: hover) and (pointer: fine) {
+    .vdsc-page.vdsc2 .vdsc-arrow { opacity: 0; transition: opacity 160ms ease, background 160ms ease, transform 160ms ease; }
+    .vdsc-page.vdsc2 .vdsc-shelf:hover .vdsc-arrow,
+    .vdsc-page.vdsc2 .vdsc-arrow:focus-visible { opacity: 1; }
+}

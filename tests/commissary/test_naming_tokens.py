@@ -255,10 +255,10 @@ def test_the_probe_carries_the_new_facts_through():
              "tags": {"language": "eng"}},
         ]})
     assert parsed["ok"] is True
-    assert parsed["audio_channels"] == "7.1"
+    assert parsed["audio_channels"] == 8          # upstream's count; the token writes 7.1
     assert parsed["video_bit_depth"] == 10
     assert parsed["dynamic_range_type"] == "HDR10"
-    assert parsed["audio_languages"] == "ENG"
+    assert parsed["audio_languages"] == ["en"]    # upstream's codes; the token writes EN
 
 
 # ── edition detection ────────────────────────────────────────────────────────

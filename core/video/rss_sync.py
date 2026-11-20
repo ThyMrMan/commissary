@@ -243,12 +243,14 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
         if any(it.get("owned") for it in items):
             per_item = vpw._cutoff_rank_for_item if any(
                 it.get("quality_profile_id") for it in items) else None
-            items = vpw.annotate_upgrades(items, cutoff, cutoff_for=per_item)
+            items = vpw.annotate_upgrades(items, cutoff, cutoff_for=per_item,
+                                          held=vpw.held_titles(db))
         target = vpw._default_target_dir(media_type)
         if not target:
             continue
         # each item's own folder, the way the wishlist drain files it: the
-        # anime folder by show type, the 4K one by quality profile (RSS used to
+        # anime folder by show type, its library (#2029: picked, the 4K one by
+        # quality profile, the rules, the default) (RSS used to
         # send every episode to the TV folder, anime included)
         anime_root = vpw._default_anime_dir() if media_type == "episode" else ""
         four_k_root = vpw._default_four_k_dir(media_type)
@@ -257,11 +259,15 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
         for item in rss_items(items, active, media_type, db=db):
             if vpw.item_key(item, media_type) in active:
                 continue
+            # a library with automatic search (or upgrades) off (#2029)
+            if not vpw.library_allows(item, media_type, vpw._default_pick_library,
+                                      vpw._default_profile_library):
+                continue
             titles = [item.get("title") or item.get("show_title")]
             pool = _prescreen(hits, titles)
             if not pool:
                 continue
-            cands = _rank(pool, item, media_type)
+            cands = _library_sources_only(_rank(pool, item, media_type), item, media_type)
             if not cands:
                 continue
             matched += 1
@@ -274,7 +280,8 @@ def _rss_pass_inner(*, fetch, log, extto=None) -> Dict[str, Any]:
                                            _skip_reason(cands, min_rank, item)))
                 continue
             folder = vpw.item_target_dir(item, media_type, target, anime_root, four_k_root,
-                                         vpw._default_route_type, vpw._default_profile_library)
+                                         vpw._default_route_type, vpw._default_profile_library,
+                                         vpw._default_pick_library)
             if vpw._default_enqueue(item, best, cands, media_type, folder):
                 grabbed += 1
                 active.add(vpw.item_key(item, media_type))
@@ -323,6 +330,24 @@ def _skip_reason(cands: List[Dict[str, Any]], min_rank: int, item: Dict[str, Any
     return "no release qualified"
 
 
+def _library_sources_only(cands: List[Dict[str, Any]], item: Dict[str, Any],
+                          media_type: str) -> List[Dict[str, Any]]:
+    """Releases from the sources (and Prowlarr indexers) the item's video
+    library searches (#2029), when it sets its own; every one otherwise. RSS itself still only runs
+    for the indexer sources in the global order."""
+    from core.automation.handlers import video_process_wishlist as vpw
+    from core.video.libraries import indexer_ids_for, source_chain
+    lib = vpw.item_library(item, media_type)
+    own = source_chain(lib, [])
+    if own:
+        cands = [c for c in cands or [] if str(c.get("source") or c.get("protocol") or "torrent").lower() in own]
+    # and its Prowlarr indexers (#2029 step 4); EXT.to has no indexer id
+    ids = indexer_ids_for(lib)
+    if ids:
+        cands = [c for c in cands or [] if c.get("indexer_id") is None or int(c["indexer_id"]) in ids]
+    return cands
+
+
 def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> List[Dict[str, Any]]:
     """The drain's ranker over a pre-fetched release pool (no network). Tags each
     accepted candidate with its protocol as the grab source."""
@@ -332,9 +357,6 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
     from core.video.numbering import ctx_alt
     from core.video.quality_profile import load_for_item
     ctx = search_context(item, media_type)
-    # Commissary: only releases from the title's video Library's trackers
-    from core.commissary.video_libraries import filter_hits, search_indexer_ids
-    pool = filter_hits(pool, search_indexer_ids(get_video_db(), media_type, item=item))
     cands = _evaluate_hits(pool, load_for_item(get_video_db(), item), ctx["scope"],
                            ctx.get("season"), ctx.get("episode"),
                            want_year=ctx.get("year"),
@@ -343,9 +365,6 @@ def _rank(pool: List[Dict[str, Any]], item: Dict[str, Any], media_type: str) -> 
                            want_alt=ctx_alt(ctx))
     for c in cands:
         c["source"] = "usenet" if str(c.get("protocol") or "") == "usenet" else "torrent"
-    # Commissary: a release that just failed on its client isn't grabbed again
-    from core.commissary.client_retry import mark_failed as _mark_failed
-    cands = _mark_failed(item, media_type, cands)
     # Full ranked list, not just accepted: rejected candidates ride along into
     # the download row as the auto-retry ladder, exactly like the drain.
     return cands

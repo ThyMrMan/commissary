@@ -51,8 +51,8 @@ def test_status_predicates():
     nf, _ = build_count_query('spotify', 'artist', 'not_found')
     pend, _ = build_count_query('spotify', 'artist', 'pending')
     un, _ = build_count_query('spotify', 'artist', 'unmatched')
-    assert "artists.spotify_match_status = 'not_found'" in nf
-    assert "artists.spotify_match_status IS NULL" in pend
+    assert "pa.status = 'not_found'" in nf
+    assert "pa.status IS NULL" in pend
     assert "IS NULL OR" in un and "= 'not_found'" in un
 
 
@@ -60,9 +60,9 @@ def test_track_query_qualifies_status_to_avoid_join_ambiguity():
     # tracks LEFT JOIN albums for artwork — both carry spotify_match_status,
     # so the predicate must be qualified or SQLite errors "ambiguous column".
     sql, _ = build_unmatched_query('spotify', 'track', 'not_found')
-    assert 'LEFT JOIN albums al' in sql
-    assert 'tracks.spotify_match_status' in sql
-    assert 'al.thumb_url AS image_url' in sql
+    assert 'LEFT JOIN lib2_albums al' in sql
+    assert 'pa.status' in sql
+    assert 'al.image_url AS image_url' in sql
 
 
 def test_search_adds_like_param():
@@ -87,14 +87,28 @@ def _seed(db: MusicDatabase):
     conn = db._get_connection()
     cur = conn.cursor()
     # 3 artists: matched / not_found / pending(NULL)
-    cur.execute("INSERT INTO artists (id, name, spotify_match_status) VALUES ('a1','Matched Artist','matched')")
-    cur.execute("INSERT INTO artists (id, name, spotify_match_status) VALUES ('a2','Failed Dragons','not_found')")
-    cur.execute("INSERT INTO artists (id, name) VALUES ('a3','Pending Person')")  # NULL status
+    cur.execute("INSERT INTO lib2_artists (id, name) VALUES (1,'Matched Artist')")
+    cur.execute("INSERT INTO lib2_artists (id, name, spotify_id) VALUES (2,'Failed Dragons','wrong-id')")
+    cur.execute("INSERT INTO lib2_artists (id, name) VALUES (3,'Pending Person')")
     # album + track to exercise the join-for-artwork path
-    cur.execute("INSERT INTO albums (id, artist_id, title, thumb_url, spotify_match_status) "
-                "VALUES ('al1','a2','Evolve','http://img/evolve.jpg','not_found')")
-    cur.execute("INSERT INTO tracks (id, album_id, artist_id, title, spotify_match_status) "
-                "VALUES ('t1','al1','a2','Believer','not_found')")
+    cur.execute("INSERT INTO lib2_albums (id, primary_artist_id, title, image_url) "
+                "VALUES (1,2,'Evolve','http://img/evolve.jpg')")
+    cur.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (1,1,'Believer')")
+    cur.execute("INSERT INTO lib2_track_files (track_id, path) VALUES (1,'/m/believer.flac')")
+    # the other two artists own a release too (the workers only enrich the
+    # owned library, G06-2)
+    for artist_id in (1, 3):
+        cur.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (?,?,'Own')",
+                    (artist_id + 10, artist_id))
+        cur.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (?,?,'Own')",
+                    (artist_id + 10, artist_id + 10))
+        cur.execute("INSERT INTO lib2_track_files (track_id, path) VALUES (?,?)",
+                    (artist_id + 10, f"/m/own{artist_id}.flac"))
+    cur.executemany(
+        "INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) VALUES(?,?,?,?)",
+        [('artist', 1, 'spotify', 'matched'), ('artist', 2, 'spotify', 'not_found'),
+         ('album', 1, 'spotify', 'not_found'), ('track', 1, 'spotify', 'not_found')],
+    )
     conn.commit()
     conn.close()
 
@@ -180,60 +194,136 @@ def test_reset_builder_bad_scope():
         build_reset_query('spotify', 'artist', 'bogus', entity_id='x')
 
 
-def test_reset_builder_nulls_status_not_just_attempted():
-    sql, _ = build_reset_query('spotify', 'artist', 'failed')
-    assert 'spotify_match_status = NULL' in sql
-    assert 'spotify_last_attempted = NULL' in sql
-    assert "WHERE spotify_match_status = 'not_found'" in sql
+def test_reset_builder_selects_failed_attempts():
+    sql, params = build_reset_query('spotify', 'artist', 'failed')
+    assert 'lib2_provider_attempts' in sql
+    assert "pa.status='not_found'" in sql
+    assert params == ['artist', 'spotify']
 
 
-def test_reset_builder_also_clears_artist_source_id():
+def test_reset_builder_selects_native_artist():
     # #868: a re-match must forget the stored id so the worker actually
     # re-resolves (otherwise its existing-id short-circuit re-confirms the wrong
     # same-name artist).
-    for service, col in [('spotify', 'spotify_artist_id'), ('itunes', 'itunes_artist_id'),
-                         ('deezer', 'deezer_id'), ('musicbrainz', 'musicbrainz_id')]:
-        sql, _ = build_reset_query(service, 'artist', 'item', entity_id=5)
-        assert f'{col} = NULL' in sql, f'{service}: expected {col} cleared'
-        assert f'{service}_match_status = NULL' in sql
+    for service in ('spotify', 'itunes', 'deezer', 'musicbrainz'):
+        sql, params = build_reset_query(service, 'artist', 'item', entity_id=5)
+        assert sql == 'SELECT id FROM lib2_artists WHERE id = ?'
+        assert params == [5]
 
 
-def test_reset_builder_clears_track_id_too():
-    # The old pin here ("tracks have no source-id column") was wrong — tracks
-    # DO carry per-service id columns (core/source_ids), and leaving one in
-    # place made a track rematch an instant no-op re-confirmation of the old
-    # id (#868's track-shaped twin). Reset must forget it.
-    sql, _ = build_reset_query('spotify', 'track', 'item', entity_id=5)
-    assert 'spotify_match_status = NULL' in sql
-    assert 'spotify_track_id = NULL' in sql
+def test_reset_builder_selects_native_track():
+    # The builder only selects native ids. MusicDatabase.reset_enrichment owns
+    # clearing promoted ids, external_ids, provenance and the attempt ledger.
+    sql, params = build_reset_query('spotify', 'track', 'item', entity_id=5)
+    assert sql == 'SELECT id FROM lib2_tracks WHERE id = ?'
+    assert params == [5]
 
 
-def test_reset_builder_clears_bandcamp_url_and_id_on_album_and_track():
+def test_reset_builder_selects_bandcamp_album_and_track():
     # PR #968 review: reset must forget the Bandcamp match or the worker's
     # existing-url short-circuit re-confirms the old release. Bandcamp's
     # canonical handle (bandcamp_url) lives in a real column on BOTH albums and
     # tracks — unlike other sources, its track id must be cleared too — and the
     # supplementary bandcamp_id must also go so no stale id lingers.
     for entity in ('album', 'track'):
-        sql, _ = build_reset_query('bandcamp', entity, 'item', entity_id=5)
-        assert 'bandcamp_match_status = NULL' in sql
-        assert 'bandcamp_url = NULL' in sql, f'{entity}: bandcamp_url must be cleared'
-        assert 'bandcamp_id = NULL' in sql, f'{entity}: bandcamp_id must be cleared'
+        sql, params = build_reset_query('bandcamp', entity, 'item', entity_id=5)
+        assert sql == f'SELECT id FROM lib2_{entity}s WHERE id = ?'
+        assert params == [5]
 
 
 def test_reset_item_requeues_to_pending(db):
-    n = db.reset_enrichment('spotify', 'artist', 'item', entity_id='a2')  # was not_found
+    n = db.reset_enrichment('spotify', 'artist', 'item', entity_id=2)  # was not_found
     assert n == 1
     # not_found dropped by 1, pending gained 1
     bd = db.get_enrichment_breakdown('spotify', 'artist')
     assert bd == {'matched': 1, 'not_found': 0, 'pending': 2, 'total': 3}
+    conn = db._get_connection()
+    assert conn.execute("SELECT spotify_id FROM lib2_artists WHERE id=2").fetchone()[0] is None
+    conn.close()
 
 
 def test_reset_failed_requeues_all(db):
     n = db.reset_enrichment('spotify', 'album', 'failed')  # one not_found album
     assert n == 1
     bd = db.get_enrichment_breakdown('spotify', 'album')
-    assert bd['not_found'] == 0 and bd['pending'] == 1
+    # the reset album plus the two owned albums never attempted
+    assert bd['not_found'] == 0 and bd['pending'] == 3
+
+
+def test_reset_failed_is_set_based_and_clears_what_each_row_held(db):
+    # review 5 W3-TD-2: Retry all walked every not_found row through the
+    # per-row clear plus a DELETE (8 statements a row) in one write
+    # transaction. the statement count must not grow with the rows, and each
+    # row ends as the per-row clear left it.
+    import json
+
+    conn = db._get_connection()
+    cur = conn.cursor()
+    first = 100
+    n = 300
+    cur.executemany("INSERT INTO lib2_tracks (id, album_id, title) VALUES (?,1,?)",
+                    [(first + i, f"t{i}") for i in range(n)])
+    cur.execute("INSERT INTO lib2_track_files (track_id, path) "
+                "SELECT id, '/m/' || id || '.flac' FROM lib2_tracks WHERE id >= ?", (first,))
+    cur.executemany(
+        "INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) VALUES(?,?,?,?)",
+        [('track', first + i, 'audiodb', 'not_found') for i in range(n)]
+        + [('track', first, 'deezer', 'not_found'), ('track', 11, 'audiodb', 'matched')])
+    # one not_found row still holds an id, one has a stale provenance row
+    cur.execute("UPDATE lib2_tracks SET external_ids=? WHERE id=?",
+                (json.dumps({"audiodb": "stale", "deezer": "9"}), first + 1))
+    cur.execute("UPDATE lib2_tracks SET external_ids=? WHERE id=?",
+                (json.dumps({"deezer": "7"}), first + 2))
+    cur.executemany(
+        "INSERT INTO metadata_match_provenance(entity_type,entity_id,service,origin,external_id) "
+        "VALUES(?,?,?,?,?)",
+        [('lib2_track', first + 1, 'audiodb', 'automatic', 'stale'),
+         ('lib2_track', first + 3, 'audiodb', 'automatic', 'old'),
+         ('lib2_track', first + 3, 'deezer', 'automatic', 'keep')])
+    conn.commit()
+    conn.close()
+
+    statements = []
+    real_connect = db._get_connection
+
+    def traced():
+        c = real_connect()
+        c.set_trace_callback(statements.append)
+        return c
+
+    db._get_connection = traced
+    assert db.reset_enrichment('audiodb', 'track', 'failed') == n
+    db._get_connection = real_connect
+
+    writes = [s for s in statements if s.lstrip().upper().startswith(("UPDATE", "DELETE", "INSERT"))]
+    assert len(writes) < 40, f"{len(writes)} writes for {n} rows"
+
+    conn = db._get_connection()
+    ledger = conn.execute(
+        "SELECT entity_id, service, status FROM lib2_provider_attempts "
+        "WHERE entity_type='track' AND entity_id >= ? OR entity_id = 11 AND entity_type='track' "
+        "ORDER BY entity_id, service", (first,)).fetchall()
+    assert [tuple(r) for r in ledger] == [(11, 'audiodb', 'matched'), (first, 'deezer', 'not_found')]
+    assert json.loads(conn.execute("SELECT external_ids FROM lib2_tracks WHERE id=?",
+                                   (first + 1,)).fetchone()[0]) == {"deezer": "9"}
+    assert json.loads(conn.execute("SELECT external_ids FROM lib2_tracks WHERE id=?",
+                                   (first + 2,)).fetchone()[0]) == {"deezer": "7"}
+    prov = conn.execute("SELECT entity_id, service FROM metadata_match_provenance "
+                        "WHERE entity_type='lib2_track' ORDER BY entity_id, service").fetchall()
+    assert [tuple(r) for r in prov] == [(first + 3, 'deezer')]
+    conn.close()
+
+
+def test_reset_failed_still_clears_a_spotify_id_column_a_not_found_row_holds(db):
+    # review 5 W3-TD-2: the set-based reset keeps the full clear for a row that
+    # still carries the id, here in spotify_id with no external_ids key
+    assert db.reset_enrichment('spotify', 'artist', 'failed') == 1
+    conn = db._get_connection()
+    assert conn.execute("SELECT spotify_id FROM lib2_artists WHERE id=2").fetchone()[0] is None
+    assert conn.execute("SELECT spotify_id FROM lib2_artists WHERE id=1").fetchone()[0] is None
+    assert conn.execute("SELECT COUNT(*) FROM lib2_provider_attempts WHERE entity_type='artist' "
+                        "AND entity_id=2 AND service='spotify'").fetchone()[0] == 0
+    conn.close()
 
 
 # --------------------------------------------------------------------------
@@ -278,7 +368,7 @@ def test_route_breakdown(client):
 
 def test_route_retry_item(client):
     r = client.post('/api/enrichment/spotify/retry',
-                    json={'entity_type': 'artist', 'scope': 'item', 'entity_id': 'a2'})
+                    json={'entity_type': 'artist', 'scope': 'item', 'entity_id': 2})
     assert r.status_code == 200
     body = r.get_json()
     assert body['success'] is True and body['reset'] == 1
@@ -312,13 +402,15 @@ def test_bandcamp_supports_album_and_track_only():
 def test_bandcamp_breakdown_and_unmatched(db):
     conn = db._get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE albums SET bandcamp_match_status = 'matched' WHERE id = 'al1'")
-    cur.execute("UPDATE tracks SET bandcamp_match_status = 'not_found' WHERE id = 't1'")
+    cur.execute("INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) "
+                "VALUES('album',1,'bandcamp','matched')")
+    cur.execute("INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) "
+                "VALUES('track',1,'bandcamp','not_found')")
     conn.commit()
     conn.close()
 
     bd = db.get_enrichment_breakdown('bandcamp', 'album')
-    assert bd == {'matched': 1, 'not_found': 0, 'pending': 0, 'total': 1}
+    assert bd == {'matched': 1, 'not_found': 0, 'pending': 2, 'total': 3}
 
     res = db.get_enrichment_unmatched('bandcamp', 'track', status='not_found')
     assert res['total'] == 1
@@ -330,3 +422,160 @@ def test_bandcamp_breakdown_route(client):
     assert r.status_code == 200
     body = r.get_json()
     assert set(body['breakdown'].keys()) == {'album', 'track'}
+
+
+def test_unowned_catalogue_rows_are_not_listed_or_counted(db):
+    """third #1062 review G06-2: a watched artist's fileless discography (and
+    the wishlist) sit in lib2 too, but no worker enriches them. counting them
+    left the modal's pending list and match rate stuck below the worker's."""
+    conn = db._get_connection()
+    conn.execute("INSERT INTO lib2_artists (id, name) VALUES (9,'Watched Only')")
+    conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (9,9,'Unowned LP')")
+    conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (9,9,'Unowned Song')")
+    conn.execute("INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) "
+                 "VALUES('album',9,'spotify','not_found')")
+    conn.commit()
+    conn.close()
+    assert db.get_enrichment_breakdown('spotify', 'artist')['total'] == 3
+    assert db.get_enrichment_breakdown('spotify', 'track')['total'] == 3
+    pending = db.get_enrichment_unmatched('spotify', 'album', status='unmatched')
+    assert 'Unowned LP' not in [i['name'] for i in pending['items']]
+    failed = db.get_enrichment_unmatched('spotify', 'album', status='not_found')
+    assert failed['total'] == 1
+
+
+
+# --------------------------------------------------------------------------
+# review 5 R5-D-1: one kept pass, not a universe scan per page
+# --------------------------------------------------------------------------
+
+def _counting(db, monkeypatch):
+    """Count the statements that walk the attempts ledger."""
+    seen = []
+    real = db._get_connection
+
+    class _Conn:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def execute(self, sql, *args):
+            if 'lib2_provider_attempts' in sql or 'owned_f' in sql:
+                seen.append(sql)
+            return self._conn.execute(sql, *args)
+
+        def cursor(self):
+            outer = self
+
+            class _Cur:
+                def __init__(self):
+                    self._cur = outer._conn.cursor()
+
+                def execute(self, sql, *args):
+                    if 'lib2_provider_attempts' in sql or 'owned_f' in sql:
+                        seen.append(sql)
+                    return self._cur.execute(sql, *args)
+
+                def __getattr__(self, name):
+                    return getattr(self._cur, name)
+            return _Cur()
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+    monkeypatch.setattr(db, '_get_connection', lambda: _Conn(real()))
+    return seen
+
+
+def test_the_modal_reads_the_universe_once(db, monkeypatch):
+    seen = _counting(db, monkeypatch)
+    db.get_enrichment_breakdown('spotify', 'track')
+    db.get_enrichment_unmatched('spotify', 'track', status='unmatched', limit=1, offset=0)
+    db.get_enrichment_unmatched('spotify', 'track', status='unmatched', limit=1, offset=1)
+    db.get_enrichment_unmatched('spotify', 'track', status='not_found', query='believ')
+    # the owned check (a file per track) is the slow part: once. the attempts
+    # are read once for the numbers and once for this worker's list
+    owned = [sql for sql in seen if 'owned_f' in sql]
+    assert len(owned) == 1, seen
+    assert len(seen) == 3, seen
+
+
+def test_every_worker_shares_the_owned_pass(db, monkeypatch):
+    """the Manage Workers window draws three numbers per worker for seventeen
+    workers. working out what is owned took a minute per worker and type on a
+    big library, and it is the same answer for all of them."""
+    seen = _counting(db, monkeypatch)
+    first = db.get_enrichment_breakdown('spotify', 'track')
+    for service in ('musicbrainz', 'deezer', 'lastfm', 'itunes'):
+        db.get_enrichment_breakdown(service, 'track')
+        db.get_enrichment_unmatched(service, 'track', status='unmatched', limit=5)
+    owned = [sql for sql in seen if 'owned_f' in sql]
+    assert len(owned) == 1, owned
+    # one read tallies every worker; each worker's list is one read of its own attempts
+    tallies = [sql for sql in seen if 'SELECT entity_id, service, status' in sql]
+    assert len(tallies) == 1
+    assert first['total'] == db.get_enrichment_breakdown('deezer', 'track')['total']
+
+
+def test_the_numbers_are_the_snapshots_numbers(db):
+    from core.enrichment import unmatched as um
+    for service in ('spotify', 'musicbrainz', 'similar_artists'):
+        for entity in um.supported_entity_types(service):
+            snapshot = um.unmatched_snapshot(db._get_connection, db.database_path, service, entity)
+            assert db.get_enrichment_breakdown(service, entity) == snapshot['counts'], (service, entity)
+
+
+def test_a_match_keeps_the_owned_list_and_a_refresh_drops_it(db, monkeypatch):
+    from core.enrichment import unmatched as um
+    seen = _counting(db, monkeypatch)
+    db.get_enrichment_breakdown('spotify', 'track')
+    um.invalidate_unmatched_snapshots()
+    db.get_enrichment_breakdown('spotify', 'track')
+    assert len([sql for sql in seen if 'owned_f' in sql]) == 1
+    um.invalidate_unmatched_snapshots(universe=True)
+    db.get_enrichment_breakdown('spotify', 'track')
+    assert len([sql for sql in seen if 'owned_f' in sql]) == 2
+
+
+def test_a_reset_shows_up_at_once(db):
+    assert db.get_enrichment_breakdown('spotify', 'artist')['not_found'] == 1
+    db.reset_enrichment('spotify', 'artist', 'item', entity_id=2)
+    assert db.get_enrichment_breakdown('spotify', 'artist')['not_found'] == 0
+    assert db.get_enrichment_unmatched('spotify', 'artist', status='not_found')['total'] == 0
+
+
+@pytest.mark.parametrize('status', ['unmatched', 'not_found', 'pending'])
+@pytest.mark.parametrize('query', [None, 'a', 'ZED'])
+def test_kept_pages_match_the_sql_list(db, status, query):
+    """same rows, order and total as the per-request sql it replaces"""
+    from core.enrichment import unmatched as um
+    conn = db._get_connection()
+    names = ['zed', 'Alpha', 'alpha two', 'Émile', 'beta', 'Zed Zed', 'b']
+    for n, name in enumerate(names):
+        aid = 100 + n
+        conn.execute("INSERT INTO lib2_artists (id, name) VALUES (?, ?)", (aid, name))
+        conn.execute("INSERT INTO lib2_albums (id, primary_artist_id, title) VALUES (?,?,?)",
+                     (aid, aid, name.upper()))
+        conn.execute("INSERT INTO lib2_tracks (id, album_id, title) VALUES (?,?,?)", (aid, aid, name))
+        conn.execute("INSERT INTO lib2_track_files (track_id, path) VALUES (?,?)", (aid, f"/m/{aid}.flac"))
+        if n % 2:
+            conn.execute("INSERT INTO lib2_provider_attempts(entity_type,entity_id,service,status) "
+                         "VALUES('track',?,'spotify','not_found')", (aid,))
+    conn.commit()
+    for entity in ('artist', 'album', 'track'):
+        for offset in (0, 2):
+            sql, params = um.build_unmatched_query('spotify', entity, status, query, 3, offset)
+            want = [dict(r) for r in conn.execute(sql, params)]
+            csql, cparams = um.build_count_query('spotify', entity, status, query)
+            total = conn.execute(csql, cparams).fetchone()[0]
+            got = db.get_enrichment_unmatched('spotify', entity, status, query, 3, offset)
+            assert got == {'total': total, 'items': want}, (entity, offset)
+    conn.close()
+
+
+def test_the_track_credit_gate_is_listed_once_not_per_track(db):
+    from core.enrichment.unmatched import build_snapshot_query
+    sql, params = build_snapshot_query('spotify', 'track')
+    conn = db._get_connection()
+    plan = [r[3] for r in conn.execute('EXPLAIN QUERY PLAN ' + sql, params)]
+    conn.close()
+    assert any(step.startswith('LIST SUBQUERY') for step in plan), plan

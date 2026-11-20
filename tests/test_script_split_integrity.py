@@ -37,7 +37,8 @@ SPLIT_MODULES = [
     "core.js",
     "shared-helpers.js",
     "media-player.js",
-    "settings.js",
+    # settings.js is GONE too: the Settings page's shell is React
+    # (src/features/settings/shell.ts, SETTINGS_PORT.md step V4b)
     "sync-spotify.js",
     "downloads.js",
     "wishlist-tools.js",
@@ -76,7 +77,6 @@ def _shell_window_exports() -> set[str]:
 # regressions from the split — they should be deduplicated in a follow-up.
 KNOWN_CROSS_FILE_DUPES = {
     "escapeHtml",        # downloads.js, shared-helpers.js
-    "_escAttr",          # downloads.js, stats-automations.js
     "_formatDuration",   # stats-automations.js, wishlist-tools.js
                          # (pages-extra.js declared a THIRD, millisecond-based
                          #  copy that loaded last and shadowed both; it went
@@ -89,6 +89,17 @@ KNOWN_CROSS_FILE_DUPES = {
 #     — downloads.js declared all three AND so did wishlist-tools.js, which
 #       loads second, so the downloads.js copies had never run. Deleted.
 #   loadDashboardData — search.js's copy went with the file.
+#   formatDuration — the sync-spotify.js / sync-services.js copies went with
+#     upstream's retired legacy sync-page scripts (3.6.0).
+# Resolved by the frontend audit (FE-07):
+#   _escAttr — downloads.js declared a JS-STRING escaper and stats-automations.js
+#     an HTML-ENTITY one under the same global name; stats-automations.js loads
+#     second, so its version won for both files and the onclick builders got
+#     `&#39;` where they needed `\'`. The attribute parser decoded it back into
+#     a bare apostrophe, which closed the JS string literal and threw — killing
+#     the whole handler ("Road trip-The Rolfe's" delete button). The downloads.js
+#     copy is gone; `_escAttr` and `_escJs` both live in stats-automations.js and
+#     each call site picks the one its context needs.
 
 # Pre-existing same-file duplicates (two filter UIs reuse the same names).
 # (the wishlist-tools double-pasted filter block was removed — c5a8bf241 —
@@ -275,8 +286,11 @@ class TestOnclickCoverage:
 
     def test_onclick_count_sanity(self):
         """Sanity check: there should be a substantial number of onclick handlers."""
-        assert len(self.onclick_fns) > 50, (
-            f"Only found {len(self.onclick_fns)} onclick handlers — expected 100+"
+        # fewer as the Settings page moves to React (SETTINGS_PORT.md: 44
+        # after the music side, step 10d); a parse that found nothing would be
+        # well under this
+        assert len(self.onclick_fns) > 30, (
+            f"Only found {len(self.onclick_fns)} onclick handlers — the parse is wrong"
         )
 
 
@@ -342,5 +356,7 @@ class TestModuleSizes:
         total = 0
         for module in SPLIT_MODULES:
             total += _read(_STATIC / module).count("\n") + 1
-        # The original was ~78K lines; allow 60K-100K for flexibility
-        assert 50000 < total < 120000, f"Total lines: {total}"
+        # The original was ~78K lines; the files keep shrinking as pages move
+        # to React (settings.js went with SETTINGS_PORT.md step V4b, ~49.6K
+        # after it). The floor only catches a read that found nothing
+        assert 30000 < total < 120000, f"Total lines: {total}"

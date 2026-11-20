@@ -28,6 +28,17 @@ from database.music_database import get_database
 logger = logging.getLogger(__name__)
 
 
+def _browser_image_url(value) -> str:
+    """a stored album image as the browser can load it"""
+    if not value:
+        return ''
+    try:
+        from core.metadata.artwork import normalize_image_url
+        return normalize_image_url(value) or ''
+    except Exception:  # noqa: BLE001
+        return str(value)
+
+
 def _album_data_from_source(full: dict, album_id: str, fallback_name: str) -> dict:
     """Build the redownload `album_data` from a primary-source get_album result (#915).
 
@@ -105,16 +116,38 @@ def redownload_start(track_id):
             return jsonify({"success": False, "error": "candidate with username and filename required"}), 400
 
         # Get current track info for old file path
+        # the copy in the library being worked in: the primary flag spans
+        # every library, so unscoped this replaced another library's file
+        # (review 5 W2-WB-1)
+        from core.library2.sql_util import owner_clause
         database = get_database()
         conn = database._get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT file_path FROM tracks WHERE id = ?", (track_id,))
+        cursor.execute(
+            "SELECT path AS file_path, owner_profile_id FROM lib2_track_files WHERE track_id=? "
+            f"AND COALESCE(file_state,'active')='active'{owner_clause(column='owner_profile_id')} "
+            "ORDER BY is_primary DESC, id LIMIT 1", (track_id,))
         row = cursor.fetchone()
         conn.close()
 
+        # the new file lands in the library the old one is in, whoever pressed
+        # the button. without a stamp the worker (no request) filed it in the
+        # shared library while the old file in the profile's was deleted
+        from core.library_scope import BATCH_OWNER_KEY, owner_for_new_file
+        from core.profile_context import get_current_profile_id
+        requester = get_current_profile_id()
+        try:
+            library_owner = row['owner_profile_id'] if row is not None else owner_for_new_file(requester)
+        except (KeyError, IndexError):
+            library_owner = owner_for_new_file(requester)
+
         old_file_path = None
+        old_stored_path = None
         if row and row['file_path'] and delete_old:
             old_file_path = _resolve_library_file_path(row['file_path'])
+            # the row's own form (a media server's view on a mapped install):
+            # what the catalogue retires it by
+            old_stored_path = row['file_path']
 
         task_id = f"redownload_{track_id}_{int(time.time())}"
         batch_id = f"redownload_batch_{track_id}"
@@ -200,6 +233,8 @@ def redownload_start(track_id):
             # #1810: tells the library writer which row this file replaces,
             # so a new filename repoints that row instead of adding a second
             '_redownload_library_track_id': track_id,
+            # and the Library v2 autolink files it on that exact catalogue track
+            'lib2_entity': {'track_id': track_id},
         }
 
         # Build explicit context if we have full album data
@@ -224,6 +259,8 @@ def redownload_start(track_id):
                 'permanently_failed_tracks': [],
                 'force_download': True,
                 'auto_initiated': False,
+                'profile_id': requester,
+                BATCH_OWNER_KEY: library_owner,
             }
 
             download_tasks[task_id] = {
@@ -246,6 +283,7 @@ def redownload_start(track_id):
                 '_redownload_context': {
                     'library_track_id': track_id,
                     'old_file_path': old_file_path,
+                    'old_stored_path': old_stored_path,
                     'delete_old_file': delete_old,
                 },
             }
@@ -305,3 +343,66 @@ def redownload_start(track_id):
     except Exception as e:
         logger.error(f"Error starting redownload: {e}", exc_info=True)
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+def search_metadata(track_id) -> dict:
+    """The redownload modal's first step: the catalogue's idea of the track and
+    what each metadata source offers for it. Tools findings, Operations and
+    the album upgrade open this modal, so it must answer for Library v2 ids."""
+    import os
+    import re
+
+    from core.library2.provider_ids import parse_external_ids
+    from core.metadata.multi_source_search import TrackQuery, search_all_sources
+
+    conn = get_database()._get_connection()
+    try:
+        row = conn.execute("""
+            SELECT t.id, t.title, t.duration, t.spotify_id, t.external_ids,
+                   al.title AS album_title, al.image_url AS thumb_url,
+                   COALESCE((SELECT ar2.name FROM lib2_track_artists ta
+                               JOIN lib2_artists ar2 ON ar2.id = ta.artist_id
+                              WHERE ta.track_id = t.id
+                              ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END, ta.position
+                              LIMIT 1), ar.name) AS artist_name,
+                   f.path AS file_path, f.bitrate
+              FROM lib2_tracks t
+              JOIN lib2_albums al ON al.id = t.album_id
+              LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+              LEFT JOIN lib2_track_files f ON f.track_id = t.id AND f.is_primary = 1
+                   AND COALESCE(f.file_state, 'active') <> 'deleted'
+             WHERE t.id = ?""", (int(track_id),)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        raise LookupError('Track not found')
+
+    title, artist = row['title'] or '', row['artist_name'] or ''
+    clean_title = re.sub(r'\s*[\(\[](single version|album version|remaster|deluxe|bonus|explicit|clean|radio edit)[\)\]]',
+                         '', title, flags=re.IGNORECASE).strip()
+    deezer_id = parse_external_ids(row['external_ids']).get('deezer')
+    ext = os.path.splitext(row['file_path'] or '')[1].lstrip('.').upper()
+    sources = [('spotify', spotify_client)] if spotify_client and spotify_client.is_authenticated() else []
+    for name, getter in (('itunes', _get_itunes_client), ('deezer', _get_deezer_client)):
+        try:
+            sources.append((name, getter()))
+        except Exception as e:  # noqa: BLE001 - an unavailable source is skipped
+            logger.debug("%s client not available for redownload search: %s", name, e)
+    result = search_all_sources(
+        TrackQuery(title=title, artist=artist, album=row['album_title'] or '',
+                   duration_ms=row['duration'] or 0, spotify_track_id=row['spotify_id'],
+                   deezer_id=deezer_id),
+        sources, clean_title=clean_title)
+    return {
+        'current_track': {
+            'id': row['id'], 'title': title, 'artist': artist, 'album': row['album_title'],
+            'duration_ms': row['duration'] or 0, 'file_path': row['file_path'] or '',
+            'format': ext if ext in ('FLAC', 'MP3', 'OPUS', 'OGG', 'M4A', 'WAV') else '',
+            'bitrate': row['bitrate'] or 0, 'spotify_track_id': row['spotify_id'],
+            # G10-6: an album carried over from 3.6.1 keeps plex/jellyfin's
+            # relative path, a broken image in the modal; 3.6.1 resolved it
+            'deezer_id': deezer_id, 'thumb_url': _browser_image_url(row['thumb_url']),
+        },
+        'metadata_results': result.metadata_results,
+        'best_match': result.best_match,
+    }

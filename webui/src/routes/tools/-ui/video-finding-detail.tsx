@@ -360,16 +360,39 @@ function WatchedDetail({ d }: { d: Details }) {
           {d.year ? ` (${d.year})` : ''}
         </div>
         <div className="vrf-chips">
-          <span className={`vrf-chip${d.watched ? ' vrf-chip--got' : ''}`}>
-            {d.watched
-              ? `✓ watched ${d.play_count > 1 ? `${d.play_count}×` : 'once'}`
-              : 'never watched'}
-          </span>
+          {Array.isArray(d.viewers) ? null : (
+            <span className={`vrf-chip${d.watched ? ' vrf-chip--got' : ''}`}>
+              {d.watched
+                ? `✓ watched ${d.play_count > 1 ? `${d.play_count}×` : 'once'}`
+                : 'never watched'}
+            </span>
+          )}
           {d.last_viewed_at ? (
             <span className="vrf-chip">last: {String(d.last_viewed_at).slice(0, 10)}</span>
           ) : null}
           <span className="vrf-chip">{gb(d.size_bytes)}</span>
         </div>
+        {Array.isArray(d.viewers) ? (
+          <div className="vrf-chips">
+            {d.viewers.map((v: Details, i: number) => (
+              <span
+                key={i}
+                className={`vrf-chip${v.counted && v.watched ? ' vrf-chip--got' : ''}`}
+                title={
+                  v.counted
+                    ? undefined
+                    : `Not counted: nothing watched in the last ${d.active_days ?? 90} days`
+                }
+              >
+                {v.counted
+                  ? v.watched
+                    ? `✓ ${v.name}${v.last_viewed_at ? ` · ${String(v.last_viewed_at).slice(0, 10)}` : ''}`
+                    : `${v.name} · not watched`
+                  : `${v.name} · not counted${v.last_active ? ` (last active ${String(v.last_active).slice(0, 10)})` : ''}`}
+              </span>
+            ))}
+          </div>
+        ) : null}
         <p className="vrf-show-overview">
           Approving moves the file into the recycle bin (Settings → Library Organization sets where
           and for how long). Nothing is erased outright. The weekly deep scan tidies the server view
@@ -378,6 +401,83 @@ function WatchedDetail({ d }: { d: Details }) {
         {d.relative_path ? <p className="vrf-show-overview">{d.relative_path}</p> : null}
         <div className="vrf-actions">
           <ViewButton kind="movie" id={d.movie_id} label="View movie" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Shelf Life's signals, in the order the score weighs them. */
+const SHELF_LIFE_SIGNALS: [string, string][] = [
+  ['watch', 'Watching'],
+  ['replaceability', 'Hard to replace'],
+  ['cultural', 'Cultural value'],
+  ['size', 'Size for its runtime'],
+  ['requests', 'Requests'],
+];
+
+/** Same reading as the score: red argues for cutting, green for keeping. A
+ * signal with no data is counted as neutral, so it stays uncoloured. */
+export function shelfLifeSignalTone(value: unknown): '' | 'low' | 'mid' | 'high' {
+  if (value == null || value === '') return '';
+  const v = Math.round(Number(value));
+  if (!Number.isFinite(v)) return '';
+  if (v < 34) return 'low';
+  return v < 67 ? 'mid' : 'high';
+}
+
+function ShelfLifeDetail({ d }: { d: Details }) {
+  const isShow = d.kind === 'show';
+  const signals: Details = d.signals || {};
+  const reasons: Details[] = Array.isArray(d.reasons) ? d.reasons : [];
+  return (
+    <div className="vrf-show">
+      <Poster
+        src={d.item_id != null ? `/api/video/poster/${isShow ? 'show' : 'movie'}/${d.item_id}` : ''}
+        className="vrf-poster"
+        fallback="🗃️"
+      />
+      <div className="vrf-show-info">
+        <div className="vrf-show-title">
+          {d.title || '?'}
+          {d.year ? ` (${d.year})` : ''}
+        </div>
+        <div className="vrf-chips">
+          <span className="vrf-chip">Shelf Life {d.score ?? '?'}</span>
+          <span className="vrf-chip">{gb(d.size_bytes)}</span>
+        </div>
+        {reasons.length ? (
+          <ul className="vrf-show-overview">
+            {reasons.map((r: Details, i: number) => (
+              <li key={i}>{r.text}</li>
+            ))}
+          </ul>
+        ) : null}
+        <div className="vrf-chips">
+          {SHELF_LIFE_SIGNALS.map(([key, label]) => {
+            const tone = shelfLifeSignalTone(signals[key]);
+            return (
+              <span
+                key={key}
+                className={`vrf-chip${tone ? ` vrf-chip--sl-${tone}` : ''}`}
+                title={signals[key] == null ? 'No data, counted as neutral (50)' : undefined}
+              >
+                {label}: {signals[key] == null ? 'no data' : Math.round(Number(signals[key]))}
+              </span>
+            );
+          })}
+        </div>
+        <p className="vrf-show-overview">
+          Approving deletes the whole {isShow ? 'show' : 'movie'} the way Delete Title does: no
+          profile gets it again, the folder goes to the recycle bin, and it is hidden from Discover.
+          You type the title to confirm.
+        </p>
+        <div className="vrf-actions">
+          <ViewButton
+            kind={isShow ? 'show' : 'movie'}
+            id={d.item_id}
+            label={isShow ? 'View show' : 'View movie'}
+          />
         </div>
       </div>
     </div>
@@ -798,6 +898,7 @@ export function VideoFindingDetail({ finding, onFixAction }: VideoFindingDetailP
     body = <GhostDetail finding={finding} onFixAction={onFixAction} />;
   else if (type === 'youtube_mass_missing') body = <MassMissingDetail d={d} />;
   else if (type === 'watched_cleanup') body = <WatchedDetail d={d} />;
+  else if (type === 'shelf_life') body = <ShelfLifeDetail d={d} />;
   else if (type === 'naming_mismatch') body = <NamingDetail d={d} />;
   else if (type === 'missing_subtitles') body = <SubtitlesDetail d={d} />;
   else body = <RawDetails d={d} />;

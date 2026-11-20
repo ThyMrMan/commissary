@@ -1,5 +1,7 @@
 import { useState } from 'react';
 
+import { usePermNotOff } from '@/platform/shell/my-permissions';
+
 import type { ArtistPool, RelatedArtist } from '../-discover.your-artists-actions';
 import type { SourceLogos } from './your-artists-shelf';
 
@@ -50,7 +52,7 @@ export interface ArtistInfoModalProps {
   info: ArtistInfo | null;
   phase: 'loading' | 'error' | 'ready';
   logos: SourceLogos;
-  buildDetailPath: (id: string, source: string | null) => string;
+  buildDetailPath: (id: string, source: string | null, name?: string | null) => string;
   onClose: () => void;
   /** The caller owns the request, the toasts, and the pool/card sync. */
   onToggleWatchlist: () => void;
@@ -159,7 +161,13 @@ export function ArtistInfoModal({
               </button>
               <a
                 className="btn btn--sm btn--secondary ya-header-btn ya-viewall-btn"
-                href={buildDetailPath(pool.active_source_id ?? '', pool.active_source || null)}
+                // the name lets the library find an artist whose provider id
+                // it doesn't hold, so a library artist opens in the library
+                href={buildDetailPath(
+                  pool.active_source_id ?? '',
+                  pool.active_source || null,
+                  pool.artist_name ?? null,
+                )}
                 style={{ textDecoration: 'none', color: 'inherit' }}
                 onClick={onViewDiscography}
               >
@@ -292,6 +300,9 @@ function WatchToggleButton({
   onToggleWatchlist: () => void;
 }) {
   const [clicked, setClicked] = useState(false);
+  // no watchlist part, no watch button (#2209)
+  const mayWatch = usePermNotOff('music.watchlist');
+  if (!mayWatch) return null;
   return (
     <button
       type="button"

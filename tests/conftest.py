@@ -28,6 +28,10 @@ import tempfile as _tempfile
 import atexit as _atexit
 import shutil as _shutil
 
+# the mirrored list reuses its status counts for a few seconds in production;
+# a test writes then reads straight away (api/mirrored_playlists.py)
+_os.environ.setdefault('SOULSYNC_STATUS_COUNTS_TTL', '0')
+
 # Under pytest-xdist, workers inherit the controller's environment, so the
 # guards below would see the controller's temp paths and skip: every worker
 # then shares ONE set of temp DBs. That collides at runtime, and a worker
@@ -43,6 +47,8 @@ if _XDIST_WORKER and 'soulsync-testdb-' in _os.environ.get('DATABASE_PATH', ''):
         _os.environ.pop(_var, None)
 if _XDIST_WORKER and 'soulsync-test-imagecache-' in _os.environ.get('SOULSYNC_IMAGE_CACHE_DIR', ''):
     _os.environ.pop('SOULSYNC_IMAGE_CACHE_DIR', None)
+if _XDIST_WORKER and 'soulsync-test-saimages-' in _os.environ.get('SOULSYNC_SA_IMAGE_DIR', ''):
+    _os.environ.pop('SOULSYNC_SA_IMAGE_DIR', None)
 if _XDIST_WORKER and 'soulsync-test-audiobooks-' in _os.environ.get('AUDIOBOOK_DATABASE_PATH', ''):
     _os.environ.pop('AUDIOBOOK_DATABASE_PATH', None)
 for _var, _mark in (('SOULSYNC_PLAYLIST_COVER_DIR', 'soulsync-test-covers-'),
@@ -77,6 +83,22 @@ if not _os.environ.get('SOULSYNC_IMAGE_CACHE_DIR'):
     _os.environ['SOULSYNC_IMAGE_CACHE_DIR'] = _TEST_IMAGE_CACHE_DIR
     _atexit.register(lambda: _shutil.rmtree(_TEST_IMAGE_CACHE_DIR, ignore_errors=True))
 
+# the server activity poster cache (core/server_activity/images.py) the same
+# way: without this a test reaching the proxy would write into storage/.
+if not _os.environ.get('SOULSYNC_SA_IMAGE_DIR'):
+    _TEST_SA_IMAGE_DIR = _tempfile.mkdtemp(prefix='soulsync-test-saimages-')
+    _os.environ['SOULSYNC_SA_IMAGE_DIR'] = _TEST_SA_IMAGE_DIR
+    _atexit.register(lambda: _shutil.rmtree(_TEST_SA_IMAGE_DIR, ignore_errors=True))
+
+# the logs too: web_server and acoustid_client log to logging.path, which the
+# test config leaves at the default logs/app.log in the checkout. every run
+# wrote its errors into the developer's live log and, from WSL, rotated the
+# file the windows server held open. Same pattern as the image cache.
+if not _os.environ.get('SOULSYNC_LOG_FILE'):
+    _TEST_LOG_DIR = _tempfile.mkdtemp(prefix='soulsync-test-logs-')
+    _os.environ['SOULSYNC_LOG_FILE'] = _os.path.join(_TEST_LOG_DIR, 'app.log')
+    _atexit.register(lambda: _shutil.rmtree(_TEST_LOG_DIR, ignore_errors=True))
+
 # the audiobook db had the same gap: its own path (AUDIOBOOK_DATABASE_PATH,
 # default database/audiobooks.db) was never redirected, so any test importing
 # web_server started the audiobook download monitor against the real file
@@ -107,11 +129,21 @@ _cover_seq = iter(range(1, 10 ** 9))
 import copy
 import os as _os
 import pytest
+import sys
 import tempfile as _tempfile2
 import threading
 import time
 from flask import Flask, jsonify
 from flask_socketio import SocketIO, join_room, leave_room
+
+# the real settings module, on the isolated test config set above, before any
+# test module is collected. ~25 test files install a stub ``core.settings``
+# (every key answers its default) when the real one isn't imported yet, and
+# collection runs their module code for the whole run: one stub swapped the
+# settings out under every later test in that process (a reorganize run of
+# tests/library2 named every file with the default template), so those
+# passed alone and failed together.
+import core.settings  # noqa: E402,F401
 
 
 def symlinks_supported() -> bool:
@@ -605,7 +637,7 @@ def add_activity_item(icon, title, subtitle, time_ago="Now", show_toast=True):
 # Fixtures
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def test_app():
     """Create a minimal Flask + SocketIO app that mirrors Phase 1+2 endpoints."""
     global _test_socketio
@@ -1077,6 +1109,179 @@ def shared_state():
     }
 
 
+@pytest.fixture(autouse=True)
+def _quality_profile_refresh_inline(monkeypatch):
+    """the Quality page's wishlist refresh runs on a thread in the app; in
+    tests it runs inline, so nothing touches a test's db after it ends."""
+    from core.library2 import wishlist_mirror
+    monkeypatch.setattr(wishlist_mirror, "RUN_INLINE", True)
+
+
+@pytest.fixture(autouse=True)
+def _no_cover_art_archive_probe(monkeypatch):
+    """the artwork lookup asks the Cover Art Archive whether a release has a
+    front cover (P2C-2). no test asks the real archive; the ones about that
+    check set their own answer"""
+    from core.library2 import provider_adapters
+    monkeypatch.setattr(provider_adapters, "_caa_has_front", lambda scope, mbid: True)
+
+
+@pytest.fixture(autouse=True)
+def _no_match_credit_fetch(monkeypatch):
+    """a manual match fetches the new release's credits on a thread. in tests
+    no provider is asked; the tests for that turn it back on."""
+    from core.library2 import provider_credits
+    monkeypatch.setattr(provider_credits, "ONLINE_REFRESH", False)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_provider_cache_and_lastfm_key(monkeypatch):
+    """the last.fm / listenbrainz / deezer answer cache and the remembered
+    last.fm key refusal live per process. each test starts with neither, and
+    nothing a test caches reaches the database."""
+    from core import lastfm_client, lastfm_fallback, listenbrainz_public, provider_cache
+    provider_cache.use_store(provider_cache.MemoryStore())
+    lastfm_client.reset_key_state()
+    # the free fallbacks ask deezer / listenbrainz / musicbrainz. no test asks
+    # the real ones; the fallback tests set their own answers
+    monkeypatch.setattr(lastfm_fallback, "_deezer_get", lambda *a, **k: None)
+    monkeypatch.setattr(listenbrainz_public, "_get", lambda *a, **k: None)
+    monkeypatch.setattr(listenbrainz_public, "artist_mbid", lambda *a, **k: None)
+    yield
+    lastfm_client.reset_key_state()
+    provider_cache.use_store(provider_cache.MemoryStore())
+
+
+@pytest.fixture(autouse=True)
+def _fresh_reconciler_name_misses():
+    """the reconciler believes a file-name miss for a few minutes; each test
+    starts without one from another test"""
+    from core.acquisition import reconciler
+    reconciler._NAME_MISSES.clear()
+
+
+@pytest.fixture(autouse=True)
+def _no_media_server_delete_roots(monkeypatch):
+    """a delete preview counts the media server's music folders as roots. in
+    tests no server is asked; the tests for that rule turn it back on."""
+    from core.library2 import file_delete
+    monkeypatch.setattr(file_delete, "MEDIA_SERVER_FOLDERS", False)
+    file_delete._server_folders_cache.update(key=None, at=0.0, folders=[])
+
+
+@pytest.fixture(autouse=True)
+def _fresh_fold_index():
+    """the folded-text index (database/fold_index) lives per database path for
+    the process. tests reseed the same path, so each one starts with it empty."""
+    from database import fold_index
+    fold_index.clear()
+    # a test writes then reads straight away; ask the table every time
+    saved, fold_index.CHECK_SECONDS = fold_index.CHECK_SECONDS, 0.0
+    # enrichment progress is a shared snapshot in production; exact here
+    from core.library2 import worker_queue
+    saved_ttl, worker_queue.PROGRESS_SNAPSHOT_TTL = worker_queue.PROGRESS_SNAPSHOT_TTL, 0.0
+    saved_pending_ttl, worker_queue.PENDING_COUNT_TTL = worker_queue.PENDING_COUNT_TTL, 0.0
+    # the mirror outbox's background drainer would outlive the test's database
+    from core.library2 import mirror_outbox as _mirror_outbox
+    saved_bg_drain, _mirror_outbox.BACKGROUND_DRAIN = _mirror_outbox.BACKGROUND_DRAIN, False
+    # the metasync depot's background network asker: same reason
+    from core import metasync_depot as _metasync_depot
+    saved_bg_ask, _metasync_depot.BACKGROUND_ASK = _metasync_depot.BACKGROUND_ASK, False
+    worker_queue._reset_progress_snapshots()
+    worker_queue._NEW_CURSOR.clear()
+    worker_queue._NEW_IDLE.clear()
+    # library membership ids are kept per file between requests; test files are reused
+    from core.library2 import member_version
+    member_version.clear()
+    # the owned genre shares are cached per database for 10 minutes; exact here
+    from database.music_database import MusicDatabase
+    MusicDatabase._owned_genres_cache.clear()
+    saved_genres_ttl, MusicDatabase._OWNED_GENRES_TTL = MusicDatabase._OWNED_GENRES_TTL, 0.0
+    # the quarantine list's artist name maps are kept per database too
+    MusicDatabase._quarantine_name_maps.clear()
+    saved_quarantine_ttl, MusicDatabase._QUARANTINE_NAME_MAPS_TTL = MusicDatabase._QUARANTINE_NAME_MAPS_TTL, 0.0
+    # which profiles keep a library of their own is cached per process. a test
+    # that set some up left it filled for the next test on the same xdist
+    # worker, which then filtered by library and read tables it doesn't have
+    from core.library_scope import invalidate_library_scope_cache
+    invalidate_library_scope_cache()
+    # cache hits write their access stats on a timer; in tests, right away
+    from core.metadata import cache as metadata_cache
+    saved_touch, metadata_cache._TOUCH_FLUSH_SECONDS = metadata_cache._TOUCH_FLUSH_SECONDS, 0.0
+    # naming never asks musicbrainz in tests; the tests of that ask turn it on
+    from core.imports import artist_facts as _artist_facts
+    saved_online, _artist_facts.ONLINE_LOOKUP = _artist_facts.ONLINE_LOOKUP, False
+    _artist_facts.clear_cache()
+    # the library's name for a download's artist (#2165) is cached for 30s;
+    # one test's library must not name the next test's download
+    from core.imports import library_names as _library_names
+    _library_names.clear_cache()
+    yield
+    fold_index.CHECK_SECONDS = saved
+    worker_queue.PROGRESS_SNAPSHOT_TTL = saved_ttl
+    MusicDatabase._QUARANTINE_NAME_MAPS_TTL = saved_quarantine_ttl
+    worker_queue.PENDING_COUNT_TTL = saved_pending_ttl
+    _mirror_outbox.BACKGROUND_DRAIN = saved_bg_drain
+    _metasync_depot.BACKGROUND_ASK = saved_bg_ask
+    MusicDatabase._OWNED_GENRES_TTL = saved_genres_ttl
+    metadata_cache._TOUCH_FLUSH_SECONDS = saved_touch
+    _artist_facts.ONLINE_LOOKUP = saved_online
+
+
+def _open_databases():
+    """the process-wide music database (the one get_database() answers with
+    DATABASE_PATH), if this process already opened it. a test's private
+    database can't carry state into the next test, and every temp file the
+    session made stays in the instance map, so only this one is checked.
+    never opens one: a test that didn't touch it leaves nothing to undo."""
+    mod = sys.modules.get("database.music_database")
+    if mod is None:
+        return {}
+    shared = _os.environ.get("DATABASE_PATH", "database/music_library.db")
+    for (_thread, path), db in list(getattr(mod, "_database_instances", {}).items()):
+        if path == shared:
+            return {path: db}
+    return {}
+
+
+def _own_library_profiles(db):
+    try:
+        with db._get_connection() as conn:
+            return {row[0] for row in conn.execute(
+                "SELECT id FROM profiles WHERE library_mode = 'own'")}
+    except Exception:  # noqa: BLE001 - no profiles table in this database
+        return set()
+
+
+@pytest.fixture(autouse=True)
+def _own_libraries_end_with_the_test():
+    """a profile a test switched to its own library goes back to shared after
+    it. the profiles live in the process's test database, so one test's own
+    library made every later test on that xdist worker read through library
+    scopes (ci 42718976935: the reorganize job asked a None db for the
+    library's owners, the findings inbox joined lib2_library_roots). profiles
+    that were own before the test (a module fixture's) are left alone."""
+    before = {path: _own_library_profiles(db) for path, db in _open_databases().items()}
+    yield
+    changed = False
+    for path, db in _open_databases().items():
+        added = _own_library_profiles(db) - before.get(path, set())
+        if not added:
+            continue
+        marks = ",".join("?" * len(added))
+        try:
+            with db._get_connection() as conn:
+                conn.execute(f"UPDATE profiles SET library_mode = 'shared', library_root = NULL "
+                             f"WHERE id IN ({marks})", tuple(added))
+                conn.commit()
+            changed = True
+        except Exception:  # noqa: BLE001, S110 - a closed or read-only test database
+            pass
+    if changed:
+        from core.library_scope import invalidate_library_scope_cache
+        invalidate_library_scope_cache()
+
+
 @pytest.fixture(autouse=True, scope='session')
 def _inert_youtube_date_enricher():
     """Neuter the YouTube date-enricher SINGLETON for the whole suite.
@@ -1174,6 +1379,16 @@ def _soulseek_ownership_in_memory():
     SoulseekClient.PERSIST_OWNERSHIP = False
     yield
     SoulseekClient.PERSIST_OWNERSHIP = True
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _songs_search_index_in_the_foreground():
+    """no background songs-index thread in the suite: one outliving its test's
+    database would write into the next. tests build and flush it directly."""
+    from core.library2 import song_search
+    song_search.BACKGROUND = False
+    yield
+    song_search.BACKGROUND = True
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1644,3 +1859,14 @@ def _isolated_cover_dir(monkeypatch):
     nothing."""
     monkeypatch.setenv('SOULSYNC_PLAYLIST_COVER_DIR',
                        _os.path.join(_COVER_ROOT, str(next(_cover_seq))))
+
+
+@pytest.fixture(autouse=True)
+def _fresh_upgradable_counts():
+    """the library's "could be better" counts are cached per process and keyed
+    by db file, and the test clients share one session db: one test's counts
+    would answer the next test's filter."""
+    from core.library2.artist_reader import forget_upgradable_counts
+    forget_upgradable_counts()
+    yield
+    forget_upgradable_counts()

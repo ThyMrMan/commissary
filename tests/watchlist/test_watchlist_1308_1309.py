@@ -28,10 +28,21 @@ def db(tmp_path):
 
 
 def _library_artist(db, lib_id, **ids):
+    # a Library v2 artist: this branch's library rows (spotify / musicbrainz
+    # have columns, every other provider id lives in external_ids)
+    import json
+    own = {"spotify_artist_id": "spotify_id", "musicbrainz_id": "musicbrainz_id"}
+    cols = {"id": lib_id, "name": "Destiny's Child"}
+    external = {}
+    for key, value in ids.items():
+        if key in own:
+            cols[own[key]] = value
+        else:
+            external[key.replace("_artist_id", "").replace("_id", "")] = value
+    cols["external_ids"] = json.dumps(external)
     conn = db._get_connection()
-    cols = ["id", "name"] + list(ids)
-    conn.execute(f"INSERT INTO artists ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-                 [lib_id, "Destiny's Child", *ids.values()])
+    conn.execute(f"INSERT INTO lib2_artists ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
+                 list(cols.values()))
     conn.commit()
     conn.close()
 
@@ -68,6 +79,21 @@ def test_a_raw_provider_id_wins_over_a_library_row_with_the_same_number(db):
     _watch(db, deezer_artist_id="999", spotify_artist_id="sp999")
     assert db.remove_artist_from_watchlist("3456", profile_id=1)
     assert db.is_artist_in_watchlist("999", profile_id=1)          # the other one is untouched
+
+
+def test_a_provider_page_id_is_never_read_as_a_library_row(db):
+    """third #1062 review G02-4: an unwatched deezer artist 13 whose number is
+    also the library row of an artist you watch. the page says the id is
+    deezer's; reading it as row 13 said "Watching", and the remove deleted
+    the other artist's watch"""
+    _library_artist(db, 13, spotify_artist_id="sp-watched")
+    _watch(db, spotify_artist_id="sp-watched")
+    assert not db.is_artist_in_watchlist("13", profile_id=1, source="deezer")
+    assert not db.remove_artist_from_watchlist("13", profile_id=1, source="deezer")
+    assert db.is_artist_in_watchlist("sp-watched", profile_id=1)
+    # a library page still finds it by its row id, bare or prefixed
+    assert db.is_artist_in_watchlist("13", profile_id=1)
+    assert db.is_artist_in_watchlist("lib2:13", profile_id=1, source="library")
 
 
 # ── #1309 ────────────────────────────────────────────────────────────────────

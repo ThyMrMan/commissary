@@ -166,6 +166,7 @@ CREATE TABLE IF NOT EXISTS seasons (
     overview      TEXT,
     poster_url    TEXT,
     monitored     INTEGER NOT NULL DEFAULT 1,
+    monitor_locked INTEGER NOT NULL DEFAULT 0,  -- 1 = set by the user's season toggle
     UNIQUE (show_id, season_number)
 );
 CREATE INDEX IF NOT EXISTS idx_seasons_show ON seasons(show_id);
@@ -195,6 +196,12 @@ CREATE TABLE IF NOT EXISTS episodes (
 CREATE INDEX IF NOT EXISTS idx_episodes_show     ON episodes(show_id);
 CREATE INDEX IF NOT EXISTS idx_episodes_air      ON episodes(air_date);
 CREATE INDEX IF NOT EXISTS idx_episodes_wanted   ON episodes(monitored, has_file);
+-- what the library manager sums a show up from (v72): how many episodes it
+-- has, owns and is missing, and which episode each file is. with every column
+-- in the index neither one ever
+-- touches the episode rows themselves, which carry each episode's overview:
+-- reading 224k of them to count took 5 seconds, the index takes half of one.
+CREATE INDEX IF NOT EXISTS idx_episodes_summary ON episodes(show_id, season_number, episode_number, has_file, monitored, air_date);
 
 -- ── Genres (normalised many-to-many; no comma-blob) ─────────────────────────
 CREATE TABLE IF NOT EXISTS genres (
@@ -414,12 +421,86 @@ CREATE TABLE IF NOT EXISTS media_files (
     audio_channels INTEGER,          -- 2 | 6 (5.1) | 8 (7.1)
     dynamic_range  TEXT,             -- HDR10 | HDR10+ | DV | HLG (NULL = SDR)
     atmos          INTEGER,          -- Dolby Atmos audio present
+    audio_languages    TEXT,         -- 'ja,en' audio track languages (NULL = not probed, '' = none tagged)
+    subtitle_languages TEXT,         -- embedded subtitle tracks, same shape
     added_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CHECK ((movie_id IS NOT NULL) + (episode_id IS NOT NULL) + (video_id IS NOT NULL) = 1)
 );
 CREATE INDEX IF NOT EXISTS idx_media_files_movie   ON media_files(movie_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_episode ON media_files(episode_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_video   ON media_files(video_id);
+CREATE INDEX IF NOT EXISTS idx_media_files_size    ON media_files(size_bytes);
+
+-- What soulsync itself read off a video file with ffprobe (v60): its audio and
+-- embedded subtitle languages. Keyed by file name + size, which match the same
+-- file whatever path the media server or this machine sees it under. A server
+-- scan rewrites media_files, so this is where a probe outlives it: the scan
+-- fills the languages in from here when the server didn't send them (plex
+-- sends no stream data in a library listing).
+CREATE TABLE IF NOT EXISTS video_file_probes (
+    file_name          TEXT NOT NULL,
+    size_bytes         INTEGER NOT NULL,
+    audio_languages    TEXT NOT NULL DEFAULT '',
+    subtitle_languages TEXT NOT NULL DEFAULT '',
+    audio_channels     INTEGER,
+    probed_at          TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (file_name, size_bytes)
+);
+
+-- The anime id map (v61): Fribb's anime-lists, which pairs AniList/MAL/AniDB
+-- ids with TVDB/TMDB ids and says which season + episode offset each AniList
+-- entry covers. Refreshed weekly by the AniList worker (core/video/anime_map).
+CREATE TABLE IF NOT EXISTS anime_id_map (
+    anilist_id   INTEGER PRIMARY KEY,
+    mal_id       INTEGER,
+    anidb_id     INTEGER,
+    format       TEXT,              -- TV | MOVIE | OVA | ONA | SPECIAL | TV_SHORT | MUSIC
+    tvdb_id      INTEGER,
+    tvdb_season  INTEGER,           -- 0 = specials
+    tvdb_offset  INTEGER NOT NULL DEFAULT 0,
+    tmdb_tv      INTEGER,
+    tmdb_season  INTEGER,
+    tmdb_offset  INTEGER NOT NULL DEFAULT 0,
+    tmdb_movie   INTEGER,
+    imdb_id      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_anime_map_tvdb  ON anime_id_map(tvdb_id);
+CREATE INDEX IF NOT EXISTS idx_anime_map_tmdb  ON anime_id_map(tmdb_tv);
+CREATE INDEX IF NOT EXISTS idx_anime_map_movie ON anime_id_map(tmdb_movie);
+
+-- What AniList says about a library title (v61), one row per AniList entry:
+-- a show has one per season or cour, a movie one. TMDB/TVDB stay the identity;
+-- this is the anime layer on top (titles for release search, score, studio,
+-- the next episode's countdown).
+CREATE TABLE IF NOT EXISTS video_anime (
+    kind           TEXT NOT NULL CHECK (kind IN ('movie', 'show')),
+    item_id        INTEGER NOT NULL,
+    anilist_id     INTEGER NOT NULL,
+    mal_id         INTEGER,
+    tvdb_season    INTEGER,
+    tvdb_offset    INTEGER NOT NULL DEFAULT 0,
+    tmdb_season    INTEGER,
+    tmdb_offset    INTEGER NOT NULL DEFAULT 0,
+    format         TEXT,
+    status         TEXT,              -- FINISHED | RELEASING | NOT_YET_RELEASED | ...
+    episodes       INTEGER,
+    season_year    INTEGER,
+    score          INTEGER,           -- averageScore 1-100
+    popularity     INTEGER,
+    site_url       TEXT,
+    title_romaji   TEXT,
+    title_english  TEXT,
+    title_native   TEXT,
+    synonyms       TEXT NOT NULL DEFAULT '[]',
+    studios        TEXT NOT NULL DEFAULT '[]',
+    next_episode   INTEGER,
+    next_airing_at INTEGER,           -- epoch seconds
+    cover_url      TEXT,
+    banner_url     TEXT,
+    synced_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, item_id, anilist_id)
+);
+CREATE INDEX IF NOT EXISTS idx_video_anime_airing ON video_anime(status, synced_at);
 
 -- ── Downloads (active queue + history) ──────────────────────────────────────
 -- One target per row: a movie, a single episode, a whole season (pack), or a
@@ -497,6 +578,62 @@ CREATE TABLE IF NOT EXISTS video_watchlist (
     UNIQUE(profile_id, kind, tmdb_id)
 );
 CREATE INDEX IF NOT EXISTS idx_video_watchlist_kind ON video_watchlist(kind);
+
+-- A quality profile chosen for a title that isn't in the library yet (picked
+-- in the Get / Manual search modal). Keyed by kind + tmdb id like the title it
+-- names; the library row adopts it when the title lands, so its future
+-- upgrades keep the same profile. kind is 'movie' or 'show'.
+CREATE TABLE IF NOT EXISTS video_title_profiles (
+    kind                TEXT    NOT NULL,
+    tmdb_id             INTEGER NOT NULL,
+    quality_profile_id  INTEGER NOT NULL,
+    updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, tmdb_id)
+);
+
+-- Video libraries (#2029): named movie / TV libraries, each with its own folder,
+-- Radarr/Sonarr style. The main and 4K folders are rows too (builtin 'main' /
+-- '4k') whose folder stays in the settings keys they always used (movies_path,
+-- movies_4k_path + its switch, ...), so nothing that reads those changes. A
+-- custom library keeps its own path. options is the library's config as JSON:
+-- assignment rules, default quality profile, download and indexer choices.
+CREATE TABLE IF NOT EXISTS video_libraries (
+    id          INTEGER PRIMARY KEY,
+    kind        TEXT    NOT NULL CHECK (kind IN ('movie', 'show')),
+    name        TEXT    NOT NULL,
+    path        TEXT    NOT NULL DEFAULT '',
+    builtin     TEXT,                          -- 'main' | '4k' | NULL (custom)
+    enabled     INTEGER NOT NULL DEFAULT 1,    -- custom only; a builtin follows its settings
+    is_default  INTEGER NOT NULL DEFAULT 0,    -- new titles of this kind go here
+    position    INTEGER NOT NULL DEFAULT 0,
+    options     TEXT    NOT NULL DEFAULT '{}',
+    created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_video_libraries_builtin
+    ON video_libraries(kind, builtin) WHERE builtin IS NOT NULL;
+
+-- A library picked for a title by hand (its page, or the Get / Manual search
+-- modal). Keyed like video_title_profiles; wins over the rules and the default.
+CREATE TABLE IF NOT EXISTS video_title_libraries (
+    kind        TEXT    NOT NULL,              -- 'movie' | 'show'
+    tmdb_id     INTEGER NOT NULL,
+    library_id  INTEGER NOT NULL REFERENCES video_libraries(id) ON DELETE CASCADE,
+    updated_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, tmdb_id)
+);
+
+-- A second copy of a title wanted in another library (#2029): the same movie
+-- in Movies (1080p) and Movies 4K, Radarr's two-instance setup. The copy is
+-- hunted by its own wishlist row (video_wishlist.video_library_id) and owned
+-- only by a file in its library; this row is what keeps the two apart once
+-- the copy has landed and its wishlist row is gone. Movies only for now.
+CREATE TABLE IF NOT EXISTS video_title_copies (
+    kind        TEXT    NOT NULL,              -- 'movie'
+    tmdb_id     INTEGER NOT NULL,
+    library_id  INTEGER NOT NULL REFERENCES video_libraries(id) ON DELETE CASCADE,
+    created_at  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, tmdb_id, library_id)
+);
 
 -- WISHLIST (curated 'get this') — atomic units are MOVIES and EPISODES. Adding a
 -- whole show or a season just expands into episode rows. Upcoming (un-aired)
@@ -846,6 +983,18 @@ CREATE INDEX IF NOT EXISTS idx_vreq_profile ON video_requests(profile_id);
 CREATE INDEX IF NOT EXISTS idx_vreq_status  ON video_requests(status);
 CREATE INDEX IF NOT EXISTS idx_vreq_title   ON video_requests(kind, tmdb_id);
 
+-- every request a profile filed, kept when the request row is withdrawn or
+-- cleared from the history: the request limit counts asks from here, so
+-- deleting your own rows doesn't hand the asks back (v73)
+CREATE TABLE IF NOT EXISTS video_request_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id  INTEGER NOT NULL,
+    request_id  INTEGER UNIQUE,                  -- the video_requests row it was (gone or not)
+    kind        TEXT,                            -- movie | show | episode | youtube (v75)
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_vreq_log_profile ON video_request_log(profile_id, created_at);
+
 CREATE TABLE IF NOT EXISTS video_issues (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     profile_id     INTEGER NOT NULL DEFAULT 1,
@@ -992,6 +1141,20 @@ CREATE TABLE IF NOT EXISTS tvdb_episode_cache (
     PRIMARY KEY (tvdb_id, season_number)
 );
 
+-- the number the scene, the indexers and the subtitle sites use for an episode
+-- of a season SoulSync keeps the way the media server numbers it. Jujutsu
+-- Kaisen is one TMDB season of 59; a server that numbers its files that way
+-- keeps the one season, and S01E48 is still only ever released as S03E01
+-- (Thibs). written by the episode sync, read by search and subtitles.
+CREATE TABLE IF NOT EXISTS episode_scene_numbers (
+    show_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL,
+    episode_number INTEGER NOT NULL,
+    scene_season INTEGER NOT NULL,
+    scene_episode INTEGER NOT NULL,
+    PRIMARY KEY (show_id, season_number, episode_number)
+);
+
 -- ── series type for shows not in any library yet ──
 -- a show's series type normally comes from its library row (set by hand, or
 -- the show sits in a library marked anime). a show that is followed, wished
@@ -1018,4 +1181,88 @@ CREATE TABLE IF NOT EXISTS video_airing_offers (
     episode_number INTEGER NOT NULL,
     offered_at TEXT NOT NULL DEFAULT (datetime('now')),
     PRIMARY KEY (profile_id, tmdb_id, season_number, episode_number)
+);
+
+-- ── per-profile watch state (#1941) ──
+-- the server scan reads watch state through the server account, so the
+-- play_count / last_viewed_at / view_offset_ms columns on movies and episodes
+-- are the server owner's. a profile linked to its own media-server account
+-- keeps its own copy here, filled with that account's token, so members see
+-- their own resume points and watched marks instead of the owner's. a profile
+-- with no linked account has no rows and no watch state. server neutral: plex
+-- fills it today, jellyfin can fill it the same way.
+CREATE TABLE IF NOT EXISTS video_watch_state (
+    profile_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,              -- movie | episode
+    item_id INTEGER NOT NULL,        -- movies.id | episodes.id
+    play_count INTEGER NOT NULL DEFAULT 0,
+    last_viewed_at TEXT,
+    view_offset_ms INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (profile_id, kind, item_id)
+);
+
+-- ── file changes (the library manager's history and undo) ──
+-- one row per file a person renamed, moved, deleted or filed under another
+-- episode. enough is kept to put it back: where it was, where the recycle
+-- folder holds it, and the library row a delete dropped.
+CREATE TABLE IF NOT EXISTS video_file_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    at TEXT NOT NULL DEFAULT (datetime('now')),
+    action TEXT NOT NULL,            -- rename | move | delete | reassign
+    kind TEXT,                       -- movie | show
+    item_id INTEGER,                 -- movies.id | shows.id
+    title TEXT,
+    label TEXT,                      -- S01E02, or the file name
+    file_id INTEGER,
+    from_path TEXT,
+    to_path TEXT,
+    from_stored TEXT,                -- the server's view of from_path
+    to_stored TEXT,                  -- the server's view of where the change left it
+    trash_path TEXT,                 -- a delete: where the recycle folder holds it
+    from_episode_id INTEGER,
+    to_episode_id INTEGER,
+    snapshot TEXT,                   -- a delete: the media_files row, as json
+    batch TEXT,                      -- one bulk run, undone together
+    undone_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_vfc_title ON video_file_changes(kind, item_id, id);
+
+-- When each source was last asked about one title (v71). A title's page reads
+-- from this database, then asks the sources that have gone stale: the media
+-- server for its files and watch state, the metadata provider for what changed
+-- since it was matched, and the ratings. One row per title per source.
+CREATE TABLE IF NOT EXISTS video_title_freshness (
+    kind        TEXT NOT NULL,            -- movie | show
+    item_id     INTEGER NOT NULL,
+    source      TEXT NOT NULL,            -- server | metadata | ratings
+    checked_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (kind, item_id, source)
+);
+
+-- ── Shelf Life ──
+-- the Shelf Life maintenance job's result per title: a 0-100 score (NULL when
+-- a gate protects the title), the gate, each signal's value and the reasons in
+-- plain words. rewritten for a kind on every run; the library and detail pages
+-- only read it, they never score.
+CREATE TABLE IF NOT EXISTS video_shelf_life (
+    kind TEXT NOT NULL,              -- movie | show
+    item_id INTEGER NOT NULL,        -- movies.id | shows.id
+    score INTEGER,
+    gate TEXT,
+    signals_json TEXT NOT NULL DEFAULT '{}',
+    reasons_json TEXT NOT NULL DEFAULT '[]',
+    size_bytes INTEGER,
+    scored_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, item_id)
+);
+
+-- titles an admin marked Keep: Shelf Life never scores or flags them. keyed by
+-- tmdb id, not the row id, so a server re-key (a fresh row for the same title)
+-- doesn't drop the mark.
+CREATE TABLE IF NOT EXISTS video_shelf_life_keep (
+    kind TEXT NOT NULL,              -- movie | show
+    tmdb_id INTEGER NOT NULL,
+    set_by INTEGER,
+    set_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (kind, tmdb_id)
 );

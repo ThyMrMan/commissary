@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.imports.folder_artist import resolve_folder_artist
+from core.imports.paths import artist_folder_names
 from core.imports.paths import config_root_path, docker_resolve_path
 from core.imports.pipeline import import_rejection_reason, kept_existing_library_file
 from utils.logging_config import get_logger
@@ -29,6 +30,28 @@ logger = get_logger("auto_import")
 
 AUDIO_EXTENSIONS = {'.mp3', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wav', '.wma', '.aiff', '.aif', '.ape'}
 DISC_FOLDER_RE = re.compile(r'^(?:disc|cd|disk)\s*(\d+)$', re.IGNORECASE)
+
+
+def _owner_breadcrumb(file_path: str, consume: bool = False):
+    """#1504: the owning user profile an AcoustID relocate left next to a
+    staged file, or None. ``consume`` deletes the breadcrumb after reading it
+    so a later staged file with the same basename can never pick up a stale
+    owner."""
+    sidecar = file_path + ".soulsync-owner.json"
+    try:
+        if not os.path.isfile(sidecar):
+            return None
+        with open(sidecar, encoding='utf-8') as handle:
+            owner = json.load(handle).get('owner_profile_id')
+    except Exception as exc:  # noqa: BLE001 - a bad crumb means no owner
+        logger.debug("owner breadcrumb read failed: %s", exc)
+        return None
+    if consume:
+        try:
+            os.remove(sidecar)
+        except OSError as exc:
+            logger.debug("owner breadcrumb cleanup failed: %s", exc)
+    return int(owner) if owner else None
 
 
 @dataclass
@@ -99,6 +122,45 @@ def _summarize_names(names: List[str], limit: int = 10) -> str:
     return f"{', '.join(names[:limit])} … and {len(names) - limit} more"
 
 
+def _hinted_track_match(candidate, identification: Dict, tracks: List,
+                        file_tags: Optional[Dict] = None) -> List[Dict]:
+    """A re-identify names the exact track the user picked (#889), so the
+    file is filed as that track before the tracklist matcher gets a say. the
+    matcher read "Let It Be (Remastered 2015)", track 26 of "1", against the
+    Let It Be album: the real song ran 13s longer (the album cut), so it took
+    "Dig a Pony" on length and a shared "Remastered" instead (#2206). Only
+    for a hint, and only for the one file a re-identify stages."""
+    if identification.get('method') != 'rematch_hint' or len(candidate.audio_files or []) != 1:
+        return []
+    from core.imports.rematch_hints import pick_hinted_track
+    tags = (file_tags or {}).get(candidate.audio_files[0]) or {}
+    track = pick_hinted_track(
+        tracks,
+        track_id=identification.get('track_id'),
+        title=identification.get('track_name'),
+        track_number=identification.get('hint_track_number'),
+        disc_number=identification.get('hint_disc_number'),
+        file_title=tags.get('title'),
+        file_duration_ms=tags.get('duration_ms'),
+    )
+    if track is None:
+        return []
+    logger.info("[Auto-Import] Re-identify: '%s' filed as the chosen track %s",
+                candidate.name,
+                track.get('name') if isinstance(track, dict) else getattr(track, 'name', '?'))
+    return [{'track': track, 'file': candidate.audio_files[0], 'confidence': 1.0}]
+
+
+def _hint_title_conflicts(identification: Dict, track: Any) -> bool:
+    """a re-identify the pick couldn't place still never lands on a song its
+    title says it isn't (#2206)"""
+    if identification.get('method') != 'rematch_hint':
+        return False
+    from core.imports.reassign_album import titles_conflict
+    name = track.get('name') if isinstance(track, dict) else getattr(track, 'name', '')
+    return titles_conflict(identification.get('track_name'), name)
+
+
 def _read_file_tags(file_path: str) -> Dict[str, Any]:
     """Read embedded tags from an audio file.
 
@@ -128,9 +190,11 @@ def _read_file_tags(file_path: str) -> Dict[str, Any]:
         'spotify_track_id': '',
     }
     try:
-        from mutagen import File as MutagenFile
-        audio = MutagenFile(file_path, easy=True)
-        if audio:
+        # AIFF/WAV carry raw ID3 the easy view can't map (#1919)
+        from core.metadata.easy_tags import open_easy
+        audio = open_easy(file_path)
+        # an untagged file is falsy to mutagen; its duration still counts (#1920)
+        if audio is not None:
             # Audio length comes off audio.info, not tags. Mutagen returns
             # seconds as a float; convert to int milliseconds to match the
             # metadata-source convention (Spotify/Deezer/iTunes all return
@@ -1155,12 +1219,18 @@ class AutoImportWorker:
             except Exception as exc:
                 logger.debug("display-name tag read failed for %s: %s", group_files[0], exc)
 
+            # A subfolder holding one album is named by the folder (#1289). The
+            # staging root is not a folder anyone named: a lone album's files
+            # dropped straight into it were listed as "Staging", and looked up
+            # as an album called Staging.
+            named_by_folder = len(groups) == 1 and not is_root
             candidates.append(FolderCandidate(
                 path=directory,
-                name=os.path.basename(directory) if len(groups) == 1 else str(display_name),
+                name=os.path.basename(directory) if named_by_folder else str(display_name),
                 audio_files=audio_files,
                 disc_structure=disc_structure if len(disc_structure) > 1 else {},
                 folder_hash=folder_hash,
+                is_staging_root=is_root,
             ))
 
         if untagged and not is_root:
@@ -1384,11 +1454,19 @@ class AutoImportWorker:
             try:
                 cursor = conn.cursor()
                 removed = delete_replaced_track(cursor, hint.replace_track_id,
-                                                resolve_fn=_resolve_old, new_paths=new_paths)
+                                                resolve_fn=_resolve_old, new_paths=new_paths,
+                                                id_space=hint.replace_id_space,
+                                                file_id=hint.replace_file_id)
                 consume_hint(cursor, hint.id)
                 conn.commit()
             finally:
                 conn.close()
+            # a folded row's wishlist withdrawals (#2193)
+            try:
+                from core.library2.mirror_outbox import drain_soon
+                drain_soon(self.database)
+            except Exception as e:  # noqa: BLE001 - the outbox catches up later
+                logger.debug("[Auto-Import] outbox drain after re-identify skipped: %s", e)
             if removed:
                 logger.info("[Auto-Import] Re-identify replaced old track — removed %s", removed)
         except Exception as e:
@@ -2040,16 +2118,25 @@ class AutoImportWorker:
             # metadata fetch; the helper is a pure function over dicts.
             from core.imports.album_matching import default_quality_rank, match_files_to_tracks
             target_album = identification.get('album_name', '')
-            match_result = match_files_to_tracks(
-                candidate.audio_files,
-                file_tags,
-                tracks,
-                target_album=target_album,
-                quality_rank=default_quality_rank,
-            )
-            matches = match_result['matches']
-            unmatched_files = match_result['unmatched_files']
-
+            # a re-identify's pick goes first: the user already said which
+            # track this is, the fuzzy matcher only guesses (#2206)
+            matches = _hinted_track_match(candidate, identification, tracks, file_tags)
+            unmatched_files = []
+            if not matches:
+                match_result = match_files_to_tracks(
+                    candidate.audio_files,
+                    file_tags,
+                    tracks,
+                    target_album=target_album,
+                    quality_rank=default_quality_rank,
+                )
+                matches = []
+                unmatched_files = list(match_result['unmatched_files'])
+                for m in match_result['matches']:
+                    if _hint_title_conflicts(identification, m['track']):
+                        unmatched_files.append(m['file'])
+                    else:
+                        matches.append(m)
             if not matches:
                 return None
 
@@ -2107,7 +2194,9 @@ class AutoImportWorker:
             if self._config_manager.get('import.folder_artist_override', True):
                 staging_root = self._resolve_staging_path() or self.staging_path
                 rel_path = os.path.relpath(candidate.path, staging_root)
-                folder_artist = resolve_folder_artist(rel_path, artist_name, enabled=True)
+                folder_artist = resolve_folder_artist(
+                    rel_path, artist_name, enabled=True,
+                    same_as=artist_folder_names(artist_name))
                 if folder_artist:
                     logger.info(f"[Auto-Import] Parent folder artist '{folder_artist}' differs from tag artist '{artist_name}' — using folder artist")
                     artist_name = folder_artist
@@ -2120,6 +2209,8 @@ class AutoImportWorker:
         if candidate.disc_structure and len(candidate.disc_structure) > 1:
             total_discs = max(candidate.disc_structure.keys())
 
+        # whose files these were (#1504 breadcrumbs): the events below are theirs
+        import_owners = set()
         processed = 0
         errors = []
         reid_final_paths = []   # #889: where the pipeline landed each file (same-home guard)
@@ -2135,6 +2226,11 @@ class AutoImportWorker:
             int(m.get('track', {}).get('duration_ms', 0) or 0)
             for m in all_matches
         )
+        # #2068: $explicit. the album's flag over every matched track, so the
+        # folder is the same for all of them; each file reads its own track's.
+        from core.imports.paths import album_explicit_flag
+        album_explicit = album_explicit_flag(
+            album_data, [m.get('track') or {} for m in all_matches])
         # Ensure an active-import entry exists for this candidate.
         # Callers from `_process_one_candidate` already registered, but
         # tests invoke `_process_matches` directly without going
@@ -2213,6 +2309,9 @@ class AutoImportWorker:
                     source_hint=source,
                     album_name=album_name,
                     quality_profile=gate_profile,
+                    # the USER profile the file is imported for (#1504
+                    # breadcrumb), so another library's copy never skips it
+                    profile_id=_owner_breadcrumb(file_path),
                 )
             except Exception as e:
                 logger.debug("library pre-check failed, importing anyway: %s", e)
@@ -2301,6 +2400,7 @@ class AutoImportWorker:
                         'images': album_data.get('images', [{'url': image_url}] if image_url else []),
                         'artists': [{'name': artist_name, 'id': identification.get('artist_id') or ''}],
                         'album_type': album_data.get('album_type', 'album'),
+                        'explicit': album_explicit,
                         # Album total duration in ms (sum of every
                         # matched track). Read by side_effects to
                         # populate the album row's `duration` column —
@@ -2315,6 +2415,7 @@ class AutoImportWorker:
                         'track_number': track_number,
                         'disc_number': disc_number,
                         'duration_ms': track.get('duration_ms', 0),
+                        'explicit': track.get('explicit'),
                         'artists': track.get('artists', [{'name': artist_name}]),
                         'uri': track.get('uri', ''),
                         # Album-id back-reference + per-recording IDs so
@@ -2341,6 +2442,12 @@ class AutoImportWorker:
                     'has_clean_spotify_data': True,
                     'has_full_spotify_metadata': True,
                 }
+                # a re-identify stages the user's own library file, not a
+                # transfer, so its length isn't held to the pick's. "Let It
+                # Be" from "1" is the 3:50 single cut and the album lists
+                # 4:03: the right pick still went to quarantine (#2206, #804)
+                if identification.get('method') == 'rematch_hint':
+                    context['is_local_import'] = True
                 # Thread the assigned profile into the import pipeline —
                 # everything profile-specific (quality gate, AcoustID
                 # strictness, downsample/lossy-copy) is resolved LIVE from
@@ -2349,29 +2456,17 @@ class AutoImportWorker:
                 # default", which the pipeline resolves on its own.
                 if auto_import_profile_id:
                     context['track_info']['quality_profile_id'] = auto_import_profile_id
+                    # the user set it for this import, so it pins (review 5 W2-WD-1)
+                    context['track_info']['quality_profile_explicit'] = True
 
                 # #1504: AcoustID relocate breadcrumb — the staged file may
                 # carry a sidecar with the owning user profile. Read it into
                 # the context as profile_id (the USER profile, not the quality
                 # profile above) so the import lands in the right library.
-                try:
-                    import json as _json
-                    _sidecar = file_path + ".soulsync-owner.json"
-                    if os.path.isfile(_sidecar):
-                        with open(_sidecar, encoding='utf-8') as _sf:
-                            _crumb = _json.load(_sf)
-                        _owner = _crumb.get('owner_profile_id')
-                        if _owner:
-                            context['profile_id'] = int(_owner)
-                        # #1504: delete the breadcrumb after reading it so a
-                        # later staged file with the same basename can never
-                        # pick up a stale owner.
-                        try:
-                            os.remove(_sidecar)
-                        except OSError as exc:
-                            logger.debug("owner breadcrumb cleanup failed: %s", exc)
-                except Exception as exc:
-                    logger.debug("owner breadcrumb read failed: %s", exc)
+                _owner = _owner_breadcrumb(file_path, consume=True)
+                if _owner:
+                    context['profile_id'] = _owner
+                    import_owners.add(_owner)
 
                 self._process_callback(context_key, context, file_path)
                 rejection = import_rejection_reason(context)
@@ -2440,18 +2535,20 @@ class AutoImportWorker:
         # Emit automation events
         if processed > 0 and self._automation_engine:
             try:
-                self._automation_engine.emit('import_completed', {
+                # staged files with no owner breadcrumb are the install's
+                from core.automation.owners import owned
+                self._automation_engine.emit('import_completed', owned({
                     'track_count': str(processed),
                     'album_name': album_name,
                     'artist': artist_name,
-                })
-                self._automation_engine.emit('batch_complete', {
+                }, import_owners))
+                self._automation_engine.emit('batch_complete', owned({
                     'playlist_name': f'Import: {album_name}',
                     'artist': artist_name,
                     'total_tracks': str(len(match_result.get('matches', []))),
                     'completed_tracks': str(processed),
                     'failed_tracks': str(len(errors)),
-                })
+                }, import_owners))
             except Exception as e:
                 logger.debug("automation emit failed: %s", e)
 

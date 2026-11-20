@@ -107,6 +107,22 @@ def canonical_aspect(v: Any) -> str | None:
     return "2.40:1"
 
 
+def stream_languages(streams: Any, codec_type: str) -> list:
+    """the languages of one kind of stream ('audio' | 'subtitle'), in track
+    order, each once, as soulsync codes ('ja', 'en', 'pt-br'). untagged and
+    'und' tracks say nothing, so they're left out."""
+    from core.video.subtitles.languages import to_code
+    out: list = []
+    for s in streams or []:
+        if not isinstance(s, dict) or s.get("codec_type") != codec_type:
+            continue
+        tags = s.get("tags") if isinstance(s.get("tags"), dict) else {}
+        code = to_code(tags.get("language"))
+        if code and code not in out:
+            out.append(code)
+    return out
+
+
 def parse_ffprobe(data: Any) -> dict:
     """Parse ffprobe's ``-show_format -show_streams`` JSON into the fields we use.
     ``ok`` is True only when a video stream is present (else: corrupt / not a video)."""
@@ -131,6 +147,10 @@ def parse_ffprobe(data: Any) -> dict:
         # Commissary: {MediaInfo ...} naming facts from the same JSON (channels,
         # HDR type, bit depth, audio languages) - the file's word, not the name's
         **probe_facts(data),
+        "audio_channels": _int((audio or {}).get("channels")) or None,
+        # the language tags Thibs asked for: audio, beside subs and resolution
+        "audio_languages": stream_languages(streams, "audio"),
+        "subtitle_languages": stream_languages(streams, "subtitle"),
     }
 
 
@@ -145,7 +165,7 @@ def _default_runner(path: str) -> str | None:
         proc = subprocess.run(
             [_FFPROBE, "-v", "quiet", "-print_format", "json",
              "-show_format", "-show_streams", str(path)],
-            capture_output=True, text=True, timeout=120, check=False,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120, check=False,
         )
     except Exception:   # noqa: BLE001 - missing binary / timeout / OS error → unverified
         return None
@@ -176,4 +196,22 @@ def probe(path: Any, runner: Callable | None = None) -> dict | None:
 
 __all__ = [
     "resolution_from_dimensions", "parse_ffprobe", "ffprobe_available", "probe",
+    "stream_languages", "language_list", "format_languages",
 ]
+
+
+def language_list(raw: Any) -> list:
+    """the stored 'ja,en' (or a list) back as ['ja', 'en']"""
+    if isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        items = str(raw or "").split(",")
+    return [str(x).strip().lower() for x in items if str(x).strip()]
+
+
+def format_languages(raw: Any) -> str | None:
+    """stored languages as the stored string: 'ja,en', '' for a file looked
+    at with nothing tagged, None for not looked at"""
+    if raw is None:
+        return None
+    return ",".join(language_list(raw))

@@ -5,7 +5,12 @@ import type { FindingGroup, FindingTypeInfo } from '../-tools.groups';
 import type { RepairJob } from '../-tools.types';
 
 import { Operations } from './operations';
-import { OperationsStudio, PLAYBOOK_PRESETS, STRATEGIC_PILLARS } from './operations-studio';
+import {
+  OperationsStudio,
+  PLAYBOOK_PRESETS,
+  STRATEGIC_PILLARS,
+  VIDEO_PILLARS,
+} from './operations-studio';
 
 const fetchMock = vi.fn();
 const toastSpy = vi.fn();
@@ -149,7 +154,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe('OperationsStudio (Simple Mode)', () => {
+describe('OperationsStudio (the top of the Jobs panel)', () => {
   it('renders all 4 Strategic Pillars and their titles', () => {
     const onShowFindings = vi.fn();
     const onSwitchToAdvanced = vi.fn();
@@ -159,115 +164,15 @@ describe('OperationsStudio (Simple Mode)', () => {
       <OperationsStudio
         jobs={testJobs}
         progress={{}}
-        runs={[]}
         onChanged={onChanged}
         onShowFindings={onShowFindings}
-        onSwitchToAdvanced={onSwitchToAdvanced}
+        onShowFamily={onSwitchToAdvanced}
       />,
     );
 
     for (const pillar of STRATEGIC_PILLARS) {
       expect(screen.getByText(pillar.title)).not.toBeNull();
     }
-  });
-
-  it('sorts every open type into what fixing it would do', async () => {
-    render(
-      <OperationsStudio
-        jobs={testJobs}
-        progress={{}}
-        runs={[]}
-        onChanged={vi.fn()}
-        onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText('What needs you')).not.toBeNull();
-    expect(screen.getByText('Safe to fix')).not.toBeNull();
-    expect(screen.getByText('Needs your call')).not.toBeNull();
-    expect(screen.getByText('Review only')).not.toBeNull();
-
-    await waitFor(() => {
-      expect(screen.getByText('42 ready')).not.toBeNull();
-      expect(screen.getByText('3 to decide')).not.toBeNull();
-      expect(screen.getByText('8 to look at')).not.toBeNull();
-    });
-    // each card names the types inside it
-    const chips = [...document.querySelectorAll('.operations-triage-type')].map((el) =>
-      el.textContent?.trim(),
-    );
-    expect(chips).toEqual(['Missing Lyrics42', 'Corrupt Audio3', 'Canonical Version8']);
-  });
-
-  it('shows the same health score advanced mode does', async () => {
-    // 42 info (0.02 each) + 3 errors (1 each) + 8 info over a 1,000 track
-    // library: 100 - (0.84 + 3 + 0.16) = 96. the old simple-mode number was
-    // (1000 - 53) / 1000 = 95%, and advanced said something else again.
-    render(
-      <OperationsStudio
-        jobs={testJobs}
-        progress={{}}
-        runs={[]}
-        trackCount={1000}
-        onChanged={vi.fn()}
-        onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
-      />,
-    );
-    await waitFor(() =>
-      expect(document.querySelector('.operations-exec-num')?.textContent).toBe('96'),
-    );
-    expect(document.querySelector('.operations-exec-status')?.textContent).toBe('healthy');
-    expect(screen.getByText('53 open findings')).not.toBeNull();
-  });
-
-  it('opens a type straight from its chip', async () => {
-    const onShowFindings = vi.fn();
-    render(
-      <OperationsStudio
-        jobs={testJobs}
-        progress={{}}
-        runs={[]}
-        onChanged={vi.fn()}
-        onShowFindings={onShowFindings}
-        onSwitchToAdvanced={vi.fn()}
-      />,
-    );
-    await waitFor(() =>
-      expect(document.querySelectorAll('.operations-triage-type').length).toBe(3),
-    );
-    fireEvent.click(document.querySelectorAll('.operations-triage-type')[1]);
-    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'corrupt_audio' });
-  });
-
-  it('triggers the safe fix-all when "Fix all" is clicked', async () => {
-    routes({
-      '/api/repair/findings/groups': { groups: mockFindingGroups },
-      '/api/repair/findings/bulk-fix-start': { started: true, total: 42 },
-    });
-
-    render(
-      <OperationsStudio
-        jobs={testJobs}
-        progress={{}}
-        runs={[]}
-        onChanged={vi.fn()}
-        onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(screen.getByText('Fix all 42')).not.toBeNull();
-    });
-
-    fireEvent.click(screen.getByText('Fix all 42'));
-
-    await waitFor(() => {
-      const calls = fetchMock.mock.calls.map((c) => String(c[0]));
-      expect(calls.some((url) => url.includes('bulk-fix-start'))).toBe(true);
-    });
   });
 
   it('renders Live Mission Control HUD when a job is actively running', async () => {
@@ -289,10 +194,9 @@ describe('OperationsStudio (Simple Mode)', () => {
             phase: 'Verifying FLAC frame signatures…',
           },
         }}
-        runs={[]}
         onChanged={vi.fn()}
         onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
+        onShowFamily={vi.fn()}
       />,
     );
 
@@ -300,39 +204,10 @@ describe('OperationsStudio (Simple Mode)', () => {
     expect(document.querySelector('.operations-live-hud-name')?.textContent).toBe(
       'Audio Corruption Detector',
     );
-    expect(screen.getByText('Verifying FLAC frame signatures…')).not.toBeNull();
-    expect(screen.getByText('⏹ Stop')).not.toBeNull();
-  });
-
-  it('opens the biggest type in each bucket when Quarantine or Suggestions is clicked', async () => {
-    // the buckets are destructive / fixable, not severity. a severity filter
-    // showed something other than what the card counted (orphans are 'info')
-    const onShowFindings = vi.fn();
-    render(
-      <OperationsStudio
-        jobs={testJobs}
-        progress={{}}
-        runs={[]}
-        onChanged={vi.fn()}
-        onShowFindings={onShowFindings}
-        onSwitchToAdvanced={vi.fn()}
-      />,
+    expect(document.querySelector('.operations-live-hud-phase')?.textContent).toContain(
+      'Verifying FLAC frame signatures…',
     );
-
-    await waitFor(() => {
-      expect(screen.getByText('Review Canonical Version →')).not.toBeNull();
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText('Review Canonical Version →').closest('button')?.disabled).toBe(
-        false,
-      );
-    });
-    fireEvent.click(screen.getByText('Review Canonical Version →'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'canonical_version' });
-
-    fireEvent.click(screen.getByText('Review Corrupt Audio →'));
-    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'corrupt_audio' });
+    expect(screen.getByRole('button', { name: 'Stop' })).not.toBeNull();
   });
 
   it('renders all 1-Click Playbooks', () => {
@@ -340,10 +215,9 @@ describe('OperationsStudio (Simple Mode)', () => {
       <OperationsStudio
         jobs={testJobs}
         progress={{}}
-        runs={[]}
         onChanged={vi.fn()}
         onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
+        onShowFamily={vi.fn()}
       />,
     );
 
@@ -360,10 +234,9 @@ describe('OperationsStudio (Simple Mode)', () => {
       <OperationsStudio
         jobs={testJobs}
         progress={{}}
-        runs={[]}
         onChanged={onChanged}
         onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
+        onShowFamily={vi.fn()}
       />,
     );
 
@@ -388,12 +261,12 @@ describe('OperationsStudio (Simple Mode)', () => {
         'album_tag_consistency',
         'missing_lyrics',
         'missing_cover_art',
-        'duplicate_detector',
+        'empty_folder_cleaner',
       ],
     ],
     [
       'Audio Fidelity Sweep',
-      ['audio_corruption_detector', 'fake_lossless_detector', 'quality_upgrade_scanner'],
+      ['audio_corruption_detector', 'fake_lossless_detector', 'short_preview_track'],
     ],
     [
       'Metadata Polish',
@@ -406,9 +279,7 @@ describe('OperationsStudio (Simple Mode)', () => {
     const catalogueIds = [
       'audio_corruption_detector',
       'fake_lossless_detector',
-      'quality_upgrade_scanner',
       'short_preview_track',
-      'duplicate_detector',
       'album_tag_consistency',
       'comma_artist_splitter',
       'genre_cleanup',
@@ -427,10 +298,9 @@ describe('OperationsStudio (Simple Mode)', () => {
       <OperationsStudio
         jobs={catalogueIds.map((job_id) => mockJob({ job_id }))}
         progress={{}}
-        runs={[]}
         onChanged={vi.fn()}
         onShowFindings={vi.fn()}
-        onSwitchToAdvanced={vi.fn()}
+        onShowFamily={vi.fn()}
       />,
     );
     fireEvent.click(screen.getByText(title).closest('button')!);
@@ -442,17 +312,16 @@ describe('OperationsStudio (Simple Mode)', () => {
     });
   });
 
-  it('navigates to advanced mode when "Inspect in Advanced" is clicked', () => {
-    const onSwitchToAdvanced = vi.fn();
+  it("an area's Job settings asks for its family in the job list", () => {
+    const onShowFamily = vi.fn();
 
     const { container } = render(
       <OperationsStudio
         jobs={testJobs}
         progress={{}}
-        runs={[]}
         onChanged={vi.fn()}
         onShowFindings={vi.fn()}
-        onSwitchToAdvanced={onSwitchToAdvanced}
+        onShowFamily={onShowFamily}
       />,
     );
 
@@ -460,12 +329,58 @@ describe('OperationsStudio (Simple Mode)', () => {
     expect(inspectLinks.length).toBeGreaterThan(0);
 
     fireEvent.click(inspectLinks[0]);
-    expect(onSwitchToAdvanced).toHaveBeenCalledWith('Audio quality');
+    expect(onShowFamily).toHaveBeenCalledWith('Audio quality');
+  });
+
+  it('an area counts its open findings and opens the biggest type', async () => {
+    const onShowFindings = vi.fn();
+    render(
+      <OperationsStudio
+        jobs={testJobs}
+        progress={{}}
+        onChanged={vi.fn()}
+        onShowFindings={onShowFindings}
+        onShowFamily={vi.fn()}
+      />,
+    );
+    // artwork & lyrics holds the 42 missing lyrics; audio holds the 3 corrupt
+    fireEvent.click(await screen.findByRole('button', { name: '42 open' }));
+    expect(onShowFindings).toHaveBeenCalledWith('', { findingType: 'missing_lyrics' });
+    fireEvent.click(screen.getByRole('button', { name: '3 open' }));
+    expect(onShowFindings).toHaveBeenLastCalledWith('', { findingType: 'corrupt_audio' });
+  });
+
+  it('the tag area owns re-tag and edition findings', async () => {
+    // they had no area, so tags read Clean over tens of thousands of them
+    render(
+      <OperationsStudio
+        jobs={testJobs}
+        progress={{}}
+        onChanged={vi.fn()}
+        onShowFindings={vi.fn()}
+        onShowFamily={vi.fn()}
+      />,
+    );
+    expect(await screen.findByRole('button', { name: '8 open' })).not.toBeNull();
+    const tags = STRATEGIC_PILLARS.find((pillar) => pillar.id === 'metadata')!;
+    expect(tags.findingTypes).toContain('library_retag');
+    expect(tags.findingTypes).toContain('canonical_version');
+    // and the area that counts them also checks them
+    expect(tags.jobIds).toContain('library_retag');
+    expect(tags.jobIds).toContain('album_edition_review');
+  });
+
+  it('the video files area owns shelf life, its job and its findings', () => {
+    // the job list groups it under files & storage from the catalog; the area
+    // has its own list, so check now and its open count would skip it
+    const files = VIDEO_PILLARS.find((pillar) => pillar.id === 'files')!;
+    expect(files.jobIds).toContain('shelf_life');
+    expect(files.findingTypes).toContain('shelf_life');
   });
 });
 
-describe('Operations component mode switcher', () => {
-  it('defaults to Simple Mode and renders the mode toggle bar', () => {
+describe('the job list has no mode', () => {
+  it('shows every family and job without a switch', () => {
     const { container } = render(
       <Operations
         jobs={testJobs}
@@ -477,43 +392,8 @@ describe('Operations component mode switcher', () => {
         onShowFindings={vi.fn()}
       />,
     );
-
-    expect(container.querySelector('.operations-mode-bar')).not.toBeNull();
-    expect(container.querySelector('.operations-studio')).not.toBeNull();
-
-    const simpleBtn = container.querySelector('.operations-mode-toggle-btn[aria-selected="true"]');
-    expect(simpleBtn?.textContent).toContain('Simple Mode');
-  });
-
-  it('switches between Simple and Advanced modes when toggle buttons are clicked', () => {
-    const onModeChange = vi.fn();
-
-    const { container } = render(
-      <Operations
-        jobs={testJobs}
-        error={false}
-        progress={{}}
-        runs={[]}
-        onChanged={vi.fn()}
-        onHelp={vi.fn()}
-        onShowFindings={vi.fn()}
-        onModeChange={onModeChange}
-      />,
-    );
-
-    // Click Advanced Mode button
-    const advancedBtn = [...container.querySelectorAll('.operations-mode-toggle-btn')].find((btn) =>
-      btn.textContent?.includes('Advanced Mode'),
-    );
-    expect(advancedBtn).not.toBeUndefined();
-
-    fireEvent.click(advancedBtn!);
-
-    expect(onModeChange).toHaveBeenCalledWith('advanced');
-    expect(localStorage.getItem('soulsync_operations_mode')).toBe('advanced');
-
-    // Advanced mode reveals the repair families container
-    const families = container.querySelector('.repair-families') as HTMLElement;
-    expect(families.hidden).toBe(false);
+    expect(container.querySelector('.operations-mode-toggle-btn')).toBeNull();
+    expect(container.querySelectorAll('.repair-job-card').length).toBe(testJobs.length);
+    expect((container.querySelector('.repair-families') as HTMLElement).hidden).toBe(false);
   });
 });

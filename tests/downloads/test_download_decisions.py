@@ -172,11 +172,55 @@ def test_duration_mismatch_on_strict_source(env):
     assert d.detail == '5:00 vs expected 3:58'
 
 
+def test_a_wrong_artist_reads_wrong_artist_not_wrong_length(env):
+    """#1980: the length check ran before the artist check on strict sources,
+    so every other artist's song of the same name was filed as wrong length,
+    and the requested artist's own version of another length was lost in them."""
+    noel = _Track(name='The First Noel (Remastered 1999)', artists=('Frank Sinatra',),
+                  duration_ms=162_000)
+    others = [_row(username='deezer_dl', filename=f'dz||{i}', artist=a, title='The First Noel',
+                   duration=d)
+              for i, (a, d) in enumerate((('Christafari', 245_000), ('Josh Groban', 230_000),
+                                          ('David Arkenstone', 260_000)))]
+    sinatra = _row(username='deezer_dl', filename='dz||s', artist='Frank Sinatra',
+                   title='The First Noel', duration=210_000)
+    pairs = evaluate_candidates(others + [sinatra], noel, 'q')
+    assert [_decision_for(pairs, r).code for r in others] == ['artist_mismatch'] * 3
+    assert _decision_for(pairs, sinatra).code == 'duration_mismatch'
+
+
 def test_artist_mismatch_torrent(env):
     tor = _row(username='torrent', filename='t||1', artist='Hope Sandoval Tribute Band', duration=None)
     d = _decision_for(evaluate_candidates([tor], WANT, 'q'), tor)
     assert d.code == 'artist_mismatch' and d.stage == 'identity'
     assert 'Hope Sandoval Tribute Band' in d.detail
+
+
+@pytest.mark.parametrize('artist', [
+    '(Dream Pop) Mazzy Star',
+    '(Rock) [LP] [24/96] Mazzy Star',
+    '[FLAC] Mazzy Star',
+])
+def test_a_genre_or_media_tag_before_the_artist_is_not_a_mismatch(env, artist):
+    # #2063: some indexers lead the title with the genre and media tags, and
+    # the title parser keeps them in the artist. every such release was refused.
+    tor = _row(username='torrent', filename='t||1', artist=artist, duration=None)
+    d = _decision_for(evaluate_candidates([tor], WANT, 'q'), tor)
+    assert d.code != 'artist_mismatch', d.detail
+
+
+def test_leading_tags_do_not_vouch_for_another_act(env):
+    tor = _row(username='torrent', filename='t||1', artist='(Dream Pop) Hope Sandoval Tribute Band',
+               duration=None)
+    d = _decision_for(evaluate_candidates([tor], WANT, 'q'), tor)
+    assert d.code == 'artist_mismatch'
+
+
+def test_an_act_whose_name_starts_with_a_bracket_matches_as_itself(env):
+    # the name as given is tried first: stripping "(hed)" would leave "p.e."
+    assert validation._release_artist_matches(['(hed) p.e.'], '(hed) p.e.')
+    assert validation._release_artist_matches(['(hed) p.e.'], '(Nu Metal) (hed) p.e.')
+    assert not validation._release_artist_matches(['Mazzy Star'], '(Mazzy Star) Someone Else')
 
 
 def test_artist_mismatch_soulseek_path(env, monkeypatch):
@@ -402,4 +446,3 @@ def test_automatic_path_records_nothing(env, monkeypatch):
     env['slsk'].formats = {'flac'}
     out = get_valid_candidates(_pool(), WANT, 'q')
     assert out
-

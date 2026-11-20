@@ -18,6 +18,8 @@ def _capped_library(db, cap, server):
     and unrated titles left out, paged after the filter so counts and pages
     stay honest. walks the filtered set in big pages; only restricted
     profiles ever come through here."""
+    from core.video.watch_scope import current_watcher
+
     from .kids import filter_library_items
     kind = request.args.get("kind", "movies")
     try:
@@ -34,7 +36,9 @@ def _capped_library(db, cap, server):
             status=request.args.get("status", "all"),
             genre=request.args.get("genre") or None,
             resolution=request.args.get("resolution") or None,
-            page=p, limit=500, server_source=server, include_size=False)
+            page=p, limit=500, server_source=server, include_size=False,
+            watcher=current_watcher().rows,
+            video_library=request.args.get("video_library") or None)
         kept.extend(filter_library_items(db, chunk.get("items") or [], cap, kind))
         if not (chunk.get("pagination") or {}).get("has_next"):
             break
@@ -73,9 +77,18 @@ def register_routes(bp):
                     limit=request.args.get("limit", 75),
                     profile_id=_profile(),
                 ))
-            from .kids import video_cap
+            from core.video.watch_scope import current_watcher
+
+            from .kids import kind_visible, rating_capped, video_cap
             cap = video_cap()
-            if cap is not None:
+            lib_kind = request.args.get("kind", "movies")
+            if not kind_visible(cap, lib_kind):
+                # a kind this profile can't see at all (a tv-only profile on
+                # the Movies tab): an honest empty page, no walk
+                return jsonify({"items": [], "total_size_bytes": 0,
+                                "pagination": {"page": 1, "total_pages": 1, "total_count": 0,
+                                               "has_next": False, "has_prev": False}})
+            if rating_capped(cap, lib_kind):
                 return jsonify(_capped_library(get_video_db(), cap, resolve_video_server()))
             return jsonify(get_video_db().query_library(
                 request.args.get("kind", "movies"),
@@ -88,11 +101,28 @@ def register_routes(bp):
                 page=request.args.get("page", 1),
                 limit=request.args.get("limit", 75),
                 server_source=resolve_video_server(),
-                library=request.args.get("library") or None,   # Commissary: a Library tab
+                watcher=current_watcher().rows,
+                # the video library its files sit in (#2029)
+                video_library=request.args.get("video_library") or None,
             ))
         except Exception:
             logger.exception("Failed to query video library")
             return jsonify({"error": "Failed to load video library"}), 500
+
+    @bp.route("/library/video-libraries", methods=["GET"])
+    def video_library_names():
+        """The video libraries (#2029) for the library, wanted and activity
+        filters: [{id, name, kind}] of the ones switched on with a folder.
+        Names only, so any profile with video access can read it (the full
+        config is the admin-only /libraries/folders)."""
+        from . import get_video_db
+        from core.video.libraries import list_libraries
+        try:
+            return jsonify({"libraries": [{"id": x["id"], "name": x["name"], "kind": x["kind"]}
+                                          for x in list_libraries(get_video_db()) if x["usable"]]})
+        except Exception:
+            logger.exception("Failed to list video library names")
+            return jsonify({"libraries": []})
 
     @bp.route("/library/resolutions", methods=["GET"])
     def video_library_resolutions():

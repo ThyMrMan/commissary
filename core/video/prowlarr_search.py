@@ -111,15 +111,25 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
+# extra names one search may add (see build_strategies)
+_MAX_ALT_TITLES = 2
+
+
 def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = None,
                      episode: Any = None, imdb_id: Any = None, tmdb_id: Any = None,
                      tvdb_id: Any = None, air_date: Any = None, absolute: Any = None,
-                     series_type: Any = None, alt: Any = None) -> List[Tuple[str, str, List[tuple]]]:
+                     series_type: Any = None, alt: Any = None,
+                     alt_titles: Any = None) -> List[Tuple[str, str, List[tuple]]]:
     """The set of Prowlarr searches to run for one request, as ``(type, query, extra)``.
 
     Pure (no I/O) so it's unit-tested. Always includes the scene-formatted text search;
     adds the structured tv/movie search (with whatever ids we have) so id-aware indexers
-    resolve exactly. Identical strategies are collapsed."""
+    resolve exactly. Identical strategies are collapsed.
+
+    ``alt_titles`` are the title's other names (TMDB's english name, the
+    original-language one, #2021). Each adds ONE text search in the scene's
+    format, never another structured one (the ids already name the title), and
+    at most two are used, so a search costs at most two more requests."""
     from core.video.slskd_search import build_query
     t = str(title or "").strip()
     scope = str(scope or "movie").lower()
@@ -191,6 +201,22 @@ def build_strategies(scope: str, title: Any, *, year: Any = None, season: Any = 
         strat.append(("tvsearch", t, extra))
         strat.append(("search", t, []))
 
+    # the title's other names: one scene-formatted text query each
+    for other in list(alt_titles or [])[:_MAX_ALT_TITLES]:
+        o = str(other or "").strip()
+        if not o or o.lower() == t.lower():
+            continue
+        if scope == "episode":
+            q = build_query("episode", o, season=season, episode=episode, air_date=air_date,
+                            absolute=absolute, series_type=series_type)
+        elif scope == "season":
+            q = build_query("season", o, season=season)
+        elif scope == "movie":
+            q = build_query("movie", o, year=year)
+        else:
+            q = o
+        strat.append(("search", q, []))
+
     # Collapse identical (type, query, extra) — e.g. a movie with no year makes the
     # structured 'movie' query and the text 'search' query the same term.
     seen, out = set(), []
@@ -243,8 +269,8 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
                     tmdb_id: Any = None, tvdb_id: Any = None, air_date: Any = None,
                     absolute: Any = None, series_type: Any = None,
                     max_wait_seconds: Any = None, indexer_names: Any = None,
-                    alt: Any = None,
-                    indexer_ids: Any = None) -> dict:  # Commissary: a Library's trackers
+                    alt: Any = None, alt_titles: Any = None, indexer_ids: Any = None,
+                    query: Any = None, any_category: bool = False) -> dict:
     """Search Prowlarr for a video release with the multi-strategy (structured + text)
     approach. ``source`` picks the protocol to keep (``torrent`` | ``usenet``). Returns
     ``{configured, error?, hits:[...]}`` — the hit shape ``_evaluate_hits`` consumes.
@@ -252,7 +278,11 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
     ``max_wait_seconds`` bounds how long this will sit in the shared Prowlarr
     budget (core.prowlarr_throttle) before giving up. Pass it from anything a
     person is waiting on: the background drain is happy to queue, a manual
-    search should say "busy" rather than hold a request worker for a minute."""
+    search should say "busy" rather than hold a request worker for a minute.
+
+    ``query``: words typed into manual search (#2121). Run as written, one text
+    search, nothing added: Prowlarr's own search box.
+    ``any_category``: no category filter, the Releases tab's search (#2127)."""
     client = _client()
     if not client.is_configured():
         return {"configured": False, "hits": []}
@@ -261,24 +291,21 @@ def prowlarr_search(scope: str, title: Any, *, year: Any = None, season: Any = N
     # tracker, do not send Radarr/Sonarr category filters. Some Jackett/Prowlarr
     # public tracker adapters either ignore or reject those categories, which made
     # obvious searches like "interstellar" return zero on The Pirate Bay.
-    cats = [] if indexer_names else _categories(scope)
+    cats = [] if (indexer_names or any_category) else _categories(scope)
     target_ids = _indexer_ids_matching(indexer_names, want_proto)
     if target_ids == []:
         label = ", ".join(str(n) for n in (indexer_names if isinstance(indexer_names, (list, tuple, set)) else [indexer_names]))
         return {"configured": True, "error": "No enabled Prowlarr indexer matches " + label, "hits": []}
-    ids = target_ids if target_ids is not None else _indexer_ids()
-    if indexer_ids and target_ids is None:
-        # Commissary: limit to the video Library's trackers (within the allowlist).
-        # A tracker the user named in Basic Search (target_ids) still wins.
-        from core.commissary.video_libraries import restrict_indexers
-        ids = restrict_indexers(indexer_ids, ids)
-        if not ids:
-            return {"configured": True, "hits": [],
-                    "error": "None of this library's trackers are enabled in Prowlarr"}
-    strategies = build_strategies(scope, title, year=year, season=season, episode=episode,
-                                  imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
-                                  air_date=air_date, absolute=absolute, series_type=series_type,
-                                  alt=alt)
+    # ``indexer_ids``: a video library's own indexers (#2029); else the
+    # global allowlist, as before
+    ids = target_ids if target_ids is not None else (
+        [int(i) for i in indexer_ids] if indexer_ids else _indexer_ids())
+    typed = " ".join(str(query or "").split())
+    strategies = [("search", typed, [])] if typed else build_strategies(
+        scope, title, year=year, season=season, episode=episode,
+        imdb_id=imdb_id, tmdb_id=tmdb_id, tvdb_id=tvdb_id,
+        air_date=air_date, absolute=absolute, series_type=series_type,
+        alt=alt, alt_titles=alt_titles)
     if not strategies:
         return {"configured": True, "hits": []}
 

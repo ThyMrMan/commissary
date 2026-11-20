@@ -14,7 +14,7 @@ import os
 from typing import Any, Callable, Optional
 
 from core.video.season_pack import is_pack_download
-from core.video.slskd_search import _is_video
+from core.video.slskd_search import VIDEO_EXTS, _is_video
 from utils.logging_config import get_logger
 
 logger = get_logger("video.client_download")
@@ -93,37 +93,30 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
             eta = int((size - done) / speed) if (speed > 0 and size > done) else None
         patch = {"status": "downloading", "progress": pct,
                  "speed_bps": speed, "eta_seconds": eta}
-        # the torrent client is holding it back on purpose (its own queue, a
-        # recheck). that's not a stall, so the monitor keeps the clock off it.
-        # usenet's queued also covers grabbing/propagating, which can hang, so
-        # it stays on the clock
-        if str(dl.get("source") or "").lower() == "torrent" \
-                and str(getattr(status, "state", "") or "").lower() == "queued":
+        # the client is holding it back on purpose (its own queue, a recheck).
+        # that's not a stall, so the monitor keeps the clock off it. usenet's
+        # ``queued`` state also covers grabbing/propagating, which can hang, so
+        # a usenet job is held only when the adapter says it is plainly waiting
+        # its turn: SAB runs one job at a time, and the third job in line can
+        # sit behind the others far longer than the stall timeout
+        source = str(dl.get("source") or "").lower()
+        if (source == "torrent"
+                and str(getattr(status, "state", "") or "").lower() == "queued") \
+                or (source == "usenet" and getattr(status, "waiting_in_queue", False) is True):
             patch["_client_queued"] = True
+        # still fetching the NZB (SAB's 'Grabbing' placeholder): the job is about
+        # to drop out of sight while the client adds its files, so the monitor
+        # keeps its new-job grace open instead of treating this as the first report
+        if source == "usenet" and getattr(status, "fetching_nzb", False) is True:
+            patch["_client_adding"] = True
         return patch
-    # Completed → locate THIS job's finished video file, then import. Prefer the client's
-    # exact content_path (this torrent's own file/folder) — the reliable anti-cross-attribution
-    # signal: the shared save_path DIR holds every concurrent grab, and the torrent NAME often
-    # differs from the real on-disk filename (e.g. name 'Love Island S13E42 1080p WEB H264-SKYFiRE'
-    # vs file 'love.island.s13e42.1080p.web.h264-skyfire[EZTVx.to].mkv'), so save_path/name misses.
-    # content_path points straight at the content. Fall back to save_path + name scoping for
-    # clients that don't report it (never the largest file in the shared folder).
-    content = getattr(status, "content_path", None)
-    if content:
-        save = resolve_path(content)
-        name = None                                          # already this job's own content
-    else:
-        reported = getattr(status, "save_path", None) or getattr(status, "incomplete_path", None)
-        save = resolve_path(reported)
-        name = getattr(status, "name", None)
-        # a usenet client reports the job's OWN folder (sab ``storage``, nzbget
-        # FinalDir/DestDir), not the shared parent a torrent client reports.
-        # looking for save/name inside it found nothing, so every usenet grab sat
-        # at 100% until the stall timer failed it. scope by name only when that
-        # subfolder really is there
-        if str(dl.get("source") or "").lower() == "usenet" and save and name \
-                and not _scoped_content(save, name):
-            name = None
+    # the client is still moving the finished files out of its incomplete /
+    # temp folder (qbittorrent's 'moving'). content_path still names the temp
+    # copy, which is about to vanish: importing from it now failed with
+    # "No such file or directory" once the move finished (#2176). wait for it.
+    if getattr(status, "moving", False) is True:
+        return {"progress": 100.0}
+    save, name = _job_content(dl, status, resolve_path)
     job_dir = _usenet_job_dir(dl, save, name, job_name=getattr(status, "name", None))
     # A season pack is a FOLDER of episodes. Falling through to find_video here would pick
     # its largest file, hand that one episode to the importer, and leave the rest on disk —
@@ -157,13 +150,88 @@ def process_client_download(dl: dict, *, get_status: Callable[[str, str], Any],
             _refused = _packed_finished(dl, _own, settled, lister=listing) if _own else None
             if _refused is not None:
                 return _refused
-        return {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
+        patch = {"progress": 100.0}   # complete but the file isn't visible yet — keep polling
+        # The job's own content IS there, just with nothing playable in it (a
+        # disc image, unextracted rars). Tag it, transient, so the monitor's
+        # at-completion timeout can tell a junk release from a path problem.
+        # Nothing acts on the tag before that timeout: a torrent client may
+        # still be moving files in.
+        junk = nothing_playable(save, name) if save else None
+        if junk:
+            patch["_nothing_playable"] = junk
+        return patch
     # Commissary: visible is not finished — a 'moving' torrent reads 100%.
     if settled is not None and not settled(dl, src):
         return {"progress": 100.0}   # still being written — keep polling
     if organizer is not None:
-        return _with_job_dir(organizer(dl, src), job_dir, src)
+        patch = organizer(dl, src)
+        if _moved_away(patch, src):
+            # the file was there a moment ago and is gone now: the client moved
+            # it while we copied (a temp/incomplete folder handing off to the
+            # final one). not a bad file, and not terminal. keep polling: the
+            # next tick asks the client again and finds it where it went. the
+            # planned destination the organizer stored is dropped, or a later
+            # tick would take it as already placed (#2176)
+            logger.info("video download %s: %s moved while importing, looking again",
+                        dl.get("id"), src)
+            return {"progress": 100.0, "dest_path": None}
+        return _with_job_dir(patch, job_dir, src)
     return {"status": "completed", "progress": 100.0, "dest_path": src}
+
+
+def _moved_away(patch, src) -> bool:
+    """An import that failed because its source file vanished mid-import."""
+    return isinstance(patch, dict) and patch.get("status") == "import_failed" \
+        and bool(src) and not os.path.exists(str(src))
+
+
+def current_job_file(dl: dict, *, get_status: Optional[Callable[[str, str], Any]] = None,
+                     resolve_path: Optional[Callable[[Any], Any]] = None,
+                     find_video: Optional[Callable[[Any, Any], Any]] = None) -> Optional[str]:
+    """Where a torrent/usenet job's video is NOW, asked fresh from the client,
+    or None (no client job, the client forgot it, or nothing found). For an
+    unplaced download whose stored path went stale because the client moved
+    the file after we read it (#2176)."""
+    if str(dl.get("source") or "").lower() not in ("torrent", "usenet") or not dl.get("client_ref"):
+        return None
+    status = (get_status or _get_status)(str(dl.get("source") or ""), str(dl.get("client_ref")))
+    if status is None or getattr(status, "moving", False) is True:
+        return None
+    save, name = _job_content(dl, status, resolve_path or _resolve_path)
+    if not save:
+        return None
+    src = (find_video or find_video_file)(save, name)
+    return str(src) if src and os.path.exists(str(src)) else None
+
+
+def _job_content(dl: dict, status: Any, resolve_path: Callable[[Any], Any]):
+    """(root, name) of THIS job's finished content, as the client reports it
+    right now: ``name`` is None when ``root`` is already the job's own file or
+    folder."""
+    # Completed → locate THIS job's finished video file, then import. Prefer the client's
+    # exact content_path (this torrent's own file/folder) — the reliable anti-cross-attribution
+    # signal: the shared save_path DIR holds every concurrent grab, and the torrent NAME often
+    # differs from the real on-disk filename (e.g. name 'Love Island S13E42 1080p WEB H264-SKYFiRE'
+    # vs file 'love.island.s13e42.1080p.web.h264-skyfire[EZTVx.to].mkv'), so save_path/name misses.
+    # content_path points straight at the content. Fall back to save_path + name scoping for
+    # clients that don't report it (never the largest file in the shared folder).
+    content = getattr(status, "content_path", None)
+    if content:
+        save = resolve_path(content)
+        name = None                                          # already this job's own content
+    else:
+        reported = getattr(status, "save_path", None) or getattr(status, "incomplete_path", None)
+        save = resolve_path(reported)
+        name = getattr(status, "name", None)
+        # a usenet client reports the job's OWN folder (sab ``storage``, nzbget
+        # FinalDir/DestDir), not the shared parent a torrent client reports.
+        # looking for save/name inside it found nothing, so every usenet grab sat
+        # at 100% until the stall timer failed it. scope by name only when that
+        # subfolder really is there
+        if str(dl.get("source") or "").lower() == "usenet" and save and name \
+                and not _scoped_content(save, name):
+            name = None
+    return save, name
 
 
 def _usenet_job_dir(dl: dict, save, name, job_name=None) -> Optional[str]:
@@ -173,19 +241,20 @@ def _usenet_job_dir(dl: dict, save, name, job_name=None) -> Optional[str]:
     multi-file job), the shared parent (scoped to ``<save>/<name>``), or -- sab
     for a single-file job -- the finished FILE itself. For a file the job folder
     is its parent, but only when that folder is named after the job
-    (``job_name``, case-insensitive): a category set up without job folders
-    puts the file straight in the category folder, which must never be
-    treated as the job's own. torrents never get one (the client is still
-    seeding). None unless it really is a folder."""
+    (``job_name``, case-insensitive, or sab's ``<job>.N`` for a repeat name):
+    a category set up without job folders puts the file straight in the
+    category folder, which must never be treated as the job's own. torrents
+    never get one (the client is still seeding). None unless it really is a
+    folder."""
     if str(dl.get("source") or "").lower() != "usenet" or not save:
         return None
     path = _scoped_content(save, name) if name else save
     if path and os.path.isdir(path):
         return str(path)
     if path and os.path.isfile(path) and job_name:
+        from core.downloads.remove_completed import matches_job_name
         parent = os.path.dirname(os.path.abspath(str(path)))
-        if os.path.basename(parent).casefold() == str(job_name).strip().casefold() \
-                and os.path.isdir(parent):
+        if matches_job_name(os.path.basename(parent), job_name) and os.path.isdir(parent):
             return parent
     return None
 
@@ -290,6 +359,38 @@ def find_video_file(root, name=None) -> Optional[str]:
         scoped = _scoped_content(root, name)
         return _largest_video(scoped) if scoped else None
     return _largest_video(root)
+
+
+def nothing_playable(root, name=None) -> Optional[str]:
+    """What a finished job holds when it holds files but no playable video, e.g.
+    ``'.iso, .jpg, .nfo + a sample'``; None when its content isn't there, is
+    empty, or has a real video. Scoped like :func:`find_video_file`, so a
+    missing job folder (a path-mapping problem) is never reported as junk."""
+    if not root:
+        return None
+    path = _scoped_content(root, name) if name else str(root)
+    if not path or not os.path.exists(path):
+        return None
+    if os.path.isfile(path):
+        names = [os.path.basename(path)]
+    else:
+        names = [f for _d, _s, files in os.walk(path) for f in files]
+    if not names:
+        return None
+    exts, sample = set(), False
+    for f in names:
+        if _is_video(f):
+            return None                     # a real video: not this case
+        ext = os.path.splitext(f)[1].lower() or "(no extension)"
+        if ext.lstrip(".") in VIDEO_EXTS:   # _is_video already said it's a sample
+            sample = True
+            continue
+        exts.add(ext)
+    if not exts:
+        return None                         # only samples: let the old path report it
+    ordered = sorted(exts)
+    shown = ", ".join(ordered[:5]) + (", ..." if len(ordered) > 5 else "")
+    return shown + (" + a sample" if sample else "")
 
 
 def find_content_dir(root, name=None) -> Optional[str]:

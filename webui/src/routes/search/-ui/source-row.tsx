@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 
+import { useFeatureOn } from '@/platform/features';
+import { useMusicVideosAllowed } from '@/platform/shell/my-permissions';
+
 import type { SearchControllerState } from '../-search.use-controller';
 
 import { sourceLabel, visibleSources } from '../-search.helpers';
 import { SOURCE_LABELS } from '../-search.types';
-import { CaretIcon, DiscIcon, FileIcon, FilmIcon } from './search-icons';
+import { ALL_SOURCES, unifiedMembers, unifiedProgress } from '../-search.unified';
+import { CaretIcon, DiscIcon, FileIcon, FilmIcon, LayersIcon } from './search-icons';
 import styles from './search.module.css';
 
 /** not metadata providers: each is its own tab */
@@ -43,19 +47,60 @@ export function ModeTabs({
   onSelect: (source: string) => void;
 }) {
   const mode = modeOf(state.activeSource);
-  const tabs: { mode: SearchMode; source: string; label: string; icon: React.ReactNode }[] = [
-    { mode: 'catalog', source: catalogSource, label: 'Catalog', icon: <DiscIcon /> },
-    { mode: 'videos', source: 'youtube_videos', label: 'Videos', icon: <FilmIcon /> },
-    { mode: 'files', source: 'soulseek', label: 'Files', icon: <FileIcon /> },
+  // music videos switched off (#1909): no Videos tab, unless you're on it.
+  // not part of this profile (#2166): no tab at all
+  const videosAllowed = useMusicVideosAllowed();
+  const videosOn = useFeatureOn('music_videos');
+  // the hint says what each one searches. "files" alone meant nothing to
+  // someone who'd never used soulseek (#1909)
+  const tabs: {
+    mode: SearchMode;
+    source: string;
+    label: string;
+    hint: string;
+    icon: React.ReactNode;
+  }[] = [
+    {
+      mode: 'catalog',
+      source: catalogSource,
+      label: 'Catalog',
+      hint: 'Artists, albums and tracks from a music catalogue. Downloads arrive tagged and filed.',
+      icon: <DiscIcon />,
+    },
+    ...(videosAllowed && (videosOn || mode === 'videos')
+      ? [
+          {
+            mode: 'videos' as const,
+            source: 'youtube_videos',
+            label: 'Videos',
+            hint: 'Music videos from YouTube.',
+            icon: <FilmIcon />,
+          },
+        ]
+      : []),
+    {
+      mode: 'files',
+      source: 'soulseek',
+      label: 'Files',
+      hint: 'Search your download sources directly and pick the exact file.',
+      icon: <FileIcon />,
+    },
   ];
   return (
-    <div className={styles.modes} id="enh-source-row" role="tablist" aria-label="What to search">
+    <div
+      className={styles.modes}
+      id="enh-source-row"
+      role="tablist"
+      aria-label="What to search"
+      data-tour="search.modes"
+    >
       {tabs.map((tab) => (
         <button
           key={tab.mode}
           type="button"
           role="tab"
           data-source={tab.source}
+          title={tab.hint}
           aria-selected={mode === tab.mode}
           onClick={(event) => {
             // the page re-renders on select and detaches this node; stopping
@@ -72,7 +117,14 @@ export function ModeTabs({
   );
 }
 
-function SourceLogo({ source }: { source: string }) {
+export function SourceLogo({ source }: { source: string }) {
+  if (source === ALL_SOURCES) {
+    return (
+      <span className={styles.sourceLogo} aria-hidden="true">
+        <LayersIcon />
+      </span>
+    );
+  }
   const info = SOURCE_LABELS[source];
   return (
     <span className={styles.sourceLogo} aria-hidden="true">
@@ -89,6 +141,52 @@ function SourceLogo({ source }: { source: string }) {
  * the provider for it. a source the server answered from somewhere else says
  * so in the menu.
  */
+/**
+ * "All sources" at the head of the menu (#2051). It asks every source below
+ * that is set up, so its note counts them, and while it is searching says how
+ * many have answered.
+ */
+function AllSourcesItem({
+  state,
+  onSelect,
+}: {
+  state: SearchControllerState;
+  onSelect: () => void;
+}) {
+  const members = unifiedMembers(catalogSources(state), state.configuredSources);
+  // one source is not "all": there is nothing to bring together
+  if (members.length < 2) return null;
+  const active = state.activeSource === ALL_SOURCES;
+  const progress = unifiedProgress(
+    members,
+    state.sources,
+    state.loadingSources,
+    state.failedSources,
+  );
+  const note =
+    active && progress.pending.length
+      ? `${progress.answered.length} of ${progress.total} answered`
+      : `${members.length} sources at once`;
+  return (
+    <button
+      type="button"
+      role="menuitemradio"
+      aria-checked={active}
+      className={styles.menuItem}
+      data-source={ALL_SOURCES}
+      title="Ask every source that is set up and bring the answers together. The same release from several sources shows once."
+      onClick={(event) => {
+        event.stopPropagation();
+        onSelect();
+      }}
+    >
+      <SourceLogo source={ALL_SOURCES} />
+      <span>{sourceLabel(ALL_SOURCES)}</span>
+      <span className={styles.menuNote}>{note}</span>
+    </button>
+  );
+}
+
 export function SourcePicker({
   state,
   onSelect,
@@ -120,7 +218,7 @@ export function SourcePicker({
 
   if (mode === 'videos') {
     return (
-      <span className={styles.source} data-static>
+      <span className={styles.source} data-static data-tour="search.source">
         <SourceLogo source="youtube_videos" />
         <span className={styles.sourceLabel}>YouTube</span>
       </span>
@@ -133,6 +231,7 @@ export function SourcePicker({
       <button
         type="button"
         className={styles.source}
+        data-tour="search.source"
         aria-haspopup="menu"
         aria-expanded={open}
         aria-label={`Search with ${sourceLabel(current)}`}
@@ -148,6 +247,13 @@ export function SourcePicker({
       {open ? (
         <div className={styles.menu} role="menu" aria-label="Search with">
           <div className={styles.menuHead}>Search with</div>
+          <AllSourcesItem
+            state={state}
+            onSelect={() => {
+              setOpen(false);
+              onSelect(ALL_SOURCES);
+            }}
+          />
           {catalogSources(state).map((source) => {
             const configured = state.configuredSources[source] !== false;
             const served = state.fallbacks[source];

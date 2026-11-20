@@ -9,126 +9,26 @@ normalizing all tracks to the canonical (majority) value.
 import json
 import os
 import re
+from contextlib import closing
+from typing import Dict
+from core.library2.maintenance_subjects import active_file_subjects
 from collections import Counter
 
 from mutagen import File as MutagenFile
-from mutagen.id3 import ID3
-from mutagen.flac import FLAC
-from mutagen.oggvorbis import OggVorbis
-from mutagen.mp4 import MP4
 
 from core.repair_jobs import register_job
-from core.repair_jobs.base import JobContext, JobResult, RepairJob
+from core.repair_jobs.base import (
+    get_scope_artist, JobContext, JobResult, RepairJob, artist_scoped_subjects, drop_hand_tagged,
+)
 from utils.logging_config import get_logger
 
 logger = get_logger("repair_job.album_tag_consistency")
 
 
 def _read_tag(audio, tag_name):
-    """Read a tag value from a Mutagen file object, handling format differences."""
-    if audio is None:
-        return None
-    try:
-        if isinstance(audio.tags, ID3):
-            # MP3
-            if tag_name == 'album':
-                frame = audio.tags.get('TALB')
-                return str(frame) if frame else None
-            elif tag_name == 'artist':
-                frame = audio.tags.get('TPE1')
-                return str(frame) if frame else None
-            elif tag_name == 'albumartist':
-                frame = audio.tags.get('TPE2')
-                return str(frame) if frame else None
-            elif tag_name == 'musicbrainz_albumid':
-                for key in audio.tags:
-                    if key.startswith('TXXX:') and 'MusicBrainz Album Id' in key:
-                        return str(audio.tags[key])
-                return None
-            elif tag_name == 'musicbrainz_releasegroupid':
-                for key in audio.tags:
-                    if key.startswith('TXXX:') and 'MusicBrainz Release Group Id' in key:
-                        return str(audio.tags[key])
-                return None
-            elif tag_name == 'date':
-                frame = audio.tags.get('TDRC')
-                return str(frame) if frame else None
-        elif isinstance(audio, (FLAC, OggVorbis)):
-            vals = audio.get(tag_name.upper(), [])
-            return vals[0] if vals else None
-        elif isinstance(audio, MP4):
-            tag_map = {
-                'album': '\xa9alb',
-                'artist': '\xa9ART',
-                'albumartist': 'aART',
-            }
-            key = tag_map.get(tag_name)
-            if key:
-                vals = audio.get(key, [])
-                return vals[0] if vals else None
-            if tag_name == 'musicbrainz_albumid':
-                vals = audio.get('----:com.apple.iTunes:MusicBrainz Album Id', [])
-                if vals:
-                    return vals[0].decode('utf-8') if isinstance(vals[0], bytes) else str(vals[0])
-                return None
-            if tag_name == 'musicbrainz_releasegroupid':
-                vals = audio.get('----:com.apple.iTunes:MusicBrainz Release Group Id', [])
-                if vals:
-                    return vals[0].decode('utf-8') if isinstance(vals[0], bytes) else str(vals[0])
-                return None
-            if tag_name == 'date':
-                vals = audio.get('\xa9day', [])
-                return str(vals[0]) if vals else None
-    except Exception as e:
-        logger.debug("read tag value failed: %s", e)
-    return None
-
-
-def _write_tag(audio, tag_name, value):
-    """Write a tag value to a Mutagen file object, handling format differences."""
-    if audio is None or value is None:
-        return False
-    try:
-        if isinstance(audio.tags, ID3):
-            from mutagen.id3 import TALB, TPE1, TPE2, TXXX
-            if tag_name == 'album':
-                audio.tags.delall('TALB')
-                audio.tags.add(TALB(encoding=3, text=[value]))
-            elif tag_name == 'artist':
-                audio.tags.delall('TPE1')
-                audio.tags.add(TPE1(encoding=3, text=[value]))
-            elif tag_name == 'albumartist':
-                audio.tags.delall('TPE2')
-                audio.tags.add(TPE2(encoding=3, text=[value]))
-            elif tag_name == 'musicbrainz_albumid':
-                # Remove existing
-                to_remove = [k for k in audio.tags if k.startswith('TXXX:') and 'MusicBrainz Album Id' in k]
-                for k in to_remove:
-                    del audio.tags[k]
-                audio.tags.add(TXXX(encoding=3, desc='MusicBrainz Album Id', text=[value]))
-            return True
-        elif isinstance(audio, (FLAC, OggVorbis)):
-            audio[tag_name.upper()] = [value]
-            return True
-        elif isinstance(audio, MP4):
-            tag_map = {
-                'album': '\xa9alb',
-                'artist': '\xa9ART',
-                'albumartist': 'aART',
-            }
-            key = tag_map.get(tag_name)
-            if key:
-                audio[key] = [value]
-                return True
-            if tag_name == 'musicbrainz_albumid':
-                from mutagen.mp4 import MP4FreeForm
-                audio['----:com.apple.iTunes:MusicBrainz Album Id'] = [
-                    MP4FreeForm(value.encode('utf-8'))
-                ]
-                return True
-    except Exception as e:
-        logger.debug(f"Failed to write tag {tag_name}: {e}")
-    return False
+    """Compatibility adapter onto the shared partial-field codec."""
+    from core.tag_writer import read_tag_field
+    return read_tag_field(audio, tag_name)
 
 
 MISSING = '(missing)'
@@ -140,63 +40,29 @@ _CHECK_FIELDS = (
 )
 
 
-def split_group_key(artist_name, album_title):
-    """the key two server-split rows of one album share.
+def _detect_inconsistencies(tag_data, check_album, check_artist, check_mbid):
+    """Majority-vote inconsistency detection over per-file tag snapshots.
 
-    case, whitespace and punctuation are folded; edition qualifiers are NOT.
-    "Album (Deluxe)" and "Album" are different releases and must stay apart,
-    or the fix would stamp one release id across two real albums."""
-    def fold(value):
-        value = (value or '').casefold()
-        value = re.sub(r"[^\w\s]", ' ', value)
-        return ' '.join(value.split())
-    return fold(artist_name), fold(album_title)
-
-
-def _year(value):
-    value = (value or '').strip()
-    return value[:4] if len(value) >= 4 and value[:4].isdigit() else None
-
-
-def rows_look_like_one_album(rows_tag_data):
-    """False when the rows that share a title are different albums.
-
-    weezer has several albums called "Weezer". grouping by title alone would
-    merge them and the fix would stamp one release id across all of them,
-    which is worse than the split it set out to mend. two rows are the same
-    album only if nothing they carry says otherwise: a release-group id on
-    each side that differs, or a year on each side that differs, means two
-    albums. a side with no id or no year can't object."""
-    groups, years = [], []
-    for tag_data in rows_tag_data:
-        rg = [t.get('rg_tag') for t in tag_data if t.get('rg_tag')]
-        yr = [_year(t.get('date_tag')) for t in tag_data if _year(t.get('date_tag'))]
-        if rg:
-            groups.append(Counter(rg).most_common(1)[0][0])
-        if yr:
-            years.append(Counter(yr).most_common(1)[0][0])
-    if len(set(groups)) > 1:
-        return False
-    if len(set(years)) > 1:
-        return False
-    return True
-
-
-def find_inconsistencies(tag_data, settings):
-    """the fields whose values disagree across tag_data, majority first.
-
-    a track missing a tag the others carry is a variant, not a pass: navidrome
-    keys an album on album + album artist + musicbrainz release id, so one
-    file without the id splits exactly like one with the wrong id. a field
-    nobody has is left alone (nothing to normalize to)."""
+    A track MISSING a tag the others carry is a variant, not a pass. Upstream
+    d97a9b3d6 found the hole: navidrome keys an album on album + album artist
+    + musicbrainz release id, so one file without the id splits the album
+    exactly like one carrying the wrong id, and the version that only compared
+    tracks which HAD a value reported that album consistent. A field nobody
+    has is still left alone - there is nothing to normalize to.
+    """
+    enabled = {
+        'check_album_name': check_album,
+        'check_album_artist': check_artist,
+        'check_mb_release_id': check_mbid,
+    }
     inconsistencies = []
     for setting_key, field, tag_key in _CHECK_FIELDS:
-        if not settings.get(setting_key, True):
+        if not enabled.get(setting_key, True):
             continue
         present = [t[tag_key] for t in tag_data if t.get(tag_key)]
         if not present:
             continue
-        values = [t[tag_key] or MISSING for t in tag_data]
+        values = [t.get(tag_key) or MISSING for t in tag_data]
         if len(set(values)) <= 1:
             continue
         # majority among the tracks that HAVE a value; a missing tag never wins
@@ -211,9 +77,226 @@ def find_inconsistencies(tag_data, settings):
     return inconsistencies
 
 
+def _write_tag(audio, tag_name, value):
+    """Set one field; callers must confirm the atomic save before reporting it."""
+    from core.tag_writer import set_tag_fields
+    if audio is None or value is None:
+        return False
+    try:
+        return bool(set_tag_fields(audio, {tag_name: value}))
+    except Exception as exc:
+        logger.debug("Failed to set tag %s: %s", tag_name, exc)
+        return False
+
+
+def split_group_key(artist_name, album_title):
+    """Upstream split detection folds punctuation but retains edition qualifiers."""
+    return tuple(' '.join(re.sub(r'[^\w\s]', ' ', str(v or '').casefold()).split())
+                 for v in (artist_name, album_title))
+
+
+def split_catalogue_state(conn, album_ids):
+    """Snapshot the native release identities a reviewed split was based on."""
+    state = []
+    for album_id in sorted(set(album_ids)):
+        row = conn.execute('SELECT id,primary_artist_id,title,year,release_date,canonical_locked,canonical_source,canonical_album_id '
+                           'FROM lib2_albums WHERE id=?', (int(album_id),)).fetchone()
+        if row is None:
+            raise ValueError('Reviewed album no longer exists')
+        editions = conn.execute('SELECT id,title,spotify_id,musicbrainz_id,external_ids,is_default '
+                                'FROM lib2_release_editions WHERE release_group_id=? ORDER BY id', (int(album_id),)).fetchall()
+        state.append({**dict(row), 'editions': [dict(e) for e in editions]})
+    return state
+
+
+def _compatible_split(state, tags):
+    """Reject positive evidence of distinct releases; unknown facts may coexist."""
+    years = {str(r.get('year') or r.get('release_date') or '')[:4] for r in state}
+    years.discard('')
+    years.update(str(t['date_tag'])[:4] for t in tags if t.get('date_tag') and str(t['date_tag'])[:4].isdigit())
+    if len(years) > 1 or len({t['rg_tag'] for t in tags if t.get('rg_tag')}) > 1:
+        return False
+    signatures = []
+    from core.library2.native_enrich import _stored_source_ids
+    for row in state:
+        ids = {}
+        for edition in row['editions']:
+            if edition['is_default']:
+                ids = _stored_source_ids(edition)
+        if row['canonical_locked'] and row['canonical_source'] and row['canonical_album_id']:
+            ids = {row['canonical_source']: str(row['canonical_album_id'])}
+        if ids:
+            signatures.append(ids)
+    for index, first in enumerate(signatures):
+        for second in signatures[index + 1:]:
+            common = set(first) & set(second)
+            if not common or any(first[source] != second[source] for source in common):
+                return False
+    return True
+
+
+VARIOUS_ARTISTS = 'Various Artists'
+#: same-titled albums the release-id pass will read the tags of. a title this
+#: many albums share is a generic one, and reading every file of it is the cost
+RELEASE_GROUP_LIMIT = 40
+_DISC_FOLDER = re.compile(r'^(cd|disc|disk)\s*\d+$', re.IGNORECASE)
+
+
+#: album ids a provider minted for one release, from the sources whose stored
+#: ids hold up. Measured on a 71k-album library (Nov 13 2026): 3,250 of 62k
+#: tidal album ids sat on more than one owned album, one of them on sixteen
+#: unrelated artists' albums of the same name, and amazon's were no better, so
+#: neither is evidence of anything. Not lastfm either: that one is a url built
+#: from the artist and album NAME. qobuz, bandcamp and audiodb joined nothing
+#: there, so they are left out until there is something to judge them by.
+RELEASE_ID_SOURCES = ('deezer', 'discogs', 'spotify', 'itunes', 'musicbrainz')
+#: what two albums are joined on. Not the barcode: on the same library one upc
+#: sat on dozens of unrelated artists' same-titled singles.
+_JOINING_IDS = RELEASE_ID_SOURCES + ('release_group',)
+_SOURCE_LABELS = {'itunes': 'Apple Music', 'musicbrainz': 'MusicBrainz release',
+                  'release_group': 'MusicBrainz release group', 'upc': 'barcode',
+                  'audiodb': 'TheAudioDB'}
+
+
+def source_label(source):
+    return _SOURCE_LABELS.get(source) or str(source).capitalize()
+
+
+def album_release_ids(row):
+    """``{source: id}`` for one catalogue album: every id that names its release."""
+    ids = {}
+    try:
+        stored = json.loads(row['external_ids'] or '{}')
+    except (TypeError, ValueError):
+        stored = {}
+    if isinstance(stored, dict):
+        for source in RELEASE_ID_SOURCES:
+            value = str(stored.get(source) or '').strip()
+            if value:
+                ids[source] = value
+    for source, column in (('spotify', 'spotify_id'), ('musicbrainz', 'musicbrainz_id'),
+                           ('release_group', 'musicbrainz_release_group_id'), ('upc', 'upc')):
+        value = str(row[column] or '').strip()
+        if value:
+            ids.setdefault(source, value)
+    return ids
+
+
+def albums_sharing_a_release_id(rows):
+    """Groups of albums that one provider says are the same release.
+
+    ``rows`` are catalogue albums of one title. Two are joined when any one
+    trusted source gave both the same id, whichever source that is: a split album
+    often has no MusicBrainz id in its files and the same Deezer or Discogs id
+    on every piece (Storm, #2072). Two albums MusicBrainz places in different
+    release groups are never joined, whatever else agrees.
+
+    Returns ``[(album ids, source, id), ...]``, the id being the one the most
+    albums of the group share.
+    """
+    ids = {int(row['id']): album_release_ids(row) for row in rows}
+    parent = {album: album for album in ids}
+
+    def root(album):
+        while parent[album] != album:
+            parent[album] = parent[parent[album]]
+            album = parent[album]
+        return album
+
+    holders = {}
+    for album, found in ids.items():
+        for pair in found.items():
+            if pair[0] in _JOINING_IDS:
+                holders.setdefault(pair, []).append(album)
+    for (_source, _value), albums in sorted(holders.items()):
+        for other in albums[1:]:
+            first, second = ids[albums[0]].get('release_group'), ids[other].get('release_group')
+            if first and second and first != second:
+                continue
+            parent[root(other)] = root(albums[0])
+    groups = {}
+    for album in ids:
+        groups.setdefault(root(album), set()).add(album)
+    found = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        shared = sorted(((len(set(albums) & members), source, value)
+                         for (source, value), albums in holders.items()
+                         if len(set(albums) & members) >= 2),
+                        key=lambda entry: (-entry[0], RELEASE_ID_SOURCES.index(entry[1])
+                                           if entry[1] in RELEASE_ID_SOURCES else 99))
+        if shared:
+            found.append((members, shared[0][1], shared[0][2]))
+    return found
+
+
+def release_folder(path):
+    """The folder a release lives in: a file's own, or the one above a disc folder."""
+    folder = os.path.dirname(str(path or '').replace('\\', '/').rstrip('/'))
+    if _DISC_FOLDER.match(os.path.basename(folder)):
+        folder = os.path.dirname(folder)
+    return folder
+
+
+def folder_split_album_artist(tags):
+    """The album artist a folder of same-titled files should share, or None.
+
+    A compilation ripped with no album artist tag lands on the server as one
+    album per track artist (#2072: Wipeout Pulse as sixteen one-track albums).
+    When most files already name one album artist, that is it. When nobody
+    agrees and three or more artists are in the folder, it is a compilation:
+    Various Artists. Two artists splitting a folder evenly is not enough to
+    say which.
+    """
+    named = [t['albumartist_tag'] for t in tags if t.get('albumartist_tag')]
+    if named:
+        value, count = Counter(named).most_common(1)[0]
+        if count * 2 > len(tags):
+            return value
+    seen = {(t.get('albumartist_tag') or t.get('artist_tag') or '').casefold() for t in tags}
+    seen.discard('')
+    return VARIOUS_ARTISTS if len(seen) >= 3 else None
+
+
+def _read_subject_tags(subjects, context, seen=None):
+    """The tags of each subject's file. ``seen`` is a ``{file id: tags}`` memo a
+    caller reading the same files in several passes hands in, so a file is
+    opened once."""
+    from core.library2.paths import resolve_lib2_path
+    tags = []
+    for subject in subjects:
+        if seen is not None and subject['file_id'] in seen:
+            if seen[subject['file_id']]:
+                tags.append(dict(seen[subject['file_id']]))
+            continue
+        if seen is not None:
+            seen[subject['file_id']] = None
+        raw = str(subject.get('path') or '')
+        path = raw if os.path.isfile(raw) else resolve_lib2_path(raw, config_manager=context.config_manager)
+        if not path:
+            continue
+        try:
+            audio = MutagenFile(path, easy=False)
+            if audio is not None:
+                tags.append({'track_id': f"lib2:{subject['track_id']}", 'file_id': subject['file_id'],
+                    'album_id': subject['album_id'], 'owner_profile_id': subject.get('owner_profile_id'),
+                    'track_title': subject.get('title'), 'file_path': raw, 'resolved_path': path,
+                    'album_tag': _read_tag(audio, 'album'), 'albumartist_tag': _read_tag(audio, 'albumartist'),
+                    'mbid_tag': _read_tag(audio, 'musicbrainz_albumid'),
+                    'artist_tag': _read_tag(audio, 'artist'),
+                    'rg_tag': _read_tag(audio, 'musicbrainz_releasegroupid'), 'date_tag': _read_tag(audio, 'date')})
+                if seen is not None:
+                    seen[subject['file_id']] = dict(tags[-1])
+        except Exception as exc:
+            logger.debug('Unable to read consistency file %s: %s', raw, exc)
+    return tags
+
+
 @register_job
 class AlbumTagConsistencyJob(RepairJob):
     job_id = 'album_tag_consistency'
+    supports_artist_scope = True
     display_name = 'Album Tag Consistency'
     description = 'Finds albums where tracks have inconsistent tags causing media server splits'
     help_text = (
@@ -222,12 +305,18 @@ class AlbumTagConsistencyJob(RepairJob):
         'tracks that belong to the same album.\n\n'
         'These inconsistencies cause media servers like Navidrome to split one album '
         'into multiple entries (e.g. "Simulation Theory" and "Simulation Theory (Super Deluxe)").\n\n'
-        'Albums your server has ALREADY split are checked too: rows that share an artist and '
-        'title are treated as one album and their tracks compared together, so two "Album X" '
-        'entries with one track each still get caught. A track missing a tag the others carry '
-        '(often the MusicBrainz release id) counts as a mismatch, since servers key on it.\n\n'
         'The fix normalizes all tracks in the album to the most common (majority) value, '
         'then writes the corrected tags to the actual audio files.\n\n'
+        'A compilation with no album artist tag, filed as one album per track artist, '
+        'is reported too: one folder, one title, several album artists, or the same '
+        'title in three or more artist folders whose track numbers fit together as one record, '
+        'or same-titled albums whose files carry one MusicBrainz release id wherever they sit, '
+        'or that Deezer, Discogs, Spotify, Apple Music or MusicBrainz gave the same album id and '
+        'whose track numbers fit together as one record.\n\n'
+        'Also reviews native album rows with the same artist and title that may '
+        'have split on your server. Conflicting years, release identities, editions '
+        'and library owners are kept separate. Apply only changes the listed files; '
+        'catalogue rows are never merged, and manual fields, hand tags and pins are protected.\n\n'
         'Settings:\n'
         '- Check album name: Detect inconsistent album title tags\n'
         '- Check album artist: Detect inconsistent album artist tags\n'
@@ -242,6 +331,7 @@ class AlbumTagConsistencyJob(RepairJob):
         'check_mb_release_id': True,
     }
     auto_fix = False
+    supports_file_scope = True
 
     def _get_settings(self, context: JobContext) -> dict:
         """Get job settings from config, merged with defaults."""
@@ -251,294 +341,378 @@ class AlbumTagConsistencyJob(RepairJob):
             merged.update(cfg)
         return merged
 
+    def estimate_scope(self, context: JobContext) -> int:
+        try:
+            counts: Dict[int, int] = {}
+            for subject in artist_scoped_subjects(context, active_file_subjects(context.db, context.config_manager)):
+                counts[int(subject["album_id"])] = counts.get(int(subject["album_id"]), 0) + 1
+            return sum(1 for count in counts.values() if count >= 2)
+        except Exception:
+            return 0
+
     def scan(self, context: JobContext) -> JobResult:
         result = JobResult()
         settings = self._get_settings(context)
-        check_album = settings.get('check_album_name', True)
-        check_artist = settings.get('check_album_artist', True)
-        check_mbid = settings.get('check_mb_release_id', True)
-
-        if not any([check_album, check_artist, check_mbid]):
-            return result
-
-        try:
-            conn = context.db._get_connection()
-            cursor = conn.cursor()
-
-            # Get all albums with 2+ tracks that have file paths
-            cursor.execute("""
-                SELECT al.id, al.title, ar.name as artist_name,
-                       COUNT(t.id) as track_count
-                FROM albums al
-                JOIN artists ar ON ar.id = al.artist_id
-                JOIN tracks t ON t.album_id = al.id
-                WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                GROUP BY al.id
-                HAVING COUNT(t.id) >= 2
-                ORDER BY ar.name, al.title
-            """)
-            albums = cursor.fetchall()
-            total = len(albums)
-
-            # Eligibility breakdown — users compare the scanned count to their
-            # server's album count ("only scans 1300 of my 4000 albums") and
-            # read the gap as a truncation bug. Say up front what was excluded
-            # and why instead of reporting a bare, smaller number.
-            total_albums = single_track = missing_paths = no_artist = 0
+        check_album = settings.get("check_album_name", True)
+        check_artist = settings.get("check_album_artist", True)
+        check_mbid = settings.get("check_mb_release_id", True)
+        if any((check_album, check_artist, check_mbid)):
             try:
-                cursor.execute("""
-                    SELECT COUNT(*) AS total_albums,
-                           SUM(CASE WHEN track_total < 2 THEN 1 ELSE 0 END) AS single_track,
-                           SUM(CASE WHEN track_total >= 2 AND with_path < 2 THEN 1 ELSE 0 END) AS missing_paths
-                    FROM (
-                        SELECT al.id,
-                               COUNT(t.id) AS track_total,
-                               SUM(CASE WHEN t.file_path IS NOT NULL AND t.file_path != ''
-                                        THEN 1 ELSE 0 END) AS with_path
-                        FROM albums al
-                        LEFT JOIN tracks t ON t.album_id = al.id
-                        GROUP BY al.id
-                    )
-                """)
-                row = cursor.fetchone()
-                if row:
-                    total_albums = row['total_albums'] or 0
-                    single_track = row['single_track'] or 0
-                    missing_paths = row['missing_paths'] or 0
-                cursor.execute("""
-                    SELECT COUNT(*) FROM albums al
-                    LEFT JOIN artists ar ON ar.id = al.artist_id
-                    WHERE ar.id IS NULL
-                """)
-                no_artist = cursor.fetchone()[0] or 0
+                subjects = drop_hand_tagged(context, artist_scoped_subjects(
+                    context, active_file_subjects(context.db, context.config_manager)))
             except Exception as e:
-                logger.debug("eligibility breakdown query failed: %s", e)
-
-            if context.report_progress:
-                context.report_progress(
-                    phase=f'Scanning {total} of {total_albums} albums for tag consistency...',
-                    total=total,
-                )
-                if total_albums > total:
-                    reasons = []
-                    if single_track:
-                        reasons.append(f'{single_track} single-track')
-                    if missing_paths:
-                        reasons.append(f'{missing_paths} without stored file paths (re-run a library scan to populate)')
-                    if no_artist:
-                        reasons.append(f'{no_artist} without an artist link')
-                    context.report_progress(
-                        log_line=(
-                            f'{total_albums} albums in the database, {total} eligible '
-                            f'(need 2+ tracks with file paths)'
-                            + (f' — excluded: {", ".join(reasons)}' if reasons else '')
-                        ),
-                        log_type='info',
-                    )
-
-            # Albums that were eligible but had <2 files actually readable from
-            # SoulSync's filesystem — a scanned album silently producing no
-            # finding is indistinguishable from a healthy one to the user, so
-            # count these and say so at the end (Docker mount mismatch is the
-            # usual cause: the server's "/music/..." path isn't mounted here).
-            unreadable_albums = 0
-
-            for idx, album_row in enumerate(albums):
-                if context.check_stop():
-                    break
-                if idx % 10 == 0 and context.wait_if_paused():
-                    break
-
-                album_id = album_row['id']
-                album_title = album_row['title']
-                artist_name = album_row['artist_name']
-                result.scanned += 1
-
-                if context.report_progress and idx % 20 == 0:
-                    context.report_progress(
-                        scanned=idx + 1, total=total,
-                        phase=f'Scanning {idx + 1} / {total}',
-                        log_line=f'{artist_name} — {album_title}',
-                        log_type='info'
-                    )
-
-                # Get all tracks in this album with file paths
-                cursor.execute("""
-                    SELECT id, title, file_path FROM tracks
-                    WHERE album_id = ? AND file_path IS NOT NULL AND file_path != ''
-                """, (album_id,))
-                tracks = cursor.fetchall()
-
-                if len(tracks) < 2:
-                    continue
-
-                tag_data = self._read_track_tags(tracks, context)
-
-                if len(tag_data) < 2:
-                    # Eligible on paper (2+ tracks with paths) but the files
-                    # themselves weren't readable/parseable from here.
-                    unreadable_albums += 1
-                    continue
-
-                inconsistencies = find_inconsistencies(tag_data, settings)
-
-                if inconsistencies:
-                    fields_affected = ', '.join(i['field'] for i in inconsistencies)
-                    total_outliers = sum(i['outlier_count'] for i in inconsistencies)
-
-                    # Build description with specifics
-                    desc_parts = []
-                    for inc in inconsistencies:
-                        variants_str = ' vs '.join(f'"{v}"' for v in inc['variants'][:3])
-                        desc_parts.append(f"{inc['field']}: {variants_str}")
-
-                    inserted = context.create_finding(
-                        job_id=self.job_id,
-                        finding_type='album_tag_inconsistency',
-                        severity='warning',
-                        entity_type='album',
-                        entity_id=str(album_id),
-                        file_path=None,
-                        title=f'Inconsistent tags: {album_title} by {artist_name}',
-                        description=f'{total_outliers} track(s) have mismatched {fields_affected}. ' + '; '.join(desc_parts),
-                        details={
-                            'album_id': album_id,
-                            'album_title': album_title,
-                            'artist_name': artist_name,
-                            'inconsistencies': inconsistencies,
-                            'track_count': len(tag_data),
-                            'tracks': [{'id': t['track_id'], 'title': t['track_title'],
-                                        'file_path': t['file_path']} for t in tag_data],
-                        }
-                    )
-                    if inserted:
-                        result.findings_created += 1
-                    else:
-                        result.findings_skipped_dedup += 1
-
-                    if context.report_progress:
-                        context.report_progress(
-                            log_line=f'Found: {album_title} — {fields_affected}',
-                            log_type='warning'
-                        )
-
-            # albums the server has already split: they reach us as two or
-            # more album rows with the same artist and title, each too small
-            # for the loop above. achilles4: two tracks from one album, two
-            # albums in navidrome, "the SoulSync tools have not picked up on
-            # these discrepancies" — this is the pass that picks them up.
+                logger.warning("V2 subject enumeration failed: %s", e)
+                result.errors += 1
+                return result
+            self._scan_native_albums(
+                context, result, subjects, check_album, check_artist, check_mbid,
+            )
             if not context.check_stop():
-                split_findings = self._scan_split_groups(cursor, context, settings, result)
-                if split_findings and context.report_progress:
-                    context.report_progress(
-                        log_line=f'{split_findings} album(s) your server has split across several entries',
-                        log_type='warning',
-                    )
-
-            if unreadable_albums and context.report_progress:
-                context.report_progress(
-                    log_line=(
-                        f'{unreadable_albums} album(s) skipped: their audio files '
-                        f'could not be read from SoulSync\'s filesystem — if your '
-                        f'media server runs elsewhere (e.g. Docker), mount the music '
-                        f'folder here at the same path the server reports'
-                    ),
-                    log_type='warning',
-                )
-
-            conn.close()
-
-        except Exception as e:
-            logger.error(f"Album tag consistency scan error: {e}")
-            result.errors += 1
-
+                self._scan_split_groups(context, result, subjects, check_album, check_artist, check_mbid)
+            if check_artist and not context.check_stop():
+                self._scan_folder_splits(context, result, subjects, check_album, check_mbid)
         return result
 
-    def _read_track_tags(self, tracks, context):
-        """one dict per track whose file could be read from here."""
-        tag_data = []
-        for track in tracks:
-            file_path = track['file_path']
-            resolved = self._resolve_path(file_path, context)
-            if not resolved or not os.path.exists(resolved):
-                continue
-            try:
-                audio = MutagenFile(resolved, easy=False)
-                if audio is None:
+    def _scan_split_groups(self, context, result, subjects, check_album, check_artist, check_mbid):
+        """Review same-name native rows as a group, without merging the catalogue."""
+        try:
+            groups = {}
+            for subject in subjects:
+                # one album split across rows shares its ALBUM artist; the
+                # first track credit differs on every guest spot and split
+                # the album's tracks into groups that never compared
+                album_artist = subject.get('album_artist_name') or subject.get('artist_name')
+                key = (*split_group_key(album_artist, subject.get('album_title')), subject.get('owner_profile_id'))
+                if key[0] and key[1]:
+                    groups.setdefault(key, []).append(subject)
+            for subjects in groups.values():
+                if context.check_stop() or context.wait_if_paused():
+                    return
+                album_ids = sorted({s['album_id'] for s in subjects})
+                if len(album_ids) < 2:
                     continue
-                tag_data.append({
-                    'track_id': track['id'],
-                    'track_title': track['title'],
-                    'file_path': file_path,
-                    'resolved_path': resolved,
-                    'album_tag': _read_tag(audio, 'album'),
-                    'albumartist_tag': _read_tag(audio, 'albumartist'),
-                    'mbid_tag': _read_tag(audio, 'musicbrainz_albumid'),
-                    # read for the same-album check only; never written
-                    'rg_tag': _read_tag(audio, 'musicbrainz_releasegroupid'),
-                    'date_tag': _read_tag(audio, 'date'),
-                    'album_row': track['album_id'] if 'album_id' in track.keys() else None,
-                })
-            except Exception:
-                continue
-        return tag_data
+                tags = _read_subject_tags(subjects, context)
+                if len({t['album_id'] for t in tags}) < 2:
+                    continue
+                with closing(context.db._get_connection()) as conn:
+                    state = split_catalogue_state(conn, album_ids)
+                if not _compatible_split(state, tags):
+                    continue
+                result.scanned += 1
+                inconsistencies = _detect_inconsistencies(tags, check_album, check_artist, check_mbid)
+                if not inconsistencies or not context.create_finding:
+                    continue
+                album_title = subjects[0].get('album_title')
+                artist_name = subjects[0].get('album_artist_name') or subjects[0].get('artist_name')
+                files = sorted({t['file_id'] for t in tags})
+                inserted = context.create_finding(job_id=self.job_id, finding_type='album_tag_inconsistency',
+                    severity='warning', entity_type='album', entity_id=f'lib2:{album_ids[0]}', file_path=None,
+                    title=f'Split on your server: {album_title} by {artist_name}',
+                    description=f'{len(album_ids)} catalogue rows with matching artist/title have inconsistent file tags. Review the listed files.',
+                    details={'album_id': f'lib2:{album_ids[0]}', 'album_ids': album_ids, 'server_split': True,
+                        'split_catalogue_state': state, 'library_v2_native': True,
+                        'library_owner_id': subjects[0].get('owner_profile_id') or 1,
+                        'album_title': album_title, 'artist_name': artist_name, 'inconsistencies': inconsistencies,
+                        'track_count': len(tags), 'tracks': [{'id': t['track_id'], 'track_id': t['track_id'],
+                            'file_id': t['file_id'], 'album_id': t['album_id'], 'owner_profile_id': t['owner_profile_id'],
+                            'title': t['track_title'], 'file_path': t['file_path']} for t in tags],
+                        'library_v2': {'album_id': album_ids[0], 'album_ids': album_ids, 'artist_id': subjects[0].get('artist_id'),
+                            'track_ids': sorted({s['track_id'] for s in subjects}), 'file_ids': files}})
+                if inserted:
+                    result.findings_created += 1
+                else:
+                    result.findings_skipped_dedup += 1
+        except Exception as exc:
+            logger.warning('Native split album scan failed: %s', exc)
+            result.errors += 1
 
-    def _scan_split_groups(self, cursor, context, settings, result) -> int:
-        """album rows that share an artist and title, compared as one album.
+    def _scan_folder_splits(self, context, result, subjects, check_album, check_mbid):
+        """One folder, one album title, several album artists (#2072).
 
-        returns the number of findings created. one finding per group,
-        keyed on the smallest album id so a re-run dedups against it."""
-        cursor.execute("""
-            SELECT al.id, al.title, ar.name AS artist_name
-            FROM albums al
-            JOIN artists ar ON ar.id = al.artist_id
-            WHERE EXISTS (
-                SELECT 1 FROM tracks t
-                WHERE t.album_id = al.id AND t.file_path IS NOT NULL AND t.file_path != ''
-            )
-        """)
-        groups = {}
-        for row in cursor.fetchall():
-            key = split_group_key(row['artist_name'], row['title'])
-            if not key[0] or not key[1]:
-                continue
-            groups.setdefault(key, []).append(row)
-        split = {key: rows for key, rows in groups.items() if len(rows) >= 2}
-        if not split:
-            return 0
+        The same-artist pass above cannot see these: a compilation with no
+        album artist tag is filed under each track's own artist, so no two of
+        its rows share an artist. What they share is the folder and the title.
 
-        created = 0
-        for rows in split.values():
-            if context.check_stop():
-                break
-            album_ids = sorted(str(r['id']) for r in rows)
-            placeholders = ','.join('?' * len(album_ids))
-            cursor.execute(f"""
-                SELECT id, title, file_path, album_id FROM tracks
-                WHERE album_id IN ({placeholders}) AND file_path IS NOT NULL AND file_path != ''
-            """, album_ids)
-            tracks = cursor.fetchall()
-            tag_data = self._read_track_tags(tracks, context)
-            if len(tag_data) < 2:
-                continue
-            result.scanned += 1
-            per_row = {}
-            for t in tag_data:
-                per_row.setdefault(t.get('album_row'), []).append(t)
-            if not rows_look_like_one_album(list(per_row.values())):
+        Or the tags say so themselves: the same MusicBrainz release id on files
+        of same-titled albums, wherever they are kept.
+
+        Or the title and the shelf: an organiser that filed by track artist
+        leaves one track in each of ``Skream/Wipeout Pulse``,
+        ``Kraftwerk/Wipeout Pulse`` and so on. Those are grouped by the folder
+        above the artist folders, and because every artist has a "Greatest
+        Hits", that group has to look like one record: three or more albums,
+        and no two files holding the same disc and track number.
+        """
+        try:
+            groups, shelves, titled = {}, {}, {}
+            for subject in subjects:
+                folder = release_folder(subject.get('path'))
+                title = split_group_key('', subject.get('album_title'))[1]
+                if folder and title:
+                    owner = subject.get('owner_profile_id')
+                    groups.setdefault((folder.casefold(), title, owner), []).append(subject)
+                    titled.setdefault((title, owner), []).append(subject)
+                    shelf = os.path.dirname(os.path.dirname(folder))
+                    if shelf:
+                        shelves.setdefault((shelf.casefold(), title, owner), []).append(subject)
+            reported = set()
+            read = {}  # the passes below overlap: each file is opened once
+
+            def by_release():
+                """Wherever the files sit: albums of one title under different
+                album artists whose files carry the same MusicBrainz release id
+                are one release, on the tags' own word (#2072, Storm: "I
+                thought this was metadata based rather than folder based").
+                A title half the library shares ("Greatest Hits") is not read
+                through: past RELEASE_GROUP_LIMIT albums the folder passes
+                above are the ones that apply."""
+                for same_title in titled.values():
+                    albums = {s['album_id'] for s in same_title}
+                    if not 2 <= len(albums) <= RELEASE_GROUP_LIMIT or albums <= reported:
+                        continue
+                    if len({str(s.get('album_artist_name') or s.get('artist_name') or '').casefold()
+                            for s in same_title}) < 2:
+                        continue
+                    releases = {}
+                    for tag in _read_subject_tags(same_title, context, read):
+                        if tag.get('mbid_tag'):
+                            releases.setdefault(tag['mbid_tag'], set()).add(tag['file_id'])
+                    for file_ids in releases.values():
+                        yield [s for s in same_title if s['file_id'] in file_ids], 'release'
+
+            evidence = {}
+
+            def by_catalogue_id():
+                """Wherever the files sit and whatever their tags hold: albums
+                of one title under different album artists that a provider
+                gave the same album id (#2072, Storm: "some albums that are
+                split have the same Deezer or Discogs ID, so this could be
+                provider agnostic"). Read from the catalogue, no file opened.
+                A provider's id is a match somebody's search made, and a search
+                by title can land two artists' "Fallen" on one id, so the
+                pieces also have to fit together as one record (below)."""
+                wanted = {}
+                for (title, owner), same_title in titled.items():
+                    albums = {s['album_id'] for s in same_title}
+                    if not 2 <= len(albums) <= RELEASE_GROUP_LIMIT:
+                        continue
+                    if len({str(s.get('album_artist_name') or s.get('artist_name') or '').casefold()
+                            for s in same_title}) < 2:
+                        continue
+                    wanted[(title, owner)] = sorted(albums)
+                if not wanted:
+                    return
+                rows = {}
+                with closing(context.db._get_connection()) as conn:
+                    every = sorted({a for albums in wanted.values() for a in albums})
+                    for start in range(0, len(every), 500):
+                        part = every[start:start + 500]
+                        for row in conn.execute(
+                                'SELECT id, spotify_id, musicbrainz_id, musicbrainz_release_group_id, '
+                                f"upc, external_ids FROM lib2_albums WHERE id IN ({','.join('?' * len(part))})",
+                                part):
+                            rows[int(row['id'])] = row
+                for key, albums in wanted.items():
+                    for members, source, value in albums_sharing_a_release_id(
+                            [rows[a] for a in albums if a in rows]):
+                        if members <= reported:
+                            continue
+                        evidence[frozenset(members)] = (source, value)
+                        yield [s for s in titled[key] if s['album_id'] in members], 'catalogue'
+
+            def candidates():
+                for members in groups.values():
+                    yield members, 'folder'
+                for members in shelves.values():
+                    yield members, 'shelf'
                 if context.report_progress:
                     context.report_progress(
-                        log_line=f'Not merged: {rows[0]["title"]} by {rows[0]["artist_name"]} — '
-                                 f'{len(rows)} entries with the same title look like different albums',
-                        log_type='info',
-                    )
+                        phase='Comparing same-titled albums across artists...',
+                        log_line=(f'{len(titled)} album titles, single-track albums included: '
+                                  'looking for one release filed under several album artists'),
+                        log_type='info')
+                yield from by_release()
+                yield from by_catalogue_id()
+
+            for members, kind in candidates():
+                if context.check_stop() or context.wait_if_paused():
+                    return
+                across_folders = kind == 'shelf'
+                if kind == 'catalogue':
+                    # one record has one track 3: unnumbered files or two on
+                    # the same disc and track are two albums of the same name
+                    places = [(int(s.get('disc_number') or 1), int(s.get('track_number') or 0))
+                              for s in members]
+                    if any(track <= 0 for _disc, track in places) or len(set(places)) != len(places):
+                        continue
+                if kind in ('release', 'catalogue') and {s['album_id'] for s in members} <= reported:
+                    continue
+                if across_folders:
+                    folders = {release_folder(s.get('path')).casefold() for s in members}
+                    places = [(int(s.get('disc_number') or 1), int(s.get('track_number') or 0))
+                              for s in members]
+                    if (len(folders) < 3 or len({s['album_id'] for s in members}) < 3
+                            or any(track <= 0 for _disc, track in places)
+                            or len(set(places)) != len(places)
+                            or {s['album_id'] for s in members} <= reported):
+                        continue
+                album_ids = sorted({s['album_id'] for s in members})
+                artists = {str(s.get('album_artist_name') or s.get('artist_name') or '').casefold()
+                           for s in members}
+                if len(album_ids) < 2 or len(artists) < 2:
+                    continue
+                tags = _read_subject_tags(members, context, read)
+                if len({t['album_id'] for t in tags}) < 2:
+                    continue
+                # positive signs of two releases sharing a folder keep them apart
+                years = {str(t['date_tag'])[:4] for t in tags
+                         if t.get('date_tag') and str(t['date_tag'])[:4].isdigit()}
+                # a provider's own id for the release outranks a year tag: the
+                # pieces of one split album are often tagged with different
+                # years, and that is one of the things to put right
+                if kind == 'catalogue':
+                    years = set()
+                if len(years) > 1 or len({t['rg_tag'] for t in tags if t.get('rg_tag')}) > 1:
+                    continue
+                result.scanned += 1
+                album_artist = folder_split_album_artist(tags)
+                if not album_artist or not context.create_finding:
+                    continue
+                outliers = [t for t in tags if (t.get('albumartist_tag') or '') != album_artist]
+                if not outliers:
+                    continue
+                variants = sorted({t.get('albumartist_tag') or MISSING for t in tags},
+                                  key=lambda v: (v == MISSING, v))
+                inconsistencies = [{'field': 'albumartist', 'canonical': album_artist,
+                                    'variants': variants, 'outlier_count': len(outliers)}]
+                inconsistencies += _detect_inconsistencies(tags, check_album, False, check_mbid)
+                with closing(context.db._get_connection()) as conn:
+                    state = split_catalogue_state(conn, album_ids)
+                album_title = members[0].get('album_title')
+                reported.update(album_ids)
+                where = {'shelf': 'sit in separate artist folders',
+                         'release': 'carry the same MusicBrainz release id'}.get(
+                             kind, 'sit in one folder')
+                shared_id = evidence.get(frozenset(s['album_id'] for s in members))
+                if kind == 'catalogue' and shared_id:
+                    where = f'have the same {source_label(shared_id[0])} id ({shared_id[1]})'
+                inserted = context.create_finding(
+                    job_id=self.job_id, finding_type='album_tag_inconsistency',
+                    severity='warning', entity_type='album', entity_id=f'lib2:{album_ids[0]}',
+                    file_path=None,
+                    title=f'Split by artist on your server: {album_title}',
+                    description=(
+                        f'{len(album_ids)} albums named "{album_title}" {where} under '
+                        f'{len(artists)} different album artists. Unify Tags sets the album '
+                        f'artist to "{album_artist}" on every file so the server shows one album.'),
+                    details={'album_id': f'lib2:{album_ids[0]}', 'album_ids': album_ids,
+                        'server_split': True, 'folder_split': True, 'split_evidence': kind,
+                        'shared_release_id': ({'source': shared_id[0], 'id': shared_id[1]}
+                                              if kind == 'catalogue' and shared_id else None),
+                        'split_catalogue_state': state, 'library_v2_native': True,
+                        'library_owner_id': members[0].get('owner_profile_id') or 1,
+                        'album_title': album_title, 'artist_name': album_artist,
+                        'inconsistencies': inconsistencies, 'track_count': len(tags),
+                        'tracks': [{'id': t['track_id'], 'track_id': t['track_id'],
+                            'file_id': t['file_id'], 'album_id': t['album_id'],
+                            'owner_profile_id': t['owner_profile_id'],
+                            'title': t['track_title'], 'file_path': t['file_path']} for t in tags],
+                        'library_v2': {'album_id': album_ids[0], 'album_ids': album_ids,
+                            'artist_id': members[0].get('artist_id'),
+                            'track_ids': sorted({s['track_id'] for s in members}),
+                            'file_ids': sorted({t['file_id'] for t in tags})}})
+                if inserted:
+                    result.findings_created += 1
+                else:
+                    result.findings_skipped_dedup += 1
+                if context.report_progress:
+                    context.report_progress(
+                        log_line=f'Found: {album_title}, split across {len(artists)} album artists',
+                        log_type='warning')
+        except Exception as exc:
+            logger.warning('Folder split album scan failed: %s', exc)
+            result.errors += 1
+
+    def _scan_native_albums(self, context: JobContext, result: JobResult, file_subjects,
+                            check_album: bool, check_artist: bool, check_mbid: bool):
+        """Library-v2 releases grouped by their native file subjects."""
+        # One finding per release: its id is the dedup key, so a per-library
+        # split would let one library's finding overwrite the other's. The
+        # fix still checks each listed file's owner.
+        albums = {}
+        for subject in file_subjects:
+            albums.setdefault(subject['album_id'], []).append(subject)
+
+        # The skip breakdown, ported from the legacy projection this replaced.
+        # It is not decoration: an album with two tracks and no stored file paths is
+        # the Navidrome-shaped gap, and without the breakdown "Scanned: 1" against a
+        # three-album library reads as a broken scan rather than as two deliberate
+        # exclusions.
+        # The scoped artist's releases, as upstream's album-artist filter: a
+        # guest-led first track does not hide one, a guest spot is not one.
+        scope_artist = get_scope_artist(context)
+        eligible, single_track, no_paths = [], 0, 0
+        for album_id, subjects in albums.items():
+            if scope_artist and (subjects[0].get('album_artist_name') or '').casefold() != scope_artist.casefold():
                 continue
-            inconsistencies = find_inconsistencies(tag_data, settings)
-            if not inconsistencies:
+            if len(subjects) < 2:
+                single_track += 1
+            elif not [s for s in subjects if str(s.get('path') or '').strip()]:
+                no_paths += 1
+            else:
+                eligible.append((album_id, subjects))
+        total = len(eligible) + single_track + no_paths
+        if context.report_progress:
+            context.report_progress(
+                # "Checking 3632 of 12376 albums" read as two thirds of the
+                # library being left out (#2072). this step compares the tracks
+                # INSIDE an album, which takes two; the split passes after it
+                # look at every album, and the log says so
+                phase=f'Comparing the tracks inside {len(eligible)} of {total} albums...',
+                total=len(eligible),
+                log_line=(
+                    f'{total} albums in the database — {len(eligible)} eligible, '
+                    f'{single_track} single-track, {no_paths} without stored file paths. '
+                    'This step compares the tracks inside one album, so it needs two or more. '
+                    'Every album, single-track ones included, is then compared with the '
+                    'others of its title for a release split across album artists.'
+                ),
+                log_type='info')
+        if context.update_progress:
+            context.update_progress(0, len(eligible))
+
+        unreadable = 0
+        for idx, (album_id, subjects) in enumerate(eligible):
+            if context.check_stop() or context.wait_if_paused():
+                return
+            result.scanned += 1
+            # G11-8: the bar sat at 0/N for the whole run; 3.6.1 moved it and
+            # named an album every 20
+            if context.update_progress:
+                context.update_progress(idx + 1, len(eligible))
+            if context.report_progress and idx % 20 == 0:
+                context.report_progress(
+                    scanned=idx + 1, total=len(eligible),
+                    phase=f'Scanning {idx + 1} / {len(eligible)}',
+                    log_line=f"{subjects[0].get('artist_name')} — {subjects[0].get('album_title')}",
+                    log_type='info')
+
+            tag_data = _read_subject_tags(subjects, context)
+
+            if len(tag_data) < 2:
+                # Eligible on paper, but the files are not there to read. Counted and
+                # reported rather than silently skipped — this is what tells a user
+                # their paths have drifted.
+                unreadable += 1
                 continue
 
-            album_title = rows[0]['title']
-            artist_name = rows[0]['artist_name']
+            inconsistencies = _detect_inconsistencies(
+                tag_data, check_album, check_artist, check_mbid)
+            if not inconsistencies or not context.create_finding:
+                continue
+
+            album_title = subjects[0].get('album_title')
+            artist_name = subjects[0].get('artist_name')
             fields_affected = ', '.join(i['field'] for i in inconsistencies)
             total_outliers = sum(i['outlier_count'] for i in inconsistencies)
             desc_parts = []
@@ -551,37 +725,45 @@ class AlbumTagConsistencyJob(RepairJob):
                 finding_type='album_tag_inconsistency',
                 severity='warning',
                 entity_type='album',
-                entity_id=album_ids[0],
+                entity_id=f"lib2:{album_id}",
                 file_path=None,
-                title=f'Split on your server: {album_title} by {artist_name}',
-                description=(
-                    f'Your server shows this album as {len(rows)} entries. '
-                    f'{total_outliers} track(s) have mismatched {fields_affected}. '
-                    + '; '.join(desc_parts)
-                ),
+                title=f'Inconsistent tags: {album_title} by {artist_name}',
+                description=f'{total_outliers} track(s) have mismatched {fields_affected}. ' + '; '.join(desc_parts),
                 details={
-                    'album_id': album_ids[0],
-                    'album_ids': album_ids,
+                    'album_id': f"lib2:{album_id}",
                     'album_title': album_title,
                     'artist_name': artist_name,
-                    'server_split': True,
                     'inconsistencies': inconsistencies,
                     'track_count': len(tag_data),
-                    'tracks': [{'id': t['track_id'], 'title': t['track_title'],
-                                'file_path': t['file_path']} for t in tag_data],
+                    'tracks': [{'id': t['track_id'], 'track_id': t['track_id'], 'file_id': t['file_id'],
+                                'album_id': album_id, 'owner_profile_id': t['owner_profile_id'],
+                                'title': t['track_title'], 'file_path': t['file_path']} for t in tag_data],
+                    'library_v2_native': True,
+                    'library_v2': {
+                        'artist_id': subjects[0].get('artist_id'),
+                        'album_id': album_id,
+                        'track_id': None,
+                        'file_id': None,
+                        'artist_ids': [subjects[0]['artist_id']] if subjects[0].get('artist_id') else [],
+                        'album_ids': [album_id],
+                        'track_ids': sorted({s['track_id'] for s in subjects}),
+                        'file_ids': sorted({s['file_id'] for s in subjects}),
+                    },
                 },
             )
             if inserted:
                 result.findings_created += 1
-                created += 1
             else:
                 result.findings_skipped_dedup += 1
             if context.report_progress:
-                context.report_progress(
-                    log_line=f'Split: {album_title} ({len(rows)} entries) — {fields_affected}',
-                    log_type='warning',
-                )
-        return created
+                context.report_progress(log_line=f'Found: {album_title} — {fields_affected}',
+                                        log_type='warning')
+
+        if unreadable and context.report_progress:
+            context.report_progress(
+                log_line=(f'{unreadable} album(s) skipped because their files '
+                          f'could not be read'),
+                log_type='warning')
 
     def _resolve_path(self, file_path, context):
         """Resolve a DB file path to an actual filesystem path."""

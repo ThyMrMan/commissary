@@ -137,27 +137,10 @@ def _publish_atomic_album(batch_id: str, batch: dict, deps=None) -> bool:
 
         db = MusicDatabase()
 
-        # Repoint one file, returning how many library rows moved with it.
-        #
-        # The count is the publish's proof that the library knows where the file
-        # went; an audio file that repoints nothing leaves the library pointing
-        # at a staging path this publish is about to remove. None means the count
-        # carries no meaning — "unknown", not "zero" — and an unknown must not
-        # fail a publish that may well have worked.
-        #
-        # THAT PROOF ONLY EXISTS ON A 'soulsync' SERVER. Rows with a staged path
-        # are written by record_soulsync_library_entry, which is gated on the
-        # active media server being soulsync — on a Plex/Navidrome/Jellyfin
-        # install there is legitimately NO row until the server scans the
-        # PUBLISHED files. Reading that 0 as a failure made every atomic album
-        # publish on a media-server install roll itself back and strand the album
-        # in .soulsync_atomic_staging forever (Lil-Uzi-Chimp, Docker + Navidrome:
-        # two direct albums landed, the one staged album stuck). The UPDATE still
-        # runs — a row from an earlier soulsync-mode session deserves repointing
-        # — but its count is only evidence where the rows are ours to expect.
-        #
-        # Shared with the startup recovery (#1289), which republishes an
-        # abandoned staging tree and needs the identical rule.
+        # Repoint one file, returning how many library rows moved with it --
+        # the publish's proof that the catalogue knows where the file went
+        # (L2-002). Shared with the startup recovery (#1289); the reasoning for
+        # why a zero is evidence on this branch lives with the helper.
         from core.downloads.atomic_recovery import make_db_path_updater
         _db_update = make_db_path_updater(db)
 
@@ -280,6 +263,38 @@ def _cleanup_private_album_bundle_staging(batch_id: str, batch: dict) -> None:
         logger.info("[Album Bundle] Cleaned private staging folder for batch %s: %s", batch_id, staging_path)
     except Exception as exc:
         logger.warning("[Album Bundle] Could not clean private staging folder %s: %s", staging_path, exc)
+
+
+# A task in one of these left nothing in the release it still needs.
+_REMOVE_COMPLETED_TASK_STATUSES = ('completed', 'already_owned')
+
+
+def _remove_completed_album_bundle(batch_id: str, batch: dict, tasks_snapshot: dict) -> bool:
+    """Remove Completed for a usenet album grab, at the end of its batch.
+
+    Only when EVERY task of the batch finished completed (or already owned):
+    one failed, not-found or cancelled track keeps the job and its files in
+    the client, so the release is still there for a retry or a manual import.
+    The staged copies are deleted with the batch, so the client's folder is
+    the only copy left. Best-effort; the setting itself is read by the usenet
+    plugin (off means nothing happens)."""
+    if (batch.get('album_bundle_source') or '').lower() != 'usenet':
+        return False
+    job_id = batch.get('album_bundle_client_job')
+    if not job_id:
+        return False
+    statuses = [str((task or {}).get('status') or '') for task in (tasks_snapshot or {}).values()]
+    queue = batch.get('queue') or []
+    if not statuses or len(statuses) < len(queue):
+        return False
+    left = [s for s in statuses if s not in _REMOVE_COMPLETED_TASK_STATUSES]
+    label = batch.get('album_bundle_client_job_label') or ''
+    if left:
+        logger.info("[Album Bundle] Kept usenet job %s for batch %s: %d of %d track(s) "
+                    "did not import", label or job_id, batch_id, len(left), len(statuses))
+        return False
+    from core.download_plugins.usenet import remove_imported_album_job
+    return remove_imported_album_job(str(job_id), label=label)
 
 
 # Audio a stranded bundle might still be holding. Same list the auto-import
@@ -666,6 +681,14 @@ def start_next_batch_of_downloads(batch_id: str, deps: LifecycleDeps) -> None:
 # on_download_completed
 # ---------------------------------------------------------------------------
 
+# Statuses that mean "this task will not do any more work". `already_owned` is
+# here because a task that stood down against a sibling that already has the
+# file has genuinely finished — leaving it out let a deduped task hold its batch
+# in 'downloading' forever, since the batch waits for every queue entry to reach
+# a terminal state.
+_FINISHED_TASK_STATUSES = ('completed', 'failed', 'cancelled', 'not_found',
+                           'already_owned')
+
 
 def _wake_waiting_batches(finished_batch_id: str, deps: LifecycleDeps) -> None:
     """Offer a just-freed worker slot to the batches the global gate is holding.
@@ -839,9 +862,11 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
     batch['phase'] = 'complete'
     batch['completion_time'] = time.time()  # Track when batch completed
 
-    # Record sync history completion (reads download_tasks, so under the lock)
-    from database.music_database import MusicDatabase
-    record_sync_history_completion(MusicDatabase(), batch_id, batch)
+    # Sync history: read download_tasks here, under the lock; the write is the
+    # first thing the out-of-lock half does. writing here held tasks_lock (and
+    # every downloads page) for as long as the db write lock was busy
+    from core.downloads.history import build_sync_history_completion
+    history_payload = build_sync_history_completion(batch_id, batch)
 
     # Add activity for batch completion
     playlist_name = batch.get('playlist_name', 'Unknown Playlist')
@@ -860,7 +885,10 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
         try:
             if deps.automation_engine:
                 _credits = _batch_event_credits(batch, queue)
-                deps.automation_engine.emit('batch_complete', {
+                from core.automation.owners import owned
+                # the batch's profile; a batch that downloaded nothing and
+                # only pays an earlier batch's scan is the install's
+                deps.automation_engine.emit('batch_complete', owned({
                     'playlist_name': playlist_name,
                     'artist': _credits['artist'],
                     'title': _credits['title'],
@@ -869,7 +897,7 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
                     'completed_tracks': str(successful_downloads),
                     'failed_tracks': str(failed_count),
                     'more_batches_pending': 'true' if more_pending else 'false',
-                })
+                }, batch.get('profile_id') if successful_downloads > 0 else None))
         except Exception as e:
             logger.debug("batch_complete emit failed: %s", e)
 
@@ -899,7 +927,9 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
         if task is None:
             continue
         tasks_snapshot[tid] = dict(task)
-        if task.get('status') == 'completed':
+        # already_owned: another batch fetched this exact recording (the
+        # cross-batch dedup); it is in the playlist all the same
+        if task.get('status') in ('completed', 'already_owned'):
             ti = task.get('track_info', {})
             artists = ti.get('artists', [])
             artist_str = artists[0] if isinstance(artists, list) and artists else ''
@@ -918,7 +948,8 @@ def _mark_batch_complete(batch_id: str, batch: dict, deps: LifecycleDeps, *,
         batch['wishlist_processing_complete'] = True
 
     return {'m3u_tracks': m3u_tracks, 'tasks_snapshot': tasks_snapshot,
-            'successful_downloads': successful_downloads}
+            'successful_downloads': successful_downloads,
+            'history_payload': history_payload}
 
 
 def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: LifecycleDeps,
@@ -933,6 +964,14 @@ def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: Lifecyc
     snapshot taken under it."""
     tasks_snapshot = outcome.get('tasks_snapshot') or {}
 
+    # sync history, built under the lock in _mark_batch_complete
+    try:
+        from core.downloads.history import write_sync_history_completion
+        from database.music_database import MusicDatabase
+        write_sync_history_completion(MusicDatabase(), batch_id, outcome.get('history_payload'))
+    except Exception as _hist_err:  # noqa: BLE001 — the batch is already complete
+        logger.warning(f"{tag} Could not write sync history: {_hist_err}")
+
     # ALBUM-BUNDLE STAGING CLEANUP: the synchronous shutil.rmtree of the
     # private staging tree. Runs here — outside the global lock — instead of
     # in _mark_batch_complete, so a large staging tree can't stall the
@@ -941,6 +980,13 @@ def _run_batch_completion_side_effects(batch_id: str, batch: dict, deps: Lifecyc
         _cleanup_private_album_bundle_staging(batch_id, batch)
     except Exception as _stage_err:  # noqa: BLE001 — best-effort, batch is already complete
         logger.warning(f"{tag} Album-bundle staging cleanup failed (non-fatal): {_stage_err}")
+
+    # Remove Completed for a usenet album grab: only now, with every track's
+    # outcome known (and never while any task could still read the release)
+    try:
+        _remove_completed_album_bundle(batch_id, batch, tasks_snapshot)
+    except Exception as _rc_err:  # noqa: BLE001 — best-effort, batch is already complete
+        logger.warning(f"{tag} Remove Completed for the album grab failed (non-fatal): {_rc_err}")
 
     # post-download playlist sync: note which playlists this batch fed. db
     # lookups, so it lives out here and not under tasks_lock
@@ -1100,7 +1146,13 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                     # a failed download keeps the task's own reason (tidal said no,
                     # the transfer stalled, ...). a bare 'Download failed' left the
                     # wishlist saying "keeps failing" with nothing to go on.
-                    'failure_reason': 'Download cancelled' if task_status == 'cancelled' else ('No matching track found' if task_status == 'not_found' else (task.get('error_message') or 'Download failed')),
+                    # a not found used to store a bare 'No matching track found',
+                    # so the wishlist couldn't say which searches ran or what they
+                    # turned up (#1981). the task's own words follow it now. the
+                    # prefix stays, the wishlist files rows by it
+                    'failure_reason': 'Download cancelled' if task_status == 'cancelled' else (
+                        ('No matching track found' + (f". {task['error_message']}" if task.get('error_message') else ''))
+                        if task_status == 'not_found' else (task.get('error_message') or 'Download failed')),
                     'candidates': task.get('cached_candidates', []),  # Include search results if available
                 }
 
@@ -1119,11 +1171,14 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
 
                     try:
                         if deps.automation_engine:
-                            deps.automation_engine.emit('download_failed', {
+                            from core.automation.owners import owned
+                            _owner = (download_tasks.get(task_id) or {}).get('profile_id') \
+                                or download_batches[batch_id].get('profile_id')
+                            deps.automation_engine.emit('download_failed', owned({
                                 'artist': track_info.get('artist_name', ''),
                                 'title': track_info.get('track_name', ''),
                                 'reason': track_info.get('failure_reason', 'Unknown'),
-                            })
+                            }, _owner))
                     except Exception as e:
                         logger.debug("download_failed emit failed: %s", e)
 
@@ -1180,7 +1235,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
             download_batches[batch_id]['active_count'] = max(0, old_active - 1)
             new_active = download_batches[batch_id]['active_count']
 
-            logger.error(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
+            (logger.info if success else logger.warning)(f"[Batch Manager] Task {task_id} completed ({'success' if success else 'failed/cancelled'}). Active workers: {old_active} → {new_active}/{download_batches[batch_id]['max_concurrent']}")
 
         # ENHANCED: Always check batch completion after any task completes (including duplicate calls)
         # This ensures completion is detected even when mixing normal downloads with cancelled tasks
@@ -1227,7 +1282,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
                         finished_count += 1
                     else:
                         retrying_count += 1
-                elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                elif task_status in _FINISHED_TASK_STATUSES:
                     finished_count += 1
             else:
                 # Task ID in queue but not in download_tasks - treat as completed to prevent blocking
@@ -1238,7 +1293,7 @@ def _on_download_completed(batch_id: str, task_id: str, success: bool, deps: Lif
         has_retrying_tasks = retrying_count > 0
 
         if all_tasks_started and no_active_workers and all_tasks_truly_finished and not has_retrying_tasks:
-            logger.error(f"[Batch Manager] Batch {batch_id} truly complete - all {finished_count}/{len(queue)} tasks finished - processing failed tracks to wishlist")
+            logger.info(f"[Batch Manager] Batch {batch_id} truly complete - all {finished_count}/{len(queue)} tasks finished - processing failed tracks to wishlist")
         elif all_tasks_started and no_active_workers and has_retrying_tasks:
             logger.warning(f"[Batch Manager] Batch {batch_id}: all workers free but {retrying_count} tasks retrying - continuing monitoring")
         elif all_tasks_started and no_active_workers:
@@ -1371,7 +1426,7 @@ def check_batch_completion_v2(batch_id: str, deps: LifecycleDeps) -> Optional[bo
                             finished_count += 1
                         else:
                             retrying_count += 1
-                    elif task_status in ['completed', 'failed', 'cancelled', 'not_found']:
+                    elif task_status in _FINISHED_TASK_STATUSES:
                         finished_count += 1
                 else:
                     # Task ID in queue but not in download_tasks - treat as completed to prevent blocking

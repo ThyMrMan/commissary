@@ -128,6 +128,39 @@ def _expected_duration_sec(db, dl) -> float | None:
         return None
 
 
+def _with_episode_title(db, dl):
+    """The download with its episode's title in ``search_ctx``, for the
+    template's $episodetitle. no grab path put it there (the wishlist search,
+    the manual search, a retry), so every import named the file without it
+    (SeadogsBooty). from the library's episode row, else the wishlist row,
+    else TMDB's season (cached). unchanged when it's known or not an episode."""
+    from core.video.importer import _scope_of, _search_ctx
+    try:
+        if _scope_of(dl) != "episode":
+            return dl
+        ctx = _search_ctx(dl)
+        if ctx.get("episode_title") or ctx.get("episode") is None or ctx.get("season") is None:
+            return dl
+        _kind, tmdb_id, sn, en, _c = _wishlist_ids(db, dl)
+        if not tmdb_id:
+            return dl
+        title = db.episode_title_for(tmdb_id, sn, en)
+        if not title:
+            from database.video_database import real_episode_title
+            from core.video.enrichment.engine import get_video_enrichment_engine
+            season = get_video_enrichment_engine().tmdb_season(int(tmdb_id), int(sn)) or {}
+            for e in season.get("episodes") or []:
+                if e.get("episode_number") == int(en) and real_episode_title(e.get("title")):
+                    title = str(e["title"]).strip()
+                    break
+        if not title:
+            return dl
+        return {**dl, "search_ctx": json.dumps({**ctx, "episode_title": title})}
+    except Exception:   # noqa: BLE001 - a title lookup never blocks an import
+        logger.debug("episode title lookup failed for download %s", dl.get("id"), exc_info=True)
+        return dl
+
+
 def _soulseek_size_error(dl, src) -> str | None:
     """Error text when a finished Soulseek transfer's bytes fall well short of what
     was advertised — the backstop for truncations the duration check can't see
@@ -160,6 +193,43 @@ def _reclaim_source(path) -> None:
     except OSError as e:
         logger.info("video import: couldn't reclaim download copy %s (%s)",
                     os.path.basename(str(path)), e)
+
+
+def _remove_completed_usenet(db, dl, upd) -> bool:
+    """Remove Completed: take a usenet job out of the client once its import is
+    persisted, per the ``usenet_remove_completed`` setting (off / history /
+    files; default off -- see core.downloads.remove_completed).
+
+    Only a ``completed`` row reaches here; failed and ``import_failed`` rows keep
+    their job, because Manual import needs the files. A season pack qualifies
+    only when every episode it mapped imported and it held no video it could not
+    place. Best-effort: never raises, and a job left behind is the old
+    behavior."""
+    try:
+        if str(dl.get("source") or "").lower() != "usenet" or upd.get("status") != "completed":
+            return False
+        from core.downloads import remove_completed
+        mode = remove_completed.normalize(db.get_setting("usenet_remove_completed"))
+        if mode == remove_completed.OFF:
+            return False
+        ref = str(dl.get("client_ref") or "")
+        if not ref:
+            return False
+        if upd.get("_pack_failed") or upd.get("_pack_unplaced"):
+            logger.info("video import: kept usenet job %s in the client -- the pack left "
+                        "%d episode(s) not imported and %d file(s) unplaced", ref,
+                        int(upd.get("_pack_failed") or 0), int(upd.get("_pack_unplaced") or 0))
+            return False
+        from core.video.client_download import _resolve_path, _run
+        return remove_completed.remove_imported_job(ref, mode, run=_run,
+                                                    label=str(dl.get("title") or ""),
+                                                    resolve=_resolve_path,
+                                                    protected=_protected_roots(),
+                                                    libraries=_library_roots())
+    except Exception:  # noqa: BLE001 - never let client cleanup break the monitor tick
+        logger.warning("video import: remove-completed failed for download %s",
+                       dl.get("id"), exc_info=True)
+        return False
 
 
 def _reclaim_job_dir(path) -> str:
@@ -209,6 +279,14 @@ def _protected_roots() -> set:
             roots.add(os.path.abspath(dl_dir))
     except Exception:   # noqa: BLE001
         pass
+    return roots | _library_roots()
+
+
+def _library_roots() -> set:
+    """The video library and transfer folders: a usenet job folder found inside
+    one is never deleted by Remove Completed (a client completing straight
+    into the library). Best-effort."""
+    roots = set()
     try:
         from api.video import get_video_db
         db = get_video_db()
@@ -217,11 +295,13 @@ def _protected_roots() -> set:
             v = db.get_setting(key)
             if v:
                 roots.add(os.path.abspath(str(v)))
-        from core.video.library_roots import four_k_path
+        from core.video.library_roots import custom_library_paths, four_k_path
         for kind in ("movie", "episode"):
             v = four_k_path(db, kind)
             if v:
                 roots.add(os.path.abspath(v))
+        for v in custom_library_paths(db):
+            roots.add(os.path.abspath(v))
     except Exception:   # noqa: BLE001
         pass
     return roots
@@ -252,17 +332,14 @@ def _sweep_import_temps(db) -> int:
             v = None
         if v:
             roots.add(os.path.abspath(str(v)))
-    try:  # Commissary: video Library folders hold import temp files too
-        from core.commissary.video_libraries import paths as _vlib_paths
-        roots.update(os.path.abspath(p) for p in _vlib_paths(db))
-    except Exception:   # noqa: BLE001
-        pass
     try:
-        from core.video.library_roots import four_k_path
+        from core.video.library_roots import custom_library_paths, four_k_path
         for kind in ("movie", "episode"):
             v = four_k_path(db, kind)
             if v:
                 roots.add(os.path.abspath(v))
+        for v in custom_library_paths(db):
+            roots.add(os.path.abspath(v))
     except Exception:   # noqa: BLE001 - the sweep is best-effort
         pass
     try:
@@ -328,7 +405,7 @@ def _make_organizer(db):
             return {"status": "failed", "progress": 100.0, "error": size_err,
                     "dest_path": src, "_bad_release": True}
         from core.video.recycle import discarder
-        from core.video.importer import plan_import
+        from core.video.importer import plan_import, title_locked
         # Plan BEFORE the file moves: move mode relocates the source before the
         # completed row is persisted, so a crash in between used to strand the row
         # at importing/100% with the file already in the library. The destination
@@ -347,20 +424,16 @@ def _make_organizer(db):
         rename_before_import(db, dl)
         from core.commissary.naming import custom_formats_for          # Commissary: {Custom Formats}
         dl = {**dl, "_custom_formats": custom_formats_for(db, dl)}
+        dl = _with_episode_title(db, dl)
+        owned_dir = _owned_library_dir(db, dl, settings)
+        ids = template_ids(db, dl, settings)
         plan = plan_import(dl, src, list_dir=fs.list_dir, probe=probe_info,
-                           settings=settings, library_dir=_owned_library_dir(db, dl, settings),
+                           settings=settings, library_dir=owned_dir,
                            expected_duration_sec=_expected_duration_sec(db, dl),
-                           ids=template_ids(db, dl, settings),
-                           identity=library_identity(db, dl))  # Commissary
-        # Commissary: "Lock automatic edits" refuses an unattended import into a locked
-        # show, season or movie (manual import never comes through here). Not a bad
-        # release: it may be fine, just aimed at protected content.
-        if plan["action"] in ("import", "upgrade"):
-            from core.commissary.import_lock import refusal as _lock_refusal
-            _locked = _lock_refusal(db, dl)
-            if _locked:
-                plan = {"action": "reject", "bad_release": False,
-                        "reason": _locked + ". Place it by hand once you have checked it."}
+                           ids=ids,
+                           identity=library_identity(db, dl),  # Commissary
+                           series_name=_series_name(db, dl, settings, ids, owned_dir),
+                           locked=title_locked(db, dl))
         if _pre_persist_dest and plan["action"] in ("import", "upgrade") and plan.get("dest"):
             try:
                 db.update_video_download(dl["id"], dest_path=plan["dest"]["path"])
@@ -377,9 +450,22 @@ def _make_organizer(db):
             # each its own download row (durable per-episode wanted rows).
             if settings.get("download_subtitles") and not dl.get("pack_episode"):
                 write_subtitles_for(db, dl, patch["dest_path"], settings, fs)
+            keep_probe(db, patch["dest_path"], probe_info)
         return patch
 
     return organize
+
+
+def keep_probe(db, dest_path, probe_info) -> None:
+    """what ffprobe read off a file that just landed (its audio and subtitle
+    languages), kept so the library shows it once the media server scans the
+    file in: a plex scan sends no stream data. best effort."""
+    if not isinstance(probe_info, dict) or not probe_info.get("ok"):
+        return
+    try:
+        db.record_file_probe(dest_path, os.path.getsize(dest_path), probe_info)
+    except Exception:   # noqa: BLE001 - the languages are a nicety, never the import
+        logger.debug("could not keep the probe for %s", dest_path, exc_info=True)
 
 
 def pack_file_list(root, walker=None, sizer=None):
@@ -433,14 +519,14 @@ def _record_pack_episode(db, ep_dl, patch):
             k: ep_dl.get(k) for k in
             ("kind", "title", "release_title", "source", "username", "filename",
              "size_bytes", "quality_label", "target_dir", "media_id", "media_source",
-             "year", "poster_url", "search_ctx", "quality_profile_id")
+             "year", "poster_url", "search_ctx", "quality_profile_id", "profile_id")
         } | {"status": "completed", "attempts": 0})
         db.update_video_download(child, dest_path=patch.get("dest_path"),
                                  progress=100.0, completed_at=_now(),
                                  quality_label=patch.get("quality_label") or ep_dl.get("quality_label"))
         row = {**ep_dl, "id": child}
         _archive_history(db, row, patch)
-        _publish_terminal(row, patch)
+        _publish_terminal(row, patch, _owners(db, row))
         return child
     except Exception:
         logger.exception("pack: failed to record the row for %s", ep_dl.get("filename"))
@@ -548,7 +634,10 @@ def _make_pack_importer(db, organize):
         # immediate searches.
         return {"status": "completed", "progress": 100.0,
                 "dest_path": imported[0][2].get("dest_path"),
-                "_pack_imported": len(imported), "_pack_failed": len(failed)}
+                "_pack_imported": len(imported), "_pack_failed": len(failed),
+                # video files the pack held but placed nowhere (no episode number,
+                # another season): Remove Completed must not delete those
+                "_pack_unplaced": sum(1 for s in skipped if s.get("unplaced"))}
 
     return import_pack
 
@@ -814,6 +903,14 @@ def write_subtitles_for(db, dl, dest_path, settings, fs):
         if isinstance(ctx, dict) and ctx.get("season") is not None:
             identity["season"] = ctx.get("season")
             identity["episode"] = ctx.get("episode")
+            try:
+                # a lumped season kept the server's way: the subtitle sites
+                # only know its split numbers
+                scene = db.scene_number(tmdb_id, ctx.get("season"), ctx.get("episode"))
+            except Exception:   # noqa: BLE001
+                scene = None
+            if scene:
+                identity["season"], identity["episode"] = scene
         if not (identity.get("tmdb_id") or identity.get("imdb_id")):
             return
 
@@ -1013,6 +1110,17 @@ def _walk(root: str):
 
 _GIVE_UP_AFTER = 8       # consecutive 'transfer gone, no file' polls before failing it
 _misses: dict = {}       # download id -> consecutive missing polls
+# A usenet job SAB has just been handed first sits as a 'Grabbing' placeholder
+# while SAB fetches its NZB (one at a time, so a few grabs queue up), then is in
+# neither the queue nor the history while SAB adds its files one by one -- on a
+# busy SAB a job with ~80 files took minutes (worst seen 245 s during a storage
+# scrub, 121 s without one). Eight 3-second polls ran out first, the row
+# failed, SAB downloaded the job anyway, and the wishlist grabbed it again. So
+# until the client reports a new usenet job in a real state, misses inside this
+# window don't count; each sighting of the placeholder starts the window again.
+_NEW_USENET_GRACE = 300  # seconds
+_grace: dict = {}        # (download id, client ref) -> window start (monotonic), None once reported
+_clock = time.monotonic  # seam for tests
 _STALL_TIMEOUT = 1800    # seconds of zero % movement (queued or frozen) before giving up
 # NB: the stall clock is NOT kept here any more — it lives on the row as
 # `progress_at`. A module dict keyed off process uptime was wiped by every
@@ -1024,6 +1132,38 @@ _requerying: set = set()  # download ids with a requery thread in flight
 
 def _now():
     return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+
+
+def _grace_key(dl):
+    ref = str(dl.get("client_ref") or "")
+    if str(dl.get("source") or "") != "usenet" or not ref:
+        return None
+    return (dl.get("id"), ref)
+
+
+def _in_new_job_grace(dl, now) -> bool:
+    """True while a usenet row's job is new and the client has not reported it
+    yet -- a miss then means 'still being added', not 'gone'."""
+    key = _grace_key(dl)
+    if key is None:
+        return False
+    start = _grace.setdefault(key, now)
+    return start is not None and now - start < _NEW_USENET_GRACE
+
+
+def _mark_reported(dl) -> None:
+    """The client has reported this job: from now on a miss is a real miss."""
+    key = _grace_key(dl)
+    if key is not None:
+        _grace[key] = None
+
+
+def _restart_grace(dl, now) -> None:
+    """The client is still fetching the job's NZB: the build, and the gap that
+    comes with it, is still ahead, so the window starts again."""
+    key = _grace_key(dl)
+    if key is not None and _grace.get(key, 0) is not None:
+        _grace[key] = now
 
 
 # ── auto-retry ────────────────────────────────────────────────────────────────
@@ -1078,13 +1218,82 @@ def retry_another_release(db, dl) -> dict:
         if tmdb_id:
             if already_failed:
                 _wishlist_failed(db, dl)   # make sure the row is back on the wishlist
-            from core.video.wishlist_search import manual_search
-            scope = "movie" if kind == "movie" else ("episode" if en is not None else "show")
-            manual_search(scope, int(tmdb_id), season_number=sn, episode_number=en)
-            kicked = True
+            kicked = _search_again_now(db, dl)
     except Exception:
         logger.exception("video download %s: wishlist search kick failed", dl.get("id"))
     return {"status": "failed", "wishlist_search": kicked}
+
+
+def block_and_retry_failed(db) -> dict:
+    """Block every failed row's release and grab the next release for each.
+
+    The bulk twin of a row's block-and-retry. Every block lands first, then
+    one background thread searches the titles one at a time: a retry per row
+    fired at once started a search per row together, which is a flood of
+    indexer calls for a list of 40. A title failed twice is searched once
+    (the second finds the first's grab in flight and skips)."""
+    # an import folder row has no release to block: its file is in the folder (#2129)
+    rows = [r for r in (db.failed_video_downloads() or [])
+            if str(r.get("kind") or "") != "youtube" and str(r.get("source") or "") != "import"]
+    blocked = 0
+    for dl in rows:
+        if dl.get("username") and dl.get("filename"):
+            _blocklist_release(db, dl, "Blocked with retry failed: %s" % (dl.get("error") or "failed"))
+            blocked += 1
+        _wishlist_failed(db, dl)   # back on the wishlist, so the search finds it
+
+    def run():
+        for dl in rows:
+            try:
+                _search_again_now(db, dl, wait=True)
+            except Exception:  # noqa: BLE001 - one title must not stop the rest
+                logger.exception("video download %s: block-and-retry search failed", dl.get("id"))
+
+    if rows:
+        threading.Thread(target=run, daemon=True, name="video-block-retry-failed").start()
+    return {"blocked": blocked, "searching": len(rows)}
+
+
+def _search_again_now(db, dl, *, wait: bool = False) -> bool:
+    """Run the wishlist search for this download's item now, for every profile
+    that has it wished. The search ranks under that wish's profile and the
+    blocklist drops what already failed, so the next best release is grabbed.
+
+    It used to search profile 1's wishlist only: a show another profile wished
+    found no item there, and "retry with another" quietly did nothing."""
+    kind, tmdb_id, sn, en, _ctx = _wishlist_ids(db, dl)
+    if kind == "youtube" or not tmdb_id:
+        return False
+    from core.video.wishlist_search import manual_search
+    scope = "movie" if kind == "movie" else ("episode" if en is not None else "show")
+    try:
+        profiles = db.wishlist_profiles_for_media(
+            kind, int(tmdb_id), season_number=sn, episode_number=en,
+            **_wishlist_scope(db, dl, kind, tmdb_id))
+    except Exception:  # noqa: BLE001 - fall back to the default profile
+        profiles = []
+    # the in-flight key is per item, not per profile, so a second profile's
+    # search is skipped while the first runs: one grab, not one per profile.
+    # ``wait``: True only when something was grabbed (or another search or
+    # download already has the item, which is handled too)
+    # the retry ranks under the profile the failed grab was ranked by. the
+    # wishlist row often has none (a profile picked in the search modal for a
+    # show not in the library yet), and the replacement fell back to Default
+    keep = {"quality_profile_id": dl["quality_profile_id"]} if dl.get("quality_profile_id") else {}
+    copy_scope = _wishlist_scope(db, dl, kind, tmdb_id)
+    if copy_scope:
+        # the retry is for this copy's row (#2029): 0 = the title's own
+        keep["video_library_id"] = int(copy_scope["video_library_id"] or 0)
+    handled = False
+    for pid in profiles or [1]:
+        res = manual_search(scope, int(tmdb_id), season_number=sn, episode_number=en,
+                            profile_id=int(pid), **({"wait": True} if wait else {}), **keep) or {}
+        if not wait:
+            continue
+        if res.get("grabbed") or (res.get("skipped") and not res.get("queued")):
+            handled = True
+            break
+    return handled if wait else True
 
 
 def _archive_history(db, dl, upd) -> None:
@@ -1127,6 +1336,50 @@ def _wishlist_ids(db, dl):
             ctx.get("season"), ctx.get("episode"), ctx)
 
 
+def _copy_scope(db, dl, kind, tmdb_id) -> dict:
+    """Which owned copy a movie download lands beside (#2029): a second
+    copy's download only the file in its library, the title's own download
+    any file but those in its copies' libraries. {} (every file, as before)
+    for a title with no copy wanted anywhere."""
+    if kind != "movie":
+        return {}
+    vlib = dl.get("video_library_id")
+    if not vlib:
+        try:
+            from core.video.libraries import title_copies
+            if not title_copies(db, "movie", tmdb_id):
+                return {}
+        except Exception:   # noqa: BLE001 - no libraries: every file, as before
+            return {}
+    return {"video_library_id": vlib or None}
+
+
+def _wishlist_scope(db, dl, kind, tmdb_id) -> dict:
+    """The wishlist rows a movie download stands for (#2029): its copy's, or
+    the title's own when the title has a copy wanted elsewhere. {} (every
+    row, as before) otherwise and for episodes."""
+    return _copy_scope(db, dl, kind, tmdb_id)
+
+
+def _series_name(db, dl, settings, ids, owned_dir):
+    """What a show the library does not own yet is filed as, when the folder
+    its title renders to is already another show's (#2052). None = the title."""
+    if owned_dir:
+        return None
+    try:
+        from core.video.show_folder import series_folder_name
+        kind, tmdb_id, _sn, _en, ctx = _wishlist_ids(db, dl)
+        if kind != "episode":
+            return None
+        return series_folder_name(
+            db, settings, tmdb_id=tmdb_id, title=ctx.get("title") or dl.get("title"),
+            year=ctx.get("year") or (ids or {}).get("year") or dl.get("year"),
+            root=dl.get("target_dir"), tmdb_of=lambda row: _wishlist_ids(db, row)[1])
+    except Exception:   # noqa: BLE001 - naming help must never block an import
+        logger.debug("series folder check failed", exc_info=True)
+        return None
+
+
 def _owned_library_dir(db, dl, settings=None):
     """The REAL local folder of the copy the library already owns for this
     download's target, or None for brand-new items. The DB stores the SERVER's
@@ -1151,7 +1404,8 @@ def _owned_library_dir(db, dl, settings=None):
         if kind == "youtube" or not tmdb_id:
             return None
         stored = db.video_stored_file_path("movie" if kind == "movie" else "episode",
-                                           tmdb_id=int(tmdb_id), season=sn, episode=en)
+                                           tmdb_id=int(tmdb_id), season=sn, episode=en,
+                                           **_copy_scope(db, dl, kind, tmdb_id))
         base_dirs = video_base_dirs(db)
         if stored:
             resolved = resolve_video_file_path(stored["path"], base_dirs,
@@ -1246,13 +1500,18 @@ def _wishlist_failed(db, dl) -> None:
         poster, year = dl.get("poster_url"), dl.get("year")
         try:
             profiles = db.wishlist_profiles_for_media(
-                kind, int(tmdb_id), season_number=sn, episode_number=en)
+                kind, int(tmdb_id), season_number=sn, episode_number=en,
+                **_wishlist_scope(db, dl, kind, tmdb_id))
         except Exception:  # noqa: BLE001 - safety net must never fail
             profiles = []
         for pid in profiles or [1]:
             if kind == "movie":
+                # a copy's row comes back as that copy (#2029)
+                copy = ({"video_library_id": dl["video_library_id"],
+                         "quality_profile_id": dl.get("quality_profile_id")}
+                        if dl.get("video_library_id") else {})
                 db.add_movie_to_wishlist(int(tmdb_id), title, year=year, poster_url=poster,
-                                         library_id=lib_id, profile_id=pid)
+                                         library_id=lib_id, profile_id=pid, **copy)
             elif sn is not None and en is not None:
                 db.add_episodes_to_wishlist(int(tmdb_id), title,
                     [{"season_number": sn, "episode_number": en}], poster_url=poster,
@@ -1261,27 +1520,32 @@ def _wishlist_failed(db, dl) -> None:
         logger.exception("video download %s: wishlist-on-fail failed", dl.get("id"))
 
 
-def _remove_satisfied_movie_wishes(db, tmdb_id: int, label: str, user_initiated: bool) -> None:
-    """Remove movie wishlist rows only for profiles whose cutoff the landed file meets."""
+def _remove_satisfied_movie_wishes(db, tmdb_id: int, label: str, user_initiated: bool,
+                                   scope=None) -> None:
+    """Remove movie wishlist rows only for profiles whose cutoff the landed file
+    meets, and only the rows of the library it landed for (#2029): the 1080p
+    copy landing never clears the 4K copy's wish, nor the other way round.
+    ``scope`` is _wishlist_scope's: {} = every row (a title with no copy)."""
+    scope = scope or {}
     try:
         from core.video.quality_eval import meets_cutoff, resolution_rank
         from core.video.quality_profile import profile_by_id
         if not resolution_rank(label):
             # unparseable quality → classic remove-on-obtain; never wedge a row
             # open on a label we can't judge (matches the old behavior)
-            db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=None)
+            db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=None, **scope)
             return
-        rows = db.get_movie_wishlist_profiles(tmdb_id)
+        rows = db.get_movie_wishlist_profiles(tmdb_id, **scope)
         for profile_id, quality_profile_id in rows:
-            profile = profile_by_id(db, quality_profile_id)
+            profile = profile_by_id(db, quality_profile_id, kind="movie")
             if user_initiated or meets_cutoff(label, profile):
-                db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=profile_id)
+                db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=profile_id, **scope)
             else:
                 logger.info("movie %s: landed '%s' below profile %s cutoff - wish kept",
                             tmdb_id, label, profile_id)
     except Exception:   # noqa: BLE001 - judgment failure → classic remove-on-obtain
         logger.debug("per-profile movie cutoff judgment failed; removing all", exc_info=True)
-        db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=None)
+        db.remove_from_wishlist("movie", tmdb_id=tmdb_id, profile_id=None, **scope)
 
 
 def _remove_satisfied_episode_wishes(db, tmdb_id: int, sn: int, en: int,
@@ -1298,7 +1562,7 @@ def _remove_satisfied_episode_wishes(db, tmdb_id: int, sn: int, en: int,
             return
         rows = db.get_episode_wishlist_profiles(tmdb_id, sn, en)
         for profile_id, quality_profile_id in rows:
-            profile = profile_by_id(db, quality_profile_id)
+            profile = profile_by_id(db, quality_profile_id, kind="show")
             if user_initiated or meets_cutoff(label, profile):
                 db.remove_from_wishlist("episode", tmdb_id=tmdb_id,
                                         season_number=sn, episode_number=en,
@@ -1333,7 +1597,7 @@ def _wishlist_obtained(db, dl, upd=None) -> None:
             from core.video.quality_profile import profile_by_id
             label = (upd or {}).get("quality_label") or dl.get("quality_label") or ""
             # judged under the profile the grab was made with (per-title, P2)
-            profile = profile_by_id(db, dl.get("quality_profile_id"))
+            profile = profile_by_id(db, dl.get("quality_profile_id"), kind=dl.get("kind"))
             if resolution_rank(label) and not meets_cutoff(label, profile):
                 if not user_initiated:
                     logger.info("video download %s: '%s' landed below the cutoff - kept on the "
@@ -1350,7 +1614,8 @@ def _wishlist_obtained(db, dl, upd=None) -> None:
         if kind == "youtube":
             db.remove_youtube_from_wishlist("video", str(tmdb_id), profile_id=None)
         elif kind == "movie":
-            _remove_satisfied_movie_wishes(db, int(tmdb_id), label, user_initiated)
+            _remove_satisfied_movie_wishes(db, int(tmdb_id), label, user_initiated,
+                                           _wishlist_scope(db, dl, kind, tmdb_id))
         elif sn is not None and en is not None:
             _remove_satisfied_episode_wishes(db, int(tmdb_id), sn, en, label, user_initiated)
     except Exception:
@@ -1377,6 +1642,11 @@ def _blocklist_release(db, dl, reason) -> None:
         logger.exception("video download %s: blocklist write failed", dl.get("id"))
 
 
+def _owners(db, dl) -> list:
+    from core.video.download_events import download_owners
+    return download_owners(db, dl)
+
+
 def _event_payload(dl, upd=None) -> dict:
     """The event-bus variables for one download — shared by every terminal
     outcome so trigger conditions/templates see one consistent shape."""
@@ -1393,7 +1663,7 @@ def _event_payload(dl, upd=None) -> dict:
             "source": dl.get("source") or "", "dest_path": upd.get("dest_path") or ""}
 
 
-def _publish_terminal(dl, upd) -> None:
+def _publish_terminal(dl, upd, owners=None) -> None:
     """Relay a terminal outcome to the automation event bus (best-effort).
     completed → 'video_download_completed' (+ 'video_upgrade_completed' when the
     import REPLACED a library copy); import_failed → 'video_import_failed'."""
@@ -1404,15 +1674,16 @@ def _publish_terminal(dl, upd) -> None:
     if (upd or {}).get("_pack_imported"):
         return
     try:
-        from core.video.download_events import publish
+        from core.video.download_events import owned, publish
         st = upd.get("status")
+        # the download's people: who grabbed it, else who wished for it
         if st == "completed":
-            publish("video_download_completed", _event_payload(dl, upd))
+            publish("video_download_completed", owned(_event_payload(dl, upd), owners))
             if upd.get("_upgraded"):
-                publish("video_upgrade_completed", _event_payload(dl, upd))
+                publish("video_upgrade_completed", owned(_event_payload(dl, upd), owners))
         elif st == "import_failed":
             publish("video_import_failed",
-                    {**_event_payload(dl, upd), "error": upd.get("error") or ""})
+                    owned({**_event_payload(dl, upd), "error": upd.get("error") or ""}, owners))
     except Exception:
         logger.exception("video download %s: event publish failed", dl.get("id"))
 
@@ -1437,7 +1708,8 @@ def _blocked_users(db):
         return frozenset()
 
 
-def _fail_or_retry(db, dl, error_msg, *, allow_retry: bool = True) -> None:
+def _fail_or_retry(db, dl, error_msg, *, allow_retry: bool = True,
+                   client_failure: bool = False) -> None:
     """A download just failed/disappeared. Try the next candidate inline; if none,
     hand off to a requery thread; if nothing left, mark it failed for real — and
     put it back on the wishlist so it isn't silently lost.
@@ -1448,8 +1720,20 @@ def _fail_or_retry(db, dl, error_msg, *, allow_retry: bool = True) -> None:
     nothing, and — because the requery path clears the error on its way through —
     it would replace a message naming the real cause with "No working release found
     after retries", pointing the user at their indexer instead of at the path
-    mapping that actually broke."""
+    mapping that actually broke.
+
+    ``client_failure`` = the torrent/usenet client failed THIS release (SAB
+    said failed, or the transfer stalled). That release is blocklisted and
+    the item searched again at once, so the next release the profile ranks is
+    grabbed instead of the item waiting hours for the wishlist's next pass."""
     from core.video.retry import plan_retry
+    if allow_retry and _held_for_pick(db, dl):
+        # a release picked for a request held for a pick (#2199): trying the
+        # next candidate, a requery or the next ranked release would be the
+        # automatic choice the admin turned off. it fails, the row stays
+        # held, and the Requests page offers the pick again
+        logger.info("video download %s: held for a release pick, no automatic retry", dl.get("id"))
+        allow_retry = False
     plan = plan_retry(dl, blocked=_blocked_pairs(db), blocked_users=_blocked_users(db)) \
         if allow_retry else {"action": "fail"}
     if plan["action"] == "candidate" and _apply_candidate(db, dl["id"], dl, plan["candidate"], plan["rest"]):
@@ -1459,20 +1743,149 @@ def _fail_or_retry(db, dl, error_msg, *, allow_retry: bool = True) -> None:
         _spawn_requery(dl["id"])
         return
     err = error_msg or "Download failed"
+    redownload = _next_release_plan(db, dl, err) if (client_failure and allow_retry) else None
+    if redownload and redownload.get("retry"):
+        err = "%s · trying the next release" % err
+    elif redownload and redownload.get("gave_up"):
+        err = redownload["gave_up"]
     completed = _now()
     db.update_video_download(dl["id"], status="failed", error=err, completed_at=completed)
     _wishlist_failed(db, dl)
     _archive_history(db, dl, {"status": "failed", "error": err, "completed_at": completed})
+    if redownload and redownload.get("retry"):
+        # the failed release is blocklisted and won't be imported: out of the
+        # client with its partial files, or a stalled torrent kept going next
+        # to its replacement
+        try:
+            from core.video.client_grab import remove as remove_client_job
+            remove_client_job(dl.get("source"), dl.get("client_ref"), delete_files=True)
+        except Exception:  # noqa: BLE001 - leaving it behind is the old behaviour
+            logger.debug("video download %s: client remove failed", dl.get("id"), exc_info=True)
+        # the notification waits for the outcome: a release that got replaced
+        # isn't something to come and fix
+        _spawn_next_release(db, dl, err)
+        return
+    _publish_failed(dl, err, _owners(db, dl))
+
+
+def _held_for_pick(db, dl) -> bool:
+    """is this download's item held for a release pick on someone's wishlist?"""
     try:
-        from core.video.download_events import publish
-        publish("video_download_failed", {**_event_payload(dl), "error": err})
+        kind, tmdb_id, sn, en, _ctx = _wishlist_ids(db, dl)
+        if kind == "youtube" or not tmdb_id or not hasattr(db, "wishlist_held"):
+            return False
+        return bool(db.wishlist_held(kind, int(tmdb_id), season_number=sn, episode_number=en))
+    except Exception:  # noqa: BLE001 - unknown: retry as before
+        logger.debug("video download %s: held check failed", dl.get("id"), exc_info=True)
+        return False
+
+
+def _publish_failed(dl, err, owners=None) -> None:
+    try:
+        from core.video.download_events import owned, publish
+        publish("video_download_failed", owned({**_event_payload(dl), "error": err}, owners))
     except Exception:
         logger.exception("video download %s: failed-event publish failed", dl.get("id"))
-    # Commissary: a torrent/usenet release that failed is remembered (so no search
-    # grabs it again this week) and the title is searched again now
-    if allow_retry:
-        from core.commissary.client_retry import after_failure as _client_retry
-        _client_retry(db, {**dl, "error": err})
+
+
+# How many releases of one title the client may fail in a row (48h) before
+# the retry stops and asks: a misconfigured client fails everything, and
+# without a cap it would blocklist every release there is.
+REDOWNLOAD_LIMIT = 5
+REDOWNLOAD_WINDOW_HOURS = 48
+
+
+_CHAIN_FIELDS = ("id", "status", "release_title", "filename", "error", "progress",
+                 "quality_label", "size_bytes", "source", "username")
+
+
+def retry_chain(db, dl, limit: int = 10) -> list:
+    """The downloads that followed this one for the same item: what the
+    next-release retry (or a later manual grab) took after it failed, oldest
+    first, so a result card can show which release ended up downloading
+    (SeadogsBooty). Matched on the resolved identity, not media_id: the retry
+    is grabbed by the wishlist search under the tmdb id while a modal grab
+    may carry the library's own id. A season pack covering the episode
+    counts. Never raises."""
+    try:
+        if not dl:
+            return []
+        kind, tmdb_id, sn, en, _ctx = _wishlist_ids(db, dl)
+        if kind == "youtube" or not tmdb_id:
+            return []
+        out = []
+        for row in db.video_downloads_after(int(dl["id"])):
+            k2, t2, s2, e2, c2 = _wishlist_ids(db, row)
+            if k2 != kind or str(t2) != str(tmdb_id):
+                continue
+            if kind == "episode" and en is not None:
+                pack = e2 is None and str((c2 or {}).get("scope") or "") == "season"
+                if not (s2 == sn and (e2 == en or pack)):
+                    continue
+            out.append({k: row.get(k) for k in _CHAIN_FIELDS})
+            if len(out) >= limit:
+                break
+        return out
+    except Exception:  # noqa: BLE001 - a status poll never fails on this
+        logger.debug("retry chain lookup failed for download %s", (dl or {}).get("id"), exc_info=True)
+        return []
+
+
+def _next_release_plan(db, dl, err) -> dict | None:
+    """Blocklist the release the client just failed and decide whether to grab
+    the next one. None = not ours to retry (the setting is off, not a client
+    grab, no title to search for). {'retry': True} or {'gave_up': message}."""
+    if str(dl.get("source") or "") not in ("torrent", "usenet"):
+        return None
+    try:
+        from core.video.download_config import load as load_download_config
+        if not load_download_config(db).get("redownload_failed", True):
+            return None
+    except Exception:  # noqa: BLE001 - an unreadable setting keeps the default (on)
+        logger.debug("redownload setting unreadable", exc_info=True)
+    kind, tmdb_id, sn, en, _ctx = _wishlist_ids(db, dl)
+    if kind == "youtube" or not tmdb_id or not (dl.get("username") and dl.get("filename")):
+        return None
+    _blocklist_release(db, dl, "Download failed: %s" % err)
+    try:
+        failed = db.recent_failed_release_count(
+            media_source=dl.get("media_source"), media_id=dl.get("media_id"),
+            season_number=sn, episode_number=en, hours=REDOWNLOAD_WINDOW_HOURS)
+    except Exception:  # noqa: BLE001 - can't count: retry, the wishlist backoff still paces it
+        logger.debug("failed-release count unreadable", exc_info=True)
+        failed = 1
+    if failed >= REDOWNLOAD_LIMIT:
+        return {"gave_up": ("%s · %d releases failed in a row, stopped trying the next one. "
+                            "Check the download client, then search again" % (err, failed))}
+    return {"retry": True}
+
+
+def _next_release_now(db, dl, err) -> bool:
+    """Search the item again and grab what ranks next. When nothing is taken
+    the row says so and the failure is announced, since that one needs a person.
+    True when something was grabbed (or the item is already in hand)."""
+    try:
+        grabbed = _search_again_now(db, dl, wait=True)
+    except Exception:  # noqa: BLE001
+        logger.exception("video download %s: next-release search failed", dl.get("id"))
+        grabbed = False
+    if grabbed:
+        logger.info("video download %s: %s failed in the client, grabbed the next release",
+                    dl.get("id"), dl.get("release_title") or dl.get("filename"))
+        return True
+    final = ("%s, and no other release your profile accepts was found. "
+             "It stays on the wishlist" % err.replace(" · trying the next release", ""))
+    try:
+        db.update_video_download(dl["id"], error=final)
+    except Exception:  # noqa: BLE001
+        logger.debug("video download %s: final error not saved", dl.get("id"), exc_info=True)
+    _publish_failed(dl, final, _owners(db, dl))
+    return False
+
+
+def _spawn_next_release(db, dl, err) -> None:
+    threading.Thread(target=_next_release_now, args=(db, dl, err), daemon=True,
+                     name="video-next-release-%s" % dl.get("id")).start()
 
 
 def _search_for_retry(query, max_seconds=55):
@@ -1516,9 +1929,10 @@ def _search_for_retry(query, max_seconds=55):
 
 
 def _requery_worker(dl_id) -> None:
-    from core.video.quality_eval import evaluate_release
+    from core.video.custom_formats import load_formats
     from core.video.quality_profile import profile_by_id
     from core.video.release_parse import parse_release
+    from core.video.release_rank import judge, sort_ranked
     from core.video.retry import exhausted_reason, merge_candidates, plan_retry
     try:
         db = _db_provider() if _db_provider else None
@@ -1526,7 +1940,7 @@ def _requery_worker(dl_id) -> None:
             return
         first = db.get_video_download(dl_id) or {}
         # requery under the profile the ORIGINAL grab was judged with (P2)
-        profile = profile_by_id(db, first.get("quality_profile_id"))
+        profile = profile_by_id(db, first.get("quality_profile_id"), kind=first.get("kind"))
         # What the retries actually SAW, so giving up can say why instead of the
         # one generic sentence every exhausted download used to record.
         seen = {"searches": 0, "hits": 0, "accepted": 0, "refusals": []}
@@ -1557,20 +1971,32 @@ def _requery_worker(dl_id) -> None:
             accepted = []
             blocked_users = db.blocked_usernames()
             from api.video.downloads import _parse_text
+            try:
+                formats = load_formats(db)
+            except Exception:   # noqa: BLE001 - no formats, never a failed retry
+                formats = []
             for hit in (polled.get("hits") or []):
                 if hit.get("username") in blocked_users:
                     continue                                  # source-wide blocked uploader
-                v = evaluate_release(parse_release(_parse_text(hit)), profile,
-                                     scope=ctx.get("scope") or "movie",
-                                     want_season=ctx.get("season"), want_episode=ctx.get("episode"),
-                                     want_year=ctx.get("year"),
-                                     want_title=ctx.get("titles") or ctx.get("title"),
-                                     want_date=ctx.get("air_date"),
-                                     want_absolute=ctx.get("absolute"),
-                                     want_alt=_scene_alt(ctx),
-                                     size_gb=round((hit.get("size_bytes") or 0) / (1024 ** 3), 1))
+                # the same judge + rank as every other picker (#2033): custom
+                # formats and their minimum count here too, and the retry takes
+                # the best release, not whatever slskd listed first
+                name = _parse_text(hit)
+                avail = hit.get("availability")
+                if avail is None:
+                    avail = hit.get("peers") or 0
+                v = judge(parse_release(name), name, profile, formats,
+                          avail=avail, size_bytes=hit.get("size_bytes") or 0,
+                          scope=ctx.get("scope") or "movie",
+                          want_season=ctx.get("season"), want_episode=ctx.get("episode"),
+                          want_year=ctx.get("year"),
+                          want_title=ctx.get("titles") or ctx.get("title"),
+                          want_date=ctx.get("air_date"),
+                          want_absolute=ctx.get("absolute"),
+                          want_alt=_scene_alt(ctx),
+                          size_gb=round((hit.get("size_bytes") or 0) / (1024 ** 3), 1))
                 if v["accepted"]:
-                    accepted.append(hit)
+                    accepted.append({**hit, "rank": v["rank"]})
                     seen["accepted"] += 1
                 else:
                     # Every refusal, so the summary counts the same population it
@@ -1585,6 +2011,7 @@ def _requery_worker(dl_id) -> None:
                 tried_files = json.loads(row2.get("tried_files") or "[]")
             except (ValueError, TypeError):
                 tried_files = []
+            accepted = sort_ranked(accepted)
             fresh = merge_candidates(accepted, tried_files, blocked=_blocked_pairs(db), blocked_users=_blocked_users(db))
             if fresh and _apply_candidate(db, dl_id, row2, fresh[0], fresh[1:]):
                 return
@@ -1616,6 +2043,34 @@ def _spawn_requery(dl_id) -> None:
                      name="video-dl-requery-%s" % dl_id).start()
 
 
+_TERMINAL = ("completed", "cancelled", "import_failed")
+
+
+def settle_outcome(db, dl, upd) -> None:
+    """Persist an import's outcome on its row and do what a finished row does:
+    clear the wishlist rows it satisfies, snapshot it into history and fire the
+    completed / upgrade / import-failed events. Shared by the monitor and the
+    import folder (#2129), so a file dropped in by hand lands exactly like a
+    download. Raises if the row can't be written; the rest is best-effort."""
+    # import_failed = the file downloaded fine but couldn't be placed (sample, wrong
+    # episode, not an upgrade, …). Terminal + needs manual import, NOT a download
+    # failure, so don't burn the retry budget re-downloading the same good file.
+    if upd.get("status") in _TERMINAL:
+        upd.setdefault("completed_at", _now())
+    db.update_video_download(dl["id"], **upd)
+    # A wished item that just landed: remove its row when it MEETS the
+    # quality cutoff, keep it when below (upgrade-until semantics).
+    # whose it is, read before the wishlist lets go of it
+    owners = _owners(db, dl) if upd.get("status") in _TERMINAL else []
+    if upd.get("status") == "completed":
+        _wishlist_obtained(db, dl, upd)
+    # Snapshot terminal outcomes into the permanent history (survives the
+    # queue cleanup; powers the History modal + smart post-download scan).
+    if upd.get("status") in _TERMINAL:
+        _archive_history(db, dl, upd)
+        _publish_terminal(dl, upd, owners)     # event triggers (completed/upgrade/import-failed)
+
+
 def _tick(db) -> bool:
     """Poll the non-YouTube active downloads once. Returns True when any row
     was in flight (the caller keeps the fast poll cadence), False when the
@@ -1643,10 +2098,13 @@ def _tick(db) -> bool:
             _spawn_requery(d["id"])
     # 'searching' rows are owned by their requery thread; 'youtube' rows are owned by
     # their yt-dlp worker thread (no slskd transfer to match) — skip both here.
+    # 'import' rows belong to the import folder's own thread (#2129): there is
+    # no transfer behind them, so the slskd path would read them as vanished.
     active = [d for d in all_active
-              if d.get("status") != "searching" and d.get("source") != "youtube"]
+              if d.get("status") != "searching" and d.get("source") not in ("youtube", "import")]
     if not active:
         _misses.clear()
+        _grace.clear()
         # Rows this tick did not process can still mean work is in flight:
         # 'searching' rows are owned by their requery thread and YouTube rows
         # by their workers / the recovery pump — either keeps the fast cadence.
@@ -1674,6 +2132,8 @@ def _tick(db) -> bool:
         if upd.get("status") == "completed":
             completed_now += 1
         if upd.get("_missing"):
+            if _in_new_job_grace(dl, _clock()):
+                continue
             n = _misses.get(dl["id"], 0) + 1
             _misses[dl["id"]] = n
             if n >= _GIVE_UP_AFTER:
@@ -1684,13 +2144,18 @@ def _tick(db) -> bool:
                                else "Soulseek transfer disappeared")
             continue
         _misses.pop(dl["id"], None)
+        if upd.get("_client_adding"):
+            _restart_grace(dl, _clock())
+        else:
+            _mark_reported(dl)
         if upd.get("status") == "failed":
             # A proven-bad release (importer-proved junk, or a truncated transfer)
             # is blocklisted before the retry so the next candidate isn't the
             # same file from the same user.
             if upd.get("_bad_release") and dl.get("username") and dl.get("filename"):
                 _blocklist_release(db, dl, upd.get("error") or "Bad release")
-            _fail_or_retry(db, dl, upd.get("error"))      # auto-retry before truly failing
+            _fail_or_retry(db, dl, upd.get("error"),      # auto-retry before truly failing
+                           client_failure=dl.get("source") in ("torrent", "usenet"))
             continue
         # Stall/queue timeout — a transfer sitting with no % movement for too long
         # (queued behind a dead peer, frozen mid-download, or finished with its file
@@ -1719,27 +2184,24 @@ def _tick(db) -> bool:
                 # A stalled DOWNLOAD deserves another release; a download that
                 # finished and then couldn't be found does not — the bytes are
                 # already on disk, and searching again just repeats the same import.
-                _fail_or_retry(db, dl, stall.reason(_verdict, _idle, at_completion=_at_completion),
-                               allow_retry=not _at_completion)
+                # Unless its folder IS there and nothing in it is playable (a disc
+                # image, unextracted rars): then the release is junk, not the path.
+                # It is blocklisted -- even with redownload_failed off, like the
+                # importer's _bad_release -- and goes to the next release.
+                _junk = upd.get("_nothing_playable") if _at_completion else None
+                _why = stall.reason(_verdict, _idle, at_completion=_at_completion,
+                                    nothing_playable=_junk)
+                if _junk and dl.get("username") and dl.get("filename"):
+                    _blocklist_release(db, dl, _why)
+                _fail_or_retry(db, dl, _why,
+                               allow_retry=not _at_completion or bool(_junk),
+                               client_failure=dl.get("source") in ("torrent", "usenet"))
                 continue
             if _verdict in (stall.MOVED, stall.SEEDED):
                 upd["progress_at"] = _now()      # restart (or start) the clock
-        # import_failed = the file downloaded fine but couldn't be placed (sample, wrong
-        # episode, not an upgrade, …). Terminal + needs manual import — NOT a download
-        # failure, so don't burn the retry budget re-downloading the same good file.
-        if upd.get("status") in ("completed", "cancelled", "import_failed"):
-            upd.setdefault("completed_at", _now())
         try:
-            db.update_video_download(dl["id"], **upd)
-            # A wished item that just landed: remove its row when it MEETS the
-            # quality cutoff, keep it when below (upgrade-until semantics).
-            if upd.get("status") == "completed":
-                _wishlist_obtained(db, dl, upd)
-            # Snapshot terminal outcomes into the permanent history (survives the
-            # queue cleanup; powers the History modal + smart post-download scan).
-            if upd.get("status") in ("completed", "cancelled", "import_failed"):
-                _archive_history(db, dl, upd)
-                _publish_terminal(dl, upd)     # event triggers (completed/upgrade/import-failed)
+            settle_outcome(db, dl, upd)
+            if upd.get("status") in _TERMINAL:
                 # The importer proved the FILE ITSELF is junk (sample/corrupt/fake):
                 # blocklist the exact release so no search ever re-picks it. Context
                 # rejects (pack / wrong episode / not-an-upgrade) are NOT tagged.
@@ -1752,10 +2214,13 @@ def _tick(db) -> bool:
             if upd.get("status") == "completed":
                 _reclaim_source(upd.get("_cleanup_source"))
                 _reclaim_job_dir(upd.get("_cleanup_dir"))
+                _remove_completed_usenet(db, dl, upd)
         except Exception:
             logger.exception("video download %s: failed to persist update", dl.get("id"))
     for k in [k for k in _misses if k not in live_ids]:
         _misses.pop(k, None)
+    for k in [k for k in _grace if k[0] not in live_ids]:
+        _grace.pop(k, None)
     # Batch complete: we finished ≥1 download this tick AND nothing is left in
     # flight (queued/downloading/searching). Fires once, on the transition to
     # empty — the next tick early-returns. Publishes to the event bridge so the

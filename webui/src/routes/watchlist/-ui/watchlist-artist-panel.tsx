@@ -2,6 +2,14 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useNavigate } from '@tanstack/react-router';
 import { useEffect, useMemo, useState } from 'react';
 
+import {
+  describeStatuses,
+  normalizeOverride,
+  normalizeStatuses,
+  RELEASE_STATUS_COPY,
+  RELEASE_STATUSES,
+  toggleStatus,
+} from '@/components/release-statuses';
 import { AudiobookRouteToggle } from '@/features/audiobook-routes/audiobook-route-toggle';
 import { playTrackByMetadata } from '@/features/playback/play-track';
 import { getShellBridge } from '@/platform/shell/bridge';
@@ -13,7 +21,6 @@ import type {
   WatchlistArtistConfigResponse,
   WatchlistMetadataSource,
 } from '../-watchlist.types';
-import type { LibraryAlbum } from '../../library/-library.types';
 
 import {
   removeWatchlistArtist,
@@ -30,8 +37,8 @@ import {
   formatRelativeScanTime,
   formatSince,
 } from '../-watchlist.helpers';
-import { loadAlbumTracks } from '../../library/-library.api';
-import { albumQueueTrack } from '../../library/-library.helpers';
+import { fetchLibraryV2Album } from '../../library/-library-v2.api';
+import { albumQueueRows } from '../../library/-library-v2.play';
 import { hideOnError } from './hide-on-error';
 import { WatchlistLinkedProviders } from './watchlist-linked-providers';
 
@@ -49,6 +56,7 @@ const RELEASE_TYPE_KEYS = ['include_albums', 'include_eps', 'include_singles'] a
 
 const CONTENT_FILTER_KEYS = [
   'include_live',
+  'include_live_tracks',
   'include_remixes',
   'include_acoustic',
   'include_compilations',
@@ -62,7 +70,11 @@ const OPTION_COPY: Record<IncludeKey, { title: string; description: string }> = 
   include_albums: { title: 'Albums', description: 'Full-length studio albums' },
   include_eps: { title: 'EPs', description: 'Extended plays (4-6 tracks)' },
   include_singles: { title: 'Singles', description: 'Single tracks and 2-3 track releases' },
-  include_live: { title: 'Live', description: 'Live performances and concerts' },
+  include_live: { title: 'Live albums', description: 'Concert recordings and unplugged sets' },
+  include_live_tracks: {
+    title: 'Live tracks',
+    description: 'Live versions on other releases, like a live bonus track',
+  },
   include_remixes: { title: 'Remixes', description: 'Remix versions and edits' },
   include_acoustic: { title: 'Acoustic', description: 'Acoustic and stripped versions' },
   include_compilations: { title: 'Compilations', description: 'Greatest hits and collections' },
@@ -183,6 +195,7 @@ function updateFromDraft(draft: WatchlistArtistConfig): WatchlistArtistConfigUpd
     include_eps: draft.include_eps,
     include_singles: draft.include_singles,
     include_live: draft.include_live,
+    include_live_tracks: draft.include_live_tracks ?? draft.include_live,
     include_remixes: draft.include_remixes,
     include_acoustic: draft.include_acoustic,
     include_compilations: draft.include_compilations,
@@ -197,7 +210,17 @@ function updateFromDraft(draft: WatchlistArtistConfig): WatchlistArtistConfigUpd
     preferred_metadata_source: draft.preferred_metadata_source,
     // always said, so the server knows which rules a save means (#1822)
     follow_defaults: Boolean(draft.follow_defaults),
+    // #2175: null follows the library-wide statuses
+    release_statuses: normalizeOverride(draft.release_statuses),
   };
+}
+
+/** #2175: does this artist go by anything but the defaults? Its own release
+ *  rules, or its own release statuses. */
+export function artistHasOwnRules(
+  config: Pick<WatchlistArtistConfig, 'follow_defaults' | 'release_statuses'>,
+): boolean {
+  return !config.follow_defaults || normalizeOverride(config.release_statuses) !== null;
 }
 
 interface Props {
@@ -305,9 +328,10 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
     setDraft((previous) => {
       if (!previous) return previous;
       if (!follow) return { ...previous, follow_defaults: false };
-      // show the rules it will get
+      // show the rules it will get. its own release statuses go back to the
+      // library's too, like Reset all to defaults (#2175)
       const defaults = payload?.config?.defaults ?? {};
-      const next = { ...previous, follow_defaults: true };
+      const next = { ...previous, follow_defaults: true, release_statuses: null };
       for (const key of [...RELEASE_TYPE_KEYS, ...CONTENT_FILTER_KEYS]) {
         const value = defaults[key];
         if (typeof value === 'boolean') next[key] = value;
@@ -315,32 +339,32 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
       return next;
     });
   const following = Boolean(draft?.follow_defaults);
+  const libraryStatuses = normalizeStatuses(payload?.config?.library_release_statuses);
+  const ownStatuses = draft ? normalizeOverride(draft.release_statuses) : null;
+  const setOwnStatuses = (statuses: WatchlistArtistConfig['release_statuses']) =>
+    setDraft((previous) => (previous ? { ...previous, release_statuses: statuses } : previous));
 
   const discography = payload ? pickDiscographySource(payload) : null;
   const releases = payload?.recent_releases ?? [];
   const library = payload?.library ?? null;
   const listening = payload?.listening ?? null;
-  // the library page's own album play: every queued row has a file
+  // the Library v2 album play the library page and the dashboard use: every
+  // queued row has a file
   const playLibraryAlbum = async (album: WatchlistArtistLibrary['recent_albums'][number]) => {
     if (!library) return;
-    const owned: LibraryAlbum = {
-      id: album.id,
-      title: album.title,
-      year: album.year,
-      thumb_url: album.thumb_url || null,
-      artist_id: library.artist_id,
-      artist_name: name,
-    };
     try {
-      const tracks = await loadAlbumTracks(album.id);
+      const tracks = albumQueueRows(await fetchLibraryV2Album(Number(album.id)), name)
+        .filter((row) => row.is_library)
+        .map((row) => ({
+          ...row,
+          playback_status: 'ready',
+          image_url: row.image_url || album.thumb_url || null,
+        }));
       if (!tracks.length) {
         window.showToast?.(`No playable tracks in ${album.title}`, 'info');
         return;
       }
-      await window.playTrackList?.(
-        tracks.map((track) => albumQueueTrack(track, owned)),
-        album.title,
-      );
+      await window.playTrackList?.(tracks, album.title);
     } catch {
       window.showToast?.(`Could not play ${album.title}`, 'error');
     }
@@ -351,6 +375,15 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
     void window.navigateToPage?.('artist-detail', {
       artistId: library.artist_id,
       artistName: name,
+    });
+  };
+  // an artist the library holds opens there (its discovery view for the
+  // discography), in the header this profile picked for outside arrivals.
+  // no onClose: it rewrites the watchlist url and would win over this
+  const openInLibrary = (discography: boolean) => {
+    if (!library) return;
+    void navigate({
+      href: `/library?artist=${library.artist_id}${discography ? '&releases=all' : ''}`,
     });
   };
   const metaTags = [artist?.style, artist?.mood, artist?.label].filter((value): value is string =>
@@ -370,12 +403,23 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
   const headText = (
     <div className="wap-head-text">
       <h2 className="wap-name" title={name}>
-        {name || 'Loading…'}
+        {library && name ? (
+          <button
+            type="button"
+            className="wap-name-link"
+            title={`Open ${name} in the library`}
+            onClick={() => openInLibrary(false)}
+          >
+            {name}
+          </button>
+        ) : (
+          name || 'Loading…'
+        )}
       </h2>
       <span className="wap-sub">
         {config ? (
-          <span className={`wap-pill${config.follow_defaults ? '' : ' wap-pill--custom'}`}>
-            {config.follow_defaults ? 'Defaults' : 'Custom rules'}
+          <span className={`wap-pill${artistHasOwnRules(config) ? ' wap-pill--custom' : ''}`}>
+            {artistHasOwnRules(config) ? 'Custom rules' : 'Defaults'}
           </span>
         ) : null}
         {scanText}
@@ -637,19 +681,22 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
             <button
               type="button"
               className="wl-chip wl-chip--cta wap-discog"
-              disabled={!discography}
+              disabled={!discography && !library}
               title={
-                payload && !discography
+                payload && !discography && !library
                   ? 'This artist is only matched on disabled metadata sources. ' +
                     'Match it to your active source under Sources.'
                   : undefined
               }
               onClick={() => {
+                if (library) return openInLibrary(true);
                 if (!discography) return;
                 onClose();
                 void navigate({
                   to: '/artist-detail/$source/$id',
                   params: { source: discography.source, id: discography.id },
+                  // the name lets the library find an artist without this id
+                  search: { name },
                 });
               }}
             >
@@ -704,6 +751,50 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
                   />
                 ))}
               </div>
+            </section>
+
+            {/* #2175: inherit or its own, like auto-download below. The chips
+                only show for its own: the default is said in the option. */}
+            <section className="config-section wap-section">
+              <label className="wap-label" htmlFor="watchlist-config-release-status">
+                Release status
+              </label>
+              <select
+                id="watchlist-config-release-status"
+                className="form-select"
+                value={ownStatuses ? 'custom' : 'inherit'}
+                onChange={(event) =>
+                  setOwnStatuses(event.target.value === 'custom' ? [...libraryStatuses] : null)
+                }
+              >
+                <option value="inherit">
+                  Use the default ({describeStatuses(libraryStatuses)})
+                </option>
+                <option value="custom">Pick for this artist</option>
+              </select>
+              {ownStatuses ? (
+                <div className="wap-chips" role="group" aria-label="Release statuses">
+                  {RELEASE_STATUSES.map((status) => {
+                    const on = ownStatuses.includes(status);
+                    return (
+                      <ToggleChip
+                        key={status}
+                        checked={on}
+                        disabled={on && ownStatuses.length === 1}
+                        onChange={(value) =>
+                          setOwnStatuses(toggleStatus(ownStatuses, status, value))
+                        }
+                        title={RELEASE_STATUS_COPY[status].label}
+                        description={RELEASE_STATUS_COPY[status].hint}
+                      />
+                    );
+                  })}
+                </div>
+              ) : null}
+              <small className="wap-hint">
+                Statuses come from MusicBrainz. A release from another source, or with no status,
+                always gets through.
+              </small>
             </section>
 
             <section className="config-section wap-section">
@@ -905,11 +996,13 @@ export function WatchlistArtistPanel({ profileId, artistId, initialTab, onClose 
 
 function ToggleChip({
   checked,
+  disabled,
   onChange,
   title,
   description,
 }: {
   checked: boolean;
+  disabled?: boolean;
   onChange: (value: boolean) => void;
   title: string;
   description: string;
@@ -919,6 +1012,7 @@ function ToggleChip({
       <input
         type="checkbox"
         checked={checked}
+        disabled={disabled}
         onChange={(event) => onChange(event.target.checked)}
       />
       {title}

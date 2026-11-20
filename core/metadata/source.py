@@ -19,15 +19,16 @@ from core.imports.context import (
     get_import_context_album,
     get_import_original_search,
     get_import_source,
-    get_import_source_ids,
+    get_provider_source_ids,
     get_import_track_info,
     get_source_tag_names,
     has_real_album_name,
     is_real_provider_album_id,
     normalize_import_context,
 )
-from core.imports.collab_artist import first_listed_artist, listed_primary_of
+from core.imports.collab_artist import collab_primary, library_has_artist, library_has_identified_artist
 from core.imports.compilation import VARIOUS_ARTIST_NAMES
+from core.imports.library_names import library_names, swap_credit, swap_names
 from core.metadata.artist_resolution import resolve_track_artists
 from core.metadata.registry import get_itunes_client
 from database.music_database import get_database
@@ -282,6 +283,17 @@ def _collect_source_ids(metadata: dict, cfg) -> dict:
             if metadata.get("itunes_album_id"):
                 source_ids["ITUNES_ALBUM_ID"] = metadata["itunes_album_id"]
 
+    # Native catalogue callers carry every already confirmed identity. Use
+    # the existing namespace/frame map and each provider's embed switch.
+    for provider, ids in (metadata.get('known_source_ids') or {}).items():
+        if not isinstance(ids, dict) or cfg.get(f'{provider}.embed_tags', True) is False:
+            continue
+        names = get_source_tag_names(provider)
+        for kind in ('track', 'artist', 'album'):
+            tag = names.get(kind) or f'{provider.upper()}_{kind.upper()}_ID'
+            if (ids.get(kind) and (names.get(kind) or tag in SOURCE_TAG_CONFIG)
+                    and cfg.get(SOURCE_TAG_CONFIG.get(tag, f'{provider}.tags.{kind}_id'), True) is not False):
+                source_ids[tag] = ids[kind]
     return source_ids
 
 
@@ -417,6 +429,20 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
     if artist_result and artist_result.get("mbid"):
         pp["artist_mbid"] = artist_result["mbid"]
         pp["id_tags"]["MUSICBRAINZ_ARTIST_ID"] = pp["artist_mbid"]
+    # §2.4 gating: when MusicBrainz's own artist lookup came back
+    # empty, pp["artist_mbid"] can only have been seeded by the
+    # depot consult (a promoted artist MBID) — and it GATES the
+    # recording match below (match_recording's hard artist gate)
+    # and the release artist check (release_by_artist). Everything
+    # those gated lookups find was reached BY WAY OF the promoted
+    # ID, so embed_source_ids marks it fetched_via_promoted_id.
+    depot_block = pp.get("_depot") or {}
+    depot_artist_gate = bool(
+        not artist_result and not pinned_release and pp.get("artist_mbid")
+        and any(m[2] == "artist_mbid" and str(m[3]) == str(pp["artist_mbid"])
+                for m in depot_block.get("marks") or []))
+    if depot_artist_gate:
+        pp["_mb_release_gated"] = True
 
     details = {}
     searched_recording = None
@@ -454,6 +480,12 @@ def _process_musicbrainz_source(pp: dict, metadata: dict, cfg, runtime, track_ti
         pp["id_tags"]["MUSICBRAINZ_RECORDING_ID"] = pp["recording_mbid"]
         if result.get("recording_disambiguation") is not None:
             pp["recording_disambiguation"] = str(result["recording_disambiguation"]).strip()
+        # A depot ID can also arrive through the release step
+        # below: the tracklist slot's recording replaces this one.
+        # Remember the search-only value so the marks block can
+        # tell "found by the gated search" apart from "found via
+        # the gated release".
+        pp["_mb_searched_recording"] = pp["recording_mbid"]
         details = _call_source_lookup(
             "MusicBrainz recording details",
             mb_service.mb_client.get_recording,
@@ -1089,6 +1121,371 @@ def _process_source_enrichment(source_name: str, pp: dict, metadata: dict, cfg, 
         _process_beatport_source(pp, metadata, cfg, runtime, track_title, _track_artist, audio_file=audio_file)
 
 
+def _depot_pick(depot, db, subject, field, **verdict_kwargs):
+    """The strongest depot candidate for one field that clears §8's
+    promotion floor, or None. Candidates are tried strongest-first;
+    the floor itself refuses when more than one survives leg (c),
+    when agreement is all a value has, or when a network-reflected
+    value lacks this node's own strong verification."""
+    if not subject:
+        return None
+    seen = set()
+    for row in depot.get_fields(db, subject, field):
+        if row["is_local"]:
+            continue
+        key = json.dumps(row["value"], sort_keys=True, ensure_ascii=False)
+        if key in seen:
+            continue
+        seen.add(key)
+        ok, leg = depot.promotion_verdict(db, subject, field, row["value"],
+                                          **verdict_kwargs)
+        if ok:
+            return row["value"], leg
+    return None
+
+
+def _process_metasync_depot_source(pp: dict, metadata: dict, cfg, runtime,
+                                   track_title: str, artist_name: str,
+                                   context=None, db=None) -> None:
+    """MetaSync depot — the tagging pipeline's FIRST source
+    (DESIGN-METADATA §1, §13 step 8).
+
+    The depot holds what the user's MetaSync node collected from the
+    metadata network, as labelled candidates. This processor consults
+    it before any live search runs; a live search still happens for
+    everything the depot cannot promote. Consultation is exact: the
+    SoulIDs are computed from the names already matched for this
+    file, and on a depot miss with a node connected, one exact ask
+    goes to the node and its answer is deposited for the next run.
+
+    Nothing is filled on the network's say-so. Every value goes
+    through core.metasync_depot.promotion_verdict (§8's floor):
+    strong-verified by the node, or confirmed by a local provider
+    fetch checked against an independent key, or the single survivor
+    picked by a verified anchor. Fills are empty slots only, and
+    every fill is recorded in pp["_depot"]["marks"] so
+    embed_source_ids can write the §2.4 network mark — a promoted
+    value must never pass itself off as the user's own data.
+    """
+    if cfg.get("metasync.depot_enabled", True) is False:
+        return
+    if db is None:
+        return
+    from core import metasync_depot as depot
+    from core.soulid_worker import generate_soul_id
+
+    if depot.is_idle(db, cfg.get):
+        # no node and nothing in the depot: most installs, and no work here
+        return
+
+    album_title = metadata.get("album") or ""
+    artist_sid = generate_soul_id("artist", artist_name) if artist_name else ""
+    album_sid = (generate_soul_id("album", artist_name, album_title)
+                 if artist_name and album_title else "")
+    track_sid = (generate_soul_id("track", artist_name, track_title)
+                 if artist_name and track_title else "")
+    if not (artist_sid or album_sid or track_sid):
+        return
+
+    def _have(subject):
+        return bool(subject) and bool(
+            depot.get_fields(db, subject))
+
+    if not _have(track_sid) and not _have(album_sid):
+        # Depot miss: one exact ask of the node's OWN data and answer
+        # cache (instant), deposited for this run. The network ask
+        # holds the node's relay round open for its collection window
+        # (6s by default), so it never runs here: the misses go to the
+        # background asker, which deposits the network's answers for
+        # the next file of this album and the next run. An import never
+        # waits on the network. A silent network (or no node) is a
+        # normal miss.
+        subjects = {}
+        if track_sid:
+            subjects.setdefault("track", []).append(track_sid)
+        if album_sid:
+            subjects.setdefault("album", []).append(album_sid)
+        if artist_sid:
+            subjects.setdefault("artist", []).append(artist_sid)
+        try:
+            depot.collect_subjects(db, cfg.get, subjects, network=False)
+        except Exception as e:  # noqa: BLE001 - depot is an optimisation
+            logger.debug("metasync depot collect failed: %s", e)
+        still_missing = {kind: [s for s in sids if not _have(s)]
+                         for kind, sids in subjects.items()}
+        still_missing = {k: v for k, v in still_missing.items() if v}
+        if still_missing:
+            depot.ask_network_soon(db, cfg.get, still_missing)
+
+    marks = []
+
+    def _mark(kind, soul_id, field, value, via="promoted"):
+        # pp["_depot"] is published at the FIRST fill, not at the
+        # end of the consult: the caller (embed_source_ids) catches
+        # this processor's exceptions, so anything published only on
+        # successful completion would strand every earlier fill —
+        # promoted values written to tags with no §2.4 mark, the
+        # exact laundering the mark exists to prevent. The marks
+        # list is shared by reference, so later fills keep landing
+        # in the published container.
+        if not pp.get("_depot"):
+            pp["_depot"] = {"marks": marks,
+                            "pending_marks": [],
+                            "track_sid": track_sid,
+                            "album_sid": album_sid,
+                            "artist_sid": artist_sid}
+        marks.append((kind, soul_id, field, value, via))
+
+    def _mark_pending(kind, soul_id, field, group):
+        # A GATED value the pipeline does not own yet (§2.4): the
+        # depot supplies the MusicBrainz ID that gates a lookup,
+        # and whatever the lookup lands becomes a library value
+        # only when the pipeline actually adopts it. The mark is
+        # therefore PENDING, keyed by adoption group ("recording"
+        # / "release"): embed_source_ids resolves the group against
+        # the ID the pipeline ended with and marks only on a match.
+        # Published with the first fill like `marks`, for the same
+        # stranding reason.
+        if not pp.get("_depot"):
+            pp["_depot"] = {"marks": marks,
+                            "pending_marks": [],
+                            "track_sid": track_sid,
+                            "album_sid": album_sid,
+                            "artist_sid": artist_sid}
+        pp["_depot"]["pending_marks"].append(
+            (kind, soul_id, field, group))
+
+    def _mb_seed(group, depot_id):
+        # The depot hands MusicBrainz a provider ID it did NOT
+        # search by name (§2.4's gated lookups): a recording MBID
+        # it may fetch details for directly, or an artist MBID
+        # that gates match_recording / release_by_artist. Values
+        # adopted through the gate carry the mark; the gate ID
+        # itself is already marked by the caller's _mark.
+        #
+        # Who reads what: the MB processor never reads this dict.
+        # It detects the artist gate itself — its own artist
+        # lookup came back empty, and a depot mark names the
+        # artist MBID it is holding — and flags
+        # pp["_mb_release_gated"] (plus _mb_searched_recording).
+        # The marks block in embed_source_ids reads this dict for
+        # exactly one check, the "recording" adoption group: it
+        # holds only while the pipeline's recording MBID is still
+        # the seeded one. The by-artist pending marks below key
+        # off the processor's flag, not this dict.
+        pp.setdefault("_mb_depot_ids", {})[group] = str(depot_id)
+        if group == "recording":
+            _mark_pending("track", track_sid, "isrc", "recording")
+            _mark_pending("album", album_sid, "genres", "recording")
+        elif group == "artist":
+            _mark_pending("track", track_sid, "recording_mbid",
+                          "recording_by_artist")
+            _mark_pending("album", album_sid, "release_group_mbid",
+                          "release_by_artist")
+            _mark_pending("album", album_sid, "year",
+                          "release_by_artist")
+            _mark_pending("track", track_sid, "year",
+                          "release_by_artist")
+
+    disc = metadata.get("disc_number") or 1
+    track_no = metadata.get("track_number")
+
+    # Local, non-network keys for floor leg (b): what the download's
+    # own match already established about this file.
+    track_info = get_import_track_info(context)
+    local_keys = {}
+    file_isrc = (track_info.get("isrc") or "").strip()
+    if file_isrc:
+        local_keys["isrc"] = file_isrc
+    if metadata.get("musicbrainz_recording_id"):
+        local_keys["mbid"] = str(metadata["musicbrainz_recording_id"])
+    local_album_id = ""
+    if (metadata.get("source") or "").strip().lower() == "deezer":
+        local_album_id = str(metadata.get("source_album_id") or "")
+    elif metadata.get("deezer_album_id"):
+        local_album_id = str(metadata["deezer_album_id"])
+    if local_album_id and track_no:
+        local_keys["album_id"] = local_album_id
+        try:
+            local_keys["position"] = [int(disc), int(track_no)]
+        except (TypeError, ValueError):
+            local_keys.pop("album_id", None)
+
+    verdict_ctx = {"album_subject": album_sid or None,
+                   "disc": disc, "position": track_no}
+
+    # -- track candidates -------------------------------------------------
+    deezer_pick = None
+    if track_sid:
+        pick = _depot_pick(depot, db, track_sid, "spotify_id", **verdict_ctx)
+        if pick and cfg.get("spotify.embed_tags", True) is not False:
+            pp["id_tags"].setdefault("SPOTIFY_TRACK_ID", str(pick[0]))
+            _mark("track", track_sid, "spotify_id", pick[0])
+        deezer_pick = _depot_pick(depot, db, track_sid, "deezer_id",
+                                  **verdict_ctx)
+        if deezer_pick is None and local_keys:
+            # Floor leg (b): spend ONE confirmation fetch by the
+            # candidate's own ID, checked against a local key —
+            # never against the name or the duration.
+            worker = getattr(runtime, "deezer_worker", None)
+            dz_client = worker.client if worker else None
+            candidates = [r for r in depot.get_fields(db, track_sid, "deezer_id")
+                          if not r["is_local"]]
+            if dz_client and candidates:
+                candidate = str(candidates[0]["value"])
+                details = _call_source_lookup(
+                    "Deezer track details (depot confirmation)",
+                    dz_client.get_track_details, candidate)
+                if details:
+                    album = details.get("album") or {}
+                    response = {
+                        "isrc": details.get("isrc"),
+                        "album_id": str(album.get("id") or ""),
+                        # The client's ENHANCED shape
+                        # (deezer_client._build_enhanced_track):
+                        # track_number / disc_number. The raw API
+                        # names are track_position / disk_number —
+                        # reading those here made the position
+                        # [disc, None], and the album+position
+                        # sub-leg could never pass.
+                        "position": [details.get("disc_number") or 1,
+                                     details.get("track_number")],
+                    }
+                    ok, _leg = depot.promotion_verdict(
+                        db, track_sid, "deezer_id", candidates[0]["value"],
+                        confirmation_response=response,
+                        confirmation_fetched_id=candidate,
+                        local_keys=local_keys, **verdict_ctx)
+                    if ok:
+                        deezer_pick = (candidates[0]["value"], "b")
+        if deezer_pick:
+            slot_was_empty = "DEEZER_TRACK_ID" not in pp["id_tags"]
+            pp["id_tags"].setdefault("DEEZER_TRACK_ID", str(deezer_pick[0]))
+            _mark("track", track_sid, "deezer_id", deezer_pick[0])
+            if slot_was_empty:
+                # The steered fetch (§2.4): embed_source_ids hands
+                # this ID to the deezer processor as provenance, so
+                # the rest of the release data is fetched BY the
+                # promoted ID — and what it fills inherits the mark.
+                # Only when the promoted ID is the one the file
+                # carries: if the slot already held the user's own
+                # ID, steering by the depot's would fetch a different
+                # track's data over theirs.
+                pp["_depot_deezer_id"] = str(deezer_pick[0])
+        pick = _depot_pick(depot, db, track_sid, "tidal_id", **verdict_ctx)
+        if pick:
+            pp["id_tags"].setdefault("TIDAL_TRACK_ID", str(pick[0]))
+            _mark("track", track_sid, "tidal_id", pick[0])
+        pick = _depot_pick(depot, db, track_sid, "itunes_id", **verdict_ctx)
+        if pick and cfg.get("itunes.embed_tags", True) is not False:
+            pp["id_tags"].setdefault("ITUNES_TRACK_ID", str(pick[0]))
+            _mark("track", track_sid, "itunes_id", pick[0])
+        pick = _depot_pick(depot, db, track_sid, "recording_mbid",
+                           **verdict_ctx)
+        if pick and not pp["recording_mbid"]:
+            pp["recording_mbid"] = str(pick[0])
+            pp["id_tags"].setdefault("MUSICBRAINZ_RECORDING_ID", str(pick[0]))
+            _mark("track", track_sid, "recording_mbid", pick[0])
+            _mb_seed("recording", pick[0])
+        pick = _depot_pick(depot, db, track_sid, "isrc", **verdict_ctx)
+        if pick and not pp["isrc"]:
+            pp["isrc"] = str(pick[0])
+            _mark("track", track_sid, "isrc", pick[0])
+
+    # -- album candidates ---------------------------------------------------
+    if album_sid:
+        pick = _depot_pick(depot, db, album_sid, "release_group_mbid",
+                           **verdict_ctx)
+        if pick:
+            pp["id_tags"].setdefault("MUSICBRAINZ_RELEASEGROUPID", str(pick[0]))
+            _mark("album", album_sid, "release_group_mbid", pick[0])
+            # No _mb_seed for the release group: nothing adopts
+            # BY a release-group ID, and a seed would register no
+            # pending marks. Gated release-group marks arrive
+            # through the artist seed's release_by_artist group.
+        pick = _depot_pick(depot, db, album_sid, "spotify_id", **verdict_ctx)
+        if pick and cfg.get("spotify.embed_tags", True) is not False:
+            pp["id_tags"].setdefault("SPOTIFY_ALBUM_ID", str(pick[0]))
+            _mark("album", album_sid, "spotify_id", pick[0])
+        pick = _depot_pick(depot, db, album_sid, "itunes_id", **verdict_ctx)
+        if pick and cfg.get("itunes.embed_tags", True) is not False:
+            pp["id_tags"].setdefault("ITUNES_ALBUM_ID", str(pick[0]))
+            _mark("album", album_sid, "itunes_id", pick[0])
+        pick = _depot_pick(depot, db, album_sid, "year", **verdict_ctx)
+        if pick and not pp["release_year"]:
+            # Every other source writes a bare 4-digit year; the
+            # depot value is whatever the node sent (a full date, a
+            # float). Normalize to the leading year and mark THAT —
+            # the value that lands — or the mark's exact comparison
+            # against the library's year drops the network bit.
+            year_match = re.match(r"\s*(\d{4})", str(pick[0]))
+            if year_match:
+                pp["release_year"] = year_match.group(1)
+                _mark("album", album_sid, "year", year_match.group(1))
+                # The year lands on the track too — the file's DATE
+                # tag becomes the track row's year at import — so the
+                # track kind carries the mark as well.
+                _mark("track", track_sid, "year", year_match.group(1))
+
+    # -- artist candidates --------------------------------------------------
+    if artist_sid:
+        pick = _depot_pick(depot, db, artist_sid, "artist_mbid",
+                           **verdict_ctx)
+        if pick and not pp["artist_mbid"]:
+            pp["artist_mbid"] = str(pick[0])
+            pp["id_tags"].setdefault("MUSICBRAINZ_ARTIST_ID", str(pick[0]))
+            _mark("artist", artist_sid, "artist_mbid", pick[0])
+            _mb_seed("artist", pick[0])
+        pick = _depot_pick(depot, db, artist_sid, "spotify_id",
+                           **verdict_ctx)
+        if pick and cfg.get("spotify.embed_tags", True) is not False:
+            pp["id_tags"].setdefault("SPOTIFY_ARTIST_ID", str(pick[0]))
+            _mark("artist", artist_sid, "spotify_id", pick[0])
+        pick = _depot_pick(depot, db, artist_sid, "deezer_id", **verdict_ctx)
+        if pick:
+            pp["id_tags"].setdefault("DEEZER_ARTIST_ID", str(pick[0]))
+            _mark("artist", artist_sid, "deezer_id", pick[0])
+
+    # -- genres (album first, then artist; each genre clears the floor
+    # on its own, disputed ones never ride along) ---------------------------
+    genres = []
+    for kind, soul_id in (("album", album_sid), ("artist", artist_sid)):
+        if not soul_id:
+            continue
+        kind_genres = []
+        seen = set()
+        for row in depot.get_fields(db, soul_id, "genres"):
+            if row["is_local"]:
+                continue
+            key = json.dumps(row["value"], sort_keys=True, ensure_ascii=False)
+            if key in seen:
+                continue
+            seen.add(key)
+            ok, _leg = depot.promotion_verdict(
+                db, soul_id, "genres", row["value"], **verdict_ctx)
+            if ok and str(row["value"]) not in genres:
+                genres.append(str(row["value"]))
+                kind_genres.append(str(row["value"]))
+        if kind_genres:
+            _mark(kind, soul_id, "genres", kind_genres)
+    if genres:
+        # The file gets ONE merged genre list, whichever kind each
+        # genre was promoted under — so the union is marked under
+        # BOTH kinds as well: a genre promoted via the artist still
+        # lands in the album row's genres at import, and checking
+        # only the album kind's own promotions would let it export
+        # as the user's own data.
+        if album_sid:
+            _mark("album", album_sid, "genres", genres)
+        if artist_sid:
+            _mark("artist", artist_sid, "genres", genres)
+        pp["depot_genres"] = genres[:5]
+
+    if marks:
+        logger.info("MetaSync depot promoted %d field(s) for '%s'",
+                    len(marks), track_title)
+
+
 def _more_precise_date(existing: Any, new: Any) -> str:
     """Pick the better of two dates for the DATE tag (#1451).
 
@@ -1315,6 +1712,11 @@ def _write_embedded_metadata(audio_file, metadata: dict, pp: dict, cfg, symbols)
         enrichment_genres = []
         if _tag_enabled(cfg, "musicbrainz.tags.genres"):
             enrichment_genres += pp["mb_genres"]
+        if pp.get("depot_genres"):
+            # Depot genres cleared §8's floor one by one in
+            # _process_metasync_depot_source; they merge like any
+            # other enrichment source's genres.
+            enrichment_genres += pp["depot_genres"]
         if pp["audiodb_genre"] and _tag_enabled(cfg, "audiodb.tags.genre"):
             enrichment_genres.append(pp["audiodb_genre"])
         if _tag_enabled(cfg, "lastfm.tags.genres"):
@@ -1469,20 +1871,22 @@ def _update_album_year_in_database(db, metadata: dict, release_year) -> None:
         album_name_for_db = metadata.get("album", "")
         album_artist_for_db = metadata.get("album_artist", "") or metadata.get("artist", "")
         if album_name_for_db and album_artist_for_db:
+            from core.library2.importer import normalize_name
             conn = db._get_connection()
             try:
                 cursor = conn.cursor()
                 cursor.execute(
                     """
-                    UPDATE albums SET year = ?
+                    UPDATE lib2_albums SET year = ?
                     WHERE (year IS NULL OR year = 0)
                       AND id IN (
-                        SELECT al.id FROM albums al
-                        JOIN artists ar ON ar.id = al.artist_id
-                        WHERE LOWER(al.title) = LOWER(?) AND LOWER(ar.name) = LOWER(?)
+                        SELECT al.id FROM lib2_albums al
+                        JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                        WHERE LOWER(al.title) = LOWER(?) AND ar.name_key = ?
                       )
                     """,
-                    (int(release_year), album_name_for_db, album_artist_for_db),
+                    (int(release_year), album_name_for_db,
+                     normalize_name(album_artist_for_db)),
                 )
                 if cursor.rowcount > 0:
                     conn.commit()
@@ -1831,6 +2235,17 @@ def _album_identity_disagrees(own_album: Dict[str, Any], album_ctx: Any) -> bool
     return False
 
 
+def album_context_vouched(track_info: Any, album_ctx: Any) -> bool:
+    """an album context nobody guessed: the library's own album (reorganize)
+    or the album the user typed in (manual download). its artist is the
+    release's album artist even when no track performs on it, a dj mix or a
+    label comp ("Group Therapy" by Above & Beyond), so a track by someone
+    else is not a sign the context was poisoned (#2133, #2135)."""
+    if isinstance(album_ctx, dict) and album_ctx.get("_library_album"):
+        return True
+    return isinstance(track_info, dict) and bool(track_info.get("_manual_metadata"))
+
+
 def evaluate_batch_album_distrust(original_search, track_info, album_ctx, explicit_artist):
     """Pure function (R4F3): evaluate whether the batch album context is
     poisoned, without running the full metadata extraction.
@@ -1911,9 +2326,11 @@ def evaluate_batch_album_distrust(original_search, track_info, album_ctx, explic
     # Artists credit is a genuine multi-artist compilation — both stay
     # trusted. Empty ground truth never fires.
     _ctx_album_id = str(album_ctx.get("id") or "").strip()
+    _ctx_vouched = album_context_vouched(track_info_ctx, album_ctx)
     _ctx_artist_norm = (own_album_artist or "").strip().casefold()
     _ctx_artist_untrusted = (
-        bool(track_own_artists)
+        not _ctx_vouched
+        and bool(track_own_artists)
         and bool(_ctx_artist_norm)
         and _ctx_artist_norm != "unknown artist"
         and _ctx_artist_norm not in VARIOUS_ARTIST_NAMES
@@ -1939,7 +2356,7 @@ def evaluate_batch_album_distrust(original_search, track_info, album_ctx, explic
                 )
 
     # Wires 1 and 2 (skipped when wire 3 already fired).
-    if not batch_album_distrusted:
+    if not batch_album_distrusted and not _ctx_vouched:
         claimed_album_artist = explicit_name or own_album_artist
         claimed_norm = (claimed_album_artist or "").strip().casefold()
         ctx_album_name = (album_ctx.get("name") or "").strip()
@@ -1999,7 +2416,9 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     album_ctx = get_import_context_album(context)
     track_info = get_import_track_info(context)
     source = get_import_source(context)
-    source_ids = get_import_source_ids(context)
+    # provider ids, never the pipeline's own keys: these go into the file's
+    # tags and to the provider (a wishlist row key was written as the track id)
+    source_ids = get_provider_source_ids(context)
 
     artist_dict = artist if isinstance(artist, dict) else {
         "name": extract_artist_name(artist),
@@ -2046,6 +2465,10 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # track object). Deezer-direct contexts populate `original_search.artists`
     # directly. Pure helper handles all three shapes.
     all_artists = resolve_track_artists(original_search, track_info, artist_dict)
+    # #2165: the library's name for each artist it knows by another one (the
+    # source says "Machine Gun Kelly", the library, which finds them by id,
+    # "mgk"). the same names the folder was built with
+    library_artist_names = library_names(context, artist_dict)
     if all_artists:
         # Deezer upgrade path: Deezer's `/search` endpoint only returns
         # the primary artist for each track. The full contributors
@@ -2080,6 +2503,7 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         # "artists" key for Vorbis) when `write_multi_artist` is on.
         # Without this assignment the field was always empty and the
         # multi-artist write path silently no-op'd.
+        all_artists = swap_names(list(all_artists), library_artist_names)
         metadata["_artists_list"] = list(all_artists)
 
         # `feat_in_title` (when true): pull featured artists out of the
@@ -2125,7 +2549,8 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
                 artist_separator, metadata["artist"],
             )
     else:
-        metadata["artist"] = artist_dict.get("name", "") or get_import_clean_artist(context)
+        metadata["artist"] = swap_credit(
+            artist_dict.get("name", "") or get_import_clean_artist(context), library_artist_names)
         logger.info("Metadata: Using primary artist: '%s'", metadata["artist"])
 
     raw_album_artist = artist_dict.get("name", "") or metadata["artist"]
@@ -2216,13 +2641,14 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     collab_mode = cfg.get("file_organization.collab_artist_mode", "first")
     if collab_mode == "first" and raw_album_artist:
         context_artists = album_artists_for_collab or original_search.get("artists") or track_info_ctx.get("artists") or []
-        primary = first_listed_artist(raw_album_artist, context_artists)
-        if not primary:
-            # the album list can be the combined name itself while the track
-            # names the primary on its own
-            _track_artists = original_search.get("artists") or track_info_ctx.get("artists") or []
-            if _track_artists:
-                primary = listed_primary_of(raw_album_artist, _track_artists[0])
+        # the album list can be the combined name itself while the track
+        # names the primary on its own, or no list splits it at all (#2028).
+        # same rule as the folder (core/imports/paths.py)
+        _track_artists = original_search.get("artists") or track_info_ctx.get("artists") or []
+        primary = collab_primary(
+            raw_album_artist, context_artists, _track_artists,
+            known_names=[n for n in (artist_dict.get("name"), *(all_artists or [])) if n],
+            library_has=library_has_artist, library_knows=library_has_identified_artist)
         if primary:
             raw_album_artist = primary
         elif len(context_artists) == 1 and ("," in raw_album_artist or " & " in raw_album_artist):
@@ -2236,11 +2662,12 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
                             raw_album_artist = resolved
                 except Exception as e:
                     logger.debug("itunes primary artist resolve failed: %s", e)
-    metadata["album_artist"] = raw_album_artist
+    metadata["album_artist"] = swap_credit(raw_album_artist, library_artist_names)
     # every album artist, for the multi-value ALBUMARTISTS tag. only from an
     # album context that names more than one. track artists aren't album
     # artists, a feature doesn't make it a collab album
-    metadata["_album_artists_list"] = _album_artist_names(album_artists_for_collab)
+    metadata["_album_artists_list"] = swap_names(
+        _album_artist_names(album_artists_for_collab), library_artist_names)
 
     # 'Unknown Album' in any slot is the no-album placeholder, not a name —
     # tracks from paste-link playlists / discovery-pool rows / TXT imports
@@ -2281,41 +2708,41 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
         _file_album_tag = ""
 
     if album_info.get("is_album") and _album_info_name:
+        # 0 = unknown (3827b0227): never invent a track 1
+        metadata["track_number"] = album_info.get("track_number", 0)
         if batch_album_distrusted:
             # #1567: album_info['album_name'] is built from the same poisoned
             # batch album in bundle flows — stamp the track's own provider
             # album instead (or the title when the track carries no album of
             # its own), and never the batch's total_tracks.
             metadata["album"] = _own_album_name or metadata["title"]
-            metadata["track_number"] = album_info.get("track_number", 1)
-            metadata["total_tracks"] = own_album.get("total_tracks") or 1
+            metadata["total_tracks"] = own_album.get("total_tracks")
         else:
             metadata["album"] = _album_info_name
-            metadata["track_number"] = album_info.get("track_number", 1)
-            metadata["total_tracks"] = album_ctx.get("total_tracks", 1) if album_ctx else 1
+            metadata["total_tracks"] = album_ctx.get("total_tracks") if album_ctx else None
         logger.info("[METADATA] Album track - track_number: %s, album: %s", metadata["track_number"], metadata["album"])
     else:
         if _album_ctx_name and not batch_album_distrusted:
             logger.info("[SAFEGUARD] Using album context name instead of track title for album metadata")
             metadata["album"] = _album_ctx_name
-            metadata["track_number"] = album_info.get("track_number", 1) if album_info else 1
-            metadata["total_tracks"] = album_ctx.get("total_tracks", 1)
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = album_ctx.get("total_tracks")
         elif batch_album_distrusted and _own_album_name:
             # #1567: the batch album context is poisoned — fall back to the
             # track's own provider album rather than stamping a stranger's
             # album on the track.
             logger.info("[SAFEGUARD] Batch album context distrusted — using the track's own provider album (#1567)")
             metadata["album"] = _own_album_name
-            metadata["track_number"] = album_info.get("track_number", 1) if album_info else 1
-            metadata["total_tracks"] = own_album.get("total_tracks") or 1
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = own_album.get("total_tracks")
         elif _file_album_tag:
             # No source named an album, but the downloaded file itself is
             # tagged with one — that tag is the track's own evidence and
             # beats modelling the track as a single named after its title.
             logger.info("[SAFEGUARD] No album in context — using the file's own album tag: %s", _file_album_tag)
             metadata["album"] = _file_album_tag
-            metadata["track_number"] = album_info.get("track_number", 1) if album_info else 1
-            metadata["total_tracks"] = (album_info.get("total_tracks") if album_info else None) or 1
+            metadata["track_number"] = album_info.get("track_number", 0) if album_info else 0
+            metadata["total_tracks"] = album_info.get("total_tracks") if album_info else None
         else:
             metadata["album"] = metadata["title"]
             metadata["track_number"] = 1
@@ -2327,6 +2754,13 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     # as disc-less and ungroup the track in Jellyfin/Plex).
     from core.imports.track_number import resolve_disc_for_track
     metadata["disc_number"] = resolve_disc_for_track(original_search, album_info)
+    reference = context.get('_metadata_reference')
+    if reference:
+        for key, ref_key in (('title', 'title'), ('artist', 'track_artist'), ('album', 'album_title'), ('album_artist', 'artist_name')):
+            if reference.get(ref_key):
+                metadata[key] = reference[ref_key]
+        metadata.update(track_number=reference.get('track_number') or metadata['track_number'], total_tracks=reference.get('track_count'),
+                        disc_number=reference.get('disc_number') or metadata['disc_number'], total_discs=reference.get('total_discs'))
 
     if album_ctx and album_ctx.get("release_date") and not batch_album_distrusted:
         release_date = _normalize_release_date_tag(album_ctx.get("release_date"))
@@ -2370,6 +2804,12 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
                 album_image = first_image.get("url") if isinstance(first_image, dict) else None
             metadata["album_art_url"] = album_image
 
+    if reference:
+        for key, ref_key in (('date', 'year'), ('genre', 'genres'), ('album_art_url', 'thumb_url')):
+            if reference.get(ref_key):
+                value = reference[ref_key]
+                metadata[key] = ', '.join(value) if isinstance(value, list) else str(value)
+
     logger.info(
         "[Metadata Summary] title='%s' | artist='%s' | album_artist='%s' | album='%s' | date=%s | track=%s/%s | disc=%s",
         metadata.get("title"),
@@ -2403,6 +2843,19 @@ def extract_source_metadata(context: dict, artist: dict, album_info: dict) -> di
     return metadata
 
 
+def known_source_id_tags(metadata: dict, cfg=None) -> dict:
+    """The exact, configured identity tags shared by preview and writing."""
+    cfg = cfg or get_config_manager()
+    tags = _collect_source_ids(metadata, cfg)
+    if cfg.get('musicbrainz.embed_tags', True) is not False:
+        for key, tag in [('musicbrainz_recording_id', 'MUSICBRAINZ_RECORDING_ID'),
+                         ('musicbrainz_release_id', 'MUSICBRAINZ_RELEASE_ID')]:
+            if metadata.get(key):
+                tags[tag] = metadata[key]
+    return {tag: value for tag, value in tags.items()
+            if _tag_enabled(cfg, SOURCE_TAG_CONFIG.get(tag, ''))}
+
+
 def embed_known_source_ids(audio_file, metadata: dict) -> list:
     """Embed ALREADY-KNOWN source IDs into a file's tags, no API re-fetch.
 
@@ -2422,15 +2875,7 @@ def embed_known_source_ids(audio_file, metadata: dict) -> list:
     if not symbols or audio_file is None:
         return []
     try:
-        id_tags = _collect_source_ids(metadata, cfg)
-        # MusicBrainz ids aren't in _collect_source_ids (they come from the MB
-        # processor at import time); add them from the DB when present, using
-        # the canonical names the frame map already knows.
-        if cfg.get("musicbrainz.embed_tags", True) is not False:
-            if metadata.get("musicbrainz_recording_id"):
-                id_tags["MUSICBRAINZ_RECORDING_ID"] = metadata["musicbrainz_recording_id"]
-            if metadata.get("musicbrainz_release_id"):
-                id_tags["MUSICBRAINZ_RELEASE_ID"] = metadata["musicbrainz_release_id"]
+        id_tags = known_source_id_tags(metadata, cfg)
         if not id_tags:
             return []
         pp = _blank_post_process_state()
@@ -2516,6 +2961,7 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
             "bandcamp_tags": [],
             "bandcamp_label": None,
             "beatport": None,
+            "depot_genres": [],
         }
 
         source_order = cfg.get("metadata_enhancement.post_process_order", None)
@@ -2567,9 +3013,31 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
 
         db = get_database()
 
+        # MetaSync depot FIRST (DESIGN-METADATA §1: the depot is the
+        # tagging pipeline's first source; a live search happens only
+        # on a depot miss). It fills only empty slots, only above §8's
+        # promotion floor, and records its fills in pp["_depot"] for
+        # the §2.4 network marks below.
+        try:
+            _process_metasync_depot_source(pp, metadata, cfg, runtime,
+                                           track_title, artist_name,
+                                           context=context, db=db)
+        except Exception as e:  # noqa: BLE001 - a depot failure must never fail tagging
+            logger.debug("metasync depot consult failed: %s", e)
+        _depot_snapshot = {key: pp.get(key) for key in
+                           ("isrc", "deezer_isrc", "mb_genres", "release_year")}
+
         for source_name in source_order:
+            provenance = cached_meta
+            if source_name == "deezer" and pp.get("_depot_deezer_id") \
+                    and not _deezer_provenance_id(cached_meta):
+                # §2.4's steered fetch: the deezer processor fetches
+                # BY the depot-promoted ID instead of searching, and
+                # what it fills inherits the network mark below.
+                provenance = {"source": "deezer",
+                              "track_id": pp["_depot_deezer_id"]}
             _process_source_enrichment(source_name, pp, metadata, cfg, runtime, track_title, artist_name,
-                                       provenance=cached_meta, audio_file=audio_file,
+                                       provenance=provenance, audio_file=audio_file,
                                        track_artist_name=track_artist_name)
 
         # #1513: stash the Last.fm client + artist name for the genre fallback
@@ -2583,10 +3051,122 @@ def embed_source_ids(audio_file, metadata: dict, context: dict = None, runtime=N
 
         # Skip the early return when the genre fallback is on — there may be
         # genres to write even if no other metadata was enriched.
-        if not fallback_enabled and not pp["id_tags"] and not pp["deezer_bpm"] and not pp["deezer_isrc"] and not pp["tidal_bpm"] and not pp["hifi_bpm"] and not pp["hifi_copyright"] and not pp["audiodb_mood"] and not pp["audiodb_style"] and not pp["bandcamp_url"] and not pp["bandcamp_tags"] and not pp["beatport"]:
+        if not fallback_enabled and not pp["id_tags"] and not pp["deezer_bpm"] and not pp["deezer_isrc"] and not pp["tidal_bpm"] and not pp["hifi_bpm"] and not pp["hifi_copyright"] and not pp["audiodb_mood"] and not pp["audiodb_style"] and not pp["bandcamp_url"] and not pp["bandcamp_tags"] and not pp["beatport"] and not pp.get("_depot"):
             return
 
+        # §2.4 network marks, recorded BEFORE the tag write below:
+        # a mark for a value that never lands is inert (the
+        # export compares the mark against the row's current
+        # value), while a value written first and marked after
+        # can be stranded unmarked if the write raises partway
+        # — and an unmarked network value exports as the
+        # user's own data. Everything the depot promoted — and
+        # what live sources filled BY WAY OF a promoted ID — is
+        # marked in SoulSync's own data, so the MetaSync export
+        # emits those values with source 'network' and they can
+        # never launder themselves into independent support.
+        if pp.get("_depot"):
+            try:
+                from core import metasync_depot as _depot
+                _marks = list(pp["_depot"]["marks"])
+                _mbid_promoted = any(m[2] in ("recording_mbid", "artist_mbid",
+                                              "release_group_mbid")
+                                     for m in _marks)
+                # Fetched-via inheritance compares VALUES, not
+                # emptiness: if a steered or gated fetch REPLACED a
+                # value that was already there (the user's own, or
+                # one the depot itself promoted), the replacement is
+                # just as network-derived as a fill of an empty slot.
+                if pp.get("_depot_deezer_id") and pp.get("deezer_isrc") \
+                        and pp["deezer_isrc"] != _depot_snapshot.get("deezer_isrc"):
+                    _marks.append(("track", pp["_depot"]["track_sid"], "isrc",
+                                   pp["deezer_isrc"], "fetched_via_promoted_id"))
+                if _mbid_promoted and pp.get("isrc") \
+                        and pp["isrc"] != _depot_snapshot.get("isrc"):
+                    _marks.append(("track", pp["_depot"]["track_sid"], "isrc",
+                                   pp["isrc"], "fetched_via_promoted_id"))
+                if _mbid_promoted and pp.get("mb_genres") \
+                        and pp["mb_genres"] != _depot_snapshot.get("mb_genres"):
+                    _marks.append(("album", pp["_depot"]["album_sid"], "genres",
+                                   list(pp["mb_genres"]), "fetched_via_promoted_id"))
+                if pp.get("_depot_deezer_id") and pp.get("release_year") \
+                        and pp["release_year"] != _depot_snapshot.get("release_year"):
+                    # The steered deezer fetch also fills the year
+                    # off the promoted ID's album (§2.4 names this
+                    # case: a steered fetch does not launder). The
+                    # snapshot was taken after the depot consult, so
+                    # a year the DEPOT promoted itself is already in
+                    # it — and already carries its own mark above;
+                    # only a year the fetch changed or newly filled
+                    # reaches this branch.
+                    # Tracks export year too, and the year written
+                    # into the file's DATE tag becomes the track
+                    # row's year: the track kind is marked as well.
+                    _marks.append(("album", pp["_depot"]["album_sid"], "year",
+                                   pp["release_year"], "fetched_via_promoted_id"))
+                    _marks.append(("track", pp["_depot"]["track_sid"], "year",
+                                   pp["release_year"], "fetched_via_promoted_id"))
+                # Gated MusicBrainz values (§2.4): the depot handed
+                # the MB processor an ID it never searched by name —
+                # a recording MBID whose details it fetched directly,
+                # or an artist MBID that gated match_recording /
+                # release_by_artist when MB's own artist lookup came
+                # back empty. What those gated lookups landed is
+                # network-derived and inherits the mark. The consult
+                # registered the candidates as PENDING marks keyed
+                # by adoption group; each resolves here against the
+                # ID the pipeline actually ended with, so a value
+                # the pipeline never adopted (a search outscored
+                # the gate, a release was vetoed) is never marked.
+                _gated = pp.get("_mb_depot_ids") or {}
+                _rg_tag = pp["id_tags"].get("MUSICBRAINZ_RELEASEGROUPID")
+                _adoptions = {
+                    "recording": bool(
+                        _gated.get("recording")
+                        and pp.get("recording_mbid") == _gated["recording"]),
+                    "recording_by_artist": bool(
+                        pp.get("_mb_release_gated")
+                        and pp.get("_mb_searched_recording")
+                        and pp.get("recording_mbid")),
+                    "release_by_artist": bool(pp.get("_mb_release_gated")),
+                }
+                _gated_values = {
+                    ("track", "recording_mbid"): pp.get("recording_mbid"),
+                    ("track", "isrc"): pp.get("isrc"),
+                    ("track", "year"): pp.get("release_year"),
+                    ("album", "genres"): (list(pp["mb_genres"])
+                                          if pp.get("mb_genres") else None),
+                    ("album", "release_group_mbid"): _rg_tag,
+                    ("album", "year"): pp.get("release_year"),
+                }
+                _marked_gated = set()
+                for _kind, _sid, _field, _group in \
+                        pp["_depot"].get("pending_marks") or []:
+                    if not _adoptions.get(_group):
+                        continue
+                    _value = _gated_values.get((_kind, _field))
+                    if not _value or (_kind, _field) in _marked_gated:
+                        continue
+                    if _group == "release_by_artist" and _field == "year" \
+                            and _depot_snapshot.get("release_year") \
+                            and _value == _depot_snapshot.get("release_year"):
+                        continue  # the year predates the gated lookup
+                    _marked_gated.add((_kind, _field))
+                    _marks.append((_kind, _sid, _field, _value,
+                                   "fetched_via_promoted_id"))
+                for _kind, _sid, _field, _value, _via in _marks:
+                    if _sid:
+                        try:
+                            _depot.record_mark(db, _kind, _sid, _field,
+                                               _value, via=_via)
+                        except Exception as _mark_err:  # noqa: BLE001 - one bad mark must not drop the rest
+                            logger.warning("metasync depot mark failed "
+                                         "for %s/%s: %s",
+                                         _kind, _field, _mark_err)
+            except Exception as e:  # noqa: BLE001 - marking must never fail tagging
+                logger.warning("metasync depot mark recording failed: %s", e)
         release_year = _write_embedded_metadata(audio_file, metadata, pp, cfg, symbols)
+
         release_id = pp["release_mbid"]
         if release_id:
             metadata["musicbrainz_release_id"] = release_id

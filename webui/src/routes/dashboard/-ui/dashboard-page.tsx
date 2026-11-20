@@ -25,6 +25,8 @@
 import { useEffect } from 'react';
 
 import { FinishSetupCard } from '@/features/onboarding/checklist-card';
+import { useFeatureOn } from '@/platform/features';
+import { usePermNotOff } from '@/platform/shell/my-permissions';
 
 import { useDashboardHeader } from '../-dash.header';
 import { ActiveDownloadsShell } from './active-downloads-shell';
@@ -38,41 +40,67 @@ import { ListeningHistoryBand } from './listening-history-band';
 import { SyncRail } from './sync-band';
 import { WeeklyDigest } from './weekly-digest';
 
-export function DashboardPage() {
-  const header = useDashboardHeader();
+/** `isAdmin` decides the worker orbs, their sheet and Manage Workers: server
+ *  maintenance, the admins' (#2196). */
+export function DashboardPage({ isAdmin }: { isAdmin: boolean }) {
+  const header = useDashboardHeader({ workers: isAdmin });
+  // cards for parts this profile switched off stay off the dashboard (#1909)
+  const statsOn = useFeatureOn('stats');
+  // playlist sync off for this profile: no sync rail, its auto-sync runs
+  // aren't theirs (#2166)
+  const playlistSync = usePermNotOff('music.playlist_sync');
+  const playlistsOn = useFeatureOn('playlists') && playlistSync;
+  const automationsOn = useFeatureOn('automations');
 
   useEffect(() => {
-    window.workerOrbs?.setPage('dashboard');
-  }, []);
+    if (isAdmin) window.workerOrbs?.setPage('dashboard');
+  }, [isAdmin]);
 
   return (
-    <div className="page-shell dashboard-container" id="dashboard-page">
-      <DashboardHeaderView header={header} library={<LibraryCard />} />
+    <div className="page-shell dashboard-container dash-room" id="dashboard-page">
+      <DashboardHeaderView
+        header={header}
+        library={<LibraryCard admin={isAdmin} />}
+        workers={isAdmin}
+      />
       {/* The exception surface: renders NOTHING while every core connection
-          is healthy — the one place that shouts when a human is needed. */}
-      <AlertsBand />
-      <div className="dash-layout">
-        <div className="dash-main">
-          {/* What setup left for later. Renders nothing once it's all done,
-              dismissed, or for anyone who isn't an admin. */}
-          <FinishSetupCard />
-          {/* This week in listening — renders nothing until plays exist. */}
-          <WeeklyDigest />
-          {/* Only while something is downloading. It stays full width: the
-              download cards are painted by vanilla into this shell. */}
-          <ActiveDownloadsShell />
-          {/* What's new in the library. Renders nothing until a feed has rows. */}
-          <ContentBand />
-          {/* What you've been playing. Renders nothing until history exists. */}
-          <ListeningHistoryBand />
-          {/* The payoff: Library Radio and the Mixes doorway — below the rails. */}
-          <ListenBand />
-        </div>
-        <aside className="dash-side" aria-label="Your system">
-          <SyncRail />
-          <AutomationsCard compact />
+          is healthy — the one place that shouts when a human is needed.
+          That human is the admin: a down server or a spotify ban, with a
+          jump to Settings, is nothing a member can act on (#2208). */}
+      {isAdmin ? <AlertsBand /> : null}
+      <div className="room-top">
+        {/* What setup left for later. Renders nothing once it's all done,
+            dismissed, or for anyone who isn't an admin. */}
+        <FinishSetupCard />
+        {/* Only while something is downloading. The download cards are
+            painted by vanilla into this shell. */}
+        <ActiveDownloadsShell />
+        {/* What you came to play: Library Radio and the mixes, first thing
+            under the hero. */}
+        <ListenBand />
+      </div>
+      {/* The music comes first: the mixes, then what just arrived, the full
+          width of the page. Renders nothing until a feed has rows. */}
+      <div className="room-shelves">
+        <ContentBand />
+      </div>
+      {/* The system as a board: your week, what you watch and wish for,
+          playlist sync, what runs next. Two by two, and all four in one row
+          once the page is wide enough to give each its own column (the
+          wrap is what the board measures itself against). Each card renders
+          nothing when its part is off or empty, and the grid closes up. */}
+      <div className="room-board-wrap">
+        <section className="room-board" aria-label="Your system">
+          {statsOn ? <WeeklyDigest /> : null}
           <QuickNavTiles header={header} />
-        </aside>
+          {playlistsOn ? <SyncRail /> : null}
+          {automationsOn ? <AutomationsCard compact timeline /> : null}
+        </section>
+      </div>
+      {/* What you've been playing, last on the page: it is a look back, not
+          something to act on. Renders nothing until history exists. */}
+      <div className="room-shelves room-shelves--last">
+        <ListeningHistoryBand />
       </div>
       <footer className="dash-footer">
         <QuickSettings />

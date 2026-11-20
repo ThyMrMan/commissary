@@ -8,9 +8,6 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-// Commissary: video Library tabs (commissary/history-library-tabs.tsx)
-import { HistoryLibraryTabs, useHistoryLibraries } from '@/commissary/history-library-tabs';
-
 import type { VdlHistoryItem, VdlHistoryTab } from '../-vdl.types';
 
 import {
@@ -43,11 +40,14 @@ function HistoryRow({
   open,
   onToggle,
   onRemoved,
+  canManage = true,
 }: {
   item: VdlHistoryItem;
   open: boolean;
   onToggle: () => void;
   onRemoved: () => void;
+  /** re-download (forget) and the blocks are the admin's */
+  canManage?: boolean;
 }) {
   const [blocked, setBlocked] = useState<'release' | 'uploader' | null>(null);
   const [busy, setBusy] = useState(false);
@@ -170,39 +170,41 @@ function HistoryRow({
               <span className="vdh-d-v">{item.error}</span>
             </div>
           ) : null}
-          <div className="vdh-detail-act">
-            <button
-              type="button"
-              className="vdh-redl"
-              title="Forget this grab so it re-downloads on the next scan"
-              disabled={busy}
-              onClick={onRedownload}
-            >
-              &#8635; Re-download
-            </button>
-            {canBlockRelease ? (
+          {canManage ? (
+            <div className="vdh-detail-act">
               <button
                 type="button"
-                className="vdh-redl vdh-block"
-                title="Never pick this exact release again"
-                disabled={busy || blocked !== null}
-                onClick={onBlockRelease}
+                className="vdh-redl"
+                title="Forget this grab so it re-downloads on the next scan"
+                disabled={busy}
+                onClick={onRedownload}
               >
-                {blocked === 'release' ? 'Blocked' : <>&#8856; Block release</>}
+                &#8635; Re-download
               </button>
-            ) : null}
-            {canBlockUploader ? (
-              <button
-                type="button"
-                className="vdh-redl vdh-block"
-                title={`Never grab from this uploader (${item.username}) again`}
-                disabled={busy || blocked === 'uploader'}
-                onClick={onBlockUploader}
-              >
-                {blocked === 'uploader' ? 'Uploader blocked' : <>&#8856; Block uploader</>}
-              </button>
-            ) : null}
-          </div>
+              {canBlockRelease ? (
+                <button
+                  type="button"
+                  className="vdh-redl vdh-block"
+                  title="Never pick this exact release again"
+                  disabled={busy || blocked !== null}
+                  onClick={onBlockRelease}
+                >
+                  {blocked === 'release' ? 'Blocked' : <>&#8856; Block release</>}
+                </button>
+              ) : null}
+              {canBlockUploader ? (
+                <button
+                  type="button"
+                  className="vdh-redl vdh-block"
+                  title={`Never grab from this uploader (${item.username}) again`}
+                  disabled={busy || blocked === 'uploader'}
+                  onClick={onBlockUploader}
+                >
+                  {blocked === 'uploader' ? 'Uploader blocked' : <>&#8856; Block uploader</>}
+                </button>
+              ) : null}
+            </div>
+          ) : null}
         </div>
       ) : null}
     </div>
@@ -213,11 +215,14 @@ export function VdlHistoryModal({
   open,
   onClose,
   onCountChange,
+  canManage = true,
 }: {
   open: boolean;
   onClose: () => void;
   /** Fired when the total changes (clear / re-download) so the header badge stays honest. */
   onCountChange: (n: number | null) => void;
+  /** an admin: clearing and forgetting history. a member reads their own grabs. */
+  canManage?: boolean;
 }) {
   const [tab, setTab] = useState<VdlHistoryTab>('all');
   const [searchInput, setSearchInput] = useState('');
@@ -235,21 +240,13 @@ export function VdlHistoryModal({
    * in-flight guard, newer requests are never silently dropped while the
    * user is already looking at the new tab. */
   const reqSeqRef = useRef(0);
-  const libs = useHistoryLibraries(open); // Commissary
-  const libraryFor = libs.libraryFor;
 
   const load = useCallback(
     async (nextPage: number, nextSearch: string, nextTab: VdlHistoryTab, append: boolean) => {
       const seq = ++reqSeqRef.current;
       setLoading(true);
       try {
-        const data = await fetchVideoHistory(
-          nextTab,
-          nextSearch,
-          nextPage,
-          undefined,
-          libraryFor(nextTab), // Commissary
-        );
+        const data = await fetchVideoHistory(nextTab, nextSearch, nextPage);
         if (seq !== reqSeqRef.current) return; // superseded — discard stale response
         setCounts({
           movie: data.counts.movie ?? 0,
@@ -264,7 +261,7 @@ export function VdlHistoryModal({
         if (seq === reqSeqRef.current) setLoading(false);
       }
     },
-    [onCountChange, libraryFor],
+    [onCountChange],
   );
 
   /* open → reset and load; close → release the scroll lock */
@@ -332,7 +329,6 @@ export function VdlHistoryModal({
     toast(`Cleared ${Number(r?.removed ?? 0)} from history`, 'info');
     setPage(1);
     void load(1, search, tab, false);
-    void libs.refresh(); // Commissary
   };
 
   const toggleRow = (id: string) => {
@@ -365,6 +361,7 @@ export function VdlHistoryModal({
         open={expanded.has(key)}
         onToggle={() => toggleRow(key)}
         onRemoved={() => setItems((prev) => prev.filter((it) => String(it.id) !== key))}
+        canManage={canManage}
       />,
     );
   }
@@ -436,25 +433,17 @@ export function VdlHistoryModal({
               onChange={(e) => setSearchInput(e.target.value)}
             />
           </div>
-          <button
-            type="button"
-            className="vdh-clear"
-            title="Clear the whole download history"
-            onClick={() => void onClear()}
-          >
-            Clear
-          </button>
+          {canManage ? (
+            <button
+              type="button"
+              className="vdh-clear"
+              title="Clear the whole download history"
+              onClick={() => void onClear()}
+            >
+              Clear
+            </button>
+          ) : null}
         </div>
-        {/* Commissary: one video Library of this kind */}
-        <HistoryLibraryTabs
-          libs={libs}
-          tab={tab}
-          kindCount={tab === 'movie' ? counts.movie : counts.show}
-          onPicked={() => {
-            setPage(1);
-            void load(1, search, tab, false);
-          }}
-        />
         <div className={`vdh-body${loading && !items.length ? ' vdh-body--loading' : ''}`}>
           {items.length === 0 && !loading ? (
             <div className="vdh-empty">

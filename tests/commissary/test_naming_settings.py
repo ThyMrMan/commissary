@@ -59,21 +59,21 @@ def test_both_are_admin_only(client):
 
 
 def _presets():
-    """The presets as the shipped script defines them (evaluated by node)."""
-    import json
-    node = shutil.which("node") or shutil.which("node.exe")
-    if node is None:
-        pytest.skip("node not available")
-    code = ("globalThis.window={};globalThis.document={readyState:'loading',addEventListener(){}};"
-            "(0,eval)(require('fs').readFileSync('webui/static/commissary-naming-settings.js','utf8'));"
-            "console.log(JSON.stringify(window.CommissaryNamingSettings.TRASH))")
-    res = subprocess.run([node, "-e", code], cwd=str(ROOT), capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
-    return json.loads(res.stdout)
+    """The presets as the shipped panel defines them (webui/src/commissary/naming-panel.tsx):
+    each is a run of quoted strings joined by +."""
+    import re
+    src = (ROOT / "webui/src/commissary/naming-panel.tsx").read_text(encoding="utf-8")
+    block = src.split("export const TRASH", 1)[1].split("};", 1)[0]
+    out = {}
+    for key in ("movie", "episode"):
+        part = block.split(key + ":", 1)[1]
+        part = part.split("episode:", 1)[0] if key == "movie" else part
+        out[key] = "".join(re.findall(r"'([^']*)'", part))
+    return out
 
 
 def test_the_trash_presets_are_the_guides_formats_and_render_cleanly(client):
-    """Parsed out of the shipped script, so the test can't drift from the button."""
+    """Parsed out of the shipped panel, so the test can't drift from the button."""
     presets = _presets()
     movie, episode = presets["movie"], presets["episode"]
     assert movie.startswith("{Movie CleanTitle} {(Release Year)} {edition-{Edition Tags}}")
@@ -87,9 +87,8 @@ def test_the_trash_presets_are_the_guides_formats_and_render_cleanly(client):
     assert "{" not in d["movie"] + d["episode"] and d["episode"].count("/") == 2
 
 
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
-def test_the_script_parses_and_is_loaded():
-    assert "filename='commissary-naming-settings.js'" in (ROOT / "webui/index.html").read_text(encoding="utf-8")
-    res = subprocess.run(["node", "--check", "webui/static/commissary-naming-settings.js"],
-                         cwd=str(ROOT), capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
+def test_the_settings_tab_shows_the_panel():
+    tab = (ROOT / "webui/src/features/settings/tabs/library-video-organization.tsx").read_text(encoding="utf-8")
+    assert '<CommissaryTokenHelp scope="movie" />' in tab
+    assert '<CommissaryTokenHelp scope="episode" />' in tab
+    assert "<CommissaryRenameFirst />" in tab

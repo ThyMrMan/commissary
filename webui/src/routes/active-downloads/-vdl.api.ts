@@ -103,13 +103,11 @@ export async function fetchVideoHistory(
   search: string,
   page: number,
   limit = 40,
-  library: number | null = null, // Commissary: a Library tab
 ): Promise<VdlHistoryPage> {
   const empty: VdlHistoryPage = { items: [], counts: {}, totalPages: 1 };
   try {
     const params: Record<string, string | number> = { page, limit, search };
     if (tab !== 'all') params.kind = tab;
-    if (library != null && tab !== 'all') params.library = library; // Commissary
     const data = await readJson<{
       success?: boolean;
       items?: VdlHistoryItem[];
@@ -179,9 +177,32 @@ export function clearVideoDownloads(): Promise<VdlResult | null> {
   return post('video/downloads/clear', {});
 }
 
+/** Clear only failed and cancelled downloads -- completed rows stay. */
+export function clearFailedVideoDownloads(): Promise<VdlResult | null> {
+  return post('video/downloads/clear', { scope: 'failed' });
+}
+
+/** Clear completed, failed and cancelled rows; import failures stay for Manual import. */
+export function clearEverythingVideoDownloads(): Promise<VdlResult | null> {
+  return post('video/downloads/clear', { scope: 'everything' });
+}
+
+/** Take one failed or cancelled download off the list, no retry. */
+export function removeVideoDownload(id: number): Promise<VdlResult | null> {
+  return post('video/downloads/remove', { id });
+}
+
 /** Block one exact release (slskd rows only — YouTube has no release identity). */
 export function blockVideoRelease(downloadId: number): Promise<VdlResult | null> {
   return post('video/downloads/blocklist', { download_id: downloadId });
+}
+
+/** Block every failed row's release and grab the next one for each, one title
+ *  at a time in the background (admin). */
+export function blockAndRetryFailedVideoDownloads(): Promise<
+  (VdlResult & { blocked?: number; searching?: number }) | null
+> {
+  return post('video/downloads/blocklist/retry-failed', {});
 }
 
 /** Block one exact release from a history row. */

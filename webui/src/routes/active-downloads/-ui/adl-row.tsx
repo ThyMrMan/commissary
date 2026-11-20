@@ -1,12 +1,13 @@
 import { useRef, useState } from 'react';
 
-import { openDownloadTaskInspector } from '@/features/downloads/inspector-modal';
+import { openDownloadTaskSearch } from '@/routes/library/-ui/interactive-search-host';
 
 import type { AdlDownload, AdlTaskDetail } from '../-adl.types';
 import type { DlFact } from './dl-parts';
 
 import { fetchTaskDetail } from '../-adl.api';
 import {
+  downloadFailureSummary,
   formatBytes,
   formatSpeed,
   liveDetailLines,
@@ -102,7 +103,10 @@ function subLine(
   const who = [dl.artist, compact ? '' : dl.album].filter(Boolean).join(' · ');
   if (cls === 'failed' || cls === 'cancelled') {
     return {
+      // an exhausted search reads as one plain sentence; the raw breakdown
+      // stays in the open sheet's "What happened"
       text:
+        downloadFailureSummary(dl)?.message ||
         dl.error ||
         (dl.status === 'not_found' ? 'Nothing matched on any source' : statusLabel(dl.status).text),
       tone: 'bad',
@@ -205,9 +209,10 @@ function sheetFacts(dl: AdlDownload, detail: AdlTaskDetail | null, compact: bool
       ? `track ${dl.batch_position} of ${dl.batch_total}`
       : '';
   const file = dl.file_path || detail?.file_path || d?.filename || '';
-  const asked = dl.expected_title || detail?.expected?.title || '';
-  const askedArtist = dl.expected_artist || detail?.expected?.artist || '';
-  const got = detail?.downloaded?.title || dl.title;
+  // the row's title is the ask. what the source handed over rides beside it.
+  const asked = dl.expected_title || detail?.expected?.title || dl.title || '';
+  const got = dl.got_title || detail?.downloaded?.title || '';
+  const gotArtist = dl.got_artist || detail?.downloaded?.artist || '';
   return [
     ['Source', source ? `${source}${peer}` : ''],
     [
@@ -226,9 +231,9 @@ function sheetFacts(dl: AdlDownload, detail: AdlTaskDetail | null, compact: bool
     ],
     // only worth a line when the file we got isn't the one we asked for
     [
-      'Asked for',
-      asked && asked.toLowerCase() !== String(got || '').toLowerCase()
-        ? [askedArtist, asked].filter(Boolean).join(' · ')
+      'Got',
+      got && got.trim().toLowerCase() !== asked.trim().toLowerCase()
+        ? [gotArtist, got].filter(Boolean).join(' · ')
         : '',
     ],
     ['File', file, { mono: true, copy: file || undefined }],
@@ -243,6 +248,11 @@ export interface AdlRowProps {
    * May return a promise. the row locks its button until it settles.
    */
   onCancel?: (dl: AdlDownload) => void | Promise<void>;
+  /**
+   * Remove from list: offered on live failed / not-found / cancelled rows
+   * only. takes the row off the page, retries nothing.
+   */
+  onRemove?: (dl: AdlDownload) => void | Promise<void>;
   /** Rendered only for queued rows; moves the track to the next unstarted slot. */
   onDownloadNext?: (dl: AdlDownload) => void | Promise<void>;
   /** Group rows: no batch line, the group header already says it. */
@@ -260,6 +270,7 @@ export interface AdlRowProps {
 export function AdlRow({
   dl,
   onCancel,
+  onRemove,
   onDownloadNext,
   compact,
   numbered,
@@ -319,6 +330,11 @@ export function AdlRow({
     (dl.status === 'failed' || dl.status === 'not_found') &&
     !dl.is_persistent_history;
   const historyId = dl.status === 'completed' ? verificationHistoryId(dl) : null;
+  // failed rows live only in memory, so a history row is never one of them
+  const removable =
+    Boolean(onRemove) &&
+    !dl.is_persistent_history &&
+    ['failed', 'not_found', 'cancelled'].includes(String(dl.status));
   const file = dl.file_path || detail?.file_path || '';
 
   const downloading = dl.status === 'downloading';
@@ -331,12 +347,13 @@ export function AdlRow({
     dl.status === 'completed'
       ? clockTime(dl.is_persistent_history ? parseStamp(dl.created_at) : parseStamp(dl.timestamp))
       : '';
-  const label = statusLabel(dl.status).text;
+  const label = statusLabel(downloadFailureSummary(dl)?.status ?? dl.status).text;
 
   const play = historyId ? () => void unverifiedPlay(dl, historyId) : undefined;
   const search = canSearch
     ? () =>
-        openDownloadTaskInspector(dl.task_id, {
+        // the library's Interactive Search for a library track, else the inspector
+        void openDownloadTaskSearch(dl.task_id, {
           name: dl.title,
           artist: dl.artist,
           album: dl.album,
@@ -373,6 +390,9 @@ export function AdlRow({
       : []),
     ...(file
       ? [{ key: 'copy', label: 'Copy file path', onSelect: () => copyText(file, 'Path copied') }]
+      : []),
+    ...(removable && onRemove
+      ? [{ key: 'remove', label: 'Remove from list', onSelect: () => void onRemove(dl) }]
       : []),
   ];
 
@@ -498,7 +518,9 @@ export function AdlRow({
               {DlIcon.x}
             </button>
           ) : null}
-          {!search ? <DlMore items={menu} /> : null}
+          {/* a failed row's Search button takes the menu's place; Remove from
+              list still needs a way in */}
+          <DlMore items={search ? menu.filter((item) => item.key === 'remove') : menu} />
         </div>
 
         {downloading && pct > 0 ? (
@@ -524,7 +546,7 @@ export function AdlRow({
           factsTitle="Details"
           facts={sheetFacts(dl, detail, Boolean(compact))}
           actions={
-            play || search || historyId || (cancellable && onCancel) ? (
+            play || search || historyId || (cancellable && onCancel) || removable ? (
               <>
                 {play ? (
                   <DlButton primary icon={DlIcon.play} onClick={play}>
@@ -546,6 +568,9 @@ export function AdlRow({
                   <DlButton disabled={cancelling} onClick={cancel}>
                     Cancel download
                   </DlButton>
+                ) : null}
+                {removable && onRemove ? (
+                  <DlButton onClick={() => void onRemove(dl)}>Remove from list</DlButton>
                 ) : null}
               </>
             ) : null

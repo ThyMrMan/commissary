@@ -241,16 +241,18 @@ class Track:
         if track_data.get('link'):
             external_urls['deezer'] = track_data['link']
 
-        # Deezer search doesn't return album_type directly; infer if nb_tracks available
+        # the album's own record_type when deezer sent it, else the store
+        # rule on its track count and runtime when those are there
         nb_tracks = album_data.get('nb_tracks') if isinstance(album_data, dict) else None
+        record_type = album_data.get('record_type') if isinstance(album_data, dict) else None
         album_type = track_data.get('type')  # Deezer sometimes returns 'album'/'single'
-        if not album_type and nb_tracks:
-            if nb_tracks <= 3:
-                album_type = 'single'
-            elif nb_tracks <= 6:
-                album_type = 'ep'
-            else:
-                album_type = 'album'
+        if record_type:
+            album_type = {'compile': 'compilation'}.get(record_type, record_type)
+        elif not album_type and nb_tracks:
+            from core.metadata.release_type import release_type_from_shape
+            _secs = album_data.get('duration') or 0
+            album_type = release_type_from_shape(
+                nb_tracks, _secs * 1000 if isinstance(_secs, (int, float)) else None)
 
         return cls(
             id=str(track_data.get('id', '')),
@@ -403,6 +405,31 @@ def _title_rank(wanted: str, got: str) -> int:
         return _OTHER_VERSION if same_base else _OTHER_SONG
     return _SAME_SONG if same_base else _OTHER_SONG
 
+# The resources addressed by a Deezer id: /artist/<id>, /album/<id>/tracks, ...
+_DEEZER_ID_ENDPOINT = re.compile(r'^/?(artist|album|track|playlist)/([^/?]*)')
+
+
+def _deezer_id_is_usable(endpoint: str) -> bool:
+    """Is the id in this endpoint one Deezer can be asked about?
+
+    Deezer's ids are whole numbers, and its api does not reject anything else:
+    it reads the leading digits and answers for THAT number. A Spotify artist
+    id that happens to start with a digit, "5bPOuhK95xuq1U...", is read as
+    artist 5, and ``/artist/5bPOuhK95xuq1U.../albums`` returns the albums of
+    Amadou & Mariam. That is how a watched artist grew another act's whole
+    catalogue (#2066). An id from any other source must never reach Deezer, so
+    the one function every call goes through refuses it.
+
+    ``isrc:<code>`` and ``upc:<code>`` are Deezer's own lookup forms and pass.
+    Endpoints with no id in them (search, chart, user/me) pass untouched.
+    """
+    match = _DEEZER_ID_ENDPOINT.match(str(endpoint or ''))
+    if not match:
+        return True
+    ident = match.group(2)
+    return ident.isdigit() or ident.lower().startswith(('isrc:', 'upc:'))
+
+
 class DeezerClient:
     """
     Deezer API client for music metadata and playlist access.
@@ -486,6 +513,11 @@ class DeezerClient:
         outright. So a user with an expired Deezer link lost the browse rows
         that never needed their account in the first place.
         """
+        if not _deezer_id_is_usable(endpoint):
+            # #2066: never ask. See _deezer_id_is_usable for what Deezer does
+            # with an id that is not one of its own.
+            logger.warning("Deezer: refusing %r, that is not a Deezer id", endpoint)
+            return None
         url = f"{self.BASE_URL}/{endpoint.lstrip('/')}"
         if params is None:
             params = {}
@@ -1759,6 +1791,8 @@ class DeezerClient:
             Full album dict with label, genres, explicit flag or None
         """
         # Check cache first — get_album_raw is called on every enrichment cycle
+        if not _deezer_id_is_usable(f'album/{album_id}'):   # #2066: only Deezer's own ids
+            return None
         try:
             cache = get_metadata_cache()
             cached = cache.get_entity('deezer', 'album', str(album_id))
@@ -1808,6 +1842,8 @@ class DeezerClient:
             Full track dict with BPM or None
         """
         # Check cache first
+        if not _deezer_id_is_usable(f'track/{track_id}'):   # #2066: only Deezer's own ids
+            return None
         try:
             cache = get_metadata_cache()
             cached = cache.get_entity('deezer', 'track', str(track_id))
@@ -1848,6 +1884,8 @@ class DeezerClient:
 
         never from the metadata cache: preview urls are signed and expire,
         so a cached one plays nothing. None when deezer has no preview."""
+        if not _deezer_id_is_usable(f'track/{track_id}'):   # #2066: only Deezer's own ids
+            return None
         try:
             response = self.session.get(f"{self.BASE_URL}/track/{track_id}", timeout=10)
             response.raise_for_status()
@@ -1875,6 +1913,8 @@ class DeezerClient:
             Dict with id, name, description, track_count, image_url, owner,
             and tracks list, or None on error
         """
+        if not _deezer_id_is_usable(f'playlist/{playlist_id}'):   # #2066: only Deezer's own ids
+            return None
         try:
             playlist_id = str(playlist_id)
 

@@ -246,8 +246,10 @@ def test_a_completed_download_announces_the_import(db):
          patch("core.app_events.publish", side_effect=lambda t, d=None: events.append((t, d))):
         tick(db=db)
 
+    # profile 1 wished for it, so the import is theirs (#2166 follow-up 25)
     assert events == [("import_completed", {
         "track_count": "1", "album_name": "The Final Empire", "artist": "Brandon Sanderson",
+        "_event_owner": 1,
     })]
 
 
@@ -1028,7 +1030,11 @@ def test_download_page_cancel_routes_persist_before_runtime_cleanup(db, clean_ru
     node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name)
     node.decorator_list = []
     scope = {"request": request, "jsonify": jsonify, "tasks_lock": threading.Lock(),
-             "_find_task_by_playlist_track": lambda *args: ("d1", tasks["d1"])}
+             "_find_task_by_playlist_track": lambda *args: ("d1", tasks["d1"]),
+             # the caller here is the admin: the ownership check has its own
+             # tests in tests/test_admin_managed_areas.py
+             "_download_owner_profile": lambda **kwargs: None,
+             "_cancel_refused": lambda owner: None}
     exec(compile(ast.Module(body=[node], type_ignores=[]), "web_server.py", "exec"), scope)
     with Flask(__name__).test_request_context(json={"playlist_id": "audiobooks", "track_index": 0}), \
          patch("core.audiobook_database.get_audiobook_db", return_value=db), \

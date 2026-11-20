@@ -930,7 +930,7 @@ class HiFiClient(DownloadSourcePlugin):
         try:
             proc = subprocess.run(
                 [ff, '-hide_banner', '-nostdin', '-i', str(path), '-map', '0:a:0', '-f', 'null', '-'],
-                capture_output=True, text=True, timeout=180)
+                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=180)
             return parse_ffmpeg_time(proc.stderr)
         except Exception:
             return 0.0
@@ -964,7 +964,7 @@ class HiFiClient(DownloadSourcePlugin):
                 ],
                 check=True,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
             )
         except subprocess.CalledProcessError as exc:
             raise RuntimeError(
@@ -1181,6 +1181,9 @@ class HiFiClient(DownloadSourcePlugin):
                     intermediate_path.unlink(missing_ok=True)
                     final_size = out_path.stat().st_size if out_path.exists() else 0
                 else:
+                    # streamed AAC reads 0:00 and won't seek until it's a plain MP4
+                    from core.downloads.mp4_remux import remux_to_plain_mp4
+                    remux_to_plain_mp4(intermediate_path, self._find_ffmpeg())
                     final_size = intermediate_path.stat().st_size if intermediate_path.exists() else 0
 
                 if final_size < MIN_AUDIO_SIZE:

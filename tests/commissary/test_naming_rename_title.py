@@ -147,16 +147,15 @@ def test_switched_off_it_leaves_them(env, tmp_path):
     assert os.path.exists(os.path.join(str(tv), "Silo", "Season 01", "Silo - S01E01.mkv"))
 
 
-def test_a_locked_show_is_not_renamed(env, tmp_path):
-    from core.commissary import import_lock
+def test_a_padlocked_show_is_not_renamed(env, tmp_path):
     from core.video.download_monitor import _make_organizer
     db, movies, tv = env
     show_id, _mid, eps, _m = _seed(db, movies, tv)
     _new_template(db)
-    import_lock.set_lock(db, "show", show_id, True)
+    db.set_hands_off("show", show_id, True)   # upstream's padlock
     dl, src = _episode_dl(tmp_path, tv)
-    patch = _make_organizer(db)(dl, str(src))
-    assert patch["status"] == "import_failed" and all(os.path.exists(p) for p in eps)
+    _make_organizer(db)(dl, str(src))
+    assert all(os.path.exists(p) for p in eps), "its existing files keep their names"
 
 
 def test_the_setting_reads_the_old_forks_value_until_set():

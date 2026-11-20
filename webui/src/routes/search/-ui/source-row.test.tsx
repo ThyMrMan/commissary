@@ -15,6 +15,8 @@ function stateOf(over: Partial<SearchControllerState> = {}): SearchControllerSta
     configuredSources: {},
     enabledExperimental: new Set(),
     userPickedSource: false,
+    primarySource: 'spotify',
+    failedSources: new Set(),
     ...over,
   };
 }
@@ -183,5 +185,83 @@ describe('SourcePicker', () => {
     // Amazon has no logo file; the emoji is the fallback, not an empty span.
     expect(item('amazon').querySelector('img')).toBeNull();
     expect(item('amazon').textContent).toContain('🛒');
+  });
+});
+
+describe('ModeTabs with music videos switched off (#1909)', () => {
+  afterEach(() => {
+    delete window.SoulSyncFeatures;
+  });
+
+  it('has no Videos tab, but keeps it while you are on it', () => {
+    window.SoulSyncFeatures = { isOn: (id: string) => id !== 'music_videos' } as never;
+    renderTabs();
+    expect(tab('youtube_videos')).toBeNull();
+    expect(tab('soulseek')).not.toBeNull();
+    cleanup();
+    renderTabs({ activeSource: 'youtube_videos' });
+    expect(tab('youtube_videos')).not.toBeNull();
+  });
+});
+
+describe('ModeTabs say what they search (#1909)', () => {
+  it('gives every tab a plain hint', () => {
+    renderTabs();
+    expect(tab('soulseek').getAttribute('title')).toBe(
+      'Search your download sources directly and pick the exact file.',
+    );
+    expect(tab('youtube_videos').getAttribute('title')).toBe('Music videos from YouTube.');
+    expect(tab('spotify').getAttribute('title')).toMatch(/tagged and filed/);
+  });
+});
+
+describe('All sources in the picker (#2051)', () => {
+  it('heads the menu, says how many sources it asks, and selects itself', () => {
+    const { onSelect } = renderPicker({ configuredSources: { discogs: false } });
+    openMenu();
+    const all = item('all');
+    expect(all).not.toBeNull();
+    // every catalog source that is set up: discogs is not, videos and files never are
+    expect(all.textContent).toContain('All sources');
+    expect(all.textContent).toContain('6 sources at once');
+    expect(document.querySelector('[role="menuitemradio"]')).toBe(all);
+    fireEvent.click(all);
+    expect(onSelect).toHaveBeenCalledWith('all');
+  });
+
+  it('counts the answers in while it is searching', () => {
+    const empty = {
+      db_artists: [],
+      artists: [],
+      albums: [],
+      tracks: [],
+      playlists: [],
+      videos: [],
+    };
+    renderPicker({
+      activeSource: 'all',
+      sources: { spotify: empty, deezer: empty },
+      loadingSources: new Set(['itunes']),
+    });
+    expect(screen.getByRole('button', { name: 'Search with All sources' })).toBeInTheDocument();
+    openMenu();
+    expect(item('all')).toHaveAttribute('aria-checked', 'true');
+    expect(item('all').textContent).toContain('2 of 7 answered');
+  });
+
+  it('is not offered when only one source is set up', () => {
+    renderPicker({
+      configuredSources: {
+        itunes: false,
+        deezer: false,
+        discogs: false,
+        hydrabase: false,
+        amazon: false,
+        musicbrainz: false,
+      },
+    });
+    openMenu();
+    expect(item('all')).toBeNull();
+    expect(item('spotify')).not.toBeNull();
   });
 });

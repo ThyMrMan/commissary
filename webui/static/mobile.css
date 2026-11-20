@@ -80,14 +80,21 @@
 
     /* --- Phase 0: Foundation --- */
 
+    /* #2182: the page scrolls inside .main-content, so the shell has to be
+       the screen as it is. 100vh is the screen with the browser's bars
+       hidden, taller than what a phone shows with them up, and the end of
+       every page sat under the bottom bar with nothing left to scroll.
+       dvh tracks the bars; 100vh stays as the fallback. */
     body {
         overflow: hidden;
         height: 100vh;
+        height: 100dvh;
     }
 
     .main-container {
         flex-direction: column;
         height: 100vh;
+        height: 100dvh;
         width: 100%;
     }
 
@@ -310,14 +317,6 @@
         transform: none;
     }
 
-    .tools-grid {
-        grid-template-columns: 1fr;
-    }
-
-    .tool-card {
-        padding: 20px 16px;
-    }
-
     .tool-card-header {
         flex-wrap: wrap;
         gap: 8px;
@@ -325,16 +324,6 @@
 
     .tool-card-title {
         font-size: 15px;
-    }
-
-    .tool-card-info {
-        font-size: 12px;
-        overflow-wrap: break-word;
-    }
-
-    .tool-card-controls {
-        flex-direction: column;
-        gap: 8px;
     }
 
     .tool-card-controls select,
@@ -472,11 +461,6 @@
 
     .album-actions {
         width: auto;
-    }
-
-    .album-track-list {
-        margin-top: 12px;
-        padding-top: 12px;
     }
 
     /* Standard search results */
@@ -940,10 +924,10 @@
         flex-wrap: wrap;
     }
 
+    /* folds like on a wide screen (style.css: 8em and Read more); lifting
+       the cap here left a phone scrolling past the whole biography */
     .artist-hero-bio {
         font-size: 12px;
-        -webkit-line-clamp: 3;
-        max-height: fit-content;
     }
 
     .artist-hero-numbers {
@@ -1635,8 +1619,15 @@
        16px circle) and this rule stretched them into ovals / made them
        protrude from their track (mobile CSS batch #2, RC1). The import
        page's pills are a CSS module (hashed class), so they are hooked by
-       data attribute like the other import-page exclusions. */
-    button:not(.watchlist-card-remove):not(.wishlist-delete-btn):not(.wishlist-delete-album-btn):not(.wishlist-delete-btn-small):not(.wishlist-back-btn):not(.alphabet-btn):not(.filter-btn):not(.playlist-modal-close):not(.notif-bell-btn):not(.helper-float-btn):not(.hero-indicator):not(.discover-blacklist-btn):not(.tool-help-button):not(.vst-half):not([data-import-page-result-row]):not([data-import-page-inline-action]):not([data-import-page-pill]):not(.modal-track-play-btn):not(.cancel-track-btn):not(.dash-qs-swatch):not(.watchlist-filter-btn):not(.play-button):not(.stop-button):not(.mini-nav-btn):not(.mini-toggle-btn):not(.expand-hint):not(.sync-tab-button):not(.sync-tab-close) {
+       data attribute like the other import-page exclusions. The Library v2
+       page sizes its own controls (its toolbar, chips and row actions are
+       built shorter than 38px), so it opts out as a whole. The automations
+       page's schedule dots are 12px marks and its pills sit in a 32px track.
+       The stats page's chart bars and heatmap cells are marks too, hooked by
+       data attribute because its classes are a CSS module's. So is the server
+       activity drawer: its controls are sized for touch already, and Settings >
+       People (switches, checkboxes and pills sized by its CSS module). */
+    button:not(.watchlist-card-remove):not(.wishlist-delete-btn):not(.wishlist-delete-album-btn):not(.wishlist-delete-btn-small):not(.wishlist-back-btn):not(.alphabet-btn):not(.filter-btn):not(.playlist-modal-close):not(.notif-bell-btn):not(.helper-float-btn):not(.hero-indicator):not(.discover-blacklist-btn):not(.tool-help-button):not(.vst-half):not([data-import-page-result-row]):not([data-import-page-inline-action]):not([data-import-page-pill]):not(.modal-track-play-btn):not(.cancel-track-btn):not(.dash-qs-swatch):not(.watchlist-filter-btn):not(.play-button):not(.stop-button):not(.mini-nav-btn):not(.mini-toggle-btn):not(.expand-hint):not(.sync-tab-button):not(.sync-tab-close):not(.automx-dot):not(.automx-pill):not([data-stats-mark]):not([data-library-v2] button):not(.notif-panel button):not(.notif-history-modal button):not(.toast-compact button):not([data-server-activity] button):not([data-people] button) {
         min-height: 38px;
     }
 
@@ -1683,7 +1674,7 @@
     /* Spacing reductions */
     /* stylelint-disable-next-line no-duplicate-selectors -- order-sensitive: a rule between the copies sets the same property at equal specificity */
     .page {
-        padding: 70px 16px 72px 16px;
+        padding: 70px 16px calc(72px + env(safe-area-inset-bottom, 0px)) 16px;
     }
 
     /* Nested wrappers each add horizontal padding, which compounds on a phone
@@ -1786,7 +1777,7 @@
 @media (max-width: 480px) {
 
     .page {
-        padding: 70px 12px 72px 12px;
+        padding: 70px 12px calc(72px + env(safe-area-inset-bottom, 0px)) 12px;
     }
 
     /* Even tighter card gutters on the smallest phones (X4). */
@@ -1819,11 +1810,6 @@
 
     .sync-tab-button {
         min-width: 0;
-    }
-
-    /* Tool cards tighter on small screens */
-    .tool-card {
-        padding: 16px 12px;
     }
 
     .tool-card-title {
@@ -2397,12 +2383,29 @@
         max-width: none;
         max-height: none;
         height: 100vh;
+        /* the screen as it is with the browser's bars showing: at 100vh the
+           transport sat under the address bar */
+        height: 100dvh;
         border-radius: 0;
     }
     .np-body {
         flex-direction: column;
         overflow-y: auto;
         max-height: 100vh;
+        max-height: 100dvh;
+    }
+    /* the player fills the screen here, so the blur behind it shows nowhere
+       and was only work for the phone */
+    .np-modal-overlay {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+    }
+    /* the drawer is off screen until the menu opens: its seasonal decorations
+       and the weather glyph stop moving while nobody can see them */
+    .sidebar:not(.mobile-open) *,
+    .sidebar:not(.mobile-open) *::before,
+    .sidebar:not(.mobile-open) *::after {
+        animation-play-state: paused;
     }
     .np-track-info {
         width: 100%;
@@ -2651,9 +2654,12 @@
    ====================================== */
 
 @media (max-width: 768px) {
+    /* #2182: the floating row (search, activity, bell, help), its panels and
+       the toasts sit above the home indicator in the installed app; the
+       pages' bottom padding clears the same band */
     /* Toast */
     .toast-container {
-        bottom: 72px;
+        bottom: calc(72px + env(safe-area-inset-bottom, 0px));
         right: 12px;
         left: 12px;
     }
@@ -2667,7 +2673,7 @@
 
     /* Bell button */
     .notif-bell-btn {
-        bottom: 16px;
+        bottom: calc(16px + env(safe-area-inset-bottom, 0px));
         right: 60px;
         width: 38px;
         height: 38px;
@@ -2689,7 +2695,7 @@
         right: 12px !important;
         width: auto !important;
         max-width: none !important;
-        bottom: 62px !important;
+        bottom: calc(62px + env(safe-area-inset-bottom, 0px)) !important;
         max-height: 55vh;
         border-radius: var(--radius-card);
     }
@@ -2704,7 +2710,7 @@
 
     /* Helper button */
     .helper-float-btn {
-        bottom: 16px;
+        bottom: calc(16px + env(safe-area-inset-bottom, 0px));
         right: 12px;
         width: 38px;
         height: 38px;
@@ -2715,7 +2721,7 @@
        44px @ bottom 24 / right 136, so it floated bigger and higher than the
        other two on phones). Same size, same baseline, next slot leftward. */
     .activity-float-btn {
-        bottom: 16px;
+        bottom: calc(16px + env(safe-area-inset-bottom, 0px));
         right: 108px;
         width: 38px;
         height: 38px;
@@ -2734,7 +2740,7 @@
     /* Global search bar */
     .gsearch-bar {
         width: calc(100vw - 160px);
-        bottom: 16px;
+        bottom: calc(16px + env(safe-area-inset-bottom, 0px));
         height: 38px;
     }
 
@@ -2752,7 +2758,7 @@
         left: 12px;
         right: 12px;
         transform: none;
-        bottom: 60px;
+        bottom: calc(60px + env(safe-area-inset-bottom, 0px));
     }
 
     .gsearch-item {
@@ -2775,21 +2781,21 @@
 
 @media (max-width: 480px) {
     .notif-bell-btn {
-        bottom: 12px;
+        bottom: calc(12px + env(safe-area-inset-bottom, 0px));
         right: 54px;
         width: 34px;
         height: 34px;
     }
 
     .helper-float-btn {
-        bottom: 12px;
+        bottom: calc(12px + env(safe-area-inset-bottom, 0px));
         right: 10px;
         width: 34px;
         height: 34px;
     }
 
     .activity-float-btn {
-        bottom: 12px;
+        bottom: calc(12px + env(safe-area-inset-bottom, 0px));
         right: 96px;
         width: 34px;
         height: 34px;
@@ -2801,7 +2807,7 @@
 
     .gsearch-bar {
         width: calc(100vw - 130px);
-        bottom: 12px;
+        bottom: calc(12px + env(safe-area-inset-bottom, 0px));
         height: 34px;
     }
 
@@ -2810,7 +2816,7 @@
     }
 
     .toast-container {
-        bottom: 56px;
+        bottom: calc(56px + env(safe-area-inset-bottom, 0px));
         right: 8px;
         left: 8px;
     }
@@ -2819,7 +2825,7 @@
         left: 8px !important;
         right: 8px !important;
         width: auto !important;
-        bottom: 54px !important;
+        bottom: calc(54px + env(safe-area-inset-bottom, 0px)) !important;
     }
 }
 
@@ -2949,7 +2955,6 @@
 
     /* #8 Page-container heroes carry desktop-sized padding/margins that waste
        space and look off on a phone. Tighten them up. */
-    .tools-maintenance-hero,
     .watchlist-artist-config-hero,
     .watchlist-detail-hero,
     .discover-hero {
@@ -3162,186 +3167,11 @@ body:has([data-year-story-overlay]) .helper-float-btn {
    house 768/480 breakpoints.
    ═══════════════════════════════════════════════════════════════════════════ */
 
-@media (max-width: 1024px) {
-    /* Tablet: two tile columns at most, so a tile never gets so narrow that
-       its cadence editor and action row fight for the same line. */
-    .repair-family-grid {
-        grid-template-columns: repeat(auto-fill, minmax(min(280px, 100%), 1fr));
-    }
-}
-
 @media (max-width: 768px) {
-    /* THE important one. The hero is its own scroll container on desktop so
-       the section nav can stick to it — on a phone that is a scroll-within-a-
-       scroll, and the findings list nests a THIRD one inside it. Release both
-       and let the page scroll like a page. */
-    .tools-maintenance-hero {
-        max-height: none;
-        overflow: visible;
-    }
-    /* The hero clipped its own 3px top edge to the rounded corner. Released,
-       nothing clips it, so it rounds itself. */
-    .tools-maintenance-hero::before {
-        border-radius: 16px 16px 0 0;
-    }
-
-    .repair-inbox-body {
-        max-height: none;
-        overflow: visible;
-        padding: 0 10px 12px 10px;
-    }
-
-    /* Sticky needs a scroll container to stick to; with the hero released it
-       would pin against the app chrome instead. Let it scroll away — it is
-       four buttons and the sections are a swipe apart. */
-    .repair-section-nav {
-        position: static;
-        overflow-x: auto;
-        scrollbar-width: none;
-        padding: 6px 0;
-    }
-    .repair-section-nav::-webkit-scrollbar { display: none; }
-    .repair-section-link { flex-shrink: 0; }
-
-    /* ── Health hero ── */
-    .repair-health {
-        gap: 14px;
-        padding: 14px;
-    }
-    .repair-health-score-block {
-        min-width: 0;
-        flex-direction: row;
-        align-items: baseline;
-        gap: 10px;
-    }
-    .repair-health-score { font-size: 42px; }
-    .repair-health-band { margin-top: 0; }
-    .repair-health-body { flex: 1 1 100%; }
-    .repair-health-actions-note { flex-basis: 100%; }
-    .repair-health-fix-safe { min-height: 40px; }
-
-    /* ── Filters ── */
-    .repair-findings-toolbar { gap: 8px; }
-    .repair-status-segments {
-        display: flex;
-        width: 100%;
-        overflow-x: auto;
-        scrollbar-width: none;
-    }
-    .repair-status-segments::-webkit-scrollbar { display: none; }
-    .repair-status-seg { flex: 1 0 auto; justify-content: center; min-height: 38px; }
-    .repair-findings-search { flex: 1 1 100%; min-height: 38px; }
-    .repair-findings-filters { flex: 1 1 100%; }
     .repair-findings-filters select { flex: 1 1 45%; min-height: 38px; }
-    .repair-clear-btn { flex: 1 1 100%; min-height: 38px; }
-
-    /* ── Findings inbox ── */
-    .repair-inbox-head {
-        flex-wrap: wrap;
-        row-gap: 6px;
-        padding: 11px 12px;
-    }
-    .repair-inbox-blurb { white-space: normal; }
-    .repair-inbox-actions {
-        width: 100%;
-        justify-content: flex-end;
-        flex-wrap: wrap;
-    }
-    .repair-inbox-btn { min-height: 36px; }
-    .repair-list-controls { gap: 8px; }
     .repair-list-controls select { flex: 1 1 45%; min-height: 36px; }
-
-    /* ── Operation tiles ── */
-    .repair-family { padding: 12px 11px 13px 11px; }
-    .repair-family-head { flex-wrap: wrap; row-gap: 4px; }
-    .repair-family-summary { flex-basis: 100%; order: 3; white-space: normal; }
-    .repair-family-grid { grid-template-columns: 1fr; }
-
-    /* Number + unit + Save + Cancel do not fit one line in a full-width
-       tile on a phone, and a clipped Save is a schedule you cannot change. */
-    .repair-tile-schedule { row-gap: 6px; }
-    .repair-tile-cadence-edit { flex-wrap: wrap; row-gap: 6px; }
-    .repair-tile-cadence,
-    .repair-tile-cadence-save,
-    .repair-tile-cadence-cancel { min-height: 34px; }
     .repair-tile-cadence-edit input,
     .repair-tile-cadence-edit select { min-height: 34px; }
-
-    /* ── Recent runs ── */
-    .repair-runs-toolbar { flex-direction: column; align-items: stretch; }
-    .repair-runs-tools { justify-content: flex-end; }
-    .repair-runs-chip,
-    .repair-runs-toggle { min-height: 32px; }
-    .repair-run-head { flex-wrap: wrap; row-gap: 3px; padding: 10px 12px; }
-    .repair-run-name { min-width: 0; }
-    /* Order 3 drops the summary onto its own line UNDER the row, leaving the
-       clock, name, age and chevron together on the first — without it the
-       summary splits the row and pushes age + chevron onto a third line. */
-    .repair-run-summary {
-        order: 3;
-        white-space: normal;
-        flex-basis: 100%;
-        padding-left: 29px;
-    }
-    .repair-run-age { margin-left: auto; }
-    .repair-run-detail { padding: 4px 12px 13px 12px; }
-    .repair-run-counters { gap: 14px; }
-    .repair-run-foot { flex-direction: column; align-items: flex-start; gap: 6px; }
-
-    /* ── Tool containers ── */
-    .tools-container { padding: 12px 11px 13px 11px; }
-    .tools-container-head { gap: 6px; }
-    .tools-container-blurb { flex-basis: 100%; }
-}
-
-@media (max-width: 480px) {
-    /* The trend line is the first thing to go: it is context, and the score
-       and the bar underneath it are the point. */
-    .repair-health-trend { display: none; }
-    .repair-health-score { font-size: 36px; }
-    .repair-health-actions { gap: 8px; }
-
-    .repair-section-link { padding: 6px 11px; }
-
-    .repair-inbox-count { min-width: 44px; font-size: 20px; }
-    .repair-inbox-head { gap: 9px; }
-    .repair-inbox-label { font-size: 13px; flex-wrap: wrap; row-gap: 4px; }
-    /* Two lines of explanation beats one line of ellipsis. */
-    .repair-inbox-blurb { font-size: 11px; }
-
-    .repair-tile { padding: 11px; }
-    .repair-tile-desc { -webkit-line-clamp: 3; }
-    .repair-tile-foot { flex-wrap: wrap; row-gap: 8px; }
-    .repair-tile .repair-job-actions { margin-left: auto; }
-
-    .repair-run-clock { min-width: 40px; }
-    .repair-run-counter-value { font-size: 15px; }
-    /* A stack trace does not need to eat the screen on a phone. */
-    .repair-run-error-text { max-height: 120px; font-size: 10px; }
-}
-
-@media (hover: none) {
-    /* Icon-only controls at desktop sizes are a miss on a fingertip. */
-    .repair-run-btn,
-    .repair-stop-btn,
-    .repair-settings-btn,
-    .repair-help-btn,
-    .repair-inbox-expand,
-    .repair-runs-refresh,
-    .repair-finding-expand-btn {
-        min-width: 34px;
-        min-height: 34px;
-    }
-
-    /* The cadence pill reads as editable on hover; on touch there is no
-       hover, so it carries its affordance all the time. */
-    .repair-tile-cadence {
-        border-style: solid;
-        border-color: rgba(var(--tile-glow), 0.35);
-    }
-
-    /* Same for the health bar segments — they are buttons. */
-    .repair-health-seg { min-width: 10px; }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -4222,7 +4052,7 @@ body:has(.artist-map-container) #gsearch-bar {
     .mm-sortbar { padding: 8px 12px 0; flex-wrap: wrap; }
     .as-panel { margin: 10px 8px 4px; padding: 14px 12px 8px; max-height: 52vh; }
     .as-row { grid-template-columns: 40px minmax(0, 1fr) auto; gap: 10px; }
-    .as-art { width: 40px; height: 40px; }
+    .as-art, .as-cover { width: 40px; height: 40px; }
     .as-dur { display: none; }
     .as-add { min-width: 64px; padding: 0 12px; }
 }
@@ -4539,6 +4369,11 @@ body:has(.artist-map-container) #gsearch-bar {
     .mirrored-modal {
         max-height: calc(100vh - 20px);
         max-height: calc(100dvh - 20px);
+    }
+    /* #2181: the detail as a page keeps the hamburger (style.css), so its
+       hero starts below it: top 16 + 44 tall + 16 */
+    .mm-as-page .mm-hero {
+        padding-top: 76px;
     }
     /* Track rows: the album column goes (the title needs the room more,
        the same call the download / discover modals made), the fixed

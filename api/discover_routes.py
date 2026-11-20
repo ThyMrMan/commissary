@@ -47,6 +47,7 @@ from core.profile_context import admin_only, get_current_profile_id
 from core.runtime_state import download_batches, tasks_lock
 from core.spotify_client import _is_globally_rate_limited as _spotify_rate_limited
 from utils.logging_config import get_logger
+from core.permissions import requires, signed_in
 
 logger = get_logger("web_server")
 
@@ -133,6 +134,16 @@ def _discover_dial_key():
         return '0.3'
 
 
+def _discover_source_key():
+    """The active metadata source, for shelves drawn from it. without it a
+    source switch kept serving the old source's ids until the warmer's next
+    pass or the 30-minute ttl (review 5 W3-TB-3)."""
+    try:
+        return _get_active_discovery_source()
+    except Exception:
+        return 'unknown'
+
+
 def _discover_rank_key():
     """The two re-ranked artist shelves: the dial, and this profile's more /
     less feedback, so an answer re-ranks that profile's shelf and no other."""
@@ -146,6 +157,15 @@ get_database = None
 config_manager = None
 download_orchestrator = None
 _get_active_discovery_source = None
+
+
+def _catalogue_name_key(name):
+    """The catalogue's folded artist key. SQLite's LOWER() is ASCII-only, so a
+    stored "Björk" never answered a searched "björk" (iss29-D13)."""
+    from core.library2.importer import normalize_name
+
+    return normalize_name(str(name or ""))
+
 _spotify_client = None
 _tidal_client = None
 _hydrabase_client = None
@@ -170,6 +190,7 @@ def create_blueprint():
     return bp
 
 @bp.route('/api/discover/stations', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'stations': ARTISTS, 'stations[].with': NAMES, 'stations[].related': NAMES})
 def get_recommended_stations():
     """Recommended Stations - the user's heaviest recent artists as one-click
@@ -184,6 +205,7 @@ def get_recommended_stations():
 
 
 @bp.route('/api/discover/layout', methods=['GET'])
+@requires("music.discover")
 def get_discover_layout():
     """The profile's discover page layout: saved rows merged over the
     defaults, so newly shipped sections appear. Empty saved layout ==
@@ -204,6 +226,7 @@ def get_discover_layout():
 
 
 @bp.route('/api/discover/layout', methods=['PUT'])
+@requires("music.discover")
 def save_discover_layout():
     """Replace the profile's discover page layout. Unknown section ids and
     missing sections are 400s; duplicates are deduped; invalid zones fall
@@ -225,6 +248,7 @@ def save_discover_layout():
 
 
 @bp.route('/api/discover/stations/<artist_id>/snapshot', methods=['POST'])
+@requires("music.discover")
 @_hide_blocked({'snapshot.tracks': WORKS})
 def get_station_snapshot(artist_id):
     """A finite, inspectable preview of one station.
@@ -250,6 +274,7 @@ def get_station_snapshot(artist_id):
 
 
 @bp.route('/api/discover/resolve-playable', methods=['POST'])
+@requires("music.access")
 def resolve_playable_endpoint():
     """Match a mix's artist/title list against owned tracks so the player can
     play what the user already has (window.playTrackList wants file_path
@@ -269,6 +294,7 @@ def resolve_playable_endpoint():
 
 
 @bp.route('/api/discover_downloads/snapshot', methods=['POST'])
+@requires("music.discover")
 def save_discover_download_snapshot():
     """
     Saves a snapshot of current discover download state for persistence across page refreshes.
@@ -276,6 +302,7 @@ def save_discover_download_snapshot():
     return _save_source_bubble_snapshot("downloads", "No download data provided", "discover_downloads", "downloads", "discover download snapshot", "downloads")
 
 @bp.route('/api/discover_downloads/hydrate', methods=['GET'])
+@requires("music.discover")
 def hydrate_discover_downloads():
     """
     Loads discover downloads with live status by cross-referencing snapshots with active processes.
@@ -389,6 +416,7 @@ def hydrate_discover_downloads():
 
 
 @bp.route('/api/discover/hero', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS, 'artists[].explanation.seeds': NAMES})
 def get_discover_hero():
     return _discover_hero_get()
@@ -428,6 +456,7 @@ def _discover_primary_genre(item):
 
 
 @bp.route('/api/discover/similar-artists', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS, 'artists[].explanation.seeds': NAMES})
 @_discover_shelf_cache(key_extra=_discover_rank_key)
 def get_discover_similar_artists():
@@ -585,6 +614,7 @@ def get_discover_similar_artists():
 
 
 @bp.route('/api/discover/adventurousness', methods=['GET', 'POST'])
+@requires("music.discover")
 def discover_adventurousness():
     """Get/set the global Discover adventurousness dial (0..1). Shares the config key
     ``discover.adventurousness`` with the Settings -> Discovery slider, so the two controls stay in
@@ -654,6 +684,7 @@ def start_popularity_backfill():
 
 
 @bp.route('/api/discover/popularity-backfill/status', methods=['GET'])
+@requires("music.discover")
 def popularity_backfill_status():
     from core.discovery import popularity_backfill as pb
     return jsonify({"success": True, "state": pb.get_state()})
@@ -709,6 +740,10 @@ def _autostart_popularity_backfill():
     _t.sleep(90)  # let the server finish its own startup work first
     while True:
         try:
+            from core.library2.migration_gate import migration_required
+            if migration_required(get_database()):
+                _t.sleep(30)
+                continue
             _popularity_backfill_tick()
         except Exception as e:
             logger.debug(f"popularity backfill tick skipped: {e}")
@@ -716,6 +751,7 @@ def _autostart_popularity_backfill():
 
 
 @bp.route('/api/discover/listening-recommendations', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS, 'artists[].explanation.seeds': NAMES})
 @_discover_shelf_cache(key_extra=_discover_rank_key)
 def get_discover_listening_recommendations():
@@ -837,6 +873,7 @@ def get_discover_listening_recommendations():
 
 
 @bp.route('/api/discover/personalized/listening-mix', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_discover_listening_mix():
     """#913: the "Listening Mix" playlist row — a playable track mix from the artists you'd
@@ -866,6 +903,7 @@ def get_discover_listening_mix():
 
 
 @bp.route('/api/discover/similar-artists/enrich', methods=['POST'])
+@requires("music.discover")
 def enrich_similar_artists():
     """Enrich a batch of artist IDs with images/genres from Spotify or iTunes.
     Uses cached metadata from DB when available, only makes API calls for uncached artists,
@@ -974,6 +1012,7 @@ def enrich_similar_artists():
 
 
 @bp.route('/api/discover/spotify-library', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 def get_spotify_library():
     """Get cached Spotify library albums with ownership status. Only available when Spotify is authenticated."""
@@ -1058,6 +1097,7 @@ def get_spotify_library():
 
 
 @bp.route('/api/discover/spotify-library/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_spotify_library():
     """Manually trigger a re-sync of the Spotify library cache"""
     try:
@@ -1087,6 +1127,7 @@ def refresh_spotify_library():
 
 
 @bp.route('/api/discover/recent-releases', methods=['GET'])
+@requires("music.access")
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
 def get_discover_recent_releases():
@@ -1154,6 +1195,7 @@ def get_discover_recent_releases():
 
 
 @bp.route('/api/discover/release-radar', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_discover_release_radar():
     """Get release radar playlist - curated selection that stays consistent until next update"""
@@ -1228,6 +1270,7 @@ def get_discover_release_radar():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/because-you-listen-to', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'sections': ARTISTS, 'sections[].tracks': WORKS})
 @_discover_shelf_cache(key_extra=_discover_bylt_key)
 def get_discover_because_you_listen_to():
@@ -1310,13 +1353,20 @@ def _profile_count(database) -> int:
 
 
 def _artist_thumb(database, name):
+    """Seed image for a legacy BYLT slot, read from the v2 catalogue.
+
+    Upstream reads `artists.thumb_url` here; that table is gone. The key is
+    the folded name rather than LOWER(name) for the reason _catalogue_name_key
+    documents - SQLite's LOWER() is ASCII-only, so a stored "Bjork" spelled
+    with the diacritic never answered its own lookup (iss29-D13).
+    """
     if not name:
         return None
     try:
         with database._get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT thumb_url FROM artists WHERE LOWER(name) = LOWER(?) LIMIT 1",
-                        (name,))
+            cur.execute("SELECT image_url FROM lib2_artists WHERE name_key = ? LIMIT 1",
+                        (_catalogue_name_key(name),))
             row = cur.fetchone()
             return row[0] if row and row[0] else None
     except Exception as e:
@@ -1343,7 +1393,41 @@ def _bylt_owned_lookup(database, sections):
         return None
 
 
+def _owned_album_keys_for(conn, artist_names):
+    """album_presence_key of every album you own by these artists.
+
+    the shelf only ever drops albums by its 25 top artists, so it asks for
+    those artists' albums and not the whole library's: 70k album keys and an
+    ownership check on each was 3.9s live (Nov 4 2026). names fold in python
+    because sqlite's LOWER only folds ascii, and a listened "Björk" has to
+    meet the library's "BJÖRK" (and a "Bjork"). the key is the one the shelf
+    folds its candidates with, so punctuation and a pressing tag never make
+    an owned album look missing (#2083). ownership is the asker's own library."""
+    from core.library2.sql_util import owned_sql
+    from core.wishlist.presence import album_presence_key, artist_presence_key
+
+    wanted = {artist_presence_key(n) for n in artist_names if n}
+    if not wanted:
+        return set()
+    ids = [int(r[0]) for r in conn.execute("SELECT id, name FROM lib2_artists")
+           if r[1] and artist_presence_key(r[1]) in wanted]
+    keys = set()
+    for start in range(0, len(ids), 500):
+        chunk = ids[start:start + 500]
+        rows = conn.execute(f"""
+            SELECT al.title, ar.name
+              FROM lib2_albums al
+              JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+             WHERE al.primary_artist_id IN ({','.join('?' * len(chunk))})
+               AND al.title IS NOT NULL
+               AND {owned_sql('album', 'al')}
+        """, chunk)
+        keys.update(album_presence_key(t, a) for t, a in rows)
+    return keys
+
+
 @bp.route('/api/discover/undiscovered-albums', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
 def get_discover_undiscovered_albums():
@@ -1361,12 +1445,7 @@ def get_discover_undiscovered_albums():
 
         # Build library album keys for exclusion
         with database._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT LOWER(al.title), LOWER(ar.name)
-                FROM albums al JOIN artists ar ON ar.id = al.artist_id
-            """)
-            library_keys = {(r[0].strip(), r[1].strip()) for r in cursor.fetchall()}
+            library_keys = _owned_album_keys_for(conn, artist_names)
 
         albums = cache.get_undiscovered_albums(artist_names, library_keys, source=active_source, limit=20)
         return jsonify({'success': True, 'albums': albums})
@@ -1375,6 +1454,7 @@ def get_discover_undiscovered_albums():
         return jsonify({'success': True, 'albums': []})
 
 @bp.route('/api/discover/genre-new-releases', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
 def get_discover_genre_new_releases():
@@ -1394,6 +1474,7 @@ def get_discover_genre_new_releases():
         return jsonify({'success': True, 'albums': []})
 
 @bp.route('/api/discover/label-explorer', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
 def get_discover_label_explorer():
@@ -1416,10 +1497,11 @@ def get_discover_label_explorer():
         return jsonify({'success': True, 'albums': [], 'labels': []})
 
 @bp.route('/api/discover/deep-cuts', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 @_discover_shelf_cache()
 def get_discover_deep_cuts():
-    """Low-popularity tracks from artists you listen to — from cache."""
+    """Low-popularity tracks by the artists you listen to — from cache."""
     try:
         database = get_database()
         cache = get_metadata_cache()
@@ -1444,6 +1526,7 @@ def _get_genre_allowed_sources():
     return sources
 
 @bp.route('/api/discover/genre-explorer', methods=['GET'])
+@requires("music.discover")
 @_discover_shelf_cache()
 def get_discover_genre_explorer():
     """Genre landscape from cached artists — highlights unexplored genres."""
@@ -1460,6 +1543,7 @@ def get_discover_genre_explorer():
         return jsonify({'success': True, 'genres': []})
 
 @bp.route('/api/discover/genre-deep-dive', methods=['GET'])
+@requires("music.access")
 @_hide_blocked({'artists': ARTISTS, 'albums': WORKS, 'tracks': WORKS})
 def get_discover_genre_deep_dive():
     """Get artists + albums for a genre — from cache."""
@@ -1476,6 +1560,7 @@ def get_discover_genre_deep_dive():
         return jsonify({'success': True, 'albums': []})
 
 @bp.route('/api/discover/resolve-cache-album', methods=['GET'])
+@requires("music.discover")
 def resolve_cache_album():
     """Look up a real album entity in the cache by name+artist (avoids playlist ID confusion)."""
     try:
@@ -1530,6 +1615,7 @@ def resolve_cache_album():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 @bp.route('/api/discover/weekly', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_discover_weekly():
     """Get discovery weekly playlist - curated selection that stays consistent until next update"""
@@ -1602,6 +1688,7 @@ def get_discover_weekly():
 
 
 @bp.route('/api/discover/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_discover_data():
     """
     Force refresh discover page data (recent albums cache and curated playlists).
@@ -1651,6 +1738,7 @@ def refresh_discover_data():
 
 
 @bp.route('/api/discover/diagnose', methods=['GET'])
+@admin_only
 def diagnose_discover_data():
     """
     Diagnostic endpoint to check the state of discover data.
@@ -1724,6 +1812,7 @@ def diagnose_discover_data():
 # ========================================
 
 @bp.route('/api/discover/seasonal/current', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 @_discover_shelf_cache()
 def get_current_seasonal_content():
@@ -1766,6 +1855,7 @@ def get_current_seasonal_content():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/seasonal/<season_key>/albums', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 def get_seasonal_albums(season_key):
     """Get albums for a specific season"""
@@ -1798,6 +1888,7 @@ def get_seasonal_albums(season_key):
 @bp.route('/api/discover/seasonal/current/playlist', methods=['GET'])
 @bp.route('/api/discover/seasonal-playlist', methods=['GET'])
 @bp.route('/api/discover/seasonal/<season_key>/playlist', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_seasonal_playlist(season_key='current'):
     """Get curated playlist for a specific season (or current season)."""
@@ -1907,6 +1998,7 @@ def get_seasonal_playlist(season_key='current'):
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/seasonal/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_seasonal_content():
     """Manually trigger seasonal content refresh (admin function)"""
     try:
@@ -1944,6 +2036,7 @@ def refresh_seasonal_content():
 # ========================================
 
 @bp.route('/api/discover/personalized/decade/<int:decade>', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_decade_playlist(decade):
     """Get tracks from a specific decade"""
@@ -1967,7 +2060,11 @@ def get_decade_playlist(decade):
 
 @bp.route('/api/discover/popular-picks', methods=['GET'])
 @bp.route('/api/discover/personalized/popular-picks', methods=['GET'])
+@requires("music.access")
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_popular_picks_playlist():
     """Get high popularity tracks from discovery pool"""
     try:
@@ -1989,7 +2086,11 @@ def get_popular_picks_playlist():
 
 @bp.route('/api/discover/hidden-gems', methods=['GET'])
 @bp.route('/api/discover/personalized/hidden-gems', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_hidden_gems_playlist():
     """Get hidden gems (low popularity) from discovery pool"""
     try:
@@ -2013,6 +2114,7 @@ def get_hidden_gems_playlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/personalized/daily-mixes', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'mixes[].tracks': WORKS, 'mixes[].artists': NAMES,
                 'mixes[].explanation.seeds': NAMES})
 def get_daily_mixes():
@@ -2042,6 +2144,7 @@ def get_daily_mixes():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/for-you', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'mixes[].tracks': WORKS})
 @_discover_shelf_cache()
 def get_for_you_mixes():
@@ -2057,6 +2160,7 @@ def get_for_you_mixes():
 
 
 @bp.route('/api/discover/flow', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_flow():
     """a fresh flow queue every call: favourites, their unplayed tracks, and
@@ -2071,6 +2175,7 @@ def get_flow():
 
 
 @bp.route('/api/discover/backdrop-video', methods=['GET'])
+@requires("music.discover")
 def get_backdrop_video():
     """a music video id to play muted behind a banner, or null. the page asks
     only for the one banner on screen; the pick is remembered for a month."""
@@ -2094,6 +2199,7 @@ def get_backdrop_video():
 
 
 @bp.route('/api/discover/moods', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'mixes[].tracks': WORKS})
 def get_mood_mixes():
     """chill / focus / energy / feel good / late night, from the owned tracks
@@ -2111,7 +2217,11 @@ def get_mood_mixes():
 
 @bp.route('/api/discover/discovery-shuffle', methods=['GET'])
 @bp.route('/api/discover/personalized/discovery-shuffle', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
+# a draw over the whole pool, 10s+ of cpu: kept like the other shelves (and
+# warmed by web_server's discover warmer), not redrawn on every visit
+@_discover_shelf_cache(key_extra=_discover_source_key)
 def get_discovery_shuffle():
     """Get Discovery Shuffle playlist - random tracks from discovery pool"""
     try:
@@ -2176,6 +2286,7 @@ def _build_personalized_manager():
 # (best-effort) so a ban survives a source switch immediately.
 
 @bp.route('/api/blocklist', methods=['GET'])
+@requires("music.access")
 def get_blocklist():
     try:
         entity_type = request.args.get('entity_type')
@@ -2210,6 +2321,7 @@ def _add_to_blocklist(entity_type, name, ids, parent_name=None):
 
 
 @bp.route('/api/blocklist', methods=['POST'])
+@requires("music.access")
 def add_blocklist():
     try:
         data = request.get_json() or {}
@@ -2243,6 +2355,7 @@ _FEEDBACK_ACTIONS = ('more', 'less', 'not_now', 'block', 'save')
 
 
 @bp.route('/api/discover/feedback', methods=['POST'])
+@requires("music.discover")
 def post_discovery_feedback():
     """One answer from a recommendation's ⋯ menu. ``entity`` is {type, name,
     artist_name?, ids?: {source: id}}; ``explanation`` is the one it was shown
@@ -2285,6 +2398,7 @@ def post_discovery_feedback():
 
 
 @bp.route('/api/discover/feedback', methods=['GET'])
+@requires("music.discover")
 def list_discovery_feedback():
     """This profile's feedback still in force, newest first."""
     try:
@@ -2297,6 +2411,7 @@ def list_discovery_feedback():
 
 
 @bp.route('/api/discover/feedback/<int:feedback_id>', methods=['DELETE'])
+@requires("music.discover")
 def undo_discovery_feedback(feedback_id):
     try:
         ok = get_database().remove_discovery_feedback(get_current_profile_id(), feedback_id)
@@ -2306,6 +2421,7 @@ def undo_discovery_feedback(feedback_id):
 
 
 @bp.route('/api/discover/feedback', methods=['DELETE'])
+@requires("music.discover")
 def reset_discovery_taste():
     """Forget every more / less / not now. Blocks stay: they're the blocklist."""
     try:
@@ -2321,6 +2437,7 @@ _INBOX_USER_STATES = ('unread', 'saved', 'dismissed')
 
 
 @bp.route('/api/discover/inbox', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'items': WORKS})
 def get_discovery_inbox():
     """What's worth coming back to. ``view`` is new (unread) or saved. A
@@ -2348,6 +2465,7 @@ def get_discovery_inbox():
 
 
 @bp.route('/api/discover/inbox/counts', methods=['GET'])
+@signed_in
 def get_discovery_inbox_counts():
     """The nav badge: how many are new. Asking also lets a stale inbox
     refresh in the background, so the badge can grow without anyone opening
@@ -2363,6 +2481,7 @@ def get_discovery_inbox_counts():
 
 
 @bp.route('/api/discover/inbox/<int:item_id>/state', methods=['POST'])
+@requires("music.access")
 def set_discovery_inbox_state(item_id):
     """Save, dismiss, or put back as new. Added is observed, not set."""
     try:
@@ -2377,6 +2496,7 @@ def set_discovery_inbox_state(item_id):
 
 
 @bp.route('/api/discover/inbox/dismiss-all', methods=['POST'])
+@requires("music.discover")
 def dismiss_discovery_inbox():
     try:
         from core.discovery import inbox as _inbox
@@ -2387,6 +2507,7 @@ def dismiss_discovery_inbox():
 
 
 @bp.route('/api/discover/inbox/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_discovery_inbox():
     try:
         from core.discovery import inbox as _inbox
@@ -2419,6 +2540,7 @@ def _recipe_card(row, payload):
 
 
 @bp.route('/api/discover/recipes', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'mixes[].tracks': WORKS})
 def list_mix_recipes():
     """Every recipe with its current mix, renewed if its schedule says so."""
@@ -2445,6 +2567,7 @@ def _recipe_from_request():
 
 
 @bp.route('/api/discover/recipes', methods=['POST'])
+@requires("music.discover")
 def create_mix_recipe():
     try:
         from core.personalized import recipes as _recipes
@@ -2462,6 +2585,7 @@ def create_mix_recipe():
 
 
 @bp.route('/api/discover/recipes/<int:recipe_id>', methods=['PUT'])
+@requires("music.discover")
 def update_mix_recipe(recipe_id):
     try:
         from core.personalized import recipes as _recipes
@@ -2481,6 +2605,7 @@ def update_mix_recipe(recipe_id):
 
 
 @bp.route('/api/discover/recipes/<int:recipe_id>', methods=['DELETE'])
+@requires("music.discover")
 def delete_mix_recipe(recipe_id):
     try:
         from core.personalized import recipes as _recipes
@@ -2491,6 +2616,7 @@ def delete_mix_recipe(recipe_id):
 
 
 @bp.route('/api/discover/recipes/<int:recipe_id>/refresh', methods=['POST'])
+@requires("music.discover")
 @_hide_blocked({'mix.tracks': WORKS})
 def refresh_mix_recipe(recipe_id):
     """A new generation now, whatever the schedule says."""
@@ -2508,6 +2634,7 @@ def refresh_mix_recipe(recipe_id):
 
 
 @bp.route('/api/discover/recipes/<int:recipe_id>/keep', methods=['POST'])
+@requires("music.discover")
 def keep_mix_recipe(recipe_id):
     """Keep this one: the current generation becomes a normal playlist."""
     try:
@@ -2523,6 +2650,7 @@ def keep_mix_recipe(recipe_id):
 
 
 @bp.route('/api/blocklist/search', methods=['GET'])
+@requires("music.access")
 def search_blocklist_candidates():
     """Search the active metadata source for an artist/album/track to block.
     Thin wrapper over the manual-match service search so the modal doesn't need
@@ -2544,6 +2672,7 @@ def search_blocklist_candidates():
 
 
 @bp.route('/api/blocklist/<int:entry_id>', methods=['DELETE'])
+@requires("music.access")
 def remove_blocklist(entry_id):
     try:
         ok = get_database().remove_blocklist_entry(get_current_profile_id(), entry_id)
@@ -2558,6 +2687,7 @@ def remove_blocklist(entry_id):
 # artist blocklist, so both screens edit the one list discovery obeys.
 
 @bp.route('/api/discover/artist-blacklist', methods=['GET'])
+@requires("music.discover")
 def get_discovery_artist_blacklist():
     """This profile's blocked artists, in the modal's shape."""
     try:
@@ -2575,6 +2705,7 @@ def get_discovery_artist_blacklist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/artist-blacklist', methods=['POST'])
+@requires("music.discover")
 def add_discovery_artist_blacklist():
     """Block an artist (this profile's blocklist)."""
     try:
@@ -2595,6 +2726,7 @@ def add_discovery_artist_blacklist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/artist-blacklist/<int:blacklist_id>', methods=['DELETE'])
+@requires("music.discover")
 def remove_discovery_artist_blacklist(blacklist_id):
     """Unblock an artist (this profile's blocklist)."""
     try:
@@ -2606,6 +2738,7 @@ def remove_discovery_artist_blacklist(blacklist_id):
 # ── Your Artists (Liked Artists Pool) ──
 
 @bp.route('/api/discover/your-artists', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS})
 def get_your_artists():
     """Get liked artists for the Discover carousel (20 random matched on active source)."""
@@ -2658,6 +2791,7 @@ def get_your_artists():
 
 
 @bp.route('/api/discover/your-artists/all', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS})
 def get_your_artists_all():
     """Get all liked artists for the View All modal (paginated)."""
@@ -2697,6 +2831,7 @@ def get_your_artists_all():
 
 
 @bp.route('/api/discover/your-artists/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_your_artists():
     """Force-trigger a fetch + match cycle for liked artists. ?clear=true wipes pool first."""
     try:
@@ -2712,6 +2847,7 @@ def refresh_your_artists():
 
 
 @bp.route('/api/discover/your-artists/sources', methods=['GET'])
+@requires("music.discover")
 def get_your_artists_sources():
     """Return current source config + which services are connected."""
     try:
@@ -2774,6 +2910,47 @@ def _trigger_your_artists_refresh(profile_id: int):
     threading.Thread(target=_run, daemon=True, name="YourArtistsRefresh").start()
 
 
+# an artist needs this many plays here before "your listening" counts it
+YOUR_LISTENING_MIN_PLAYS = 3
+
+
+def _your_top_artists_fallback(database, profile_id: int):
+    """(artists, source_service) standing in for Last.fm's top artists: the
+    profile's ListenBrainz stats (official server only, public, no token
+    needed), else SoulSync's own listening history."""
+    username = ''
+    try:
+        lb = database.get_profile_listenbrainz(profile_id) or {}
+        token, base_url, username = lb.get('token'), lb.get('base_url') or '', lb.get('username') or ''
+        if not token and profile_id == 1:
+            token = config_manager.get('listenbrainz.token', '')
+            base_url = config_manager.get('listenbrainz.base_url', '') or ''
+            username = config_manager.get('listenbrainz.username', '') or ''
+        if not token or base_url.strip():
+            # no account, or a self-hosted / maloja server with no stats api
+            username = ''
+        elif not username.strip():
+            from core.listenbrainz_client import ListenBrainzClient
+            username = ListenBrainzClient(token=token, base_url='').get_authenticated_username() or ''
+        username = username.strip()
+    except Exception as e:
+        logger.debug(f"[Your Artists] ListenBrainz account lookup failed: {e}")
+        username = ''
+    if username:
+        from core import listenbrainz_public
+        rows = listenbrainz_public.user_top_artists(username, limit=200)
+        if rows:
+            return [{'name': r['name']} for r in rows], 'listenbrainz'
+    try:
+        rows = database.get_top_artists(time_range='all', limit=200, profile_id=profile_id) or []
+    except Exception as e:
+        logger.debug(f"[Your Artists] listening history read failed: {e}")
+        rows = []
+    return ([{'name': r['name']} for r in rows
+             if r.get('name') and int(r.get('play_count') or 0) >= YOUR_LISTENING_MIN_PLAYS],
+            'listening_history')
+
+
 def _fetch_and_match_liked_artists(profile_id: int):
     """Background worker: fetch from services, deduplicate, match to active source."""
     database = get_database()
@@ -2829,21 +3006,33 @@ def _fetch_and_match_liked_artists(profile_id: int):
             lastfm_secret = config_manager.get('lastfm.api_secret', '')
             lastfm_session = config_manager.get('lastfm.session_key', '')
             logger.info(f"[Your Artists] Last.fm credentials: key={'yes' if lastfm_key else 'NO'}, secret={'yes' if lastfm_secret else 'NO'}, session={'yes' if lastfm_session else 'NO'}")
-            if lastfm_key and lastfm_secret and lastfm_session:
-                from core.lastfm_client import LastFMClient
+            lastfm_artists = []
+            from core.lastfm_client import LastFMClient, lastfm_usable
+            if lastfm_key and lastfm_secret and lastfm_session and lastfm_usable(lastfm_key):
                 lfm = LastFMClient(api_key=lastfm_key, api_secret=lastfm_secret, session_key=lastfm_session)
                 username = lfm.get_authenticated_username()
                 logger.info(f"[Your Artists] Last.fm username resolved: {username or 'NONE'}")
                 if username:
                     logger.info(f"[Your Artists] Fetching top artists from Last.fm ({username})...")
-                    artists = lfm.get_user_top_artists(username, period='overall', limit=200)
-                    for a in artists:
+                    lastfm_artists = lfm.get_user_top_artists(username, period='overall', limit=200)
+                    for a in lastfm_artists:
                         database.upsert_liked_artist(
                             artist_name=a['name'], source_service='lastfm',
                             image_url=a.get('image_url'), profile_id=profile_id
                         )
-                    fetched += len(artists)
-                    logger.info(f"[Your Artists] Fetched {len(artists)} from Last.fm")
+                    fetched += len(lastfm_artists)
+                    logger.info(f"[Your Artists] Fetched {len(lastfm_artists)} from Last.fm")
+            if not lastfm_artists:
+                # last.fm not set up, its key refused (pro only from 1 december
+                # 2026) or it had nothing: listenbrainz, else what you played here
+                fallback, fallback_source = _your_top_artists_fallback(database, profile_id)
+                for a in fallback:
+                    database.upsert_liked_artist(
+                        artist_name=a['name'], source_service=fallback_source, profile_id=profile_id
+                    )
+                fetched += len(fallback)
+                if fallback:
+                    logger.info(f"[Your Artists] Fetched {len(fallback)} top artists from {fallback_source}")
     except Exception as e:
         logger.error(f"[Your Artists] Last.fm fetch error: {e}")
 
@@ -2888,6 +3077,7 @@ from core.artists.liked_match import (
 # ── Your Albums (Liked Albums Pool) ──
 
 @bp.route('/api/discover/your-albums', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'albums': WORKS})
 def get_your_albums():
     """Get liked albums with library ownership status, paginated."""
@@ -2976,6 +3166,7 @@ def get_your_albums():
 
 
 @bp.route('/api/discover/your-albums/refresh', methods=['POST'])
+@requires("music.discover")
 def refresh_your_albums():
     """Force-trigger a fetch cycle for liked albums. ?clear=true wipes pool first."""
     try:
@@ -2991,6 +3182,7 @@ def refresh_your_albums():
 
 
 @bp.route('/api/discover/your-albums/sources', methods=['GET'])
+@requires("music.access")
 def get_your_albums_sources():
     """Return current source config + which services are connected (albums)."""
     try:
@@ -3174,6 +3366,7 @@ def _fetch_liked_albums(profile_id: int):
 
 
 @bp.route('/api/discover/your-artists/info/<artist_id>', methods=['GET'])
+@requires("music.discover")
 def get_your_artist_info(artist_id):
     """Get artist info for the Your Artists info modal. Checks library, cache, then API."""
     try:
@@ -3185,28 +3378,46 @@ def get_your_artist_info(artist_id):
             database = get_database()
             conn = database._get_connection()
             cursor = conn.cursor()
-            # Check by various ID columns
-            cursor.execute("""
-                SELECT * FROM artists WHERE id = ? OR spotify_artist_id = ? OR itunes_artist_id = ?
-                OR deezer_id = ? OR discogs_id = ? LIMIT 1
-            """, (artist_id, artist_id, artist_id, artist_id, artist_id))
-            row = cursor.fetchone()
+            # by the provider ids the card carries, never the catalogue row
+            # id: a Deezer id like 13 is not lib2 artist 13 (a stranger). the
+            # canonical row wins, and a name the card sent has to agree
+            from core.library2.importer import normalize_name
+            from core.library2.provider_ids import indexed_provider_id_sql
+            row = None
+            for source in ("spotify", "itunes", "deezer", "discogs"):
+                expression = indexed_provider_id_sql(source)
+                if not expression:
+                    continue
+                cursor.execute(
+                    f"SELECT * FROM lib2_artists WHERE {expression} = ? "
+                    "ORDER BY (canonical_artist_id IS NOT NULL), id LIMIT 1", (str(artist_id),))
+                found = cursor.fetchone()
+                if found and (not artist_name
+                              or normalize_name(found["name"] or "") == normalize_name(artist_name)):
+                    row = found
+                    break
             if row:
                 r = dict(row)
+                from core.library2.provider_ids import parse_external_ids
+                ids = parse_external_ids(r.get('external_ids'))
+                try:
+                    lastfm = (json.loads(r.get('enrichment') or '{}').get('lastfm') or {})
+                except (TypeError, ValueError):
+                    lastfm = {}
                 result.update({
                     'name': r.get('name', artist_name),
                     'genres': json.loads(r['genres']) if r.get('genres') else [],
                     'summary': r.get('summary', ''),
-                    'image_url': r.get('thumb_url', ''),
-                    'spotify_artist_id': r.get('spotify_artist_id'),
+                    'image_url': r.get('image_url', ''),
+                    'spotify_artist_id': r.get('spotify_id'),
                     'musicbrainz_id': r.get('musicbrainz_id'),
-                    'deezer_id': r.get('deezer_id'),
-                    'itunes_artist_id': r.get('itunes_artist_id'),
-                    'discogs_id': r.get('discogs_id'),
-                    'lastfm_url': r.get('lastfm_url'),
-                    'tidal_id': r.get('tidal_id'),
-                    'lastfm_listeners': r.get('lastfm_listeners', 0),
-                    'lastfm_playcount': r.get('lastfm_playcount', 0),
+                    'deezer_id': ids.get('deezer'),
+                    'itunes_artist_id': ids.get('itunes'),
+                    'discogs_id': ids.get('discogs'),
+                    'lastfm_url': ids.get('lastfm') or lastfm.get('url'),
+                    'tidal_id': ids.get('tidal'),
+                    'lastfm_listeners': lastfm.get('listeners', 0),
+                    'lastfm_playcount': lastfm.get('playcount', 0),
                 })
                 return jsonify(result)
         except Exception as e:
@@ -3286,6 +3497,7 @@ def get_your_artist_info(artist_id):
 
 
 @bp.route('/api/image-proxy', methods=['GET'])
+@signed_in
 def image_proxy():
     """Proxy external images to avoid CORS issues for canvas rendering.
 
@@ -3344,6 +3556,7 @@ def image_proxy():
 
 
 @bp.route('/api/image-cache/status', methods=['GET'])
+@admin_only
 def image_cache_status():
     """What the artwork cache is holding, for Settings -> Advanced."""
     try:
@@ -3359,6 +3572,7 @@ def image_cache_status():
 
 
 @bp.route('/api/image-cache/clear', methods=['POST'])
+@admin_only
 def image_cache_clear():
     """Empty the artwork cache. Everything in it is re-fetchable, so this is
     only ever a temporary cost — nothing user-created lives here."""
@@ -3372,6 +3586,7 @@ def image_cache_clear():
 
 
 @bp.route('/api/image-cache/prune', methods=['POST'])
+@admin_only
 def image_cache_prune():
     """Apply the TTL and size cap now, rather than waiting for the next store."""
     try:
@@ -3384,6 +3599,7 @@ def image_cache_prune():
 
 
 @bp.route('/api/image-cache/<cache_key>', methods=['GET'])
+@signed_in
 def serve_cached_image(cache_key):
     """Serve a registered image URL from SoulSync's disk cache."""
     if not re.fullmatch(r'[a-f0-9]{64}', cache_key or ''):
@@ -3411,16 +3627,29 @@ def serve_cached_image(cache_key):
         response.headers['X-SoulSync-Image-Cache'] = cached.status
         return response
     except Exception as exc:
-        logger.debug("cached image serve failed for %s: %s", cache_key, exc)
+        # An empty 404 made every distinct failure look identical from the
+        # browser — "key not found", "upstream refused", "host unreachable" and
+        # "not an image" were indistinguishable, so a production report could
+        # only say "218 images 404" without saying why. The reason travels in a
+        # header (secrets redacted) rather than a body so nothing about the
+        # response contract changes for the <img> that requested it.
+        from core.metadata.artwork import _redact_url_secrets
+        reason = ' '.join(_redact_url_secrets(str(exc)).split())[:200] \
+            or exc.__class__.__name__
+        logger.debug("cached image serve failed for %s: %s", cache_key, reason)
         try:
+            # send the browser to the original instead of a 404 (#1763), but
+            # never hand it a URL that carries a server token
             from core.image_cache import get_image_cache
-            cache = get_image_cache()
-            orig_url = cache.get_original_url(cache_key)
-            if orig_url:
+            orig_url = get_image_cache().get_original_url(cache_key)
+            if orig_url and _redact_url_secrets(orig_url) == orig_url:
                 return redirect(orig_url, code=302)
         except Exception as redirect_exc:
             logger.debug("original URL redirect lookup failed for %s: %s", cache_key, redirect_exc)
-        return '', 404
+        response = Response('', status=404)
+        response.headers['X-SoulSync-Image-Error'] = reason
+        response.headers['Cache-Control'] = 'no-store'
+        return response
 
 
 from core.artists.map import (
@@ -3435,29 +3664,34 @@ from core.artists.map import (
 
 
 @bp.route('/api/discover/artist-map', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'nodes': GRAPH})
 def get_artist_map_data():
     return _artists_map_get_artist_map_data()
 
 
 @bp.route('/api/discover/artist-map/genre-list', methods=['GET'])
+@requires("music.discover")
 def get_artist_map_genre_list():
     return _artists_map_get_artist_map_genre_list()
 
 
 @bp.route('/api/discover/artist-map/genres', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'nodes': GRAPH})
 def get_artist_map_genres():
     return _artists_map_get_artist_map_genres()
 
 
 @bp.route('/api/discover/artist-map/explore', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'nodes': GRAPH})
 def get_artist_map_explore():
     return _artists_map_get_artist_map_explore()
 
 
 @bp.route('/api/discover/artist-map/perf', methods=['POST'])
+@requires("music.discover")
 def log_artist_map_perf():
     """Debug sink: the artist-map frontend POSTs its render timings here (toggled
     with 'd' on the map) so they land in app.log — the on-canvas overlay text
@@ -3471,6 +3705,7 @@ def log_artist_map_perf():
 
 
 @bp.route('/api/discover/build-playlist/search-artists', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'artists': ARTISTS})
 def search_artists_for_playlist():
     """Search for artists to use as seeds for custom playlist building"""
@@ -3534,6 +3769,7 @@ def search_artists_for_playlist():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/build-playlist/generate', methods=['POST'])
+@requires("music.discover")
 @_hide_blocked({'playlist.tracks': WORKS})
 def generate_custom_playlist():
     """Generate custom playlist from seed artists"""
@@ -3569,7 +3805,25 @@ def generate_custom_playlist():
         traceback.print_exc()
         return jsonify({"success": False, "error": str(e)}), 500
 
+# served by idx_discovery_pool_profile_release, which covers it: without that
+# every call read each pool row in full to reach release_date (6.9s live)
+AVAILABLE_DECADES_SQL = """
+    SELECT DISTINCT
+        (CAST(SUBSTR(release_date, 1, 4) AS INTEGER) / 10) * 10 as decade,
+        COUNT(*) as track_count
+    FROM discovery_pool
+    WHERE release_date IS NOT NULL
+      AND profile_id = ?
+      AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) >= 1950
+      AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) <= 2029
+    GROUP BY decade
+    HAVING track_count >= 10
+    ORDER BY decade ASC
+"""
+
+
 @bp.route('/api/discover/decades/available', methods=['GET'])
+@requires("music.discover")
 @_discover_shelf_cache()
 def get_available_decades():
     """Get list of decades that have content in discovery pool"""
@@ -3580,19 +3834,7 @@ def get_available_decades():
             cursor = conn.cursor()
 
             # Get distinct decades from discovery pool
-            cursor.execute("""
-                SELECT DISTINCT
-                    (CAST(SUBSTR(release_date, 1, 4) AS INTEGER) / 10) * 10 as decade,
-                    COUNT(*) as track_count
-                FROM discovery_pool
-                WHERE release_date IS NOT NULL
-                  AND profile_id = ?
-                  AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) >= 1950
-                  AND CAST(SUBSTR(release_date, 1, 4) AS INTEGER) <= 2029
-                GROUP BY decade
-                HAVING track_count >= 10
-                ORDER BY decade ASC
-            """, (get_current_profile_id(),))
+            cursor.execute(AVAILABLE_DECADES_SQL, (get_current_profile_id(),))
 
             rows = cursor.fetchall()
             decades = []
@@ -3612,6 +3854,7 @@ def get_available_decades():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/decade/<int:decade>', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_discover_decade_playlist(decade):
     """Get tracks from a specific decade for discovery page"""
@@ -3658,6 +3901,7 @@ def get_discover_decade_playlist(decade):
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/genres/available', methods=['GET'])
+@requires("music.discover")
 def get_available_genres():
     """Get list of genres that have content in discovery pool"""
     try:
@@ -3680,6 +3924,7 @@ def get_available_genres():
         return jsonify({"success": False, "error": str(e)}), 500
 
 @bp.route('/api/discover/genre/<path:genre_name>', methods=['GET'])
+@requires("music.discover")
 @_hide_blocked({'tracks': WORKS})
 def get_discover_genre_playlist(genre_name):
     """Get tracks from a specific genre for discovery page"""

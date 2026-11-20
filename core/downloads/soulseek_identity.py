@@ -23,6 +23,7 @@ from functools import lru_cache
 from typing import Any, Sequence
 
 from core.text.normalize import normalize_for_comparison
+from core.text.title_match import numbers_conflict
 from core.text.track_prefix import parse_track_prefix
 
 
@@ -49,6 +50,8 @@ _VERSION_WORD = re.compile(
 )
 # A weak edge in release assignment needs this much title similarity.
 _WEAK_TITLE_SIMILARITY = 0.80
+# a file this close to the requested length counts as the same cut
+_DURATION_CLOSE_MS = 15_000
 
 
 def normalize(text: Any) -> str:
@@ -264,6 +267,10 @@ def match_track(target: Any, candidate: Any, *, album: str = '') -> IdentityResu
             and bool(_VERSION_WORD.search(variant.title[len(wanted):]))
         )
         if not exact_title and not versioned_title:
+            # a near title with other numbers is another part or episode,
+            # not a weak edge: ABGT696's Pt. 2 filled ABGT699's Pt. 1 (#2134)
+            if numbers_conflict(wanted, variant.title):
+                continue
             best_similarity = max(
                 best_similarity, SequenceMatcher(None, wanted, variant.title).ratio(),
             )
@@ -307,6 +314,27 @@ def _edge_rank(result: IdentityResult) -> int | None:
     return None
 
 
+def _duration_ms(value: Any) -> int | None:
+    try:
+        ms = int(value)
+    except (TypeError, ValueError):
+        return None
+    return ms if ms > 0 else None
+
+
+def _duration_fit(target: Any, candidate: Any) -> tuple[int, int]:
+    """How well a file's length answers the request: (tier, gap). Close is
+    0, unknown is 1, a known mismatch is 2. A folder holding the single edit
+    and the 13 minute extended mix, with no track number to tell them apart,
+    went to whichever file the peer listed first (#2001)."""
+    wanted = _duration_ms(_field(target, 'duration_ms', None) or _field(target, 'duration', None))
+    got = _duration_ms(_field(candidate, 'duration', None))
+    if not wanted or not got:
+        return 1, 0
+    gap = abs(wanted - got)
+    return (0 if gap <= _DURATION_CLOSE_MS else 2), gap
+
+
 def assign_album_tracks(expected: Sequence[Any], candidates: Sequence[Any], *, album: str = '') -> AlbumAssignment:
     """Maximum one-to-one coverage, preferring the strongest evidence per pair.
 
@@ -316,16 +344,18 @@ def assign_album_tracks(expected: Sequence[Any], candidates: Sequence[Any], *, a
     unfamiliar layout still counts toward coverage while an exact,
     numbered match always wins the file when both exist.
     """
-    edges: list[list[tuple[int, int]]] = [[] for _ in expected]
+    # within the same identity rank, the file whose length fits comes first
+    edges: list[list[tuple[int, int, int, int]]] = [[] for _ in expected]
     for expected_index, target in enumerate(expected):
         for candidate_index, candidate in enumerate(candidates):
             rank = _edge_rank(match_track(target, candidate, album=album))
             if rank is not None:
-                edges[expected_index].append((rank, candidate_index))
+                tier, gap = _duration_fit(target, candidate)
+                edges[expected_index].append((rank, tier, gap, candidate_index))
     owner: dict[int, int] = {}
 
     def augment(expected_index: int, seen: set[int]) -> bool:
-        for _, candidate_index in sorted(edges[expected_index]):
+        for *_, candidate_index in sorted(edges[expected_index]):
             if candidate_index in seen:
                 continue
             seen.add(candidate_index)

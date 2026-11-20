@@ -179,7 +179,8 @@ async def _database_only_find_track(spotify_track, candidate_pool=None):
             try:
                 cached = db.read_sync_match_cache(_match_id, active_server)
                 if cached:
-                    db_track_check = db.get_track_by_id(cached['server_track_id'])
+                    db_track_check = db.get_track_by_server_id(
+                        cached['server_track_id'], active_server)
                     if db_track_check:
                         # #1721: same unchecked-cache trap as the media-server
                         # matcher — an auto-match cached by an older, buggier
@@ -233,11 +234,16 @@ async def _database_only_find_track(spotify_track, candidate_pool=None):
                 m = db.find_manual_library_match_by_source_track_id(
                     get_current_profile_id(), str(_match_id), active_server)
                 if m:
+                    # the stored id is a catalogue id; every match path here
+                    # answers with the server's id (#1417 records it)
+                    from core.sync.match_overrides import manual_match_server_id
                     lib_id = m.get('library_track_id')
-                    dt = db.get_track_by_id(lib_id) if lib_id is not None else None
+                    sid = manual_match_server_id(db, lib_id, active_server, m.get('library_track_id_kind'))
+                    dt = db.get_track_by_server_id(sid, active_server) if sid else None
                     if not dt and m.get('library_file_path'):
                         new_id = db.find_track_id_by_file_path(m['library_file_path'])
-                        dt = db.get_track_by_id(new_id) if new_id else None
+                        sid = manual_match_server_id(db, new_id, active_server) if new_id else None
+                        dt = db.get_track_by_server_id(sid, active_server) if sid else None
                     if dt:
                         class DatabaseTrackDurable:
                             def __init__(self, db_t):
@@ -369,12 +375,14 @@ def _record_library_membership(tracks_json, match_details) -> None:
             db_track_id = (tracks_json[idx] or {}).get('db_track_id')
             if not db_track_id:
                 continue
-            found = detail.get('status') == 'found'
+            found = detail.get('status') == 'found' or detail.get('owned_in_library') is True
             db.update_mirrored_track_extra_data(db_track_id, {
                 'in_library': found,
                 # which library row: the next sync's skip checks it still
                 # exists, or a deleted file was never noticed (#1417)
                 'library_track_id': ((detail.get('matched_track') or {}).get('id') or None) if found else None,
+                # the sync matches by the server's id (review 5 W2-WB-2)
+                'library_track_id_kind': 'server' if found else None,
                 # Stamped so the count can say WHEN it was true. The flag is a
                 # cache: deleting files outside SoulSync will not update it
                 # until the next sync, and a number that cannot say how old it
@@ -436,7 +444,18 @@ def _sync_cover_is_users(playlist_id, profile_id) -> bool:
     return bool(row) and (row.get('source') == 'soulsync' or bool(row.get('custom_cover')))
 
 
-def run_sync_task(
+def run_sync_task(*args, **kwargs):
+    """The actual sync function that runs in the background thread.
+
+    Holds the background workers paused for the whole run, the way a library
+    scan does: they write in bursts all day, and a sync queued behind every
+    one of them (a 75-track playlist took 20+ minutes next to them)."""
+    from core import background_pause
+    with background_pause.paused_for("playlist sync"):
+        return _run_sync_task(*args, **kwargs)
+
+
+def _run_sync_task(
     playlist_id,
     playlist_name,
     tracks_json,
@@ -447,7 +466,7 @@ def run_sync_task(
     sync_mode: str = 'reconcile',  # #1289: safer default (preserves server edits)
     skip_wishlist_add: bool = False,
     organize_by_playlist: bool = False,
-    user_initiated: bool = False,
+    user_initiated: bool | None = None,
     is_request_list: bool = False,
     auto_remove_fulfilled: bool = False,
 ):
@@ -721,7 +740,11 @@ def run_sync_task(
             'download_missing': False,
             'profile_id': profile_id,
             'sync_mode': sync_mode,
-            'user_initiated': user_initiated,
+            # only a caller that says so overrides the wishlist ignore-list
+            # (#874), as in 3.6.1. reading "no automation id" as a click let
+            # the nightly playlist pipeline and every sync-page sync re-queue
+            # tracks the user had removed.
+            'user_initiated': bool(user_initiated),
         }
         if is_request_list:
             sync_kwargs['is_request_list'] = is_request_list
@@ -761,6 +784,7 @@ def run_sync_task(
         # unverified playlist write). It used to land as "finished" with
         # 0 matched, so the pipeline counted it as a clean sync.
         sync_errors = [str(e) for e in (getattr(result, 'errors', None) or [])]
+        sync_error = '; '.join(sync_errors)
         with sync_lock:
             current_status = sync_states.get(playlist_id, {}).get("status")
             if current_status == "cancelled":
@@ -778,7 +802,6 @@ def run_sync_task(
             logger.warning(f"Sync for {playlist_id} ended with errors: {'; '.join(sync_errors)}")
         else:
             logger.info(f"Sync finished for {playlist_id} - state updated")
-
         # Set playlist poster image if available (Plex, Jellyfin, Emby).
         # Don't log the URL itself — it may carry an auth token (Plex
         # X-Plex-Token / Jellyfin X-Emby-Token / Subsonic auth) that we
@@ -824,7 +847,9 @@ def run_sync_task(
         # exists (#993) — either re-clobbers a user's custom poster. The source cover
         # is pushed only to a brand-new playlist (a genuine first mirror); after that
         # its cover is left alone. A one-off retroactive backfill is future work.
-        if sync_mode in ('reconcile', 'append') and not _cover_is_users:
+        if sync_errors:
+            logger.info("[PLAYLIST IMAGE] sync failed — skipping image upload")
+        elif sync_mode in ('reconcile', 'append') and not _cover_is_users:
             logger.info(f"[PLAYLIST IMAGE] {sync_mode} mode — preserving existing playlist image")
         elif playlist_image_url and _synced > 0 and _playlist_preexisted and not _cover_is_users:
             logger.info("[PLAYLIST IMAGE] playlist already existed — leaving its current cover untouched (#993)")
@@ -933,11 +958,13 @@ def run_sync_task(
             )
 
         if sync_errors:
-            # Nothing reached the server, so no "synced" event and no new sync
-            # status. The status is the smart-skip fingerprint: saving this
-            # run's would skip a fully matched playlist as "unchanged" on
-            # every later run, and so would keeping the one from the last
-            # good run. Drop it, so the next run retries the write.
+            # The server playlist write failed. The library membership above
+            # and the automation's downloads still ran: the sync service keeps
+            # going on purpose ("still wishlist what is missing"), and 3.6.1
+            # started those downloads too. What a failed write must not do is
+            # look like a success: no fingerprint, no playlist_synced event,
+            # no saved sync status.
+            logger.error("SYNC FAILED for %s: %s", playlist_id, sync_error)
             if deps.invalidate_sync_fingerprint:
                 deps.invalidate_sync_fingerprint(
                     _fingerprint_sync_id(playlist_id, _resync_entry_id))
@@ -946,13 +973,15 @@ def run_sync_task(
         # Emit playlist_synced event for automation engine
         try:
             if deps.automation_engine:
-                deps.automation_engine.emit('playlist_synced', {
+                from core.automation.owners import owned
+                # the playlist's owner, whoever's thread ran the sync
+                deps.automation_engine.emit('playlist_synced', owned({
                     'playlist_name': playlist_name,
                     'total_tracks': str(getattr(result, 'total_tracks', 0)),
                     'matched_tracks': str(getattr(result, 'matched_tracks', 0)),
                     'synced_tracks': str(getattr(result, 'synced_tracks', 0)),
                     'failed_tracks': str(getattr(result, 'failed_tracks', 0)),
-                })
+                }, profile_id))
         except Exception as e:
             logger.debug("playlist_synced emit failed: %s", e)
 

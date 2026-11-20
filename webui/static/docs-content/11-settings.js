@@ -1,5 +1,6 @@
 registerDocsSection({
     id: 'settings',
+    needs: 'admin',
     title: 'Settings',
     icon: '⚙️',
     pages: [
@@ -10,12 +11,16 @@ registerDocsSection({
             body: `
 SoulSync needs credentials for the services it queries for metadata and enrichment. The Settings search finds any setting by name — handy when you're not sure which tab it lives under.
 
+Settings save themselves a moment after you change them. The status at the top right says **All changes saved**, **Save now** while a change is waiting (click it to save straight away), or **Retry save** if a save failed. Rather save by hand? Turn off **Save settings as I change them** under System, Saving. Changes then wait for the save button, and leaving Settings without saving drops them.
+
+![Service credentials in Settings: the service cards grouped under Metadata, Scrobbling and Extras](settings-services.jpg)
+
 ## Service list
 
 - **Spotify** — Client ID, Client Secret, and Redirect URI (from the Spotify Developer Dashboard). Powers metadata, discovery, and playlist sync. Redirect URIs must be **HTTPS** for anything that isn't a loopback address (NAS, Docker, remote host) — see [Connecting services](#gs-connecting).
 - **slskd** — slskd URL and API key, entered on the Soulseek source panel (Downloads / Sources tabs). Powers Soulseek downloading.
 - **Tidal** — Client ID, Client Secret, and Redirect URI. Log in with the Authenticate button — it opens Tidal's authorization page in the browser, and the callback is just a success page: close the window and you're connected.
-- **Last.fm** — API key, API secret, and your username. Powers scrobbling, similar artists, and listening-history import.
+- **Last.fm** — API key, API secret, and your username. Powers scrobbling, similar artists, and listening-history import. From 1 December 2026 a Last.fm API key needs a **Last.fm Pro** subscription; a key without one is refused, and the card says so. SoulSync then fills in from free sources: top tracks from ListenBrainz or Deezer, similar artists from ListenBrainz or Deezer, similar tracks and Radio from Deezer, Your Artists from ListenBrainz or your own plays. Artist pages still get a bio, tags and numbers: the bio from TheAudioDB or Wikipedia, tags from MusicBrainz, ListenBrainz listeners and Deezer fans, with a small note under the bio saying where it came from. Answers are kept for a while and Last.fm data you already have is kept, so a key that lapses keeps what it already knew. The refused key is tried again every few hours, so subscribing puts Last.fm first again on its own (or click **Test**). History import has no stand-in: import from ListenBrainz instead.
 - **Genius** — Client access token for lyrics.
 - **Pollinations** — Optional API key for playlist cover art. Works without one (one image every 45 seconds, with their mark).
 - **Qobuz** — Email and password, or a pasted auth token when login hits a CAPTCHA. Powers metadata enrichment and Qobuz downloads.
@@ -23,7 +28,7 @@ SoulSync needs credentials for the services it queries for metadata and enrichme
 - **Deezer** — App ID, App Secret, and Redirect URI (OAuth), or an ARL token for playlist access and downloads. Powers favorites, playlists, and Deezer downloads.
 - **Discogs** — Personal access token for release metadata.
 - **AcoustID** — API key for audio fingerprinting and download verification.
-- **ListenBrainz** — User token (username optional) for listening-history import and scrobbling.
+- **ListenBrainz** — User token (username optional) for listening-history import and scrobbling. The recommended scrobbler: free and open, no subscription.
 
 Each service card shows **configured** or **missing** in its header — the colored dot next to the service name is branding, not a live health light.
 `
@@ -35,7 +40,7 @@ Each service card shows **configured** or **missing** in its header — the colo
             body: `
 Connect your media server to enable library scans, metadata syncing, and in-app playback.
 
-![Media server settings](settings-media-server.jpg)
+![Media server settings: server connections for Plex, Jellyfin, Navidrome, Music Assistant and standalone](settings-media-server.jpg)
 
 ## Plex
 
@@ -73,10 +78,16 @@ No media server at all: SoulSync itself is the player and library manager. Impor
 | **HiFi** | Free lossless downloads via community-run hifi-api instances — no account needed |
 | **Deezer** | Download from Deezer (ARL token) |
 | **Lidarr** | Hand off to your Lidarr server |
-| **SoundCloud** | Download from SoundCloud — nothing to set up |
+| **SoundCloud** | Download from SoundCloud, nothing to set up. Optional: paste a free account's oauth_token to get the original file when the uploader allows downloads |
 | **Torrent** | Search via Prowlarr indexers through your torrent client |
 | **Usenet** | Search via Prowlarr indexers through your usenet client |
 | **Hybrid** | Drag sources into a priority chain — SoulSync works down the list and uses the first source that returns a match |
+
+For **Usenet**, SoulSync downloads each NZB from Prowlarr itself and hands SABnzbd or NZBGet the file, the way Sonarr does. Their queue shows the release name straight away, never a "Trying to fetch NZB" entry or the Prowlarr link with your api key, and they don't need to reach Prowlarr. If the NZB can't be fetched, nothing is sent to the client and the grab fails with the reason (for example the indexer's HTTP error).
+
+**A shared qBittorrent.** If your qBittorrent is set to add torrents stopped, or to stop them once the metadata is in, everything SoulSync adds sits there and never downloads. Turn on **Start the torrents SoulSync adds** in the torrent client section and SoulSync's torrents start anyway, while what other apps add keeps your qBittorrent setting. It is off by default and only applies to qBittorrent.
+
+**Pacing indexer searches.** Prowlarr passes every search straight to your indexers, so SoulSync spaces them out: 2 seconds between searches and at most 20 a minute by default, one budget for music and video together. Both are in the Prowlarr section as **Seconds between searches** and **Searches per minute, at most**. Raise the first if a tracker answers 429 Too Many Requests or Prowlarr marks an indexer unhealthy; a tracker that asks for 11 seconds between requests wants 12 or more. 0 turns either one off. A manual search waits its turn behind background searches.
 
 The chain editor lives on the Downloads tab: drag sources from **Available** into your **Download chain**. One source in the chain means "that source only"; two or more means hybrid. Any source can be configured on the Sources tab first — it doesn't need to be in the chain yet.
 
@@ -98,7 +109,7 @@ Every folder on the Folders card is checked as you type, with one line under it:
 - **Inside your download folder** (or the other way round): keep downloads and libraries side by side, not nested, or half-finished files get scanned.
 - **Not on a mapped volume** (Docker): files there live inside the container and are lost when it's recreated.
 
-The Video tab adds optional **4K libraries** (see [Video: 4K libraries](#vid-sources)) and, in Docker, the compose volume lines for every folder you've set, ready to copy.
+The Video tab adds optional **4K libraries** and **More libraries** for your own movie and TV libraries (see [Video: 4K libraries](#vid-sources)) and, in Docker, the compose volume lines for every folder you've set, ready to copy.
 
 ## Behavior
 
@@ -108,7 +119,7 @@ These live on other tabs, not Downloads:
 - **Lossy copy** — on the **Quality** tab ("Create lossy copy of downloaded FLAC files"): optionally keep a lossy copy of each downloaded FLAC alongside the original
 - **YouTube cookies** — on the **Sources** tab, in the YouTube source panel ("YouTube Browser Cookies" / "Paste cookies.txt"): authenticate with a browser profile or a \`cookies.txt\` file when YouTube rate-limits anonymous downloads
 
-![Downloads settings](settings-downloads.jpg)
+![Downloads settings: the download chain with Soulseek tried first and YouTube as fallback](settings-downloads.jpg)
 `
         },
         {
@@ -116,7 +127,7 @@ These live on other tabs, not Downloads:
             title: 'Processing & Organization',
             lede: 'How downloads are verified, enhanced, tagged, and filed.',
             body: `
-![Processing settings](settings-processing.jpg)
+![Processing settings: post-processing options for verification, artwork sources, lyrics and ReplayGain](settings-processing.jpg)
 
 ## Verification & enhancement
 
@@ -126,7 +137,10 @@ These live on other tabs, not Downloads:
 ## Organization
 
 - **Path templates** — customize how artists, albums, and tracks are named and nested (e.g. \`$albumartist/$album/$track - $title\`). Variables use \`$name\` syntax: \`$albumartist\`, \`$artist\`, \`$album\`, \`$track\`, \`$title\`, \`$year\`, \`$discnum\`, \`$explicit\` (\`[E]\` on explicit tracks), \`$contentrating\` (\`[E]\` or \`[C]\`), \`$albumartistinfo\` / \`$albumartistcomposite\` / \`$albumartistclash\` (MusicBrainz's note, country or genre, to keep same-named artists apart), and more
+- **Artist names**: \`$artist\` and \`$albumartist\` use the name your library has for the artist, found by id, so a source that spells them differently (Deezer's "Machine Gun Kelly" for a library's "mgk") doesn't start a second folder. Set your own name in the artist's **Artist Settings > Folder and tag name**
 - **Live preview** — under each template is the path it makes for an example release, updated as you type and before you save. Switch the example between **Standard**, **Explicit**, **Multi-disc** and **Shared artist name** to see the content rating badges, the disc folder and the artist notes come out. It runs through the same code a real download does, so what it shows is what you get
+- **Singles with several tracks**: a release your source calls a single can hold more than one track. On a customized Single Path Template each one keeps its own \`$track\` and \`$disc\`.
+- **Explicit and clean versions** (Filtering): **Prefer explicit versions when matching** ranks explicit files above clean ones and never skips anything. **Never download clean versions** goes further: a file marked Clean, Censored, Edited or Radio Edit is not picked at all unless the track is that cut itself, and the track waits on your Wishlist until a real one turns up.
 - **Multi-disc labels** — the **Multi-Disc Folder Label** setting controls the subfolder added automatically on multi-disc albums; put a disc variable in your template instead to take over
 - **Lookalike characters** — Windows doesn't allow \`: ? / \\ " * | < >\` in names, so by default they become \`_\` (\`AC_DC\`). Turn on **Keep symbols in names with lookalike characters** and they become lookalikes that work on every system instead (\`AC∕DC\`, \`What's Going On？\`), and a trailing dot is kept (\`DAMN․\`). New downloads use it right away; run Reorganize to rename what's already in your library
 - **Detect multi-artist compilations** — file soundtracks and compilations under Various Artists instead of whichever contributor happened to be first
@@ -148,9 +162,19 @@ Quality profiles define which formats are acceptable for downloads, and when a f
 - **Upgrade until** — **Any accepted target** stops once a file matches any target; **Selected target or better** keeps replacing lower-quality files until they reach the selected cutoff target or better
 - **Quick Presets** — one-click starting points for common quality setups
 
-![Quality profiles](dl-quality-profiles.jpg)
+![Quality profile settings: the format priority ladder, upgrade rules and quick presets](dl-quality-profiles.jpg)
 
-Quality profiles are checked during downloads and auto-import, and by the **Quality Upgrade Finder** repair job, which finds files that fall below your standards and proposes replacements.
+Quality profiles are checked during downloads and auto-import. The Library evaluates monitored tracks against their upgrade cutoff and sends the ones with no file to the Wishlist through **Watchlist & Wishlist Reconcile**.
+
+**Automatic upgrades.** A file below its profile (a 128 kbps fallback under a 320 kbps target, say) is asked for again by the same job, with a memory so it cannot loop:
+
+- **A few at a time.** *Upgrades per run* on the job (default 5, hourly) is how many tracks are asked for each run; 0 turns automatic upgrades off. The rest wait their turn.
+- **A growing wait.** A track that found nothing better is not asked for again for *Upgrade retry days* (default 7), then twice that, up to 90 days. A new file starts the count over.
+- **A short stay.** An upgrade search that found nothing in 12 hours leaves the Wishlist until its next turn.
+- **Only a better copy is downloaded.** A candidate whose quality is known and no better than your file is skipped, and so is the streaming source that just delivered that file, which can only deliver it again. Whatever does arrive is measured against the profile before it replaces anything.
+- **A file that cannot be measured is left alone**, since nothing can be shown to be better than it.
+
+**Enhance Quality** asks for chosen tracks right away, without the wait. The **Quality Profile Audit** repair job flags library files below their profile for review; the old Quality Upgrade Finder is retired.
 `
         },
         {
@@ -158,6 +182,8 @@ Quality profiles are checked during downloads and auto-import, and by the **Qual
             title: 'Miscellaneous',
             lede: 'Appearance, API keys, logging, extra libraries, and the remaining toggles.',
             body: `
+![Appearance settings: accent color, visualizer and interface toggles](settings-other.jpg)
+
 ## Appearance
 
 Accent color, theme, visualizer effects, and interface controls. Changes apply immediately — no restart needed.
@@ -166,10 +192,13 @@ Accent color, theme, visualizer effects, and interface controls. Changes apply i
 
 Generate API keys for external integrations. A key is either **admin** (full rights, the default) or **read** (can look, can't change anything). Guard admin keys like passwords and revoke any you no longer use. Keys are shown once at creation. See the API docs for endpoint details.
 
-The same section has two switches, both off by default:
+![The SoulSync API settings: REST API keys, the inbound request endpoint, and the MCP and Lidarr compatible API switches](api-keys.jpg)
+
+The same section has three switches, all off by default:
 
 - **MCP for AI Clients** answers at \`/mcp\`, so Claude and other AI apps can drive SoulSync with one of these keys. See [MCP for AI clients](#api-mcp).
 - **Lidarr Compatible API** answers at \`/lidarr\`, so request apps that only speak Lidarr can use SoulSync. Pick which profile's wishlist their requests land on. See [Lidarr compatible API](#api-lidarr).
+- **Seerr Compatible API** answers at \`/seerr\`, so Seerr apps like Litefin can browse and request movies and shows. Pick the profile Jellyfin users with no profile of their own request as. See [Seerr compatible API](#api-seerr).
 
 ## Log level
 
@@ -192,13 +221,21 @@ Your **Music Library Folder** above is already covered — you don't need to rep
             title: 'Database Maintenance',
             lede: 'Backups, vacuuming, and cache management to keep SoulSync healthy.',
             body: `
+![Database maintenance: database size, Compact Database (VACUUM) and incremental vacuum](settings-maintenance.jpg)
+
 ## Backups
 
 Backups don't live in Settings — they're on the **Tools** page, in the **Backup Manager** card: create a backup now, download copies for off-site storage, and restore from any previous backup. Scheduled backups run through the Backup Database system automation.
 
 ## VACUUM
 
-Over time the database accumulates unused space from deleted rows. **Compact Database (VACUUM)** rewrites the database file to reclaim that space — it locks the database briefly, so it can take a minute on large libraries. **Incremental Vacuum** is a mode you switch on (**Enable Incremental Vacuum**): after a one-time full compact, freed pages are reclaimed in small batches automatically.
+Over time the database accumulates unused space from deleted rows. **Compact Database (VACUUM)** rewrites the database file to reclaim that space. Back up first: it needs free disk space about the size of the database (SoulSync refuses to start it without that), and the database is locked while it runs, which on a very large library can take a long time. **Incremental Vacuum** is a mode you switch on (**Enable Incremental Vacuum**): after a one-time full compact, freed pages are handed back in slices by Cache Maintenance.
+
+## Tidy up and table sizes
+
+**Tidy Up (safe)** drops old rows from caches and logs that keep their own retention (never listening history or library data), merges the full-text search indexes, refreshes the query planner's stats and folds the write-ahead log back into the database. It doesn't lock the library for long and is safe to run any time; the Cache Maintenance repair job does the same on its schedule. **Show Biggest Tables** measures what takes the room; it reads the whole file, so it runs in the background and the list fills in when it's done. The **Write-Ahead Log** line shows the size of the \`-wal\` file; SoulSync folds it back every 10 minutes and caps it at 64 MB after each fold.
+
+Tuning for big libraries can be changed with environment variables: \`SOULSYNC_DB_CACHE_MB\` (page cache per connection, 8 by default), \`SOULSYNC_DB_WAL_LIMIT_MB\` (64), \`SOULSYNC_DB_MMAP_MB\` (0, off) and \`SOULSYNC_DB_CHECKPOINT_MINUTES\` (10, 0 turns it off).
 
 ## Cache management
 

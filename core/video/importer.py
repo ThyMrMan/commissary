@@ -168,6 +168,19 @@ def _user_replace_policy(dl: dict) -> bool:
     return str(ctx.get("import_policy") or "").lower() == "user_replace"
 
 
+def title_locked(db, dl: dict) -> bool:
+    """the download's title is padlocked in the library (reviewed and locked:
+    automation leaves its files alone)"""
+    try:
+        kind = "movie" if _scope_of(dl) == "movie" else "show"
+        item = int(str((dl or {}).get("media_id") or "").strip())
+        if str((dl or {}).get("media_source") or "tmdb") == "library":
+            return bool(db.is_hands_off(kind, item))
+        return item in db.hands_off_tmdb_ids()[kind]
+    except Exception:   # noqa: BLE001 - no id or no answer means not locked
+        return False
+
+
 def _unique_dest(dest: dict, names: list[str]) -> dict:
     existing = {str(n).casefold() for n in (names or [])}
     filename = str(dest.get("filename") or "")
@@ -182,6 +195,50 @@ def _unique_dest(dest: dict, names: list[str]) -> dict:
     suffix = uuid.uuid4().hex[:8]
     candidate = f"{stem} ({suffix}){ext}"
     return {**dest, "filename": candidate, "path": os.path.join(dest["dir"], candidate)}
+
+
+def _adopt_existing_case(dest: dict, root: str, list_dir: Callable) -> dict:
+    """Use a folder that already exists under ``root`` when it differs from the
+    rendered one only by letter case. Linux filesystems are case-sensitive, so a
+    grab titled 'YAGA' would otherwise start a second show folder beside an
+    existing 'Yaga'. Walks each folder below the root: an exact name is kept;
+    otherwise the ONE existing folder whose name matches case-insensitively is
+    used. No match, two or more, or a candidate that lists nothing (a file, or an
+    empty folder) keeps the rendered name. The filename is never changed."""
+    root = str(root or "")
+    d = str(dest.get("dir") or "")
+    if not root or not d:
+        return dest
+    try:
+        rel = os.path.relpath(d, root)
+    except ValueError:
+        return dest
+    if rel == "." or rel == os.pardir or rel.startswith(os.pardir + os.sep):
+        return dest
+    cur = root
+    changed = False
+    for seg in rel.split(os.sep):
+        try:
+            names = [str(n) for n in (list_dir(cur) or [])]
+        except Exception:   # noqa: BLE001 - adoption is best-effort
+            names = []
+        if seg not in names:
+            want = seg.casefold()
+            hits = [n for n in names if n.casefold() == want]
+            if len(hits) == 1:
+                cand = os.path.join(cur, hits[0])
+                try:
+                    usable = bool(list(list_dir(cand) or []))
+                except Exception:   # noqa: BLE001
+                    usable = False
+                if usable:
+                    seg = hits[0]
+                    changed = True
+        cur = os.path.join(cur, seg)
+    if not changed:
+        return dest
+    filename = str(dest.get("filename") or "")
+    return {**dest, "dir": cur, "path": os.path.join(cur, filename)}
 
 
 def _reject(reason: str, bad_release: bool = False) -> dict:
@@ -240,7 +297,8 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                 settings: dict | None = None, force: bool = False,
                 override: dict | None = None, library_dir: str | None = None,
                 expected_duration_sec: float | None = None,
-                ids: dict | None = None,
+                ids: dict | None = None, series_name: str | None = None,
+                locked: bool = False,
                 identity: dict | None = None) -> dict:
     """Decide what to do with a finished download. Returns one of:
 
@@ -257,6 +315,9 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     truncated download or the wrong file entirely, and is rejected. ``ids`` are
     the title's {tmdb_id, imdb_id, tvdb_id} for the $tmdbid/$imdbid/$tvdbid
     tokens (an episode's are its show's); None = only a TMDB id we're sure of.
+    ``series_name`` is what $series renders as for a show the library does not
+    own yet, when its plain title's folder is already another show's
+    (core.video.show_folder, #2052); None = the title.
 
     MANUAL placement: ``force=True`` with an ``override`` ({scope, title, year, season,
     episode, episode_title, target_dir, media_id}) trusts the user's chosen identity —
@@ -433,11 +494,15 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
             # the grab's own year wins; a show not in the library yet and a
             # repair grab carry none, so the title's year is used to NAME it
             "title": ctx.get("title"), "year": _naming_year(ctx.get("year"), ids),
-            "series": ctx.get("title"), "season": ctx.get("season"),
+            "series": (series_name if (series_name and not force and not library_dir)
+                       else ctx.get("title")),
+            "season": ctx.get("season"),
             "episode": ep, "episode_end": ep_end, "episode_title": ctx.get("episode_title"),
             "air_date": ctx.get("air_date"),
             "quality": quality, "resolution": parsed.get("resolution"),
             "source": parsed.get("source"), "codec": parsed.get("codec"),
+            "audio_languages": (probe or {}).get("audio_languages"),
+            "subtitle_languages": (probe or {}).get("subtitle_languages"),
             # Commissary: the library row's ids when the caller resolved none
             "tmdbid": ids.get("tmdb_id") or _ident.get("tmdbid"),
             "imdbid": ids.get("imdb_id") or _ident.get("imdbid"),
@@ -454,6 +519,10 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
     if library_dir and not force:
         dest = {"dir": library_dir, "filename": dest["filename"],
                 "path": os.path.join(library_dir, dest["filename"])}
+    elif not force:
+        # not owned yet: a folder that exists already under another letter
+        # case is the same title, so it gets this file instead of a twin folder
+        dest = _adopt_existing_case(dest, root, list_dir)
     # Commissary: say where the file is going and on whose authority — a folder
     # named from the grab rather than the library is how a show gets a second one.
     try:
@@ -509,6 +578,10 @@ def plan_import(dl: dict, src_path: str, *, list_dir: Callable, probe: dict | No
                     "artwork_dir": artwork_dir}
         if not settings.get("replace_existing", True):
             return _reject("Already in the library (%s) - replace is turned off" % existing)
+        if locked:
+            # the padlock: only a replace the user asked for (forced, or their
+            # own grab above) takes the copy a locked title has
+            return _reject("This title is locked, so the copy it has (%s) is kept" % existing)
         if new_score > old_score:
             return {"action": "upgrade", "dest": dest, "quality_label": quality,
                     "replace_path": os.path.join(dest["dir"], existing), "artwork_dir": artwork_dir}
@@ -550,7 +623,8 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
                override: dict | None = None, library_dir: str | None = None,
                recycle: Callable | None = None,
                expected_duration_sec: float | None = None,
-               plan: dict | None = None, ids: dict | None = None) -> dict:
+               plan: dict | None = None, ids: dict | None = None,
+               series_name: str | None = None, locked: bool = False) -> dict:
     """Execute the import and return a DB patch dict for the download row.
 
     ``fs`` is an injected facade with: ``list_dir(dir)->iterable[name]``,
@@ -584,7 +658,7 @@ def run_import(dl: dict, src_path: str, *, fs: Any, prober: Callable | None = No
         plan = plan_import(dl, src_path, list_dir=fs.list_dir, probe=probe_info,
                            settings=settings, force=force, override=override,
                            library_dir=library_dir, expected_duration_sec=expected_duration_sec,
-                           ids=ids)
+                           ids=ids, series_name=series_name, locked=locked)
     if plan["action"] == "reject":
         # Commissary: a refused import used to leave no trace in the log.
         logger.info("[Import] %r refused: %s%s | file=%s",

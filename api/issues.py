@@ -15,6 +15,7 @@ from core.issues.lifecycle import visible_to
 from core.metadata import normalize_image_url as fix_artist_image_url
 from core.profile_context import get_current_profile_id, is_admin_request
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("web_server")
 
@@ -45,10 +46,18 @@ CATEGORIES = ('wrong_track', 'wrong_metadata', 'wrong_cover', 'duplicate_tracks'
               'incomplete_album', 'other')
 
 def _caller():
-    """(profile_id, is_admin) from the session. never a header: the old
+    """(profile_id, manages) from the session. never a header: the old
     X-Profile-Id read let any profile claim to be the admin (or anyone), and
-    no header at all meant profile 1."""
-    return get_current_profile_id(), is_admin_request()
+    no header at all meant profile 1.
+
+    manages: an admin, or a moderator (requests.moderate, #2166), who answers
+    and tidies everyone's issues the way an admin does. never settings,
+    people or tools: those routes ask for an admin themselves."""
+    pid = get_current_profile_id()
+    if is_admin_request():
+        return pid, True
+    from core.permissions import can, enforcing
+    return pid, bool(enforcing() and can(None, "requests.moderate"))
 
 
 def _actor_name():
@@ -88,6 +97,7 @@ def _fix_snapshot_thumbs(issue):
 
 
 @bp.route('/api/issues', methods=['GET'])
+@requires("issues.report")
 def list_issues():
     """List issues. Admin sees all; non-admin sees own only."""
     try:
@@ -126,6 +136,7 @@ def list_issues():
 
 
 @bp.route('/api/issues', methods=['POST'])
+@requires("issues.report")
 def create_issue():
     """Create a new library issue."""
     try:
@@ -161,6 +172,7 @@ def create_issue():
 
 
 @bp.route('/api/issues/<int:issue_id>', methods=['GET'])
+@requires("issues.report")
 def get_issue(issue_id):
     """Get a single issue. someone else's reads as not found."""
     try:
@@ -175,6 +187,7 @@ def get_issue(issue_id):
 
 
 @bp.route('/api/issues/<int:issue_id>', methods=['PUT'])
+@requires("issues.report")
 def update_issue(issue_id):
     """Update an issue (admin: respond/resolve; user: edit own title/description)."""
     try:
@@ -191,6 +204,7 @@ def update_issue(issue_id):
 
 
 @bp.route('/api/issues/<int:issue_id>', methods=['DELETE'])
+@requires("issues.report")
 def delete_issue(issue_id):
     """Delete an issue (admin or issue owner)."""
     try:
@@ -207,6 +221,7 @@ def delete_issue(issue_id):
 
 
 @bp.route('/api/issues/counts', methods=['GET'])
+@requires("issues.report")
 def get_issue_counts():
     """Get issue counts by status for badge display."""
     try:
@@ -223,6 +238,7 @@ def get_issue_counts():
 
 
 @bp.route('/api/issues/bulk', methods=['POST'])
+@requires("issues.report")
 def bulk_issues():
     """admin: {ids, status?|priority?} or {ids, delete: true} in one go."""
     try:
@@ -237,6 +253,7 @@ def bulk_issues():
 
 
 @bp.route('/api/issues/<int:issue_id>/comments', methods=['POST'])
+@requires("issues.report")
 def add_issue_comment(issue_id):
     """reply on an issue: its reporter, a follower, or an admin."""
     try:
@@ -259,20 +276,31 @@ def _build_issue_snapshot(database, entity_type, entity_id):
         if entity_type == 'track':
             cursor.execute("""
                 SELECT t.id, t.title, t.track_number, t.duration,
-                       t.file_path, t.bitrate, t.bpm,
-                       t.spotify_track_id, t.musicbrainz_recording_id, t.deezer_id as track_deezer_id,
+                       f.path AS file_path, f.bitrate, t.bpm,
+                       t.spotify_id AS spotify_track_id,
+                       t.musicbrainz_id AS musicbrainz_recording_id,
+                       json_extract(t.external_ids, '$.deezer') as track_deezer_id,
                        a.name as artist_name, a.id as artist_id,
-                       a.spotify_artist_id, a.musicbrainz_id as artist_musicbrainz_id,
-                       a.deezer_id as artist_deezer_id, a.tidal_id as artist_tidal_id,
-                       a.qobuz_id as artist_qobuz_id, a.thumb_url as artist_thumb,
-                       al.title as album_title, al.year, al.thumb_url as album_thumb,
-                       al.id as album_id, al.spotify_album_id, al.musicbrainz_release_id,
-                       al.deezer_id as album_deezer_id, al.tidal_id as album_tidal_id,
-                       al.qobuz_id as album_qobuz_id, al.label, al.record_type,
+                       a.spotify_id AS spotify_artist_id,
+                       a.musicbrainz_id as artist_musicbrainz_id,
+                       json_extract(a.external_ids, '$.deezer') as artist_deezer_id,
+                       json_extract(a.external_ids, '$.tidal') as artist_tidal_id,
+                       json_extract(a.external_ids, '$.qobuz') as artist_qobuz_id,
+                       a.image_url as artist_thumb,
+                       al.title as album_title, al.year, al.image_url as album_thumb,
+                       al.id as album_id, al.spotify_id AS spotify_album_id,
+                       al.musicbrainz_id AS musicbrainz_release_id,
+                       json_extract(al.external_ids, '$.deezer') as album_deezer_id,
+                       json_extract(al.external_ids, '$.tidal') as album_tidal_id,
+                       json_extract(al.external_ids, '$.qobuz') as album_qobuz_id,
+                       al.label, al.album_type AS record_type,
                        al.track_count as album_track_count
-                FROM tracks t
-                JOIN artists a ON t.artist_id = a.id
-                JOIN albums al ON t.album_id = al.id
+                FROM lib2_tracks t
+                JOIN lib2_albums al ON al.id = t.album_id
+                JOIN lib2_artists a ON a.id = al.primary_artist_id
+                LEFT JOIN lib2_track_files f
+                       ON f.track_id = t.id AND f.is_primary = 1
+                      AND COALESCE(f.file_state, 'active') <> 'deleted'
                 WHERE t.id = ?
             """, (entity_id,))
             row = cursor.fetchone()
@@ -293,17 +321,23 @@ def _build_issue_snapshot(database, entity_type, entity_id):
 
         elif entity_type == 'album':
             cursor.execute("""
-                SELECT al.id, al.title, al.year, al.track_count, al.thumb_url,
-                       al.genres, al.label, al.record_type, al.duration,
-                       al.spotify_album_id, al.musicbrainz_release_id,
-                       al.deezer_id as album_deezer_id, al.tidal_id as album_tidal_id,
-                       al.qobuz_id as album_qobuz_id, al.upc,
+                SELECT al.id, al.title, al.year, al.track_count,
+                       al.image_url AS thumb_url, al.genres, al.label,
+                       al.album_type AS record_type, al.duration,
+                       al.spotify_id AS spotify_album_id,
+                       al.musicbrainz_id AS musicbrainz_release_id,
+                       json_extract(al.external_ids, '$.deezer') as album_deezer_id,
+                       json_extract(al.external_ids, '$.tidal') as album_tidal_id,
+                       json_extract(al.external_ids, '$.qobuz') as album_qobuz_id, al.upc,
                        a.name as artist_name, a.id as artist_id,
-                       a.spotify_artist_id, a.musicbrainz_id as artist_musicbrainz_id,
-                       a.deezer_id as artist_deezer_id, a.tidal_id as artist_tidal_id,
-                       a.qobuz_id as artist_qobuz_id, a.thumb_url as artist_thumb
-                FROM albums al
-                JOIN artists a ON al.artist_id = a.id
+                       a.spotify_id AS spotify_artist_id,
+                       a.musicbrainz_id as artist_musicbrainz_id,
+                       json_extract(a.external_ids, '$.deezer') as artist_deezer_id,
+                       json_extract(a.external_ids, '$.tidal') as artist_tidal_id,
+                       json_extract(a.external_ids, '$.qobuz') as artist_qobuz_id,
+                       a.image_url as artist_thumb
+                FROM lib2_albums al
+                JOIN lib2_artists a ON a.id = al.primary_artist_id
                 WHERE al.id = ?
             """, (entity_id,))
             row = cursor.fetchone()
@@ -322,9 +356,14 @@ def _build_issue_snapshot(database, entity_type, entity_id):
                         pass
                 # Get track listing with enriched data
                 cursor.execute("""
-                    SELECT id, title, track_number, duration, file_path, bitrate,
-                           spotify_track_id, bpm
-                    FROM tracks WHERE album_id = ? ORDER BY track_number
+                    SELECT t.id, t.title, t.track_number, t.duration,
+                           f.path AS file_path, f.bitrate,
+                           t.spotify_id AS spotify_track_id, t.bpm
+                    FROM lib2_tracks t
+                    LEFT JOIN lib2_track_files f
+                           ON f.track_id = t.id AND f.is_primary = 1
+                          AND COALESCE(f.file_state, 'active') <> 'deleted'
+                    WHERE t.album_id = ? ORDER BY t.track_number
                 """, (entity_id,))
                 tracks_list = []
                 for r in cursor.fetchall():
@@ -341,11 +380,13 @@ def _build_issue_snapshot(database, entity_type, entity_id):
 
         elif entity_type == 'artist':
             cursor.execute("""
-                SELECT id, name, thumb_url, genres, summary,
-                       spotify_artist_id, musicbrainz_id as artist_musicbrainz_id,
-                       deezer_id as artist_deezer_id, tidal_id as artist_tidal_id,
-                       qobuz_id as artist_qobuz_id
-                FROM artists WHERE id = ?
+                SELECT id, name, image_url AS thumb_url, genres, summary,
+                       spotify_id AS spotify_artist_id,
+                       musicbrainz_id as artist_musicbrainz_id,
+                       json_extract(external_ids, '$.deezer') as artist_deezer_id,
+                       json_extract(external_ids, '$.tidal') as artist_tidal_id,
+                       json_extract(external_ids, '$.qobuz') as artist_qobuz_id
+                FROM lib2_artists WHERE id = ?
             """, (entity_id,))
             row = cursor.fetchone()
             if row:

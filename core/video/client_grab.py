@@ -33,8 +33,7 @@ def _usenet_category() -> str:
 
 
 def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None,
-                 fallback_magnet: Optional[str] = None,
-                 category: Optional[str] = None) -> dict:  # Commissary: per-Library category
+                 fallback_magnet: Optional[str] = None, category: Optional[str] = None) -> dict:
     """Add a magnet/.torrent URL to the active torrent client. Returns
     ``{ok, ref}`` (ref = the info-hash to poll) or ``{ok: False, error}``.
 
@@ -49,6 +48,7 @@ def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None,
         return {"ok": False, "error": "No torrent client configured — set it on Settings → Downloads."}
     try:
         from core.torrent_clients.base import add_torrent_smart
+        # a video library's own category / label (#2029), else the client's
         ref = _run(add_torrent_smart(adapter, url_or_magnet, category=category or _torrent_category(),
                                      save_path=save_path, fallback_magnet=fallback_magnet))
     except Exception as e:   # noqa: BLE001 - surface the client error to the grab handler
@@ -60,16 +60,20 @@ def grab_torrent(url_or_magnet: str, *, save_path: Optional[str] = None,
 
 
 def grab_usenet(url_or_nzb: Any, *, save_path: Optional[str] = None,
-                category: Optional[str] = None) -> dict:  # Commissary: per-Library category
+                category: Optional[str] = None) -> dict:
     """Add an NZB (URL or bytes) to the active usenet client. Returns
     ``{ok, ref}`` (ref = the nzo_id/NZBID to poll) or ``{ok: False, error}``."""
     from core.usenet_clients import get_active_adapter
     adapter = get_active_adapter()
     if adapter is None or not adapter.is_configured():
         return {"ok": False, "error": "No usenet client configured — set it on Settings → Downloads."}
+    from core.usenet_clients.nzb_fetch import NzbFetchError
     try:
         ref = _run(adapter.add_nzb(url_or_nzb, category=category or _usenet_category(),
                                    save_path=save_path))
+    except NzbFetchError as e:
+        # #2030: the nzb never reached the client
+        return {"ok": False, "error": "Usenet grab failed: " + str(e)}
     except Exception as e:   # noqa: BLE001
         logger.warning("usenet add failed: %s", e, exc_info=True)
         return {"ok": False, "error": "Usenet client: " + str(e)}
@@ -78,23 +82,41 @@ def grab_usenet(url_or_nzb: Any, *, save_path: Optional[str] = None,
     return {"ok": True, "ref": str(ref)}
 
 
-def _category_kw(category):
-    """Commissary: pass a Library category only when there is one, so grab
-    stand-ins that predate it keep working."""
-    return {"category": category} if category else {}
-
-
 def grab(source: str, url: Any, *, save_path: Optional[str] = None,
-         fallback_magnet: Optional[str] = None,
-         category: Optional[str] = None) -> dict:  # Commissary: per-Library category
+         fallback_magnet: Optional[str] = None, category: Optional[str] = None) -> dict:
     """Dispatch a grab by source (torrent | usenet).
 
     ``fallback_magnet`` is torrent-only and ignored for usenet, which has no
     such thing — keeping it on the shared signature means callers don't have
     to branch on the source just to pass it."""
+    # ``category``: a video library's own client category / label (#2029);
+    # None keeps the client's setting
+    extra = {"category": category} if category else {}
     if str(source).lower() == "torrent":
-        return grab_torrent(url, save_path=save_path, fallback_magnet=fallback_magnet,
-                            **_category_kw(category))
+        return grab_torrent(url, save_path=save_path, fallback_magnet=fallback_magnet, **extra)
     if str(source).lower() == "usenet":
-        return grab_usenet(url, save_path=save_path, **_category_kw(category))
+        return grab_usenet(url, save_path=save_path, **extra)
     return {"ok": False, "error": "Unsupported source %r" % source}
+
+
+def remove(source: str, ref: Any, *, delete_files: bool = True) -> bool:
+    """Take one job out of the torrent/usenet client, with what it downloaded
+    when ``delete_files``. For a download SoulSync gave up on (cancelled, or a
+    failed release it replaced): the client kept it going, or kept its partial
+    files, forever. Best-effort, False when it couldn't. Never for a finished
+    download, whose files are the import's."""
+    source = str(source or "").lower()
+    if not ref or source not in ("torrent", "usenet"):
+        return False
+    try:
+        if source == "torrent":
+            from core.torrent_clients import get_active_adapter
+        else:
+            from core.usenet_clients import get_active_adapter
+        adapter = get_active_adapter()
+        if adapter is None or not adapter.is_configured():
+            return False
+        return bool(_run(adapter.remove(str(ref), delete_files=delete_files)))
+    except Exception as e:  # noqa: BLE001 - leaving the job behind is the old behaviour
+        logger.warning("%s remove of %s failed: %s", source, ref, e)
+        return False

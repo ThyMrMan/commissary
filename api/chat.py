@@ -18,6 +18,7 @@ when actually needed.
 """
 
 import ipaddress
+import json
 import math as _math
 import os
 import re as _re
@@ -27,6 +28,7 @@ from urllib.parse import urljoin, urlparse
 from flask import Blueprint, g, jsonify, request
 
 from utils.logging_config import get_logger
+from core.permissions import requires
 
 logger = get_logger("chat.api")
 
@@ -181,6 +183,13 @@ def _can_send() -> bool:
         return False
 
 
+def _can_use_shared_account() -> bool:
+    """may this caller read and act as the shared soulseek account (its
+    private messages, its notes on users)? the same people who may send as
+    it: the admin, and members once the admin turns member sending on."""
+    return _can_send()
+
+
 def _clean_message(payload) -> str | None:
     msg = str((payload or {}).get("message") or "").strip()
     if not msg:
@@ -332,24 +341,152 @@ def _gif_fetch(url: str, params: dict) -> dict:
     return r.json()
 
 
+# the radio's library artist, folded across accents. unidecode_lower(name)
+# ran python over every artist (1 s on 30k, review 5 W3-TB-4); the indexed
+# name_key answers every plain spelling, and only the accented keys, read off
+# that index rather than the table, pay for the python fold
+_RADIO_ARTIST_SQL = (
+    "SELECT spotify_id, musicbrainz_id, external_ids FROM lib2_artists"
+    " WHERE name_key = :key"
+    " UNION ALL"
+    " SELECT spotify_id, musicbrainz_id, external_ids FROM lib2_artists"
+    " WHERE id IN (SELECT id FROM lib2_artists"
+    "               WHERE name_key GLOB '*[^ -~]*' AND name_key <> :key"
+    "                 AND unidecode_lower(name_key) = :folded)")
+
+
+# the share-from-library search (review 5 W3-TB-1). it ran two correlated
+# subqueries and three python folds per track over the whole library before
+# its LIMIT: 13.8 s for two letters, 3.5 s for "the". now it picks the 20
+# ids first, from the Songs search index, and only those 20 are decorated
+_SHARE_ROWS = 20
+# a match list this short is ordered in one go
+_SHARE_SORT_CAP = 2000
+# a broader one walks A to Z this many tracks at a time and stops at 20
+_SHARE_WALK_CHUNK = 2000
+_SHARE_WALK_CHUNKS = 10
+
+
+def _share_live_file_sql(alias):
+    """A non-deleted file with a path, in the caller's library: another
+    profile's own copy is not theirs to share (review 5 W3-TB-2)."""
+    from core.library2.sql_util import owner_clause
+    return (f"EXISTS (SELECT 1 FROM lib2_track_files lf WHERE lf.track_id = {alias}.id"
+            " AND COALESCE(lf.file_state, 'active') <> 'deleted'"
+            " AND COALESCE(lf.path, '') <> ''"
+            f"{owner_clause(column='lf.owner_profile_id')})")
+
+
+def _share_search_ids(conn, query):
+    """Up to 20 matching track ids with a live file here, A to Z (the Songs
+    tab's A-Z key, read off its index). Matches title, track artist or album
+    artist, folded the way the Songs search folds them."""
+    from core.library2 import song_search
+    from core.library2.queries import _fold_sql
+    from database.music_database import _library_sort_key_sql
+
+    folded = song_search.fold(query)
+    like = song_search.like_pattern(folded)
+    live = _share_live_file_sql("t")
+    key = _library_sort_key_sql("t.title")
+
+    def ordered(ids):
+        return [r[0] for r in conn.execute(
+            f"SELECT t.id FROM json_each(:ids) j CROSS JOIN lib2_tracks t ON t.id = j.value"
+            f" WHERE {live} ORDER BY {key}, t.id LIMIT {_SHARE_ROWS}",
+            {"ids": json.dumps(sorted(set(ids)))})]
+
+    hits = song_search.indexed_ids(conn, folded, limit=_SHARE_SORT_CAP + 1)
+    if hits is None:
+        # the index is not built yet: fold every track live, ascii in C
+        song_search.register_fold(conn)
+        return [r[0] for r in conn.execute(
+            f"""SELECT t.id FROM lib2_tracks t
+                  JOIN lib2_albums al ON al.id = t.album_id
+                  LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                 WHERE ({_fold_sql('t.title')} LIKE :like ESCAPE '\\'
+                        OR {_fold_sql('t.track_artist')} LIKE :like ESCAPE '\\'
+                        OR {_fold_sql('ar.name')} LIKE :like ESCAPE '\\')
+                   AND {live}
+                 ORDER BY {key}, t.id LIMIT {_SHARE_ROWS}""",
+            {"like": like})]
+    dirty = song_search.dirty_matches(conn, like)
+    if len(hits) <= _SHARE_SORT_CAP:
+        return ordered(hits + dirty)
+
+    # a broad query: its first 20 sit near the top of A to Z, so walk the
+    # alpha index a chunk at a time instead of sorting every match
+    found = []
+    match = song_search.indexed_match_sql("t.id")
+    for step in range(_SHARE_WALK_CHUNKS):
+        chunk = [r[0] for r in conn.execute(
+            f"SELECT t.id FROM lib2_tracks t ORDER BY {key}, t.id LIMIT ? OFFSET ?",
+            (_SHARE_WALK_CHUNK, step * _SHARE_WALK_CHUNK))]
+        found += [r[0] for r in conn.execute(
+            f"""SELECT t.id FROM json_each(:chunk) j
+                  CROSS JOIN lib2_tracks t ON t.id = j.value
+                 WHERE (t.id IN (SELECT value FROM json_each(:dirty)) OR {match})
+                   AND {live}
+                 ORDER BY j.key LIMIT {_SHARE_ROWS - len(found)}""",
+            {"chunk": json.dumps(chunk), "dirty": json.dumps(dirty), "like": like})]
+        if len(found) >= _SHARE_ROWS or len(chunk) < _SHARE_WALK_CHUNK:
+            return found
+    # many matches but few with a file here (a small own library): sort them all
+    return ordered(song_search.indexed_ids(conn, folded) + dirty)
+
+
+def _share_search_rows(conn, ids):
+    """The picked tracks with their file size, credit and album, in order."""
+    if not ids:
+        return []
+    from core.library2.sql_util import owner_clause
+    from core.library2.track_files import primary_order
+    return conn.execute(
+        f"""SELECT t.id, t.title, tf.size,
+                  COALESCE(credited.name, album_artist.name, '') AS artist,
+                  COALESCE(al.title, '') AS album
+             FROM json_each(:ids) j
+             CROSS JOIN lib2_tracks t ON t.id = j.value
+             LEFT JOIN lib2_albums al ON al.id = t.album_id
+             JOIN lib2_track_files tf ON tf.id = (
+                  SELECT f.id FROM lib2_track_files f
+                   WHERE f.track_id = t.id
+                     AND COALESCE(f.file_state, 'active') <> 'deleted'
+                     AND COALESCE(f.path, '') <> ''
+                     {owner_clause(column='f.owner_profile_id')}
+                   ORDER BY {primary_order('f')} LIMIT 1)
+             LEFT JOIN lib2_artists album_artist
+                    ON album_artist.id = al.primary_artist_id
+             LEFT JOIN lib2_artists credited ON credited.id = (
+                  SELECT ta.artist_id FROM lib2_track_artists ta
+                   WHERE ta.track_id = t.id
+                   ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END,
+                            ta.position, ta.artist_id LIMIT 1)
+            ORDER BY j.key""",
+        {"ids": json.dumps(list(ids))}).fetchall()
+
+
 def _resolve_track_path(db, track_id):
-    """A library track's on-disk path. The DB stores the path as the MEDIA
-    SERVER sees it (e.g. Plex's ``/mnt/musicBackup/...``), which the SoulSync
-    process usually can't open directly — so we hand it to the shared library
+    """A library track's on-disk path. The path lives on the track's primary
+    FILE row (ADR-03), not on the track, and it is stored as the MEDIA SERVER
+    sees it (e.g. Plex's ``/mnt/musicBackup/...``), which the SoulSync process
+    usually can't open directly — so we hand it to the shared library
     resolver, the same one the repair/import flows use. It maps the stored
     path onto SoulSync's actual mounts via ``library.music_paths`` +
     transfer/download roots (suffix-matching). None when unreachable."""
     conn = None
     try:
+        from core.library2.track_files import primary_file_row
         conn = db._get_connection()
-        row = conn.execute("SELECT file_path FROM tracks WHERE id = ?",
-                           (str(track_id),)).fetchone()
+        # only this library's copy: another profile's own library is not
+        # theirs to share (review 5 W3-TB-2)
+        row = primary_file_row(conn, int(track_id), scoped=True)
     except Exception:
         return None
     finally:
         if conn:
             conn.close()
-    fp = row["file_path"] if row else None
+    fp = row["path"] if row else None
     if not fp:
         return None
     try:
@@ -711,6 +848,7 @@ def create_blueprint() -> Blueprint:
     _ARCADE_MAX_STAKE = 1000
 
     @bp.route("/api/chat/arcade/bank", methods=["GET"])
+    @requires("chat.use")
     def arcade_bank_get():
         db = _db()
         if db is None:
@@ -718,6 +856,7 @@ def create_blueprint() -> Blueprint:
         return jsonify(db.get_arcade_bank(int(getattr(g, "profile_id", 1) or 1)))
 
     @bp.route("/api/chat/arcade/bank", methods=["POST"])
+    @requires("chat.use")
     def arcade_bank_adjust():
         """Stake or collect. Bounded per call so a typo (or a bug) cannot mint
         a fortune in one request; going below zero is refused outright, which
@@ -738,6 +877,7 @@ def create_blueprint() -> Blueprint:
         return jsonify(out)
 
     @bp.route("/api/chat/settings", methods=["GET"])
+    @requires("chat.use")
     def chat_settings_get():
         """The chat settings for the cog modal (admin-only — these are
         server-wide). The GIPHY key is never echoed back, only whether one
@@ -770,6 +910,7 @@ def create_blueprint() -> Blueprint:
         })
 
     @bp.route("/api/chat/settings", methods=["POST"])
+    @requires("chat.use")
     def chat_settings_set():
         if not bool(getattr(g, "is_admin", True)):
             return jsonify({"error": "Admin access required"}), 403
@@ -858,6 +999,7 @@ def create_blueprint() -> Blueprint:
         return chat_settings_get()
 
     @bp.route("/api/chat/room/react", methods=["POST"])
+    @requires("chat.use")
     def chat_room_react():
         """Send a reaction: an empty-text envelope carrying {re:{k,e}} that
         SoulSync clients aggregate into chips (other clients see line noise).
@@ -893,6 +1035,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True})
 
     @bp.route("/api/chat/user/<path:username>", methods=["GET"])
+    @requires("chat.use")
     def chat_user_card(username):
         """The user popover: presence + info card from slskd, best-effort
         per field (peers can be offline / refuse info)."""
@@ -921,14 +1064,20 @@ def create_blueprint() -> Blueprint:
             db = _db()
             if db is not None:
                 out["history"] = db.get_user_download_stats(username)
-                out["note"] = db.get_chat_user_note(username)
+                # the note is the shared account's, like its private messages
+                out["note_editable"] = _can_use_shared_account()
+                if out["note_editable"]:
+                    out["note"] = db.get_chat_user_note(username)
         except Exception:
             logger.debug("chat: user history/note failed", exc_info=True)
         return jsonify(out)
 
     @bp.route("/api/chat/user/<path:username>/note", methods=["POST"])
+    @requires("chat.use")
     def chat_user_note_set(username):
         """Save the local, private note for a user ('' clears it)."""
+        if not _can_use_shared_account():
+            return jsonify({"error": "Notes on the shared Soulseek account are the admin's"}), 403
         db = _db()
         if db is None:
             return jsonify({"error": "database unavailable"}), 503
@@ -939,6 +1088,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True, "note": note.strip()})
 
     @bp.route("/api/chat/user/<path:username>/shares", methods=["GET"])
+    @requires("chat.use")
     def chat_user_shares(username):
         """Browse a peer's shares: their directory list (names + file counts).
         Files are fetched per-directory — big shares are tens of thousands of
@@ -962,6 +1112,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"username": username, "directories": dirs})
 
     @bp.route("/api/chat/user/<path:username>/shares/files", methods=["GET"])
+    @requires("chat.use")
     def chat_user_share_files(username):
         """One directory of a peer's share: [{filename, size}]."""
         client = _client()
@@ -988,6 +1139,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"username": username, "directory": directory, "files": out})
 
     @bp.route("/api/chat/user/<path:username>/download", methods=["POST"])
+    @requires("chat.use")
     def chat_user_download(username):
         """Queue files from a peer's share into the normal slskd download
         pipeline (they land in the downloads folder and import like any other
@@ -997,6 +1149,9 @@ def create_blueprint() -> Blueprint:
             return jsonify({"error": "Soulseek (slskd) is not configured"}), 503
         if not (bool(getattr(g, "is_admin", True)) or bool(getattr(g, "can_download", True))):
             return jsonify({"error": "Your profile can't start downloads"}), 403
+        from core.permissions import can, enforcing, refusal
+        if enforcing() and not can(None, "music.get", "download"):
+            return refusal("music.get")
         files = (request.get_json(silent=True) or {}).get("files")
         if not isinstance(files, list) or not files:
             return jsonify({"error": "files required"}), 400
@@ -1020,6 +1175,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True, "queued": queued, "failed": len(files) - queued})
 
     @bp.route("/api/chat/gifs", methods=["GET"])
+    @requires("chat.use")
     def chat_gifs():
         """GIF search (GIPHY — Tenor's API was shut down June 2026), proxied so
         the API key never reaches the browser. Key: ``soulseek.chat_giphy_key``
@@ -1053,9 +1209,11 @@ def create_blueprint() -> Blueprint:
         return jsonify({"gifs": gifs})
 
     @bp.route("/api/chat/files/library-search", methods=["GET"])
+    @requires("chat.use")
     def chat_files_library_search():
         """Pick-a-track-from-your-library search for the share flow: title or
-        artist match, only tracks with a stored file path, 20 max."""
+        artist match, only tracks with a stored file path in the caller's
+        library, 20 max, A to Z."""
         db = _db()
         if db is None:
             return jsonify({"tracks": []})
@@ -1064,22 +1222,13 @@ def create_blueprint() -> Blueprint:
             return jsonify({"tracks": []})
         conn = None
         try:
+            from core.library2 import song_search
             conn = db._get_connection()
-            like = "%" + query.replace("%", "\\%") + "%"
-            rows = conn.execute(
-                """SELECT t.id, t.title, t.file_path, t.file_size,
-                          COALESCE(t.track_artist, ar.name, '') AS artist,
-                          COALESCE(al.title, '') AS album
-                   FROM tracks t
-                   LEFT JOIN artists ar ON ar.id = t.artist_id
-                   LEFT JOIN albums al ON al.id = t.album_id
-                   WHERE t.file_path IS NOT NULL AND t.file_path != ''
-                     AND (t.title LIKE ? OR ar.name LIKE ? OR t.track_artist LIKE ?)
-                   ORDER BY t.title LIMIT 20""",
-                (like, like, like)).fetchall()
+            ids = _share_search_ids(conn, query)
+            rows = _share_search_rows(conn, ids)
             return jsonify({"tracks": [
                 {"id": r["id"], "title": r["title"], "artist": r["artist"],
-                 "album": r["album"], "size": r["file_size"]}
+                 "album": r["album"], "size": r["size"]}
                 for r in rows]})
         except Exception as e:
             logger.debug("chat: library search failed: %s", e)
@@ -1087,8 +1236,15 @@ def create_blueprint() -> Blueprint:
         finally:
             if conn:
                 conn.close()
+            # build the index (or catch it up) for the next keystroke, as
+            # opening the Songs tab does
+            try:
+                song_search.refresh_in_background(db)
+            except Exception:  # noqa: BLE001
+                logger.debug("chat: song index refresh failed", exc_info=True)
 
     @bp.route("/api/chat/wanted/resolve-share", methods=["POST"])
+    @requires("chat.use")
     def chat_wanted_resolve_share():
         """Look up local library files matching a Wanted/ISO card, computing the
         relative share filenames for Soulseek P2P direct sharing."""
@@ -1121,6 +1277,27 @@ def create_blueprint() -> Blueprint:
 
         conn = None
         try:
+            # Library v2: a track's file is its (scoped) primary file row, its
+            # artist the first track credit, else the album's artist. Only rows
+            # with a live file can be shared.
+            from core.library2.sql_util import owned_sql, scoped_primary_file_join
+            track_select = f"""SELECT t.id, t.title, t.track_number, t.duration,
+                                     tf.path AS file_path, tf.size AS file_size, tf.bitrate,
+                                     COALESCE(credited.name, ar.name, '') as artist,
+                                     COALESCE(al.title, '') as album,
+                                     al.image_url as album_thumb_url,
+                                     ar.image_url as artist_thumb_url
+                              FROM lib2_tracks t
+                              JOIN lib2_albums al ON al.id = t.album_id
+                              JOIN lib2_track_files tf ON {scoped_primary_file_join('t', 'tf')}
+                              LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                              LEFT JOIN lib2_artists credited ON credited.id = (
+                                   SELECT ta.artist_id FROM lib2_track_artists ta
+                                    WHERE ta.track_id = t.id
+                                    ORDER BY CASE ta.role WHEN 'primary' THEN 0 ELSE 1 END,
+                                             ta.position, ta.artist_id LIMIT 1)
+                              WHERE COALESCE(tf.file_state, 'active') = 'active'
+                                AND tf.path IS NOT NULL AND tf.path != ''"""
             conn = db._get_connection()
             album_row = None
             tracks_rows = []
@@ -1132,11 +1309,12 @@ def create_blueprint() -> Blueprint:
                     like_alb = "%" + alb_query.replace("%", "\\%") + "%"
                     like_art = "%" + artist.replace("%", "\\%") + "%" if artist else "%"
                     album_row = conn.execute(
-                        """SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
-                                  al.thumb_url, ar.thumb_url as artist_thumb_url
-                           FROM albums al
-                           LEFT JOIN artists ar ON ar.id = al.artist_id
+                        f"""SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
+                                  al.image_url AS thumb_url, ar.image_url as artist_thumb_url
+                           FROM lib2_albums al
+                           LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id
                            WHERE al.title LIKE ? AND (ar.name LIKE ? OR ? LIKE ('%' || ar.name || '%') OR ? = '%')
+                             AND {owned_sql('album', 'al')}
                            ORDER BY CASE WHEN LOWER(al.title) = LOWER(?) THEN 0 ELSE 1 END,
                                     al.id LIMIT 1""",
                         (like_alb, like_art, artist if artist else "%", like_art, alb_query)
@@ -1145,11 +1323,11 @@ def create_blueprint() -> Blueprint:
                     # Fall back to album title if artist naming has slight discrepancy
                     if not album_row and artist:
                         album_row = conn.execute(
-                            """SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
-                                      al.thumb_url, ar.thumb_url as artist_thumb_url
-                               FROM albums al
-                               LEFT JOIN artists ar ON ar.id = al.artist_id
-                               WHERE al.title LIKE ?
+                            f"""SELECT al.id, al.title, al.year, COALESCE(ar.name, '') as artist,
+                                      al.image_url AS thumb_url, ar.image_url as artist_thumb_url
+                               FROM lib2_albums al
+                               LEFT JOIN lib2_artists ar ON ar.id = al.primary_artist_id
+                               WHERE al.title LIKE ? AND {owned_sql('album', 'al')}
                                ORDER BY CASE WHEN LOWER(al.title) = LOWER(?) THEN 0 ELSE 1 END,
                                         al.id LIMIT 1""",
                             (like_alb, alb_query)
@@ -1157,16 +1335,8 @@ def create_blueprint() -> Blueprint:
 
                 if album_row:
                     tracks_rows = conn.execute(
-                        """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
-                                  t.file_size, t.bitrate,
-                                  COALESCE(t.track_artist, ar.name, '') as artist,
-                                  al.title as album,
-                                  al.thumb_url as album_thumb_url,
-                                  ar.thumb_url as artist_thumb_url
-                           FROM tracks t
-                           JOIN albums al ON al.id = t.album_id
-                           LEFT JOIN artists ar ON ar.id = t.artist_id
-                           WHERE t.album_id = ? AND t.file_path IS NOT NULL AND t.file_path != ''
+                        track_select + """
+                             AND t.album_id = ?
                            ORDER BY t.track_number, t.id""",
                         (album_row["id"],)
                     ).fetchall()
@@ -1177,17 +1347,8 @@ def create_blueprint() -> Blueprint:
                 like_trk = "%" + track_query.replace("%", "\\%") + "%"
                 like_art = "%" + artist.replace("%", "\\%") + "%" if artist else "%"
                 tracks_rows = conn.execute(
-                    """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
-                              t.file_size, t.bitrate,
-                              COALESCE(t.track_artist, ar.name, '') as artist,
-                              COALESCE(al.title, '') as album,
-                              al.thumb_url as album_thumb_url,
-                              ar.thumb_url as artist_thumb_url
-                       FROM tracks t
-                       LEFT JOIN artists ar ON ar.id = t.artist_id
-                       LEFT JOIN albums al ON al.id = t.album_id
-                       WHERE t.title LIKE ? AND (ar.name LIKE ? OR t.track_artist LIKE ? OR ? LIKE ('%' || ar.name || '%') OR ? = '%')
-                         AND t.file_path IS NOT NULL AND t.file_path != ''
+                    track_select + """
+                         AND t.title LIKE ? AND (ar.name LIKE ? OR credited.name LIKE ? OR ? LIKE ('%' || ar.name || '%') OR ? = '%')
                        ORDER BY CASE WHEN LOWER(t.title) = LOWER(?) THEN 0 ELSE 1 END,
                                 t.id LIMIT ?""",
                     (like_trk, like_art, like_art, artist if artist else "%", like_art, track_query,
@@ -1197,16 +1358,8 @@ def create_blueprint() -> Blueprint:
                 # Fallback to track title alone if artist string differs
                 if not tracks_rows and track_query and artist:
                     tracks_rows = conn.execute(
-                        """SELECT t.id, t.title, t.track_number, t.duration, t.file_path,
-                                  t.file_size, t.bitrate,
-                                  COALESCE(t.track_artist, ar.name, '') as artist,
-                                  COALESCE(al.title, '') as album,
-                                  al.thumb_url as album_thumb_url,
-                                  ar.thumb_url as artist_thumb_url
-                           FROM tracks t
-                           LEFT JOIN artists ar ON ar.id = t.artist_id
-                           LEFT JOIN albums al ON al.id = t.album_id
-                           WHERE t.title LIKE ? AND t.file_path IS NOT NULL AND t.file_path != ''
+                        track_select + """
+                             AND t.title LIKE ?
                            ORDER BY CASE WHEN LOWER(t.title) = LOWER(?) THEN 0 ELSE 1 END,
                                     t.id LIMIT ?""",
                         (like_trk, track_query, 1 if req_type == "track" else 50)
@@ -1292,6 +1445,7 @@ def create_blueprint() -> Blueprint:
                 conn.close()
 
     @bp.route("/api/chat/files/upload", methods=["POST"])
+    @requires("chat.use")
     def chat_files_upload():
         """Upload to filepost.dev and hand back the CDN link + metadata.
 
@@ -1373,6 +1527,7 @@ def create_blueprint() -> Blueprint:
                         "size": size, "mime": mime})
 
     @bp.route("/api/chat/files/import", methods=["POST"])
+    @requires("chat.use")
     def chat_files_import():
         """Save a shared audio file into YOUR library: fetch the filepost link
         into the auto-import staging folder, where the import pipeline picks it
@@ -1429,6 +1584,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True, "name": name, "bytes": got, "auto_import": auto})
 
     @bp.route("/api/chat/rooms", methods=["GET"])
+    @requires("chat.use")
     def chat_rooms():
         """The rooms rail: home room + joined extras. Any profile can read;
         managing the set is admin-only (the account's room memberships are
@@ -1441,6 +1597,7 @@ def create_blueprint() -> Blueprint:
         })
 
     @bp.route("/api/chat/rooms/available", methods=["GET"])
+    @requires("chat.use")
     def chat_rooms_available():
         """The room browser: every public Soulseek room with its user count.
         The full list is a few thousand rooms — cached 5 minutes; the page
@@ -1470,6 +1627,7 @@ def create_blueprint() -> Blueprint:
                         "can_manage": bool(getattr(g, "is_admin", True))})
 
     @bp.route("/api/chat/rooms/join", methods=["POST"])
+    @requires("chat.use")
     def chat_rooms_join():
         """Admin joins a public room: persisted to config (slskd forgets rooms
         on restart; the hydrate re-joins on demand) + joined now."""
@@ -1497,6 +1655,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True, "room": room})
 
     @bp.route("/api/chat/rooms/leave", methods=["POST"])
+    @requires("chat.use")
     def chat_rooms_leave():
         """Admin leaves an extra room (config + slskd). The home room is left
         via the auto-join setting, not here — one obvious path each."""
@@ -1521,6 +1680,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True})
 
     @bp.route("/api/chat/status", methods=["GET"])
+    @requires("chat.use")
     def chat_status():
         """Cheap page hydrate: is chat usable, which room, may I send."""
         client = _client()
@@ -1536,6 +1696,7 @@ def create_blueprint() -> Blueprint:
         })
 
     @bp.route("/api/chat/room", methods=["GET"])
+    @requires("chat.use")
     def chat_room():
         """A joined room (?room=…, default the community room): ensure joined,
         then messages + user list."""
@@ -1653,6 +1814,7 @@ def create_blueprint() -> Blueprint:
                         "protocol": feed})
 
     @bp.route("/api/chat/room/protocol", methods=["POST"])
+    @requires("chat.use")
     def chat_room_protocol_send():
         """Send a PROTOCOL carrier into the room: an empty-text envelope whose
         'p' object coordinates SoulSync clients (a vote, a beacon, a pin).
@@ -1691,6 +1853,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True})
 
     @bp.route("/api/chat/jukebox/resolve", methods=["POST"])
+    @requires("chat.use")
     def chat_jukebox_resolve():
         """Turn a user's jukebox input into candidate tracks.
 
@@ -1743,6 +1906,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"results": results})
 
     @bp.route("/api/chat/link-preview", methods=["GET"])
+    @requires("chat.use")
     def chat_link_preview():
         """Fetch OpenGraph and page metadata for an external link in chat."""
         raw_url = str(request.args.get("url") or "").strip()
@@ -1820,6 +1984,7 @@ def create_blueprint() -> Blueprint:
         return "vibe", "", "", " ".join(keep[:6])[:80]
 
     @bp.route("/api/chat/jukebox/radio", methods=["POST"])
+    @requires("chat.use")
     def chat_jukebox_radio():
         if not _can_send():
             return jsonify({"error": "Chat sending is admin-only on this server"}), 403
@@ -1864,6 +2029,17 @@ def create_blueprint() -> Blueprint:
                             return jsonify({"query": ca, "why": "%s" % vibe})
                 except Exception:   # noqa: BLE001
                     logger.debug("chat radio: tag lookup failed", exc_info=True)
+            # no last.fm (not set up, or the key refused without pro): the
+            # artists on deezer's playlists for the tag
+            try:
+                from core import lastfm_fallback
+                cands, _src = lastfm_fallback.tag_top_artists(vibe, limit=40, lastfm=None)
+                for cand in cands:
+                    ca = str(cand.get("name") or "")
+                    if _fresh(ca):
+                        return jsonify({"query": ca, "why": "%s" % vibe})
+            except Exception:   # noqa: BLE001
+                logger.debug("chat radio: free tag lookup failed", exc_info=True)
             # Unknown tag (or no Last.fm): stay in the same lane by searching
             # for more of the same KIND of thing rather than the same video.
             return jsonify({"query": "%s mix" % vibe, "why": vibe})
@@ -1892,21 +2068,42 @@ def create_blueprint() -> Blueprint:
                 logger.debug("chat radio: similar-artists failed", exc_info=True)
 
         # 3) the local similar-artist graph the watchlist scan already built.
-        # It's keyed by the user's OWN artist ids, so join through artists to
-        # match on the playing artist's name (only hits when they own them).
+        # It only hits for artists the user owns, so the playing artist is
+        # looked up in the library by name — folded, because the seed is a
+        # YouTube title and its spelling is not the library's.
+        #
+        # `similar_artists.source_artist_id` is a PROVIDER id (whichever id the
+        # scan ran with — see `similar_artists_worker.pick_source_artist_id`),
+        # so the library's job here is to hand over the artist's provider ids.
+        # Spotify and MusicBrainz sit in their own columns, every other
+        # provider inside `external_ids`.
         if artist:
             conn = None
             try:
+                from core.library2.importer import normalize_name
+                from core.library2.provider_ids import parse_external_ids
+                from core.text.normalize import normalize_for_comparison
                 conn = _db()._get_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT sa.similar_artist_name FROM similar_artists sa "
-                    "JOIN artists a ON a.id = sa.source_artist_id "
-                    "WHERE LOWER(a.name) = LOWER(?) "
-                    "ORDER BY sa.similarity_rank LIMIT 30",
-                    (artist,),
-                )
-                for row in cur.fetchall():
+                source_ids = []
+                folded = normalize_for_comparison(artist)
+                for row in conn.execute(
+                    _RADIO_ARTIST_SQL,
+                    {"key": normalize_name(folded), "folded": folded},
+                ).fetchall():
+                    known = parse_external_ids(row["external_ids"])
+                    for value in (row["spotify_id"], known.get("itunes"),
+                                  known.get("deezer"), row["musicbrainz_id"]):
+                        text = str(value or "").strip()
+                        if text and text not in source_ids:
+                            source_ids.append(text)
+                marks = ",".join("?" for _ in source_ids)
+                rows = conn.execute(
+                    "SELECT similar_artist_name FROM similar_artists "
+                    f"WHERE source_artist_id IN ({marks}) "
+                    "ORDER BY similarity_rank LIMIT 30",
+                    source_ids,
+                ).fetchall() if source_ids else []
+                for row in rows:
                     ca = str(row[0] or "")
                     if _fresh(ca):
                         return jsonify({"query": ca, "why": "similar to %s" % artist})
@@ -1916,9 +2113,31 @@ def create_blueprint() -> Blueprint:
                 if conn:
                     conn.close()
 
+        # 4) free sources, for when last.fm is not set up or refused the key
+        # (pro only from 1 december 2026): deezer's artist radio for a track,
+        # then listenbrainz / deezer similar artists
+        if artist:
+            try:
+                from core import lastfm_fallback
+                if track:
+                    cands, _src = lastfm_fallback.similar_tracks(artist, track, limit=30, lastfm=None)
+                    for cand in cands:
+                        ca, ct = str(cand.get("artist") or ""), str(cand.get("name") or "")
+                        if _fresh(ca, ct):
+                            return jsonify({"query": ("%s %s" % (ca, ct)).strip(),
+                                            "why": "similar to %s" % (track or artist)})
+                cands, _src = lastfm_fallback.similar_artists(artist, limit=30, lastfm=None)
+                for cand in cands:
+                    ca = str(cand.get("name") or "")
+                    if _fresh(ca):
+                        return jsonify({"query": ca, "why": "similar to %s" % artist})
+            except Exception:   # noqa: BLE001
+                logger.debug("chat radio: free similar lookup failed", exc_info=True)
+
         return jsonify({"query": None, "why": "no similar data"})
 
     @bp.route("/api/chat/room/history", methods=["GET"])
+    @requires("chat.use")
     def chat_room_history():
         """Scrollback: a page of archived messages strictly OLDER than
         ``before`` (a timestamp), oldest-first within the page."""
@@ -1937,6 +2156,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"messages": msgs, "done": len(msgs) < limit})
 
     @bp.route("/api/chat/room/search", methods=["GET"])
+    @requires("chat.use")
     def chat_room_search():
         """Archive search: ?room=&q= → newest-first matches (message text or
         sender). Local archive only — Soulseek has no server-side history."""
@@ -1952,6 +2172,7 @@ def create_blueprint() -> Blueprint:
         return jsonify({"messages": db.search_chat_messages(room, qstr), "q": qstr})
 
     @bp.route("/api/chat/room/message", methods=["POST"])
+    @requires("chat.use")
     def chat_room_send():
         client = _client()
         if client is None:
@@ -2109,10 +2330,15 @@ def create_blueprint() -> Blueprint:
         return jsonify({"ok": True})
 
     @bp.route("/api/chat/conversations", methods=["GET"])
+    @requires("chat.use")
     def chat_conversations():
         client = _client()
         if client is None:
             return jsonify({"error": "Soulseek (slskd) is not configured"}), 503
+        # private messages are the shared account's: a member who may not act
+        # as it gets an empty list, not the admin's inbox
+        if not _can_use_shared_account():
+            return jsonify({"conversations": [], "can_send": False})
         try:
             convos = _run_async(client.get_conversations())
         except Exception as e:
@@ -2121,10 +2347,13 @@ def create_blueprint() -> Blueprint:
         return jsonify({"conversations": convos or [], "can_send": _can_send()})
 
     @bp.route("/api/chat/conversations/<path:username>", methods=["GET"])
+    @requires("chat.use")
     def chat_conversation(username):
         client = _client()
         if client is None:
             return jsonify({"error": "Soulseek (slskd) is not configured"}), 503
+        if not _can_use_shared_account():
+            return jsonify({"error": "Private messages on the shared Soulseek account are the admin's"}), 403
         try:
             convo = _run_async(client.get_conversation(username))
             # Reading a conversation marks it read (clears slskd's unread flag).
@@ -2147,6 +2376,7 @@ def create_blueprint() -> Blueprint:
                         "can_send": _can_send()})
 
     @bp.route("/api/chat/conversations/<path:username>", methods=["POST"])
+    @requires("chat.use")
     def chat_conversation_send(username):
         client = _client()
         if client is None:

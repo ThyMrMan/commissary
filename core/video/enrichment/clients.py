@@ -47,6 +47,43 @@ def tmdb_certification(kind, dr, region="US"):
     return None
 
 
+def parse_title_identity(kind, d):
+    """{name, original_name, year, aliases} out of a tmdb movie/tv detail
+    response fetched with alternative_titles appended. {} for an empty one."""
+    d = d if isinstance(d, dict) else {}
+    if not d.get("id"):
+        return {}
+    if kind == "movie":
+        name, original, date = d.get("title"), d.get("original_title"), d.get("release_date")
+        rows = (d.get("alternative_titles") or {}).get("titles")
+    else:
+        name, original, date = d.get("name"), d.get("original_name"), d.get("first_air_date")
+        rows = (d.get("alternative_titles") or {}).get("results")
+    seen, aliases = set(), []
+    for a in (rows or []):
+        t = str((a or {}).get("title") or "").strip()
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            aliases.append(t)
+    year = str(date or "")[:4]
+    out = {"name": str(name or "").strip() or None,
+           "original_name": str(original or "").strip() or None,
+           "year": int(year) if year.isdigit() else None,
+           "aliases": aliases[:30]}
+    # genres and keywords, for the library rules (#2029): only when tmdb sent
+    # them, so a response without them reads exactly as before
+    genres = [str(g.get("name")).strip() for g in (d.get("genres") or [])
+              if isinstance(g, dict) and g.get("name")]
+    kw = d.get("keywords") if isinstance(d.get("keywords"), dict) else {}
+    keywords = [str(k.get("name")).strip() for k in (kw.get("keywords") or kw.get("results") or [])
+                if isinstance(k, dict) and k.get("name")]
+    if genres:
+        out["genres"] = genres
+    if keywords:
+        out["keywords"] = keywords[:60]
+    return out
+
+
 class TMDBClient:
     BASE = "https://api.themoviedb.org/3"
     IMG = "https://image.tmdb.org/t/p/original"
@@ -506,6 +543,31 @@ class TMDBClient:
         out.sort(key=lambda x: x["date"] or "zzzz")
         return out
 
+    def title_identity(self, kind, tmdb_id):
+        """who a movie or show is, for judging releases: TMDB's own (english)
+        name, its original-language name, its year and its alternative titles,
+        in one call. {} on any error / no key.
+
+        the alias list alone missed the names that matter most. a library
+        whose server is in french stores "L'amour sous couverture", and TMDB's
+        alternative titles for that show carry neither that nor "Love in
+        Disguise", so a release named in english was never searched for and
+        was refused as a wrong title (#2021)."""
+        if not self.api_key or tmdb_id is None:
+            return {}
+        import requests
+        path = "/movie/" if kind == "movie" else "/tv/"
+        try:
+            r = requests.get(self.BASE + path + str(int(tmdb_id)),
+                             params={"api_key": self.api_key,
+                                     "append_to_response": "alternative_titles,keywords"}, timeout=12)
+            r.raise_for_status()
+            d = r.json() or {}
+        except Exception:
+            logger.debug("title identity fetch failed for %s %s", kind, tmdb_id, exc_info=True)
+            return {}
+        return parse_title_identity(kind, d)
+
     def alternative_titles(self, kind, tmdb_id):
         """AKA / alternative-release titles for a movie or show — the alias set the
         downloader matches releases against (Radarr/Sonarr parity: a release named
@@ -594,11 +656,15 @@ class TMDBClient:
             if mt == "movie":
                 out.append({"kind": "movie", "tmdb_id": tid, "title": it.get("title"),
                             "year": (it.get("release_date") or "")[:4] or None,
+                            "date": it.get("release_date") or None,
+                            "backdrop": (self.BACKDROP_W + it["backdrop_path"]) if it.get("backdrop_path") else None,
                             "overview": it.get("overview"), "rating": it.get("vote_average") or None,
                             "poster": (self.POSTER_W + it["poster_path"]) if it.get("poster_path") else None})
             elif mt == "tv":
                 out.append({"kind": "show", "tmdb_id": tid, "title": it.get("name"),
                             "year": (it.get("first_air_date") or "")[:4] or None,
+                            "date": it.get("first_air_date") or None,
+                            "backdrop": (self.BACKDROP_W + it["backdrop_path"]) if it.get("backdrop_path") else None,
                             "overview": it.get("overview"), "rating": it.get("vote_average") or None,
                             "poster": (self.POSTER_W + it["poster_path"]) if it.get("poster_path") else None})
             elif mt == "person":
@@ -713,6 +779,8 @@ class TMDBClient:
                 "kind": k, "tmdb_id": tid,
                 "title": it.get("title") if is_movie else it.get("name"),
                 "year": ((it.get("release_date") if is_movie else it.get("first_air_date")) or "")[:4] or None,
+                # the full date too, the seerr compat api hands it to request apps
+                "date": (it.get("release_date") if is_movie else it.get("first_air_date")) or None,
                 "rating": it.get("vote_average") or None,
                 "overview": it.get("overview") or None,
                 "original_language": it.get("original_language") or None,   # for the language filter
@@ -858,7 +926,7 @@ class TMDBClient:
         - ``certification`` (+ ``cert_country``) — e.g. 'PG-13', movies — family-friendly.
         - ``vote_count_min`` — override the default popularity floor (40).
         - ``release_window`` — 'last_30' | 'last_90' | 'last_365' — date-windowed "new"
-          rails (computed relative to today)."""
+          rails (computed relative to today). 'next_90' is the coming three months."""
         if not self.api_key:
             return []
         import requests
@@ -905,12 +973,17 @@ class TMDBClient:
             except (TypeError, ValueError):
                 pass
         if release_window:
-            days = {"last_30": 30, "last_90": 90, "last_365": 365}.get(release_window)
+            days = {"last_30": 30, "last_90": 90, "last_365": 365, "next_90": -90}.get(release_window)
             if days:
                 import datetime as _dt
                 today = _dt.date.today()
-                start = (today - _dt.timedelta(days=days)).isoformat()
-                end = today.isoformat()
+                # a negative window looks ahead: tomorrow up to that many days out
+                if days < 0:
+                    start = (today + _dt.timedelta(days=1)).isoformat()
+                    end = (today + _dt.timedelta(days=-days)).isoformat()
+                else:
+                    start = (today - _dt.timedelta(days=days)).isoformat()
+                    end = today.isoformat()
                 if is_movie:
                     params["primary_release_date.gte"], params["primary_release_date.lte"] = start, end
                 else:

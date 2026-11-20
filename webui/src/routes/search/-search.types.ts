@@ -146,6 +146,26 @@ export interface SearchArtist {
   images?: { url?: string }[];
   source?: string;
   followers?: number;
+  /**
+   * `lib2_artists.id`. The "In Your Library" bucket is Library v2's catalogue
+   * (`_build_db_artists`, core/search/orchestrator.py), so every entry of that
+   * bucket carries one and its `id` is the same value. Absent on provider
+   * results, which have no library row.
+   */
+  library_v2_id?: number | null;
+  /**
+   * iss29-B04c: this row's `id` is a LIB2 id and its artwork is already served
+   * by Library V2. The generic
+   * `/api/artist/<id>/image` resolver forwards whatever id it gets to the
+   * providers, so asking it about a lib2 id returned whichever Deezer/iTunes
+   * artist owned that number. Cards must not lazily resolve these.
+   */
+  image_is_native?: boolean;
+  /**
+   * "All sources" only: every source that returned this result, the one whose
+   * copy this is first. Absent on a single source's results.
+   */
+  sources?: string[];
 }
 
 export interface SearchAlbum {
@@ -168,6 +188,11 @@ export interface SearchAlbum {
    *     the only way to fetch that exact release instead of re-searching.
    */
   external_urls?: Record<string, string | undefined>;
+  /**
+   * "All sources" only: every source that returned this result, the one whose
+   * copy this is first. Absent on a single source's results.
+   */
+  sources?: string[];
 }
 
 export interface SearchTrack {
@@ -193,6 +218,11 @@ export interface SearchTrack {
   popularity?: number;
   preview_url?: string | null;
   external_urls?: Record<string, string | undefined> | null;
+  /**
+   * "All sources" only: every source that returned this result, the one whose
+   * copy this is first. Absent on a single source's results.
+   */
+  sources?: string[];
 }
 
 export interface SearchLabel {

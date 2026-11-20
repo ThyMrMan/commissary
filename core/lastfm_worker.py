@@ -5,6 +5,7 @@ import time
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
+from core.text.title_match import numbers_conflict
 from utils.logging_config import get_logger
 from database.music_database import MusicDatabase
 from core.lastfm_client import LastFMClient
@@ -51,6 +52,13 @@ class LastFMWorker:
 
         # Name matching threshold
         self.name_similarity_threshold = 0.80
+
+        # free sources for artists last.fm has nothing for (or no key at all).
+        # the sweep walks artist ids and rests an hour after a full pass
+        self._fallback = None
+        self._fallback_cursor = 0
+        self._fallback_rest_until = 0.0
+        self.fallback_rest_seconds = 3600
 
         logger.info("Last.fm background worker initialized")
 
@@ -132,16 +140,25 @@ class LastFMWorker:
                     continue
 
                 # Check if API key is configured
-                if not self.client.api_key:
+                if not self._lastfm_usable():
                     self._init_client()
-                    if not self.client.api_key:
-                        interruptible_sleep(self._stop_event, 30)
+                    if not self._lastfm_usable():
+                        # no last.fm: the free sources still fill bios, tags
+                        # and numbers
+                        self.current_item = None
+                        if self._fallback_step():
+                            interruptible_sleep(self._stop_event, 1)
+                        else:
+                            interruptible_sleep(self._stop_event, 30)
                         continue
 
                 self.current_item = None
                 item = self._get_next_item()
 
                 if not item:
+                    if self._fallback_step():
+                        interruptible_sleep(self._stop_event, 1)
+                        continue
                     logger.debug("No pending items, sleeping...")
                     interruptible_sleep(self._stop_event, 10)
                     continue
@@ -170,104 +187,81 @@ class LastFMWorker:
 
         logger.info("Last.fm worker thread finished")
 
-    def _get_next_item(self) -> Optional[Dict[str, Any]]:
-        """Get next item to process from priority queue (artists -> albums -> tracks)"""
+    def _lastfm_usable(self) -> bool:
+        """a key is set and last.fm has not turned it away. ``key_rejected``
+        is read softly: the client may not track it."""
+        client = self.client
+        if not client or not getattr(client, 'api_key', None):
+            return False
+        return not bool(getattr(client, 'key_rejected', False))
+
+    def _fallback_fetcher(self):
+        if self._fallback is None:
+            from core.enrichment.lastfm_fallback import ArtistAboutFallback
+            self._fallback = ArtistAboutFallback()
+        return self._fallback
+
+    def _fill_fallbacks(self, artist_id: int) -> bool:
+        """the free sources for one artist, when last.fm left a field empty
+        and they were not asked in the last 30 days. never touches the
+        last.fm data itself."""
+        try:
+            from core.enrichment.lastfm_fallback import fill_artist
+            return fill_artist(self.db._get_connection, artist_id, self._fallback_fetcher())
+        except Exception as e:
+            logger.debug(f"fallback fill failed for artist #{artist_id}: {e}")
+            return False
+
+    def _fallback_step(self) -> bool:
+        """one artist of the fallback sweep. False when there was nothing to
+        do (resting after a full pass), so the caller sleeps."""
+        if time.time() < self._fallback_rest_until:
+            return False
         conn = None
         try:
+            from core.enrichment.lastfm_fallback import next_due_artist
+
             conn = self.db._get_connection()
-            cursor = conn.cursor()
+            row, cursor = next_due_artist(conn, self._fallback_cursor)
+        except Exception as e:
+            logger.debug(f"fallback sweep failed: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+        if cursor is None:
+            self._fallback_cursor = 0
+            self._fallback_rest_until = time.time() + self.fallback_rest_seconds
+            return False
+        self._fallback_cursor = cursor
+        if row is None:
+            return True
+        self.current_item = {'type': 'artist', 'id': row['id'], 'name': row['name'],
+                             'fallback': True}
+        try:
+            self._fill_fallbacks(int(row['id']))
+        finally:
+            self.current_item = None
+        return True
 
-            # Pinned-group override (Manage Enrichment Workers): process one
-            # entity type first, then fall through to the normal chain. Unset or
-            # exhausted ⇒ default artist→album→track order, unchanged.
-            from core.worker_utils import read_enrichment_priority, priority_pending_item
-            _prio = read_enrichment_priority('lastfm')
-            if _prio:
-                _pi = priority_pending_item(cursor, 'lastfm', _prio)
-                if _pi:
-                    return _pi
+    def _get_next_item(self) -> Optional[Dict[str, Any]]:
+        """Get next item to process from the Library-v2 catalogue.
 
-            # Priority 1: Unattempted artists
-            cursor.execute("""
-                SELECT id, name
-                FROM artists
-                WHERE lastfm_match_status IS NULL AND id IS NOT NULL
-                ORDER BY id ASC
-                LIMIT 1
-            """)
-            row = cursor.fetchone()
-            if row:
-                return {'type': 'artist', 'id': row[0], 'name': row[1]}
+        Priority, retry window and the pinned-group override all live in
+        ``core.library2.worker_queue`` — the same rules every enrichment worker
+        uses, so they cannot drift apart per worker (docs §32.3.1 stage 2).
+        """
+        conn = None
+        try:
+            from core.library2.worker_queue import next_pending
+            from core.worker_utils import read_enrichment_priority
 
-            # Priority 2: Unattempted albums
-            cursor.execute("""
-                SELECT a.id, a.title, ar.name AS artist_name
-                FROM albums a
-                JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.lastfm_match_status IS NULL AND a.id IS NOT NULL
-                ORDER BY a.id ASC
-                LIMIT 1
-            """)
-            row = cursor.fetchone()
-            if row:
-                return {'type': 'album', 'id': row[0], 'name': row[1], 'artist': row[2]}
-
-            # Priority 3: Unattempted tracks
-            cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
-                FROM tracks t
-                JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.lastfm_match_status IS NULL AND t.id IS NOT NULL
-                ORDER BY t.id ASC
-                LIMIT 1
-            """)
-            row = cursor.fetchone()
-            if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
-
-            # Priority 4: Retry 'not_found' artists only (errors don't auto-retry —
-            # they require a user-triggered full refresh to prevent infinite retry loops)
-            not_found_cutoff = datetime.now() - timedelta(days=self.retry_days)
-            cursor.execute("""
-                SELECT id, name
-                FROM artists
-                WHERE lastfm_match_status IN ('not_found', 'error') AND lastfm_last_attempted < ?
-                ORDER BY lastfm_last_attempted ASC
-                LIMIT 1
-            """, (not_found_cutoff,))
-            row = cursor.fetchone()
-            if row:
-                logger.info(f"Retrying artist '{row[1]}' (last attempted before cutoff)")
-                return {'type': 'artist', 'id': row[0], 'name': row[1]}
-
-            # Priority 5: Retry not_found albums
-            cursor.execute("""
-                SELECT a.id, a.title, ar.name AS artist_name
-                FROM albums a
-                JOIN artists ar ON a.artist_id = ar.id
-                WHERE a.lastfm_match_status IN ('not_found', 'error') AND a.lastfm_last_attempted < ?
-                ORDER BY a.lastfm_last_attempted ASC
-                LIMIT 1
-            """, (not_found_cutoff,))
-            row = cursor.fetchone()
-            if row:
-                return {'type': 'album', 'id': row[0], 'name': row[1], 'artist': row[2]}
-
-            # Priority 6: Retry not_found tracks
-            cursor.execute("""
-                SELECT t.id, t.title, ar.name AS artist_name
-                FROM tracks t
-                JOIN artists ar ON t.artist_id = ar.id
-                WHERE t.lastfm_match_status IN ('not_found', 'error') AND t.lastfm_last_attempted < ?
-                ORDER BY t.lastfm_last_attempted ASC
-                LIMIT 1
-            """, (not_found_cutoff,))
-            row = cursor.fetchone()
-            if row:
-                return {'type': 'track', 'id': row[0], 'name': row[1], 'artist': row[2]}
-
-            return None
-
+            conn = self.db._get_connection()
+            return next_pending(
+                conn, 'lastfm',
+                retry_after_days=self.retry_days,
+                pinned=read_enrichment_priority('lastfm') or None,
+            )
         except Exception as e:
             logger.error(f"Error getting next item: {e}")
             return None
@@ -286,6 +280,10 @@ class LastFMWorker:
 
     def _name_matches(self, query_name: str, result_name: str) -> bool:
         """Check if result name matches our query with fuzzy matching"""
+        # names that differ by a number are other releases: 'Group Therapy 702'
+        # scored 0.94 of 701 and its ids landed on 701's rows (#2134)
+        if numbers_conflict(query_name or '', result_name or ''):
+            return False
         norm_query = self._normalize_name(query_name)
         norm_result = self._normalize_name(result_name)
         if not norm_query or not norm_result:
@@ -324,23 +322,26 @@ class LastFMWorker:
                 logger.error(f"Error updating item status: {e2}")
 
     def _get_existing_id(self, entity_type: str, entity_id: int) -> Optional[str]:
-        """Check if an entity already has a lastfm_url (e.g. from manual match).
+        """The Last.fm URL already stored for this entity, if any.
 
-        The Last.fm schema uses `lastfm_url` (not `lastfm_id`) on artists, albums,
-        and tracks. This helper always returned None before because it queried a
-        non-existent column and silently caught the exception.
+        Last.fm identifies by URL rather than a numeric id, so that is what lands
+        in ``external_ids['lastfm']`` — set by a manual match or by an earlier run.
         """
-        table_map = {'artist': 'artists', 'album': 'albums', 'track': 'tracks'}
-        table = table_map.get(entity_type)
-        if not table:
-            return None
         conn = None
         try:
+            from core.library2.provider_ids import parse_external_ids
+
+            table = {'artist': 'lib2_artists', 'album': 'lib2_albums',
+                     'track': 'lib2_tracks'}.get(entity_type)
+            if not table:
+                return None
             conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(f"SELECT lastfm_url FROM {table} WHERE id = ?", (entity_id,))
-            row = cursor.fetchone()
-            return row[0] if row and row[0] else None
+            row = conn.execute(
+                f"SELECT external_ids FROM {table} WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if not row:
+                return None
+            return parse_external_ids(row[0]).get('lastfm') or None
         except Exception:
             return None
         finally:
@@ -373,6 +374,10 @@ class LastFMWorker:
             self._mark_status('artist', artist_id, 'not_found')
             self.stats['not_found'] += 1
             logger.debug(f"No match for artist '{artist_name}'")
+
+        # whatever last.fm left empty (all of it on a miss) the free sources
+        # fill now, not on the next sweep
+        self._fill_fallbacks(artist_id)
 
     def _process_album(self, album_id: int, album_name: str, artist_name: str):
         """Process an album: get full info from Last.fm"""
@@ -427,7 +432,6 @@ class LastFMWorker:
         conn = None
         try:
             conn = self.db._get_connection()
-            cursor = conn.cursor()
 
             # Extract stats
             stats = data.get('stats', {})
@@ -443,7 +447,6 @@ class LastFMWorker:
 
             # Extract tags
             tags = self.client.extract_tags(data.get('tags'))
-            tags_json = json.dumps(tags) if tags else None
 
             # Extract similar artists (Last.fm returns a single dict instead of list when only 1 result)
             similar_data = data.get('similar')
@@ -462,35 +465,34 @@ class LastFMWorker:
             # Last.fm URL (serves as unique identifier)
             lastfm_url = data.get('url')
 
-            # Update core lastfm fields
-            cursor.execute("""
-                UPDATE artists SET
-                    lastfm_match_status = 'matched',
-                    lastfm_last_attempted = CURRENT_TIMESTAMP,
-                    lastfm_listeners = ?,
-                    lastfm_playcount = ?,
-                    lastfm_tags = ?,
-                    lastfm_similar = ?,
-                    lastfm_bio = ?,
-                    lastfm_url = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (listeners, playcount, tags_json, similar_json, summary or None, lastfm_url, artist_id))
+            # Library v2 is the catalogue (docs §32.3.1 stage 2). The payload
+            # shape is the mirror's own declaration, so a natively written row is
+            # indistinguishable from a mirrored one and the divergence report
+            # stays quiet about our own output.
+            from core.library2.provider_attempts import record_attempt
+            from core.library2.provider_writes import write_provider_enrichment
 
-            # Backfill thumb_url if missing
+            backfill = {}
             if thumb_url:
-                cursor.execute("""
-                    UPDATE artists SET thumb_url = ?
-                    WHERE id = ? AND (thumb_url IS NULL OR thumb_url = '')
-                """, (thumb_url, artist_id))
-
-            # Backfill style from tags if missing
+                backfill['image_url'] = thumb_url
             if tags:
-                cursor.execute("""
-                    UPDATE artists SET style = ?
-                    WHERE id = ? AND (style IS NULL OR style = '')
-                """, (', '.join(tags[:5]), artist_id))
-
+                # Style is a backfill, never an overwrite — same as before.
+                backfill['style'] = ', '.join(tags[:5])
+            write_provider_enrichment(
+                conn, entity_type='artist', entity_id=artist_id, service='lastfm',
+                payload={
+                    'listeners': listeners,
+                    'playcount': playcount,
+                    'tags': tags or None,
+                    'similar': json.loads(similar_json) if similar_json else None,
+                    'bio': summary or None,
+                    'url': lastfm_url,
+                },
+                provider_id=lastfm_url,
+                backfill=backfill or None,
+            )
+            record_attempt(conn, entity_type='artist', entity_id=artist_id,
+                           service='lastfm', status='matched')
             conn.commit()
 
         except Exception as e:
@@ -505,14 +507,12 @@ class LastFMWorker:
         conn = None
         try:
             conn = self.db._get_connection()
-            cursor = conn.cursor()
 
             listeners = int(data.get('listeners', 0)) if data.get('listeners') else None
             playcount = int(data.get('playcount', 0)) if data.get('playcount') else None
 
             # Extract tags
             tags = self.client.extract_tags(data.get('tags'))
-            tags_json = json.dumps(tags) if tags else None
 
             # Extract wiki summary
             wiki = data.get('wiki', {})
@@ -526,36 +526,31 @@ class LastFMWorker:
             # Last.fm URL
             lastfm_url = data.get('url')
 
-            cursor.execute("""
-                UPDATE albums SET
-                    lastfm_match_status = 'matched',
-                    lastfm_last_attempted = CURRENT_TIMESTAMP,
-                    lastfm_listeners = ?,
-                    lastfm_playcount = ?,
-                    lastfm_tags = ?,
-                    lastfm_wiki = ?,
-                    lastfm_url = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (listeners, playcount, tags_json, summary or None, lastfm_url, album_id))
+            from core.library2.provider_attempts import record_attempt
+            from core.library2.provider_writes import write_provider_enrichment
 
-            # Backfill thumb_url
+            backfill = {}
             if thumb_url:
-                cursor.execute("""
-                    UPDATE albums SET thumb_url = ?
-                    WHERE id = ? AND (thumb_url IS NULL OR thumb_url = '')
-                """, (thumb_url, album_id))
-
-            # Backfill genres from tags
+                backfill['image_url'] = thumb_url
             if tags:
                 from core.genre_filter import filter_genres
                 filtered_tags = filter_genres(tags[:10], config_manager)
                 if filtered_tags:
-                    cursor.execute("""
-                        UPDATE albums SET genres = ?
-                        WHERE id = ? AND (genres IS NULL OR genres = '' OR genres = '[]')
-                    """, (json.dumps(filtered_tags), album_id))
-
+                    backfill['genres'] = json.dumps(filtered_tags)
+            write_provider_enrichment(
+                conn, entity_type='album', entity_id=album_id, service='lastfm',
+                payload={
+                    'listeners': listeners,
+                    'playcount': playcount,
+                    'tags': tags or None,
+                    'wiki': summary or None,
+                    'url': lastfm_url,
+                },
+                provider_id=lastfm_url,
+                backfill=backfill or None,
+            )
+            record_attempt(conn, entity_type='album', entity_id=album_id,
+                           service='lastfm', status='matched')
             conn.commit()
 
         except Exception as e:
@@ -570,7 +565,6 @@ class LastFMWorker:
         conn = None
         try:
             conn = self.db._get_connection()
-            cursor = conn.cursor()
 
             listeners = int(data.get('listeners', 0)) if data.get('listeners') else None
             playcount = int(data.get('playcount', 0)) if data.get('playcount') else None
@@ -578,23 +572,25 @@ class LastFMWorker:
             # Extract tags
             tags_data = data.get('toptags', {})
             tags = self.client.extract_tags(tags_data)
-            tags_json = json.dumps(tags) if tags else None
 
             # Last.fm URL
             lastfm_url = data.get('url')
 
-            cursor.execute("""
-                UPDATE tracks SET
-                    lastfm_match_status = 'matched',
-                    lastfm_last_attempted = CURRENT_TIMESTAMP,
-                    lastfm_listeners = ?,
-                    lastfm_playcount = ?,
-                    lastfm_tags = ?,
-                    lastfm_url = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (listeners, playcount, tags_json, lastfm_url, track_id))
+            from core.library2.provider_attempts import record_attempt
+            from core.library2.provider_writes import write_provider_enrichment
 
+            write_provider_enrichment(
+                conn, entity_type='track', entity_id=track_id, service='lastfm',
+                payload={
+                    'listeners': listeners,
+                    'playcount': playcount,
+                    'tags': tags or None,
+                    'url': lastfm_url,
+                },
+                provider_id=lastfm_url,
+            )
+            record_attempt(conn, entity_type='track', entity_id=track_id,
+                           service='lastfm', status='matched')
             conn.commit()
 
         except Exception as e:
@@ -605,24 +601,20 @@ class LastFMWorker:
                 conn.close()
 
     def _mark_status(self, entity_type: str, entity_id: int, status: str):
-        """Mark an entity with a match status"""
-        table_map = {'artist': 'artists', 'album': 'albums', 'track': 'tracks'}
-        table = table_map.get(entity_type)
-        if not table:
-            logger.error(f"Unknown entity type: {entity_type}")
-            return
+        """Record the outcome of an attempt in the provider ledger.
 
+        Replaces the legacy `<service>_match_status`/`_last_attempted` column
+        pair. Both `not_found` and `error` become due again after the retry
+        window; a source-wide outage is handled by the worker's own backoff
+        before an attempt is ever recorded, so it cannot become a tight loop.
+        """
         conn = None
         try:
+            from core.library2.provider_attempts import record_attempt
+
             conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute(f"""
-                UPDATE {table} SET
-                    lastfm_match_status = ?,
-                    lastfm_last_attempted = CURRENT_TIMESTAMP,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (status, entity_id))
+            record_attempt(conn, entity_type=entity_type, entity_id=entity_id,
+                           service='lastfm', status=status)
             conn.commit()
         except Exception as e:
             logger.error(f"Error marking {entity_type} #{entity_id} status: {e}")
@@ -634,17 +626,10 @@ class LastFMWorker:
         """Count how many items still need processing"""
         conn = None
         try:
+            from core.library2.worker_queue import pending_count
+
             conn = self.db._get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT
-                    (SELECT COUNT(*) FROM artists WHERE lastfm_match_status IS NULL AND id IS NOT NULL) +
-                    (SELECT COUNT(*) FROM albums WHERE lastfm_match_status IS NULL AND id IS NOT NULL) +
-                    (SELECT COUNT(*) FROM tracks WHERE lastfm_match_status IS NULL AND id IS NOT NULL)
-                AS pending
-            """)
-            row = cursor.fetchone()
-            return row[0] if row else 0
+            return pending_count(conn, 'lastfm', retry_after_days=self.retry_days)
         except Exception as e:
             logger.error(f"Error counting pending items: {e}")
             return 0
@@ -656,28 +641,10 @@ class LastFMWorker:
         """Get progress breakdown by entity type"""
         conn = None
         try:
+            from core.library2.worker_queue import progress_breakdown
+
             conn = self.db._get_connection()
-            cursor = conn.cursor()
-            progress = {}
-
-            for entity, table in [('artists', 'artists'), ('albums', 'albums'), ('tracks', 'tracks')]:
-                cursor.execute(f"""
-                    SELECT
-                        COUNT(*) AS total,
-                        SUM(CASE WHEN lastfm_match_status IS NOT NULL THEN 1 ELSE 0 END) AS processed
-                    FROM {table}
-                """)
-                row = cursor.fetchone()
-                if row:
-                    total, processed = row[0], row[1] or 0
-                    progress[entity] = {
-                        'matched': processed,
-                        'total': total,
-                        'percent': int((processed / total * 100) if total > 0 else 0)
-                    }
-
-            return progress
-
+            return progress_breakdown(conn, 'lastfm')
         except Exception as e:
             logger.error(f"Error getting progress breakdown: {e}")
             return {}

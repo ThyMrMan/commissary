@@ -373,3 +373,146 @@ def test_jukebox_display_honesty_fallback():
     # ...and cleared on a genuine end + on tune-out
     ended = js[js.index("function _jbxOnPlayerState"):js.index("function _jbxOnPlayerState") + 400]
     assert "state.jukebox.playingNow = null" in ended
+
+
+# ── the radio's local rung: the similar-artist graph ────────────────────────
+
+@pytest.fixture()
+def radio_app(tmp_path, monkeypatch):
+    """The radio with its three remote rungs muted, so a request lands on the
+    local graph — the only rung that reads the library."""
+    from database.music_database import MusicDatabase
+    db = MusicDatabase(str(tmp_path / "radio.db"))
+
+    class _NoLastFM:
+        def __init__(self, *a, **k):
+            pass
+
+        def get_similar_tracks(self, *a, **k):
+            return []
+
+        def get_similar_artists(self, *a, **k):
+            return []
+
+        def get_tag_top_artists(self, *a, **k):
+            return []
+
+    import core.lastfm_client as lastfm_module
+    monkeypatch.setattr(lastfm_module, "LastFMClient", _NoLastFM)
+    monkeypatch.setattr(chat_api, "_db", lambda: db)
+    chat_api.configure(client_getter=lambda: None, run_async=lambda v: v,
+                       config_get=lambda k, d=None: d)
+    app = Flask(__name__)
+
+    @app.before_request
+    def _fake_profile():
+        g.is_admin = True
+
+    app.register_blueprint(chat_api.create_blueprint())
+    yield app.test_client(), db
+    chat_api.configure(client_getter=lambda: None, run_async=lambda v: v,
+                       config_get=lambda k, d=None: d)
+
+
+def _seed_graph(db, *, name, spotify_id=None, external_ids='{}', keyed_by,
+                similar='Portishead'):
+    from core.library2.importer import normalize_name
+    with db._get_connection() as conn:
+        conn.execute(
+            "INSERT INTO lib2_artists(name, name_key, spotify_id, external_ids)"
+            " VALUES(?,?,?,?)",
+            (name, normalize_name(name), spotify_id, external_ids))
+        conn.execute(
+            "INSERT INTO similar_artists(source_artist_id, similar_artist_name,"
+            "                            similarity_rank) VALUES(?,?,1)",
+            (keyed_by, similar))
+        conn.commit()
+
+
+def test_radio_reaches_the_local_graph_through_a_provider_id(radio_app):
+    """The graph is keyed by the artist's PROVIDER id (the scan stores whichever
+    id it scanned with), never by a catalogue row id — so the library lookup has
+    to hand over the artist's provider ids, not its own primary key."""
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Bjork - Hyperballad"}).get_json()
+
+    assert body == {"query": "Portishead", "why": "similar to Bjork"}
+
+
+def test_radio_local_graph_reads_a_long_tail_provider_id(radio_app):
+    """Only Spotify and MusicBrainz have promoted columns in v2; every other
+    provider lives in ``external_ids``, and the scan may well have keyed the
+    graph by one of those."""
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', external_ids='{"deezer": "DZ-77"}',
+                keyed_by='DZ-77')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Bjork - Hyperballad"}).get_json()
+
+    assert body["query"] == "Portishead"
+
+
+def test_radio_local_graph_matches_the_artist_across_accents(radio_app):
+    """The seed is a YouTube title, so its spelling is not the library's:
+    'Bjork - Hyperballad' must still find the stored 'Björk'."""
+    http, db = radio_app
+    _seed_graph(db, name='Björk', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "BJORK - Hyperballad"}).get_json()
+
+    assert body["query"] == "Portishead"
+
+
+def test_radio_says_so_when_the_library_does_not_know_the_artist(radio_app):
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Someone Else - A Song"}).get_json()
+
+    assert body == {"query": None, "why": "no similar data"}
+
+
+def test_radio_local_graph_matches_an_accented_seed_to_a_plain_name(radio_app):
+    """the other direction: the library spells it plainly, the title does not"""
+    http, db = radio_app
+    _seed_graph(db, name='Bjork', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Björk - Hyperballad"}).get_json()
+
+    assert body["query"] == "Portishead"
+
+
+def test_radio_artist_lookup_never_scans_the_artist_table(radio_app, monkeypatch):
+    """review 5 W3-TB-4: unidecode_lower(name) = ? ran python over every
+    artist row, 1 s per radio pick on a 30k-artist library. the lookup reads
+    the name_key index; a SCAN of lib2_artists is the regression"""
+    http, db = radio_app
+    _seed_graph(db, name='Björk', spotify_id='SP-BJORK', keyed_by='SP-BJORK')
+    seen = []
+    real = db._get_connection
+
+    def traced():
+        conn = real()
+        conn.set_trace_callback(seen.append)
+        return conn
+
+    monkeypatch.setattr(db, "_get_connection", traced)
+    body = http.post("/api/chat/jukebox/radio",
+                     json={"title": "Bjork - Hyperballad"}).get_json()
+    assert body["query"] == "Portishead"
+
+    lookups = [sql for sql in seen if "FROM lib2_artists" in sql]
+    assert lookups
+    with real() as conn:
+        for sql in lookups:
+            plan = [row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql)]
+            scans = [step for step in plan
+                     if step.startswith("SCAN lib2_artists") and "COVERING INDEX" not in step]
+            assert scans == [], plan

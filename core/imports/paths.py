@@ -16,8 +16,9 @@ from utils.logging_config import get_logger
 # imported helper because the path builder still needs it.
 from core.imports.album_naming import resolve_album_group
 from core.imports.album_types import album_types_config, format_album_types
-from core.imports.collab_artist import first_listed_artist, listed_primary_of
+from core.imports.collab_artist import collab_primary, library_has_artist, library_has_identified_artist
 from core.imports.compilation import is_various_artists_credit, is_various_artists_name
+from core.imports.library_names import library_names, swap_credit
 from core.library.case_folding import resolve_existing_case_dir
 from core.imports.context import (
     extract_artist_name,
@@ -235,6 +236,46 @@ def import_profile_id(context) -> Optional[int]:
     return None
 
 
+def import_owner_id(context) -> Optional[int]:
+    """Which library this download belongs to, as decided ONCE at the start.
+
+    The selected directory lives in the Flask session, and by the time a
+    download is organised, post-processed and linked there is no request left
+    to read it from -- those stages run on worker threads. So the answer is
+    stamped on the batch when the download is created and every later stage
+    reads it back here, which is also what keeps the five transfer-root call
+    sites from disagreeing about where the file went.
+
+    The KEY is the decision: ``library_owner_id: None`` is "the shared library,
+    on purpose" and must not fall through to the download's profile. Falls
+    back to resolving it live, for a caller that predates the stamp.
+    """
+    from core.library_scope import BATCH_OWNER_KEY, batch_library_owner, owner_for_new_file
+
+    def _owner(value):
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    if isinstance(context, dict):
+        if BATCH_OWNER_KEY in context:
+            return _owner(context[BATCH_OWNER_KEY])
+        track_info = context.get("track_info")
+        if isinstance(track_info, dict) and BATCH_OWNER_KEY in track_info:
+            return _owner(track_info[BATCH_OWNER_KEY])
+        batch_id = context.get("batch_id")
+        if batch_id:
+            try:
+                from core.runtime_state import download_batches
+                batch = download_batches.get(batch_id)
+                if isinstance(batch, dict) and BATCH_OWNER_KEY in batch:
+                    return batch_library_owner(batch)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("batch %s has no library owner stamp: %s", batch_id, exc)
+    return owner_for_new_file(import_profile_id(context))
+
+
 _notified_own_lib_fallback: set[int] = set()
 
 
@@ -300,13 +341,27 @@ def shared_transfer_root() -> str:
 
 
 def transfer_root_for_context(context) -> str:
-    """where this download/import's files go: the audiobook folder for a routed
-    artist, else the profile's own folder when it has one, else the configured
-    transfer folder."""
+    """Where this download's files go.
+
+    The SELECTED directory wins over the profile that started the download: an
+    admin who switched the library page to someone else's directory and grabbed
+    a track there meant that directory, and the file has to land where it was
+    put (E-04). Only with nothing selected does the download's own profile
+    decide, and with neither it is the configured transfer folder -- which is
+    every download on an install without own directories.
+    """
     from core.audiobook_routing import routed_root_for_context
-    return (routed_root_for_context(context)
-            or library_root_for_profile(import_profile_id(context))
-            or shared_transfer_root())
+    routed = routed_root_for_context(context)
+    if routed:
+        return routed
+    owner = import_owner_id(context)
+    if owner is None:
+        # a profile whose own library the media server cannot isolate lands in
+        # the shared folder -- and is told so, once (#1276)
+        from core.library_scope import own_library_supported
+        if not own_library_supported():
+            library_root_for_profile(import_profile_id(context))
+    return library_root_for_profile(owner) or shared_transfer_root()
 
 
 # ── reverse lookup: which profile owns a path (#1504) ─────────────────────────
@@ -557,12 +612,15 @@ _LOCKED_TYPE_DISPLAY = {
 }
 
 
-def get_album_type_display(raw_type, track_count, source: str = "", locked: bool = False) -> str:
+def get_album_type_display(raw_type, track_count, source: str = "", locked: bool = False,
+                           total_ms=None) -> str:
     """Return the display form of an album's type for the $albumtype template variable.
 
     ``locked``: the type is the section the release sat in on the artist
     page, which the user already saw. it's used as-is, no track-count
-    guessing, so the folder always matches the section."""
+    guessing, so the folder always matches the section.
+    ``total_ms``: the release's runtime when known. a type the source didn't
+    give goes by the store rule, so 5 tracks over 44 minutes is an album."""
     raw = (raw_type or "").strip().lower()
     if locked and raw in _LOCKED_TYPE_DISPLAY:
         return _LOCKED_TYPE_DISPLAY[raw]
@@ -596,15 +654,26 @@ def get_album_type_display(raw_type, track_count, source: str = "", locked: bool
     # default fallback at every upstream layer (wishlist payloads,
     # album_grouping, import context) — not a signal. Deezer's track-level
     # responses hardcode album_type='album', so trusting it files every
-    # Deezer single/EP under Album/. Verify against the track count when we
-    # have one; with no count, keep the "Album" default rather than guessing.
-    if tc <= 0:
-        return "Album"
-    if tc <= 3:
-        return "Single"
-    if tc <= 6:
-        return "EP"
-    return "Album"
+    # Deezer single/EP under Album/. Verify against the track count (and the
+    # runtime when known) when we have one; with no count, keep the "Album"
+    # default rather than guessing.
+    from core.metadata.release_type import release_type_from_shape
+    return _LOCKED_TYPE_DISPLAY[release_type_from_shape(tc, total_ms)]
+
+
+def _named_artist(*values) -> str:
+    """the first real artist name among ``values`` (names, artist dicts or
+    lists of them), '' when none names one."""
+    for value in values:
+        if isinstance(value, (list, tuple)):
+            name = _named_artist(*value)
+        elif isinstance(value, dict):
+            name = str(value.get("name") or "").strip()
+        else:
+            name = str(value or "").strip()
+        if name and name.casefold() not in ("unknown artist", "unknown"):
+            return name
+    return ""
 
 
 def _first_album_artist_id(album_ctx) -> str:
@@ -627,6 +696,40 @@ def explicit_flag(value) -> Optional[bool]:
             return True
         if word in ("false", "0", "no", "notexplicit", "cleaned", "clean"):
             return False
+    return None
+
+
+def album_explicit_flag(album=None, tracks=()) -> Optional[bool]:
+    """Is the album explicit? Its own word first, else what its tracks say.
+
+    An album is explicit when any of its tracks is, and clean only when every
+    track is known to be. Most sources flag tracks and say nothing about the
+    album, so without this an album folder's $explicit had nothing to read
+    and always came out empty (#2068). None when nothing is known."""
+    own = explicit_flag((album or {}).get("explicit")) if isinstance(album, dict) else None
+    if own is not None:
+        return own
+    flags = [explicit_flag(t.get("explicit")) for t in tracks or () if isinstance(t, dict)]
+    if any(flag is True for flag in flags):
+        return True
+    if flags and all(flag is False for flag in flags):
+        return False
+    return None
+
+
+def resolve_album_explicit(album_context, track_info) -> Optional[bool]:
+    """The album's flag for a path: the album context's own, else the one the
+    batch or import stamped on the track (``_album_explicit``, worked out over
+    the whole album). Never the track's own flag: an explicit album has clean
+    tracks too, and reading theirs would file one album in two folders."""
+    track_info = track_info if isinstance(track_info, dict) else {}
+    for value in ((album_context or {}).get("explicit") if isinstance(album_context, dict) else None,
+                  (track_info.get("_explicit_album_context") or {}).get("explicit")
+                  if isinstance(track_info.get("_explicit_album_context"), dict) else None,
+                  track_info.get("_album_explicit")):
+        flag = explicit_flag(value)
+        if flag is not None:
+            return flag
     return None
 
 
@@ -690,7 +793,8 @@ def apply_artist_facts(template: str, album_artist: str, track_artist: str, cont
     else:
         album = artist_facts(album_artist, mbid=context.get("_albumartist_mbid"),
                              source=context.get("_albumartist_source"),
-                             source_id=context.get("_albumartist_source_id"))
+                             source_id=context.get("_albumartist_source_id"),
+                             album=context.get("album"))
         same = str(track_artist or "").casefold() == str(album_artist or "").casefold()
         track = album if same else artist_facts(track_artist)
     result = template
@@ -716,21 +820,28 @@ def _replace_template_variables(template: str, context: dict) -> str:
     result = apply_content_rating(template, context.get("explicit"), context.get("album_explicit"))
     template = result
 
-    album_artist_value = clean_context.get("albumartist", clean_context.get("artist", "Unknown Artist"))
+    # an empty name is no name: it rendered an empty folder and put the album
+    # at the library root (#2023)
+    artist_value = clean_context.get("artist") or "Unknown Artist"
+    album_artist_value = clean_context.get("albumartist") or artist_value
     collab_mode = _get_config_manager().get("file_organization.collab_artist_mode", "first")
     if collab_mode == "first" and album_artist_value:
         artists_list = context.get("_artists_list")
         # match on the raw name: the list's names aren't sanitized either
         _raw_album_artist = str(context.get("albumartist") or context.get("artist") or album_artist_value)
-        primary = first_listed_artist(_raw_album_artist, artists_list)
-        if not primary:
-            # the album list can be the combined name itself while the track
-            # names the primary on its own
-            track_list = context.get("_track_artists_list")
-            if track_list:
-                primary = listed_primary_of(_raw_album_artist, track_list[0])
+        # the album list can be the combined name itself while the track
+        # names the primary on its own, or no list splits it at all (#2028)
+        primary = collab_primary(
+            _raw_album_artist, artists_list, context.get("_track_artists_list"),
+            known_names=context.get("_collab_known_names") or (),
+            library_has=library_has_artist, library_knows=library_has_identified_artist)
         if primary:
-            album_artist_value = primary
+            # the list's name is raw: unsanitized, a collab album went to
+            # "L.A.B." and a solo one to "L.A.B" (#1954), and a "/" in it
+            # made an extra folder. the library's name for it when it has
+            # another one (#2165)
+            album_artist_value = sanitize_filename(
+                swap_credit(primary, context.get("_library_names")))
         elif artists_list and len(artists_list) == 1:
             itunes_artist_id = context.get("_itunes_artist_id")
             if itunes_artist_id and ("," in album_artist_value or " & " in album_artist_value):
@@ -739,7 +850,8 @@ def _replace_template_variables(template: str, context: dict) -> str:
                     if resolved_client and hasattr(resolved_client, "resolve_primary_artist"):
                         resolved = resolved_client.resolve_primary_artist(itunes_artist_id)
                         if resolved and resolved != album_artist_value:
-                            album_artist_value = resolved
+                            album_artist_value = sanitize_filename(
+                                swap_credit(resolved, context.get("_library_names")))
                 except Exception as e:
                     logger.debug("resolve primary artist failed: %s", e)
 
@@ -785,7 +897,7 @@ def _replace_template_variables(template: str, context: dict) -> str:
         "atypes": clean_context.get("atypes", ""),
         "playlist": clean_context.get("playlist_name", ""),
         "artistletter": artist_letter_value,
-        "artist": clean_context.get("artist", "Unknown Artist"),
+        "artist": artist_value,
         "album": clean_context.get("album", "Unknown Album"),
         "title": clean_context.get("title", "Unknown Track"),
         "track": track_value,
@@ -794,6 +906,8 @@ def _replace_template_variables(template: str, context: dict) -> str:
         # (a track on disc 2+ still shows even if total_discs wasn't populated).
         "disc": (str(_disc_number) if (_total_discs > 1 or _disc_number > 1) else ""),
         "discnum": (str(_disc_number) if (_total_discs > 1 or _disc_number > 1) else ""),
+        "discalways": f"{_disc_number:02d}",
+        "discnumalways": str(_disc_number),
         "year": str(clean_context.get("year", "")),
         "quality": clean_context.get("quality", ""),
         "disambiguation": clean_context.get("disambiguation", ""),
@@ -809,6 +923,14 @@ def _replace_template_variables(template: str, context: dict) -> str:
     for var_name, val in bracket_map.items():
         result = result.replace("${" + var_name + "}", val)
 
+    # $discalways / $discnumalways: the disc number on EVERY album, one disc
+    # or five. $disc and $discnum drop out on a single-disc album (#981, so
+    # nobody gets "01-" stamped on every file), which is wrong for someone who
+    # wants every file named 01-06 the same way (#2044). both start with
+    # $disc, so they go first, here, before anything can eat that prefix.
+    result = result.replace("$discnumalways", str(_disc_number))
+    result = result.replace("$discalways", f"{_disc_number:02d}")
+
     result = result.replace("$disambiguation", clean_context.get("disambiguation", ""))
     result = result.replace("$label", clean_context.get("label", ""))
     # $albumartistletter must replace before $albumartist (longest-prefix-first)
@@ -821,7 +943,7 @@ def _replace_template_variables(template: str, context: dict) -> str:
     result = result.replace("$atypes", clean_context.get("atypes", ""))
     result = result.replace("$playlist", clean_context.get("playlist_name", ""))
     result = result.replace("$artistletter", artist_letter_value)
-    result = result.replace("$artist", clean_context.get("artist", "Unknown Artist"))
+    result = result.replace("$artist", artist_value)
     result = result.replace("$album", clean_context.get("album", "Unknown Album"))
     result = result.replace("$title", clean_context.get("title", "Unknown Track"))
     # $track_disambiguation must replace before $track: it starts with $track,
@@ -1059,6 +1181,45 @@ def get_file_path_from_template_raw(template: str, context: dict) -> tuple[str, 
     return "", sanitize_filename(full_path)
 
 
+_ARTIST_TOKEN_RE = re.compile(r"\$\{(?:album)?artist[a-z]*\}|\$(?:album)?artist[a-z]*")
+
+
+def artist_folder_names(artist_name: str) -> set:
+    """Every folder name the path templates give this artist.
+
+    auto-import reads the artist off the folder an album sits in. a folder the
+    template named ("Nirvana (UK)", "AC_DC") says nothing new about who the
+    artist is, so the import has to know its own handwriting (#2045)."""
+    name = str(artist_name or "").strip()
+    if not name:
+        return set()
+    names = {sanitize_filename(name)}
+    try:
+        templates = _get_config_manager().get("file_organization.templates", {}) or {}
+    except Exception:
+        templates = {}
+    seen = set()
+    for template in templates.values():
+        if not isinstance(template, str):
+            continue
+        for segment in template.replace("\\", "/").split("/")[:-1]:
+            # a folder made of nothing but the artist: tokens and fixed text
+            if segment in seen or not _ARTIST_TOKEN_RE.search(segment):
+                continue
+            seen.add(segment)
+            if "$" in _ARTIST_TOKEN_RE.sub("", segment):
+                continue
+            try:
+                folder, _file = get_file_path_from_template_raw(
+                    segment + "/x", {"artist": name, "albumartist": name})
+            except Exception as e:
+                logger.debug("artist folder render failed for %r: %s", segment, e)
+                continue
+            if folder:
+                names.add(folder)
+    return names
+
+
 _SINGLE_PATH_DEFAULTS = frozenset({
     "$albumartist/$albumartist - $title/$title",
     "$artist/$artist - $title/$title",
@@ -1282,6 +1443,19 @@ def _artist_identity(artist_context, source) -> dict:
     }
 
 
+def _with_library_names(template_context: dict, context, artist_context) -> None:
+    """name the folder after the library artist the download belongs to
+    (#2165): the source can call them "Machine Gun Kelly" while the library,
+    which finds them by id, calls them "mgk". only whole credits change, so a
+    feature keeps its own name."""
+    names = library_names(context, artist_context)
+    if not names:
+        return
+    template_context["_library_names"] = names
+    for key in ("artist", "albumartist"):
+        template_context[key] = swap_credit(template_context.get(key), names)
+
+
 def build_final_path_for_track(context, artist_context, album_info, file_ext, create_dirs: bool = True):
     """Shared path builder used by both post-processing and verification.
 
@@ -1422,7 +1596,29 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         (album_context and album_context.get("album_type_locked"))
         or (isinstance(album_info, dict) and album_info.get("album_type_locked"))
     )
-    album_type_display = get_album_type_display(raw_album_type, total_tracks, _type_source, _type_locked)
+    # the release's runtime, when the album context carried it
+    album_runtime_ms = _coerce_int(
+        album_context.get("duration_ms") if album_context else None, 0)
+    album_type_display = get_album_type_display(
+        raw_album_type, total_tracks, _type_source, _type_locked, album_runtime_ms or None)
+    if isinstance(context, dict):
+        # the inputs that decided the release type, kept on the Library v2
+        # album at registration so a reorganize files the release where this
+        # download did (core/library2/reorganize_plan.py)
+        context["_filed_release"] = {
+            "type": raw_album_type or "album",
+            "total_tracks": _coerce_int(total_tracks, 0),
+            "duration_ms": album_runtime_ms,
+            "source": str(_type_source or ""),
+            "locked": _type_locked,
+            "secondary_types": [
+                str(value) for value in ((album_context or {}).get("secondary_types") or [])
+                if value
+            ],
+            # #1299: the release's disambiguation the folder was built with, so
+            # a reorganize keeps "Album (baby punk version)" apart from "Album"
+            "disambiguation": str((album_context or {}).get("disambiguation") or "").strip(),
+        }
 
     # $atypes: every qualifier the release actually carries, bracketed, and
     # nothing at all for a plain album — the beets convention, so a library
@@ -1551,6 +1747,16 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         elif (raw_album_type in ("compilation", "compile", "compilations") or is_explicit_comp) \
                 and track_info.get("artist"):
             _artist_name = track_info["artist"]
+        if not _artist_name:
+            _artist_name = _named_artist(original_search.get("artist"), track_info.get("artist"))
+
+        # #2023: an album whose download named no artist anywhere above (an
+        # empty artist context and album credit) rendered an empty
+        # $albumartist, and the album folder landed at the library root next
+        # to the artist's real folder. the track's own artist is the next best
+        # answer, the one #989 gives an itunes single
+        if not _album_artist_name or _album_artist_name == "Unknown Artist":
+            _album_artist_name = _named_artist(_artist_name) or _album_artist_name
 
         template_context = {
             "artist": _artist_name,
@@ -1565,6 +1771,9 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             "atypes": atypes_value,
             "_artists_list": _album_artists_for_collab if _album_artists_for_collab else _artists,
             "_track_artists_list": _artists,
+            # names this download vouches for, so a credit given as one
+            # string can still be split on 'first listed' (#2028)
+            "_collab_known_names": [n for n in (artist_name, _artist_name) if n],
             "_itunes_artist_id": _itunes_aid,
             # #1299: the one thing telling same-named releases apart.
             "disambiguation": str((album_context or {}).get("disambiguation") or "").strip(),
@@ -1575,10 +1784,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
             "label": str((album_context or {}).get("label") or "").strip(),
             # #1860: $explicit / $contentrating
             "explicit": (track_info or {}).get("explicit"),
-            "album_explicit": (album_context or {}).get("explicit"),
+            "album_explicit": resolve_album_explicit(album_context, track_info),
             # #1859: who the album artist is, for $albumartistinfo and friends
             **_artist_identity(artist_context, source),
         }
+        _with_library_names(template_context, context, artist_context)
         # A caller that KNOWS the disc count is authoritative: re-deriving it from
         # a live provider tracklist made the destination depend on whether that
         # lookup happened to succeed, so a cache miss or an offline provider filed
@@ -1681,6 +1891,11 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
                     # A single/EP sharing the album's title is a different
                     # release — never let it reuse the album's folder.
                     incoming_album_type=raw_album_type,
+                    # #2023: a layout with an artist folder never reuses an
+                    # album folder that sits at the library root. no template
+                    # (None) means the Artist/Artist - Album fallback below
+                    min_depth=2 if folder_path is None else min(
+                        2, len([p for p in folder_path.replace("\\", "/").split("/") if p])),
                 )
             except Exception as _reuse_err:
                 logger.debug("[Existing Album Folder] lookup failed: %s", _reuse_err)
@@ -1747,26 +1962,61 @@ def build_final_path_for_track(context, artist_context, album_info, file_ext, cr
         if _aid.isdigit():
             _itunes_aid = _aid
 
+    # a release typed single files under its own credit, like an album does.
+    # the download's artist is the track's, so a single credited to
+    # "Creed, 3 Doors Down & Finger Eleven" went under whichever of them sang
+    # this track (#2028)
+    if not _named_artist(artist_name):
+        # #2023: same as the album branch, never an empty artist folder
+        artist_name = _named_artist(
+            _artists, original_search.get("artist"), track_info.get("artist")) or artist_name
+    _single_album_artist = artist_name
+    _single_artists_list = _artists
+    if _single_template_override and _album_ctx:
+        _credit = [a for a in (_album_ctx.get("artists") or [])
+                   if (a.get("name") if isinstance(a, dict) else a)]
+        if _credit:
+            _first = _credit[0]
+            _first_name = str(_first.get("name") if isinstance(_first, dict) else _first)
+            if _first_name != "Unknown Artist":
+                _single_album_artist = _first_name
+                _single_artists_list = _credit
+
+    # #2044: a release the source typed a single can hold several tracks (a
+    # 4-track maxi single). on a customized single template every one of them
+    # was numbered 01. a lone track with no release behind it is still 1
+    _single_track_number = _single_disc_number = _single_total_discs = 1
+    if _single_template_override:
+        _single_track_number = _coerce_int(album_info.get("track_number", 1), 1)
+        _single_disc_number = _coerce_int(album_info.get("disc_number", 1), 1)
+        _single_total_discs = max(
+            _single_disc_number,
+            _coerce_int((_album_ctx or {}).get("total_discs"), 1))
+
     template_context = {
         "artist": artist_name,
-        "albumartist": artist_name,
+        "albumartist": _single_album_artist,
         "album": album_info.get("album_name", clean_track_name) if album_info else clean_track_name,
         "title": clean_track_name,
-        "track_number": 1,
-        "disc_number": 1,
+        "track_number": _single_track_number,
+        "disc_number": _single_disc_number,
+        "total_discs": _single_total_discs,
         "year": year,
         "quality": context.get("_audio_quality", ""),
         "albumtype": album_type_display,
         "atypes": atypes_value,
-        "_artists_list": _artists,
+        "_artists_list": _single_artists_list,
+        "_track_artists_list": _artists,
+        "_collab_known_names": [artist_name] if artist_name else [],
         "_itunes_artist_id": _itunes_aid,
         # #1536: recording disambiguation for the single filename.
         "track_disambiguation": str((track_info or {}).get("disambiguation") or "").strip(),
         # #1860: $explicit / $contentrating
         "explicit": (track_info or {}).get("explicit"),
-        "album_explicit": (_album_ctx or {}).get("explicit"),
+        "album_explicit": resolve_album_explicit(_album_ctx, track_info),
         **_artist_identity(artist_context, source),
     }
+    _with_library_names(template_context, context, artist_context)
 
     folder_path, filename_base = get_file_path_from_template(template_context, "single_path")
     if filename_base:

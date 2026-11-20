@@ -129,7 +129,8 @@ def test_a_finished_job_of_archives_is_refused_once_settled(tmp_path):
     dl = {"id": 2, "source": "usenet", "client_ref": "n"}
     st = _status(state="completed", progress=1.0, content_path=str(folder))
     still_unpacking = _run(dl, st, listing=pr.listing, settled=lambda d, p: False)
-    assert still_unpacking == {"progress": 100.0}, "a usenet unrar in progress is left to finish"
+    # upstream (3.6.8) tags the poll with what it saw; it is still only a poll
+    assert still_unpacking.get("progress") == 100.0 and "status" not in still_unpacking,         "a usenet unrar in progress is left to finish"
     out = _run(dl, st, listing=pr.listing, settled=lambda d, p: True)
     assert out["status"] == "failed" and "Finished, but there is no video file" in out["error"]
 

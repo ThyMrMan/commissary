@@ -7,7 +7,8 @@ the (later-phase) engine tries in turn.
 
 Pure normalize here (no DB, no network) so it's unit-tested in isolation. Stored in
 video.db's ``video_settings`` (``download_mode`` + ``hybrid_order`` JSON). Isolated:
-imports only json/typing plus the equally-pure core.downloads.seed_rules, and the
+imports only json/typing plus the equally-pure core.downloads.seed_rules and
+remove_completed (its client import is lazy), and the
 music side never imports it. Keep it that way — importing core.torrent_clients here
 instead ran that package's __init__ and dragged in all four client adapters plus the
 config manager, 479 modules to normalise a settings dict.
@@ -18,7 +19,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from core.downloads import seed_rules
+from core.downloads import remove_completed, seed_rules
 
 SOURCES = ("soulseek", "torrent", "usenet", "extto")
 MODES = SOURCES + ("hybrid",)
@@ -81,6 +82,17 @@ def load(db) -> dict:
         # per indexer overrides, arr style. blank field on a rule = inherit the
         # global goal above, so a tracker can set just a ratio.
         "seed_overrides": seed_rules.normalize_overrides(db.get_setting("seed_overrides")),
+        # Remove Completed (usenet): off (default) / history / files -- what
+        # happens to a usenet job once its import has landed. Opt-in, same
+        # rule as the seed sweep. See core.downloads.remove_completed.
+        "usenet_remove_completed": remove_completed.normalize(
+            db.get_setting("usenet_remove_completed")),
+        # A usenet/torrent download the client failed: blocklist that release
+        # and grab the next one the profile ranks, arr style. On by default.
+        "redownload_failed": (db.get_setting("redownload_failed") or "1") != "0",
+        # off: Specials (season 0) are not hunted, except a show that is all
+        # specials. see VideoDatabase._apply_specials_policy
+        "monitor_specials": (db.get_setting("monitor_specials") or "1") != "0",
     }
 
 
@@ -101,6 +113,17 @@ def save(db, body: Any) -> dict:
         db.set_setting("seed_mode", _norm_seed_mode(body.get("seed_mode")))
     if "seed_overrides" in body:
         db.set_setting("seed_overrides", seed_rules.dumps(body.get("seed_overrides")))
+    if "usenet_remove_completed" in body:
+        db.set_setting("usenet_remove_completed",
+                       remove_completed.normalize(body.get("usenet_remove_completed")))
+    if "redownload_failed" in body:
+        db.set_setting("redownload_failed", "1" if body.get("redownload_failed") else "0")
+    if "monitor_specials" in body:
+        before = (db.get_setting("monitor_specials") or "1") != "0"
+        after = bool(body.get("monitor_specials"))
+        db.set_setting("monitor_specials", "1" if after else "0")
+        if after != before:
+            db.apply_specials_policy()
     return load(db)
 
 

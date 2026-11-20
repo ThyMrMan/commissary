@@ -7,9 +7,52 @@ import type { MirroredPipelineState } from '@/routes/sync/-sync.pipeline';
 
 import type { ShellProfileContext, ShellRouteDefinition, ShellPageId } from './bridge';
 
+/** the profile fields the sidebar rule reads (profile-nav.js) */
+interface SoulSyncNavProfile {
+  id: number;
+  is_admin: boolean;
+  can_download?: boolean;
+  allowed_pages?: string[] | null;
+  allowed_sides?: string | null;
+  home_page?: string | null;
+}
+
 declare global {
   interface Window {
-    showToast?: (message: string, type?: string, durationOrContext?: number | string) => void;
+    /** static/downloads.js. opts.history false shows the toast but keeps it
+     *  out of the notification panel and its journal: a refusal or a
+     *  progress line isn't something to come back to (#2191) */
+    showToast?: (
+      message: string,
+      type?: string,
+      durationOrContext?: number | string | null,
+      opts?: { history?: boolean; journal?: boolean },
+    ) => void;
+    /** index.html: the signed-in profile the server rendered in, null when it knows none (#2156) */
+    SOULSYNC_BOOT_PROFILE?: SoulSyncNavProfile | null;
+    /** static/profile-nav.js: the sidebar's permission rule and the landing page (#2154, #2156) */
+    SoulSyncProfileNav?: {
+      MUSIC_LANDING: string[];
+      VIDEO_LANDING: string[];
+      normalizePageId: (pageId: string) => string;
+      allowedSides: (profile: SoulSyncNavProfile | null) => 'music' | 'video' | 'both';
+      navButtonVisible: (
+        profile: SoulSyncNavProfile | null,
+        pageId: string,
+        video: boolean,
+      ) => boolean;
+      apply: (profile: SoulSyncNavProfile | null, root?: Document) => void;
+      featureHiddenPages: () => string[];
+      landingPage: (opts: {
+        home?: string;
+        isAdmin?: boolean;
+        adminPage?: string;
+        order?: string[];
+        allowed?: (pageId: string) => boolean;
+        hidden?: string[];
+        fallback: string;
+      }) => string;
+    };
     /** core.js: the latest server-side active music download count from the status push. */
     __soulsyncMusicActiveDownloads?: number;
     /** src/shell/oidc-signin.ts: sign-in is OIDC only right now (#1839), from /api/auth/oidc/available. */
@@ -83,6 +126,8 @@ declare global {
      * hands the shell over for the edit instead — see -automations.builder.ts.
      */
     showAutomationBuilder?: (automationId?: number) => void;
+    /** the same builder on the video side's blocks, saving `owned_by: 'video'` */
+    showVideoAutomationBuilder?: (automationId?: number) => void;
     /**
      * Closes the shared builder. Wrapped by the React automations page so it
      * can reclaim the shell — every exit path (Back, Cancel, Save) calls it.
@@ -124,6 +169,9 @@ declare global {
      * synced after that.
      */
     _updateSidebarLibraryBreadcrumb?: () => void;
+    /** library-globals — the Library page shows (or stopped showing) an artist:
+     *  "Library / <Artist>" in the sidebar. */
+    setLibraryArtistBreadcrumb?: (name: string | null) => void;
     updateWatchlistCount?: () => void;
     /** shared-helpers.js — drops JioSaavn entries unless the experimental
      *  source is enabled. Kept as the single source of truth for that flag. */
@@ -150,6 +198,10 @@ declare global {
     ) => Promise<boolean | void> | boolean | void;
     /** media-player.js — seedless Library Radio: queues a ranked-random batch
      *  from the whole library and arms radio mode for refills. */
+    npSetRadioMode?: (
+      enabled: boolean,
+      options: { toast: boolean; fetchIfNeeded: boolean },
+    ) => void;
     startLibraryRadio?: () => void | Promise<void>;
     /** media-player.js — the track the player has loaded (title, artist,
      *  album, image_url, artist_id...), or null. */
@@ -157,6 +209,8 @@ declare global {
     /** media-player.js — play a resolved library track list (radio-row shape)
      *  as the queue, labeled with a "Playing from" context. */
     cancelPendingPlayback?: () => void;
+    /** media-player.js — the queue's auto-download switch for missing rows. */
+    isQueueAutoDownloadEnabled?: () => boolean;
     playTrackList?: (
       tracks: unknown[],
       contextName?: string,
@@ -547,6 +601,11 @@ declare global {
     getWeatherPreview?: () => { preset: string; date: string | null } | null;
     setWeatherPreview?: (preview: { preset: string; date: string | null } | null) => void;
     weatherPreviewPresets?: () => Array<{ key: string; label: string }>;
+    /** ...and wiring its controls once the React System tab renders them */
+    initWeatherPreviewSettings?: () => void;
+    /** src/shell/oidc-signin.ts / oidc-only.ts: the OIDC boxes in Security & Access */
+    initOidcAdminStatus?: () => void;
+    refreshOidcOnlySettingsStatus?: () => Promise<void>;
     /** shared-helpers.js html escaper (also re-declared by downloads.js) */
     escapeHtml?: (text: unknown) => string;
     /** init.js - the active profile, or null before profiles load */
@@ -608,11 +667,32 @@ declare global {
     _mlmDeleteMatch?: (id: number) => Promise<void>;
     ServerActivity?: {
       toggle: () => void;
-      open: () => void;
+      open: (tab?: string) => void;
       close: () => void;
       refresh: () => Promise<unknown>;
       _onSocket: (d: unknown) => void;
       _wantsLive: () => boolean;
+      /** the open drawer hands each payload over, for the badge */
+      _sawActivity?: (d: unknown) => void;
+    };
+    /** the help sheet (features/help/host.tsx); the ? button's shim in helper.js opens it */
+    SoulSyncHelp?: {
+      open: (view?: string, params?: Record<string, string>) => void;
+      close: () => void;
+      toggle: () => void;
+      isOpen: () => boolean;
+      openSearch: () => void;
+    };
+    /** docs.js: open a docs article on the Help & Docs page */
+    navigateToDocsSection?: (id: string) => void;
+    /** the React drawer (features/server-activity/host.tsx); the shell opens it */
+    SoulSyncActivityDrawer?: {
+      open: (tab?: string) => void;
+      close: () => void;
+      toggle: () => void;
+      isOpen: () => boolean;
+      wantsLive: () => boolean;
+      push: (payload: unknown) => void;
     };
     SoulSyncActivitySocket?: {
       isConnected: () => boolean;
@@ -621,6 +701,8 @@ declare global {
     };
     SoulSyncVideo?: {
       openDetail?: (args: { kind: string; id: number | string; source?: string }) => void;
+      /** video-side.js videoPageAllowed: may this profile open a video page */
+      pageAllowed?: (pageId: string) => boolean;
     };
     /** video-download-view.js: the shared release-picker modal (manual search). */
     VideoDownload?: {
@@ -631,12 +713,16 @@ declare global {
         episode?: number | null;
         year?: number | string | null;
         poster?: string | null;
+        /** the title's id for the grab: a tmdb id with mediaSource 'tmdb' */
+        mediaId?: number | string | null;
+        mediaSource?: string | null;
+        tmdbId?: number | string | null;
       }) => void;
     };
     /** video-poster-modal.js: the poster manager (search, then pick art). */
     VideoPoster?: { openSearch?: () => void };
     /** video-overlay-editor.js / video-collection-editor.js: the two studios. */
-    VideoOverlayEditor?: { open?: () => void };
+    VideoOverlayEditor?: { open?: () => void; openSettings?: () => void };
     VideoCollectionEditor?: { open?: () => void };
     /** video-worker-orbs.js: re-anchor to the video dashboard's orb stage. */
     videoWorkerOrbs?: { refresh: () => void; onStatus: (id: string, data: unknown) => void };
@@ -644,6 +730,8 @@ declare global {
     videoEnrichmentPrime?: () => void;
     /** video-side.js: the calendar on a day, optionally with an episode open. */
     videoOpenCalendar?: (opts?: { date?: string; ep?: number | string }) => void;
+    /** #2128: the video Library's recycle bin button (video-side.js) */
+    videoOpenRecycleBin?: () => void;
     /** video-side.js: flip the shell chrome music <-> video (does NOT navigate). */
     _switchAppSide?: (side: 'music' | 'video', opts?: { force?: boolean }) => void;
     /** unified downloads page: true while any video download is active.
@@ -695,6 +783,15 @@ declare global {
           labelName?: string;
         },
       ) => Promise<boolean>;
+      /**
+       * Navigate to a full in-app href, query string included.
+       *
+       * `navigateToPage` addresses a page by id and cannot carry search params,
+       * so a plain `<a href="/library?artist=7">` — which is what a search
+       * result card is — had no way in and fell through to the browser as a
+       * full document load (iss29-B03).
+       */
+      navigateToHref: (href: string, options?: { replace?: boolean }) => Promise<boolean>;
     };
     SoulSyncWebShellBridge?: {
       getCurrentProfileContext: () => ShellProfileContext | null;
@@ -723,11 +820,22 @@ declare global {
       showReactHost: (pageId: ShellPageId) => void;
       playLibraryTrack: (
         track: {
-          id: string | number;
+          id?: string | number | null;
+          lib2_track_id?: string | number | null;
+          legacy_track_id?: string | number | null;
+          server_track_id?: string | number | null;
           title: string;
           file_path: string;
           bitrate?: string | number | null;
           artist_id?: string | number | null;
+          /**
+           * iss29-B08: the LIB2 artist id, when the track came from Library V2.
+           * `artist_id` above is a legacy id and is correctly null for a
+           * V2-native track — which left the player's "Go to artist" button
+           * permanently disabled during V2 playback, because nothing routed to
+           * `/library?artist=`.
+           */
+          lib2_artist_id?: string | number | null;
           album_id?: string | number | null;
           _stats_image?: string | null;
           /** Play this exact file: skip the title+artist re-resolve. */
@@ -840,10 +948,6 @@ declare global {
     showLaunchPinScreen?: () => void;
     checkForActiveProcesses?: () => Promise<void>;
     updateDashboardDownloads?: () => void;
-
-    /** Ask the tools page to show whichever tab holds `selector`. True when it
-     *  had to switch, so the caller knows to wait a frame before measuring. */
-    revealToolsTabFor?: (selector: string) => boolean;
   }
 }
 

@@ -120,6 +120,39 @@ def _annotate_trouble(kind, items):
         logger.exception("wishlist trouble annotation failed")
 
 
+def _quality_for_add(db, body):
+    """{"quality": id or None} for a wishlist add by this profile, or the
+    response to send instead: a refusal for a quality it may not pick, or
+    the request the add became when the quality needs an OK first."""
+    from flask import jsonify
+
+    from . import access
+    kind = "movie" if isinstance(body.get("movie"), dict) else "show"
+    if access.is_admin():
+        wanted = body.get("quality_profile_id")
+        return {"quality": int(wanted) if str(wanted or "").isdigit() and int(wanted) > 0 else None}
+    d = access.resolve(db, kind, body.get("quality_profile_id"))
+    if d.refused:
+        return access.quality_refusal(d)
+    if not d.needs_approval:
+        return {"quality": d.profile_id}
+    from .requests import file_request
+    item = body.get(kind) or {}
+    episodes = [e for e in (body.get("episodes") or []) if isinstance(e, dict)]
+    if kind == "movie":
+        ask = {"kind": "movie", "tmdb_id": item.get("tmdb_id"), "title": item.get("title"),
+               "year": item.get("year"), "poster_url": item.get("poster_url")}
+    elif len(episodes) == 1:
+        ask = {"kind": "episode", "tmdb_id": item.get("tmdb_id"), "title": item.get("title"),
+               "season": episodes[0].get("season_number"), "episode": episodes[0].get("episode_number")}
+    else:
+        return jsonify({"success": False, "error": "needs_approval", "needs_approval": True,
+                        "message": "That quality needs an OK first. Ask for the show from its "
+                                   "Request button and you'll hear when it's decided."}), 403
+    ask["quality_profile_id"] = d.profile_id
+    return file_request(ask)
+
+
 def register_routes(bp):
     @bp.route("/wishlist", methods=["GET"])
     def video_wishlist_list():
@@ -135,7 +168,8 @@ def register_routes(bp):
                     kind, search=request.args.get("search", ""), sort=request.args.get("sort", "added"),
                     page=request.args.get("page", 1), limit=request.args.get("limit", 60),
                     profile_id=_profile(),
-                    library=request.args.get("library") or None)   # Commissary: a Library tab
+                    # where it files (#2029): a copy's library, else its own's
+                    video_library=request.args.get("video_library") or None)
                 _annotate_live_state(db, kind, res.get("items") or [])
                 _annotate_trouble(kind, res.get("items") or [])
                 from .kids import filter_tmdb_items, video_cap
@@ -150,6 +184,32 @@ def register_routes(bp):
         except Exception:
             logger.exception("Failed to list video wishlist")
             return jsonify({"success": False, "error": "Failed to load wishlist"}), 500
+
+    @bp.route("/wishlist/export", methods=["GET"])
+    def video_wishlist_export():
+        """The video wishlist as json or csv: everything, movies only
+        (kind=movie) or TV only (kind=show), one row per wanted movie,
+        episode or YouTube video. The kids cap applies like it does to the list."""
+        from flask import Response
+        from . import get_video_db
+        from core.exports.artist_export import export_mime_and_ext
+        from core.exports.wishlist_export import VIDEO_FIELDS, VIDEO_SCOPES, render, video_rows
+        try:
+            fmt = "csv" if request.args.get("format") == "csv" else "json"
+            scope = request.args.get("kind") if request.args.get("kind") in VIDEO_SCOPES else "all"
+            db = get_video_db()
+            items = db.wishlist_export_items(profile_id=_profile(), kinds=VIDEO_SCOPES[scope])
+            from .kids import filter_tmdb_items, video_cap
+            cap = video_cap()
+            if cap is not None:
+                items = filter_tmdb_items(db, items, cap)
+            rows = video_rows(items)
+            mime, ext = export_mime_and_ext(fmt)
+            return Response(render(rows, VIDEO_FIELDS, fmt), mimetype=mime,
+                            headers={"X-Export-Count": str(len(rows)), "X-Export-Ext": ext})
+        except Exception:
+            logger.exception("Video wishlist export failed")
+            return jsonify({"success": False, "error": "Export failed"}), 500
 
     @bp.route("/wishlist/counts", methods=["GET"])
     def video_wishlist_counts():
@@ -184,10 +244,17 @@ def register_routes(bp):
             if scope not in _SCOPES or not tmdb_id:
                 return jsonify({"success": False, "error": "scope + tmdb_id required"}), 400
             from core.video.wishlist_search import manual_search
+            # one library's row of a movie (#2029, 0 = the title's own)
+            extra = {}
+            if scope == "movie" and data.get("video_library_id") is not None:
+                try:
+                    extra["video_library_id"] = int(data.get("video_library_id") or 0)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": "video_library_id must be a number"}), 400
             res = manual_search(scope, tmdb_id,
                                 season_number=data.get("season_number"),
                                 episode_number=data.get("episode_number"),
-                                profile_id=_profile())
+                                profile_id=_profile(), **extra)
             return jsonify({"success": True, **res})
         except Exception:
             logger.exception("wishlist manual search failed")
@@ -239,16 +306,24 @@ def register_routes(bp):
             from core.automation.handlers.video_process_wishlist import reset_source_cooldowns
             from core.video.wishlist_search import manual_search
             kind = "movie" if scope == "movie" else "episode"
+            # one library's row of a movie (#2029, 0 = the title's own)
+            row, search = {}, {}
+            if scope == "movie" and data.get("video_library_id") is not None:
+                try:
+                    vlib = int(data.get("video_library_id") or 0)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": "video_library_id must be a number"}), 400
+                row, search = {"video_library_id": vlib or None}, {"video_library_id": vlib}
             reset = get_video_db().reset_wishlist_search_state(
                 kind, tmdb_id,
                 season_number=data.get("season_number"),
                 episode_number=data.get("episode_number"),
-                profile_id=_profile())
+                profile_id=_profile(), **row)
             reset_source_cooldowns()
             res = manual_search(scope, tmdb_id,
                                 season_number=data.get("season_number"),
                                 episode_number=data.get("episode_number"),
-                                all_sources=True, profile_id=_profile())
+                                all_sources=True, profile_id=_profile(), **search)
             return jsonify({"success": True, "reset": reset, **res})
         except Exception:
             logger.exception("wishlist retry-all-sources failed")
@@ -284,6 +359,25 @@ def register_routes(bp):
         body = request.get_json(silent=True) or {}
         srv = _server()
         db = get_video_db()
+        # a kids profile wishes only for what its rating cap allows
+        from .kids import restricted_response, tmdb_title_allowed, video_cap
+        cap = video_cap()
+        if cap is not None:
+            for kind, key in (("movie", "movie"), ("show", "show")):
+                item = body.get(key)
+                if isinstance(item, dict) and item.get("tmdb_id") is not None:
+                    try:
+                        allowed = tmdb_title_allowed(db, kind, int(item["tmdb_id"]), cap)
+                    except (TypeError, ValueError):
+                        allowed = False
+                    if not allowed:
+                        return restricted_response(kind)
+        # the quality (#2168): what this profile may pick for the kind, its
+        # default when it picks none. a quality that needs an OK first turns
+        # the add into a request (same row, same Requests page)
+        held = _quality_for_add(db, body)
+        if not isinstance(held, dict):
+            return held
         try:
             movie = body.get("movie")
             if movie and movie.get("tmdb_id") and (movie.get("title") or "").strip():
@@ -292,6 +386,9 @@ def register_routes(bp):
                     poster_url=movie.get("poster_url") or None,
                     library_id=movie.get("library_id") or None, server_source=srv,
                     profile_id=_profile())
+                if ok and held.get("quality") is not None:
+                    db.set_wishlist_quality_for_tmdb(int(movie["tmdb_id"]), held["quality"],
+                                                     profile_id=_profile())
                 return jsonify({"success": ok, "added": 1 if ok else 0,
                                 "counts": db.wishlist_counts(profile_id=_profile())})
 
@@ -308,6 +405,14 @@ def register_routes(bp):
                     # suggestion) so its episodes are filed in the right folder
                     from core.video.anime_hint import note_show_wanted
                     note_show_wanted(get_video_db, show["tmdb_id"])
+                    if held.get("quality") is not None:
+                        for ep in episodes:
+                            if not isinstance(ep, dict):
+                                continue
+                            db.set_wishlist_quality_for_tmdb(
+                                int(show["tmdb_id"]), held["quality"],
+                                season_number=ep.get("season_number"),
+                                episode_number=ep.get("episode_number"), profile_id=_profile())
                 return jsonify({"success": n > 0, "added": n,
                                 "counts": db.wishlist_counts(profile_id=_profile())})
 
@@ -327,10 +432,23 @@ def register_routes(bp):
             return jsonify({"success": False, "error": "scope and tmdb_id are required"}), 400
         try:
             db = get_video_db()
+            # one library's row of a movie (#2029): video_library_id 0 is the
+            # title's own row, a set one a copy wanted elsewhere (which stops
+            # being wanted there). left out, every copy goes, as before
+            extra = {}
+            if scope == "movie" and "video_library_id" in body:
+                try:
+                    vlib = int(body.get("video_library_id") or 0)
+                except (TypeError, ValueError):
+                    return jsonify({"success": False, "error": "video_library_id must be a number"}), 400
+                extra["video_library_id"] = vlib or None
+                if vlib:
+                    from core.video.libraries import remove_copy
+                    remove_copy(db, "movie", int(tmdb_id), vlib)
             removed = db.remove_from_wishlist(
                 scope, tmdb_id=int(tmdb_id),
                 season_number=body.get("season_number"), episode_number=body.get("episode_number"),
-                profile_id=_profile())
+                profile_id=_profile(), **extra)
             return jsonify({"success": True, "removed": removed,
                             "counts": db.wishlist_counts(profile_id=_profile())})
         except Exception:

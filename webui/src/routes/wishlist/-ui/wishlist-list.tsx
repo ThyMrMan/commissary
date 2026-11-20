@@ -14,11 +14,13 @@ import {
   describeTrouble,
   shortStamp,
   trackCountLabel,
+  upgradeTitle,
   wishlistZones,
   type WishlistZone,
 } from '../-wishlist.helpers';
-import { openWishlistInspector } from '../../../features/downloads/inspector-modal';
+import { openWishlistSearch } from '../../library/-ui/interactive-search-host';
 import { NebulaZoneHead } from './nebula-parts';
+import { WishlistCover } from './wishlist-cover';
 
 /**
  * The dense LIST view — the nebula's operational twin (Boulder: "alternative
@@ -60,7 +62,7 @@ function TrackRow({
   track: ParsedWishlistTrack;
   onRemoveTrack: (trackId: string) => void;
   /** Present only on album rows — the ✕ on the album cell removes the set. */
-  onRemoveAlbum?: (albumName: string) => void;
+  onRemoveAlbum?: (albumName: string, artistName: string) => void;
   /** When present, renders the bulk-selection checkbox column. The boolean is
       shiftKey: shift-click selects the whole visible range, like every mail
       client and file manager. */
@@ -93,11 +95,12 @@ function TrackRow({
           data-testid={`wl-select-${track.id}`}
         />
       ) : null}
-      {track.image ? (
-        <img className="wl-list-cover" src={track.image} alt="" loading="lazy" />
-      ) : (
-        <div className="wl-list-cover wl-list-cover--ph">♪</div>
-      )}
+      <WishlistCover
+        className="wl-list-cover"
+        src={track.image}
+        fallback={track.imageFallback}
+        placeholder={<div className="wl-list-cover wl-list-cover--ph">♪</div>}
+      />
       {/* Title with the album stacked beneath — ONE flexible cell, so wide
           screens read as left cluster + right cluster instead of columns
           adrift in a void (Boulder's image 8). */}
@@ -106,13 +109,21 @@ function TrackRow({
           {track.track}
         </span>
         <span className="wl-list-track-album" title={track.album}>
+          {/* Upgrades are neither missing tracks nor duplicates. Saying so on
+              the row is the difference between "my wishlist is broken" and
+              "my quality profile is doing its job". */}
+          {track.upgrade ? (
+            <span className="wl-list-upgrade" title={upgradeTitle(track)}>
+              ⬆ upgrade{track.currentQuality ? ` · ${track.currentQuality}` : ''}
+            </span>
+          ) : null}
           {track.type === 'single' ? 'Single' : track.album}
           {track.type !== 'single' && onRemoveAlbum ? (
             <button
               type="button"
               className="wl-list-album-x"
               title={`Remove all tracks from "${track.album}"`}
-              onClick={() => onRemoveAlbum(track.album)}
+              onClick={() => onRemoveAlbum(track.album, track.artist)}
             >
               ✕
             </button>
@@ -142,14 +153,7 @@ function TrackRow({
           type="button"
           className="wl-list-btn"
           title="Interactive Search"
-          onClick={() =>
-            openWishlistInspector({
-              id: track.id,
-              name: track.track,
-              artist: track.artist,
-              album: track.album,
-            })
-          }
+          onClick={() => void openWishlistSearch(track)}
         >
           🔍
         </button>
@@ -181,7 +185,7 @@ export function WishlistList({
   /** Keyed by LOWERCASED artist name — buildArtistImageMap's contract. */
   artistImages: Map<string, string>;
   groups: WishlistArtistGroup[];
-  onRemoveAlbum: (albumName: string) => void;
+  onRemoveAlbum: (albumName: string, artistName: string) => void;
   onRemoveTrack: (trackId: string) => void;
   /** A live text filter auto-expands matches — collapsed search hits confuse. */
   filterActive?: boolean;

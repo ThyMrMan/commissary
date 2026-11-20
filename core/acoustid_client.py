@@ -23,7 +23,7 @@ import shutil
 import logging
 import logging.handlers
 
-from utils.logging_config import get_logger
+from utils.logging_config import SafeFormatter, app_log_path, get_logger
 from core.settings import config_manager
 
 # fpcalc binary location (downloaded automatically if needed)
@@ -32,14 +32,14 @@ CHROMAPRINT_VERSION = "1.5.1"
 
 _acoustid_logger = logging.getLogger("soulsync.acoustid")
 _acoustid_logger.setLevel(logging.DEBUG)
-_acoustid_log_path = Path(config_manager.get('logging.path', 'logs/app.log')).parent / "acoustid.log"
+_acoustid_log_path = Path(app_log_path(config_manager.get('logging.path', 'logs/app.log'))).parent / "acoustid.log"
 _acoustid_log_path.parent.mkdir(parents=True, exist_ok=True)
 if not _acoustid_logger.handlers:
     _acoustid_file_handler = logging.handlers.RotatingFileHandler(
         _acoustid_log_path, encoding='utf-8', maxBytes=5*1024*1024, backupCount=2
     )
     _acoustid_file_handler.setLevel(logging.DEBUG)
-    _acoustid_file_handler.setFormatter(logging.Formatter(
+    _acoustid_file_handler.setFormatter(SafeFormatter(
         fmt='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     ))
@@ -56,6 +56,28 @@ try:
 except ImportError:
     ACOUSTID_AVAILABLE = False
     logger.warning("pyacoustid library not installed - run: pip install pyacoustid")
+
+# AcoustID web service error codes (acoustid-server acoustid/api/errors.py).
+# The client key is checked before anything else in the request, so any other
+# code means the key was accepted.
+ACOUSTID_ERROR_INVALID_FINGERPRINT = 3
+ACOUSTID_ERROR_INVALID_APIKEY = 4
+ACOUSTID_ERROR_TOO_MANY_REQUESTS = 14
+
+
+def is_invalid_key_error(code: Any, message: Optional[str]) -> bool:
+    """True when an AcoustID error means the API key itself was rejected.
+
+    The error code decides when there is one: "invalid fingerprint" (code 3,
+    a file with no usable audio) also contains "invalid" but says nothing about
+    the key, and treating it as a dead key aborted whole scans on one bad file.
+    The message is only read when no code came back.
+    """
+    if code:
+        return code == ACOUSTID_ERROR_INVALID_APIKEY
+    msg = (message or '').lower()
+    return 'invalid api key' in msg or 'invalid client' in msg or 'invalid key' in msg
+
 
 def parse_lookup_with_duration(data: Dict[str, Any]):
     """pyacoustid's parse_lookup_result, plus each recording's duration.
@@ -243,20 +265,14 @@ class AcoustIDClient:
             return self._enabled
         return bool(config_manager.get('acoustid.enabled', False)) if config_manager else False
 
-    def is_available(self) -> Tuple[bool, str]:
-        """
-        Check if AcoustID verification is available and ready.
-
-        Returns:
-            Tuple of (is_available, reason_message)
-        """
+    def _ready(self, require_enabled: bool) -> Tuple[bool, str]:
         if not ACOUSTID_AVAILABLE:
             return False, "pyacoustid library not installed"
 
         if not self.api_key:
             return False, "No AcoustID API key configured"
 
-        if not self.enabled:
+        if require_enabled and not self.enabled:
             return False, "AcoustID verification is disabled"
 
         # Check if chromaprint or fpcalc is available
@@ -264,6 +280,28 @@ class AcoustIDClient:
             return False, "Chromaprint library not installed (install libchromaprint1)"
 
         return True, "AcoustID verification ready"
+
+    def is_available(self) -> Tuple[bool, str]:
+        """
+        Check if AcoustID verification is available and ready.
+
+        This is the answer for anything SoulSync does on its own: checking a
+        new download, the background matcher. It needs the setting on.
+
+        Returns:
+            Tuple of (is_available, reason_message)
+        """
+        return self._ready(require_enabled=True)
+
+    def can_fingerprint(self) -> Tuple[bool, str]:
+        """can this install fingerprint a file and look it up: the library, a
+        key, chromaprint. it doesn't ask whether download verification is on.
+
+        that setting means "check every new download", and it used to gate
+        everything. turning it off also killed the scan and the fingerprint
+        button a person starts by hand, which is exactly what someone who
+        turned it off to check later wants to run (#2042)."""
+        return self._ready(require_enabled=False)
 
     def _check_fingerprint_available(self) -> bool:
         """Check if we can generate fingerprints (chromaprint lib or fpcalc)."""
@@ -427,13 +465,13 @@ class AcoustIDClient:
                     err = raw_response.get('error', {})
                     err_code = err.get('code', 0)
                     err_msg = err.get('message', 'Unknown AcoustID error')
-                    invalid = (err_code == 4 or 'invalid' in err_msg.lower() or 'key' in err_msg.lower())
+                    invalid = is_invalid_key_error(err_code, err_msg)
                     if invalid:
                         logger.error(
                             "AcoustID API key appears to be invalid (Application API key required): %s (code %s)",
                             err_msg, err_code
                         )
-                    elif 'rate' in err_msg.lower() or 'limit' in err_msg.lower() or err_code == 5:
+                    elif 'rate' in err_msg.lower() or 'limit' in err_msg.lower() or err_code == ACOUSTID_ERROR_TOO_MANY_REQUESTS:
                         logger.warning("Rate limited by AcoustID — will retry later: %s", err_msg)
                     return {'status': 'error', 'recordings': [], 'invalid_key': invalid,
                             'error': f'AcoustID API error (code {err_code}): {err_msg}'}
@@ -484,9 +522,15 @@ class AcoustIDClient:
             api_key_preview = f"{self.api_key[:8]}..." if self.api_key and len(self.api_key) > 8 else "???"
             logger.warning(f"AcoustID API error (key: {api_key_preview}): {e}")
             error_str = str(e).lower()
-            # Old pyacoustid reports an invalid key as the bare "status: error"
-            # (it drops the detail), so treat that as an invalid-key signal too.
-            invalid = ('invalid' in error_str or 'unknown' in error_str or 'status: error' in error_str)
+            invalid = is_invalid_key_error(getattr(e, 'code', None), str(e))
+            # Old pyacoustid (no parse_lookup_result) reports an invalid key as
+            # the bare "status: error" (it drops the detail), so treat that as
+            # an invalid-key signal too. A current pyacoustid only gets here
+            # after the raw lookup above failed, and there the bare message is
+            # as likely a bad file (code 3) as a bad key, and the scanner has
+            # already checked the key with test_api_key() before it started.
+            if not invalid and not hasattr(acoustid, 'parse_lookup_result'):
+                invalid = error_str.strip() == 'status: error'
             if invalid:
                 logger.error("AcoustID API key appears to be invalid — check your AcoustID settings")
             elif 'rate' in error_str or 'limit' in error_str:

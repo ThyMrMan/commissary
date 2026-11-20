@@ -77,8 +77,10 @@ class ServerDescriptor:
     # library, a Navidrome music folder, or nothing.
     library_concept: str = 'none'
     # Per-profile own libraries (#1199) need a server that can hold more
-    # than one music library. Plex and Jellyfin can; Navidrome has one
-    # music folder per server; the standalone library has no server.
+    # than one music library. Plex and Jellyfin can; Navidrome can from
+    # 0.58 (#2031, version-checked at runtime); the standalone library
+    # has no server. Ask core.library_scope.own_libraries_supported_on,
+    # not this flag.
     supports_own_libraries: bool = False
     # The server has user accounts a profile can be linked to.
     per_user_accounts: bool = False
@@ -198,6 +200,9 @@ NAVIDROME = ServerDescriptor(
     detection=Detection(port=4533, path='/rest/ping'),
     brand=Brand(color='#3b6cf6', logo='/static/img/brands/navidrome.png'),
     library_concept='folder',
+    # from 0.58 only (multiple libraries, #2031): the running version is
+    # checked by core.library_scope.own_libraries_supported_on
+    supports_own_libraries=True,
     per_user_accounts=True,
 )
 
@@ -208,13 +213,32 @@ SOULSYNC = ServerDescriptor(
     # folder from the soulseek section.
     config_section='soulseek',
     fields=(
-        ConfigField('transfer_path', 'path', required=False, label='Transfer folder', default='./Transfer'),
+        ConfigField('transfer_path', 'path', required=False, label='Music library folder', default='./Transfer'),
     ),
     brand=Brand(color='#7c5cff', logo='/static/trans2.png', dark=True),
     is_external=False,
 )
 
-SERVERS: Tuple[ServerDescriptor, ...] = (PLEX, JELLYFIN, NAVIDROME, SOULSYNC)
+MUSIC_ASSISTANT = ServerDescriptor(
+    name='music_assistant',
+    display_name='Music Assistant',
+    config_section='music_assistant',
+    fields=(
+        ConfigField('base_url', 'url', label='Music Assistant URL'),
+        ConfigField('token', 'token', label='Long-lived token'),
+        # the Local files or SMB source whose tracks have file paths; picked
+        # in settings from the server's sources, empty = first one found
+        ConfigField('source_instance', 'text', required=False, label='Music source'),
+        ConfigField('auto_detect', 'text', required=False, default=True),
+        ConfigField('request_timeout_seconds', 'text', required=False, default=30),
+    ),
+    detection=Detection(port=8095, path='/info'),
+    brand=Brand(color='#1976d2', logo='/static/img/brands/music-assistant.png'),
+    library_concept='source',
+    aliases=('musicassistant', 'ma'),
+)
+
+SERVERS: Tuple[ServerDescriptor, ...] = (PLEX, JELLYFIN, NAVIDROME, MUSIC_ASSISTANT, SOULSYNC)
 
 _BY_NAME: Dict[str, ServerDescriptor] = {}
 for _d in SERVERS:

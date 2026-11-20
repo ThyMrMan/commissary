@@ -1,0 +1,42 @@
+/* Commissary: {Token} naming help under the video path templates */
+.link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  cursor: pointer;
+  color: rgb(var(--accent-rgb));
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.link:hover {
+  filter: brightness(1.2);
+}
+
+.tokens {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 4px;
+  padding: 10px;
+  border: 1px solid var(--white-a12);
+  border-radius: var(--radius-md);
+}
+
+.token {
+  padding: 2px 7px;
+  border-radius: var(--radius-xs);
+  background: var(--white-a08);
+  border: 1px solid transparent;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+}
+
+.token:hover {
+  border-color: rgb(var(--accent-rgb));
+  color: rgb(var(--accent-rgb));
+}

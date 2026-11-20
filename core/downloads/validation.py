@@ -6,6 +6,7 @@ constructed in web_server.py and referenced by name throughout
 the body.
 """
 from utils.logging_config import get_logger
+import copy
 import re
 
 from core.settings import config_manager
@@ -186,7 +187,7 @@ def _filter_youtube_by_quality(candidates, profile_id=None, why=None):
 
 
 def _torrent_usenet_artist_is_fallback(result):
-    """True when a release result has no parsed artist, only indexer filler."""
+    """True when a release result has no parsed artist, only a placeholder."""
     if getattr(result, 'username', None) not in ('torrent', 'usenet'):
         return False
     artist = (getattr(result, 'artist', None) or '').strip()
@@ -194,7 +195,7 @@ def _torrent_usenet_artist_is_fallback(result):
         return True
     metadata = getattr(result, '_source_metadata', None) or {}
     indexer = str(metadata.get('indexer') or '').strip()
-    if artist.lower() in ('torrent', 'usenet'):
+    if artist.lower() in ('torrent', 'usenet', 'unknown artist'):
         return True
     return bool(indexer and artist.lower() == indexer.lower())
 
@@ -454,7 +455,26 @@ def _select(results, spotify_track, query, profile_id, why):
 
     if p2p:
         accepted.extend(_match_filename_candidates(p2p, spotify_track, profile_id, why=why))
-    return accepted
+    return _keep_the_named_recording(accepted, spotify_track, why)
+
+
+def _keep_the_named_recording(accepted, spotify_track, why):
+    """a track no catalogue has (#2097) is only ever the file whose name says
+    so: the usual scoring would take the original for a remix of it."""
+    if not accepted:
+        return accepted
+    from core.playlists import uncatalogued
+    if not uncatalogued.track_is_uncatalogued(spotify_track):
+        return accepted
+    kept = uncatalogued.filter_candidates(accepted, spotify_track)
+    if why is not None:
+        kept_ids = {id(r) for r in kept}
+        for r in accepted:
+            if id(r) not in kept_ids:
+                _note(why, r, 'version_conflict',
+                      "its name doesn't say it is this recording",
+                      getattr(r, 'confidence', None))
+    return kept
 
 
 def _filter_prowlarr_by_quality(candidates, profile_id=None, why=None):
@@ -526,8 +546,45 @@ def _filter_prowlarr_by_quality(candidates, profile_id=None, why=None):
     return filtered
 
 
+_TITLE_FEATURE_RE = re.compile(
+    r'[(\[]\s*(?:feat\.?|ft\.?|featuring|with)\s+([^)\]]+)[)\]]', re.IGNORECASE)
+
+
+def _credited_in_title(expected_artists, candidate_artist, candidate_title) -> bool:
+    """A hit whose artist field names only the lead ("Topic") still credits
+    the wanted second artist when its title says "(feat. A7S)".
+
+    every wanted artist has to be named, in the artist field or in the title.
+    a title credit for the guest alone used to vouch for any act, so
+    "Robbe, Kuokka, ropsu" with "(feat. A7S)" passed as Topic's song
+    (review 5 W3-TD-1). a library that credits only the guest has no lead to
+    check, so there the title credit is still enough.
+    """
+    from core.matching.artist_aliases import split_artist_credit
+    titled = [name for group in _TITLE_FEATURE_RE.findall(candidate_title or '')
+              for name in split_artist_credit(group)]
+    if not titled:
+        return False
+    wanted = [artist for artist in expected_artists if artist]
+    return bool(wanted) and all(
+        _release_artist_matches([artist], candidate_artist or '')
+        or any(_release_artist_matches([artist], name) for name in titled)
+        for artist in wanted)
+
+
+# "(Electronic) Some Artist", "(Rock) [LP] [24/96] Other Band": bracket groups
+# some indexers put in front of the artist (#2063).
+_LEADING_RELEASE_TAG = re.compile(r'^\s*[\[\(][^\]\)]*[\]\)]\s*')
+
+
 def _release_artist_matches(expected_artists, candidate_artist):
-    """Require a whole artist credit, rather than a name inside another band."""
+    """Require a whole artist credit, rather than a name inside another band.
+
+    Some indexers lead a release title with the genre and media tags, and the
+    title parser keeps them in the artist ("(Electronic) Some Artist"). The
+    name as given is tried first, so an act whose name really starts with a
+    bracket ("(hed) p.e.") still matches as itself; then the groups come off
+    one at a time, so "(Nu Metal) (hed) p.e." is still tried as "(hed) p.e."."""
     from difflib import SequenceMatcher
     from core.matching.artist_aliases import artist_names_match
 
@@ -536,8 +593,20 @@ def _release_artist_matches(expected_artists, candidate_artist):
         found = matching_engine.normalize_string(actual).removeprefix('the ')
         return SequenceMatcher(None, wanted, found).ratio() if wanted and found else 0.0
 
-    return any(artist_names_match(artist, candidate_artist, threshold=0.80,
-                                 similarity=similarity)[0] for artist in expected_artists if artist)
+    def matches(name):
+        return any(artist_names_match(artist, name, threshold=0.80,
+                                      similarity=similarity)[0] for artist in expected_artists if artist)
+
+    if matches(candidate_artist):
+        return True
+    name = (candidate_artist or '').strip()
+    while True:
+        untagged = _LEADING_RELEASE_TAG.sub('', name, count=1).strip()
+        if not untagged or untagged == name:
+            return False
+        if matches(untagged):
+            return True
+        name = untagged
 
 
 def _score_streaming_candidates(results, spotify_track, why=None):
@@ -560,22 +629,6 @@ def _score_streaming_candidates(results, spotify_track, why=None):
     scored = []
     _strict_duration_sources = {'tidal', 'qobuz', 'hifi', 'deezer_dl', 'amazon'}
     for r in results:
-        if (
-            r.username in _strict_duration_sources
-            and _duration_mismatch_exceeds_integrity_tolerance(expected_duration, r.duration or 0)
-        ):
-            logger.info(
-                "[%s] Rejecting candidate due to duration mismatch before download: "
-                "expected %.1fs, candidate %.1fs",
-                source_label,
-                expected_duration / 1000.0,
-                (r.duration or 0) / 1000.0,
-            )
-            if why is not None:
-                _note(why, r, 'duration_mismatch',
-                      f"{_fmt_dur(r.duration)} vs expected {_fmt_dur(expected_duration)}")
-            continue
-
         # Score using matching engine's generic scorer (same weights as Soulseek).
         if r.username in ('torrent', 'usenet'):
             release_title = (getattr(r, '_source_metadata', None) or {}).get('release_title')
@@ -726,6 +779,9 @@ def _score_streaming_candidates(results, spotify_track, why=None):
                     break
                 else:
                     _best_artist = max(_best_artist, _fuzzy_artist_similarity(_ea_norm, _cand_artist))
+            if _best_artist < 0.5 and _credited_in_title(
+                    expected_artists, _cand_artist_raw, r.title):
+                _best_artist = 1.0
             # Raised from 0.4 → 0.5 to close a fencepost bug: SequenceMatcher
             # returns exactly 0.400 for "maduk" vs "tom walker" (5 chars vs
             # 10 chars with 2 coincidental char matches), which bypassed the
@@ -782,6 +838,26 @@ def _score_streaming_candidates(results, spotify_track, why=None):
                           confidence)
                 continue
 
+        # the length check comes after the identity checks (#1980). it used to
+        # run first, so on a strict source every other artist's song of the
+        # same name was filed as "wrong length", never "wrong artist", and the
+        # one right-artist version of a different length was lost among them
+        if (
+            r.username in _strict_duration_sources
+            and _duration_mismatch_exceeds_integrity_tolerance(expected_duration, r.duration or 0)
+        ):
+            logger.info(
+                "[%s] Rejecting candidate due to duration mismatch before download: "
+                "expected %.1fs, candidate %.1fs",
+                source_label,
+                expected_duration / 1000.0,
+                (r.duration or 0) / 1000.0,
+            )
+            if why is not None:
+                _note(why, r, 'duration_mismatch',
+                      f"{_fmt_dur(r.duration)} vs expected {_fmt_dur(expected_duration)}")
+            continue
+
         r.confidence = confidence
         r.version_type = 'wrong_version' if is_wrong_version else match_type
         # every best-of copy of a song scores the same here; this says which
@@ -820,7 +896,71 @@ def _score_streaming_candidates(results, spotify_track, why=None):
 _ZERO_SCORE_VERSIONS = frozenset({'live', 'remix', 'acoustic', 'instrumental', 'slowed', 'sped_up'})
 
 
-def _note_unmatched(results, matched, max_q, why):
+def _artist_aliases(name):
+    """other names the library or musicbrainz knows this artist by: the same
+    lookup the acoustid check uses, cached per name."""
+    from core.acoustid_verification import _resolve_expected_artist_aliases
+    return _resolve_expected_artist_aliases(name)
+
+
+def _segments_name(filename, words) -> bool:
+    for segment in re.split(r'[/\\]', str(filename or '')):
+        seg_words = set(matching_engine.normalize_string(segment).split()) if segment else set()
+        if seg_words and words.issubset(seg_words):
+            return True
+    return False
+
+
+def _rescue_by_artist_alias(results, accepted, spotify_track, max_q):
+    """Score the refused soulseek files again under each alias of the artist.
+
+    Only files whose path names the alias are rescored, each as if the
+    request had named the artist that way. Returns the alias word sets, for
+    the path gate after the quality filter. Looked up only when something
+    was refused, so a clean search never asks.
+    """
+    artists = list(getattr(spotify_track, 'artists', None) or [])
+    if not artists or matching_engine is None:
+        return []
+    taken = {id(r) for r in accepted}
+    leftovers = [r for r in results or ()
+                 if id(r) not in taken
+                 and getattr(r, 'username', None) not in _STREAMING_USERNAMES
+                 and (max_q <= 0 or (getattr(r, 'queue_length', 0) or 0) <= max_q)]
+    if not leftovers:
+        return []
+    primary = artists[0].get('name', '') if isinstance(artists[0], dict) else str(artists[0] or '')
+    known = {matching_engine.normalize_string(str(a.get('name', '') if isinstance(a, dict) else a))
+             for a in artists}
+    try:
+        aliases = list(_artist_aliases(primary) or [])
+    except Exception as exc:  # noqa: BLE001 - no alias is the old behaviour
+        logger.debug("artist alias lookup failed for %r: %s", primary, exc)
+        return []
+    word_sets = []
+    for alias in dict.fromkeys(str(a or '').strip() for a in aliases):
+        normalized = matching_engine.normalize_string(alias) if alias else ''
+        words = set(normalized.split())
+        if not words or normalized in known:
+            continue
+        word_sets.append(words)
+        named = [r for r in leftovers if id(r) not in taken and _segments_name(r.filename, words)]
+        if not named:
+            continue
+        alias_track = copy.copy(spotify_track)
+        try:
+            alias_track.artists = [alias, *artists[1:]]
+        except AttributeError:
+            continue
+        for row in matching_engine.find_best_slskd_matches_enhanced(alias_track, named):
+            if id(row) not in taken:
+                taken.add(id(row))
+                accepted.append(row)
+                logger.info("[Soulseek] %s accepted under the artist's alias %r", row.filename, alias)
+    return word_sets
+
+
+def _note_unmatched(results, matched, max_q, why, spotify_track=None):
     """Say why find_best_slskd_matches_enhanced (+ recovery) left rows out.
 
     The engine only returns survivors, so read its footprints: its queue gate
@@ -848,7 +988,15 @@ def _note_unmatched(results, matched, max_q, why):
                 version = matching_engine.detect_version_type(r.filename or '')[0]
             except Exception:  # noqa: BLE001 - stub engines, odd filenames
                 version = ''
-            if version in _ZERO_SCORE_VERSIONS:
+            asked = ''
+            if version and spotify_track is not None:
+                try:
+                    asked = matching_engine.detect_version_type(
+                        getattr(spotify_track, 'name', '') or '')[0]
+                except Exception:  # noqa: BLE001 - stub engines
+                    asked = ''
+            # a live file on a live request was refused for something else
+            if version in _ZERO_SCORE_VERSIONS and version != asked:
                 _note(why, r, 'version_conflict', f"{version} version, asked for the original",
                       0.0, keep_existing=True)
                 continue
@@ -919,8 +1067,12 @@ def _match_filename_candidates(results, spotify_track, profile_id=None, why=None
             identity = match_track(spotify_track, row)
             if identity.matches and identity.artist_path_evidence:
                 initial_candidates.append(row)
+    # a folder can name the artist the way his own country does (久石譲 for
+    # joe hisaishi) or the other way round; the artist's known aliases count
+    # as naming him (#2105)
+    alias_words = _rescue_by_artist_alias(results, initial_candidates, spotify_track, _max_q)
     if why is not None:
-        _note_unmatched(results, initial_candidates, _max_q, why)
+        _note_unmatched(results, initial_candidates, _max_q, why, spotify_track)
     if not initial_candidates:
         return []
 
@@ -977,6 +1129,7 @@ def _match_filename_candidates(results, spotify_track, profile_id=None, why=None
         words = set(normalized.split())
         if words:
             artist_word_sets.append(words)
+    artist_word_sets.extend(alias_words)
 
     for candidate in quality_filtered_candidates:
         # Streaming results: the matching engine already scored the title.

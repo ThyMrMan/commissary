@@ -162,7 +162,7 @@ def run_service_test(service, test_config):
                     't': token,
                     's': salt,
                     'v': '1.16.1',
-                    'c': 'soulsync',
+                    'c': 'SoulSync',  # one player in navidrome, not two (#2005)
                     'f': 'json'
                 }, timeout=5)
 
@@ -179,6 +179,20 @@ def run_service_test(service, test_config):
 
             except Exception as e:
                 return False, f"Navidrome connection error: {str(e)}"
+        elif service == "music_assistant":
+            base_url = (test_config.get('base_url') or '').strip()
+            token = (test_config.get('token') or '').strip()
+            if not base_url or not token:
+                return False, "Missing Music Assistant URL or token."
+            try:
+                from core.music_assistant_client import MusicAssistantClient
+                client = MusicAssistantClient()
+                client.base_url = base_url.rstrip('/')
+                client.token = token
+                client.source_instance = (test_config.get('source_instance') or '').strip() or None
+                return client.test_connection()
+            except Exception as e:
+                return False, f"Music Assistant connection error: {str(e)}"
         elif service == "soulsync":
             transfer_path = docker_resolve_path(config_manager.get('soulseek.transfer_path', './Transfer'))
             if os.path.isdir(transfer_path):
@@ -195,9 +209,9 @@ def run_service_test(service, test_config):
                                 break
                     if found_enough:
                         break
-                return True, f"SoulSync standalone ready! Output folder: {transfer_path}" + (f" ({count}+ audio files)" if count > 0 else " (empty)")
+                return True, f"SoulSync standalone ready! Music library folder: {transfer_path}" + (f" ({count}+ audio files)" if count > 0 else " (empty)")
             else:
-                return False, f"Output folder not found: {transfer_path}"
+                return False, f"Music library folder not found: {transfer_path}"
         elif service == "soulseek":
             if download_orchestrator is None:
                 return False, "Download orchestrator failed to initialize. Check server logs for startup errors."
@@ -333,10 +347,9 @@ def run_service_test(service, test_config):
             try:
                 from core.lastfm_client import LastFMClient
                 client = LastFMClient(api_key=api_key)
-                if client.validate_api_key():
-                    return True, "Successfully connected to Last.fm!"
-                else:
-                    return False, "Invalid Last.fm API key."
+                # a refused key (no pro subscription) answers with the plain
+                # pro message, not "invalid"
+                return client.check_api_key()
             except Exception as e:
                 return False, f"Last.fm connection error: {str(e)}"
         elif service == "genius":
@@ -354,6 +367,9 @@ def run_service_test(service, test_config):
                     return False, "Invalid Genius access token."
             except Exception as e:
                 return False, f"Genius connection error: {str(e)}"
+        elif service == "fanart":
+            from core.metadata.artist_artwork import check_fanart_key
+            return check_fanart_key(config_manager.get('fanart.api_key', ''))
         elif service == "pollinations":
             from core.playlists.cover_art import check_key
             return check_key(config_manager.get('pollinations.api_key', ''))
