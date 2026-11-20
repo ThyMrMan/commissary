@@ -209,8 +209,12 @@ def _render(text: str, tokens: TokenSet, sanitize):
                 produced = True
             i = j
             continue
-        hit = tokens.match(body)
-        if hit is None:
+        # a group holding a $token is upstream's ('{imdb-$imdbid}', the Plex id
+        # tag): braces and all, it's left for upstream's renderer
+        hit = None if "$" in body else tokens.match(body)
+        if hit is None and "$" in body:
+            out.append("{" + body + "}")
+        elif hit is None:
             out.append(body)            # no token in here — pure literal
         else:
             prefix, value, suffix = hit

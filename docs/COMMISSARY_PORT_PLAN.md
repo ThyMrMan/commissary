@@ -97,7 +97,7 @@ own search modal for that task, the one its status cell already opened unannounc
    write now uses a unique `?t=` URL.
 8. Sonarr/Radarr `{Token}` naming + rename panel (L) — **done**. Engine core/commissary/naming_tokens.py, vocabulary
    + import/rename/conformance suppliers core/commissary/naming.py; settings chips/TRaSH preset/server preview
-   (commissary-naming-settings.js); per-title Rename Files (commissary-rename-panel.js, mass_rename scope +
+   (commissary-naming-settings.js); per-title Rename Files (commissary-rename-panel.js - retired in 3.6.1, upstream's library tab renames; mass_rename scope +
    one-off template); rename-before-import (fork key `commissary_rename_before_import`, since upstream's
    organization.normalize drops unknown keys) - skipped for a locked title, once per pack.
 9. Manual import any file/folder on upstream `season_pack.py` claim model (L) — **done**
@@ -251,6 +251,30 @@ AcoustID's `client=` included).
     monitor tick later: its two end-to-end tests tick twice (`# Commissary:`).
   - Download window's compass button reads `globalThis.commissaryInspectButton`
     (upstream's download-modal-body test renders the row with no `window`).
+- **3.6.1** (2026-11-20, 295 upstream commits) -> `3.6.1-c.1`. Step 1 of two: 3.6.2+
+  brings Library v2, upstream's own video libraries and the React settings page, and
+  is merged on its own, retiring the fork features upstream then covers.
+  - Conflicts (14 files). Upstream now resolves a title's real ids and year for the
+    naming template (`ids=template_ids(...)`); the fork's `identity` stays beside it
+    for the library's title and episode titles, and fills an id upstream couldn't.
+  - Upstream's `_target_for` (anime folder, 4K folder by quality profile) is where the
+    video Library hook lives now - one hook for every grab, manual import and the
+    fork's folder placement.
+  - Naming facts: upstream moved the conformance job's fields into
+    `core/video/file_ops.naming_fields` (shared with the new library tab); the
+    `{Token}` hook moved with it.
+  - Repair findings: upstream's recurrence rules (#1882) replace "any status
+    suppresses"; `ignore_resolved` (Wishlist Audit) now just leaves resolved rows out.
+  - The Tools page is React: the Wishlist Audit wording moved to
+    `video-finding-detail.tsx`. The detail page's More menu was regrouped: "Manage"
+    (title setup) for an unowned title sits in its Library group.
+  - Retired: the per-title Rename Files panel. Upstream's library tab renames a
+    title's files to the template through the same naming code, `{Token}`s included.
+    Rename-before-import stays (its switch is on the naming settings card).
+  - Upstream's CSS budget and stylelint rules: the Import folder picker uses tokens.
+  - Local dev: another project's regular `core` package on the user site path
+    shadows SoulSync's namespace `core`; run tests and the scratch server with that
+    path removed from `sys.path`.
 
 ## Decisions (2026-10-20)
 

@@ -1,73 +1,65 @@
-# soulsync 3.5.9: `dev` → `main`
+# soulsync 3.6.1: `dev` → `main`
 
-soulsync can answer as lidarr and as an mcp server now, first-run setup is rebuilt as a guided flow, the downloads page and the wishlist are rebuilt on both sides, you can choose what new sign-ups start with, anime gets its own library folder, and a stack of matching, library and video fixes. scope: everything on dev since 3.5.8.
+the video side moves onto react: a new dashboard, calendar, tools page and detail pages with a your library tab. also optional 4k libraries, folders that check themselves as you type, a playlist flow where every source imports into soulsync, a songs tab on the library page, rebuilt daily mixes, sign in with oidc only, and a lot of fixes. scope: everything on dev since 3.6.0.
 
-## api
+## video, on react
 
-- lidarr compatible api. singarr and musicseerr 1.x only talk to lidarr, so point their lidarr url at `http://<host>:8008/lidarr` with an admin api key and they run against soulsync. requested albums land on the wishlist of the profile picked in settings, through the same add the album modal uses, and a profile without download rights means every request waits for approval. off until turned on in settings > advanced > soulsync api (thanks @Topaze77 for the request) (#1799).
-- mcp endpoint at `/mcp`, so an ai client can drive soulsync. 35 tools, almost all one `/api/v1` call each, replayed with the caller's own key, so scopes, gates and rate limits are the rest api's. settings, keys, profiles and blocklist clears are not tools. also off until turned on.
+- **dashboard:** the video dashboard is the music dashboard's layout now. a greeting with your library's size, a scan strip, the video enrichment workers on their own orb stage, the calendar's next up billboard, continue watching, downloading now (only while something is), recently added with movies / shows tabs, and a rail with this week (how many aired episodes you have, a meter by state, when auto-wishlist last ran, one button to wishlist what's missing), automations up next and issue / findings tiles that only show when something needs you.
+- **calendar:** week, agenda and month views, and every episode says where it stands: in library, downloading with percent, queued, wanted, failed, missing, grabs on air, upcoming. the old page hid the state on most cards and showed none for upcoming episodes. state chips count and filter, a health line says when schedules refreshed, and movies get cinema / home release dates. airing auto-wishlist also stopped losing days.
+- **tools:** video tools is the same react tools page as music. findings got a real pass on both sides: one health score (simple mode had its own that disagreed), triage cards (safe to fix, needs your call, review only), issue types as the landing view, and fix verbs from the server's catalog. video repair speaks the same api as music repair, and video findings get rechecked after a fix (#1882).
+- **detail pages read like a streaming app.** shows count specials and unaired episodes as not missing, so breaking bad stops saying 22 missing with every aired episode on disk. the hero has one primary action (play, else get) and everything else in one more menu, the synopsis opens in place, side-scrolling rows get page buttons, rating links open their sites, and a page that can't load says why and offers a way back. channels read like youtube.
+- **your library tab** on every movie and show: every copy you own with its quality, codecs, size, folder, subtitles and whether its name matches your template, with rename to template, search subtitles, copy path and delete to the recycle bin. shows get seasons with counts, size, a resolution mix, a monitored switch and the folders a show is split across.
+- **fix match sticks.** a tmdb re-point was never locked, so the next server scan wrote the wrong id straight back, and it kept the old title's imdb id so ratings came from the wrong movie.
+- **mark one episode or one season watched**, pushed to your server like the show toggle.
+- subtitle languages you grab come first, anilist only scores animation by exact title and year, where to watch folds resold channels into their service, and subtitles find files plex reports under its own paths.
+- **naming and renames (thanks @PapaBearDoes):** templates get the title's real ids and year, a title that carries its year doesn't get another, renames keep the quality tag and the library's path, and a new episode of an owned show goes in that show's folder.
+- jujutsu kaisen's last five lumped episodes find their tvdb season.
 
-## sign-ups
+## 4k libraries and folders that check themselves
 
-- choose what new sign-ups start with. settings > security has a new sign-ups block: the side a profile made by plex sign-in starts on (music, movies and tv, or both) and an optional request limit. nothing set means exactly what sign-up made before (thanks @PapaBearDoes) (#1818).
-- members can open video requests. a request-only profile could file a request from a card but never open the page to see or withdraw it. it follows the music rule now: admins see it, and so does anyone without download rights (thanks @PapaBearDoes) (#1819).
+- **optional 4k libraries.** a separate movies 4k and tv 4k folder, off until you switch one on under settings > folders > video. set a quality profile's new save to option to 4k library and new grabs of those titles file there, from the wishlist, rss sync, a manual grab or a manual import. titles you already have stay put and their upgrades land beside the copy you have. anime keeps its own folder either way. switch one off and it's ignored everywhere. rss sync was also sending anime episodes to the tv folder, fixed on the way. the compose file has commented 4k mounts.
+- **every folder checks itself as you type**, on every folders tab: ready with the free space left, will be created, can't write here (check PUID / PGID), a windows path typed into docker, the same folder as another row, nested inside the download folder, or in docker a folder on no mapped volume, which lives in the container and is lost when it's recreated. extra folders that aren't there say check the drive instead.
+- **the video folders tab** is regrouped (where downloads arrive, libraries, 4k libraries, collections on other drives) and every folder locks like the music ones. docker installs start movies, tv and youtube on the compose file's mounts the way music starts on /app/Transfer, only for a folder never saved and only one the container really has mapped. in docker the tab also lists the compose volume line for every folder you've set, ready to copy.
+- **extra audiobook folders** for a collection on another drive. the scan reads every folder, covers and delete work in any of them, new books still land in the main one, and an unplugged drive keeps its books until it's back.
 
-## first-run setup
+## playlists
 
-- the setup wizard is rebuilt as a guided react flow. it looks around first (docker or not, and plex, jellyfin, navidrome, slskd, prowlarr, qbittorrent and sabnzbd on the network), then walks admin and unlock, media server with plex pin sign-in, folders checked live, ordered download sources and a quality preset, accounts, movies and tv, artists to follow and a playlist to mirror.
-- nothing saves until the last step, which saves and then checks every part for real. finish later picks up where it stopped, and the dashboard shows a "finish setting up" checklist.
-
-## downloads page
-
-- rebuilt for music and video on one row grammar. status lives on the art (a ring while it downloads, a spinner while it searches, play once it's done), one visible action per row with the rest in ⋯, and clicking a row opens a sheet that says what happened step by step, with asked for vs got.
-- album batches read like a tracklist, playlist batches get a cover mosaic, history is grouped by day, and failed music tracks open the candidate inspector from the row.
-- rows get their artist photo and cover from the library when the task didn't carry one, and a video that's downloading actually reads as downloading instead of a lone "0%".
-
-## wishlist
-
-- the music nebula groups artists by what's wrong, worst first: downloaded then rejected, no match found, download keeps failing, still hunting. each zone has a retry that only touches its own tracks, and clicking an artist opens a panel beside the field that says why in plain words ("only ~30s of 3:54 actually played") with grab, retry and open artist.
-- the video wishlist moved onto the same page: movies, tv and youtube tabs with the same hero, zones and side panel. every action it had is still there.
-
-## matching
-
-- acoustid judges a file by its real length. pyacoustid dropped the duration acoustid sends, so every duration guard read nothing. with lengths in hand, a remix filed under the plain title or a different length cut stops failing a correct file, and a match that's a wildly different length stops passing (thanks @QT3496) (#1804).
-- duration quarantines name the duration tolerance setting so you can actually find it, and the help text says how auto behaves (thanks @QT3496) (#1805).
-- youtube music results get scored on their own title and artist. the matcher read `videoId||title` like a soulseek path, so the id swamped the title and the artist was never found, and an exact match like sugar by maroon 5 got rejected (thanks @andreamassaro9) (#1817).
-- k/da and other slashed names stop getting skipped as "by other artists". names compare case and punctuation blind, and a slash only splits inside each credit (thanks chung man on discord).
-
-## sync and review
-
-- append drops an old wrong match once the right track is on the playlist, so the el puffin "seville" from a broken sync stops sitting next to the right one. navidrome only for now (thanks @kevin2xk) (#1801).
-- deleting a wrong download in review blacklists its source, so the next sync doesn't pull the exact same file again (thanks @kevin2xk) (#1801).
+- **every source tab imports into soulsync** and lands you on the playlist under mirrored, account tabs, link tabs, listenbrainz, last.fm, discovery and beatport alike. they used to run their own identify, sync and download next to the same playlist on the mirrored tab. the old start sync sidebar and its sequential sync are gone.
+- **keep your own copy (#1913).** a playlist card can go straight to my playlists as an editable playlist that never refreshes from the source, a base to build on.
+- **the flow says what it means (#1910).** a mirror is checked against your library when you open it, so it stops saying 65 not synced yet on a playlist the server already has. identification says identified, the download window shows owned or missing and the real source, and add to wishlist skips songs you own.
+- **download missing retries first (#1912).** a track that missed identification never reached the download and nothing said so. now it asks: retry, then download, or download the rest.
+- server playlists find their mirror by the name sync wrote (#1907), a spotify id only counts when the artist agrees too (#1885), a discovery mirror edits its daily mix's schedule, and tidal start identifying answers right away.
+- generated playlist covers write for any PUID, and say so when they can't.
 
 ## library
 
-- redownload with "delete old file" no longer leaves two library rows when the new file lands at a different path. the original row gets repointed instead (thanks @glebosotov) (#1810).
-- alt-J and friends stop splitting into two artists when one source uses a unicode hyphen (thanks @glebosotov) (#1797).
-- batch tag writing only downloads covers for the tracks it actually writes (thanks @glebosotov) (#1798).
-- dead file findings close once the track is gone or the file is back, and fix refuses one whose file is on disk (thanks @splitsec2) (#1802, #1803).
+- **a songs tab (#1906):** every song you can see, searchable by title or artist. click a song to play it and the ones after it, play all and shuffle, play next and add to queue, a heart for liked songs, filters for duplicates, lossless and could be better, and sorts by artist, album or newest. n copies opens the copies side by side, best file first, and an admin can keep one and remove the rest. tick songs, or shift for a range, to act on them together. a search in artists or albums puts the best song matches on top. built for 300k-track libraries: every sort and search walks an index (the first version read the whole tracks table, 20 seconds on a big library).
+- **paste a link to match (#1901):** eleven artists called 1905 and only names to pick from. the match search takes a spotify, apple, discogs, tidal, qobuz, amazon, audiodb, jiosaavn, last.fm or bandcamp link or id and shows that exact one. fixing an artist's match also points your watchlist entry at it.
+- **daily mixes rebuilt** on what you play in the same sittings instead of any shared genre ("pop" put katy perry in an electronic mix). your artists capped at six, then their neighbours, then discovery spread across several artists, no repeats, a new mix each day, and every discovery playlist taste-drawn.
+- **discover's hero** can play the artist's music video behind the still.
+- **listen before you take it (#1911):** interactive search shows the song instead of a dispatch key, every streamable hit gets a play button, and it shows the wanted length and can be retyped.
 
-## video
+## sign in with oidc only (thanks @PapaBearDoes)
 
-- collections stop wishlisting things nobody asked for. the franchise and universe presets started with "wishlist the movies i'm missing" ticked, and a removed movie came straight back on the nightly sync. the box starts off now, says how many titles it'll grab, and each collection feeds a movie to the wishlist once (thanks @hilburn) (#1807).
-- an optional anime library folder. episodes of anime-type shows (set by hand, or tagged with the anime genre) import there instead of the tv folder, and scans, renames and subtitles cover it. empty means off (thanks @PapaBearDoes) (#1820).
-- a usenet grab's empty release folder is removed after import (thanks @PapaBearDoes) (#1815).
+- an optional login mode where your oidc provider is the only way in (#1839). password, recovery question, plex sign-in and switching profiles by password all stop, the login screen shows just the provider's button, and a session that didn't sign in with oidc ends. api keys are untouched. it only turns on from an admin oidc session with every profile linked, and the refusal names who isn't.
+- signing out everywhere takes the browsers off the device list, the oidc-only count says what the rows show, sign-in keeps the url base, the callback is https behind an https proxy, and there's a setup guide in docs/guides/OIDC.md.
 
-## audiobooks
+## navidrome and performance
 
-- german release names match: eszett and umlauts fold, numbers glued to titles split, and series words count as evidence when they're not already in the title (thanks @SimpleSimonLA) (#1796).
-- an mp3 whose header understates its length is measured from its bytes, so a complete 71 minute book stops reading as 7 minutes (thanks @SimpleSimonLA) (#1800).
-- a terminal album bundle failure stamps its tracks, so the wishlist stops refetching the same dead release every cycle (thanks @SimpleSimonLA) (#1795).
+- **navidrome:** a library scan is done when navidrome says so, not after 5 minutes (#1899). the hourly update kept missing albums because navidrome's newest list sorts by file dates, so a census now reads every album's song count each hour and re-reads only what changed. the listening poll stops hammering it, and subsonic calls share one kept-alive session so pi-hole sees a lookup per connection instead of per call (thanks TheHomeGuy for both reports).
+- **idle cpu (#1905):** the video download monitor polled an empty queue every 3 seconds forever, and every page render (the docker healthcheck included, every 30 seconds) walked the whole static folder to build its cache-bust. the monitor rests when idle, the scan is cached, and the healthcheck probes a light endpoint now (thanks cremonies for the profiling).
+- **lyrics filler (#1902):** skips tracks that already have a pending finding and can remember empty lrclib answers, so it stops asking lrclib about the same songs every run (thanks NeskireDK).
+- a big staging folder no longer rescans forever, and the match-status backfill runs once instead of on every boot (#1889).
+- soulid moves to v2 ids, and its one-time cutover commits in 1,000-row chunks: one update held the write lock for 7 minutes on a 311k-track library.
 
-## performance
+## downloads and fixes
 
-- the gpu stops pegging while a sync or wishlist download runs. the download modal stacked four blurs and the browser redid all of them every frame the rows pulse, but three sat on near-opaque surfaces and never showed. those are gone with no visible change, about half the gpu in that modal, and the wishlist hero lost one the same way (thanks @OlivierMartinez) (#1816).
-
-## under the hood
-
-- the css token system is filled in across the legacy sheets, exact literals swapped for tokens, declarations a later copy always overrides are dropped, and six latent css bugs are fixed (thanks @Thundernerd) (#1792, #1793, #1809, #1811, #1812).
-- react modules share Spinner, Skeleton and EmptyState primitives, and hand-rolled overlays moved onto DialogFrame (thanks @Thundernerd) (#1794, #1808, #1813).
-
-## validation
-
-- every fix shipped with regression tests, the matching and blur guards were negative-checked against the old code, the gpu fix was pixel-diffed and measured in real chromium on a real gpu, and the downloads, wishlist and onboarding rebuilds ran through chromium end to end.
+- **atomic publishing repoints the download ledger and listening history too (thanks @SimpleSimonLA).** a staged batch's ledger rows kept pointing at the staging folder the publish removes, so an artist routed to the audiobook library looked missing and got downloaded again every watchlist scan. a startup repair fixes rows left behind.
+- **a theme song shared by every album** no longer counts as missing on the wanted one (thanks @SimpleSimonLA).
+- a song we downloaded counts as owned before the server scans it.
+- playlist downloads stop getting tagged unknown album (thanks criminyjickets).
+- album completeness stops wishlisting other artists' tracks on a bulk fix (thanks seadogsbooty), and a feat credit on the album artist's own track isn't another artist's.
+- saving from the video side saves the whole settings page (thanks @PapaBearDoes).
+- the sidebar uses one icon per page on both sides, sample studio sits under manage, and the landscape phone drawer scrolls (thanks thibs).
+- chat reads slskd's login state on non-admin keys, and the wishlist zones lose the gap under each poster.
+- docs/styling.md documents the web ui styling rules (thanks @Thundernerd).

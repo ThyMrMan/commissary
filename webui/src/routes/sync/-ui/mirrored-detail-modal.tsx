@@ -20,6 +20,7 @@ import { createPortal } from 'react-dom';
 import type { MirroredPlaylistDetail } from '../-sync.api';
 import type { MirroredTrack, MirroredTrackStatus } from '../-sync.mirrored';
 
+import { isLiveBeatportRef, saveBeatportSnapshot } from '../-beatport.lists';
 import {
   mirroredDetailSourceIcon,
   mirroredDetailSourceLabel,
@@ -33,6 +34,7 @@ import {
 import { skippedNoteText } from '../-sync.modal-core';
 import { AddSongsPanel } from '../../../features/playlists/add-songs-panel';
 import { AddToPlaylistButton } from '../../../features/playlists/add-to-playlist';
+import { restoreOriginalCover } from '../../../features/playlists/cover-art';
 import { playPlaylist, type PlaylistPlayMode } from '../../../features/playlists/play-playlist';
 import {
   isLikedPlaylist,
@@ -44,7 +46,9 @@ import {
   setPlaylistDescription,
   uploadPlaylistCover,
 } from '../../../features/playlists/user-playlists';
+import { CoverArtSheet } from './cover-art-sheet';
 import { LikedArt } from './playlist-art';
+import { useLibraryCheck } from './use-library-check';
 import { usePopoverDismiss } from './use-popover-dismiss';
 
 export interface MirroredDetailModalProps {
@@ -426,9 +430,38 @@ export function MirroredDetailModal({
   const [addOpen, setAddOpen] = useState(own && tracks.length === 0);
   const [playing, setPlaying] = useState<PlaylistPlayMode | null>(null);
   const [makingMine, setMakingMine] = useState(false);
+  const [snapshotting, setSnapshotting] = useState(false);
+  const saveSnapshot = async () => {
+    if (snapshotting) return;
+    setSnapshotting(true);
+    try {
+      const result = await saveBeatportSnapshot(String(data.source_playlist_id ?? ''));
+      if (result.success) {
+        window.showToast?.(
+          `Saved "${result.name}" (${result.track_count} tracks) to your mirrored playlists`,
+          'success',
+        );
+      } else {
+        window.showToast?.(result.error || 'Snapshot failed', 'error');
+      }
+    } catch {
+      window.showToast?.('Snapshot failed', 'error');
+    } finally {
+      setSnapshotting(false);
+    }
+  };
   // click a part of the status line to see just those tracks
   const [statusFilter, setStatusFilter] = useState<MirroredTrackStatus | null>(null);
-  const segments = trackStatusSegments(data.status_counts);
+  // tracks nothing has checked against the library yet get checked now, so
+  // the line says what's owned instead of "not checked yet" (#1910)
+  const checkingLibrary = useLibraryCheck(
+    playlistId,
+    data.library_check_due ?? data.status_counts?.unchecked ?? 0,
+    onRefresh,
+  );
+  const segments = trackStatusSegments(data.status_counts).map((seg) =>
+    seg.status === 'unchecked' && checkingLibrary ? { ...seg, label: 'being checked…' } : seg,
+  );
   const shownTracks = sortTracks(tracks, sort).filter(
     (t) => !statusFilter || t.status === statusFilter,
   );
@@ -462,6 +495,22 @@ export function MirroredDetailModal({
   const [descDraft, setDescDraft] = useState('');
   const [descBusy, setDescBusy] = useState(false);
   const [dupBusy, setDupBusy] = useState(false);
+  const [coverArtOpen, setCoverArtOpen] = useState(false);
+  const [restoring, setRestoring] = useState(false);
+  const restoreCover = async () => {
+    setRestoring(true);
+    try {
+      await restoreOriginalCover(playlistId);
+      onRefresh();
+    } catch (err) {
+      window.showToast?.(
+        err instanceof Error ? err.message : 'Could not restore the cover',
+        'error',
+      );
+    } finally {
+      setRestoring(false);
+    }
+  };
   useEffect(() => {
     setCoverOpen(false);
     setCoverError(null);
@@ -956,6 +1005,35 @@ export function MirroredDetailModal({
                           ]
                         : []),
                       ...(!own ? [{ label: 'Edit source link', onSelect: onEditSource }] : []),
+                      // a live beatport list follows the chart, so last week's
+                      // tracks drop out. a snapshot keeps today's as its own
+                      // playlist that never refreshes
+                      ...(data.source === 'beatport' && isLiveBeatportRef(data.source_playlist_id)
+                        ? [
+                            {
+                              label: snapshotting ? 'Saving snapshot…' : 'Save snapshot',
+                              hint: "today's list as its own playlist that never changes",
+                              busy: snapshotting,
+                              onSelect: () => void saveSnapshot(),
+                            },
+                          ]
+                        : []),
+                      {
+                        label: 'Generate cover art',
+                        hint: 'a new cover from its genres and mood',
+                        separated: true,
+                        onSelect: () => setCoverArtOpen(true),
+                      },
+                      ...(!own && data.custom_cover
+                        ? [
+                            {
+                              label: restoring ? 'Restoring…' : 'Restore original cover',
+                              hint: `back to ${srcLabel === 'unknown' ? "the source's" : `${srcLabel}'s`} cover`,
+                              busy: restoring,
+                              onSelect: () => void restoreCover(),
+                            },
+                          ]
+                        : []),
                       {
                         label: own ? 'Delete playlist' : 'Delete mirror',
                         danger: true,
@@ -977,6 +1055,14 @@ export function MirroredDetailModal({
             &times;
           </button>
         </div>
+        {coverArtOpen ? (
+          <CoverArtSheet
+            playlistId={playlistId}
+            playlistName={data.display_name || data.name || 'this playlist'}
+            onClose={() => setCoverArtOpen(false)}
+            onApplied={onRefresh}
+          />
+        ) : null}
         {addOpen && editable ? (
           <AddSongsPanel
             playlistId={playlistId}

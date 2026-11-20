@@ -17,7 +17,11 @@ The model (rich-curated — Radarr-competitive without a full custom-formats eng
   - preferences (SOFT — they score/tie-break, they never reject on their own):
       ``prefer_codec`` (any|hevc|av1), ``prefer_hdr`` (off|prefer|require),
       ``prefer_audio`` (any|surround|lossless|atmos), ``prefer_repack`` (bool).
+  - ``audio_language_mode`` (off|prefer|require) + ``audio_languages`` : dubbed /
+                        MULTI releases. require is a real filter, prefer ranks.
   - ``min_size_gb`` / ``max_size_gb`` : size guard per item (0 = no limit).
+  - ``library``     : main|4k. 4k files new titles on this profile in the optional
+                        4K library (Settings → Folders), when that one is switched on.
 
 Pure data + normalize/validate here (no DB, no network) so it's unit-tested in
 isolation. Persisted as a JSON blob in video.db's ``video_settings['quality_profile']``.
@@ -63,6 +67,15 @@ REJECTS = ("cam", "screener", "workprint", "3d", "x264")
 CODECS = ("any", "hevc", "av1")              # SOFT codec preference (tie-breaker)
 HDR_MODES = ("off", "prefer", "require")     # require = HDR-only (a real filter)
 AUDIO_MODES = ("any", "surround", "lossless", "atmos")
+# audio language (dubbed / MULTI). off = don't look, prefer = rank releases
+# tagged with one of the languages (or MULTI) first, require = skip the rest.
+# a release with no tag is the original audio, so require skips it.
+LANGUAGE_MODES = ("off", "prefer", "require")
+# which library a title on this profile is filed in: the main Movies / TV
+# folder, or the 4K one (Settings > Folders > Video, off until switched on)
+LIBRARIES = ("main", "4k")
+AUDIO_LANGUAGES = ("fr", "de", "it", "es", "pt", "ja", "ko", "zh", "ru", "pl", "nl",
+                   "sv", "da", "no", "fi", "hi", "tr", "cs", "hu", "ar", "uk", "en")
 MAX_SIZE_CAP_GB = 200                        # slider ceiling; 0 means "no limit"
 MAX_MIN_SEEDERS = 100                        # slider ceiling; 0 means "no floor"
 
@@ -87,6 +100,9 @@ def default_profile() -> dict:
         "prefer_hdr": "prefer",
         "prefer_audio": "any",
         "prefer_repack": True,
+        "audio_language_mode": "off",
+        "audio_languages": [],
+        "library": "main",
         "max_movie_gb": 0,      # per-item size guard, split by runtime (0 = no limit)
         "max_episode_gb": 0,
         "format_scores": {},    # custom-format score overrides (P3): {format_id: score}
@@ -160,6 +176,14 @@ def normalize(raw: Any) -> dict:
     if raw.get("prefer_audio") in AUDIO_MODES:
         d["prefer_audio"] = raw["prefer_audio"]
     d["prefer_repack"] = bool(raw.get("prefer_repack", d["prefer_repack"]))
+    if raw.get("audio_language_mode") in LANGUAGE_MODES:
+        d["audio_language_mode"] = raw["audio_language_mode"]
+    if str(raw.get("library") or "").strip().lower() in LIBRARIES:
+        d["library"] = str(raw["library"]).strip().lower()
+    al = raw.get("audio_languages")
+    if isinstance(al, list):
+        chosen = {str(x or "").strip().lower() for x in al}
+        d["audio_languages"] = [c for c in AUDIO_LANGUAGES if c in chosen]
 
     d["max_movie_gb"] = _clamp_size(raw.get("max_movie_gb"))
     d["max_episode_gb"] = _clamp_size(raw.get("max_episode_gb"))
@@ -282,7 +306,7 @@ def load_for_item(db, item: Any) -> dict:
 
 
 __all__ = [
-    "TIERS", "REJECTS", "CODECS", "HDR_MODES", "AUDIO_MODES", "RESOLUTIONS",
+    "TIERS", "REJECTS", "CODECS", "HDR_MODES", "AUDIO_MODES", "RESOLUTIONS", "LIBRARIES",
     "MAX_SIZE_CAP_GB", "MAX_MIN_SEEDERS", "DEFAULT_PROFILE_ID", "default_profile", "normalize",
     "normalize_tiers", "load", "save", "list_profiles", "profile_by_id",
     "save_named", "delete_named", "load_for_item",
