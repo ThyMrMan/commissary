@@ -317,6 +317,12 @@ AcoustID's `client=` included).
   - Series type set before a show is owned is adopted after each scan
     (`title_overrides.adopt_after_scan`, one call in scanner.py).
 
+- **After 3.6.8** (2026-11-21): the legacy fork's 1.8.6 manual search, back. The video
+  manual search shows up to 100 accepted + 40 rejected releases and asks Prowlarr for 200
+  (core/commissary/search_caps.py defaults; the settings keys are unchanged), and each
+  release title links to its page at the source: `source_url`, checked by tracker_link,
+  rendered by webui/static/commissary-release-link.js (two hooks in video-download-view.js).
+
 ## Decisions (2026-10-20)
 
 - Versioning follows upstream: `<upstream version>-c.<n>`, e.g. `3.5.7-c.1`.
