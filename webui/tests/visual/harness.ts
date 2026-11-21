@@ -52,6 +52,9 @@ export function renderIndex() {
     'initial_reduce_effects | tojson': 'false',
     'initial_max_performance | tojson': 'false',
     'profile_gate_rules | tojson': 'null',
+    // Commissary: upstream's index.html reads it (#2156) but its harness never set
+    // it; the admin, so the sidebar shows from the first frame as in the baselines
+    'boot_profile | tojson': '{"id": 1, "is_admin": true, "can_download": true}',
     soulsync_base_version: '0.0.0',
     // Commissary: no fork head CSS, so pages compare against upstream's baselines
     commissary_head: '',
