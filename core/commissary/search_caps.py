@@ -3,8 +3,9 @@
 Upstream hard-codes them: Prowlarr is asked for 100 results per call and the
 ranked list is cut to 40 accepted + 15 rejected rows, which is why a popular
 title "only shows so many torrents" — the ranker had more and the response threw
-them away. Defaults stay at upstream's numbers; the keys are the legacy fork's,
-so an existing config carries over.
+them away. The defaults are the legacy fork's (1.8.6): 100 accepted, 40
+rejected, 200 per Prowlarr call. The keys are the legacy fork's too, so an
+existing config carries over.
 
 Rejects are capped separately and lower on purpose: the structured tv/movie
 search casts a wide net, and uncapped they would bury the accepted rows. Every
@@ -18,9 +19,9 @@ MAX_ACCEPTED_KEY = "video.search.max_results"
 MAX_REJECTED_KEY = "video.search.max_rejected"
 PROWLARR_LIMIT_KEY = "prowlarr.search_limit"
 
-DEFAULT_MAX_ACCEPTED = 40
-DEFAULT_MAX_REJECTED = 15
-DEFAULT_PROWLARR_LIMIT = 100
+DEFAULT_MAX_ACCEPTED = 100
+DEFAULT_MAX_REJECTED = 40
+DEFAULT_PROWLARR_LIMIT = 200
 
 
 def _setting(key: str, default: int, floor: int, ceiling: int) -> int:

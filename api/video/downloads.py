@@ -605,6 +605,13 @@ def _torrent_lane_hits(body, scope, title, want_season, want_episode, source):
     return hits, note, None
 
 
+def _source_url(hit) -> str | None:
+    """Commissary: the result's details page, checked (core.commissary.tracker_link)."""
+    from core.commissary.tracker_link import safe_info_url
+    return safe_info_url(hit.get("info_url"), download_url=hit.get("download_url"),
+                         magnet_uri=hit.get("magnet_uri"))
+
+
 def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None, want_year=None,
                    want_title=None, blocked_users=None, want_date=None, want_absolute=None,
                    want_alt=None) -> list:
@@ -716,6 +723,9 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
             # (EXT.to). Without it every EXT.to hit rendered as "Result only" and had
             # nothing a grab could resolve from.
             "info_url": hit.get("info_url"), "magnet_id": hit.get("magnet_id"),
+            # Commissary: the release's page at its source, for the title link;
+            # never a download link or one carrying an indexer key (tracker_link).
+            "source_url": _source_url(hit),
             # Per-source extras. No source has all of them - an indexer knows the
             # age and the grab count, Soulseek knows how many peers hold the file
             # and how contended they are, EXT.to knows what the film IS. The card
@@ -748,7 +758,7 @@ def _evaluate_hits(raw, profile, scope, want_season, want_episode, blocked=None,
     # rejects stay visible (with their reason) for a deliberate manual override.
     accepted = [r for r in results if r["accepted"]]
     rejected = [r for r in results if not r["accepted"]]
-    # Commissary: the caps are settings (core.commissary.search_caps), defaults 40/15.
+    # Commissary: the caps are settings (core.commissary.search_caps), defaults 100/40.
     from core.commissary.search_caps import max_accepted, max_rejected
     return (accepted[:max_accepted()] + rejected[:max_rejected()])
 

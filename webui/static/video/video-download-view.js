@@ -1121,12 +1121,18 @@
             '<div class="vdl-pack-head" data-vdl-pack-toggle="' + i + '">' +
                 '<span class="vdl-pack-caret" aria-hidden="true">▸</span>' +
                 '<span class="vdl-r-q vdl-r-q--' + resKind(r.resolution) + '">' + esc(RES_LABEL[r.resolution] || r.resolution || '?') + '</span>' +
-                '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>' +
+                _relTitle(r) +   // Commissary: the title links to its source page
                 '<span class="vdl-pack-meta">' + r.file_count + ' ep' + (r.file_count === 1 ? '' : 's') + ' · ' + _gb(r.folder_size_bytes) + '</span>' +
                 getBtn +
             '</div>' +
             '<div class="vdl-pack-list">' + rankWhyHTML(r) + rows + '</div>' +
         '</div>';
+    }
+
+    // Commissary: commissary-release-link.js links the title to its page at the source
+    function _relTitle(r) {
+        var L = globalThis.CommissaryReleaseLink;
+        return L ? L.titleHTML(r) : '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>';
     }
 
     // Is this result a whole season rather than one episode? Soulseek says so by
@@ -1227,7 +1233,7 @@
             '<div class="vdl-res-main">' +
                 '<div class="vdl-r-l1">' +
                     '<span class="vdl-r-q vdl-r-q--' + resKind(r.resolution) + '">' + esc(RES_LABEL[r.resolution] || r.resolution || '?') + '</span>' +
-                    '<span class="vdl-r-title" title="' + esc(r.title) + '">' + esc(r.title) + '</span>' +
+                    _relTitle(r) +   // Commissary: the title links to its source page
                     (isBest ? '<span class="vdl-r-best">Best match</span>' : '') +
                 '</div>' +
                 '<div class="vdl-r-l2">' + esc(meta.filter(Boolean).join('  ·  ')) + '</div>' +

@@ -1,8 +1,8 @@
-"""Manual-search caps are settings, defaulting to upstream's numbers (fork 1.8.6).
+"""Manual-search caps are settings, defaulting to the legacy fork's numbers (1.8.6).
 
-Upstream cut the ranked list to 40 accepted + 15 rejected rows and asked
+Upstream cuts the ranked list to 40 accepted + 15 rejected rows and asks
 Prowlarr for 100 results per call, all hard-coded — the ranker had more and the
-response threw them away.
+response threw them away. The fork shows 100 + 40 and asks for 200.
 """
 
 from __future__ import annotations
@@ -52,14 +52,14 @@ def _evaluate(profile, accepted=0, rejected=0):
     return [r for r in out if r["accepted"]], [r for r in out if not r["accepted"]]
 
 
-def test_defaults_match_upstream(config):
+def test_defaults_are_the_legacy_forks(config):
     assert (search_caps.max_accepted(), search_caps.max_rejected(),
-            search_caps.prowlarr_limit()) == (40, 15, 100)
+            search_caps.prowlarr_limit()) == (100, 40, 200)
 
 
 def test_the_ranker_honours_the_defaults(config, profile):
-    acc, rej = _evaluate(profile, accepted=60, rejected=30)
-    assert (len(acc), len(rej)) == (40, 15)
+    acc, rej = _evaluate(profile, accepted=120, rejected=50)
+    assert (len(acc), len(rej)) == (100, 40)
 
 
 def test_the_ranker_honours_configured_caps(config, profile):
@@ -69,11 +69,11 @@ def test_the_ranker_honours_configured_caps(config, profile):
 
 
 @pytest.mark.parametrize("key,value,fn,want", [
-    ("video.search.max_results", 0, "max_accepted", 40),        # 0 = unset -> default
+    ("video.search.max_results", 0, "max_accepted", 100),       # 0 = unset -> default
     ("video.search.max_results", -5, "max_accepted", 1),
     ("video.search.max_results", 99999, "max_accepted", 500),
     ("video.search.max_rejected", 99999, "max_rejected", 200),
-    ("video.search.max_results", "junk", "max_accepted", 40),
+    ("video.search.max_results", "junk", "max_accepted", 100),
     ("prowlarr.search_limit", 5, "prowlarr_limit", 20),
     ("prowlarr.search_limit", 250, "prowlarr_limit", 250),
 ])
