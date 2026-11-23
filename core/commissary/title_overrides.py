@@ -213,6 +213,22 @@ def series_type(db, tmdb_id) -> Optional[str]:
     return get(db, "show", tmdb_id)["series_type"]
 
 
+def show_type(db, tmdb_id) -> Optional[str]:
+    """The show row's own type, else the one set before it was owned."""
+    if not tmdb_id:
+        return None
+    conn = db._get_connection()
+    try:
+        row = conn.execute("SELECT series_type FROM shows WHERE tmdb_id=? ORDER BY id LIMIT 1",
+                           (int(tmdb_id),)).fetchone()
+    except (sqlite3.Error, ValueError, TypeError):
+        row = None
+    finally:
+        conn.close()
+    value = str((row[0] if row else "") or "").strip().lower()
+    return value or series_type(db, tmdb_id)
+
+
 # The wishlist queries' series type: the show row's own type first, then this.
 WISHLIST_SERIES_TYPE_SQL = (
     "(SELECT o.series_type FROM video_title_overrides o WHERE o.kind='show' "

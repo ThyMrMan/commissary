@@ -5,6 +5,7 @@ import {
   useVideoOrganization,
   videoOrganization,
 } from '@/features/settings/tabs/video-organization';
+import { Row, Switch } from '@/features/settings/ui';
 
 import s from './naming-panel.module.css';
 
@@ -53,9 +54,26 @@ export const TRASH: Record<Scope, string> = {
 const toast = (message: string, type: string) =>
   (window as Window & { showToast?: (m: string, t: string) => void }).showToast?.(message, type);
 
+/**
+ * Whether to ask at all. index.html sets SOULSYNC_BOOT_PROFILE (upstream #2156):
+ * a member's profile means the admin-only routes would refuse, so nothing is
+ * asked; null (nobody known yet) leaves it to the server. Absent means no page
+ * shell around the settings (upstream's component tests), so nothing is asked.
+ */
+function mayAsk(): boolean {
+  const w = window as Window & {
+    SOULSYNC_BOOT_PROFILE?: { id?: unknown; is_admin?: boolean } | null;
+  };
+  if (!('SOULSYNC_BOOT_PROFILE' in w)) return false;
+  const p = w.SOULSYNC_BOOT_PROFILE;
+  // the same test index.html's nav uses: an admin, or profile 1
+  return !p || !!p.is_admin || String(p.id) === '1';
+}
+
 let tokensAsked: Promise<Tokens | null> | null = null;
 /** one request per page load; null when the caller isn't an admin */
 function loadTokens(): Promise<Tokens | null> {
+  if (!mayAsk()) return Promise.resolve(null);
   tokensAsked ??= readJson<Tokens>(
     apiClient.get(`${API}tokens`, { searchParams: { t: Date.now() } }),
   ).catch(() => null);
@@ -210,22 +228,17 @@ export function CommissaryRenameFirst() {
       });
   };
   return (
-    <div className="form-group">
-      <label className="checkbox-label">
-        <input
-          type="checkbox"
-          id="commissary-rename-first"
-          checked={!!enabled}
-          disabled={enabled === null}
-          onChange={(event) => change(event.target.checked)}
-        />{' '}
-        <span>Rename a title’s existing files before importing into it</span>
-      </label>
-      <small className="settings-hint">
-        Brings a show’s earlier files up to the current template first, so a template change doesn’t
-        split it across two folder names. Skipped for a padlocked title; a rename that fails never
-        blocks the import.
-      </small>
-    </div>
+    <Row
+      label="Rename a title’s existing files before importing into it"
+      htmlFor="commissary-rename-first"
+      help="Brings a show’s earlier files up to the current template first, so a template change doesn’t split it across two folder names. Skipped for a padlocked title; a rename that fails never blocks the import."
+    >
+      <Switch
+        id="commissary-rename-first"
+        checked={!!enabled}
+        disabled={enabled === null}
+        onChange={(event) => change(event.target.checked)}
+      />
+    </Row>
   );
 }

@@ -322,6 +322,24 @@ AcoustID's `client=` included).
   (core/commissary/search_caps.py defaults; the settings keys are unchanged), and each
   release title links to its page at the source: `source_url`, checked by tracker_link,
   rendered by webui/static/commissary-release-link.js (two hooks in video-download-view.js).
+- **3.6.9** (2026-11-22) -> `3.6.9-c.1`. Upstream adds a player at `/player`, music apps
+  (Subsonic at `/rest`), paired devices, folder watching, and a manual search that can
+  look for a whole series / season / episode (#2233, #2234, #2224).
+  - Retired: the manual-search identity (item 3; core/commissary/search_identity.py and
+    commissary-search-identity.js). Upstream now fills a search's ids, year, alias set
+    (manual AKAs included), air date, absolute number and scene numbering on the server,
+    for the start and every Soulseek poll. Kept from it: a manual episode grab records the
+    air date and absolute number (`_grab_numbering` in api/video/downloads.py, on upstream's
+    `_episode_numbering_facts`), and a series type set for a show not yet owned is also
+    written to upstream's `show_type_hints`, which its search reads.
+  - The CSRF guard waves through paired-device and `/rest` requests (they sign each
+    request themselves, never with the cookie).
+  - The monitor's no-source watchdog sits beside upstream's Soulseek login wait.
+  - Merged with upstream's versions: the year-aware title match (the arc check keeps
+    `want_year`), the coverage chip next to the title link, the rewritten settings
+    files (hooks re-added; the rename switch now uses upstream's Row/Switch, and the
+    naming panel asks for its admin-only routes only when the page's boot profile
+    allows it).
 
 ## Decisions (2026-10-20)
 
