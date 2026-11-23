@@ -21,14 +21,13 @@ logger = get_logger("video_api.commissary_titles")
 
 
 def _state(db, kind, tmdb_id):
-    from core.commissary import search_identity as si
     from core.commissary import title_overrides as to
     library_id = to.library_row(db, kind, tmdb_id)
     ovr = db.title_overrides_for(kind, tmdb_id=tmdb_id)
     out = {"success": True, "kind": kind, "tmdb_id": tmdb_id, "library_id": library_id,
            "manual_aliases": ovr.get("manual_aliases") or []}
     if kind == "show":
-        out["series_type"] = si.series_type(db, tmdb_id) or "standard"
+        out["series_type"] = to.show_type(db, tmdb_id) or "standard"
         out["pack_preference"] = ovr.get("pack_preference") or "auto"
     return out
 
@@ -74,6 +73,10 @@ def register_routes(bp):
                 ok = db.set_show_series_type(library_id, fields["series_type"]) and ok
         else:
             ok = to.set_values(db, kind, tmdb_id, **fields)
+            if ok and "series_type" in fields:
+                # upstream's own type for a show in no library, which its
+                # manual search and wishlist read (show_type_hints)
+                db.set_show_type_hint(tmdb_id, fields["series_type"], "user")
         if not ok:
             return jsonify({"success": False, "error": "Couldn't save."}), 500
         return jsonify(_state(db, kind, tmdb_id))

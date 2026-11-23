@@ -120,7 +120,9 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
     # title; ``template`` previews a typed template without saving it.
     """Every file whose on-disk name differs from the current template.
     {status, entries: [{key, kind, title, current, proposed, reason?}],
-    unresolved: int}.
+    unresolved: int, held: int} (held: would be renamed, but an id their
+    name uses isn't stored, so they're left alone; the naming check lists
+    those titles).
 
     ``progress(done, total)`` is called as files are scanned so a background
     caller can report a live count. Pure read — never mutates."""
@@ -143,6 +145,7 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
     name_bases = [d for d in base_dirs if d not in mapped]
     entries: List[Dict[str, Any]] = []
     unresolved = 0
+    held = 0   # files left alone because an id their name uses isn't stored
 
     # Per-directory resolution cache. Files in one server folder (a show's
     # episodes, movies sharing a root) re-root to the same local folder, so once
@@ -178,7 +181,7 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
     done = 0
 
     def _consider(kind: str, key: str, title: str, stored: str, size, fields: Dict[str, Any]):
-        nonlocal unresolved
+        nonlocal unresolved, held
         if organization.languages_unknown(kind, fields, settings):
             return   # not probed yet: renaming now could strip a right '[JA]'
         local = _resolve(stored, size)
@@ -194,6 +197,9 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
         fields = dict(fields, quality=file_quality(fields.get("quality"), local))
         proposed = organization.render_path(kind, base, fields, settings, ext)["path"]
         if os.path.normpath(proposed) != os.path.normpath(local):
+            if organization.missing_ids(kind, fields, settings):
+                held += 1
+                return   # no stored id: renaming now would strip the '{imdb-...}' it may carry
             entries.append({"key": key, "kind": kind, "title": title,
                             "current": local, "proposed": proposed})
 
@@ -213,7 +219,7 @@ def preview(progress: Optional[Callable[[int, int], None]] = None, *,
             progress(done, total)
     if progress:
         progress(total, total)
-    return {"status": "completed", "entries": entries, "unresolved": unresolved}
+    return {"status": "completed", "entries": entries, "unresolved": unresolved, "held": held}
 
 
 def _same_size(cand: str, size) -> bool:

@@ -130,10 +130,9 @@ def test_standard_set_on_an_owned_show_beats_a_stored_anime(db):
     assert db.show_detail(rid)["series_type"] == "standard"
 
 
-def test_the_manual_search_identity_knows_an_unowned_type(db):
-    from core.commissary import search_identity as si
+def test_an_unowned_type_is_read_back(db):
     to.set_values(db, "show", NEW_SHOW, series_type="anime")
-    assert si.series_type(db, NEW_SHOW) == "anime"
+    assert to.show_type(db, NEW_SHOW) == "anime"
 
 
 # ── the endpoint ────────────────────────────────────────────────────────────
@@ -148,6 +147,13 @@ def client(db):
         yield app.test_client()
     finally:
         videoapi._video_db = None
+
+
+def test_an_unowned_type_reaches_upstreams_search(client, db):
+    """upstream 3.6.9 manual search reads a show's type from show_type_hints"""
+    url = "/api/video/commissary/title/show/%d/overrides" % NEW_SHOW
+    assert client.put(url, json={"series_type": "anime"}).status_code == 200
+    assert db.effective_series_type(tmdb_id=NEW_SHOW) == "anime"
 
 
 def test_put_and_get_for_an_unowned_show(client):

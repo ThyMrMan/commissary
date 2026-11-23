@@ -236,6 +236,17 @@ def _rt_arc_match(release_name, want_title, want_episode):
     return arc_episode_match(release_name, want_title, want_episode)
 
 
+def _wanted_names(want_title) -> str:
+    """the names a release was refused against, short: with every language's
+    title in the list (#2234) the whole of it is a wall of text"""
+    if isinstance(want_title, str) or not want_title:
+        return str(want_title or "")
+    names = [str(t) for t in want_title]
+    if len(names) <= 4:
+        return str(names)
+    return "%s +%d more" % (names[:4], len(names) - 4)
+
+
 def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_title=None,
               want_date=None, want_absolute=None, want_alt=None):
     from core.video.release_parse import title_region_year
@@ -256,7 +267,7 @@ def _scope_ok(parsed, scope, want_season, want_episode, want_year=None, want_tit
         from core.commissary import release_titles as _rt
         _arc = scope == "episode" and _rt.arc_episode_match(
             parsed.get("title"), want_title, want_episode)
-        if not _arc and not titles_match(parsed.get("title"), want_title):
+        if not _arc and not titles_match(parsed.get("title"), want_title, want_year):
             if scope == "episode" and _rt.arc_episode_number(
                     parsed.get("title"), want_title) is not None:
                 return None, "Wrong episode"
